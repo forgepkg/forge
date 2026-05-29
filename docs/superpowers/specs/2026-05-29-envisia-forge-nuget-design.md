@@ -27,6 +27,12 @@ model. Everything else is explicitly deferred (Section 12) with a per-item plan.
   (S3 gateway over a POSIX filesystem). Production points at real S3.
 - **PostgreSQL** for all metadata.
 - **Performance matters.** Streaming I/O, content-addressable dedup, minimal copies.
+- **Horizontal scale-out is a slice-1 requirement.** Multiple stateless server
+  instances must run against shared Postgres + shared S3 (+ optional Redis).
+  **No authoritative state lives in process memory only** — caches, locks,
+  sessions, proxy metadata, and blob bookkeeping are all backed by a shared
+  store, so a cold instance rebuilds everything from Postgres/S3/Redis. In-memory
+  is permitted only as an L1 cache in front of a shared source of truth.
 - Unit tests **and** e2e tests.
 
 ### Stack (decided)
@@ -52,8 +58,9 @@ front — but it is kept minimal (no speculative generality).
 repo/
 ├─ Cargo.toml                # workspace manifest
 ├─ crates/
-│  ├─ storage/               # CAS blob store over S3 (aws-sdk-s3): sha256, dedup, refcount
+│  ├─ storage/               # CAS blob store over S3 (aws-sdk-s3): sha256, dedup, refcount, outbox worker
 │  ├─ db/                    # sqlx Postgres pool, migrations runner, data-access layer
+│  ├─ cache/                 # HybridCache-style L1 (moka) + optional L2 (Redis) + invalidation backplane
 │  ├─ core/                  # domain model; hosted/proxy/group orchestration; auth/authz; Format trait
 │  ├─ format-nuget/          # NuGet V3 protocol: routes, nuspec/zip parsing, version normalization
 │  └─ server/                # axum app, config, principal middleware, admin API, wiring, bin
@@ -83,6 +90,41 @@ Routes are NuGet-specific and provided by `format-nuget` as an axum `Router`
 mounted by `server` under `/v3/{repo}`. `core` exposes format-agnostic
 operations the routes call: `resolve_versions`, `resolve_asset`, `store_upload`,
 `delete_component`, plus the proxy/group resolution logic.
+
+### 2.1 State, caching & scale-out (no in-memory-only state)
+
+Every server instance is stateless and interchangeable. The source of truth is
+always **Postgres** (metadata, locks, outbox, sessions later) and **S3** (bytes).
+Redis is **optional** and used only as a shared L2 cache / invalidation
+backplane; the system is fully correct without it (just with more Postgres reads
+on cold caches).
+
+- **`cache` crate — a HybridCache analogue.** L1 = `moka` (in-process, TTL +
+  size-bounded). L2 = optional Redis. Lookups: L1 → L2 → factory; on factory run,
+  write both layers. This mirrors .NET `HybridCache`. `foyer` (memory+*disk*)
+  and `multi-tier-cache` (moka+redis) are references; we keep a thin in-house
+  wrapper so the L2 and the invalidation backplane are ours to control.
+- **Stampede protection.** Per-instance request coalescing via `moka`'s
+  `try_get_with`. Cross-instance coalescing for *expensive* shared work (proxy
+  upstream fetch, registration rebuild) uses **Postgres advisory locks** so only
+  one instance in the cluster does the work.
+- **Cross-node invalidation.** When Redis is present, a pub/sub backplane
+  broadcasts key invalidations so every instance drops the stale L1 entry
+  (HybridCache's distributed-invalidation approach). Without Redis, L1 entries
+  use short TTLs and authoritative re-reads from Postgres bound staleness.
+- **What is cached vs. authoritative.** Everything cached is *derivable* from
+  Postgres/S3: proxy upstream service-index resolution, proxy metadata/version
+  listings, registration/search documents, service-index docs. The authoritative
+  copies live in Postgres tables (`proxy_cached_version`, `proxy_upstream_index`,
+  `repository`, …). A cold instance never needs another instance's memory.
+- **Sessions & ephemeral auth state (forward-looking).** Slice 1 auth is
+  stateless (tokens / basic), so there are no sessions yet. The §12.2 OIDC slice
+  and anything session-like (login sessions, CSRF/nonce, rate-limit counters)
+  **must** use Postgres or Redis — never in-process memory. This constraint is
+  recorded now so later slices honor it.
+- **Background workers** (outbox processor §4, orphan reconciler, proxy refresh)
+  run on every instance and coordinate via Postgres (`SELECT … FOR UPDATE
+  SKIP LOCKED` / advisory locks) so work is not duplicated across the cluster.
 
 ## 3. Data model (PostgreSQL)
 
@@ -117,12 +159,21 @@ operations the routes call: `resolve_versions`, `resolve_asset`, `store_upload`,
 - **`blob`**: `sha256` (PK), `size bigint`, `s3_key text`, `ref_count bigint not
   null default 0`, `state text` (`pending` | `committed`), `created_at`.
   Identical bytes stored once.
+- **`blob_outbox`**: reliable, crash-safe blob side-effects (the transactional
+  outbox pattern). `id`, `op text` (`delete_object`), `sha256`, `s3_key`,
+  `available_at timestamptz` (grace delay before a delete fires), `attempts int`,
+  `locked_until timestamptz null`, `processed_at timestamptz null`,
+  `created_at`. Rows are enqueued **in the same transaction** as the refcount
+  change that produced them; a worker drains them idempotently (§4).
 - **`proxy_cached_version`**: proxy metadata cache distinct from `component`
   (versions are *discovered* from upstream before any download). Columns:
   `id`, `repository_id` (FK, proxy), `name`, `version`, `listed bool`,
   `first_seen_at timestamptz not null` (package-delay clock), `downloaded bool
   not null default false`, `metadata_refreshed_at`, `not_found bool` +
   `not_found_at` (negative cache). Unique `(repository_id, name, version)`.
+- **`proxy_upstream_index`**: authoritative cache of a proxy's resolved upstream
+  V3 service index (so any instance can use it; L1/L2 sit on top). `repository_id`
+  (PK, proxy), `resources jsonb` (resolved `@id`s), `fetched_at`, `etag`.
 - **`app_user`**: `id`, `username` (unique), `password_hash` (argon2id),
   `is_admin bool not null default false`, `active bool`, `created_at`,
   `updated_at`. (`user` is reserved in Postgres ⇒ `app_user`.)
@@ -149,16 +200,30 @@ operations the routes call: `resolve_versions`, `resolve_asset`, `store_upload`,
      refcount change is atomic and always in the asset's transaction, so counts
      never drift.
   5. The temp file (already hashed) is handed to `Format::parse_upload`.
-- **Crash/orphan safety:** if the process dies between PUT and commit, the S3
-  object exists but the `blob` stays `pending` with `ref_count = 0`. A
-  **slice-1 orphan sweeper** (periodic task) deletes S3 objects whose `blob` is
-  `pending` and older than a grace period, and `pending`/`committed` blobs with
-  `ref_count = 0` older than the grace period. This is the minimal GC needed for
-  correctness; policy-driven retention GC is §12.1.
+- **Delete via transactional outbox (reliable, crash-safe, cluster-safe):**
+  deleting an asset decrements `ref_count` in its transaction; **iff** that drops
+  the blob to `ref_count = 0`, the same transaction inserts a `blob_outbox`
+  `delete_object` row with `available_at = now + grace`. The Postgres write
+  (refcount + outbox row) is atomic, so a delete intent is never lost even if the
+  process dies immediately after commit.
+- **Outbox worker (runs on every instance):** `SELECT … FOR UPDATE SKIP LOCKED`
+  a batch of due (`available_at <= now`, unprocessed) rows, lease them
+  (`locked_until`), and execute. For `delete_object`: re-check the blob still has
+  `ref_count = 0` (a concurrent re-push may have revived it — if so, drop the
+  outbox row without deleting), then `DELETE` the S3 object (idempotent: a
+  missing object is success) and remove the `blob` row. Mark `processed_at`.
+  Retries with backoff via `attempts`; `SKIP LOCKED` makes it safe across
+  instances. This is the primary blob-GC mechanism.
+- **Orphan reconciler (backstop):** a periodic job covers the one gap the outbox
+  cannot — bytes PUT to S3 whose owning transaction never committed (crash
+  between PUT and commit). It deletes S3 objects whose `blob` row is `pending`
+  (or absent) and older than a grace period, and any `ref_count = 0` blob with no
+  pending outbox row. Belt-and-suspenders to the outbox, not the main path.
 - **Read path:** `GET` by content key, stream to the HTTP response. `HEAD`
   supported (returns size/hash headers, no body).
-- **Delete:** decrement `ref_count` in the asset-delete transaction; the sweeper
-  reclaims at zero.
+
+Policy-driven retention GC (§12.1) reuses this exact machinery: it just enqueues
+the asset deletes that drive refcounts to zero.
 
 ## 5. Authentication & authorization
 
@@ -309,9 +374,12 @@ TOML + env overrides (`FORGE_*`). Keys: `server.bind`,
 `server.public_base_url`, `database.url`,
 `s3.{endpoint,region,bucket,access_key,secret_key,force_path_style,multipart_threshold}`,
 `auth.{anonymous_mode, anonymous_ip_allowlist, trusted_proxy_cidrs,
-allow_password_basic, bootstrap_admin}`. Repositories, members, users, and
-tokens are managed via the **admin REST API** (admin-only) in `server`, plus
-first-run bootstrap. Admin **UI** is a later slice.
+allow_password_basic, bootstrap_admin}`, `redis.url` (**optional**; absent ⇒
+L1-only caching with short TTLs, still fully correct),
+`cache.{l1_max_capacity, default_ttl}`, `outbox.{batch_size, grace_seconds,
+poll_interval}`. Repositories, members, users, and tokens are managed via the
+**admin REST API** (admin-only) in `server`, plus first-run bootstrap. Admin
+**UI** is a later slice.
 
 ## 9. Testing strategy
 
@@ -322,8 +390,12 @@ first-run bootstrap. Admin **UI** is a later slice.
   winner); rejection of nested-group config; tie determinism.
 - Package-delay gating (inside vs. outside the window); delay-404 not negatively
   cached.
-- CAS sha256/sha512 hashing, dedup, refcount transitions, pending→committed,
-  orphan-sweeper selection.
+- CAS sha256/sha512 hashing, dedup, refcount transitions, pending→committed.
+- Outbox: enqueue-on-refcount-zero in the same tx; worker idempotent delete;
+  revival check (re-push before delete cancels the delete); `SKIP LOCKED`
+  leasing; retry/backoff; orphan reconciler selection.
+- `cache` crate: L1 hit/miss, factory coalescing, TTL expiry; with a mocked L2,
+  L1→L2→factory order and invalidation-backplane drop of a stale L1 entry.
 - Principal extraction: token, password-basic on/off, invalid-creds→401,
   anonymous modes; admin vs non-admin authz.
 - IP allowlist matching incl. `loopback`/`private`/`local`, IPv6; XFF
@@ -342,9 +414,17 @@ Mock upstream NuGet feed served in-process for proxy scenarios.
 - Anonymous modes `off`/`allowlist`/`all`; allowed vs denied IP; mixed-anon
   group exposes only anon members.
 - CAS dedup: same package pushed to two repos ⇒ one blob, `ref_count == 2`;
-  orphan sweeper reclaims a `pending` blob.
+  delete one ⇒ `ref_count == 1`, no S3 delete; delete the other ⇒ outbox worker
+  removes the S3 object and `blob` row.
+- Orphan reconciler reclaims a `pending` blob whose transaction never committed.
 - Admin API requires admin; bootstrap admin works.
 - SSRF: proxy `remote_url` to a private address is rejected by default.
+- **Scale-out:** run two server instances against the same Postgres + versitygw
+  (+ Redis); push on instance A is visible on instance B; concurrent proxy
+  misses across both instances fetch upstream once (advisory lock); outbox is
+  drained exactly once cluster-wide (`SKIP LOCKED`).
+- **Redis L2 (optional, gated on a Redis container):** invalidation backplane
+  drops a stale L1 entry on the other instance after a mutation.
 - **Optional** `dotnet restore` / `dotnet nuget push` smoke test, gated on the
   dotnet SDK being present on the runner.
 
@@ -373,10 +453,11 @@ sequencing below.
   days", "keep N most-recently-downloaded", proxy "evict cached not pulled in X
   days". Parity survey vs. Nexus cleanup policies and Artifactory retention.
 - **Plan:** `retention_policy jsonb` on `repository`; background tokio evaluator
-  unlists/deletes components and decrements `ref_count`; the slice-1 orphan
-  sweeper (§4) is extended into the policy GC. Add `last_downloaded_at` to
+  unlists/deletes components, decrementing `ref_count` and enqueuing
+  `blob_outbox` deletes — i.e. it reuses the slice-1 outbox + reconciler (§4)
+  rather than adding a parallel GC path. Add `last_downloaded_at` to
   `asset`/`component`. Tests: policy unit tests; e2e push >N versions → pruning +
-  blob deletion.
+  blob deletion via the outbox.
 
 ### 12.2 OIDC / Microsoft Entra authentication
 - **What:** OIDC login (auth-code + PKCE), primarily Entra; map identities to
@@ -404,11 +485,20 @@ sequencing below.
   checks in the slice-1 authz seam; group cycle detection. Tests: principal ×
   repo × action matrix; nested-group resolution + cycle rejection.
 
-### 12.5 Secret encryption at rest
+### 12.5 Secret encryption at rest (double envelope encryption)
 - **What:** proxy `upstream_password` and similar secrets are redacted from APIs
-  in slice 1 but stored plaintext in Postgres; encrypt them at rest.
-- **Plan:** envelope encryption with a configured KEK (env/KMS); transparent
-  encrypt/decrypt in the data-access layer; migration to wrap existing values.
+  in slice 1 but stored plaintext in Postgres; encrypt them at rest with
+  **double envelope encryption** (preferred): a per-secret Data Encryption Key
+  (DEK) wraps the plaintext; the DEK is itself wrapped by a Key Encryption Key
+  (KEK); the KEK is wrapped by a root key held in a KMS/HSM (or, lower
+  environments, a root key from env/file). Two wrapping layers ⇒ KEK rotation
+  re-wraps only DEKs (cheap) and root-key rotation re-wraps only KEKs, without
+  touching ciphertext.
+- **Plan:** `encryption_key` table storing wrapped DEKs/KEKs + versions;
+  transparent encrypt/decrypt in the data-access layer; AEAD (AES-GCM or
+  XChaCha20-Poly1305) with per-secret nonces; migration to wrap existing
+  plaintext; rotation jobs for each layer. Tests: round-trip, rotation at each
+  layer, tamper detection.
 
 ### 12.6 Frontend (admin + browse UI)
 - **What:** TanStack Start admin UI: manage repositories/members/users/tokens,
@@ -427,12 +517,22 @@ sequencing below.
   protocol `Router`; `core` orchestration and storage reused unchanged — the
   payoff of Approach A.
 
-## 13. Out-of-scope assumptions
+## 13. Scale-out posture & out-of-scope assumptions
 
-- Single-node deployment in slice 1 (no clustering/HA). Stateless server +
-  shared Postgres + shared S3 keeps later horizontal scaling feasible without
-  redesign, but it is not a slice-1 goal or test target.
-- No mirroring/replication between forge instances.
+**In scope (slice 1):** multiple stateless server instances against shared
+Postgres + S3 (+ optional Redis). No in-memory-only authoritative state (§2.1):
+caches are L1+optional-L2 over Postgres/S3; cross-instance coordination uses
+Postgres advisory locks and `SELECT … FOR UPDATE SKIP LOCKED`; blob bookkeeping
+uses the transactional outbox; sessions/ephemeral auth state (when later added)
+go to Postgres/Redis. The scale-out e2e test (§9) exercises two instances. A
+cold instance reconstructs all state from the shared stores.
+
+**Out of scope (slice 1):**
+- Managing the scale-out *infrastructure* itself: HA/replication of Postgres,
+  S3, and Redis are operated externally (managed services / the deployment),
+  not by forge. Forge assumes they are available and shared.
+- Leader election / cross-node scheduling beyond Postgres-lock coordination.
+- Mirroring/replication between independent forge clusters.
 - No package signing/verification beyond what NuGet clients already do.
 
 ## Appendix A — concrete NuGet V3 JSON shapes
