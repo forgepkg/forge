@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Used by sqlx for compile-time query verification from the cached .sqlx/ dir.
+  # The `prepare` job overrides this when it needs a live database.
+  SQLX_OFFLINE: "true"
+
+jobs:
+  # ── Formatting ─────────────────────────────────────────────────────────────
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain (with rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+  # ── Clippy ─────────────────────────────────────────────────────────────────
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain (with clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── Unit tests (no containers required) ────────────────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    services:
+      # Postgres is provisioned here so tasks in later phases that use sqlx
+      # compile-time checks against a live DB (via `cargo sqlx prepare --check`)
+      # can run in this job. Unit tests themselves use SQLX_OFFLINE=true.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: forge
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://forge:forge@localhost:5432/forge
+      FORGE_DATABASE_URL: postgres://forge:forge@localhost:5432/forge
+      SQLX_OFFLINE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      - name: cargo build --workspace
+        run: cargo build --workspace
+      - name: cargo test --workspace
+        # forge-e2e feature is intentionally excluded here — unit tests only.
+        run: cargo test --workspace
+
+  # ── E2E / integration tests (requires Postgres + versitygw containers) ─────
+  # Gated behind the `forge-e2e` feature flag in the forge-e2e crate.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    # Only run on pushes to main/master or when explicitly labelled; skipping
+    # on every PR keeps CI fast. Adjust the condition to taste.
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: forge
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://forge:forge@localhost:5432/forge
+      FORGE_DATABASE_URL: postgres://forge:forge@localhost:5432/forge
+      FORGE_S3_ENDPOINT: http://localhost:7070
+      FORGE_S3_REGION: us-east-1
+      FORGE_S3_BUCKET: forge
+      FORGE_S3_ACCESS_KEY: minioadmin
+      FORGE_S3_SECRET_KEY: minioadmin
+      FORGE_S3_FORCE_PATH_STYLE: "true"
+      SQLX_OFFLINE: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      # versitygw: posix backend over a local directory on port 7070.
+      # Global flags: --port, --access, --secret.  Backend subcommand: posix <root-dir>.
+      - name: Start versitygw
+        run: |
+          mkdir -p /tmp/vgw-data/forge
+          docker run -d --name versitygw \
+            -p 7070:7070 \
+            -v /tmp/vgw-data:/data \
+            versity/versitygw:latest \
+            --port :7070 \
+            --access minioadmin \
+            --secret minioadmin \
+            posix /data
+          # Wait for versitygw to be ready
+          timeout 30 bash -c 'until curl -sf http://localhost:7070/ >/dev/null 2>&1 || curl -sf http://localhost:7070/ 2>&1 | grep -q "NoSuchBucket\|ListBuckets\|InvalidRequest"; do sleep 1; done' || true
+
+      - name: Run e2e tests (forge-e2e feature)
+        run: cargo test --workspace --features forge-e2e
+
+      - name: Stop versitygw
+        if: always()
+        run: docker rm -f versitygw || true
