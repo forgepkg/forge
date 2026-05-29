@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE blob_outbox\n        SET processed_at = now(), locked_until = NULL\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d9002492175c990f3e2ba5f85ce48a4c3c84b3a7ff938678c04471faa4203349"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE blob\n        SET ref_count = ref_count - 1\n        WHERE sha256 = $1\n        RETURNING ref_count, s3_key\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ref_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "s3_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7c01644d5b997c4d6058c107773960d24681389e30ef24d358b80355132c6e6c"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE blob\n        SET state = 'committed', ref_count = ref_count + 1\n        WHERE sha256 = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e1d7345535a16a4094042772321429ea7641affdb944252698b5648ed0faa95e"
+}

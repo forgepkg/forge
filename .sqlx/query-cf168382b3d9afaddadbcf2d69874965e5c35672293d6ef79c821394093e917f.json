@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH due AS (\n            SELECT id\n            FROM blob_outbox\n            WHERE processed_at IS NULL\n              AND available_at <= $1\n              AND (locked_until IS NULL OR locked_until < $1)\n            ORDER BY id\n            FOR UPDATE SKIP LOCKED\n            LIMIT $2\n        )\n        UPDATE blob_outbox o\n        SET locked_until = $1 + make_interval(secs => $3)\n        FROM due\n        WHERE o.id = due.id\n        RETURNING\n            o.id, o.op, o.sha256, o.s3_key, o.available_at,\n            o.attempts, o.locked_until, o.processed_at, o.created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "op",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "sha256",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "s3_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "available_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "locked_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "processed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "cf168382b3d9afaddadbcf2d69874965e5c35672293d6ef79c821394093e917f"
+}

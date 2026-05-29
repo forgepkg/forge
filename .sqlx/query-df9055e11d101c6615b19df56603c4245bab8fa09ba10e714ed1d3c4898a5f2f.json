@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO blob_outbox (op, sha256, s3_key, available_at)\n        VALUES ('delete_object', $1, $2, now() + make_interval(secs => $3))\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df9055e11d101c6615b19df56603c4245bab8fa09ba10e714ed1d3c4898a5f2f"
+}

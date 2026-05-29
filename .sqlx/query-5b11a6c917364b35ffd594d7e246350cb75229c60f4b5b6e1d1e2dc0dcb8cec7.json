@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE blob_outbox\n        SET attempts = attempts + 1,\n            available_at = $2,\n            locked_until = NULL\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5b11a6c917364b35ffd594d7e246350cb75229c60f4b5b6e1d1e2dc0dcb8cec7"
+}

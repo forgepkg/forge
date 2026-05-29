@@ -1,0 +1,116 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "format",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "anonymous_read",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "online",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "remote_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "package_delay_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "upstream_username",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "upstream_password",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "allow_private_upstream",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "metadata_ttl_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "not_found_ttl_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "allow_redeploy",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "326360e3f48d357a2a3237ecef494b281364312ee2e35b730d327acc68561967"
+}
