@@ -39,6 +39,9 @@ moka = { version = "0.12", features = ["future"] }
 # Redis (optional)
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
+# Futures combinators (Stream adapters for redis pub/sub)
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
