@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT sha256, size, s3_key, ref_count, state, created_at\n        FROM blob\n        WHERE state = 'pending' AND created_at < $1\n        ORDER BY created_at\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sha256",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "s3_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "ref_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5e6d23ebae1b92ace59e8505fd2a60604d6d64a5c7f907f1fbd2fb888a6d1d89"
+}

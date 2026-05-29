@@ -4,3 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+forge-db = { path = "../db" }
+
+tokio = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+sqlx = { workspace = true }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

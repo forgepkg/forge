@@ -50,3 +50,15 @@ thiserror = { version = "2" }
 # Tracing / logging
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Hashing
+sha2 = { version = "0.10" }
+
+# Base64 (RFC 4648 standard alphabet)
+base64 = { version = "0.22" }
+
+# Temp files
+tempfile = { version = "3" }
+
+# Date/time (shared with forge-db's model types)
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
