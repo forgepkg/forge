@@ -39,14 +39,14 @@ services:
   #     --endpoint-url http://localhost:7070 \
   #     --region us-east-1
   s3:
-    image: versity/versitygw:latest
+    image: versity/versitygw:v1.4.1
     command: ["--port", ":7070", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
     ports:
       - "7070:7070"
     volumes:
       - s3_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7070/ || true"]
+      test: ["CMD-SHELL", "nc -z localhost 7070 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

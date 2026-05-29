@@ -29,6 +29,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    needs: [fmt]
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain (with clippy)
@@ -52,6 +53,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    needs: [fmt]
 
     services:
       # Postgres is provisioned here so tasks in later phases that use sqlx
@@ -154,13 +156,13 @@ jobs:
           docker run -d --name versitygw \
             -p 7070:7070 \
             -v /tmp/vgw-data:/data \
-            versity/versitygw:latest \
+            versity/versitygw:v1.4.1 \
             --port :7070 \
             --access minioadmin \
             --secret minioadmin \
             posix /data
           # Wait for versitygw to be ready
-          timeout 30 bash -c 'until curl -sf http://localhost:7070/ >/dev/null 2>&1 || curl -sf http://localhost:7070/ 2>&1 | grep -q "NoSuchBucket\|ListBuckets\|InvalidRequest"; do sleep 1; done' || true
+          timeout 30 bash -c 'until curl -sf http://localhost:7070/ >/dev/null 2>&1 || curl -sf http://localhost:7070/ 2>&1 | grep -q "NoSuchBucket\|ListBuckets\|InvalidRequest"; do sleep 1; done'
 
       - name: Run e2e tests (forge-e2e feature)
         run: cargo test --workspace --features forge-e2e
