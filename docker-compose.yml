@@ -1,0 +1,56 @@
+name: envisia-forge-dev
+
+services:
+  # PostgreSQL 17 — metadata store
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: forge
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge -d forge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # versitygw — S3-compatible gateway backed by a local POSIX directory.
+  #
+  # CLI reference (discovered via `docker run --rm versity/versitygw --help`):
+  #   versitygw [global options] <backend-command> [backend options]
+  #   Global:  --port/-p <addr>  (default ":7070")
+  #            --access/-a <key>   (also ROOT_ACCESS_KEY_ID)
+  #            --secret/-s <key>   (also ROOT_SECRET_ACCESS_KEY)
+  #   Backend: posix <root-dir>
+  #
+  # The posix backend treats each subdirectory of <root-dir> as a bucket.
+  # versitygw does NOT auto-create the bucket directory — you must create it
+  # yourself before (or just after) startup:
+  #
+  #   docker compose exec s3 mkdir -p /data/forge
+  #
+  # Or with the AWS CLI against the endpoint:
+  #   AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  #     aws s3 mb s3://forge \
+  #     --endpoint-url http://localhost:7070 \
+  #     --region us-east-1
+  s3:
+    image: versity/versitygw:latest
+    command: ["--port", ":7070", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
+    ports:
+      - "7070:7070"
+    volumes:
+      - s3_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7070/ || true"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db_data:
+  s3_data:

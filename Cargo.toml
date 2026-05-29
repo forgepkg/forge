@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/db",
+    "crates/storage",
+    "crates/cache",
+    "crates/core",
+    "crates/format-nuget",
+    "crates/server",
+    "crates/e2e",
+]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+
+# HTTP framework
+axum = { version = "0.8" }
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "chrono",
+    "uuid",
+] }
+
+# S3
+aws-sdk-s3 = { version = "1.85" }
+aws-config = { version = "1.8" }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# In-memory cache
+moka = { version = "0.12", features = ["future"] }
+
+# Redis (optional)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# Error handling
+anyhow = { version = "1" }
+thiserror = { version = "2" }
+
+# Tracing / logging
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
