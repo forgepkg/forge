@@ -1,7 +1,7 @@
 //! Data access for `blob_outbox` — the deferred S3-delete work queue.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
 use crate::model::BlobOutbox;
 
@@ -54,7 +54,13 @@ pub async fn claim_due(
 }
 
 /// Mark an outbox row as successfully processed.
-pub async fn mark_processed(pool: &PgPool, id: i64) -> sqlx::Result<()> {
+///
+/// Accepts any [`PgExecutor`] so it can be composed inside a caller's
+/// transaction (pass `&mut *tx`) or run against the bare pool.
+pub async fn mark_processed<'e, E>(executor: E, id: i64) -> sqlx::Result<()>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query!(
         r#"
         UPDATE blob_outbox
@@ -63,7 +69,7 @@ pub async fn mark_processed(pool: &PgPool, id: i64) -> sqlx::Result<()> {
         "#,
         id,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

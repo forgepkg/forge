@@ -25,6 +25,8 @@ use crate::s3::{BlobStore, S3Error};
 pub enum CasError {
     #[error("content exceeds max_bytes limit of {limit} bytes")]
     TooLarge { limit: u64 },
+    #[error("content size {size} bytes exceeds i64::MAX and cannot be stored")]
+    SizeOverflow { size: u64 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("s3 error: {0}")]
@@ -111,7 +113,7 @@ impl Cas {
             writer.finalize().await?
         };
 
-        let size_i64 = i64::try_from(size).unwrap_or(i64::MAX);
+        let size_i64 = i64::try_from(size).map_err(|_| CasError::SizeOverflow { size })?;
         let s3_key = Self::blob_key(&sha256);
 
         // Record the pending row (idempotent across concurrent ingests).

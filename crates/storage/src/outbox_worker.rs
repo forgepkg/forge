@@ -98,13 +98,14 @@ async fn process_row(
             // S3 delete is idempotent and runs OUTSIDE any DB transaction.
             store.delete(&row.s3_key).await?;
 
-            // Short tx: drop the blob row only if it is still unreferenced, then
-            // mark the outbox row processed.
+            // Short tx: drop the blob row only if it is still unreferenced AND
+            // mark the outbox row processed — both in the same transaction so a
+            // crash between the two is not possible.
             let mut tx = pool.begin().await?;
             forge_db::blob_dao::delete_if_unreferenced(&mut *tx, &row.sha256).await?;
+            forge_db::outbox_dao::mark_processed(&mut *tx, row.id).await?;
             tx.commit().await?;
 
-            forge_db::outbox_dao::mark_processed(pool, row.id).await?;
             Ok(true)
         }
     }
