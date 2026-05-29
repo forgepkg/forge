@@ -1,0 +1,242 @@
+//! Row models mirroring the `0001_init.sql` schema.
+//!
+//! Every struct derives [`sqlx::FromRow`] so it can be produced both by the
+//! compile-time `query_as!` macros and the runtime `query_as::<_, T>` API.
+//! Ids are plain `i64` (see [`crate::ids`] for the rationale).
+
+use chrono::{DateTime, Utc};
+use serde_json::Value as JsonValue;
+
+/// Kind of a repository. Stored as `text` with a CHECK constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoKind {
+    Hosted,
+    Proxy,
+    Group,
+}
+
+impl RepoKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoKind::Hosted => "hosted",
+            RepoKind::Proxy => "proxy",
+            RepoKind::Group => "group",
+        }
+    }
+}
+
+impl From<&str> for RepoKind {
+    fn from(s: &str) -> Self {
+        match s {
+            "hosted" => RepoKind::Hosted,
+            "proxy" => RepoKind::Proxy,
+            "group" => RepoKind::Group,
+            other => panic!("invalid repository.kind value in database: {other:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for RepoKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle state of a blob. Stored as `text` with a CHECK constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobState {
+    Pending,
+    Committed,
+}
+
+impl BlobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlobState::Pending => "pending",
+            BlobState::Committed => "committed",
+        }
+    }
+}
+
+impl From<&str> for BlobState {
+    fn from(s: &str) -> Self {
+        match s {
+            "pending" => BlobState::Pending,
+            "committed" => BlobState::Committed,
+            other => panic!("invalid blob.state value in database: {other:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for BlobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A row of `repository`.
+///
+/// `kind` and `format` are kept as the raw `text` from the DB; use
+/// [`Repository::kind`] for the parsed [`RepoKind`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Repository {
+    pub id: i64,
+    pub name: String,
+    pub format: String,
+    pub kind: String,
+    pub anonymous_read: bool,
+    pub online: bool,
+    pub config: JsonValue,
+    pub remote_url: Option<String>,
+    pub package_delay_seconds: i32,
+    pub upstream_username: Option<String>,
+    pub upstream_password: Option<String>,
+    pub allow_private_upstream: bool,
+    pub metadata_ttl_seconds: Option<i32>,
+    pub not_found_ttl_seconds: Option<i32>,
+    pub allow_redeploy: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Repository {
+    /// Parsed repository kind.
+    pub fn kind(&self) -> RepoKind {
+        RepoKind::from(self.kind.as_str())
+    }
+}
+
+/// A row of `group_member`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GroupMember {
+    pub group_id: i64,
+    pub member_id: i64,
+    pub priority: i32,
+}
+
+/// A row of `blob`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Blob {
+    pub sha256: String,
+    pub size: i64,
+    pub s3_key: String,
+    pub ref_count: i64,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Blob {
+    /// Parsed blob state.
+    pub fn state(&self) -> BlobState {
+        BlobState::from(self.state.as_str())
+    }
+}
+
+/// A row of `blob_outbox`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BlobOutbox {
+    pub id: i64,
+    pub op: String,
+    pub sha256: String,
+    pub s3_key: String,
+    pub available_at: DateTime<Utc>,
+    pub attempts: i32,
+    pub locked_until: Option<DateTime<Utc>>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A row of `component`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Component {
+    pub id: i64,
+    pub repository_id: i64,
+    pub name: String,
+    pub original_id: String,
+    pub version: String,
+    pub version_original: String,
+    pub listed: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A row of `asset`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Asset {
+    pub id: i64,
+    pub component_id: i64,
+    pub path: String,
+    pub content_type: String,
+    pub blob_sha256: String,
+    pub size: i64,
+    pub sha512_base64: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A row of `proxy_cached_version`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyCachedVersion {
+    pub id: i64,
+    pub repository_id: i64,
+    pub name: String,
+    pub version: String,
+    pub listed: bool,
+    pub first_seen_at: DateTime<Utc>,
+    pub downloaded: bool,
+    pub metadata_refreshed_at: Option<DateTime<Utc>>,
+    pub not_found: bool,
+    pub not_found_at: Option<DateTime<Utc>>,
+}
+
+/// A row of `proxy_upstream_index`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProxyUpstreamIndex {
+    pub repository_id: i64,
+    pub resources: JsonValue,
+    pub fetched_at: DateTime<Utc>,
+    pub etag: Option<String>,
+}
+
+/// A row of `app_user`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AppUser {
+    pub id: i64,
+    pub username: String,
+    pub password_hash: String,
+    pub is_admin: bool,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A row of `token`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Token {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub token_hash: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_kind_round_trip() {
+        for k in [RepoKind::Hosted, RepoKind::Proxy, RepoKind::Group] {
+            assert_eq!(RepoKind::from(k.as_str()), k);
+        }
+    }
+
+    #[test]
+    fn blob_state_round_trip() {
+        for s in [BlobState::Pending, BlobState::Committed] {
+            assert_eq!(BlobState::from(s.as_str()), s);
+        }
+    }
+}

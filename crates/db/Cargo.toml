@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sqlx = { workspace = true }
+sqlx = { workspace = true, features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sqlx = { workspace = true, features = ["json"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
