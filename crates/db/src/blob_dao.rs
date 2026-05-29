@@ -72,6 +72,9 @@ pub async fn commit_and_incref(
 ///
 /// Returns `true` if the ref count hit zero (and a delete was enqueued),
 /// `false` otherwise (nothing enqueued).
+///
+/// Note: `grace` is truncated to whole seconds before being passed to
+/// `make_interval`; sub-second precision is lost.
 pub async fn decref_and_maybe_enqueue_delete(
     tx: &mut Transaction<'_, Postgres>,
     sha256: &str,

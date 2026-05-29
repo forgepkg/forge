@@ -14,6 +14,9 @@ use crate::model::BlobOutbox;
 /// statement, giving a visibility lease beyond the transaction.
 ///
 /// Runs inside the caller's transaction so the row locks are held until commit.
+///
+/// Note: `lease` is truncated to whole seconds before being passed to
+/// `make_interval`; sub-second precision is lost.
 pub async fn claim_due(
     tx: &mut Transaction<'_, Postgres>,
     batch: i64,

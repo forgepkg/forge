@@ -69,8 +69,8 @@ CREATE TABLE blob_outbox (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
--- Worker claim query: pending rows (processed_at IS NULL) due to run.
-CREATE INDEX blob_outbox_claim_idx ON blob_outbox (processed_at, available_at);
+-- Worker claim query: only unprocessed rows, better selectivity than a full-table index.
+CREATE INDEX blob_outbox_claim_idx ON blob_outbox (available_at) WHERE processed_at IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- component

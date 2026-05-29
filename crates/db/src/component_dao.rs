@@ -16,7 +16,13 @@ pub struct NewComponent {
 }
 
 /// Insert a component, returning the persisted row.
-pub async fn insert_component(pool: &PgPool, new: NewComponent) -> sqlx::Result<Component> {
+///
+/// Accepts any [`PgExecutor`] (pool, `&mut Transaction`, etc.) so the insert
+/// can participate in the same transaction as `blob_dao::commit_and_incref`.
+pub async fn insert_component<'e, E>(executor: E, new: NewComponent) -> sqlx::Result<Component>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         Component,
         r#"
@@ -35,7 +41,7 @@ pub async fn insert_component(pool: &PgPool, new: NewComponent) -> sqlx::Result<
         new.version_original,
         new.listed,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 

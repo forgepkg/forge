@@ -12,6 +12,7 @@ use forge_db::component_dao::{self, NewComponent};
 use forge_db::locks::{advisory_key, with_advisory_xact_lock};
 use forge_db::model::{BlobState, RepoKind};
 use forge_db::outbox_dao;
+use forge_db::proxy_dao::{self, NewProxyCachedVersion};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao::{self, NewUser};
@@ -581,5 +582,200 @@ async fn advisory_xact_lock_provides_mutual_exclusion() {
         .execute(&mut *tx_c)
         .await
         .expect("C acquires after A released");
+    tx_c.commit().await.expect("commit c");
+}
+
+// ── proxy_dao ─────────────────────────────────────────────────────────────────
+
+/// Helper: insert a proxy repository and return its id.
+async fn proxy_repo(pool: &sqlx::PgPool, suffix: u64) -> i64 {
+    repository_dao::insert_repository(pool, NewRepository::proxy(format!("proxy-repo-{suffix}")))
+        .await
+        .expect("proxy repo")
+        .id
+}
+
+#[tokio::test]
+async fn proxy_upsert_cached_version_insert_then_conflict_is_noop() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+
+    let new = NewProxyCachedVersion {
+        repository_id: repo_id,
+        name: format!("pkg-{n}"),
+        version: "1.0.0".to_string(),
+        listed: true,
+        downloaded: false,
+        not_found: false,
+    };
+
+    // First insert: returns true (row created).
+    let inserted = proxy_dao::upsert_cached_version(pool, new.clone())
+        .await
+        .expect("first upsert");
+    assert!(inserted, "first upsert must return true");
+
+    // Second insert with same (repo, name, version): ON CONFLICT DO NOTHING.
+    let conflict = proxy_dao::upsert_cached_version(pool, new)
+        .await
+        .expect("second upsert");
+    assert!(!conflict, "ON CONFLICT DO NOTHING must return false");
+}
+
+#[tokio::test]
+async fn proxy_get_cached_version_returns_inserted_row() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+    let name = format!("pkg-get-{n}");
+
+    proxy_dao::upsert_cached_version(
+        pool,
+        NewProxyCachedVersion {
+            repository_id: repo_id,
+            name: name.clone(),
+            version: "2.0.0".to_string(),
+            listed: false,
+            downloaded: true,
+            not_found: false,
+        },
+    )
+    .await
+    .expect("upsert");
+
+    let row = proxy_dao::get_cached_version(pool, repo_id, &name, "2.0.0")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(row.repository_id, repo_id);
+    assert_eq!(row.name, name);
+    assert_eq!(row.version, "2.0.0");
+    assert!(!row.listed);
+    assert!(row.downloaded);
+    assert!(!row.not_found);
+
+    // Missing version returns None.
+    let missing = proxy_dao::get_cached_version(pool, repo_id, &name, "9.9.9")
+        .await
+        .expect("get missing");
+    assert!(missing.is_none());
+}
+
+#[tokio::test]
+async fn proxy_set_upstream_index_insert_then_upsert_updates_resources() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+
+    let v1 = serde_json::json!([{"@id": "https://example.com/v1/", "@type": "SearchQueryService"}]);
+    let first = proxy_dao::set_upstream_index(pool, repo_id, v1.clone(), Some("etag-1"))
+        .await
+        .expect("insert");
+    assert_eq!(first.repository_id, repo_id);
+    assert_eq!(first.resources, v1);
+    assert_eq!(first.etag.as_deref(), Some("etag-1"));
+
+    // Upsert with updated resources and etag.
+    let v2 = serde_json::json!([{"@id": "https://example.com/v2/", "@type": "SearchQueryService"}]);
+    let second = proxy_dao::set_upstream_index(pool, repo_id, v2.clone(), Some("etag-2"))
+        .await
+        .expect("upsert");
+    assert_eq!(second.resources, v2);
+    assert_eq!(second.etag.as_deref(), Some("etag-2"));
+}
+
+#[tokio::test]
+async fn proxy_get_upstream_index_returns_latest() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+
+    // Not yet set.
+    let missing = proxy_dao::get_upstream_index(pool, repo_id)
+        .await
+        .expect("get missing");
+    assert!(missing.is_none());
+
+    let resources =
+        serde_json::json!([{"@id": "https://example.com/", "@type": "RegistrationsBaseUrl"}]);
+    proxy_dao::set_upstream_index(pool, repo_id, resources.clone(), None)
+        .await
+        .expect("set");
+
+    let fetched = proxy_dao::get_upstream_index(pool, repo_id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(fetched.repository_id, repo_id);
+    assert_eq!(fetched.resources, resources);
+    assert!(fetched.etag.is_none());
+}
+
+#[tokio::test]
+async fn proxy_lock_cached_version_for_update_blocks_concurrent_tx() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+    let name = format!("pkg-lock-{n}");
+    let version = "1.0.0".to_string();
+
+    // Seed the row.
+    proxy_dao::upsert_cached_version(
+        pool,
+        NewProxyCachedVersion {
+            repository_id: repo_id,
+            name: name.clone(),
+            version: version.clone(),
+            listed: true,
+            downloaded: false,
+            not_found: false,
+        },
+    )
+    .await
+    .expect("seed");
+
+    // Transaction A locks the row.
+    let mut tx_a = pool.begin().await.expect("begin a");
+    let locked = proxy_dao::lock_cached_version_for_update(&mut tx_a, repo_id, &name, &version)
+        .await
+        .expect("lock a")
+        .expect("row present");
+    assert_eq!(locked.version, version);
+
+    // Transaction B tries to lock the same row with a statement timeout; it
+    // must block (and time out) because A still holds the FOR UPDATE lock.
+    let mut tx_b = pool.begin().await.expect("begin b");
+    sqlx::query("SET LOCAL statement_timeout = '500ms'")
+        .execute(&mut *tx_b)
+        .await
+        .expect("set timeout b");
+    let blocked =
+        proxy_dao::lock_cached_version_for_update(&mut tx_b, repo_id, &name, &version).await;
+    assert!(
+        blocked.is_err(),
+        "second locker must block (and time out) while A holds FOR UPDATE"
+    );
+    let _ = tx_b.rollback().await;
+
+    // A releases by committing; row is now free.
+    tx_a.commit().await.expect("commit a");
+
+    // Transaction C can now lock the row without timing out.
+    let mut tx_c = pool.begin().await.expect("begin c");
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *tx_c)
+        .await
+        .expect("set timeout c");
+    let re_locked = proxy_dao::lock_cached_version_for_update(&mut tx_c, repo_id, &name, &version)
+        .await
+        .expect("lock c")
+        .expect("row present c");
+    assert_eq!(re_locked.version, version);
     tx_c.commit().await.expect("commit c");
 }

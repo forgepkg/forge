@@ -1,6 +1,6 @@
 //! Data access for `asset`.
 
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use crate::model::Asset;
 
@@ -16,7 +16,13 @@ pub struct NewAsset {
 }
 
 /// Insert an asset, returning the persisted row.
-pub async fn insert_asset(pool: &PgPool, new: NewAsset) -> sqlx::Result<Asset> {
+///
+/// Accepts any [`PgExecutor`] (pool, `&mut Transaction`, etc.) so the insert
+/// can participate in the same transaction as `blob_dao::commit_and_incref`.
+pub async fn insert_asset<'e, E>(executor: E, new: NewAsset) -> sqlx::Result<Asset>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         Asset,
         r#"
@@ -35,7 +41,7 @@ pub async fn insert_asset(pool: &PgPool, new: NewAsset) -> sqlx::Result<Asset> {
         new.size,
         new.sha512_base64,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 

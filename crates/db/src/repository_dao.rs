@@ -54,6 +54,14 @@ impl NewRepository {
             ..Self::hosted(name)
         }
     }
+
+    /// Convenience constructor for a proxy repository with default options.
+    pub fn proxy(name: impl Into<String>) -> Self {
+        Self {
+            kind: "proxy".to_string(),
+            ..Self::hosted(name)
+        }
+    }
 }
 
 /// Insert a repository, returning the full persisted row.
