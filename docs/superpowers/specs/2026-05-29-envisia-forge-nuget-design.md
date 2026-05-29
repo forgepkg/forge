@@ -1,8 +1,12 @@
 # envisia-forge — NuGet-capable package registry (Slice 1 design)
 
 **Date:** 2026-05-29
-**Status:** Approved (pending spec review)
+**Status:** Approved (revised after adversarial review)
 **Product name:** `envisia-forge`
+
+> Revision note: this spec was reviewed adversarially by `codex`; 26 findings
+> were reconciled. The protocol, CAS, proxy, group, and auth sections below
+> reflect that pass. Appendix A pins the concrete NuGet V3 JSON shapes.
 
 ## 1. Context & goal
 
@@ -22,15 +26,14 @@ model. Everything else is explicitly deferred (Section 12) with a per-item plan.
 - **S3 as the file backend.** Local dev and e2e use [versitygw](https://github.com/versity/versitygw)
   (S3 gateway over a POSIX filesystem). Production points at real S3.
 - **PostgreSQL** for all metadata.
-- **Performance matters.** Streaming I/O, content-addressable dedup, minimal
-  copies.
+- **Performance matters.** Streaming I/O, content-addressable dedup, minimal copies.
 - Unit tests **and** e2e tests.
 
 ### Stack (decided)
 
 axum + tokio (HTTP), sqlx with compile-time-checked queries (Postgres),
 aws-sdk-s3 (S3 client, pointed at versitygw locally), sha256 content-addressable
-blobs, argon2id password hashing.
+blobs, argon2id password hashing, reqwest (proxy upstream client).
 
 ### Process
 
@@ -42,8 +45,8 @@ implementation.
 
 Cargo workspace. The hosted/proxy/group orchestration lives in `core` behind a
 minimal `Format` seam; NuGet is the only `Format` implementation in this slice.
-The seam exists so format #2 is cheap and so the DB schema is designed correctly
-up front — but it is kept minimal (no speculative generality).
+The seam exists so format #2 is cheap and the DB schema is designed correctly up
+front — but it is kept minimal (no speculative generality).
 
 ```
 repo/
@@ -61,305 +64,446 @@ repo/
 
 ### The `Format` seam (minimal)
 
+The artifact parser reads from a **seekable temp file** (a `.nupkg` is a zip; its
+central directory is at the end, so streaming-only parsing is impossible and we
+must not buffer the whole package in memory). The CAS write produces that temp
+file as a side effect of hashing (§4), so parsing reuses it.
+
 ```rust
 // crates/core — illustrative, not final
 trait Format {
-    fn id(&self) -> &'static str;                 // "nuget"
-    // Parse an uploaded artifact into component identity + assets + derived metadata.
-    fn parse_upload(&self, bytes: &[u8]) -> Result<ParsedUpload, FormatError>;
-    // Map a logical asset request to a stored asset path / content type.
-    // Protocol HTTP routes themselves live in the format crate and are mounted by `server`.
+    fn id(&self) -> &'static str;                       // "nuget"
+    /// Parse an uploaded artifact (from a seekable file) into component
+    /// identity + assets + derived metadata. Bounded reads; no full-buffer.
+    fn parse_upload(&self, file: &mut (impl Read + Seek)) -> Result<ParsedUpload, FormatError>;
 }
 ```
 
 Routes are NuGet-specific and provided by `format-nuget` as an axum `Router`
-that `server` mounts under `/v3/{repo}`. `core` exposes format-agnostic
-operations the routes call: `resolve_versions`, `resolve_asset`,
-`store_upload`, `delete_component`, plus the proxy/group resolution logic.
+mounted by `server` under `/v3/{repo}`. `core` exposes format-agnostic
+operations the routes call: `resolve_versions`, `resolve_asset`, `store_upload`,
+`delete_component`, plus the proxy/group resolution logic.
 
 ## 3. Data model (PostgreSQL)
 
-All tables use `bigint` generated identity PKs unless noted; timestamps are
-`timestamptz`.
+`bigint` generated identity PKs unless noted; timestamps are `timestamptz`.
 
 - **`repository`**
   - `id`, `name` (unique, url-safe slug), `format` (`nuget`), `kind`
     (`hosted` | `proxy` | `group`), `anonymous_read bool not null default false`,
     `online bool not null default true`, `config jsonb not null`,
     `created_at`, `updated_at`.
-  - `config` (proxy): `remote_url`, `package_delay_seconds int`,
-    `upstream_username`, `upstream_password` (basic auth; nullable),
-    `metadata_ttl_seconds`, `not_found_ttl_seconds`.
-  - `config` (group): empty (members live in `group_member`).
-  - `config` (hosted): `allow_redeploy bool` (default false ⇒ 409 on duplicate).
+  - proxy also has dedicated columns (not in `config`, so they can be redacted
+    and later encrypted): `remote_url text`, `package_delay_seconds int not null
+    default 0`, `upstream_username text`, `upstream_password text` (redacted from
+    all API responses — §5), `metadata_ttl_seconds int`, `not_found_ttl_seconds int`.
+  - hosted `config`: `allow_redeploy bool` (default false ⇒ 409 on duplicate).
 - **`group_member`**: `group_id` (FK→repository), `member_id` (FK→repository),
-  `priority int not null`. PK `(group_id, member_id)`. **Higher `priority`
-  wins** when the same package id+version exists in multiple visible members.
+  `priority int not null`. PK `(group_id, member_id)`; **unique `(group_id,
+  priority)`** so resolution is deterministic. **Higher `priority` wins** ties.
+  Slice 1: `member_id` must reference a `hosted` or `proxy` repo — **nested
+  groups are rejected** at config time (cycle-free by construction; nesting
+  deferred to §12.4-adjacent work).
 - **`component`**: `id`, `repository_id` (FK), `name` (lowercased NuGet id),
-  `original_id` (original-case id), `version` (normalized, lowercased),
-  `version_original`, `listed bool not null default true`,
-  `first_seen_at timestamptz` (proxy delay clock), `created_at`, `updated_at`.
-  Unique `(repository_id, name, version)`. Index on `(repository_id, name)`.
+  `original_id`, `version` (normalized, lowercased), `version_original`,
+  `listed bool not null default true`, `created_at`, `updated_at`.
+  Unique `(repository_id, name, version)`. Index `(repository_id, name)`.
 - **`asset`**: `id`, `component_id` (FK), `path` (logical, e.g.
-  `<id>.<version>.nupkg`), `content_type`, `blob_sha256` (FK→blob), `size`,
-  `created_at`. A NuGet component has exactly one `.nupkg` asset; the `.nuspec`
-  is extracted on demand from the blob (or cached as a second asset — see §6).
-- **`blob`**: `sha256` (PK, text/bytea), `size bigint`, `s3_key text`,
-  `ref_count bigint not null default 0`, `created_at`. Identical bytes are
-  stored once; dedup keyed on `sha256`.
+  `<id>.<version>.nupkg`), `content_type`, `blob_sha256` (FK→blob),
+  `size bigint`, `sha512_base64 text` (NuGet `packageHash`, computed on ingest
+  for the primary `.nupkg` asset), `created_at`. A NuGet component has one
+  `.nupkg` asset; the `.nuspec` is extracted on demand and may be cached as a
+  second derived asset (its own blob; dedup applies).
+- **`blob`**: `sha256` (PK), `size bigint`, `s3_key text`, `ref_count bigint not
+  null default 0`, `state text` (`pending` | `committed`), `created_at`.
+  Identical bytes stored once.
+- **`proxy_cached_version`**: proxy metadata cache distinct from `component`
+  (versions are *discovered* from upstream before any download). Columns:
+  `id`, `repository_id` (FK, proxy), `name`, `version`, `listed bool`,
+  `first_seen_at timestamptz not null` (package-delay clock), `downloaded bool
+  not null default false`, `metadata_refreshed_at`, `not_found bool` +
+  `not_found_at` (negative cache). Unique `(repository_id, name, version)`.
 - **`app_user`**: `id`, `username` (unique), `password_hash` (argon2id),
-  `active bool`, `created_at`, `updated_at`. (`user` is reserved in Postgres ⇒
-  table named `app_user`.)
-- **`token`**: `id`, `user_id` (FK), `name`, `token_hash` (sha256 of the random
-  secret; the plaintext is shown once at creation), `last_used_at`,
-  `created_at`. Used both as the NuGet API key (`X-NuGet-ApiKey`, push) and as
-  the basic-auth password (restore).
+  `is_admin bool not null default false`, `active bool`, `created_at`,
+  `updated_at`. (`user` is reserved in Postgres ⇒ `app_user`.)
+- **`token`**: `id`, `user_id` (FK), `name`, `token_hash` (sha256 of a 256-bit
+  random secret; **unique index**), `expires_at timestamptz null`,
+  `revoked_at timestamptz null`, `last_used_at`, `created_at`. Plaintext shown
+  once at creation. Compared in constant time.
 
 ## 4. Content-addressable storage layer (`storage`)
 
-- aws-sdk-s3 client. Endpoint/credentials configurable ⇒ versitygw locally,
-  real S3 in prod. Force path-style addressing for versitygw.
-- **Blob key layout:** `blobs/sha256/<aa>/<bb>/<full-hash>` (fan-out by first
-  two byte-pairs to avoid hot prefixes).
-- **Write path (streaming, single hashing pass):**
-  1. Stream the incoming body to a temp file, computing sha256 incrementally.
-  2. `HEAD` the content key. If present ⇒ dedup: bump `ref_count` in Postgres,
-     discard temp, return `(sha256, size)`.
-  3. Else `PUT` (multipart upload for bodies over a threshold, e.g. 8 MiB),
-     then insert/`ref_count`-bump the `blob` row.
-  - Blob insert and `ref_count` changes happen in the **same DB transaction** as
-    the owning `asset` insert/delete, so counts never drift.
-- **Read path:** `GET` by content key, stream to the HTTP response.
-- **GC:** not in this slice. `ref_count` is maintained now; the retention slice
-  adds the sweeper that deletes `ref_count == 0` blobs from S3. (See §12.)
+- aws-sdk-s3 client; endpoint/credentials/region/path-style configurable ⇒
+  versitygw locally (force path-style), real S3 in prod.
+- **Blob key layout:** `blobs/sha256/<aa>/<bb>/<full-hash>` (prefix fan-out).
+- **Write path (streaming, single hashing pass, race- and crash-safe):**
+  1. Stream the body to a temp file, computing sha256 incrementally; also
+     compute SHA512 for the NuGet `packageHash` in the same pass.
+  2. Upsert a `blob` row `state='pending'` via `INSERT … ON CONFLICT (sha256)
+     DO NOTHING`. If it already exists `committed`, treat as dedup hit.
+  3. `HEAD` the content key; if absent, `PUT` (multipart above
+     `multipart_threshold`, e.g. 8 MiB). Idempotent — re-PUT of identical
+     content is harmless.
+  4. In **one DB transaction**: set the `blob` row `state='committed'`, insert
+     the owning `asset`, and `UPDATE blob SET ref_count = ref_count + 1`. The
+     refcount change is atomic and always in the asset's transaction, so counts
+     never drift.
+  5. The temp file (already hashed) is handed to `Format::parse_upload`.
+- **Crash/orphan safety:** if the process dies between PUT and commit, the S3
+  object exists but the `blob` stays `pending` with `ref_count = 0`. A
+  **slice-1 orphan sweeper** (periodic task) deletes S3 objects whose `blob` is
+  `pending` and older than a grace period, and `pending`/`committed` blobs with
+  `ref_count = 0` older than the grace period. This is the minimal GC needed for
+  correctness; policy-driven retention GC is §12.1.
+- **Read path:** `GET` by content key, stream to the HTTP response. `HEAD`
+  supported (returns size/hash headers, no body).
+- **Delete:** decrement `ref_count` in the asset-delete transaction; the sweeper
+  reclaims at zero.
 
 ## 5. Authentication & authorization
 
-Deliberately coarse in Slice 1. Fine-grained RBAC and OIDC are deferred (§12).
+Deliberately coarse in Slice 1 (no per-user RBAC). OIDC and credential
+forwarding are deferred (§12).
 
 ### Principal extraction (axum middleware)
 
-Resolve, in order:
-1. **`X-NuGet-ApiKey: <token>`** ⇒ look up `token` by hash ⇒ `User`.
-2. **HTTP Basic** `username:secret` where `secret` is the password **or** a
-   token ⇒ `User`.
-3. Otherwise **anonymous** per the configured anonymous mode (below).
-4. Otherwise unauthenticated (no principal).
+1. **`X-NuGet-ApiKey: <token>`** → token lookup (hash, constant-time) → `User`.
+2. **HTTP Basic** `username:secret`: `secret` is matched as a **token** first,
+   then (if `auth.allow_password_basic = true`) as the user password. NuGet
+   clients are expected to use tokens; password-basic defaults **off** for repo
+   endpoints and is intended for the admin API.
+3. If an auth header (Basic or `X-NuGet-ApiKey`) is **present but invalid** →
+   **401**. Never silently downgrade bad credentials to anonymous.
+4. No auth header → anonymous per `anonymous_mode` (below), else unauthenticated.
 
-`last_used_at` on tokens is updated best-effort.
+`last_used_at` updated best-effort. Tokens past `expires_at`/`revoked_at` are
+rejected.
 
-### Anonymous modes (global config: `anonymous_mode`)
+### Anonymous modes (global `auth.anonymous_mode`)
 
-- **`off`** — no anonymous access. Unauthenticated requests to protected repos → 401.
-- **`allowlist`** — an unauthenticated request from a client IP in
-  `anonymous_ip_allowlist` becomes `Anonymous(ip)`. The literal `"local"` entry
-  expands to `127.0.0.0/8, ::1/128, 10.0.0.0/8, 172.16.0.0/12,
-  192.168.0.0/16, 169.254.0.0/16, fc00::/7, fe80::/10`.
+- **`off`** — no anonymous; unauthenticated → 401 on protected repos.
+- **`allowlist`** — unauthenticated request whose resolved client IP ∈
+  `auth.anonymous_ip_allowlist` becomes `Anonymous(ip)`. Tokens:
+  - `"loopback"` → `127.0.0.0/8, ::1/128`
+  - `"private"` → `10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, fc00::/7, fe80::/10`
+  - `"local"` → loopback **+** private. **Documented risk:** behind a reverse
+    proxy on RFC1918 space, `private`/`local` can effectively grant anonymous
+    access to anyone the proxy forwards. Use `loopback`, explicit CIDRs, and/or
+    correct `trusted_proxy_cidrs`. `off`/`loopback` are the safe defaults.
 - **`all`** — every unauthenticated request becomes `Anonymous` regardless of IP
   ("anonymous access for everything").
 
-Client IP is the socket peer unless the request arrives from a configured
-trusted proxy (`trusted_proxy_cidrs`), in which case the last untrusted hop in
-`X-Forwarded-For` is used.
+### Client IP resolution
+
+Client IP is the **socket peer** unless the peer ∈ `auth.trusted_proxy_cidrs`.
+When trusted, walk `X-Forwarded-For` **right-to-left**, dropping trusted hops,
+and take the first untrusted address. Malformed XFF → reject (treat as
+untrusted). Never trust XFF from an untrusted peer.
 
 ### Authorization (Slice 1)
 
-- **Read** a repository: allowed if principal is `User` (any authenticated user)
-  **or** (principal is `Anonymous` **and** `repository.anonymous_read = true`).
-- **Write** (push / delete / relist): requires `User`. Never anonymous. (No
-  per-user write permissions yet — any authenticated user may write to a hosted
-  repo. Fine-grained RBAC deferred.)
+- **Read** a repository: `User` (any authenticated user) **or** (`Anonymous`
+  **and** `repository.anonymous_read = true`).
+- **Write** (push/delete/relist): requires `User`. Never anonymous.
+- **Admin API** (repositories/users/tokens/members): requires `User` with
+  `is_admin = true`. A **bootstrap admin** is created on first run from
+  `auth.bootstrap_admin` config/env (username + password or pre-hashed); a
+  warning is logged until its password is changed.
 
 ### Identity-aware group resolution
 
-When resolving a group for principal `P`, the visible member set is
-`[m for m in members if can_read(P, m)]`, evaluated **before** package
-resolution. Consequence: an anonymous request to a group containing both
-anonymous and non-anonymous members only ever sees packages from the anonymous
-members. Authenticated users see all members.
+Resolving a group for principal `P`: visible members = `[m for m in members if
+can_read(P, m)]`, evaluated **before** package resolution. ⇒ an anonymous
+request to a mixed group only sees packages from `anonymous_read` members;
+authenticated users see all members.
 
 ## 6. NuGet V3 protocol surface
 
-All endpoints are scoped per repository under base `/v3/{repo}`. The service
-index advertises resource `@id`s that point back into the same `{repo}` base, so
-clients self-configure from one URL.
+Per repository under base `/v3/{repo}`. The service index advertises **absolute**
+resource `@id`s built from a configured `server.public_base_url` +
+`/v3/{repo}/...` so clients self-configure from one URL. Trailing slashes match
+NuGet conventions (Appendix A). `GET` resources also support `HEAD`.
 
-- **Service index:** `GET /v3/{repo}/index.json` →
-  `{ "version": "3.0.0", "resources": [...] }` advertising the resources below.
-- **Flat container** (`PackageBaseAddress/3.0.0`, drives restore):
-  - `GET /v3/{repo}/flat/{lower_id}/index.json` → `{ "versions": [..] }`
-    (normalized, lowercased; 404 if none).
-  - `GET /v3/{repo}/flat/{lower_id}/{lower_ver}/{lower_id}.{lower_ver}.nupkg` →
-    binary nupkg.
-  - `GET /v3/{repo}/flat/{lower_id}/{lower_ver}/{lower_id}.nuspec` → XML manifest.
-- **Registration** (`RegistrationsBaseUrl/3.6.0`, metadata + dependencies):
-  - `GET /v3/{repo}/registration/{lower_id}/index.json` → inlined registration
-    pages built from stored nuspecs (dependency groups, listed flag, etc.).
-- **Search** (`SearchQueryService/3.5.0`):
-  - `GET /v3/{repo}/query?q=&skip=&take=&prerelease=` → search results.
+- **Service index:** `GET /v3/{repo}/index.json` — advertises only the
+  resources the repo supports. **`PackagePublish` is advertised for `hosted`
+  repos only**; proxy/group advertise read resources only.
+- **Flat container** (`PackageBaseAddress/3.0.0`):
+  - `GET /flat/{lower_id}/index.json` → `{ "versions": [..] }` (normalized,
+    lowercased; 404 if none). Includes unlisted versions (per spec).
+  - `GET /flat/{lower_id}/{lower_ver}/{lower_id}.{lower_ver}.nupkg` → bytes.
+  - `GET /flat/{lower_id}/{lower_ver}/{lower_id}.nuspec` → XML.
+- **Registration** (`RegistrationsBaseUrl/3.6.0`): `GET
+  /registration/{lower_id}/index.json` — inlined pages with `catalogEntry`
+  (id, version, deps groups, `listed`, `packageHash` (SHA512 base64),
+  `packageContent` absolute URL). Exact JSON in Appendix A.
+- **Search** (`SearchQueryService/3.5.0`): `GET
+  /query?q=&skip=&take=&prerelease=&semVerLevel=` → `{ totalHits, data:[…] }`
+  with per-package `versions`, honoring `listed` and `prerelease` filtering.
+  Exact JSON in Appendix A.
 - **Publish** (`PackagePublish/2.0.0`, hosted only):
-  - `PUT /v3/{repo}/package` — `multipart/form-data`, first part = raw `.nupkg`;
-    `X-NuGet-ApiKey` header. 201/202 success, 400 invalid, 409 duplicate.
-  - `DELETE /v3/{repo}/package/{id}/{version}` — unlist (204 / 404).
-  - `POST /v3/{repo}/package/{id}/{version}` — relist (200 / 404).
+  - `PUT /package` — `multipart/form-data`, first part = raw `.nupkg`;
+    `X-NuGet-ApiKey`. 201/202 ok, 400 invalid, 409 duplicate (unless
+    `allow_redeploy`).
+  - `DELETE /package/{id}/{version}` — **unlist** (`listed=false`); the package
+    **remains downloadable by exact version** and present in flat-container
+    enumeration; it is hidden from search and "latest"/registration listed
+    views. 204 / 404. Hard delete is an admin-API operation, not this endpoint.
+  - `POST /package/{id}/{version}` — relist (200 / 404).
 
-ID lowercasing follows `System.String.ToLowerInvariant()`; versions are
-normalized per NuGet's version normalization rules (build metadata stripped).
+ID lowercasing follows `ToLowerInvariant()`; versions normalized per NuGet rules
+(build metadata stripped).
 
-The `.nuspec` is extracted from the `.nupkg` zip on first request and may be
-cached as a derived `asset` referencing its own blob (dedup applies).
+### Redeploy (`allow_redeploy = true`)
+
+`SELECT … FOR UPDATE` the component, replace the `.nupkg` asset (and derived
+nuspec) to point at the new blob, **decrement the old blob's `ref_count` and
+increment the new one's in the same transaction**. Idempotent re-push of
+identical bytes is a no-op (same sha256).
 
 ## 7. Repository behaviors
 
 ### Hosted
-- **Push:** parse the `.nupkg` (zip → locate `*.nuspec` → parse id/version/deps),
-  validate, store bytes via CAS, write `component` + `asset` (+ derived nuspec).
+- **Push:** CAS-store the bytes (§4) → parse the temp `.nupkg` (zip → `*.nuspec`
+  → id/version/deps) → write `component` + `.nupkg` asset (+ derived nuspec).
   Duplicate `(id, version)` → 409 unless `allow_redeploy`.
-- **Read:** serve all read resources from local data.
-- **Delete/relist:** flip `listed`; hard delete optional (config), decrementing
+- **Read:** served from local data.
+- **Delete/relist:** flip `listed`. Hard delete is admin-only and decrements
   `ref_count`.
 
 ### Proxy
-- **Read-through cache:** on a miss, fetch from `remote_url` via reqwest
-  (optional upstream HTTP Basic from config), store into CAS, create a
-  `component` with `first_seen_at = now`.
-- **Package delay:** a discovered version is only **enumerated/served** once
-  `now − first_seen_at ≥ package_delay_seconds`. The clock starts at the proxy's
-  **first sighting** of the version (open question 3 — confirmable to use the
-  upstream publish timestamp instead). Versions still inside the delay window are
-  hidden from flat-container/registration/search output and return 404 on direct
-  download.
-- **Caching TTLs:** positive metadata cached for `metadata_ttl_seconds`;
-  negative (404) cached for `not_found_ttl_seconds`. Downloaded `.nupkg` blobs
-  are immutable once cached. Respects the repo `online` flag (offline ⇒ serve
-  only cached).
+- **Upstream discovery:** `remote_url` is treated as an **upstream V3 service
+  index**; forge fetches it, resolves the upstream's `PackageBaseAddress` /
+  `RegistrationsBaseUrl` / search `@id`s, and caches them for
+  `metadata_ttl_seconds`. Defined timeouts; bounded redirects; redirects
+  re-validated by the SSRF guard.
+- **SSRF guard:** `remote_url` and every redirect target must be `http`/`https`
+  and, by default, must **not** resolve to loopback/link-local/private ranges
+  (overridable per-proxy `allow_private_upstream` for internal mirrors). DNS is
+  re-checked at connect time.
+- **Read-through cache + singleflight:** on a miss, take a Postgres **advisory
+  lock** keyed on `(repo, name, version)` (or `SELECT FOR UPDATE` on the
+  `proxy_cached_version` row) so concurrent requests fetch once. Fetch from
+  upstream (optional HTTP Basic from `upstream_username`/`password`), CAS-store,
+  mark `downloaded=true`, attach a `component` + asset.
+- **Package delay:** on metadata discovery, upsert `proxy_cached_version` with
+  `first_seen_at = now` **without serving**. A version is enumerated/served only
+  once `now − first_seen_at ≥ package_delay_seconds`. Inside the window it is
+  omitted from flat/registration/search and direct download returns 404.
+  Open question 3 settled: clock = **proxy's first sighting** (configurable to
+  use upstream publish timestamp later).
+- **Negative cache vs. delay:** delay-gated 404s are **never** written to the
+  not-found cache; they expire naturally at `first_seen_at + delay`. Genuine
+  upstream 404s use `not_found` + `not_found_at` with `not_found_ttl_seconds`.
+- **Offline:** `online=false` ⇒ serve only what is already cached.
 
 ### Group
-- Ordered members by `priority`. **Enumeration** = union of visible members'
-  versions. **Specific id+version download** = the **highest-priority** visible
-  member that has it serves it. Registration/search merge across visible
-  members, dedup by id+version with highest-priority winning. No writes.
+- Ordered visible members by `priority` (unique per group). **Enumeration** =
+  union of visible members' versions. **Specific id+version download** = the
+  **highest-priority** visible member that has it. Registration/search merge
+  across visible members, dedup by id+version, highest-priority wins. No writes;
+  no nested members (slice 1).
 
 ## 8. Configuration
 
-TOML file with environment-variable overrides (`FORGE_*`). Keys:
-`server.bind`, `database.url`, `s3.endpoint/region/bucket/access_key/secret_key/force_path_style`,
-`auth.anonymous_mode` (`off|allowlist|all`), `auth.anonymous_ip_allowlist`
-(list, supports `"local"`), `auth.trusted_proxy_cidrs`, blob `multipart_threshold`.
-
-Repositories, users, and tokens are managed via a **minimal admin REST API** in
-`server` (create/list/update repositories, members, users, tokens) and a
-seed-on-boot option for first-run bootstrap. The admin **UI** is a later slice.
+TOML + env overrides (`FORGE_*`). Keys: `server.bind`,
+`server.public_base_url`, `database.url`,
+`s3.{endpoint,region,bucket,access_key,secret_key,force_path_style,multipart_threshold}`,
+`auth.{anonymous_mode, anonymous_ip_allowlist, trusted_proxy_cidrs,
+allow_password_basic, bootstrap_admin}`. Repositories, members, users, and
+tokens are managed via the **admin REST API** (admin-only) in `server`, plus
+first-run bootstrap. Admin **UI** is a later slice.
 
 ## 9. Testing strategy
 
 ### Unit tests
-- NuGet version normalization + `ToLowerInvariant` id rules.
-- nuspec extraction + parsing from a `.nupkg` zip fixture.
-- Group priority resolution (union enumeration; highest-priority download winner).
-- Package-delay gating (inside vs. outside the window).
-- CAS sha256 hashing + dedup + refcount transitions.
-- Principal extraction and authz decisions (user/anon/unauth × read/write).
-- Anonymous IP allowlist matching, incl. `"local"` expansion and IPv6.
+- Version normalization + `ToLowerInvariant` id rules.
+- nuspec extraction + parsing from a `.nupkg` zip fixture (seekable).
+- Group priority resolution (union enumeration; highest-priority download
+  winner); rejection of nested-group config; tie determinism.
+- Package-delay gating (inside vs. outside the window); delay-404 not negatively
+  cached.
+- CAS sha256/sha512 hashing, dedup, refcount transitions, pending→committed,
+  orphan-sweeper selection.
+- Principal extraction: token, password-basic on/off, invalid-creds→401,
+  anonymous modes; admin vs non-admin authz.
+- IP allowlist matching incl. `loopback`/`private`/`local`, IPv6; XFF
+  right-to-left stripping with trusted/untrusted peers; malformed XFF rejection.
+- SSRF guard: scheme + private-range blocking, redirect re-validation.
 
-### E2E tests (`tests/`, testcontainers)
-Bring up Postgres + versitygw containers and an in-process axum server. Mock
-upstream NuGet feed served in-process for proxy scenarios.
-- Push to hosted, then restore via flat container; assert nupkg bytes round-trip.
-- Registration + search responses for a pushed package.
-- Proxy cache-on-demand: first request fetches from mock upstream and caches;
-  second request served locally.
-- Proxy package-delay: version hidden inside the window, visible after.
-- Group ordered resolution across two members with an overlapping version.
-- Anonymous mode `allowlist`: allowed IP reads an `anonymous_read` repo; denied
-  IP gets 401; non-anon repo denied to anonymous.
-- Mixed-anon group: anonymous principal sees only anon members' packages.
-- CAS dedup: same package pushed to two repos stores one blob (ref_count == 2).
-- **Optional** `dotnet restore`/`dotnet nuget push` smoke test, gated on the
+### E2E tests (`tests/`, testcontainers: Postgres + versitygw, in-process server)
+Mock upstream NuGet feed served in-process for proxy scenarios.
+- Push to hosted → restore via flat container; nupkg bytes round-trip;
+  registration + search responses; SHA512 `packageHash` matches.
+- Unlist: hidden from search but still downloadable by exact version; relist.
+- Proxy cache-on-demand (singleflight: concurrent first requests fetch once);
+  package-delay hidden→visible; genuine upstream 404 negative cache.
+- Group ordered resolution across two members with an overlapping version
+  (highest priority wins); union enumeration.
+- Anonymous modes `off`/`allowlist`/`all`; allowed vs denied IP; mixed-anon
+  group exposes only anon members.
+- CAS dedup: same package pushed to two repos ⇒ one blob, `ref_count == 2`;
+  orphan sweeper reclaims a `pending` blob.
+- Admin API requires admin; bootstrap admin works.
+- SSRF: proxy `remote_url` to a private address is rejected by default.
+- **Optional** `dotnet restore` / `dotnet nuget push` smoke test, gated on the
   dotnet SDK being present on the runner.
 
 ## 10. Performance notes
 
-- Stream everything; never buffer a whole nupkg in memory beyond the hashing
-  temp file. Multipart S3 upload above the threshold.
-- Dedup avoids re-storing identical blobs across repos/versions.
-- DB indexes on `(repository_id, name)` and `(repository_id, name, version)`.
-- Proxy metadata caching avoids hammering upstreams.
+Stream everything; single hashing pass yields both sha256 (CAS key) and SHA512
+(`packageHash`). Multipart S3 upload above threshold. Dedup avoids re-storing
+identical blobs. Indexes on `(repository_id, name)` and `(repository_id, name,
+version)`; `proxy_cached_version` unique key. Proxy metadata caching avoids
+hammering upstreams; singleflight avoids thundering-herd fetches.
 
-## 11. Open questions (to settle in spec review)
+## 11. Open questions — resolved
 
-1. **Product name** — `envisia-forge` confirmed.
-2. **Group priority direction** — **higher integer wins** (confirmed in design).
-3. **Package-delay clock origin** — proposal: proxy's **first sighting**.
-   Alternative: upstream publish timestamp when the remote exposes it. Default
-   to first-sighting unless overridden.
+1. **Product name** — `envisia-forge`.
+2. **Group priority direction** — higher integer wins; unique priority per group.
+3. **Package-delay clock** — proxy's first sighting (upstream-timestamp variant
+   deferred as a config option).
 
 ## 12. Deferred scope — with plans
 
-Each deferred item is its own future spec → plan → build cycle. Order below is
-the recommended sequencing.
+Each deferred item is its own future spec → plan → build cycle. Recommended
+sequencing below.
 
-### 12.1 Retention / cleanup + blob GC  *(recommended next slice)*
-- **What:** per-repository retention policies — "keep last N versions",
-  "keep for X days", "keep N most-recently-downloaded", and proxy
-  "evict cached not pulled in X days". Survey Nexus cleanup policies and
-  Artifactory retention for parity.
-- **Plan:** add `retention_policy jsonb` to `repository`; a background tokio task
-  (or external cron-invoked endpoint) evaluates policies, unlists/deletes
-  components, decrements `blob.ref_count`; a separate **blob GC sweeper** deletes
-  `ref_count == 0` blobs from S3 (with a grace period to avoid races with
-  in-flight uploads). Add `last_downloaded_at` tracking to `asset`/`component`.
-  Tests: policy evaluation unit tests; e2e that pushes >N versions and asserts
-  pruning + blob deletion.
+### 12.1 Retention / cleanup + policy-driven blob GC  *(recommended next slice)*
+- **What:** per-repository retention — "keep last N versions", "keep for X
+  days", "keep N most-recently-downloaded", proxy "evict cached not pulled in X
+  days". Parity survey vs. Nexus cleanup policies and Artifactory retention.
+- **Plan:** `retention_policy jsonb` on `repository`; background tokio evaluator
+  unlists/deletes components and decrements `ref_count`; the slice-1 orphan
+  sweeper (§4) is extended into the policy GC. Add `last_downloaded_at` to
+  `asset`/`component`. Tests: policy unit tests; e2e push >N versions → pruning +
+  blob deletion.
 
 ### 12.2 OIDC / Microsoft Entra authentication
-- **What:** OpenID Connect login (authorization-code + PKCE), primarily Entra.
-  Map OIDC identities to `app_user` (auto-provision option); issue session
-  cookies for the UI and let users mint repository tokens.
-- **Plan:** add `oidc` config (issuer, client id/secret, redirect, scopes);
-  `/auth/oidc/login` + `/auth/oidc/callback`; `external_identity` table linking
-  subject→`app_user`. Token minting endpoint already exists from Slice 1.
-  Tests: callback flow against a mock OIDC provider.
+- **What:** OIDC login (auth-code + PKCE), primarily Entra; map identities to
+  `app_user` (auto-provision option); session cookies for the UI; users mint
+  repository tokens (token endpoint already exists from slice 1).
+- **Plan:** `oidc` config (issuer, client id/secret, redirect, scopes);
+  `/auth/oidc/login` + `/callback`; `external_identity` table (subject→user).
+  Tests: callback against a mock OIDC provider.
 
 ### 12.3 Credential-forwarding authentication backend  *("authenticate against the registry")*
-- **What:** validate a login by forwarding the supplied username/password to a
-  configured upstream (e.g. an existing Nexus) via HTTP Basic — the pattern from
-  `github.com/schmitch/verdaccio-nexus-auth-proxy`. Distinct from a proxy repo's
-  own upstream credentials (which Slice 1 has). This is an **authentication
-  provider** for end-user logins.
-- **Plan:** pluggable auth-provider chain in `core` (local password provider +
-  upstream-basic provider + later OIDC). Config: provider order, upstream URL,
-  success criteria, auto-provision + caching of validated users. Tests: mock
-  upstream returning 200/401.
+- **What:** validate a login by forwarding username/password to a configured
+  upstream (e.g. existing Nexus) via HTTP Basic — the
+  `github.com/schmitch/verdaccio-nexus-auth-proxy` pattern. Distinct from a proxy
+  repo's own upstream credentials (slice 1 has those). This is an
+  **authentication provider** for end-user logins.
+- **Plan:** pluggable auth-provider chain in `core` (local password + upstream-
+  basic + later OIDC). Config: provider order, upstream URL, success criteria,
+  auto-provision + validated-user caching. Tests: mock upstream 200/401.
 
-### 12.4 Fine-grained RBAC / authorization
+### 12.4 Fine-grained RBAC / authorization (+ nested groups)
 - **What:** roles, per-repository read/write/admin privileges, content
-  selectors. Replaces Slice 1's "any authenticated user can read/write".
+  selectors; nested group membership with cycle detection. Replaces slice 1's
+  "any authenticated user can read/write" and the no-nesting limitation.
 - **Plan:** `role`, `privilege`, `user_role`, `repository_privilege` tables;
-  privilege checks in the existing authz layer (the authz seam from Slice 1 is
-  the extension point). Tests: matrix of principals × repos × actions.
+  checks in the slice-1 authz seam; group cycle detection. Tests: principal ×
+  repo × action matrix; nested-group resolution + cycle rejection.
 
-### 12.5 Frontend (admin + browse UI)
+### 12.5 Secret encryption at rest
+- **What:** proxy `upstream_password` and similar secrets are redacted from APIs
+  in slice 1 but stored plaintext in Postgres; encrypt them at rest.
+- **Plan:** envelope encryption with a configured KEK (env/KMS); transparent
+  encrypt/decrypt in the data-access layer; migration to wrap existing values.
+
+### 12.6 Frontend (admin + browse UI)
 - **What:** TanStack Start admin UI: manage repositories/members/users/tokens,
   browse/search packages, view download stats.
 - **Constraint:** the browser calls the **Rust HTTP API directly** — TanStack
-  Start serves UI/SSR only; **no Node→Rust API proxy**. CORS/static-serving
-  configured on the Rust side (the Rust server may also serve the built static
-  assets to keep a single origin).
-- **Plan:** its own brainstorming pass for IA and screens; reuse the admin REST
-  API from Slice 1, extended as needed.
+  Start serves UI/SSR only; **no Node→Rust API proxy**. The Rust server may also
+  serve the built static assets for a single origin; otherwise CORS is
+  configured on the Rust side.
+- **Plan:** its own brainstorming pass for IA/screens; reuse + extend the slice-1
+  admin REST API.
 
-### 12.6 Additional formats (npm, Maven, Cargo, …)
+### 12.7 Additional formats (npm, Maven, Cargo, …)
 - **What:** implement the `Format` seam for more ecosystems; npm modeled with
   reference to verdaccio.
-- **Plan:** each format is a new `format-*` crate implementing `Format` and
-  providing its protocol `Router`; the `core` hosted/proxy/group orchestration
-  and storage are reused unchanged. This is the payoff of Approach A.
+- **Plan:** each format is a new `format-*` crate implementing `Format` +
+  protocol `Router`; `core` orchestration and storage reused unchanged — the
+  payoff of Approach A.
 
 ## 13. Out-of-scope assumptions
 
-- Single-node deployment in Slice 1 (no clustering/HA). Stateless server +
-  shared Postgres + shared S3 means horizontal scaling is feasible later without
-  redesign, but it is not a Slice 1 goal or test target.
+- Single-node deployment in slice 1 (no clustering/HA). Stateless server +
+  shared Postgres + shared S3 keeps later horizontal scaling feasible without
+  redesign, but it is not a slice-1 goal or test target.
 - No mirroring/replication between forge instances.
 - No package signing/verification beyond what NuGet clients already do.
+
+## Appendix A — concrete NuGet V3 JSON shapes
+
+`{base}` = `server.public_base_url` + `/v3/{repo}`.
+
+### Service index (`GET {base}/index.json`)
+```json
+{
+  "version": "3.0.0",
+  "resources": [
+    { "@id": "{base}/query",                "@type": "SearchQueryService/3.5.0" },
+    { "@id": "{base}/registration/",        "@type": "RegistrationsBaseUrl/3.6.0" },
+    { "@id": "{base}/flat/",                "@type": "PackageBaseAddress/3.0.0" },
+    { "@id": "{base}/package",              "@type": "PackagePublish/2.0.0" }
+  ]
+}
+```
+`PackagePublish` entry present **only** for hosted repos. `@type` aliases may be
+duplicated (e.g. also advertise `SearchQueryService/3.0.0-rc`) for client
+compatibility.
+
+### Flat container versions (`GET {base}/flat/{lower_id}/index.json`)
+```json
+{ "versions": ["1.0.0", "1.1.0", "2.0.0-beta1"] }
+```
+
+### Registration index (`GET {base}/registration/{lower_id}/index.json`)
+Inlined single page (slice 1 always inlines):
+```json
+{
+  "count": 1,
+  "items": [{
+    "count": 2,
+    "lower": "1.0.0",
+    "upper": "2.0.0",
+    "items": [{
+      "catalogEntry": {
+        "id": "Sample.Lib",
+        "version": "1.0.0",
+        "listed": true,
+        "packageHash": "<base64 SHA512>",
+        "packageHashAlgorithm": "SHA512",
+        "packageContent": "{base}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg",
+        "dependencyGroups": [{
+          "targetFramework": "net8.0",
+          "dependencies": [
+            { "id": "Newtonsoft.Json", "range": "[13.0.1, )" }
+          ]
+        }]
+      },
+      "packageContent": "{base}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"
+    }]
+  }]
+}
+```
+
+### Search (`GET {base}/query?q=&skip=&take=&prerelease=&semVerLevel=2.0.0`)
+```json
+{
+  "totalHits": 1,
+  "data": [{
+    "id": "Sample.Lib",
+    "version": "2.0.0",
+    "description": "...",
+    "versions": [
+      { "version": "1.0.0", "downloads": 0,
+        "@id": "{base}/registration/sample.lib/1.0.0.json" },
+      { "version": "2.0.0", "downloads": 0,
+        "@id": "{base}/registration/sample.lib/2.0.0.json" }
+    ]
+  }]
+}
+```
