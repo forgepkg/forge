@@ -1489,6 +1489,30 @@ dependencies = [
 [[package]]
 name = "forge-e2e"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "chrono",
+ "figment",
+ "forge-cache",
+ "forge-core",
+ "forge-db",
+ "forge-nuget",
+ "forge-server",
+ "forge-storage",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
+ "zip",
+]
 
 [[package]]
 name = "forge-nuget"
