@@ -116,20 +116,28 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     };
 
-    // Build the per-repo router and dispatch the sub-path into it. We rewrite
-    // the request's URI to the `/v3/{repo}`-stripped remainder in place so the
-    // body, headers (Content-Type for multipart publish), and extensions are
-    // all preserved — only the path the sub-router matches on changes.
+    // Dispatch the `/v3/{repo}`-stripped sub-path into the per-repo router.
+    //
+    // We rebuild the request from its parts rather than mutating the URI in
+    // place: the outer router (`/v3/{repo}/{*rest}`) left its own matched path
+    // params (`repo`, `rest`) in the request extensions, and the inner router's
+    // `Path` extractors would otherwise read those stale params (causing a
+    // "wrong number of path arguments" 500). Dropping the extensions clears
+    // them. Method, headers (Content-Type / X-NuGet-ApiKey for publish), and
+    // the body are all carried over.
     let rest = subpath(&uri, &repo.name);
     let new_uri: Uri = match rest.parse() {
         Ok(u) => u,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
-    let mut req = req;
-    *req.uri_mut() = new_uri;
+
+    let (mut parts, body) = req.into_parts();
+    parts.uri = new_uri;
+    parts.extensions.clear();
+    let sub_req = Request::from_parts(parts, body);
 
     let router = nuget_router(repo.kind(), ctx);
-    match router.oneshot(req).await {
+    match router.oneshot(sub_req).await {
         Ok(resp) => resp,
         Err(infallible) => match infallible {},
     }

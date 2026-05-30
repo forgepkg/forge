@@ -29,7 +29,6 @@ use forge_core::repo::{CacheInvalidator, RepoError, RepoReadOps};
 use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
-use tokio::io::AsyncReadExt;
 
 use crate::config::Config;
 
@@ -164,18 +163,19 @@ pub struct BlobBytes {
 
 impl BlobBytes {
     async fn read_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        let stream = self
-            .store
-            .get(s3_key)
+        let stream = self.store.get(s3_key).await.map_err(|e| {
+            tracing::error!(error = %e, %s3_key, "s3 get failed");
+            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
+        })?;
+        let bytes = stream
+            .collect()
             .await
-            .map_err(|e| RepoError::Storage(format!("s3 get {s3_key}: {e}")))?;
-        let mut reader = stream.into_async_read();
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| RepoError::Storage(format!("read blob {s3_key}: {e}")))?;
-        Ok(buf)
+            .map_err(|e| {
+                tracing::error!(error = %e, %s3_key, "s3 body read failed");
+                RepoError::Storage(format!("read blob {s3_key}: {e}"))
+            })?
+            .into_bytes();
+        Ok(bytes.to_vec())
     }
 }
 

@@ -43,8 +43,10 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 forge-nuget = { path = "../format-nuget" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+serde_json = { workspace = true }
