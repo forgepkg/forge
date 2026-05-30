@@ -26,10 +26,10 @@ use forge_core::repo::{
     NupkgLocation, RepoError, RepoReadOps, SearchParams, NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH,
 };
 use forge_db::asset_dao::{self, NewAsset};
+use forge_db::blob_dao;
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::repository_dao::{self, NewRepository};
-use forge_db::blob_dao;
 use forge_nuget::NugetFormat;
 use sqlx::PgPool;
 
@@ -299,7 +299,12 @@ async fn mixed_anon_group_filters_by_principal() {
     // Anonymous: only the public member is visible.
     let g_anon = group_repo(&pool, blobs.clone(), anon());
     assert!(
-        g_anon.list_versions(&group.name, "pub").await.unwrap().len() == 1,
+        g_anon
+            .list_versions(&group.name, "pub")
+            .await
+            .unwrap()
+            .len()
+            == 1,
         "anon sees public member"
     );
     assert!(
@@ -319,7 +324,11 @@ async fn mixed_anon_group_filters_by_principal() {
     // Authenticated user: both members visible.
     let g_user = group_repo(&pool, blobs, user());
     assert_eq!(
-        g_user.list_versions(&group.name, "priv").await.unwrap().len(),
+        g_user
+            .list_versions(&group.name, "priv")
+            .await
+            .unwrap()
+            .len(),
         1,
         "user sees private member"
     );
@@ -352,7 +361,10 @@ async fn search_merges_and_dedups_highest_priority_wins() {
         .unwrap();
 
     let g = group_repo(&pool, blobs, user());
-    let res = g.search(&group.name, &SearchParams::default()).await.unwrap();
+    let res = g
+        .search(&group.name, &SearchParams::default())
+        .await
+        .unwrap();
     // Two distinct ids: Shared (from high) + OnlyLow (from low).
     assert_eq!(res.total_hits, 2);
     let shared = res
