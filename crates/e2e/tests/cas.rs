@@ -103,12 +103,20 @@ async fn dedup_refcount_2_to_1_to_0_with_outbox_delete() {
         .unwrap();
     assert_eq!(resp.status(), 204, "hard delete B");
 
-    // The worker (poll 1s, grace 0) removes the blob row and the S3 object.
+    // The worker (poll 1s, grace 0) removes the blob row + S3 object AND marks
+    // every outbox row processed. Poll all three together: the outbox finalize
+    // (set processed_at) happens in a short tx *after* the blob-row delete (A7),
+    // so `pending == 0` is the authoritative "fully drained" signal.
     let mut gone = false;
     for _ in 0..40 {
         let row = ref_count(&srv.pool, &sha).await;
         let s3_present = srv.state.blob_store.get(&s3_key).await.is_ok();
-        if row.is_none() && !s3_present {
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM blob_outbox WHERE processed_at IS NULL")
+                .fetch_one(&srv.pool)
+                .await
+                .unwrap();
+        if row.is_none() && !s3_present && pending == 0 {
             gone = true;
             break;
         }
@@ -116,16 +124,8 @@ async fn dedup_refcount_2_to_1_to_0_with_outbox_delete() {
     }
     assert!(
         gone,
-        "outbox worker must delete the S3 object and the blob row once ref_count hits 0"
+        "outbox worker must delete the S3 object + blob row and fully drain the outbox once ref_count hits 0"
     );
-
-    // No unprocessed outbox rows remain.
-    let pending: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM blob_outbox WHERE processed_at IS NULL")
-            .fetch_one(&srv.pool)
-            .await
-            .unwrap();
-    assert_eq!(pending, 0, "outbox fully drained");
 }
 
 /// The orphan reconciler reclaims a `pending` blob whose ingest transaction
