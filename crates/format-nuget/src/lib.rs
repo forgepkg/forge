@@ -1,1 +1,1 @@
-pub fn _stub() {}
+pub mod version;

@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+forge-core = { path = "../core" }
+
+thiserror = { workspace = true }
+base64 = { workspace = true }
+
+# ZIP archive reading (.nupkg is a zip); default features keep deflate support.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Namespace-insensitive XML parsing of the .nuspec manifest.
+quick-xml = { version = "0.40" }
+
+[dev-dependencies]
