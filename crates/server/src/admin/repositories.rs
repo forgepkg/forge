@@ -1,0 +1,378 @@
+//! Admin repository CRUD + package hard-delete (plan 10.4, A12).
+//!
+//! `upstream_password` is **write-only**: accepted on create/update, never
+//! returned (responses carry a [`RepoView`] with no password field). On update
+//! a `null`/absent password leaves the stored secret unchanged; a present value
+//! replaces it.
+//!
+//! `remote_url` on a proxy is **SSRF-validated** at create/update time
+//! (scheme + resolved-IP policy, honoring `allow_private_upstream`) so a bad
+//! upstream is rejected before any fetch.
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use forge_core::net::ssrf::{validate_url, SystemResolver};
+use forge_db::model::{RepoKind, Repository};
+use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
+use forge_db::{asset_dao, blob_dao, component_dao};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use super::db_error;
+use crate::state::AppState;
+
+/// Public, password-free view of a repository (REDACTED secrets).
+#[derive(Debug, Serialize)]
+pub struct RepoView {
+    pub id: i64,
+    pub name: String,
+    pub format: String,
+    pub kind: String,
+    pub anonymous_read: bool,
+    pub online: bool,
+    pub remote_url: Option<String>,
+    pub package_delay_seconds: i32,
+    pub upstream_username: Option<String>,
+    /// `true` when an `upstream_password` is stored; the value itself is never
+    /// returned.
+    pub has_upstream_password: bool,
+    pub allow_private_upstream: bool,
+    pub metadata_ttl_seconds: Option<i32>,
+    pub not_found_ttl_seconds: Option<i32>,
+    pub allow_redeploy: bool,
+}
+
+impl From<&Repository> for RepoView {
+    fn from(r: &Repository) -> Self {
+        RepoView {
+            id: r.id,
+            name: r.name.clone(),
+            format: r.format.clone(),
+            kind: r.kind.clone(),
+            anonymous_read: r.anonymous_read,
+            online: r.online,
+            remote_url: r.remote_url.clone(),
+            package_delay_seconds: r.package_delay_seconds,
+            upstream_username: r.upstream_username.clone(),
+            has_upstream_password: r.upstream_password.is_some(),
+            allow_private_upstream: r.allow_private_upstream,
+            metadata_ttl_seconds: r.metadata_ttl_seconds,
+            not_found_ttl_seconds: r.not_found_ttl_seconds,
+            allow_redeploy: r.allow_redeploy,
+        }
+    }
+}
+
+/// Create-repository request body.
+#[derive(Debug, Deserialize)]
+pub struct CreateRepo {
+    pub name: String,
+    /// `hosted` | `proxy` | `group`.
+    pub kind: String,
+    #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(default)]
+    pub anonymous_read: bool,
+    #[serde(default = "default_true")]
+    pub online: bool,
+    // Proxy fields:
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub package_delay_seconds: i32,
+    #[serde(default)]
+    pub upstream_username: Option<String>,
+    #[serde(default)]
+    pub upstream_password: Option<String>,
+    #[serde(default)]
+    pub allow_private_upstream: bool,
+    #[serde(default)]
+    pub metadata_ttl_seconds: Option<i32>,
+    #[serde(default)]
+    pub not_found_ttl_seconds: Option<i32>,
+    #[serde(default)]
+    pub allow_redeploy: bool,
+}
+
+/// Update-repository request body. Identity columns (`kind`, `format`) are not
+/// updatable. A present `upstream_password` replaces the stored one; an absent
+/// one leaves it unchanged.
+#[derive(Debug, Deserialize)]
+pub struct UpdateRepo {
+    pub name: Option<String>,
+    pub anonymous_read: Option<bool>,
+    pub online: Option<bool>,
+    pub remote_url: Option<String>,
+    pub package_delay_seconds: Option<i32>,
+    pub upstream_username: Option<String>,
+    pub upstream_password: Option<String>,
+    pub allow_private_upstream: Option<bool>,
+    pub metadata_ttl_seconds: Option<i32>,
+    pub not_found_ttl_seconds: Option<i32>,
+    pub allow_redeploy: Option<bool>,
+}
+
+fn default_format() -> String {
+    "nuget".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, msg.into()).into_response()
+}
+
+/// SSRF-validate a proxy `remote_url` against the privacy policy. `None` is OK
+/// at this layer (proxy-without-url is rejected separately).
+async fn validate_remote_url(url: &str, allow_private: bool) -> Result<(), Response> {
+    validate_url(url, allow_private, &SystemResolver)
+        .await
+        .map(|_| ())
+        .map_err(|e| bad_request(format!("invalid remote_url: {e}")))
+}
+
+/// `GET /admin/repositories`
+pub async fn list(State(state): State<AppState>) -> Response {
+    match repository_dao::list_repositories(&state.pool).await {
+        Ok(repos) => {
+            let views: Vec<RepoView> = repos.iter().map(RepoView::from).collect();
+            Json(views).into_response()
+        }
+        Err(e) => db_error(e),
+    }
+}
+
+/// `GET /admin/repositories/{name}`
+pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    match repository_dao::find_repository_by_name(&state.pool, &name).await {
+        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `POST /admin/repositories`
+pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>) -> Response {
+    let kind = match body.kind.as_str() {
+        "hosted" | "proxy" | "group" => body.kind.clone(),
+        other => return bad_request(format!("invalid kind {other:?}")),
+    };
+    let parsed_kind = RepoKind::from(kind.as_str());
+
+    // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
+    if parsed_kind == RepoKind::Proxy {
+        let Some(url) = body.remote_url.as_deref() else {
+            return bad_request("proxy repository requires remote_url");
+        };
+        if let Err(resp) = validate_remote_url(url, body.allow_private_upstream).await {
+            return resp;
+        }
+    } else if body.remote_url.is_some() {
+        return bad_request("remote_url is only valid for proxy repositories");
+    }
+
+    let new = NewRepository {
+        name: body.name.clone(),
+        format: body.format.clone(),
+        kind: kind.clone(),
+        anonymous_read: body.anonymous_read,
+        online: body.online,
+        config: json!({}),
+        remote_url: body.remote_url.clone(),
+        package_delay_seconds: body.package_delay_seconds,
+        upstream_username: body.upstream_username.clone(),
+        upstream_password: body.upstream_password.clone(),
+        allow_private_upstream: body.allow_private_upstream,
+        metadata_ttl_seconds: body.metadata_ttl_seconds,
+        not_found_ttl_seconds: body.not_found_ttl_seconds,
+        allow_redeploy: body.allow_redeploy,
+    };
+
+    match repository_dao::insert_repository(&state.pool, new).await {
+        Ok(r) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+        Err(e) if is_unique_violation(&e) => {
+            (StatusCode::CONFLICT, "repository name already exists").into_response()
+        }
+        Err(e) => db_error(e),
+    }
+}
+
+/// `PUT /admin/repositories/{name}`
+pub async fn update(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdateRepo>,
+) -> Response {
+    let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+
+    // Merge: each absent field keeps the existing value. `upstream_password`
+    // absent ⇒ keep stored secret; present ⇒ replace.
+    let allow_private = body
+        .allow_private_upstream
+        .unwrap_or(existing.allow_private_upstream);
+    let remote_url = match &body.remote_url {
+        Some(u) => Some(u.clone()),
+        None => existing.remote_url.clone(),
+    };
+
+    // Re-validate the remote_url for proxies whenever url or privacy changed.
+    if existing.kind() == RepoKind::Proxy {
+        if let Some(url) = remote_url.as_deref() {
+            if body.remote_url.is_some() || body.allow_private_upstream.is_some() {
+                if let Err(resp) = validate_remote_url(url, allow_private).await {
+                    return resp;
+                }
+            }
+        }
+    }
+
+    let upd = RepositoryUpdate {
+        name: body.name.clone().unwrap_or(existing.name.clone()),
+        anonymous_read: body.anonymous_read.unwrap_or(existing.anonymous_read),
+        online: body.online.unwrap_or(existing.online),
+        config: existing.config.clone(),
+        remote_url,
+        package_delay_seconds: body
+            .package_delay_seconds
+            .unwrap_or(existing.package_delay_seconds),
+        upstream_username: match &body.upstream_username {
+            Some(u) => Some(u.clone()),
+            None => existing.upstream_username.clone(),
+        },
+        upstream_password: match &body.upstream_password {
+            Some(p) => Some(p.clone()),
+            None => existing.upstream_password.clone(),
+        },
+        allow_private_upstream: allow_private,
+        metadata_ttl_seconds: body.metadata_ttl_seconds.or(existing.metadata_ttl_seconds),
+        not_found_ttl_seconds: body
+            .not_found_ttl_seconds
+            .or(existing.not_found_ttl_seconds),
+        allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
+    };
+
+    match repository_dao::update_repository(&state.pool, existing.id, upd).await {
+        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) if is_unique_violation(&e) => {
+            (StatusCode::CONFLICT, "repository name already exists").into_response()
+        }
+        Err(e) => db_error(e),
+    }
+}
+
+/// `DELETE /admin/repositories/{name}`
+///
+/// Refuses to delete a repository that still has components — the admin must
+/// hard-delete its packages first so blob ref-counts are correctly decremented
+/// and S3 objects reclaimed (a raw cascade would orphan blob references).
+pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+
+    // Hosted repos may still own components; require them gone first.
+    if existing.kind() == RepoKind::Hosted {
+        match component_dao::list_components_for_repo(&state.pool, existing.id).await {
+            Ok(comps) if !comps.is_empty() => {
+                return (
+                    StatusCode::CONFLICT,
+                    "repository still has packages; hard-delete them first",
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => return db_error(e),
+        }
+    }
+
+    match repository_dao::delete_repository(&state.pool, existing.id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
+/// (A12): remove the component + its assets and decrement the referenced blobs'
+/// ref-counts (enqueuing outbox deletes at zero) in one transaction.
+pub async fn hard_delete_package(
+    State(state): State<AppState>,
+    Path((name, id, version)): Path<(String, String, String)>,
+) -> Response {
+    let repo = match repository_dao::find_repository_by_name(&state.pool, &name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    if repo.kind() != RepoKind::Hosted {
+        return (
+            StatusCode::BAD_REQUEST,
+            "hard delete is only supported for hosted repositories",
+        )
+            .into_response();
+    }
+
+    let format = state.formats.for_repository(&repo);
+    let lower = format.lower_id(&id);
+    let norm_ver = match format.normalize_version(&version) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::NOT_FOUND, "package not found").into_response(),
+    };
+
+    let grace = state.config.outbox.grace();
+    match hard_delete(&state, repo.id, &lower, &norm_ver, grace).await {
+        Ok(true) => {
+            state
+                .cache
+                .invalidate(crate::state::NS_PACKAGE, &format!("{}/{lower}", repo.name))
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "package not found").into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// Transactionally remove a component, its assets, and decref each referenced
+/// blob (enqueuing an outbox delete when a blob reaches zero refs). Mirrors the
+/// hosted write path's hard-delete so blob GC stays correct.
+async fn hard_delete(
+    state: &AppState,
+    repo_id: i64,
+    lower_id: &str,
+    version: &str,
+    grace: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let mut tx = state.pool.begin().await?;
+
+    let Some(comp) = component_dao::find_component(&mut *tx, repo_id, lower_id, version).await?
+    else {
+        return Ok(false);
+    };
+
+    // Decref every blob this component's assets reference.
+    let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
+    for asset in &assets {
+        blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
+    }
+
+    // Remove the component (assets cascade via FK).
+    component_dao::delete_component(&mut *tx, repo_id, lower_id, version).await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Whether a `sqlx::Error` is a Postgres unique-violation (23505).
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}

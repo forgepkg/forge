@@ -22,7 +22,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 axum = { workspace = true, features = ["multipart"] }
 tower = { version = "0.5", features = ["util"] }
 sqlx = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

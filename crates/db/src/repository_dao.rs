@@ -249,3 +249,86 @@ pub async fn remove_group_member(
     .await?;
     Ok(res.rows_affected() > 0)
 }
+
+/// Mutable settings of an existing repository (admin update).
+///
+/// Identity columns (`id`, `format`, `kind`) and server-managed timestamps are
+/// **not** updatable here — changing a repository's kind is structurally unsafe
+/// (it would orphan components/members), so the admin API rejects it and a
+/// kind change is a delete-then-recreate.
+#[derive(Debug, Clone)]
+pub struct RepositoryUpdate {
+    pub name: String,
+    pub anonymous_read: bool,
+    pub online: bool,
+    pub config: JsonValue,
+    pub remote_url: Option<String>,
+    pub package_delay_seconds: i32,
+    pub upstream_username: Option<String>,
+    pub upstream_password: Option<String>,
+    pub allow_private_upstream: bool,
+    pub metadata_ttl_seconds: Option<i32>,
+    pub not_found_ttl_seconds: Option<i32>,
+    pub allow_redeploy: bool,
+}
+
+/// Update the mutable settings of a repository by id. Returns the updated row,
+/// or `None` if no repository has that id. `updated_at` is bumped to `now()`.
+pub async fn update_repository(
+    pool: &PgPool,
+    id: i64,
+    upd: RepositoryUpdate,
+) -> sqlx::Result<Option<Repository>> {
+    sqlx::query_as!(
+        Repository,
+        r#"
+        UPDATE repository SET
+            name = $2,
+            anonymous_read = $3,
+            online = $4,
+            config = $5,
+            remote_url = $6,
+            package_delay_seconds = $7,
+            upstream_username = $8,
+            upstream_password = $9,
+            allow_private_upstream = $10,
+            metadata_ttl_seconds = $11,
+            not_found_ttl_seconds = $12,
+            allow_redeploy = $13,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING
+            id, name, format, kind, anonymous_read, online, config,
+            remote_url, package_delay_seconds, upstream_username, upstream_password,
+            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            allow_redeploy, created_at, updated_at
+        "#,
+        id,
+        upd.name,
+        upd.anonymous_read,
+        upd.online,
+        upd.config,
+        upd.remote_url,
+        upd.package_delay_seconds,
+        upd.upstream_username,
+        upd.upstream_password,
+        upd.allow_private_upstream,
+        upd.metadata_ttl_seconds,
+        upd.not_found_ttl_seconds,
+        upd.allow_redeploy,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Delete a repository by id. Returns whether a row was deleted.
+///
+/// FK constraints cascade `group_member` rows that reference it (as group or
+/// member); component/asset rows must already be gone (the admin layer hard-
+/// deletes packages first) or the FK will reject the delete.
+pub async fn delete_repository(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query!(r#"DELETE FROM repository WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}

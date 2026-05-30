@@ -60,3 +60,25 @@ pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppU
     .fetch_optional(pool)
     .await
 }
+
+/// List all users ordered by username (admin listing).
+pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        SELECT id, username, password_hash, is_admin, active, created_at, updated_at
+        FROM app_user
+        ORDER BY username
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete a user by id (cascading their tokens). Returns whether a row went.
+pub async fn delete_user(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query!(r#"DELETE FROM app_user WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
