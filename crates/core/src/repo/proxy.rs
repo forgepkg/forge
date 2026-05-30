@@ -13,7 +13,13 @@
 //! * **NO advisory locks** — first-time fetch singleflight is a plain row lock:
 //!   [`proxy_dao::upsert_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
 //!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
-//!   (SELECT … FOR UPDATE) so concurrent first-time fetches do the work once.
+//!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
+//!   and finalize transactions; it is **released before** the upstream HTTP
+//!   fetch and the CAS/S3 PUT (Addendum A7 — never hold a DB tx across a
+//!   network/S3 call). The singleflight is therefore best-effort: under
+//!   contention more than one caller may fetch from upstream, but the CAS is
+//!   content-addressed and the finalize tx re-checks `downloaded`, so
+//!   concurrent fetches converge on identical state.
 //!   Upstream-index refresh serializes on a `SELECT … FOR UPDATE` of the proxy
 //!   `repository` row (spec A11).
 //! * **Package delay** — a version discovered from upstream is recorded with
@@ -455,32 +461,60 @@ impl ProxyRepo {
         )
         .await?;
 
-        let mut tx = self.pool.begin().await?;
-        let locked = proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
-            .await?
-            .ok_or_else(|| RepoError::Storage("cached-version row vanished under lock".into()))?;
+        // ── Singleflight gate (short tx, NO network/S3 held under the lock) ──
+        //
+        // Addendum A7: never hold a DB transaction across an S3/network call.
+        // We therefore split the work into three phases:
+        //   1. a short tx that locks the row, re-checks state, and decides
+        //      whether this caller must perform the upstream fetch — then
+        //      *commits immediately*, releasing the row lock;
+        //   2. the unbounded network I/O (upstream HTTP fetch) and the S3 PUT
+        //      (CAS store), with NO transaction held;
+        //   3. a second short tx that re-locks the row, re-checks (a racing
+        //      caller may have finished in the meantime), and finalizes.
+        //
+        // The row lock no longer spans the network round-trip, so a slow or
+        // misbehaving upstream can no longer pin a Postgres connection. The
+        // cost is that the singleflight window is best-effort: under contention
+        // more than one caller may fetch from upstream. That is safe — the CAS
+        // is content-addressed (dedup by sha) and the finalize tx re-checks
+        // `downloaded`, so concurrent fetches converge on identical state.
+        let first_seen_at = {
+            let mut tx = self.pool.begin().await?;
+            let locked =
+                proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
+                    .await?
+                    .ok_or_else(|| {
+                        RepoError::Storage("cached-version row vanished under lock".into())
+                    })?;
 
-        // Re-check under the lock: a racing winner may have finished the fetch.
-        if locked.downloaded {
-            tx.commit().await?;
-            if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
-                return Ok(None);
-            }
-            return self.local_nupkg(repo.id, lower_id, version).await;
-        }
-        if locked.not_found {
-            if let Some(at) = locked.not_found_at {
-                if Utc::now() - at < Self::not_found_ttl(repo) {
-                    tx.commit().await?;
+            // A racing caller already finished the fetch.
+            if locked.downloaded {
+                tx.commit().await?;
+                if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
                     return Ok(None);
                 }
+                return self.local_nupkg(repo.id, lower_id, version).await;
             }
-        }
+            // A still-valid genuine-404 marker short-circuits (no upstream call).
+            if locked.not_found {
+                if let Some(at) = locked.not_found_at {
+                    if Utc::now() - at < Self::not_found_ttl(repo) {
+                        tx.commit().await?;
+                        return Ok(None);
+                    }
+                }
+            }
 
-        // We hold the lock and must do the fetch. Resolve the flat-container base.
+            // This caller will perform the fetch; release the lock first.
+            tx.commit().await?;
+            locked.first_seen_at
+        };
+
+        // ── Network I/O — performed with NO transaction held (A7). ───────────
+        // Resolve the flat-container base.
         let resources = self.resolve_upstream_index(repo).await?;
         let Some(base) = resources.package_base_address else {
-            tx.commit().await?;
             return Err(RepoError::Storage(
                 "upstream advertises no PackageBaseAddress".into(),
             ));
@@ -500,17 +534,26 @@ impl ProxyRepo {
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Genuine upstream 404 → negative cache on this exact version row.
-            sqlx::query!(
-                r#"UPDATE proxy_cached_version SET not_found = true, not_found_at = now() WHERE id = $1"#,
-                locked.id
-            )
-            .execute(&mut *tx)
-            .await?;
+            // Short tx; re-lock and only set the marker if no racing caller has
+            // since downloaded it.
+            let mut tx = self.pool.begin().await?;
+            if let Some(row) =
+                proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
+                    .await?
+            {
+                if !row.downloaded {
+                    sqlx::query!(
+                        r#"UPDATE proxy_cached_version SET not_found = true, not_found_at = now() WHERE id = $1"#,
+                        row.id
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
             tx.commit().await?;
             return Ok(None);
         }
         if !resp.status().is_success() {
-            tx.commit().await?;
             return Err(RepoError::Storage(format!(
                 "upstream nupkg fetch returned {}",
                 resp.status()
@@ -520,7 +563,6 @@ impl ProxyRepo {
         // Reject an over-large advertised body before reading it.
         if let Some(len) = resp.content_length() {
             if len > MAX_NUPKG_BYTES {
-                tx.commit().await?;
                 return Err(RepoError::Storage("upstream nupkg too large".into()));
             }
         }
@@ -529,7 +571,6 @@ impl ProxyRepo {
             .await
             .map_err(|e| RepoError::Storage(format!("read upstream nupkg body: {e}")))?;
         if bytes.len() as u64 > MAX_NUPKG_BYTES {
-            tx.commit().await?;
             return Err(RepoError::Storage("upstream nupkg too large".into()));
         }
 
@@ -542,7 +583,7 @@ impl ProxyRepo {
         };
 
         // CAS-store the bytes (dedup applies across repos); the CAS re-enforces
-        // the cap while streaming to disk.
+        // the cap while streaming to disk. This is an S3 PUT — still NO tx held.
         let stored = self
             .cas
             .store(Cursor::new(bytes.to_vec()), MAX_NUPKG_BYTES)
@@ -552,8 +593,23 @@ impl ProxyRepo {
         let size = i64::try_from(stored.size)
             .map_err(|_| RepoError::Storage("nupkg size overflow".into()))?;
 
-        // Commit blob + attach component/asset within the same tx that holds the
-        // row lock so the singleflight stays atomic.
+        // ── Finalize (short tx) — re-lock, re-check, attach, mark downloaded. ─
+        let mut tx = self.pool.begin().await?;
+        let locked = proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
+            .await?
+            .ok_or_else(|| RepoError::Storage("cached-version row vanished under lock".into()))?;
+
+        // A racing caller finished while we were fetching. The blob we stored is
+        // already on disk (CAS dedup); just roll back and serve the local copy.
+        if locked.downloaded {
+            tx.rollback().await?;
+            if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+                return Ok(None);
+            }
+            return self.local_nupkg(repo.id, lower_id, version).await;
+        }
+
+        // Commit blob + attach component/asset within this short tx.
         blob_dao::commit_and_incref(&mut tx, &stored.sha256).await?;
 
         // Insert the component if it is not already present (a prior metadata
@@ -606,7 +662,7 @@ impl ProxyRepo {
         tx.commit().await?;
 
         // Delay gate on the recorded first sighting.
-        if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+        if !Self::delay_cleared(repo, first_seen_at, Utc::now()) {
             return Ok(None);
         }
         self.local_nupkg(repo.id, lower_id, version).await

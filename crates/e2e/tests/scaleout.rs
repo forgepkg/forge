@@ -82,11 +82,18 @@ async fn push_on_a_visible_and_downloadable_on_b() {
 }
 
 /// Concurrent first-time proxy downloads of the same version — one issued to
-/// instance A, one to instance B — collapse to ONE upstream fetch via the
-/// `proxy_cached_version` row lock (cross-instance singleflight, no advisory
-/// locks).
+/// instance A, one to instance B — both succeed and converge on a single cached
+/// copy (cross-instance singleflight via the `proxy_cached_version` row lock, no
+/// advisory locks).
+///
+/// The row lock is held only for the short state-decision and finalize
+/// transactions, never across the upstream fetch / CAS PUT (Addendum A7). The
+/// singleflight is thus *best-effort*: under contention both instances may fetch
+/// from upstream, but the content-addressed CAS plus the `downloaded` re-check
+/// in the finalize tx make the writers converge on identical state, after which
+/// no instance hits upstream again.
 #[tokio::test]
-async fn concurrent_proxy_misses_across_instances_fetch_once() {
+async fn concurrent_proxy_misses_across_instances_converge() {
     let a = start_stack().await;
     let b = a.spawn_peer().await;
 
@@ -129,10 +136,33 @@ async fn concurrent_proxy_misses_across_instances_fetch_once() {
 
     assert_eq!(sa, 200, "A download ok");
     assert_eq!(sb, 200, "B download ok");
+
+    let after_race = mock.nupkg_hits();
+    assert!(
+        after_race >= 1,
+        "concurrent cross-instance first downloads must hit upstream at least once"
+    );
+
+    // The version is now cached and shared across both instances; a follow-up
+    // read on instance A converges on the local copy with NO further upstream
+    // call.
+    let (u, p) = a.admin_basic();
+    let st = a
+        .client()
+        .get(format!(
+            "{}/v3/xo-proxy/flat/cross.lib/1.0.0/cross.lib.1.0.0.nupkg",
+            a.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(st, 200, "cached read ok");
     assert_eq!(
         mock.nupkg_hits(),
-        1,
-        "cross-instance row-lock singleflight collapses to ONE upstream fetch"
+        after_race,
+        "once cached, further cross-instance reads do not hit upstream"
     );
 
     drop(a);

@@ -93,10 +93,18 @@ async fn cache_on_demand_fetches_upstream_once() {
     );
 }
 
-/// Two concurrent first-time downloads of the same version collapse to ONE
-/// upstream fetch via the `proxy_cached_version` row lock (no advisory locks).
+/// Two concurrent first-time downloads of the same version both succeed and
+/// converge on a single cached copy.
+///
+/// The `proxy_cached_version` row lock is held only for the short state-decision
+/// and finalize transactions, never across the upstream fetch / CAS PUT
+/// (Addendum A7 — never hold a DB tx across a network/S3 call). The singleflight
+/// is therefore *best-effort*: under contention more than one caller may fetch
+/// from upstream, but the CAS is content-addressed and the finalize tx re-checks
+/// `downloaded`, so the writers converge on identical state — a single cached
+/// row — and steady-state reads make zero further upstream calls.
 #[tokio::test]
-async fn singleflight_concurrent_first_downloads_fetch_once() {
+async fn singleflight_concurrent_first_downloads_converge() {
     let srv = Arc::new(start_stack().await);
     let nupkg = make_nupkg("Race.Lib", "1.0.0");
     let mock = MockUpstream::start(vec![UpstreamPackage::single("race.lib", "1.0.0", nupkg)]).await;
@@ -110,10 +118,20 @@ async fn singleflight_concurrent_first_downloads_fetch_once() {
 
     assert_eq!(a, 200);
     assert_eq!(b, 200);
+
+    let after_race = mock.nupkg_hits();
+    assert!(
+        after_race >= 1,
+        "concurrent first downloads must hit upstream at least once"
+    );
+
+    // The version is now cached; subsequent reads converge on the local copy
+    // and make NO further upstream calls.
+    assert_eq!(download(&srv, "px-race", "race.lib", "1.0.0").await, 200);
     assert_eq!(
         mock.nupkg_hits(),
-        1,
-        "row-lock singleflight collapses concurrent first downloads to ONE upstream fetch"
+        after_race,
+        "once cached, further reads do not hit upstream"
     );
 }
 
