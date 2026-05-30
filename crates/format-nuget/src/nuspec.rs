@@ -47,6 +47,14 @@ pub fn lower_id(id: &str) -> String {
     id.trim().to_ascii_lowercase()
 }
 
+/// Extract just the dependency groups from raw `.nuspec` bytes.
+///
+/// Used by the registration route to render `dependencyGroups` without
+/// re-reading the package zip (the manifest is already stored as an asset).
+pub fn dependency_groups_from_nuspec(bytes: &[u8]) -> Result<Vec<DependencyGroup>, FormatError> {
+    Ok(parse_nuspec(bytes).map_err(FormatError::from)?.deps)
+}
+
 /// Locate and read the `*.nuspec` entry out of the zip, enforcing limits.
 fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u8>, NupkgError> {
     let mut archive =

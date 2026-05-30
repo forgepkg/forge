@@ -3,7 +3,9 @@
 
 pub mod model;
 pub mod nuspec;
+pub mod routes;
 pub mod version;
 
 mod format;
 pub use format::NugetFormat;
+pub use routes::{nuget_router, NupkgBytes, RouteContext};

@@ -9,9 +9,19 @@ forge-core = { path = "../core" }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 
+# HTTP routing for the NuGet V3 surface.
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+bytes = "1"
+
 # ZIP archive reading (.nupkg is a zip); default features keep deflate support.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # Namespace-insensitive XML parsing of the .nuspec manifest.
 quick-xml = { version = "0.40" }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

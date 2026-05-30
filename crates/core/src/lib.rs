@@ -22,6 +22,6 @@ pub mod repo;
 pub use domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 pub use format::{Format, ReadSeek};
 pub use repo::{
-    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    NupkgLocation, RegistrationEntry, RepoError, RepoKind, RepoReadOps, SearchHit, SearchParams,
     SearchResult, VersionEntry,
 };

@@ -12,6 +12,10 @@ pub mod hosted;
 
 use async_trait::async_trait;
 
+/// Re-export of the repository-kind enum so the protocol crates can branch on
+/// it without depending on `forge-db` directly.
+pub use forge_db::model::RepoKind;
+
 /// Canonical asset path of the stored `.nupkg` blob within a component.
 pub const NUPKG_ASSET_PATH: &str = "package.nupkg";
 /// Canonical asset path of the derived `.nuspec` blob within a component.
