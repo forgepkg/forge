@@ -2,8 +2,43 @@
 name = "forge-e2e"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [features]
+# All e2e harness code + tests are gated behind this feature so a plain
+# `cargo build/test --workspace` never pulls in testcontainers / Docker.
 forge-e2e = []
 
+[lib]
+name = "forge_e2e"
+path = "src/lib.rs"
+
 [dependencies]
+forge-db = { path = "../db" }
+forge-storage = { path = "../storage" }
+forge-cache = { path = "../cache" }
+forge-core = { path = "../core" }
+forge-nuget = { path = "../format-nuget" }
+forge-server = { path = "../server" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+reqwest = { workspace = true, features = ["multipart"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+figment = { version = "0.10", features = ["toml"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
