@@ -24,6 +24,21 @@ use crate::routes::{write_error_response, RouteContext};
 /// Header carrying the NuGet API key on publish/delete requests.
 const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 
+/// Enforce presence of the API key on write routes.
+///
+/// Write operations (push, unlist, relist) require a `User` and are never
+/// anonymous (spec §6, plan Task 7.1). The server's principal middleware
+/// (Phase 10) validates the key against a real user; here we only enforce
+/// presence so each route is self-contained and never accepts an
+/// unauthenticated request.
+fn require_api_key(headers: &HeaderMap) -> Option<Response> {
+    if headers.contains_key(API_KEY_HEADER) {
+        None
+    } else {
+        Some((StatusCode::UNAUTHORIZED, "missing API key").into_response())
+    }
+}
+
 /// Handler: `PUT /package` — publish (or redeploy) a `.nupkg`.
 pub async fn push(
     State(ctx): State<RouteContext>,
@@ -35,11 +50,9 @@ pub async fn push(
         return (StatusCode::NOT_FOUND, "publish not supported").into_response();
     };
 
-    // Push requires authentication: an API key must be present. The server's
-    // principal middleware (Phase 10) validates it against a `User`; here we
-    // only enforce presence so the route is self-contained.
-    if !headers.contains_key(API_KEY_HEADER) {
-        return (StatusCode::UNAUTHORIZED, "missing API key").into_response();
+    // Push requires authentication: an API key must be present.
+    if let Some(resp) = require_api_key(&headers) {
+        return resp;
     }
 
     // Build an **owned** byte stream over the first multipart part so it can be
@@ -82,16 +95,24 @@ pub async fn push(
 /// Handler: `DELETE /package/{id}/{version}` — unlist (soft delete).
 pub async fn unlist(
     State(ctx): State<RouteContext>,
+    headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Response {
+    if let Some(resp) = require_api_key(&headers) {
+        return resp;
+    }
     delete_version(&ctx, &id, &version, false).await
 }
 
 /// Handler: `POST /package/{id}/{version}` — relist.
 pub async fn relist(
     State(ctx): State<RouteContext>,
+    headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Response {
+    if let Some(resp) = require_api_key(&headers) {
+        return resp;
+    }
     let Some(write) = ctx.write.clone() else {
         return (StatusCode::NOT_FOUND, "relist not supported").into_response();
     };

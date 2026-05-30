@@ -169,6 +169,33 @@ async fn send(
     (status, headers, body)
 }
 
+/// Like [`send`], but attaches an `X-NuGet-ApiKey` header — used for the write
+/// routes (unlist/relist) which reject anonymous requests.
+async fn send_with_key(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    api_key: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-NuGet-ApiKey", api_key)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
 fn json(body: &[u8]) -> Value {
     serde_json::from_slice(body).expect("valid json")
 }
@@ -884,15 +911,27 @@ async fn unlist_returns_204_when_found_404_when_not() {
         RepoKind::Hosted,
         ctx_with_write(RepoKind::Hosted, MockWrite::found()),
     );
-    let (status, _h, _) = send(&found, "DELETE", "/package/Sample.Lib/1.0.0").await;
+    let (status, _h, _) = send_with_key(&found, "DELETE", "/package/Sample.Lib/1.0.0", "key").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let missing = nuget_router(
         RepoKind::Hosted,
         ctx_with_write(RepoKind::Hosted, MockWrite::default()),
     );
-    let (status, _h, _) = send(&missing, "DELETE", "/package/Sample.Lib/9.9.9").await;
+    let (status, _h, _) =
+        send_with_key(&missing, "DELETE", "/package/Sample.Lib/9.9.9", "key").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unlist_requires_api_key() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    // No API key → 401 (never anonymous), and the delete must not run.
+    let (status, _h, _) = send(&router, "DELETE", "/package/Sample.Lib/1.0.0").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -901,13 +940,24 @@ async fn relist_returns_200_when_found_404_when_not() {
         RepoKind::Hosted,
         ctx_with_write(RepoKind::Hosted, MockWrite::found()),
     );
-    let (status, _h, _) = send(&found, "POST", "/package/Sample.Lib/1.0.0").await;
+    let (status, _h, _) = send_with_key(&found, "POST", "/package/Sample.Lib/1.0.0", "key").await;
     assert_eq!(status, StatusCode::OK);
 
     let missing = nuget_router(
         RepoKind::Hosted,
         ctx_with_write(RepoKind::Hosted, MockWrite::default()),
     );
-    let (status, _h, _) = send(&missing, "POST", "/package/Sample.Lib/9.9.9").await;
+    let (status, _h, _) = send_with_key(&missing, "POST", "/package/Sample.Lib/9.9.9", "key").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn relist_requires_api_key() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    // No API key → 401 (never anonymous), and the relist must not run.
+    let (status, _h, _) = send(&router, "POST", "/package/Sample.Lib/1.0.0").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
