@@ -109,7 +109,7 @@ pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
         RepoError::WrongKind { .. } => {
             (StatusCode::NOT_FOUND, "unsupported for repository").into_response()
         }
-        RepoError::Db(_) => {
+        RepoError::Db(_) | RepoError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }

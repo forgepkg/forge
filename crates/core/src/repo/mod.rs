@@ -39,6 +39,11 @@ pub enum RepoError {
     /// A database error bubbled up from the DAO layer.
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+    /// A storage/I-O error while fetching blob bytes (e.g. an S3 failure).
+    /// The concrete blob fetcher (Phase 10) surfaces transport errors here
+    /// rather than overloading [`RepoError::RepoNotFound`].
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 /// One resolved version of a package (a `component` row, normalized).

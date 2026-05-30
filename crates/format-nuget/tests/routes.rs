@@ -528,9 +528,8 @@ async fn search_empty_query_returns_empty_data() {
 }
 
 #[tokio::test]
-async fn search_take_zero_paging_observed() {
-    // take=0 falls back to default; skip past the only hit yields empty page
-    // but accurate totalHits.
+async fn search_skip_past_hits_yields_empty_page_with_accurate_total() {
+    // skip past the only hit yields an empty page but accurate totalHits.
     let router = nuget_router(
         RepoKind::Hosted,
         ctx(RepoKind::Hosted, ops_with_search(), MockBytes::default()),
@@ -539,6 +538,137 @@ async fn search_take_zero_paging_observed() {
     let v = json(&body);
     assert_eq!(v["totalHits"], 1);
     assert_eq!(v["data"].as_array().unwrap().len(), 0);
+}
+
+/// Build mock ops with `n` distinct search hits so paging/clamping is
+/// observable through the route layer.
+fn ops_with_n_hits(n: usize) -> MockOps {
+    let mut ops = MockOps::default();
+    ops.search_hits = (0..n)
+        .map(|i| SearchHit {
+            original_id: format!("Pkg.{i:04}"),
+            latest_version: "1.0.0".into(),
+            versions: vec![VersionEntry {
+                original_id: format!("Pkg.{i:04}"),
+                version: "1.0.0".into(),
+                version_original: "1.0.0".into(),
+                listed: true,
+            }],
+        })
+        .collect();
+    ops
+}
+
+#[tokio::test]
+async fn search_take_zero_clamps_to_default_at_route_layer() {
+    // A14: `take=0` must clamp to DEFAULT_TAKE (20) at the route layer, not
+    // return an empty page. Seed more than DEFAULT_TAKE hits to observe it.
+    let n = SearchParams::DEFAULT_TAKE + 5;
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops_with_n_hits(n), MockBytes::default()),
+    );
+    let (status, _h, body) = get(&router, "/query?take=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["totalHits"], n);
+    assert_eq!(
+        v["data"].as_array().unwrap().len(),
+        SearchParams::DEFAULT_TAKE
+    );
+}
+
+#[tokio::test]
+async fn search_take_missing_clamps_to_default_at_route_layer() {
+    // A14: absent `take` defaults to DEFAULT_TAKE (20) at the route layer.
+    let n = SearchParams::DEFAULT_TAKE + 5;
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops_with_n_hits(n), MockBytes::default()),
+    );
+    let (status, _h, body) = get(&router, "/query?q=pkg").await;
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["totalHits"], n);
+    assert_eq!(
+        v["data"].as_array().unwrap().len(),
+        SearchParams::DEFAULT_TAKE
+    );
+}
+
+#[tokio::test]
+async fn search_take_above_max_clamps_to_max_at_route_layer() {
+    // A14: `take` above MAX_TAKE clamps down to MAX_TAKE at the route layer.
+    let n = SearchParams::MAX_TAKE + 50;
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops_with_n_hits(n), MockBytes::default()),
+    );
+    let (status, _h, body) = get(
+        &router,
+        &format!("/query?take={}", SearchParams::MAX_TAKE + 100),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["totalHits"], n);
+    assert_eq!(v["data"].as_array().unwrap().len(), SearchParams::MAX_TAKE);
+}
+
+#[tokio::test]
+async fn search_skip_take_page_window_at_route_layer() {
+    // A14: `skip`/`take` select an exact window of the totalHits, in order.
+    let n = 10;
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops_with_n_hits(n), MockBytes::default()),
+    );
+    let (status, _h, body) = get(&router, "/query?skip=3&take=4").await;
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["totalHits"], n);
+    let data = v["data"].as_array().unwrap();
+    assert_eq!(data.len(), 4);
+    // Window is [3, 7): ids Pkg.0003 .. Pkg.0006 in order.
+    assert_eq!(data[0]["id"], "Pkg.0003");
+    assert_eq!(data[3]["id"], "Pkg.0006");
+}
+
+#[tokio::test]
+async fn search_semver_level_param_does_not_filter_results() {
+    // A14: `semVerLevel=2.0.0` is accepted for client compatibility and must
+    // not break the request or unexpectedly drop results. With prerelease on,
+    // a SemVer2 prerelease hit is still returned unchanged.
+    let mut ops = MockOps::default();
+    ops.search_hits = vec![SearchHit {
+        original_id: "Sample.Lib".into(),
+        latest_version: "2.0.0-beta.1".into(),
+        versions: vec![VersionEntry {
+            original_id: "Sample.Lib".into(),
+            version: "2.0.0-beta.1".into(),
+            version_original: "2.0.0-beta.1".into(),
+            listed: true,
+        }],
+    }];
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+
+    // Without semVerLevel.
+    let (status, _h, body) = get(&router, "/query?q=sample&prerelease=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let baseline = json(&body);
+
+    // With semVerLevel=2.0.0 — identical result, nothing filtered out.
+    let (status, _h, body) =
+        get(&router, "/query?q=sample&prerelease=true&semVerLevel=2.0.0").await;
+    assert_eq!(status, StatusCode::OK);
+    let with_level = json(&body);
+
+    assert_eq!(with_level, baseline);
+    assert_eq!(with_level["totalHits"], 1);
+    assert_eq!(with_level["data"][0]["version"], "2.0.0-beta.1");
 }
 
 #[tokio::test]
