@@ -57,6 +57,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Hashing
 sha2 = { version = "0.10" }
 
+# Hex encoding (token hashes)
+hex = { version = "0.4" }
+
+# Password hashing (PHC argon2 verification)
+argon2 = { version = "0.5" }
+
+# Constant-time comparison
+subtle = { version = "2.6" }
+
+# CSPRNG for token secrets
+rand = { version = "0.8" }
+
+# CIDR / IP network parsing (anon allowlist, SSRF guard)
+ipnet = { version = "2.10" }
+
+# HTTP types (HeaderMap for principal sources)
+http = { version = "1" }
+
+# async fn in dyn traits (PrincipalSource, SSRF resolver)
+async-trait = { version = "0.1" }
+
 # Base64 (RFC 4648 standard alphabet)
 base64 = { version = "0.22" }
 

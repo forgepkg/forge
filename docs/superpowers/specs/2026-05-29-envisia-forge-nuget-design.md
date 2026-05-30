@@ -106,8 +106,10 @@ on cold caches).
   wrapper so the L2 and the invalidation backplane are ours to control.
 - **Stampede protection.** Per-instance request coalescing via `moka`'s
   `try_get_with`. Cross-instance coalescing for *expensive* shared work (proxy
-  upstream fetch, registration rebuild) uses **Postgres advisory locks** so only
-  one instance in the cluster does the work.
+  upstream fetch) uses **row-level `SELECT … FOR UPDATE` locks** on the relevant
+  row (e.g. `proxy_cached_version` / `proxy_upstream_index`) — **no Postgres
+  advisory locks**. Cheap idempotent rebuilds (hosted registration/search) rely
+  on per-instance coalescing + short TTL.
 - **Cross-node invalidation.** When Redis is present, a pub/sub backplane
   broadcasts key invalidations so every instance drops the stale L1 entry
   (HybridCache's distributed-invalidation approach). Without Redis, L1 entries
@@ -124,7 +126,8 @@ on cold caches).
   recorded now so later slices honor it.
 - **Background workers** (outbox processor §4, orphan reconciler, proxy refresh)
   run on every instance and coordinate via Postgres (`SELECT … FOR UPDATE
-  SKIP LOCKED` / advisory locks) so work is not duplicated across the cluster.
+  SKIP LOCKED` for the outbox; row-level `FOR UPDATE` for proxy refresh) so work
+  is not duplicated across the cluster — **no advisory locks**.
 
 ## 3. Data model (PostgreSQL)
 
@@ -345,9 +348,10 @@ identical bytes is a no-op (same sha256).
   and, by default, must **not** resolve to loopback/link-local/private ranges
   (overridable per-proxy `allow_private_upstream` for internal mirrors). DNS is
   re-checked at connect time.
-- **Read-through cache + singleflight:** on a miss, take a Postgres **advisory
-  lock** keyed on `(repo, name, version)` (or `SELECT FOR UPDATE` on the
-  `proxy_cached_version` row) so concurrent requests fetch once. Fetch from
+- **Read-through cache + singleflight:** on a miss, serialize with a **row lock**
+  — `INSERT … ON CONFLICT DO NOTHING` the `proxy_cached_version` row then
+  `SELECT … FOR UPDATE` it (NO advisory locks) — so concurrent requests fetch
+  once. Fetch from
   upstream (optional HTTP Basic from `upstream_username`/`password`), CAS-store,
   mark `downloaded=true`, attach a `component` + asset.
 - **Package delay:** on metadata discovery, upsert `proxy_cached_version` with
@@ -421,7 +425,7 @@ Mock upstream NuGet feed served in-process for proxy scenarios.
 - SSRF: proxy `remote_url` to a private address is rejected by default.
 - **Scale-out:** run two server instances against the same Postgres + versitygw
   (+ Redis); push on instance A is visible on instance B; concurrent proxy
-  misses across both instances fetch upstream once (advisory lock); outbox is
+  misses across both instances fetch upstream once (row `FOR UPDATE`); outbox is
   drained exactly once cluster-wide (`SKIP LOCKED`).
 - **Redis L2 (optional, gated on a Redis container):** invalidation backplane
   drops a stale L1 entry on the other instance after a mutation.
@@ -522,7 +526,7 @@ sequencing below.
 **In scope (slice 1):** multiple stateless server instances against shared
 Postgres + S3 (+ optional Redis). No in-memory-only authoritative state (§2.1):
 caches are L1+optional-L2 over Postgres/S3; cross-instance coordination uses
-Postgres advisory locks and `SELECT … FOR UPDATE SKIP LOCKED`; blob bookkeeping
+row-level `SELECT … FOR UPDATE` and `SELECT … FOR UPDATE SKIP LOCKED` (no advisory locks); blob bookkeeping
 uses the transactional outbox; sessions/ephemeral auth state (when later added)
 go to Postgres/Redis. The scale-out e2e test (§9) exercises two instances. A
 cold instance reconstructs all state from the shared stores.

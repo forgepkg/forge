@@ -14,7 +14,7 @@
 - `core::authz` exposes async `can_read(&Principal,&Repository)`, `can_write(...)`, `can_admin(...)` — the single extension point §12.4 will replace.
 - `Principal::User` carries `user_id: i64` and `token_id: Option<i64>`.
 - `core::delete_component` / asset-delete decrements `blob.ref_count` and enqueues `blob_outbox` in one DB transaction.
-- `db` provides `claim_due_rows`/advisory-lock helpers using `FOR UPDATE SKIP LOCKED`.
+- `db` provides `claim_due` using `FOR UPDATE SKIP LOCKED`; all singleflight/coordination uses row-level `SELECT … FOR UPDATE` or `INSERT … ON CONFLICT` — **NO Postgres advisory locks anywhere**.
 - Version normalization + ordering are exposed through the `Format` trait (so `core` and §12.1 order versions without depending on `format-nuget`).
 - `cache` exposes generic `get_or_try_insert_with(ns, key, ttl, factory)` and `invalidate(ns, key)`.
 - `core::net::ssrf` guard is reusable (proxy uses it; §12.3 reuses it).
@@ -87,7 +87,7 @@ repo/
 - [ ] **Step 2 (test):** `repository_dao` round-trip test (insert hosted repo, fetch by name) on a testcontainer. FAIL → implement `insert_repository`, `find_repository_by_name`, `list_repositories`, `group_members(group_id)->Vec<(Repository,priority)>` **`ORDER BY priority DESC`** (highest priority first = wins ties, per spec §7); test asserts ordering direction. PASS.
 - [ ] **Step 3 (test):** `blob_dao`: `upsert_pending(sha256,size,s3_key)->bool(inserted)` via `INSERT … ON CONFLICT (sha256) DO NOTHING RETURNING`; `commit_and_incref(tx, sha256)`; `decref_and_maybe_enqueue_delete(tx, sha256, grace)` returns whether it hit zero. Test refcount transitions + that decref-to-zero inserts a `blob_outbox` row in the SAME tx. PASS.
 - [ ] **Step 4 (test):** `outbox_dao::claim_due(tx, batch, now)` using `SELECT … WHERE processed_at IS NULL AND available_at<=now AND (locked_until IS NULL OR locked_until<now) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT n` + lease update. Test two concurrent claimers get disjoint rows. PASS.
-- [ ] **Step 5:** `locks.rs`: `pub async fn with_advisory_lock<T>(pool, key:i64, f)` using `pg_advisory_xact_lock`. Test mutual exclusion. PASS.
+- [ ] **Step 5:** (NO advisory locks.) Provide a row-lock helper instead: a `lock_row_for_update` pattern via `INSERT … ON CONFLICT DO NOTHING` then `SELECT … FOR UPDATE` on a concrete row (e.g. the `proxy_cached_version` row), used for singleflight. Test mutual exclusion with two concurrent transactions on the same row. PASS.
 - [ ] **Step 6:** DAOs for `component`,`asset`,`proxy_cached_version`,`proxy_upstream_index`,`app_user`,`token`. Each: a focused round-trip test. Commit per DAO.
 
 ---
@@ -218,7 +218,7 @@ pub trait Format: Send + Sync {
 ### Task 8.2: read-through cache + singleflight + delay
 **Files:** `crates/core/src/repo/proxy.rs` (extend).
 - [ ] **Step 1 (test, e2e):** version discovery upserts `proxy_cached_version{first_seen_at=now}` WITHOUT serving; with `package_delay_seconds>0`, the version is absent from `list_versions`/registration/search and direct download 404s until the clock passes; after, it serves. Delay-404 is NOT written to negative cache (a later in-window request still re-checks). Genuine upstream 404 sets `not_found`+`not_found_at` honoring `not_found_ttl_seconds`. FAIL.
-- [ ] **Step 2 (test, e2e):** two concurrent first-time downloads of the same version trigger ONE upstream fetch (advisory lock on `(repo,name,version)`); both get bytes; `downloaded=true`; blob stored once. FAIL.
+- [ ] **Step 2 (test, e2e):** two concurrent first-time downloads of the same version trigger ONE upstream fetch (singleflight via ROW LOCK: `INSERT … ON CONFLICT DO NOTHING` the `proxy_cached_version` row, then `SELECT … FOR UPDATE` it — NOT an advisory lock); both get bytes; `downloaded=true`; blob stored once. FAIL.
 - [ ] **Step 3:** Implement the state machine + singleflight + delay gating + offline mode. PASS. Commit.
 
 ---
@@ -253,7 +253,7 @@ pub trait Format: Send + Sync {
 
 ### Task 10.5: background workers
 **Files:** `crates/server/src/workers.rs`.
-- [ ] **Step 1:** Spawn outbox worker, orphan reconciler, proxy metadata refresh on intervals; each guarded so multi-instance is safe (SKIP LOCKED / advisory locks). Test (e2e) that with two `AppState`s sharing a DB the outbox is drained exactly once. Commit.
+- [ ] **Step 1:** Spawn outbox worker, orphan reconciler, proxy metadata refresh on intervals; each guarded so multi-instance is safe (`FOR UPDATE SKIP LOCKED` for the outbox; row `FOR UPDATE` for proxy refresh — NO advisory locks). Test (e2e) that with two `AppState`s sharing a DB the outbox is drained exactly once. Commit.
 
 ---
 
@@ -292,7 +292,7 @@ These amend the tasks named; executors MUST apply them.
 - **A8 (Task 8.2) — proxy lock = row lock, not text key.** Before fetch/delay decisions, `INSERT … ON CONFLICT (repository_id,name,version) DO NOTHING` then `SELECT … FOR UPDATE` the `proxy_cached_version` row as the singleflight lock (deterministic, no hash-collision risk). Direct-download-before-discovery therefore always has a row to lock.
 - **A9 (Task 4.5 / 8.1) — SSRF DNS TOCTOU.** Resolve once with a guarded resolver, validate the resolved IPs, and connect to those exact IPs (custom `reqwest` resolver / `resolve()` override), re-validating on every redirect hop — so a re-resolve can't swap in a private IP after the check.
 - **A10 (Task 1.1 / 8.1 / 10.4) — `allow_private_upstream`.** Add a per-proxy `allow_private_upstream bool default false` column; thread it through admin create/update, config, and the SSRF call; default-deny test + allow test.
-- **A11 (Task 6.1 / 8.1) — cross-instance singleflight for expensive cache factories.** Registration/search rebuilds and proxy upstream-index refresh wrap their cache factory in a Postgres advisory lock so only one instance in the cluster recomputes; others wait and read the populated cache. Test with two instances.
+- **A11 (Task 6.1 / 8.1) — cross-instance singleflight WITHOUT advisory locks.** For proxy upstream-index refresh, serialize with a row lock: `SELECT … FOR UPDATE` on the `proxy_upstream_index` (or proxy `repository`) row before recompute, so only one instance refetches; others wait then read the populated row/cache. For hosted registration/search rebuilds, per-instance moka coalescing + short TTL is sufficient (cross-instance dedup is not required for cheap, idempotent rebuilds). NO `pg_advisory_*`.
 - **A12 (NEW Task 7.2 + 10.4) — `core::delete_component` + hard delete.** Add `core::delete_component(repo,id,ver, hard: bool)`: unlist (soft) or hard-delete (remove component+assets, decref blobs + enqueue outbox in one tx). Expose hard delete via the admin API (`DELETE /admin/repositories/{repo}/packages/{id}/{ver}`), admin-only. This is what the CAS refcount 2→1→0 e2e (Task 11.2) drives. TDD + e2e.
 - **A13 (Task 2.2 / 11.1) — versitygw setup.** Harness creates the bucket on startup; configure aws-sdk-s3 for path-style and disable default request checksums that versitygw may reject (`request_checksum_calculation = WhenRequired`); a smoke test puts/gets/deletes against versitygw.
 - **A14 (Task 6.2) — search params.** Test `semVerLevel` (2.0.0 includes SemVer2 prerelease), `prerelease` default false, `skip`/`take` bounds + clamping, and `totalHits` accuracy.
