@@ -7,7 +7,9 @@ publish = false
 [features]
 # All e2e harness code + tests are gated behind this feature so a plain
 # `cargo build/test --workspace` never pulls in testcontainers / Docker.
-forge-e2e = []
+# The testcontainers crates are optional deps activated only by this feature,
+# so a clean build never resolves, downloads, or compiles them.
+forge-e2e = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [lib]
 name = "forge_e2e"
@@ -32,8 +34,8 @@ tracing = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 figment = { version = "0.10", features = ["toml"] }
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
+testcontainers = { version = "0.27", optional = true }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"], optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
