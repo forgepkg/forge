@@ -41,7 +41,7 @@ pub trait Format: Send + Sync {
 mod tests {
     use super::*;
     use crate::domain::ParsedUpload;
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
     use std::sync::Arc;
 
     /// A trivial format used only to prove object-safety and exercise the seam.

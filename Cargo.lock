@@ -1381,6 +1381,7 @@ name = "forge-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "base64",
  "chrono",
  "forge-db",
@@ -1390,6 +1391,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "subtle",
@@ -1398,6 +1400,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

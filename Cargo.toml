@@ -72,6 +72,9 @@ rand = { version = "0.8" }
 # CIDR / IP network parsing (anon allowlist, SSRF guard)
 ipnet = { version = "2.10" }
 
+# URL parsing (SSRF guard)
+url = { version = "2.5" }
+
 # HTTP types (HeaderMap for principal sources)
 http = { version = "1" }
 

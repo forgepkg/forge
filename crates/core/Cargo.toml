@@ -21,14 +21,17 @@ subtle = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 http = { workspace = true }
+async-trait = { workspace = true }
 
 # Networking / SSRF guard
 ipnet = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 forge-db = { path = "../db" }
 argon2 = { workspace = true, features = ["password-hash"] }
+serde_json = { workspace = true }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

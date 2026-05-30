@@ -56,7 +56,13 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> 
     // Defense in depth: constant-time compare of stored vs recomputed hash.
     // (The DB lookup matched on `hash`, but we never want a timing side channel
     // to leak whether a near-miss hash exists.)
-    if token.token_hash.as_bytes().ct_eq(hash.as_bytes()).unwrap_u8() != 1 {
+    if token
+        .token_hash
+        .as_bytes()
+        .ct_eq(hash.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
         return None;
     }
 
