@@ -9,7 +9,6 @@ use chrono::{Duration, Utc};
 use forge_db::asset_dao::{self, NewAsset};
 use forge_db::blob_dao;
 use forge_db::component_dao::{self, NewComponent};
-use forge_db::locks::{advisory_key, with_advisory_xact_lock};
 use forge_db::model::{BlobState, RepoKind};
 use forge_db::outbox_dao;
 use forge_db::proxy_dao::{self, NewProxyCachedVersion};
@@ -535,54 +534,6 @@ async fn user_and_token_round_trip() {
         .expect("by hash")
         .expect("present");
     assert!(touched.last_used_at.is_some());
-}
-
-// ── advisory locks ────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn advisory_xact_lock_provides_mutual_exclusion() {
-    let pool = pool().await;
-    let pool = &pool;
-    // Unique key per test run to avoid colliding with concurrent test bins.
-    let key = advisory_key(&["test-mutex", &unique().to_string()]);
-
-    // Transaction A grabs the lock and holds it (does not commit yet).
-    let mut tx_a = pool.begin().await.expect("begin a");
-    with_advisory_xact_lock(&mut tx_a, key, |_tx| async { Ok::<(), sqlx::Error>(()) })
-        .await
-        .expect("lock a");
-
-    // Transaction B tries to take the same key with a statement timeout; it must
-    // block (and time out) because A still holds the xact lock.
-    let mut tx_b = pool.begin().await.expect("begin b");
-    sqlx::query("SET LOCAL statement_timeout = '500ms'")
-        .execute(&mut *tx_b)
-        .await
-        .expect("set timeout");
-    let blocked = sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(key)
-        .execute(&mut *tx_b)
-        .await;
-    assert!(
-        blocked.is_err(),
-        "second acquirer must block (and time out) while A holds the lock"
-    );
-    let _ = tx_b.rollback().await;
-
-    // A releases by committing; the key is now free.
-    tx_a.commit().await.expect("commit a");
-
-    let mut tx_c = pool.begin().await.expect("begin c");
-    sqlx::query("SET LOCAL statement_timeout = '2s'")
-        .execute(&mut *tx_c)
-        .await
-        .expect("set timeout c");
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(key)
-        .execute(&mut *tx_c)
-        .await
-        .expect("C acquires after A released");
-    tx_c.commit().await.expect("commit c");
 }
 
 // ── proxy_dao ─────────────────────────────────────────────────────────────────

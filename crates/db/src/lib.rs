@@ -11,7 +11,6 @@ pub mod asset_dao;
 pub mod blob_dao;
 pub mod component_dao;
 pub mod ids;
-pub mod locks;
 pub mod model;
 pub mod outbox_dao;
 pub mod proxy_dao;
