@@ -1,0 +1,107 @@
+# GitLab CI for envisia-forge.
+#
+# Mirrors .github/workflows/ci.yml: fmt → clippy → test → e2e.
+# Unit tests build/run with SQLX_OFFLINE=true against the committed .sqlx/ dir;
+# the test/e2e jobs additionally provision a live Postgres 17 service, and e2e
+# adds a versitygw S3 gateway. Dev credentials below are CI-only.
+
+stages:
+  - fmt
+  - clippy
+  - test
+  - e2e
+
+default:
+  image: rust:latest
+
+variables:
+  CARGO_TERM_COLOR: "always"
+  # Build against the committed .sqlx/ cache; no live DB needed for compilation.
+  SQLX_OFFLINE: "true"
+  # Keep cargo's registry/git caches inside the project dir so GitLab can cache them.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+# Shared cache for the cargo registry and build artefacts. Keyed per-branch so
+# feature branches don't fight over a single cache entry.
+.cargo-cache: &cargo-cache
+  key:
+    files:
+      - Cargo.lock
+    prefix: "$CI_JOB_NAME"
+  paths:
+    - .cargo/registry/index/
+    - .cargo/registry/cache/
+    - .cargo/git/db/
+    - target/
+
+# ── Formatting ─────────────────────────────────────────────────────────────
+fmt:
+  stage: fmt
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all --check
+
+# ── Clippy ─────────────────────────────────────────────────────────────────
+clippy:
+  stage: clippy
+  needs: ["fmt"]
+  cache:
+    <<: *cargo-cache
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+# ── Unit tests (live Postgres service, SQLX_OFFLINE build) ───────────────────
+test:
+  stage: test
+  needs: ["fmt"]
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_DB: forge
+    POSTGRES_USER: forge
+    POSTGRES_PASSWORD: forge
+    DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
+    FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
+  cache:
+    <<: *cargo-cache
+  script:
+    - cargo build --workspace
+    # forge-e2e feature is intentionally excluded here — unit tests only.
+    - cargo test --workspace
+
+# ── E2E / integration tests (Postgres + versitygw containers) ────────────────
+# Gated behind the `forge-e2e` feature in the forge-e2e crate. Runs only on the
+# default branch to keep MR pipelines fast.
+e2e:
+  stage: e2e
+  needs: ["test"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  services:
+    - name: postgres:17
+      alias: postgres
+    # versitygw: posix backend over /data on port 7070. The posix backend
+    # treats each subdir of /data as a bucket; the bucket dir is created by the
+    # test harness (or pre-created against the running service).
+    - name: versity/versitygw:v1.4.1
+      alias: versitygw
+      command:
+        ["--port", ":7070", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
+  variables:
+    POSTGRES_DB: forge
+    POSTGRES_USER: forge
+    POSTGRES_PASSWORD: forge
+    DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
+    FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
+    FORGE_S3_ENDPOINT: "http://versitygw:7070"
+    FORGE_S3_REGION: "us-east-1"
+    FORGE_S3_BUCKET: "forge"
+    FORGE_S3_ACCESS_KEY: "minioadmin"
+    FORGE_S3_SECRET_KEY: "minioadmin"
+    FORGE_S3_FORCE_PATH_STYLE: "true"
+  cache:
+    <<: *cargo-cache
+  script:
+    - cargo test --workspace --features forge-e2e
