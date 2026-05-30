@@ -21,6 +21,11 @@ pub const NUPKG_ASSET_PATH: &str = "package.nupkg";
 /// Canonical asset path of the derived `.nuspec` blob within a component.
 pub const NUSPEC_ASSET_PATH: &str = "package.nuspec";
 
+/// Content type stored/served for the `.nupkg` asset.
+pub const NUPKG_CONTENT_TYPE: &str = "application/octet-stream";
+/// Content type stored/served for the derived `.nuspec` asset.
+pub const NUSPEC_CONTENT_TYPE: &str = "application/xml";
+
 /// Errors the read/write ops surface to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
@@ -44,6 +49,92 @@ pub enum RepoError {
     /// rather than overloading [`RepoError::RepoNotFound`].
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+/// Errors surfaced by the hosted **write** path (publish / delete / relist).
+///
+/// Distinct from [`RepoError`] so the protocol layer can map each variant to the
+/// right HTTP status: [`WriteError::TooLarge`] → 413, [`WriteError::Conflict`]
+/// → 409, [`WriteError::InvalidPackage`] → 400, and the wrapped [`RepoError`]
+/// for not-found / wrong-kind / db / storage.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    /// Repository / database / storage error (also covers not-found and
+    /// wrong-kind via the wrapped [`RepoError`]).
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+    /// The upload exceeded the configured `max_upload_bytes` limit → HTTP 413.
+    #[error("upload exceeds limit of {limit} bytes")]
+    TooLarge {
+        /// The configured byte limit that was exceeded.
+        limit: u64,
+    },
+    /// The uploaded bytes are not a valid package of this format → HTTP 400.
+    #[error("invalid package: {0}")]
+    InvalidPackage(#[from] crate::domain::FormatError),
+    /// `(id, version)` already exists and the repository disallows redeploy →
+    /// HTTP 409.
+    #[error("package {id} {version} already exists")]
+    Conflict {
+        /// Package id (original casing).
+        id: String,
+        /// Normalized version.
+        version: String,
+    },
+}
+
+impl From<forge_storage::CasError> for WriteError {
+    fn from(e: forge_storage::CasError) -> Self {
+        match e {
+            forge_storage::CasError::TooLarge { limit } => WriteError::TooLarge { limit },
+            forge_storage::CasError::Db(db) => WriteError::Repo(RepoError::Db(db)),
+            other => WriteError::Repo(RepoError::Storage(other.to_string())),
+        }
+    }
+}
+
+/// Outcome of a successful publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// A brand-new `(id, version)` was created → HTTP 201.
+    Created,
+    /// An existing `(id, version)` was redeployed (assets swapped) → HTTP 201.
+    Replaced,
+}
+
+/// Outcome of a delete / relist operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The version was unlisted (soft delete) → HTTP 204.
+    Unlisted,
+    /// The version was hard-deleted (rows removed, blobs dereferenced).
+    Deleted,
+    /// The version was relisted → HTTP 200.
+    Relisted,
+    /// The `(id, version)` was unknown → HTTP 404.
+    NotFound,
+}
+
+/// Seam for invalidating cached read responses after a write.
+///
+/// Hosted reads (registration/search/flat) may be cached per `(repo, id)` by
+/// the server's [`forge_cache::Cache`]; the write path calls
+/// [`CacheInvalidator::invalidate_package`] after committing so stale entries
+/// are dropped. Abstracted here (like [`hosted::BlobFetch`]) so `forge-core`
+/// stays independent of the cache implementation and tests can use a no-op.
+#[async_trait]
+pub trait CacheInvalidator: Send + Sync {
+    /// Invalidate any cached reads for `(repo, lower_id)`.
+    async fn invalidate_package(&self, repo: &str, lower_id: &str);
+}
+
+/// A [`CacheInvalidator`] that does nothing — for tests and cache-less setups.
+#[derive(Debug, Default, Clone)]
+pub struct NoopCacheInvalidator;
+
+#[async_trait]
+impl CacheInvalidator for NoopCacheInvalidator {
+    async fn invalidate_package(&self, _repo: &str, _lower_id: &str) {}
 }
 
 /// One resolved version of a package (a `component` row, normalized).

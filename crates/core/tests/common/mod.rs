@@ -9,19 +9,27 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use forge_storage::{BlobStore, Cas, S3Config};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use testcontainers_modules::{
-    postgres::Postgres,
-    testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt},
-};
+use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers_modules::postgres::Postgres;
 use tokio::sync::Mutex;
 
 static ENDPOINT: OnceLock<String> = OnceLock::new();
+static S3_ENDPOINT: OnceLock<String> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::const_new(());
 static MIGRATED: OnceLock<()> = OnceLock::new();
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const S3_ACCESS: &str = "test";
+const S3_SECRET: &str = "test";
+const S3_BUCKET: &str = "forge-test";
+const S3_PORT: u16 = 7070;
 
 async fn endpoint() -> &'static str {
     if let Some(e) = ENDPOINT.get() {
@@ -77,4 +85,72 @@ pub async fn pool() -> PgPool {
 /// A process-unique suffix for building collision-free names within a test run.
 pub fn unique() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// --- versitygw (S3) ---------------------------------------------------------
+
+async fn s3_endpoint() -> &'static str {
+    if let Some(e) = S3_ENDPOINT.get() {
+        return e;
+    }
+    let _guard = INIT_LOCK.lock().await;
+    if let Some(e) = S3_ENDPOINT.get() {
+        return e;
+    }
+
+    // versitygw posix backend (see storage harness): root must already exist,
+    // so we point it at `/tmp` and use a named bucket subdir we create below.
+    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+        .with_exposed_port(S3_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("listening on"))
+        .with_cmd([
+            "--port", ":7070", "--access", S3_ACCESS, "--secret", S3_SECRET, "posix", "/tmp",
+        ])
+        .start()
+        .await
+        .expect("failed to start versitygw testcontainer (is Docker running?)");
+
+    let host = container.get_host().await.expect("host");
+    let port = container
+        .get_host_port_ipv4(S3_PORT)
+        .await
+        .expect("mapped port");
+
+    let _: &'static ContainerAsync<GenericImage> = Box::leak(Box::new(container));
+
+    let e = format!("http://{host}:{port}");
+    S3_ENDPOINT.set(e).ok();
+    S3_ENDPOINT.get().unwrap()
+}
+
+/// A `BlobStore` with its bucket ensured, backed by the shared versitygw
+/// container. Tests dedup by content, so a single shared bucket is safe.
+pub async fn blob_store() -> BlobStore {
+    let endpoint = s3_endpoint().await.to_string();
+    let store = BlobStore::new(S3Config {
+        endpoint,
+        region: "us-east-1".to_string(),
+        bucket: S3_BUCKET.to_string(),
+        access_key: S3_ACCESS.to_string(),
+        secret_key: S3_SECRET.to_string(),
+        force_path_style: true,
+        multipart_threshold: 8 * 1024 * 1024,
+    });
+
+    let mut last_err = None;
+    for _ in 0..30 {
+        match store.ensure_bucket().await {
+            Ok(()) => return store,
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    panic!("versitygw never became ready: {last_err:?}");
+}
+
+/// A content-addressed store over the shared pool + versitygw bucket.
+pub async fn cas(pool: &PgPool) -> Cas {
+    Cas::new(blob_store().await, pool.clone())
 }

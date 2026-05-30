@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 forge-db = { path = "../db" }
+forge-storage = { path = "../storage" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }
@@ -36,5 +37,7 @@ forge-db = { path = "../db" }
 forge-nuget = { path = "../format-nuget" }
 argon2 = { workspace = true, features = ["password-hash"] }
 serde_json = { workspace = true }
+chrono = { workspace = true }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
