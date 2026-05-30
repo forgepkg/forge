@@ -372,8 +372,11 @@ impl HostedWrite {
         // 4. Commit references + component/asset rows in one transaction.
         let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
 
+        // Read the duplicate-check *inside* the transaction so it serializes
+        // with the subsequent insert/redeploy write against concurrent pushes
+        // of the same (id, version).
         let existing =
-            component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
+            component_dao::find_component(&mut *tx, repo_row.id, &parsed.id, &parsed.version)
                 .await
                 .map_err(RepoError::from)?;
 
@@ -510,7 +513,7 @@ impl HostedWrite {
 
         // Capture the old blob shas, delete the asset rows, decref the old blobs.
         for path in [NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH] {
-            if let Some(old) = asset_dao::find_asset(&self.pool, comp.id, path)
+            if let Some(old) = asset_dao::find_asset(&mut **tx, comp.id, path)
                 .await
                 .map_err(RepoError::from)?
             {
@@ -632,19 +635,34 @@ impl HostedWrite {
         }
 
         // Hard delete: one transaction removing component + assets and decrefing
-        // every blob the assets referenced.
-        let Some(comp) = component_dao::find_component(&self.pool, repo_row.id, &lower, &norm_ver)
+        // every blob the assets referenced. Begin the tx *first* and resolve the
+        // component on the transaction connection so the lookup, the FOR UPDATE
+        // lock, and the asset reads all see a consistent snapshot — otherwise a
+        // concurrent redeploy could swap the asset blob references between the
+        // read and the decref, leaking the redeployed blob and over-decrefing
+        // the old one.
+        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
+
+        let Some(comp) = component_dao::find_component(&mut *tx, repo_row.id, &lower, &norm_ver)
             .await
             .map_err(RepoError::from)?
         else {
             return Ok(DeleteOutcome::NotFound);
         };
 
-        let assets = asset_dao::assets_for_component(&self.pool, comp.id)
+        // Lock the component row so any concurrent redeploy serializes behind
+        // this hard delete (NO advisory locks — a plain row-level FOR UPDATE).
+        sqlx::query!(
+            r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
+            comp.id
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(RepoError::from)?;
+
+        let assets = asset_dao::assets_for_component(&mut *tx, comp.id)
             .await
             .map_err(RepoError::from)?;
-
-        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
 
         // Delete asset rows first (FK to component), decref their blobs.
         for asset in &assets {

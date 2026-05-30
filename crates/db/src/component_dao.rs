@@ -46,12 +46,19 @@ where
 }
 
 /// Find a component by its `(repository_id, name, version)` unique key.
-pub async fn find_component(
-    pool: &PgPool,
+///
+/// Accepts any [`PgExecutor`] (pool, `&mut Transaction`, etc.) so the read can
+/// participate in the same transaction as a subsequent write — required to
+/// serialize the publish/redeploy duplicate-check against concurrent pushes.
+pub async fn find_component<'e, E>(
+    executor: E,
     repository_id: i64,
     name: &str,
     version: &str,
-) -> sqlx::Result<Option<Component>> {
+) -> sqlx::Result<Option<Component>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         Component,
         r#"
@@ -65,7 +72,7 @@ pub async fn find_component(
         name,
         version,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

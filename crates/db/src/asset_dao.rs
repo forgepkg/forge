@@ -1,6 +1,6 @@
 //! Data access for `asset`.
 
-use sqlx::{PgExecutor, PgPool};
+use sqlx::PgExecutor;
 
 use crate::model::Asset;
 
@@ -46,11 +46,19 @@ where
 }
 
 /// Find an asset by its `(component_id, path)` unique key.
-pub async fn find_asset(
-    pool: &PgPool,
+///
+/// Accepts any [`PgExecutor`] so the read can run on the same transaction
+/// connection that holds the component's `FOR UPDATE` lock during a redeploy
+/// swap — otherwise the lookup could observe rows a concurrent redeploy already
+/// swapped in, corrupting blob ref-counts.
+pub async fn find_asset<'e, E>(
+    executor: E,
     component_id: i64,
     path: &str,
-) -> sqlx::Result<Option<Asset>> {
+) -> sqlx::Result<Option<Asset>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         Asset,
         r#"
@@ -63,12 +71,19 @@ pub async fn find_asset(
         component_id,
         path,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// List all assets belonging to a component, ordered by path.
-pub async fn assets_for_component(pool: &PgPool, component_id: i64) -> sqlx::Result<Vec<Asset>> {
+///
+/// Accepts any [`PgExecutor`] so a hard delete can read the asset set inside
+/// the same transaction that locked the component row `FOR UPDATE`, preventing
+/// a concurrent redeploy from swapping blob references out from under it.
+pub async fn assets_for_component<'e, E>(executor: E, component_id: i64) -> sqlx::Result<Vec<Asset>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         Asset,
         r#"
@@ -81,6 +96,6 @@ pub async fn assets_for_component(pool: &PgPool, component_id: i64) -> sqlx::Res
         "#,
         component_id,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
