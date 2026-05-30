@@ -111,10 +111,15 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
 
     // PackagePublish surface — hosted only.
     if kind == RepoKind::Hosted {
-        router = router.route("/package", put(publish::push)).route(
-            "/package/{id}/{version}",
-            delete(publish::unlist).post(publish::relist),
-        );
+        router = router
+            .route("/package", put(publish::push))
+            // The official NuGet client appends a trailing slash to the
+            // PackagePublish `@id` before the PUT (`.../package/`); accept both.
+            .route("/package/", put(publish::push))
+            .route(
+                "/package/{id}/{version}",
+                delete(publish::unlist).post(publish::relist),
+            );
     }
 
     router.with_state(ctx)
