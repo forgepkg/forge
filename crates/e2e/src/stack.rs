@@ -215,6 +215,7 @@ fn config_toml(
     redis: Option<&str>,
     trusted_proxies: &[String],
     cache_ttl_seconds: u64,
+    public_base_url: &str,
 ) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
@@ -232,7 +233,7 @@ fn config_toml(
         r#"
 [server]
 bind = "127.0.0.1:0"
-public_base_url = "http://test.local"
+public_base_url = "{public_base_url}"
 
 [database]
 url = "{db_url}"
@@ -343,6 +344,15 @@ impl StackBuilder {
             None
         };
 
+        // Bind first so the public base URL can advertise the *real* ephemeral
+        // address — a real NuGet client follows the absolute `@id`s the service
+        // index returns, so they must be reachable.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr");
+        let base_url = format!("http://{addr}");
+
         let admin_ref = self
             .bootstrap_admin
             .as_ref()
@@ -355,6 +365,7 @@ impl StackBuilder {
             redis.as_deref(),
             &self.trusted_proxies,
             self.cache_ttl_seconds,
+            &base_url,
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
@@ -383,10 +394,6 @@ impl StackBuilder {
         };
 
         let app = build_router(state.clone(), layer);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind ephemeral");
-        let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -400,7 +407,7 @@ impl StackBuilder {
         let admin_pass = self.bootstrap_admin.as_ref().map(|(_, p)| p.clone());
 
         let mut srv = TestServer {
-            base_url: format!("http://{addr}"),
+            base_url,
             pool,
             db_url,
             state,
