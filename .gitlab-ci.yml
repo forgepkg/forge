@@ -52,6 +52,9 @@ clippy:
     - cargo clippy --workspace --all-targets -- -D warnings
 
 # ── Unit tests (live Postgres service, SQLX_OFFLINE build) ───────────────────
+# GitLab does not support per-service health-check options the way GitHub
+# Actions does, so each job waits for its service containers to accept
+# connections before running anything that touches them.
 test:
   stage: test
   needs: ["fmt"]
@@ -66,10 +69,19 @@ test:
     FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
   cache:
     <<: *cargo-cache
+  before_script:
+    # Wait for the postgres service to accept connections.
+    - apt-get update -qq && apt-get install -y -qq postgresql-client
+    - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
   script:
     - cargo build --workspace
     # forge-e2e feature is intentionally excluded here — unit tests only.
     - cargo test --workspace
+    # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
+    # the committed .sqlx/ cache matches the current queries + schema.
+    - cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+    - SQLX_OFFLINE= sqlx migrate run --source migrations
+    - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
 # ── E2E / integration tests (Postgres + versitygw containers) ────────────────
 # Gated behind the `forge-e2e` feature in the forge-e2e crate. Runs only on the
@@ -103,5 +115,10 @@ e2e:
     FORGE_S3_FORCE_PATH_STYLE: "true"
   cache:
     <<: *cargo-cache
+  before_script:
+    # Wait for the postgres + versitygw services to accept connections.
+    - apt-get update -qq && apt-get install -y -qq postgresql-client curl
+    - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
+    - timeout 60 bash -c 'until curl -sf http://versitygw:7070/ >/dev/null 2>&1 || curl -s http://versitygw:7070/ 2>&1 | grep -q "NoSuchBucket\|ListBuckets\|InvalidRequest\|AccessDenied"; do sleep 1; done'
   script:
     - cargo test --workspace --features forge-e2e

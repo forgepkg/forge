@@ -56,9 +56,9 @@ jobs:
     needs: [fmt]
 
     services:
-      # Postgres is provisioned here so tasks in later phases that use sqlx
-      # compile-time checks against a live DB (via `cargo sqlx prepare --check`)
-      # can run in this job. Unit tests themselves use SQLX_OFFLINE=true.
+      # Postgres is provisioned here so we can run `cargo sqlx prepare --check`
+      # against a live DB to catch drift between migrations/ and the committed
+      # .sqlx/ cache. Unit tests themselves use SQLX_OFFLINE=true.
       postgres:
         image: postgres:17
         env:
@@ -97,6 +97,20 @@ jobs:
       - name: cargo test --workspace
         # forge-e2e feature is intentionally excluded here — unit tests only.
         run: cargo test --workspace
+
+      # sqlx cache drift guard (A1). Runs migrations against the live Postgres
+      # service, then verifies the committed .sqlx/ dir matches the current
+      # queries + schema. SQLX_OFFLINE is unset here so the check talks to the DB.
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+      - name: Run migrations
+        env:
+          SQLX_OFFLINE: ""
+        run: sqlx migrate run --source migrations
+      - name: cargo sqlx prepare --check (catch .sqlx drift)
+        env:
+          SQLX_OFFLINE: ""
+        run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
   # ── E2E / integration tests (requires Postgres + versitygw containers) ─────
   # Gated behind the `forge-e2e` feature flag in the forge-e2e crate.
