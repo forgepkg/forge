@@ -23,6 +23,6 @@ pub use domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 pub use format::{Format, ReadSeek};
 pub use repo::{
     CacheInvalidator, DeleteOutcome, NoopCacheInvalidator, NupkgLocation, PublishOutcome,
-    RegistrationEntry, RepoError, RepoKind, RepoReadOps, SearchHit, SearchParams, SearchResult,
-    VersionEntry, WriteError,
+    RegistrationEntry, RepoError, RepoKind, RepoReadOps, RepoWriteOps, SearchHit, SearchParams,
+    SearchResult, UploadReader, VersionEntry, WriteError,
 };

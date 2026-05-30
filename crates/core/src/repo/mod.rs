@@ -280,3 +280,44 @@ pub trait RepoReadOps: Send + Sync {
     /// `skip`/`take` paging.
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError>;
 }
+
+/// A boxed async byte source, used by [`RepoWriteOps::store_upload`] so the
+/// trait stays object-safe (no generic method). The server bridges an axum
+/// multipart field stream into this via `tokio_util::io::StreamReader`.
+pub type UploadReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
+/// Write operations a NuGet **publish** route handler needs, abstracted (like
+/// [`RepoReadOps`]) so handlers can be unit-tested against an in-memory mock.
+///
+/// Keyed by **repository name**; ids/versions are passed as written and
+/// normalized internally by the implementation's [`crate::format::Format`].
+#[async_trait]
+pub trait RepoWriteOps: Send + Sync {
+    /// Publish (or redeploy) a package read from `reader`, enforcing
+    /// `max_upload_bytes`. See [`hosted::HostedWrite::store_upload`].
+    async fn store_upload(
+        &self,
+        repo: &str,
+        reader: UploadReader,
+        max_upload_bytes: u64,
+    ) -> Result<PublishOutcome, WriteError>;
+
+    /// Soft- or hard-delete a specific version. See
+    /// [`hosted::HostedWrite::delete_component`].
+    async fn delete_component(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        hard: bool,
+    ) -> Result<DeleteOutcome, WriteError>;
+
+    /// Relist a previously unlisted version. See
+    /// [`hosted::HostedWrite::relist`].
+    async fn relist(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<DeleteOutcome, WriteError>;
+}

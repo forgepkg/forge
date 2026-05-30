@@ -6,22 +6,29 @@
 //! are **absolute**, built from `public_base_url + /v3/{repo}`.
 //!
 //! `PackagePublish` is advertised in the service index for **hosted** repos
-//! only; proxy/group advertise read resources. The publish routes themselves
-//! land in Phase 7.
+//! only; proxy/group advertise read resources. The publish routes
+//! (`PUT/DELETE/POST /package`) are mounted for hosted repos via
+//! [`publish`].
 
 pub mod flat;
 pub mod index;
+pub mod publish;
 pub mod registration;
 pub mod search;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::routing::{get, MethodRouter};
+use axum::routing::{delete, get, put, MethodRouter};
 use axum::Router;
 use forge_core::format::Format;
 use forge_core::repo::{RepoError, RepoKind};
-use forge_core::RepoReadOps;
+use forge_core::{RepoReadOps, RepoWriteOps};
+
+/// Default maximum accepted upload size (bytes) when the server does not
+/// override it. Mirrors a generous NuGet package size ceiling; the real limit
+/// comes from server config (Phase 10).
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Stream the bytes of a stored `.nupkg` blob by its S3 object key.
 ///
@@ -50,6 +57,12 @@ pub struct RouteContext {
     pub format: Arc<dyn Format>,
     /// Byte access to stored `.nupkg` blobs.
     pub nupkg: Arc<dyn NupkgBytes>,
+    /// Write operations (publish / unlist / relist / hard delete). Present only
+    /// for **hosted** repositories; `None` for proxy/group, whose publish routes
+    /// are never mounted.
+    pub write: Option<Arc<dyn RepoWriteOps>>,
+    /// Maximum accepted upload size in bytes; uploads exceeding it yield 413.
+    pub max_upload_bytes: u64,
 }
 
 impl RouteContext {
@@ -86,7 +99,7 @@ where
 pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
     // The `kind` argument is authoritative for resource advertisement.
     ctx.kind = kind;
-    Router::new()
+    let mut router = Router::new()
         .route("/index.json", get_head(index::service_index))
         .route("/flat/{id}/index.json", get_head(flat::versions))
         .route("/flat/{id}/{version}/{filename}", get_head(flat::content))
@@ -94,8 +107,17 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
             "/registration/{id}/index.json",
             get_head(registration::index),
         )
-        .route("/query", get_head(search::query))
-        .with_state(ctx)
+        .route("/query", get_head(search::query));
+
+    // PackagePublish surface — hosted only.
+    if kind == RepoKind::Hosted {
+        router = router.route("/package", put(publish::push)).route(
+            "/package/{id}/{version}",
+            delete(publish::unlist).post(publish::relist),
+        );
+    }
+
+    router.with_state(ctx)
 }
 
 /// Map a [`RepoError`] to an HTTP response.
@@ -112,5 +134,30 @@ pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
         RepoError::Db(_) | RepoError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
+    }
+}
+
+/// Map a [`forge_core::WriteError`] to an HTTP response (spec §6 publish status
+/// codes): 413 too-large, 409 conflict, 400 invalid, else the wrapped
+/// [`RepoError`] mapping (404 / 500).
+pub(crate) fn write_error_response(err: forge_core::WriteError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use forge_core::WriteError;
+    match err {
+        WriteError::TooLarge { limit } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload exceeds limit of {limit} bytes"),
+        )
+            .into_response(),
+        WriteError::Conflict { id, version } => (
+            StatusCode::CONFLICT,
+            format!("package {id} {version} already exists"),
+        )
+            .into_response(),
+        WriteError::InvalidPackage(e) => {
+            (StatusCode::BAD_REQUEST, format!("invalid package: {e}")).into_response()
+        }
+        WriteError::Repo(re) => repo_error_response(re),
     }
 }

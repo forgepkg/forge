@@ -691,3 +691,35 @@ impl HostedWrite {
         Ok(DeleteOutcome::Relisted)
     }
 }
+
+#[async_trait]
+impl crate::repo::RepoWriteOps for HostedWrite {
+    async fn store_upload(
+        &self,
+        repo: &str,
+        reader: crate::repo::UploadReader,
+        max_upload_bytes: u64,
+    ) -> Result<PublishOutcome, WriteError> {
+        // Delegate to the inherent generic method over the boxed reader.
+        HostedWrite::store_upload(self, repo, reader, max_upload_bytes).await
+    }
+
+    async fn delete_component(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        hard: bool,
+    ) -> Result<DeleteOutcome, WriteError> {
+        HostedWrite::delete_component(self, repo, id, version, hard).await
+    }
+
+    async fn relist(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<DeleteOutcome, WriteError> {
+        HostedWrite::relist(self, repo, id, version).await
+    }
+}

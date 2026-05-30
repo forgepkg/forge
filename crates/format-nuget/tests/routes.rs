@@ -123,6 +123,22 @@ fn ctx(kind: RepoKind, ops: MockOps, bytes: MockBytes) -> RouteContext {
         ops: Arc::new(ops),
         format: Arc::new(NugetFormat::new()),
         nupkg: Arc::new(bytes),
+        write: None,
+        max_upload_bytes: 16 * 1024 * 1024,
+    }
+}
+
+/// Build a context wired with a mock write-ops backend for publish tests.
+fn ctx_with_write(kind: RepoKind, write: MockWrite) -> RouteContext {
+    RouteContext {
+        repo: "main".to_string(),
+        kind,
+        public_base_url: BASE.to_string(),
+        ops: Arc::new(MockOps::default()),
+        format: Arc::new(NugetFormat::new()),
+        nupkg: Arc::new(MockBytes::default()),
+        write: Some(Arc::new(write)),
+        max_upload_bytes: 16 * 1024 * 1024,
     }
 }
 
@@ -680,4 +696,218 @@ async fn search_supports_head() {
     let (status, _h, body) = send(&router, "HEAD", "/query?q=sample").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Publish surface (Phase 7) — mock write ops, no DB/S3
+// ---------------------------------------------------------------------------
+
+use forge_core::repo::{DeleteOutcome, PublishOutcome, RepoWriteOps, UploadReader, WriteError};
+use std::sync::Mutex;
+
+/// Records publish/delete/relist calls and replays a scripted outcome.
+#[derive(Default)]
+struct MockWrite {
+    /// Bytes received by the most recent `store_upload`, for assertions.
+    last_upload: Mutex<Option<Vec<u8>>>,
+    /// Outcome to return from `store_upload` (default: Created).
+    publish_result: Mutex<Option<Result<PublishOutcome, WriteError>>>,
+    /// Whether delete/relist should report the version as found.
+    found: bool,
+}
+
+impl MockWrite {
+    fn found() -> Self {
+        MockWrite {
+            found: true,
+            ..Default::default()
+        }
+    }
+}
+
+#[async_trait]
+impl RepoWriteOps for MockWrite {
+    async fn store_upload(
+        &self,
+        _repo: &str,
+        mut reader: UploadReader,
+        max_upload_bytes: u64,
+    ) -> Result<PublishOutcome, WriteError> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        if buf.len() as u64 > max_upload_bytes {
+            return Err(WriteError::TooLarge {
+                limit: max_upload_bytes,
+            });
+        }
+        *self.last_upload.lock().unwrap() = Some(buf);
+        self.publish_result
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Ok(PublishOutcome::Created))
+    }
+
+    async fn delete_component(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+        _hard: bool,
+    ) -> Result<DeleteOutcome, WriteError> {
+        Ok(if self.found {
+            DeleteOutcome::Unlisted
+        } else {
+            DeleteOutcome::NotFound
+        })
+    }
+
+    async fn relist(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<DeleteOutcome, WriteError> {
+        Ok(if self.found {
+            DeleteOutcome::Relisted
+        } else {
+            DeleteOutcome::NotFound
+        })
+    }
+}
+
+/// Send a `multipart/form-data` PUT with a single part holding `bytes`.
+async fn put_multipart(
+    router: &axum::Router,
+    uri: &str,
+    api_key: Option<&str>,
+    bytes: &[u8],
+) -> (StatusCode, Vec<u8>) {
+    let boundary = "TESTBOUNDARY1234";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"package\"; filename=\"p.nupkg\"\r\n",
+    );
+    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let mut builder = Request::builder().method("PUT").uri(uri).header(
+        "content-type",
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    if let Some(k) = api_key {
+        builder = builder.header("X-NuGet-ApiKey", k);
+    }
+    let req = builder.body(Body::from(body)).unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let out = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, out)
+}
+
+#[tokio::test]
+async fn publish_routes_present_for_hosted_only() {
+    // Proxy repos do not mount /package; PUT yields 405 (method not allowed) on
+    // the unrouted path (axum returns 405 when a path exists for other methods,
+    // 404 otherwise). Either way it is not 201/200.
+    let proxy = nuget_router(
+        RepoKind::Proxy,
+        ctx_with_write(RepoKind::Proxy, MockWrite::found()),
+    );
+    let (status, _) = put_multipart(&proxy, "/package", Some("key"), b"PK\x03\x04").await;
+    assert_ne!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn push_requires_api_key() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let (status, _) = put_multipart(&router, "/package", None, b"PK\x03\x04").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn push_streams_bytes_and_returns_201() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let payload = b"PK\x03\x04-nupkg-bytes";
+    let (status, _) = put_multipart(&router, "/package", Some("key"), payload).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn push_redeploy_also_returns_201() {
+    let w = MockWrite::found();
+    *w.publish_result.lock().unwrap() = Some(Ok(PublishOutcome::Replaced));
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn push_conflict_maps_to_409() {
+    let w = MockWrite::found();
+    *w.publish_result.lock().unwrap() = Some(Err(WriteError::Conflict {
+        id: "Sample.Lib".into(),
+        version: "1.0.0".into(),
+    }));
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn push_too_large_maps_to_413() {
+    let w = MockWrite::found();
+    *w.publish_result.lock().unwrap() = Some(Err(WriteError::TooLarge { limit: 4 }));
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn unlist_returns_204_when_found_404_when_not() {
+    let found = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let (status, _h, _) = send(&found, "DELETE", "/package/Sample.Lib/1.0.0").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let missing = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::default()),
+    );
+    let (status, _h, _) = send(&missing, "DELETE", "/package/Sample.Lib/9.9.9").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn relist_returns_200_when_found_404_when_not() {
+    let found = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let (status, _h, _) = send(&found, "POST", "/package/Sample.Lib/1.0.0").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let missing = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::default()),
+    );
+    let (status, _h, _) = send(&missing, "POST", "/package/Sample.Lib/9.9.9").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
