@@ -83,42 +83,37 @@ test:
     - SQLX_OFFLINE= sqlx migrate run --source migrations
     - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
-# ── E2E / integration tests (Postgres + versitygw containers) ────────────────
-# Gated behind the `forge-e2e` feature in the forge-e2e crate. Runs only on the
-# default branch to keep MR pipelines fast.
+# ── E2E / integration tests (forge-e2e crate, testcontainers) ────────────────
+# The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis) containers
+# via testcontainers, so this job needs a Docker daemon rather than GitLab
+# `services:`. We run Docker-in-Docker and point testcontainers at it.
+# Gated behind the `forge-e2e` feature; runs only on the default branch to keep
+# MR pipelines fast. The optional dotnet smoke test is skipped here (no SDK on
+# the rust image); add a dotnet SDK to the image to exercise it.
 e2e:
   stage: e2e
   needs: ["test"]
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
-    - name: postgres:17
-      alias: postgres
-    # versitygw: posix backend over /data on port 7070. The posix backend
-    # treats each subdir of /data as a bucket; the bucket dir is created by the
-    # test harness (or pre-created against the running service).
-    - name: versity/versitygw:v1.4.1
-      alias: versitygw
-      command:
-        ["--port", ":7070", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
+    - name: docker:27-dind
+      alias: docker
   variables:
-    POSTGRES_DB: forge
-    POSTGRES_USER: forge
-    POSTGRES_PASSWORD: forge
-    DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
-    FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
-    FORGE_S3_ENDPOINT: "http://versitygw:7070"
-    FORGE_S3_REGION: "us-east-1"
-    FORGE_S3_BUCKET: "forge"
-    FORGE_S3_ACCESS_KEY: "minioadmin"
-    FORGE_S3_SECRET_KEY: "minioadmin"
-    FORGE_S3_FORCE_PATH_STYLE: "true"
+    # Talk to the dind daemon over TCP (no TLS inside the CI network).
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    # testcontainers connects to the same daemon.
+    TESTCONTAINERS_HOST_OVERRIDE: "docker"
+    TESTCONTAINERS_RYUK_DISABLED: "true"
   cache:
     <<: *cargo-cache
   before_script:
-    # Wait for the postgres + versitygw services to accept connections.
-    - apt-get update -qq && apt-get install -y -qq postgresql-client curl
-    - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
-    - timeout 60 bash -c 'until curl -sf http://versitygw:7070/ >/dev/null 2>&1 || curl -s http://versitygw:7070/ 2>&1 | grep -q "NoSuchBucket\|ListBuckets\|InvalidRequest\|AccessDenied"; do sleep 1; done'
+    # Wait for the dind daemon to accept connections.
+    - apt-get update -qq && apt-get install -y -qq docker.io
+    - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+    # Pre-pull the images the harness uses (faster, deterministic).
+    - docker pull postgres:17
+    - docker pull versity/versitygw:v1.4.1
+    - docker pull redis:5.0
   script:
     - cargo test --workspace --features forge-e2e
