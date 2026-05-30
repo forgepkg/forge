@@ -560,6 +560,21 @@ impl TestServer {
             .await
             .unwrap()
     }
+
+    /// Add `member` to group `group` at the given priority via the admin API.
+    pub async fn add_member(&self, group: &str, member: &str, priority: i32) -> reqwest::Response {
+        let (u, p) = self.admin_basic();
+        self.client()
+            .post(format!(
+                "{}/admin/repositories/{group}/members",
+                self.base_url
+            ))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"member": member, "priority": priority}))
+            .send()
+            .await
+            .unwrap()
+    }
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -567,6 +582,13 @@ impl TestServer {
 /// Build a minimal valid `.nupkg` (a zip with `[Content_Types].xml` + a
 /// `{id}.nuspec`) that parses to `id@version`.
 pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
+    make_nupkg_with_desc(id, version, "generated test package")
+}
+
+/// Like [`make_nupkg`] but with a caller-supplied description, so two packages
+/// with the same `id@version` but different `desc` produce **distinct bytes**
+/// (distinct CAS blobs) — used to prove which group member served a download.
+pub fn make_nupkg_with_desc(id: &str, version: &str, desc: &str) -> Vec<u8> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -577,7 +599,7 @@ pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
     <id>{id}</id>
     <version>{version}</version>
     <authors>test</authors>
-    <description>generated test package</description>
+    <description>{desc}</description>
     <dependencies>
       <group targetFramework="net8.0">
         <dependency id="Newtonsoft.Json" version="[13.0.1, )" />

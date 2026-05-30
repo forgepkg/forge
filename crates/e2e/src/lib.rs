@@ -27,5 +27,6 @@ mod stack;
 
 pub use mock_upstream::{MockUpstream, UpstreamPackage};
 pub use stack::{
-    make_nupkg, start_stack, AnonMode, StackBuilder, TestServer, S3_ACCESS, S3_BUCKET, S3_SECRET,
+    make_nupkg, make_nupkg_with_desc, start_stack, AnonMode, StackBuilder, TestServer, S3_ACCESS,
+    S3_BUCKET, S3_SECRET,
 };
