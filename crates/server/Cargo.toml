@@ -7,4 +7,44 @@ edition = "2021"
 name = "forge-server"
 path = "src/main.rs"
 
+[lib]
+name = "forge_server"
+path = "src/lib.rs"
+
 [dependencies]
+forge-db = { path = "../db" }
+forge-storage = { path = "../storage" }
+forge-cache = { path = "../cache" }
+forge-core = { path = "../core" }
+forge-nuget = { path = "../format-nuget" }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
+axum = { workspace = true, features = ["multipart"] }
+tower = { version = "0.5", features = ["util"] }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http = { workspace = true }
+async-trait = { workspace = true }
+ipnet = { workspace = true }
+url = { workspace = true }
+argon2 = { workspace = true, features = ["password-hash"] }
+tokio-util = { workspace = true }
+
+# Config: TOML + FORGE_* env overrides.
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+reqwest = { workspace = true }
+forge-nuget = { path = "../format-nuget" }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+figment = { version = "0.10", features = ["toml", "env", "test"] }
