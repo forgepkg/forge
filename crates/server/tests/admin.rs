@@ -4,6 +4,10 @@
 
 mod common;
 
+use forge_db::asset_dao::{self, NewAsset};
+use forge_db::blob_dao;
+use forge_db::component_dao::{self, NewComponent};
+use forge_db::repository_dao::{self, NewRepository};
 use serde_json::{json, Value};
 
 /// The bootstrap admin can authenticate (basic) and list repositories; the
@@ -196,6 +200,155 @@ async fn token_issue_use_and_revoke() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "revoked token must be rejected");
+}
+
+/// Deleting a **proxy** repository that has cached packages must decrement the
+/// referenced blobs' ref-counts (enqueuing outbox deletes at zero) so S3 objects
+/// can be reclaimed — a raw FK cascade would orphan the blob references. The
+/// repository is then removed (204).
+#[tokio::test]
+async fn delete_proxy_repo_decrefs_cached_blobs() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("proxydel{s}");
+    let sha = format!("{:0>64}", format!("deadbeef{s}"));
+    let s3_key = format!("blobs/{sha}");
+
+    // Seed a proxy repo with a cached package: blob (committed, ref_count 1) +
+    // component + asset — mirroring what the proxy download path persists.
+    let repo = repository_dao::insert_repository(
+        &srv.pool,
+        NewRepository {
+            remote_url: Some("https://api.nuget.org/v3/index.json".into()),
+            ..NewRepository::proxy(name.clone())
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        blob_dao::upsert_pending(&srv.pool, &sha, 123, &s3_key)
+            .await
+            .unwrap(),
+        "blob should be newly inserted"
+    );
+    {
+        let mut tx = srv.pool.begin().await.unwrap();
+        blob_dao::commit_and_incref(&mut tx, &sha).await.unwrap();
+        let comp = component_dao::insert_component(
+            &mut *tx,
+            NewComponent {
+                repository_id: repo.id,
+                name: "somepkg".into(),
+                original_id: "SomePkg".into(),
+                version: "1.0.0".into(),
+                version_original: "1.0.0".into(),
+                listed: true,
+            },
+        )
+        .await
+        .unwrap();
+        asset_dao::insert_asset(
+            &mut *tx,
+            NewAsset {
+                component_id: comp.id,
+                path: "somepkg.1.0.0.nupkg".into(),
+                content_type: "application/octet-stream".into(),
+                blob_sha256: sha.clone(),
+                size: 123,
+                sha512_base64: Some("c2hh".into()),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let before = blob_dao::get_blob(&srv.pool, &sha).await.unwrap().unwrap();
+    assert_eq!(before.ref_count, 1, "blob seeded with one reference");
+
+    // Delete the proxy repository.
+    let resp = client
+        .delete(format!("{}/admin/repositories/{name}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "proxy repo with cache must delete");
+
+    // The repository is gone.
+    assert!(repository_dao::find_repository_by_name(&srv.pool, &name)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The blob ref-count was decremented to zero (not leaked).
+    let after = blob_dao::get_blob(&srv.pool, &sha).await.unwrap().unwrap();
+    assert_eq!(
+        after.ref_count, 0,
+        "blob ref-count must be decremented on repo delete"
+    );
+
+    // A deferred delete was enqueued so the S3 object is reclaimable (grace=0).
+    let enqueued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM blob_outbox WHERE sha256 = $1 AND op = 'delete_object'",
+    )
+    .bind(&sha)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        enqueued, 1,
+        "an outbox delete must be enqueued at zero refs"
+    );
+}
+
+/// Deleting a **hosted** repository that still owns packages is refused (409);
+/// the admin must hard-delete the packages first.
+#[tokio::test]
+async fn delete_hosted_repo_with_packages_refused() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("hosteddel{s}");
+
+    let repo = repository_dao::insert_repository(&srv.pool, NewRepository::hosted(name.clone()))
+        .await
+        .unwrap();
+    component_dao::insert_component(
+        &srv.pool,
+        NewComponent {
+            repository_id: repo.id,
+            name: "pkg".into(),
+            original_id: "Pkg".into(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = client
+        .delete(format!("{}/admin/repositories/{name}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "hosted repo with packages must be refused"
+    );
+
+    // Still present.
+    assert!(repository_dao::find_repository_by_name(&srv.pool, &name)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// Group membership: nested-group members and duplicate priorities are

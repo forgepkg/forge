@@ -269,9 +269,20 @@ pub async fn update(
 
 /// `DELETE /admin/repositories/{name}`
 ///
-/// Refuses to delete a repository that still has components — the admin must
-/// hard-delete its packages first so blob ref-counts are correctly decremented
-/// and S3 objects reclaimed (a raw cascade would orphan blob references).
+/// A raw cascade would drop a repository's `component`/`asset` rows via FK while
+/// leaving the referenced `blob` ref-counts inflated and their S3 objects
+/// unreclaimable. Both hosted *and* proxy repositories accumulate
+/// component/asset/blob rows (a proxy persists them when it caches a package
+/// downloaded from upstream — see `forge_core::repo::proxy`), so the blob
+/// ref-counts must be decremented before the repository is removed regardless of
+/// kind.
+///
+/// - **Hosted** repos refuse deletion while they still own components — the
+///   admin must hard-delete its packages first (an explicit, auditable step,
+///   since hosted content is uploaded and not reproducible).
+/// - **Proxy** repos hold only a reconstructible upstream cache, so deletion
+///   transactionally decrefs every referenced blob (enqueuing outbox deletes at
+///   zero refs) and removes the components before dropping the repository.
 pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
         Ok(Some(r)) => r,
@@ -279,7 +290,8 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Err(e) => return db_error(e),
     };
 
-    // Hosted repos may still own components; require them gone first.
+    // Hosted repos may still own (non-reproducible) components; require them
+    // gone first so the deletion is an explicit admin action.
     if existing.kind() == RepoKind::Hosted {
         match component_dao::list_components_for_repo(&state.pool, existing.id).await {
             Ok(comps) if !comps.is_empty() => {
@@ -292,6 +304,14 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
             Ok(_) => {}
             Err(e) => return db_error(e),
         }
+    } else {
+        // Proxy (and any non-hosted) repos: decref every blob referenced by the
+        // repo's cached components so blob GC stays correct, then the cascade
+        // can safely drop the now-zero-ref component/asset rows.
+        let grace = state.config.outbox.grace();
+        if let Err(e) = purge_repo_blob_refs(&state, existing.id, grace).await {
+            return db_error(e);
+        }
     }
 
     match repository_dao::delete_repository(&state.pool, existing.id).await {
@@ -299,6 +319,33 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Ok(false) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => db_error(e),
     }
+}
+
+/// Transactionally decrement the ref-count of every blob referenced by any asset
+/// of any component in `repo_id`, enqueuing an outbox delete when a blob reaches
+/// zero refs, then delete the components (assets cascade via FK). Mirrors the
+/// per-package [`hard_delete`] path so blob GC stays correct when a whole
+/// repository is removed.
+async fn purge_repo_blob_refs(
+    state: &AppState,
+    repo_id: i64,
+    grace: chrono::Duration,
+) -> sqlx::Result<()> {
+    let components = component_dao::list_components_for_repo(&state.pool, repo_id).await?;
+    if components.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = state.pool.begin().await?;
+    for comp in &components {
+        let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
+        for asset in &assets {
+            blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
+        }
+        component_dao::delete_component(&mut *tx, repo_id, &comp.name, &comp.version).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
