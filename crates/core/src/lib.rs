@@ -17,6 +17,11 @@ pub mod auth;
 pub mod domain;
 pub mod format;
 pub mod net;
+pub mod repo;
 
 pub use domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 pub use format::{Format, ReadSeek};
+pub use repo::{
+    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    SearchResult, VersionEntry,
+};

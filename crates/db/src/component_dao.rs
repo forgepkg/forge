@@ -92,6 +92,28 @@ pub async fn list_versions(
     .await
 }
 
+/// List every component (all ids, all versions) in a repository, ordered by
+/// `(name, id)`. Used by hosted search, which groups in memory.
+pub async fn list_components_for_repo(
+    pool: &PgPool,
+    repository_id: i64,
+) -> sqlx::Result<Vec<Component>> {
+    sqlx::query_as!(
+        Component,
+        r#"
+        SELECT
+            id, repository_id, name, original_id, version, version_original,
+            listed, created_at, updated_at
+        FROM component
+        WHERE repository_id = $1
+        ORDER BY name, id
+        "#,
+        repository_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Set the `listed` flag on a specific component version. Returns whether a row
 /// was updated.
 pub async fn set_listed(

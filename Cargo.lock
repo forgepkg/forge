@@ -1401,6 +1401,7 @@ dependencies = [
  "base64",
  "chrono",
  "forge-db",
+ "forge-nuget",
  "hex",
  "http 1.4.1",
  "ipnet",

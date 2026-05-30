@@ -31,6 +31,9 @@ url = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
 forge-db = { path = "../db" }
+# dev-only cycle (forge-nuget depends on forge-core); Cargo permits this for the
+# version-ordering Format impl used by the hosted-read integration tests.
+forge-nuget = { path = "../format-nuget" }
 argon2 = { workspace = true, features = ["password-hash"] }
 serde_json = { workspace = true }
 testcontainers = "0.27"
