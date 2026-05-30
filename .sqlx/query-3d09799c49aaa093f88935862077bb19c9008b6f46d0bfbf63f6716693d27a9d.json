@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO proxy_upstream_index (repository_id, resources, fetched_at, etag)\n        VALUES ($1, $2, now(), NULL)\n        ON CONFLICT (repository_id)\n        DO UPDATE SET resources = EXCLUDED.resources, fetched_at = EXCLUDED.fetched_at, etag = EXCLUDED.etag\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3d09799c49aaa093f88935862077bb19c9008b6f46d0bfbf63f6716693d27a9d"
+}

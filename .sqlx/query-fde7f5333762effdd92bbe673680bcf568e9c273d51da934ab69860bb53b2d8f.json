@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO proxy_cached_version\n                (repository_id, name, version, listed, downloaded, not_found, not_found_at)\n            VALUES ($1, $2, $3, false, false, true, now())\n            ON CONFLICT (repository_id, name, version)\n            DO UPDATE SET not_found = true, not_found_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fde7f5333762effdd92bbe673680bcf568e9c273d51da934ab69860bb53b2d8f"
+}

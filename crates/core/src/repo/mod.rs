@@ -9,6 +9,7 @@
 //! `forge-core` free of NuGet-specific manifest parsing).
 
 pub mod hosted;
+pub mod proxy;
 
 use async_trait::async_trait;
 
