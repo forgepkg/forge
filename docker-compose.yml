@@ -9,7 +9,9 @@ services:
       POSTGRES_USER: forge
       POSTGRES_PASSWORD: forge
     ports:
-      - "5432:5432"
+      # Host 5433 -> container 5432, to avoid colliding with a Postgres that may
+      # already be listening on the host's default 5432. forge.toml points here.
+      - "5433:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:

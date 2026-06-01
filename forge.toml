@@ -1,0 +1,66 @@
+# envisia-forge — ready-to-use LOCAL DEV configuration.
+#
+# The server loads ./forge.toml automatically (override the path with
+# $FORGE_CONFIG). Values match docker-compose.yml (Postgres on :5432,
+# versitygw S3 on :7070). Any key can be overridden by an environment
+# variable using DOUBLE-underscore nesting, e.g.:
+#   FORGE_SERVER__BIND=0.0.0.0:8080
+#   FORGE_AUTH__ANONYMOUS_MODE=off
+#
+# ⚠️  Dev credentials only — do NOT use these in production. In prod, point
+#     $FORGE_CONFIG at a real file (or use FORGE_* env vars) with real secrets.
+
+[server]
+bind = "0.0.0.0:3000"
+# Used to build absolute NuGet V3 @id URLs in the service index. No trailing slash.
+public_base_url = "http://localhost:3000"
+
+[database]
+# docker-compose maps the dev Postgres to host port 5433 (see docker-compose.yml).
+url = "postgres://forge:forge@localhost:5433/forge"
+
+[s3]
+endpoint = "http://localhost:7070"
+region = "us-east-1"
+bucket = "forge"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+force_path_style = true          # required for versitygw / MinIO
+# multipart_threshold = 8388608  # 8 MiB (default)
+
+[auth]
+# Controls whether an UNAUTHENTICATED request is treated as an "anonymous"
+# principal. It does NOT by itself grant read access — a repo must ALSO be
+# created with `anonymous_read: true` (authz = User OR (Anonymous AND
+# repo.anonymous_read)). So for no-auth local reads: anonymous_mode = "all"
+# here AND create repos with {"anonymous_read": true}.
+#   "all"       — every unauthenticated request becomes Anonymous (easiest local).
+#   "allowlist" — only client IPs in anonymous_ip_allowlist become Anonymous.
+#   "off"       — no anonymous principal; all access requires authentication.
+anonymous_mode = "all"
+# Only used when anonymous_mode = "allowlist". Tokens: loopback | private | local | <CIDR>.
+anonymous_ip_allowlist = ["loopback"]
+# CIDRs of reverse proxies whose X-Forwarded-For header is trusted.
+trusted_proxy_cidrs = []
+# Allow HTTP Basic auth with a USER PASSWORD (token-in-Basic is always allowed).
+# REQUIRED so the bootstrap admin below can authenticate to the /admin API.
+allow_password_basic = true
+
+# First-run admin, created automatically if no admin user exists yet.
+[auth.bootstrap_admin]
+username = "admin"
+password = "changeme"
+
+# ── Optional ───────────────────────────────────────────────────────────────
+# Redis L2 cache + cross-instance invalidation backplane. Omit for L1-only.
+# [redis]
+# url = "redis://localhost:6379"
+
+# [cache]
+# l1_max_capacity = 10000
+# default_ttl_seconds = 30
+
+# [outbox]
+# batch_size = 100
+# grace_seconds = 3600        # delay before a dereferenced blob is deleted from S3
+# poll_interval_seconds = 10
