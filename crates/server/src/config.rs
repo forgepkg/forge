@@ -387,6 +387,64 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn env_example_var_names_map_to_nested_fields() {
+        // Guards `.env.example`: every FORGE_* name documented there must use the
+        // `__` nested separator and match a real Config field. This exercises one
+        // representative key per section (incl. the doubly-nested bootstrap admin,
+        // a numeric, a bool, and a Vec) so a stale example name fails CI.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_SERVER__BIND", "127.0.0.1:9999");
+            jail.set_env("FORGE_SERVER__PUBLIC_BASE_URL", "https://forge.test");
+            jail.set_env("FORGE_DATABASE__URL", "postgres://u:p@db/forge");
+            jail.set_env("FORGE_S3__ENDPOINT", "http://s3.test:7070");
+            jail.set_env("FORGE_S3__ACCESS_KEY", "ak");
+            jail.set_env("FORGE_S3__SECRET_KEY", "sk");
+            jail.set_env("FORGE_S3__FORCE_PATH_STYLE", "false");
+            jail.set_env("FORGE_S3__MULTIPART_THRESHOLD", "1048576");
+            jail.set_env("FORGE_AUTH__ANONYMOUS_MODE", "allowlist");
+            jail.set_env("FORGE_AUTH__ANONYMOUS_IP_ALLOWLIST", "[loopback,private]");
+            jail.set_env("FORGE_AUTH__ALLOW_PASSWORD_BASIC", "true");
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "root");
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "s3cret");
+            jail.set_env("FORGE_REDIS__URL", "redis://localhost:6379");
+            jail.set_env("FORGE_CACHE__L1_MAX_CAPACITY", "42");
+            jail.set_env("FORGE_CACHE__DEFAULT_TTL_SECONDS", "120");
+            jail.set_env("FORGE_OUTBOX__BATCH_SIZE", "7");
+            jail.set_env("FORGE_OUTBOX__GRACE_SECONDS", "60");
+            jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
+
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+
+            assert_eq!(cfg.server.bind, "127.0.0.1:9999");
+            assert_eq!(cfg.public_base_url(), "https://forge.test");
+            assert_eq!(cfg.database.url, "postgres://u:p@db/forge");
+            assert_eq!(cfg.s3.endpoint, "http://s3.test:7070");
+            assert_eq!(cfg.s3.access_key, "ak");
+            assert_eq!(cfg.s3.secret_key, "sk");
+            assert!(!cfg.s3.force_path_style);
+            assert_eq!(cfg.s3.multipart_threshold, 1_048_576);
+            assert_eq!(cfg.auth.anonymous_mode, "allowlist");
+            assert_eq!(
+                cfg.auth.anonymous_ip_allowlist,
+                vec!["loopback".to_string(), "private".to_string()]
+            );
+            assert!(cfg.auth.allow_password_basic);
+            let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin set via env");
+            assert_eq!(ba.username, "root");
+            assert_eq!(ba.password, "s3cret");
+            assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
+            assert_eq!(cfg.cache.l1_max_capacity, 42);
+            assert_eq!(cfg.cache.default_ttl_seconds, 120);
+            assert_eq!(cfg.outbox.batch_size, 7);
+            assert_eq!(cfg.outbox.grace_seconds, 60);
+            assert_eq!(cfg.outbox.poll_interval_seconds, 3);
+            Ok(())
+        });
+    }
+
+    #[test]
     fn missing_required_key_errors() {
         // Drop the [database] section.
         let toml = r#"

@@ -1,0 +1,53 @@
+# envisia-forge configuration (TOML form).
+#
+# Copy this to `forge.toml` (loaded automatically if present in the working
+# directory) or point $FORGE_CONFIG at it. This file is the base layer; any
+# `FORGE_*` environment variable overrides the matching key (see .env.example).
+# Nested keys map section-by-section: `[auth].bootstrap_admin.username` is set
+# via `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME`.
+#
+# Keys marked "(default: …)" may be omitted entirely.
+
+[server]
+bind = "0.0.0.0:3000"
+# Public base URL for absolute NuGet V3 service-index @id values. No trailing slash.
+public_base_url = "http://localhost:3000"
+
+[database]
+url = "postgres://forge:forge@localhost:5432/forge"
+
+[s3]
+endpoint = "http://localhost:7070"
+region = "us-east-1"            # (default: "us-east-1")
+bucket = "forge"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+force_path_style = true         # (default: true) required for versitygw/MinIO
+multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above this many bytes
+
+[auth]
+anonymous_mode = "off"          # (default: "off") off | allowlist | all
+# Tokens (loopback/private/local) or CIDRs; used only when anonymous_mode = "allowlist".
+anonymous_ip_allowlist = ["loopback"]   # (default: [])
+# CIDRs of reverse proxies whose X-Forwarded-For is trusted.
+trusted_proxy_cidrs = []        # (default: [])
+allow_password_basic = false    # (default: false)
+
+# Optional: bootstrap admin created on first run if no admin users exist.
+# Omit the whole section to skip.
+[auth.bootstrap_admin]
+username = "admin"
+password = "changeme"
+
+[redis]
+# Optional shared L2 cache + invalidation backplane. Omit for L1-only caching.
+# url = "redis://localhost:6379"
+
+[cache]
+l1_max_capacity = 10000         # (default: 10000)
+default_ttl_seconds = 30        # (default: 30)
+
+[outbox]
+batch_size = 100                # (default: 100)
+grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted
+poll_interval_seconds = 10      # (default: 10)
