@@ -1,0 +1,625 @@
+//! Retention policy model + validation (the `repository.retention_policy` jsonb).
+//!
+//! The shape mirrors the design doc (§2) and the `0002_retention.sql` migration:
+//! a policy is a list of **rules**; a component is acted on if **any** rule
+//! selects it (union), but `keep_last_n` / `keep_n_most_downloaded` protections
+//! always win (a protected version is never deleted — see [`crate::retention::evaluate`]).
+//!
+//! Parity subset of Nexus cleanup policies + Artifactory retention:
+//!   * protections: `keep_last_n`, `keep_n_most_downloaded`
+//!   * triggers (ANDed within a rule): `older_than_days`, `not_downloaded_for_days`
+//!   * filters: `release_type` (release vs prerelease), `package_name_prefix`
+//!   * proxy rules: `scope: proxy_cached` with `not_pulled_for_days`
+//!
+//! These types are **pure data** + a `validate_policy` function; no I/O. They are
+//! (de)serialized straight to/from the jsonb column with serde.
+
+use serde::{Deserialize, Serialize};
+
+use crate::repo::RepoKind;
+
+/// The current policy schema version. Bumped if the shape changes incompatibly.
+pub const POLICY_VERSION: u32 = 1;
+
+/// A repository's retention policy, stored as `repository.retention_policy` jsonb.
+///
+/// `None` policy column ⇒ no retention. An `enabled = false` policy is parsed
+/// and stored but produces no decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Policy schema version (must equal [`POLICY_VERSION`]).
+    pub version: u32,
+    /// Master switch; a disabled policy yields no decisions.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Safety flag: evaluate + audit but never apply (every decision forced to
+    /// `dry_run = true`, apply skipped). Lets an operator stage a policy.
+    #[serde(default)]
+    pub dry_run_only: bool,
+    /// Minimum seconds between automatic runs for this repo (advisory scheduling
+    /// floor used by the worker; a manual trigger bypasses it).
+    #[serde(default = "default_min_run_interval")]
+    pub min_run_interval_seconds: u64,
+    /// The ordered list of rules. Must be non-empty.
+    pub rules: Vec<RetentionRule>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_min_run_interval() -> u64 {
+    3600
+}
+
+/// A single retention rule. Criteria within a rule are ANDed; a component is
+/// acted on if **any** rule selects it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionRule {
+    /// Stable, human-chosen id, recorded on every audit row this rule produces.
+    pub id: String,
+    /// What to do with a selected component.
+    pub action: Action,
+    /// Which targets this rule operates on. Defaults to hosted components.
+    #[serde(default)]
+    pub scope: Scope,
+    /// Restrict the rule to release / prerelease versions. Defaults to `Any`.
+    #[serde(default)]
+    pub release_type: ReleaseType,
+    /// Optional case-insensitive package-id prefix filter (`None` ⇒ all ids).
+    #[serde(default)]
+    pub package_name_prefix: Option<String>,
+    /// The protections + triggers for this rule.
+    #[serde(default)]
+    pub criteria: Criteria,
+}
+
+/// What a rule does with a selected version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Soft delete: hide from search/metadata but keep the blob downloadable.
+    Unlist,
+    /// Hard delete: remove rows and dereference blobs (driving the outbox).
+    HardDelete,
+}
+
+impl Action {
+    /// Severity ordering for "highest-severity action wins" when multiple rules
+    /// match a version: `HardDelete` outranks `Unlist`.
+    pub fn severity(self) -> u8 {
+        match self {
+            Action::Unlist => 1,
+            Action::HardDelete => 2,
+        }
+    }
+}
+
+/// The set of targets a rule operates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Hosted components (the default scope).
+    #[default]
+    Hosted,
+    /// Proxy cached versions (`proxy_cached_version` rows); only valid on proxy
+    /// repos. Eviction = delete; proxy entries are never "unlisted".
+    ProxyCached,
+}
+
+/// Release-type filter for a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseType {
+    /// Match every version.
+    #[default]
+    Any,
+    /// Match only stable releases (no prerelease label).
+    Releases,
+    /// Match only prerelease versions.
+    Prereleases,
+}
+
+/// Protections + triggers for a rule. All fields optional; an empty `Criteria`
+/// is rejected by [`validate_policy`] (a rule must do *something*).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Criteria {
+    /// Protect the newest N versions (by format version order) per package id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_last_n: Option<u32>,
+    /// Protect the N most-recently-downloaded versions per package id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_n_most_downloaded: Option<u32>,
+    /// Trigger: component age since `created_at` is at least this many days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_days: Option<u32>,
+    /// Trigger: not downloaded for at least this many days (never-downloaded
+    /// always matches).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_downloaded_for_days: Option<u32>,
+    /// Proxy trigger: cached version not pulled for at least this many days
+    /// (falls back to `first_seen_at` when never pulled). Only meaningful for
+    /// `scope: proxy_cached` rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_pulled_for_days: Option<u32>,
+}
+
+impl Criteria {
+    /// Whether this rule expresses any deletion **trigger** (as opposed to only
+    /// protections). A rule of pure protections selects nothing, so it is
+    /// rejected at validation time.
+    pub fn has_trigger(&self) -> bool {
+        self.older_than_days.is_some()
+            || self.not_downloaded_for_days.is_some()
+            || self.not_pulled_for_days.is_some()
+    }
+
+    /// Whether this rule defines any protection.
+    pub fn has_protection(&self) -> bool {
+        self.keep_last_n.is_some() || self.keep_n_most_downloaded.is_some()
+    }
+}
+
+/// Validation errors for a [`RetentionPolicy`] against a repository kind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyError {
+    /// `version` did not match [`POLICY_VERSION`].
+    #[error("unsupported policy version {found} (expected {expected})")]
+    UnsupportedVersion {
+        /// The version found in the policy.
+        found: u32,
+        /// The version this build supports.
+        expected: u32,
+    },
+    /// The policy had no rules.
+    #[error("policy must contain at least one rule")]
+    EmptyRules,
+    /// Two rules shared the same `id`.
+    #[error("duplicate rule id {0:?}")]
+    DuplicateRuleId(String),
+    /// A rule's `id` was empty.
+    #[error("rule id must not be empty")]
+    EmptyRuleId,
+    /// A rule had no deletion trigger (only protections / nothing).
+    #[error("rule {0:?} has no trigger criterion (older_than_days / not_downloaded_for_days / not_pulled_for_days)")]
+    RuleHasNoTrigger(String),
+    /// A `keep_*` count was zero (meaningless — protects nothing; use absence
+    /// instead).
+    #[error("rule {rule:?} field {field} must be greater than zero")]
+    ZeroCount {
+        /// The offending rule id.
+        rule: String,
+        /// The offending field name.
+        field: &'static str,
+    },
+    /// A `*_days` value was zero (would match everything immediately; reject as
+    /// almost certainly a mistake).
+    #[error("rule {rule:?} field {field} must be greater than zero")]
+    ZeroDays {
+        /// The offending rule id.
+        rule: String,
+        /// The offending field name.
+        field: &'static str,
+    },
+    /// A `scope: proxy_cached` rule was attached to a non-proxy repository.
+    #[error("rule {0:?} uses scope=proxy_cached but the repository is not a proxy")]
+    ProxyScopeOnNonProxy(String),
+    /// A hosted-scope rule used the proxy-only `not_pulled_for_days` criterion.
+    #[error("rule {0:?} uses not_pulled_for_days but scope is not proxy_cached")]
+    NotPulledOnHostedScope(String),
+    /// A proxy-scope rule used hosted-only criteria / fields that don't apply.
+    #[error("rule {rule:?} uses {field} which is not valid for scope=proxy_cached")]
+    HostedFieldOnProxyScope {
+        /// The offending rule id.
+        rule: String,
+        /// The offending field name.
+        field: &'static str,
+    },
+    /// Retention was configured on a group repository (groups own no content).
+    #[error("retention policies are not supported on group repositories")]
+    GroupRepoUnsupported,
+}
+
+/// Validate a policy against the repository kind it will attach to.
+///
+/// Rejects: wrong version, empty / duplicate rule ids, rules with no trigger,
+/// zero counts/days, proxy-scope rules on non-proxy repos (and vice-versa for
+/// proxy-only criteria), and any policy on a group repo. A disabled policy is
+/// still validated so a re-enable can't smuggle in a broken rule.
+pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<(), PolicyError> {
+    if policy.version != POLICY_VERSION {
+        return Err(PolicyError::UnsupportedVersion {
+            found: policy.version,
+            expected: POLICY_VERSION,
+        });
+    }
+    if repo_kind == RepoKind::Group {
+        return Err(PolicyError::GroupRepoUnsupported);
+    }
+    if policy.rules.is_empty() {
+        return Err(PolicyError::EmptyRules);
+    }
+
+    let mut seen_ids: Vec<&str> = Vec::with_capacity(policy.rules.len());
+    for rule in &policy.rules {
+        if rule.id.trim().is_empty() {
+            return Err(PolicyError::EmptyRuleId);
+        }
+        if seen_ids.contains(&rule.id.as_str()) {
+            return Err(PolicyError::DuplicateRuleId(rule.id.clone()));
+        }
+        seen_ids.push(&rule.id);
+
+        validate_rule(rule, repo_kind)?;
+    }
+    Ok(())
+}
+
+fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), PolicyError> {
+    let c = &rule.criteria;
+
+    // Scope/repo-kind coherence.
+    match rule.scope {
+        Scope::ProxyCached if repo_kind != RepoKind::Proxy => {
+            return Err(PolicyError::ProxyScopeOnNonProxy(rule.id.clone()));
+        }
+        Scope::ProxyCached => {
+            // Proxy rules act only on `not_pulled_for_days`; hosted-only fields
+            // are nonsensical here and almost certainly a copy-paste mistake.
+            if c.older_than_days.is_some() {
+                return Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: rule.id.clone(),
+                    field: "older_than_days",
+                });
+            }
+            if c.not_downloaded_for_days.is_some() {
+                return Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: rule.id.clone(),
+                    field: "not_downloaded_for_days",
+                });
+            }
+            if c.has_protection() {
+                return Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: rule.id.clone(),
+                    field: "keep_last_n/keep_n_most_downloaded",
+                });
+            }
+        }
+        Scope::Hosted => {
+            if c.not_pulled_for_days.is_some() {
+                return Err(PolicyError::NotPulledOnHostedScope(rule.id.clone()));
+            }
+        }
+    }
+
+    // Counts must be positive when present.
+    if c.keep_last_n == Some(0) {
+        return Err(PolicyError::ZeroCount {
+            rule: rule.id.clone(),
+            field: "keep_last_n",
+        });
+    }
+    if c.keep_n_most_downloaded == Some(0) {
+        return Err(PolicyError::ZeroCount {
+            rule: rule.id.clone(),
+            field: "keep_n_most_downloaded",
+        });
+    }
+    // Days must be positive when present.
+    if c.older_than_days == Some(0) {
+        return Err(PolicyError::ZeroDays {
+            rule: rule.id.clone(),
+            field: "older_than_days",
+        });
+    }
+    if c.not_downloaded_for_days == Some(0) {
+        return Err(PolicyError::ZeroDays {
+            rule: rule.id.clone(),
+            field: "not_downloaded_for_days",
+        });
+    }
+    if c.not_pulled_for_days == Some(0) {
+        return Err(PolicyError::ZeroDays {
+            rule: rule.id.clone(),
+            field: "not_pulled_for_days",
+        });
+    }
+
+    // Every rule must express at least one trigger; pure-protection rules
+    // delete nothing and are almost certainly a config error.
+    if !c.has_trigger() {
+        return Err(PolicyError::RuleHasNoTrigger(rule.id.clone()));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The §2 example policy (hosted keep-recent + a proxy evict rule), built in
+    /// code so tests can mutate it.
+    fn example_hosted_rule() -> RetentionRule {
+        RetentionRule {
+            id: "keep-recent-releases".into(),
+            action: Action::HardDelete,
+            scope: Scope::Hosted,
+            release_type: ReleaseType::Any,
+            package_name_prefix: None,
+            criteria: Criteria {
+                keep_last_n: Some(10),
+                keep_n_most_downloaded: None,
+                older_than_days: Some(90),
+                not_downloaded_for_days: Some(30),
+                not_pulled_for_days: None,
+            },
+        }
+    }
+
+    fn example_proxy_rule() -> RetentionRule {
+        RetentionRule {
+            id: "proxy-evict-cold".into(),
+            action: Action::HardDelete,
+            scope: Scope::ProxyCached,
+            release_type: ReleaseType::Any,
+            package_name_prefix: None,
+            criteria: Criteria {
+                not_pulled_for_days: Some(30),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn minimal_valid() -> RetentionPolicy {
+        RetentionPolicy {
+            version: POLICY_VERSION,
+            enabled: true,
+            dry_run_only: false,
+            min_run_interval_seconds: 3600,
+            rules: vec![example_hosted_rule()],
+        }
+    }
+
+    #[test]
+    fn roundtrips_the_design_example() {
+        let policy = RetentionPolicy {
+            version: 1,
+            enabled: true,
+            dry_run_only: false,
+            min_run_interval_seconds: 3600,
+            rules: vec![example_hosted_rule(), example_proxy_rule()],
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: RetentionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, back);
+    }
+
+    #[test]
+    fn deserializes_compact_jsonc_shape() {
+        // Mirrors the doc example with optional fields omitted (serde defaults).
+        let json = r#"{
+            "version": 1,
+            "rules": [
+                {
+                    "id": "keep-recent",
+                    "action": "hard_delete",
+                    "criteria": { "keep_last_n": 10, "older_than_days": 90 }
+                }
+            ]
+        }"#;
+        let policy: RetentionPolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.enabled, "enabled defaults to true");
+        assert!(!policy.dry_run_only);
+        assert_eq!(policy.min_run_interval_seconds, 3600);
+        assert_eq!(policy.rules.len(), 1);
+        let r = &policy.rules[0];
+        assert_eq!(r.scope, Scope::Hosted);
+        assert_eq!(r.release_type, ReleaseType::Any);
+        assert_eq!(r.criteria.keep_last_n, Some(10));
+        validate_policy(&policy, RepoKind::Hosted).unwrap();
+    }
+
+    #[test]
+    fn action_and_enums_use_snake_case_wire_form() {
+        assert_eq!(
+            serde_json::to_string(&Action::HardDelete).unwrap(),
+            "\"hard_delete\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Action::Unlist).unwrap(),
+            "\"unlist\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Scope::ProxyCached).unwrap(),
+            "\"proxy_cached\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReleaseType::Prereleases).unwrap(),
+            "\"prereleases\""
+        );
+    }
+
+    #[test]
+    fn accepts_minimal_valid_policy() {
+        validate_policy(&minimal_valid(), RepoKind::Hosted).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_version() {
+        let mut p = minimal_valid();
+        p.version = 2;
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::UnsupportedVersion {
+                found: 2,
+                expected: 1
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_empty_rules() {
+        let mut p = minimal_valid();
+        p.rules.clear();
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::EmptyRules)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_rule_id() {
+        let mut p = minimal_valid();
+        p.rules[0].id = "  ".into();
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::EmptyRuleId)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_rule_ids() {
+        let mut p = minimal_valid();
+        p.rules.push(example_hosted_rule());
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::DuplicateRuleId("keep-recent-releases".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_scope_on_hosted_repo() {
+        let p = RetentionPolicy {
+            rules: vec![example_proxy_rule()],
+            ..minimal_valid()
+        };
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::ProxyScopeOnNonProxy("proxy-evict-cold".into()))
+        );
+    }
+
+    #[test]
+    fn accepts_proxy_scope_on_proxy_repo() {
+        let p = RetentionPolicy {
+            rules: vec![example_proxy_rule()],
+            ..minimal_valid()
+        };
+        validate_policy(&p, RepoKind::Proxy).unwrap();
+    }
+
+    #[test]
+    fn rejects_not_pulled_on_hosted_scope() {
+        let mut rule = example_hosted_rule();
+        rule.criteria.not_pulled_for_days = Some(10);
+        let p = RetentionPolicy {
+            rules: vec![rule],
+            ..minimal_valid()
+        };
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::NotPulledOnHostedScope(
+                "keep-recent-releases".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_hosted_fields_on_proxy_scope() {
+        let mut rule = example_proxy_rule();
+        rule.criteria.older_than_days = Some(5);
+        let p = RetentionPolicy {
+            rules: vec![rule],
+            ..minimal_valid()
+        };
+        assert_eq!(
+            validate_policy(&p, RepoKind::Proxy),
+            Err(PolicyError::HostedFieldOnProxyScope {
+                rule: "proxy-evict-cold".into(),
+                field: "older_than_days",
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_protection_on_proxy_scope() {
+        let mut rule = example_proxy_rule();
+        rule.criteria.keep_last_n = Some(3);
+        let p = RetentionPolicy {
+            rules: vec![rule],
+            ..minimal_valid()
+        };
+        assert!(matches!(
+            validate_policy(&p, RepoKind::Proxy),
+            Err(PolicyError::HostedFieldOnProxyScope { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_counts() {
+        let mut p = minimal_valid();
+        p.rules[0].criteria.keep_last_n = Some(0);
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::ZeroCount {
+                rule: "keep-recent-releases".into(),
+                field: "keep_last_n"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_days() {
+        let mut p = minimal_valid();
+        p.rules[0].criteria.older_than_days = Some(0);
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::ZeroDays {
+                rule: "keep-recent-releases".into(),
+                field: "older_than_days"
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_rule_with_no_trigger() {
+        // Only a protection, no trigger → meaningless rule.
+        let rule = RetentionRule {
+            id: "protect-only".into(),
+            action: Action::HardDelete,
+            scope: Scope::Hosted,
+            release_type: ReleaseType::Any,
+            package_name_prefix: None,
+            criteria: Criteria {
+                keep_last_n: Some(5),
+                ..Default::default()
+            },
+        };
+        let p = RetentionPolicy {
+            rules: vec![rule],
+            ..minimal_valid()
+        };
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::RuleHasNoTrigger("protect-only".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_any_policy_on_group_repo() {
+        assert_eq!(
+            validate_policy(&minimal_valid(), RepoKind::Group),
+            Err(PolicyError::GroupRepoUnsupported)
+        );
+    }
+
+    #[test]
+    fn disabled_policy_is_still_validated() {
+        let mut p = minimal_valid();
+        p.enabled = false;
+        p.rules[0].criteria.keep_last_n = Some(0);
+        // Even disabled, a broken rule is rejected so a later enable is safe.
+        assert!(validate_policy(&p, RepoKind::Hosted).is_err());
+    }
+}

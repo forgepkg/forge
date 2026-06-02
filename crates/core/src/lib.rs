@@ -12,12 +12,15 @@
 //!   resolution behind trusted proxies, and the coarse Slice-1 authorization
 //!   seam.
 //! * [`net`] — outbound-networking helpers, notably the [`net::ssrf`] guard.
+//! * [`retention`] — the slice-12.1 retention policy model + pure evaluator
+//!   (decides which versions to delete/unlist; no I/O).
 
 pub mod auth;
 pub mod domain;
 pub mod format;
 pub mod net;
 pub mod repo;
+pub mod retention;
 
 pub use domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 pub use format::{Format, ReadSeek};
