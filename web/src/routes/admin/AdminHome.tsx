@@ -1,4 +1,4 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/_app/admin/')({
   component: AdminHome,
@@ -19,14 +19,19 @@ function AdminHome() {
         </p>
       </div>
       <ul className="grid gap-3 sm:grid-cols-3">
-        <li className="rounded-lg border border-slate-200 bg-white p-4 text-slate-400">
-          Repositories
+        <li>
+          <Link
+            to="/admin/repositories"
+            className="block rounded-lg border border-slate-200 bg-white p-4 font-medium text-sky-700 hover:border-slate-300 hover:bg-slate-50"
+          >
+            Repositories
+          </Link>
         </li>
         <li className="rounded-lg border border-slate-200 bg-white p-4 text-slate-400">
-          Users
+          Users (Phase 5)
         </li>
         <li className="rounded-lg border border-slate-200 bg-white p-4 text-slate-400">
-          Tokens
+          Tokens (Phase 5)
         </li>
       </ul>
     </section>
