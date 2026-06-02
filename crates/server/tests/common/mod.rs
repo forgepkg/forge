@@ -148,6 +148,7 @@ fn config_toml(
     admin: Option<(&str, &str)>,
     anon: &str,
     web_assets_dir: Option<&str>,
+    oidc_block: Option<&str>,
 ) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
@@ -191,10 +192,12 @@ grace_seconds = 0
 poll_interval_seconds = 1
 
 {web}
+{oidc}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
         secret = S3_SECRET,
+        oidc = oidc_block.unwrap_or(""),
     )
 }
 
@@ -226,6 +229,9 @@ pub struct ServerOpts {
     /// When set, the static SPA is served from this directory; otherwise the
     /// web UI is disabled for the test.
     pub web_assets_dir: Option<String>,
+    /// When set, this raw TOML is appended as the `[oidc]` section so the server
+    /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes (slice 12.2).
+    pub oidc_block: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -235,6 +241,7 @@ impl Default for ServerOpts {
             anonymous_mode: "off".into(),
             spawn_workers: false,
             web_assets_dir: None,
+            oidc_block: None,
         }
     }
 }
@@ -257,6 +264,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         admin_ref,
         &opts.anonymous_mode,
         opts.web_assets_dir.as_deref(),
+        opts.oidc_block.as_deref(),
     );
     use figment::providers::Format as _;
     let config = Config::from_figment(

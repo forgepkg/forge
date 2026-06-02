@@ -53,3 +53,15 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+# Mock OIDC IdP for the /auth route integration tests (slice 12.2 Phase 5):
+# serve discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA
+# key. Mirrors the forge-core OIDC test harness.
+wiremock = "0.6"
+rsa = { version = "0.9", features = ["sha2"] }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+sqlx = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

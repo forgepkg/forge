@@ -1,0 +1,498 @@
+//! Route-level integration tests for the slice-12.2 `/auth` surface (Phase 5).
+//!
+//! Drives the **real** forge server over HTTP against a real Postgres
+//! testcontainer + an in-process mock OIDC IdP (wiremock serving
+//! discovery/JWKS/token, signing a self-issued ID token with a throwaway RSA
+//! key). Verifies:
+//!   * `GET /auth/oidc/login` 302s to the IdP authorize URL and writes an
+//!     `oidc_flow` row (state/nonce/PKCE), with the open-redirect guard on
+//!     `redirect_to`;
+//!   * `GET /auth/oidc/callback` happy path sets a `forge_session` cookie and
+//!     302s to the validated relative target; the cookie authenticates
+//!     `GET /admin/me` (proving `SessionCookieSource` is wired into the
+//!     principal chain);
+//!   * an unknown `state` is rejected (400);
+//!   * `POST /auth/logout` clears the cookie + revokes the session (CSRF
+//!     enforced), after which the cookie no longer authenticates.
+//!
+//! Requires Docker.
+
+mod common;
+
+use base64::Engine;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use rsa::pkcs1::EncodeRsaPrivateKey;
+use rsa::traits::PublicKeyParts;
+use rsa::{RsaPrivateKey, RsaPublicKey};
+use serde_json::{json, Value};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use common::{start_with, ServerOpts};
+
+/// Throwaway RSA signer for the mock IdP (mirrors the forge-core OIDC harness).
+struct TestSigner {
+    private_pem: String,
+    kid: String,
+    jwk: Value,
+}
+
+impl TestSigner {
+    fn new(kid: &str) -> Self {
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+        let public_key = RsaPublicKey::from(&private_key);
+        let n =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
+        let e =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+        let private_pem = private_key
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("pkcs1 pem")
+            .to_string();
+        let jwk = json!({
+            "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid, "n": n, "e": e,
+        });
+        Self {
+            private_pem,
+            kid: kid.to_string(),
+            jwk,
+        }
+    }
+
+    fn sign(&self, claims: &Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.kid.clone());
+        let key = EncodingKey::from_rsa_pem(self.private_pem.as_bytes()).expect("enc key");
+        encode(&header, claims, &key).expect("sign jwt")
+    }
+}
+
+const CLIENT_ID: &str = "client-abc";
+
+/// Mock IdP: discovery + JWKS mounted at start; token endpoint mounted per-login
+/// so the test controls the claims/nonce.
+struct MockIdp {
+    server: MockServer,
+    issuer: String,
+    signer: TestSigner,
+}
+
+impl MockIdp {
+    async fn start() -> Self {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("k1");
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "end_session_endpoint": format!("{issuer}/logout"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [signer.jwk] })))
+            .mount(&server)
+            .await;
+
+        Self {
+            server,
+            issuer,
+            signer,
+        }
+    }
+
+    /// The `[oidc]` TOML block pointing at this mock; `allow_private_issuer`
+    /// lets the SSRF-guarded client reach the loopback mock.
+    fn oidc_block(&self) -> String {
+        format!(
+            r#"
+[oidc]
+issuer = "{issuer}"
+client_id = "{CLIENT_ID}"
+client_secret = "shh-secret"
+redirect_url = "http://test.local/auth/oidc/callback"
+allow_private_issuer = true
+admin_groups = ["forge-admins"]
+admin_claim = "roles"
+"#,
+            issuer = self.issuer,
+        )
+    }
+
+    /// Mount a one-shot token endpoint returning an ID token with `claims`.
+    async fn mount_token_with_claims(&self, claims: Value) {
+        let id_token = self.signer.sign(&claims);
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "opaque-access",
+                "token_type": "Bearer",
+                "id_token": id_token,
+            })))
+            .up_to_n_times(1)
+            .mount(&self.server)
+            .await;
+    }
+}
+
+/// Standard ID-token claim set.
+fn id_claims(issuer: &str, sub: &str, username: &str, nonce: &str, roles: Value) -> Value {
+    let now = chrono::Utc::now().timestamp();
+    json!({
+        "sub": sub,
+        "iss": issuer,
+        "aud": CLIENT_ID,
+        "exp": now + 3600,
+        "nbf": now - 10,
+        "iat": now - 10,
+        "nonce": nonce,
+        "azp": CLIENT_ID,
+        "preferred_username": username,
+        "email": format!("{username}@corp.example"),
+        "name": format!("User {username}"),
+        "roles": roles,
+    })
+}
+
+/// A reqwest client that does NOT follow redirects (so we can assert 302s).
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client")
+}
+
+/// Peek the nonce stored on a live `oidc_flow` row (without consuming it).
+async fn peek_nonce(pool: &sqlx::PgPool, state: &str) -> String {
+    sqlx::query!("SELECT nonce FROM oidc_flow WHERE state = $1", state)
+        .fetch_one(pool)
+        .await
+        .expect("flow row")
+        .nonce
+}
+
+/// Extract the `state` query param from an authorize URL.
+fn state_from_url(url: &str) -> String {
+    let parsed = url::Url::parse(url).expect("authorize url");
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.to_string())
+        .expect("state param")
+}
+
+/// Extract the `forge_session` cookie value from a Set-Cookie header.
+fn session_cookie_from(set_cookie: &str) -> String {
+    set_cookie
+        .split(';')
+        .next()
+        .and_then(|kv| kv.trim().strip_prefix("forge_session="))
+        .map(str::to_string)
+        .expect("forge_session cookie")
+}
+
+// ── login ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn login_redirects_to_idp_and_writes_flow_row() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with(&format!("{}/authorize", idp.issuer)),
+        "redirects to IdP authorize: {location}"
+    );
+    assert!(location.contains("code_challenge_method=S256"));
+    // No session cookie is set on the login leg (state lives in the DB).
+    assert!(resp.headers().get("set-cookie").is_none());
+
+    // The oidc_flow row exists with the sanitized redirect target.
+    let state = state_from_url(&location);
+    let row = sqlx::query!("SELECT redirect_to FROM oidc_flow WHERE state = $1", state)
+        .fetch_one(&srv.pool)
+        .await
+        .expect("flow row present");
+    assert_eq!(row.redirect_to, "/browse");
+}
+
+#[tokio::test]
+async fn login_rejects_open_redirect_target() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=https://evil.example",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    // The open-redirect target is normalised to "/".
+    let row = sqlx::query!("SELECT redirect_to FROM oidc_flow WHERE state = $1", state)
+        .fetch_one(&srv.pool)
+        .await
+        .expect("flow row");
+    assert_eq!(row.redirect_to, "/", "absolute URL normalised to root");
+}
+
+// ── callback happy path + /admin/me ──────────────────────────────────────────
+
+#[tokio::test]
+async fn callback_sets_session_cookie_and_me_recognises_it() {
+    let idp = MockIdp::start().await;
+    let pool = common::pool().await;
+    let srv = start_with(
+        pool.clone(),
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let username = format!("alice-{n}");
+    let sub = format!("sub-{n}");
+
+    // 1. Login → authorize URL + state.
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+
+    // 2. The IdP echoes the flow's nonce so the token verifies; user is admin.
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(
+        &idp.issuer,
+        &sub,
+        &username,
+        &nonce,
+        json!(["forge-admins"]),
+    ))
+    .await;
+
+    // 3. Callback → 302 to the validated target + a session cookie.
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302, "callback redirects after login");
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/browse"
+    );
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("session cookie set")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Lax"));
+    let cookie = session_cookie_from(&set_cookie);
+
+    // 4. The cookie authenticates /admin/me as the provisioned admin user.
+    let resp = no_redirect_client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "session cookie authenticates /admin/me");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["username"], json!(username));
+    assert_eq!(body["is_admin"], json!(true), "roles claim granted admin");
+}
+
+#[tokio::test]
+async fn callback_rejects_unknown_state() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=x&state=never-issued",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "unknown state is rejected");
+    assert!(resp.headers().get("set-cookie").is_none());
+}
+
+// ── logout ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn logout_revokes_session_and_clears_cookie() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+
+    // Complete a login to obtain a session cookie.
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(
+        &idp.issuer,
+        &format!("sub-{n}"),
+        &format!("loguser-{n}"),
+        &nonce,
+        json!([]),
+    ))
+    .await;
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=c&state={state}",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie = session_cookie_from(&set_cookie);
+
+    // Read the session's CSRF secret (the UI gets it from a who-am-I; here we
+    // read the row directly to exercise the server-side double-submit check).
+    // The session is stored under sha256(cookie_secret), mirroring the token
+    // model.
+    let token_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(cookie.as_bytes()))
+    };
+    let csrf: String = sqlx::query_scalar!(
+        "SELECT csrf_secret FROM session WHERE token_hash = $1",
+        token_hash
+    )
+    .fetch_one(&srv.pool)
+    .await
+    .expect("session row");
+
+    // A logout WITHOUT the CSRF token is rejected (403).
+    let resp = no_redirect_client()
+        .post(format!("{}/auth/logout", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "logout without CSRF token is rejected");
+
+    // With the CSRF token it succeeds, clears the cookie, and revokes.
+    let resp = no_redirect_client()
+        .post(format!("{}/auth/logout", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cleared = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cleared.contains("Max-Age=0"), "cookie cleared: {cleared}");
+
+    // The old cookie no longer authenticates (session revoked) → 401.
+    let resp = no_redirect_client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "revoked session cookie is rejected");
+}
+
+// ── OIDC disabled ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn auth_routes_absent_when_oidc_disabled() {
+    // No oidc_block ⇒ no OIDC runtime ⇒ /auth/oidc/login is not mounted.
+    let srv = common::start().await;
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    // Web UI is disabled in the default harness, so an unmounted route 404s.
+    assert_eq!(resp.status(), 404);
+}

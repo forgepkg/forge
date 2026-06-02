@@ -54,6 +54,9 @@ pub struct AppState {
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
+    /// Interactive OIDC login runtime (slice 12.2). `None` ⇒ OIDC disabled and
+    /// no `/auth/oidc/*` routes are mounted.
+    pub oidc: Option<crate::auth::OidcRuntime>,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -82,6 +85,12 @@ impl FormatRegistry {
 
 impl AppState {
     /// Construct state from its parts.
+    ///
+    /// When the config has an **enabled** `[oidc]` section, the OIDC login
+    /// runtime is built here (SSRF-guarded HTTP client + discovery/JWKS metadata
+    /// client + session service); on a build failure we log and disable OIDC
+    /// rather than failing startup. A disabled/absent section leaves `oidc =
+    /// None` and mounts no `/auth/oidc/*` routes.
     pub fn new(
         pool: PgPool,
         blob_store: BlobStore,
@@ -90,6 +99,25 @@ impl AppState {
         config: Config,
     ) -> Self {
         let cas = Cas::new(blob_store.clone(), pool.clone());
+
+        let oidc = match &config.oidc {
+            Some(o) if o.enabled => {
+                match crate::auth::OidcRuntime::build(
+                    o,
+                    pool.clone(),
+                    &config.public_base_url(),
+                    cache.clone(),
+                ) {
+                    Ok(rt) => Some(rt),
+                    Err(e) => {
+                        tracing::error!(error = %e, "OIDC runtime build failed; OIDC disabled");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         AppState {
             pool,
             blob_store,
@@ -97,6 +125,7 @@ impl AppState {
             cache,
             formats: Arc::new(FormatRegistry::new(nuget)),
             config: Arc::new(config),
+            oidc,
         }
     }
 

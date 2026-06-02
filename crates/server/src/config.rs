@@ -342,6 +342,13 @@ pub struct OidcConfig {
     /// Allowed leeway (seconds) on `exp`/`nbf`/`iat` ID-token validation.
     #[serde(default = "default_oidc_clock_skew")]
     pub clock_skew_seconds: u64,
+    /// Permit the OIDC HTTP client (discovery / JWKS / token endpoint) to reach
+    /// **private / loopback** addresses. Off by default — the SSRF guard blocks
+    /// them. Set `true` only when the IdP is self-hosted on a private network
+    /// (mirrors the proxy's per-repo `allow_private_upstream`). Also enables the
+    /// in-process mock IdP used by the integration tests.
+    #[serde(default)]
+    pub allow_private_issuer: bool,
 
     // ---- claim → user mapping ----
     /// Claim used as the `app_user.username` (fallback chain handled in code:
@@ -399,6 +406,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("redirect_url", &self.redirect_url)
             .field("scopes", &self.scopes)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
+            .field("allow_private_issuer", &self.allow_private_issuer)
             .field("username_claim", &self.username_claim)
             .field("email_claim", &self.email_claim)
             .field("display_name_claim", &self.display_name_claim)
@@ -564,7 +572,12 @@ impl Config {
         let issuer = url::Url::parse(oidc.issuer.trim()).map_err(|e| {
             ConfigError::Invalid(format!("invalid oidc.issuer {:?}: {e}", oidc.issuer))
         })?;
-        if issuer.scheme() != "https" {
+        // The issuer must be https — except when `allow_private_issuer` is set,
+        // which signals a trusted IdP on a private/dev network (e.g. a
+        // self-hosted Keycloak or the in-process test IdP) where plain http is
+        // acceptable. This mirrors the relaxed SSRF posture that flag also
+        // enables, so the two knobs move together.
+        if issuer.scheme() != "https" && !(oidc.allow_private_issuer && issuer.scheme() == "http") {
             return Err(ConfigError::Invalid(format!(
                 "oidc.issuer must be https, got {:?}",
                 oidc.issuer
@@ -1031,6 +1044,25 @@ mod tests {
         );
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("oidc.redirect_url"), "{err}");
+    }
+
+    #[test]
+    fn oidc_http_issuer_allowed_only_with_allow_private_issuer() {
+        // Plain-http issuer is rejected by default …
+        let toml = minimal_with_oidc("").replace(
+            "https://login.microsoftonline.com",
+            "http://login.microsoftonline.com",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("oidc.issuer"), "{err}");
+
+        // … but accepted when allow_private_issuer is set (trusted private IdP).
+        let toml = toml.replace("[oidc]", "[oidc]\nallow_private_issuer = true");
+        let cfg = Config::from_figment(fig_from_toml(&toml))
+            .expect("http issuer allowed with allow_private_issuer");
+        let oidc = cfg.oidc.expect("present");
+        assert!(oidc.allow_private_issuer);
+        assert!(oidc.issuer.starts_with("http://"));
     }
 
     #[test]

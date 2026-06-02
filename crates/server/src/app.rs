@@ -6,11 +6,14 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::routing::any;
 use axum::Router;
+use forge_core::auth::session_source::SessionCookieSource;
 use forge_core::auth::token::{BasicAuthSource, PrincipalSource, TokenHeaderSource};
+use forge_core::session::SessionService;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 
 use crate::admin::admin_router;
+use crate::auth::auth_router;
 use crate::browse::browse_router;
 use crate::config::Config;
 use crate::dispatch::dispatch;
@@ -22,15 +25,32 @@ use crate::web_ui::spa_service;
 /// Build the principal middleware layer from config + pool.
 ///
 /// Sources are ordered: the `X-NuGet-ApiKey` token header first, then HTTP
-/// Basic (token-in-basic, with optional password fallback).
+/// Basic (token-in-basic, with optional password fallback), then — when OIDC is
+/// enabled — the `forge_session` cookie. The cookie source is **last** so that
+/// API credentials (tokens) always win for NuGet clients, and the browser
+/// session only resolves a principal when no API credential was presented. A
+/// session cookie that fails validation reports `Invalid`, which the resolver
+/// turns into a 401 (never downgraded to anonymous).
 pub fn principal_layer(config: &Config, pool: &PgPool) -> anyhow::Result<PrincipalLayer> {
-    let sources: Vec<Box<dyn PrincipalSource>> = vec![
+    let mut sources: Vec<Box<dyn PrincipalSource>> = vec![
         Box::new(TokenHeaderSource::new(pool.clone())),
         Box::new(BasicAuthSource::new(
             pool.clone(),
             config.auth.allow_password_basic,
         )),
     ];
+
+    // Append the session-cookie source only when OIDC login is enabled (it is
+    // the only path that mints sessions).
+    if let Some(oidc) = config.oidc.as_ref().filter(|o| o.enabled) {
+        let sessions = SessionService::new(
+            pool.clone(),
+            chrono::Duration::seconds(oidc.session_idle_ttl_seconds as i64),
+            chrono::Duration::seconds(oidc.session_absolute_ttl_seconds as i64),
+        );
+        sources.push(Box::new(SessionCookieSource::new(sessions, pool.clone())));
+    }
+
     let anon = config.anon_policy().context("anonymous policy")?;
     let trusted = config
         .trusted_proxy_cidrs()
@@ -65,6 +85,14 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         .merge(me_router())
         .nest("/admin", admin)
         .merge(browse_router())
+        // Interactive OIDC login surface (slice 12.2). Mounted only when the
+        // runtime was built (OIDC enabled + config valid); otherwise the
+        // `/auth/oidc/*` paths simply 404 (and fall through to the SPA).
+        .merge(if state.oidc.is_some() {
+            auth_router()
+        } else {
+            Router::new()
+        })
         // Everything under /v3/{repo} is handled by the dispatcher (which builds
         // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
         // /DELETE; the dispatcher enforces authz per method.
