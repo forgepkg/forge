@@ -9,50 +9,144 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/root'
-import { Route as HomeRouteImport } from './routes/Home'
+import { Route as LoginRouteImport } from './routes/Login'
+import { Route as AppLayoutRouteImport } from './routes/AppLayout'
+import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
+import { Route as BrowseRouteImport } from './routes/Browse'
+import { Route as adminAdminHomeRouteImport } from './routes/admin/AdminHome'
 
-const HomeRoute = HomeRouteImport.update({
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AppLayoutRoute = AppLayoutRouteImport.update({
+  id: '/_app',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AdminLayoutRoute = AdminLayoutRouteImport.update({
+  id: '/admin',
+  path: '/admin',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
+const BrowseRoute = BrowseRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => rootRouteImport,
+  getParentRoute: () => AppLayoutRoute,
+} as any)
+const adminAdminHomeRoute = adminAdminHomeRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AdminLayoutRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof HomeRoute
+  '/': typeof BrowseRoute
+  '/login': typeof LoginRoute
+  '/admin': typeof AdminLayoutRouteWithChildren
+  '/admin/': typeof adminAdminHomeRoute
 }
 export interface FileRoutesByTo {
-  '/': typeof HomeRoute
+  '/login': typeof LoginRoute
+  '/': typeof BrowseRoute
+  '/admin': typeof adminAdminHomeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/': typeof HomeRoute
+  '/_app': typeof AppLayoutRouteWithChildren
+  '/login': typeof LoginRoute
+  '/_app/': typeof BrowseRoute
+  '/_app/admin': typeof AdminLayoutRouteWithChildren
+  '/_app/admin/': typeof adminAdminHomeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths: '/' | '/login' | '/admin' | '/admin/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to: '/login' | '/' | '/admin'
+  id:
+    | '__root__'
+    | '/_app'
+    | '/login'
+    | '/_app/'
+    | '/_app/admin'
+    | '/_app/admin/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  HomeRoute: typeof HomeRoute
+  AppLayoutRoute: typeof AppLayoutRouteWithChildren
+  LoginRoute: typeof LoginRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_app': {
+      id: '/_app'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof AppLayoutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_app/admin': {
+      id: '/_app/admin'
+      path: '/admin'
+      fullPath: '/admin'
+      preLoaderRoute: typeof AdminLayoutRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/': {
+      id: '/_app/'
       path: '/'
       fullPath: '/'
-      preLoaderRoute: typeof HomeRouteImport
-      parentRoute: typeof rootRouteImport
+      preLoaderRoute: typeof BrowseRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/admin/': {
+      id: '/_app/admin/'
+      path: '/'
+      fullPath: '/admin/'
+      preLoaderRoute: typeof adminAdminHomeRouteImport
+      parentRoute: typeof AdminLayoutRoute
     }
   }
 }
 
+interface AdminLayoutRouteChildren {
+  adminAdminHomeRoute: typeof adminAdminHomeRoute
+}
+
+const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
+  adminAdminHomeRoute: adminAdminHomeRoute,
+}
+
+const AdminLayoutRouteWithChildren = AdminLayoutRoute._addFileChildren(
+  AdminLayoutRouteChildren,
+)
+
+interface AppLayoutRouteChildren {
+  BrowseRoute: typeof BrowseRoute
+  AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
+}
+
+const AppLayoutRouteChildren: AppLayoutRouteChildren = {
+  BrowseRoute: BrowseRoute,
+  AdminLayoutRoute: AdminLayoutRouteWithChildren,
+}
+
+const AppLayoutRouteWithChildren = AppLayoutRoute._addFileChildren(
+  AppLayoutRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
-  HomeRoute: HomeRoute,
+  AppLayoutRoute: AppLayoutRouteWithChildren,
+  LoginRoute: LoginRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
