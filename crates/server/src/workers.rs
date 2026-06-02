@@ -18,7 +18,16 @@
 //!    `proxy_upstream_index` row (NO advisory locks); other instances wait and
 //!    then read the freshly-populated row/cache.
 //!
-//! [`spawn_all`] launches all three and returns their join handles (so a caller
+//! 4. **Auth reaper** (slice 12.2) — periodically deletes expired/used
+//!    `oidc_flow` rows and revoked/expired `session` rows. Both are pure
+//!    `DELETE`s (no advisory locks, no leases): the auth-code-flow rows are
+//!    single-use and short-lived, sessions carry their own validity predicate,
+//!    so running the reap on **every** instance is harmless (a row deleted by
+//!    one instance simply isn't there for the next). It only bounds table
+//!    growth; correctness never depends on it (callback/validate already reject
+//!    expired rows in SQL).
+//!
+//! [`spawn_all`] launches all four and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process.
 
@@ -46,6 +55,9 @@ pub struct WorkerHandles {
     pub proxy_refresh: JoinHandle<()>,
     /// Retention-evaluation loop (slice 12.1).
     pub retention: JoinHandle<()>,
+    /// Expired-`oidc_flow` / `session` reaper loop (slice 12.2). Present only
+    /// when OIDC login is enabled (the only path that writes those tables).
+    pub auth_reaper: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandles {
@@ -55,6 +67,9 @@ impl WorkerHandles {
         self.reconciler.abort();
         self.proxy_refresh.abort();
         self.retention.abort();
+        if let Some(h) = &self.auth_reaper {
+            h.abort();
+        }
     }
 }
 
@@ -113,12 +128,47 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         tokio::spawn(async {})
     };
 
+    // Auth reaper (slice 12.2): only when OIDC login is enabled — it is the only
+    // path that writes `oidc_flow` / `session`. Both reaps are pure `DELETE`s
+    // safe on every instance (no advisory locks, no leases). Cadence reuses the
+    // outbox poll scaled up — flow rows live ~10min and sessions hours/days, so
+    // a per-minute sweep is plenty to bound growth.
+    let auth_reaper = state.config.oidc.as_ref().filter(|o| o.enabled).map(|_| {
+        spawn_auth_reaper(
+            state.pool.clone(),
+            poll.saturating_mul(6).max(Duration::from_secs(60)),
+        )
+    });
+
     WorkerHandles {
         outbox,
         reconciler,
         proxy_refresh,
         retention,
+        auth_reaper,
     }
+}
+
+/// Spawn the auth reaper loop: each tick deletes expired/used `oidc_flow` rows
+/// and revoked/expired `session` rows. Pure `DELETE`s — no advisory locks; safe
+/// to run concurrently on every instance.
+fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match forge_db::oidc_flow_dao::reap_expired(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted expired oidc_flow rows"),
+                Err(e) => tracing::error!(error = %e, "oidc_flow reap failed"),
+            }
+            match forge_db::session_dao::reap_expired(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
+                Err(e) => tracing::error!(error = %e, "session reap failed"),
+            }
+        }
+    })
 }
 
 /// Spawn the orphan-reconciler loop.

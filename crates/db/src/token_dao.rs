@@ -55,6 +55,24 @@ pub async fn find_token_by_hash(pool: &PgPool, token_hash: &str) -> sqlx::Result
     .await
 }
 
+/// Find a token by its primary key (used to enforce ownership before a
+/// session-scoped revoke). Returns `None` if no such row exists.
+pub async fn find_token_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<Token>> {
+    sqlx::query_as!(
+        Token,
+        r#"
+        SELECT
+            id, user_id, name, token_hash, expires_at, revoked_at,
+            last_used_at, created_at
+        FROM token
+        WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// List a user's tokens ordered by creation time (admin listing). Hashes are
 /// included on the row but the admin layer never serializes them.
 pub async fn list_tokens_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Vec<Token>> {

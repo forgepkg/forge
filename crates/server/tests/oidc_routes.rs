@@ -482,6 +482,177 @@ async fn logout_revokes_session_and_clears_cookie() {
     assert_eq!(resp.status(), 401, "revoked session cookie is rejected");
 }
 
+// ── /auth/me + /auth/tokens (session-authenticated) ──────────────────────────
+
+/// Drive a full login and return `(session_cookie, csrf_token)` for the
+/// provisioned user. Shared by the /auth/me + token-minting tests.
+async fn login_and_get_cookie(
+    idp: &MockIdp,
+    srv: &common::TestServer,
+    sub: &str,
+    username: &str,
+    roles: Value,
+) -> (String, String) {
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(&idp.issuer, sub, username, &nonce, roles))
+        .await;
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=c&state={state}",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie = session_cookie_from(&set_cookie);
+
+    // /auth/me returns the per-session CSRF token the UI echoes on mutations.
+    let me: Value = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let csrf = me["csrf_token"].as_str().expect("csrf token").to_string();
+    (cookie, csrf)
+}
+
+#[tokio::test]
+async fn auth_me_returns_identity_and_csrf_token() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let username = format!("meuser-{n}");
+
+    // Unauthenticated /auth/me → 401.
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "no cookie → 401");
+
+    let (cookie, csrf) =
+        login_and_get_cookie(&idp, &srv, &format!("sub-{n}"), &username, json!([])).await;
+
+    let body: Value = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["username"], json!(username));
+    assert_eq!(body["is_admin"], json!(false), "no admin role claim");
+    assert!(!csrf.is_empty(), "csrf token present");
+}
+
+#[tokio::test]
+async fn session_can_mint_and_revoke_repository_token() {
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let (cookie, csrf) = login_and_get_cookie(
+        &idp,
+        &srv,
+        &format!("sub-{n}"),
+        &format!("minter-{n}"),
+        json!([]),
+    )
+    .await;
+
+    // Minting WITHOUT the CSRF token is rejected (403).
+    let resp = no_redirect_client()
+        .post(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "token mint without CSRF rejected");
+
+    // With CSRF → 201 + a one-time plaintext token.
+    let created: Value = {
+        let resp = no_redirect_client()
+            .post(format!("{}/auth/tokens", srv.base_url))
+            .header("cookie", format!("forge_session={cookie}"))
+            .header("x-csrf-token", &csrf)
+            .json(&json!({"name": "ci"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        resp.json().await.unwrap()
+    };
+    let token_id = created["id"].as_i64().expect("token id");
+    let plaintext = created["token"].as_str().expect("plaintext token");
+    assert!(!plaintext.is_empty());
+
+    // It appears in the session user's token list (no secret leaked).
+    let list: Value = no_redirect_client()
+        .get(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = list.as_array().unwrap();
+    assert!(arr.iter().any(|t| t["id"].as_i64() == Some(token_id)));
+    assert!(
+        arr.iter().all(|t| t.get("token").is_none()),
+        "list never returns the secret"
+    );
+
+    // Revoke (CSRF required) → 204; a second revoke → 404 (idempotent-ish).
+    let resp = no_redirect_client()
+        .delete(format!("{}/auth/tokens/{token_id}", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "owned token revoked");
+}
+
 // ── OIDC disabled ─────────────────────────────────────────────────────────────
 
 #[tokio::test]

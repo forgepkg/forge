@@ -20,20 +20,25 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
+use chrono::{DateTime, Utc};
 use forge_cache::Cache;
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
+use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::net::ssrf::{guarded_client, SystemResolver};
 use forge_core::oidc::{
     begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
     ClientParams, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
-use serde::Deserialize;
+use forge_db::model::Session;
+use forge_db::token_dao::{self, NewToken};
+use forge_db::user_dao;
+use serde::{Deserialize, Serialize};
 
 use crate::config::OidcConfig;
 use crate::state::AppState;
@@ -133,6 +138,9 @@ pub fn auth_router() -> Router<AppState> {
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/auth/logout", post(logout))
+        .route("/auth/me", get(me))
+        .route("/auth/tokens", get(list_tokens).post(create_token))
+        .route("/auth/tokens/{id}", delete(revoke_token))
 }
 
 /// `GET /auth/oidc/login` — begin the auth-code + PKCE flow and 302 to the IdP.
@@ -276,6 +284,256 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Json(LogoutResult { revoked }),
     )
         .into_response()
+}
+
+// ── session-authenticated endpoints (/auth/me, /auth/tokens) ─────────────────
+//
+// These endpoints are cookie-authenticated (not token/basic): they re-validate
+// the `forge_session` cookie through the session service so they can read the
+// session's `csrf_secret` directly. Reusing the principal-middleware extension
+// would not expose the session row (only a `Principal::User`), and the CSRF
+// double-submit secret is bound to the session, so a direct validate is the
+// clean seam. Mutating endpoints additionally enforce the double-submit token.
+
+/// Why a session-authenticated request could not proceed.
+enum SessionAuthError {
+    /// No cookie / unknown / expired / revoked session → 401.
+    Unauthorized,
+    /// Cookie valid but the `X-CSRF-Token` is missing or wrong → 403.
+    CsrfFailed,
+    /// A backend error while validating → 500.
+    Internal,
+}
+
+impl IntoResponse for SessionAuthError {
+    fn into_response(self) -> Response {
+        match self {
+            SessionAuthError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "authentication required").into_response()
+            }
+            SessionAuthError::CsrfFailed => {
+                (StatusCode::FORBIDDEN, "missing or invalid csrf token").into_response()
+            }
+            SessionAuthError::Internal => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response()
+            }
+        }
+    }
+}
+
+/// Validate the `forge_session` cookie and return the live session row. `None`
+/// of the error variants leaks whether the cookie was malformed vs unknown.
+async fn require_session(
+    rt: &OidcRuntime,
+    headers: &HeaderMap,
+) -> Result<Session, SessionAuthError> {
+    let Some(secret) = cookie_value(headers, SESSION_COOKIE).filter(|s| !s.is_empty()) else {
+        return Err(SessionAuthError::Unauthorized);
+    };
+    match rt.sessions.validate(&secret).await {
+        Ok(Some(s)) => Ok(s),
+        Ok(None) => Err(SessionAuthError::Unauthorized),
+        Err(e) => {
+            tracing::warn!(error = %e, "session validate failed");
+            Err(SessionAuthError::Internal)
+        }
+    }
+}
+
+/// Like [`require_session`] but also enforces the double-submit CSRF token
+/// (`X-CSRF-Token` must equal the session's stored `csrf_secret`). Use on every
+/// state-changing cookie-authenticated endpoint (§3.8).
+async fn require_session_csrf(
+    rt: &OidcRuntime,
+    headers: &HeaderMap,
+) -> Result<Session, SessionAuthError> {
+    let session = require_session(rt, headers).await?;
+    let presented = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !csrf_token_matches(presented, &session.csrf_secret) {
+        return Err(SessionAuthError::CsrfFailed);
+    }
+    Ok(session)
+}
+
+/// `GET /auth/me` who-am-I body for the SPA. Carries the per-session
+/// `csrf_token` the UI must echo on mutating requests (§3.8).
+#[derive(Debug, Serialize)]
+struct AuthMe {
+    user_id: i64,
+    username: String,
+    is_admin: bool,
+    /// Per-session double-submit CSRF secret (echo it in `X-CSRF-Token`).
+    csrf_token: String,
+}
+
+/// `GET /auth/me` — identity for the logged-in browser session. `401` if the
+/// cookie is missing/invalid. Unlike `/admin/me` (which accepts any principal
+/// incl. token/basic), this is **cookie-only** and additionally returns the
+/// CSRF token, so the SPA can bootstrap its mutating-request defense.
+async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(rt) = state.oidc.as_ref() else {
+        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
+    };
+    let session = match require_session(rt, &headers).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // Reflect the live user row (admin grant/revoke, deactivation).
+    match user_dao::find_user_by_id(&state.pool, session.user_id).await {
+        Ok(Some(u)) if u.active => Json(AuthMe {
+            user_id: u.id,
+            username: u.username,
+            is_admin: u.is_admin,
+            csrf_token: session.csrf_secret,
+        })
+        .into_response(),
+        Ok(_) => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth/me user lookup failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+/// Token metadata view (never includes the secret or its hash).
+#[derive(Debug, Serialize)]
+struct TokenView {
+    id: i64,
+    name: String,
+    expires_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    last_used_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<&forge_db::model::Token> for TokenView {
+    fn from(t: &forge_db::model::Token) -> Self {
+        TokenView {
+            id: t.id,
+            name: t.name.clone(),
+            expires_at: t.expires_at,
+            revoked_at: t.revoked_at,
+            last_used_at: t.last_used_at,
+            created_at: t.created_at,
+        }
+    }
+}
+
+/// `POST /auth/tokens` request body.
+#[derive(Debug, Deserialize)]
+struct CreateTokenBody {
+    name: String,
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /auth/tokens` response — the only time the plaintext `token` appears.
+#[derive(Debug, Serialize)]
+struct CreatedToken {
+    #[serde(flatten)]
+    view: TokenView,
+    /// Plaintext secret — store it now; it cannot be retrieved again.
+    token: String,
+}
+
+/// `GET /auth/tokens` — list the logged-in user's repository tokens (no secret).
+async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(rt) = state.oidc.as_ref() else {
+        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
+    };
+    let session = match require_session(rt, &headers).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    match token_dao::list_tokens_for_user(&state.pool, session.user_id).await {
+        Ok(tokens) => {
+            let views: Vec<TokenView> = tokens.iter().map(TokenView::from).collect();
+            Json(views).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "auth/tokens list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+/// `POST /auth/tokens` — mint a slice-1 repository token for the **session's**
+/// user (CSRF-protected). Delegates to the same hash-only token model the admin
+/// API uses; the plaintext is returned once.
+async fn create_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateTokenBody>,
+) -> Response {
+    let Some(rt) = state.oidc.as_ref() else {
+        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
+    };
+    let session = match require_session_csrf(rt, &headers).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+
+    let secret = generate_token_secret();
+    let token_hash = hash_token(&secret);
+    let new = NewToken {
+        user_id: session.user_id,
+        name: body.name,
+        token_hash,
+        expires_at: body.expires_at,
+    };
+    match token_dao::insert_token(&state.pool, new).await {
+        Ok(t) => (
+            StatusCode::CREATED,
+            Json(CreatedToken {
+                view: TokenView::from(&t),
+                token: secret,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth/tokens create failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+/// `DELETE /auth/tokens/{id}` — revoke one of the session user's own tokens
+/// (CSRF-protected). A token belonging to a different user yields `404` (we do
+/// not reveal that the id exists).
+async fn revoke_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let Some(rt) = state.oidc.as_ref() else {
+        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
+    };
+    let session = match require_session_csrf(rt, &headers).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+
+    // Enforce ownership: the token must exist AND belong to the session's user.
+    match token_dao::find_token_by_id(&state.pool, id).await {
+        Ok(Some(t)) if t.user_id == session.user_id => {}
+        Ok(_) => return (StatusCode::NOT_FOUND, "token not found").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth/tokens lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+        }
+    }
+
+    match token_dao::revoke_token(&state.pool, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "token not found or already revoked").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "auth/tokens revoke failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
 }
 
 /// Build the `Set-Cookie` value that installs the session cookie.
