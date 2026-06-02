@@ -276,7 +276,19 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         return (StatusCode::FORBIDDEN, "missing or invalid csrf token").into_response();
     }
 
-    let revoked = rt.sessions.revoke(session.id).await.unwrap_or(false);
+    // Revoke server-side BEFORE clearing the cookie. If the DB revoke fails the
+    // session is still live cluster-wide, so we must NOT tell the client it has
+    // logged out (and must not clear its cookie as if it had): surface a 500 so
+    // the client knows the logout did not take effect and can retry. Silently
+    // returning 200 here would leave a live session an attacker holding the
+    // cookie could keep using.
+    let revoked = match rt.sessions.revoke(session.id).await {
+        Ok(revoked) => revoked,
+        Err(e) => {
+            tracing::error!(error = %e, session_id = session.id, "logout session revoke failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+        }
+    };
 
     (
         StatusCode::OK,
