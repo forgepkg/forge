@@ -18,6 +18,7 @@
 
 pub mod members;
 pub mod repositories;
+pub mod retention;
 pub mod tokens;
 pub mod users;
 
@@ -66,6 +67,24 @@ pub fn admin_router() -> Router<AppState> {
         .route(
             "/repositories/{name}/packages/{id}/{version}",
             axum::routing::delete(repositories::hard_delete_package),
+        )
+        .route(
+            "/repositories/{name}/retention",
+            get(retention::get)
+                .put(retention::put)
+                .delete(retention::delete),
+        )
+        .route(
+            "/repositories/{name}/retention/preview",
+            axum::routing::post(retention::preview),
+        )
+        .route(
+            "/repositories/{name}/retention/run",
+            axum::routing::post(retention::run),
+        )
+        .route(
+            "/repositories/{name}/retention/audit",
+            get(retention::audit),
         )
         .route(
             "/repositories/{name}/members",

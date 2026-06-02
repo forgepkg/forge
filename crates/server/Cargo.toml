@@ -36,6 +36,7 @@ ipnet = { workspace = true }
 url = { workspace = true }
 argon2 = { workspace = true, features = ["password-hash"] }
 tokio-util = { workspace = true }
+uuid = { workspace = true }
 
 # Config: TOML + FORGE_* env overrides.
 figment = { version = "0.10", features = ["toml", "env"] }

@@ -1,0 +1,497 @@
+//! E2E: admin retention REST surface (slice 12.1, plan Phase 7). Requires Docker
+//! (Postgres + versitygw via the shared harness).
+//!
+//! Covers the six endpoints under `/admin/repositories/{name}/retention`:
+//! admin gating (401/403), PUT validation (400) + GET round-trip, DELETE
+//! clearing, dry-run preview (decisions without mutation), run scheduling
+//! (`next_run_at = now()` via the ledger), and audit listing.
+
+mod common;
+
+use forge_db::asset_dao::{self, NewAsset};
+use forge_db::blob_dao;
+use forge_db::component_dao::{self, NewComponent};
+use forge_db::repository_dao::{self, NewRepository};
+use serde_json::{json, Value};
+
+/// A minimal valid hosted policy: keep newest 1, hard-delete the rest. The
+/// trigger is `not_downloaded_for_days` (seeded components are never downloaded,
+/// which always matches), so it fires without backdating `created_at`.
+fn keep_one_policy() -> Value {
+    json!({
+        "version": 1,
+        "enabled": true,
+        "dry_run_only": false,
+        "min_run_interval_seconds": 3600,
+        "rules": [
+            {
+                "id": "keep-one",
+                "action": "hard_delete",
+                "release_type": "any",
+                "criteria": { "keep_last_n": 1, "not_downloaded_for_days": 1 }
+            }
+        ]
+    })
+}
+
+/// Seed a hosted repo with `versions.len()` components, each with a committed
+/// blob + `.nupkg` asset, so retention has real candidates to evaluate.
+async fn seed_hosted_with_versions(
+    srv: &common::TestServer,
+    repo_name: &str,
+    pkg: &str,
+    versions: &[&str],
+) -> i64 {
+    let repo =
+        repository_dao::insert_repository(&srv.pool, NewRepository::hosted(repo_name.to_string()))
+            .await
+            .unwrap();
+
+    for (i, ver) in versions.iter().enumerate() {
+        let sha = format!("{:0>64}", format!("{repo_name}{i}"));
+        let s3_key = format!("blobs/{sha}");
+        blob_dao::upsert_pending(&srv.pool, &sha, 10, &s3_key)
+            .await
+            .unwrap();
+        let mut tx = srv.pool.begin().await.unwrap();
+        blob_dao::commit_and_incref(&mut tx, &sha).await.unwrap();
+        let comp = component_dao::insert_component(
+            &mut *tx,
+            NewComponent {
+                repository_id: repo.id,
+                name: pkg.to_lowercase(),
+                original_id: pkg.to_string(),
+                version: ver.to_string(),
+                version_original: ver.to_string(),
+                listed: true,
+            },
+        )
+        .await
+        .unwrap();
+        asset_dao::insert_asset(
+            &mut *tx,
+            NewAsset {
+                component_id: comp.id,
+                path: format!("{}.{ver}.nupkg", pkg.to_lowercase()),
+                content_type: "application/octet-stream".into(),
+                blob_sha256: sha.clone(),
+                size: 10,
+                sha512_base64: Some("c2hh".into()),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    repo.id
+}
+
+/// Anonymous → 401; non-admin → 403 on the retention surface.
+#[tokio::test]
+async fn retention_admin_gated() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    // Anonymous → 401.
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "anonymous retention GET must be 401");
+
+    // Non-admin user → 403.
+    let username = format!("plain{s}");
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "non-admin retention GET must be 403");
+}
+
+/// PUT an invalid policy → 400; PUT a valid one → 200, then GET round-trips it.
+#[tokio::test]
+async fn put_validates_then_get_round_trips() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    // Invalid: empty rules list is rejected by validate_policy → 400.
+    let bad = json!({
+        "version": 1, "enabled": true, "dry_run_only": false,
+        "min_run_interval_seconds": 3600, "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": bad}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "empty-rules policy must be rejected");
+
+    // Invalid: a proxy-cached rule on a hosted repo is rejected → 400.
+    let proxy_on_hosted = json!({
+        "version": 1, "enabled": true, "dry_run_only": false,
+        "min_run_interval_seconds": 3600,
+        "rules": [{ "id": "x", "action": "hard_delete", "scope": "proxy_cached",
+                    "criteria": { "not_pulled_for_days": 30 } }]
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": proxy_on_hosted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "proxy_cached scope on hosted repo must be rejected"
+    );
+
+    // Valid PUT → 200.
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": keep_one_policy()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "valid policy PUT must succeed");
+
+    // GET round-trips the policy and exposes a ledger run row (armed).
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["policy"]["rules"][0]["id"], json!("keep-one"));
+    assert!(
+        !body["last_run"].is_null(),
+        "arming a policy must create a ledger run row"
+    );
+    assert_eq!(body["last_run"]["state"], json!("idle"));
+}
+
+/// DELETE clears the policy; a subsequent GET shows a null policy.
+#[tokio::test]
+async fn delete_clears_policy() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": keep_one_policy()}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .delete(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "DELETE clears the policy");
+
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["policy"].is_null(), "policy must be cleared");
+}
+
+/// Preview is a true dry run: it returns the decisions the worker would apply
+/// but mutates nothing (no listed flip, no deleted component, no outbox row).
+#[tokio::test]
+async fn preview_returns_decisions_without_mutating() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    // 3 versions; keep_last_n=1 → 2 oldest are deletion candidates.
+    let repo_id =
+        seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0", "1.1.0", "2.0.0"]).await;
+
+    client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": keep_one_policy()}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(
+        body["counts"]["evaluated"],
+        json!(3),
+        "all three versions evaluated"
+    );
+    assert_eq!(
+        body["counts"]["deleted"],
+        json!(2),
+        "two oldest would be hard-deleted"
+    );
+    assert_eq!(body["decisions"].as_array().unwrap().len(), 2);
+
+    // No mutation: all three components still present.
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM component WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 3, "preview must not delete any component");
+
+    // No outbox rows enqueued by the preview.
+    let outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM blob_outbox bo \
+         JOIN asset a ON a.blob_sha256 = bo.sha256 \
+         JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox, 0, "preview must not enqueue any outbox delete");
+
+    // No audit rows persisted by the preview.
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM retention_audit WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 0, "preview must not write audit rows");
+}
+
+/// Preview with no policy returns an empty decision set (not an error).
+#[tokio::test]
+async fn preview_without_policy_is_empty() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["decisions"].as_array().unwrap().len(), 0);
+    assert_eq!(body["counts"]["evaluated"], json!(0));
+}
+
+/// `run` with a policy schedules the repo promptly (`next_run_at` advanced to
+/// ~now via the ledger); without a policy it is a 409.
+#[tokio::test]
+async fn run_schedules_via_ledger() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    // No policy yet → run is a 409.
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/run",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "run without a policy must be 409");
+
+    // Arm a policy with a far-future next_run via a large min_run_interval, then
+    // push next_run_at into the future by finishing a run? Simpler: arm, then
+    // bump next_run_at far out, then `run` should reset it to ~now.
+    client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": keep_one_policy()}))
+        .send()
+        .await
+        .unwrap();
+
+    // Move next_run_at far into the future to prove `run` pulls it back.
+    sqlx::query(
+        "UPDATE retention_run SET next_run_at = now() + interval '1 day' WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/run",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202, "run with a policy must be 202");
+
+    // next_run_at was pulled back to ~now (well under the 1-day future stamp).
+    let due_soon: bool = sqlx::query_scalar(
+        "SELECT next_run_at <= now() + interval '1 minute' FROM retention_run WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(due_soon, "run must schedule next_run_at to ~now");
+}
+
+/// The audit endpoint returns persisted audit rows (newest first) and respects
+/// the `run_id` filter.
+#[tokio::test]
+async fn audit_lists_persisted_rows() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+
+    // Insert two audit rows directly (one per run) to exercise the reader +
+    // filter without driving a full worker run.
+    let run_a = uuid::Uuid::new_v4();
+    let run_b = uuid::Uuid::new_v4();
+    for (run, ver) in [(run_a, "1.0.0"), (run_b, "2.0.0")] {
+        sqlx::query(
+            "INSERT INTO retention_audit \
+             (repository_id, run_id, rule_id, action, target_kind, package_name, version, dry_run, reason) \
+             VALUES ($1, $2, 'keep-one', 'hard_delete', 'component', 'sample.lib', $3, false, '{}'::jsonb)",
+        )
+        .bind(repo_id)
+        .bind(run)
+        .bind(ver)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    }
+
+    // All rows for the repo.
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention/audit",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "both audit rows returned");
+    // Newest first: the second-inserted row (larger id) comes first.
+    assert_eq!(items[0]["version"], json!("2.0.0"));
+
+    // Filtered by run_id → only that pass's row.
+    let resp = client
+        .get(format!(
+            "{}/admin/repositories/{name}/retention/audit?run_id={run_a}",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "run_id filter narrows to one row");
+    assert_eq!(items[0]["version"], json!("1.0.0"));
+}
