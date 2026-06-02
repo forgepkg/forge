@@ -13,9 +13,11 @@ import { Route as LoginRouteImport } from './routes/Login'
 import { Route as AppLayoutRouteImport } from './routes/AppLayout'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as BrowseRouteImport } from './routes/Browse'
+import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
 import { Route as adminAdminHomeRouteImport } from './routes/admin/AdminHome'
 import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
+import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
 import { Route as adminRepositoriesCreateRouteImport } from './routes/admin/repositories/Create'
 import { Route as adminRepositoriesEditRouteImport } from './routes/admin/repositories/Edit'
 import { Route as adminRepositoriesGroupMembersRouteImport } from './routes/admin/repositories/GroupMembers'
@@ -39,6 +41,11 @@ const BrowseRoute = BrowseRouteImport.update({
   path: '/',
   getParentRoute: () => AppLayoutRoute,
 } as any)
+const adminUsersListRoute = adminUsersListRouteImport.update({
+  id: '/users',
+  path: '/users',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
 const adminRepositoriesListRoute = adminRepositoriesListRouteImport.update({
   id: '/repositories',
   path: '/repositories',
@@ -53,6 +60,11 @@ const PackageDetailRoute = PackageDetailRouteImport.update({
   id: '/packages/$repo/$id',
   path: '/packages/$repo/$id',
   getParentRoute: () => AppLayoutRoute,
+} as any)
+const adminUsersEditRoute = adminUsersEditRouteImport.update({
+  id: '/users/$userId',
+  path: '/users/$userId',
+  getParentRoute: () => AdminLayoutRoute,
 } as any)
 const adminRepositoriesCreateRoute = adminRepositoriesCreateRouteImport.update({
   id: '/repositories/new',
@@ -77,8 +89,10 @@ export interface FileRoutesByFullPath {
   '/admin': typeof AdminLayoutRouteWithChildren
   '/admin/': typeof adminAdminHomeRoute
   '/admin/repositories': typeof adminRepositoriesListRoute
+  '/admin/users': typeof adminUsersListRoute
   '/admin/repositories/$repo': typeof adminRepositoriesEditRoute
   '/admin/repositories/new': typeof adminRepositoriesCreateRoute
+  '/admin/users/$userId': typeof adminUsersEditRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/admin/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
 }
@@ -87,8 +101,10 @@ export interface FileRoutesByTo {
   '/': typeof BrowseRoute
   '/admin': typeof adminAdminHomeRoute
   '/admin/repositories': typeof adminRepositoriesListRoute
+  '/admin/users': typeof adminUsersListRoute
   '/admin/repositories/$repo': typeof adminRepositoriesEditRoute
   '/admin/repositories/new': typeof adminRepositoriesCreateRoute
+  '/admin/users/$userId': typeof adminUsersEditRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/admin/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
 }
@@ -100,8 +116,10 @@ export interface FileRoutesById {
   '/_app/admin': typeof AdminLayoutRouteWithChildren
   '/_app/admin/': typeof adminAdminHomeRoute
   '/_app/admin/repositories': typeof adminRepositoriesListRoute
+  '/_app/admin/users': typeof adminUsersListRoute
   '/_app/admin/repositories/$repo': typeof adminRepositoriesEditRoute
   '/_app/admin/repositories/new': typeof adminRepositoriesCreateRoute
+  '/_app/admin/users/$userId': typeof adminUsersEditRoute
   '/_app/packages/$repo/$id': typeof PackageDetailRoute
   '/_app/admin/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
 }
@@ -113,8 +131,10 @@ export interface FileRouteTypes {
     | '/admin'
     | '/admin/'
     | '/admin/repositories'
+    | '/admin/users'
     | '/admin/repositories/$repo'
     | '/admin/repositories/new'
+    | '/admin/users/$userId'
     | '/packages/$repo/$id'
     | '/admin/repositories/$repo/members'
   fileRoutesByTo: FileRoutesByTo
@@ -123,8 +143,10 @@ export interface FileRouteTypes {
     | '/'
     | '/admin'
     | '/admin/repositories'
+    | '/admin/users'
     | '/admin/repositories/$repo'
     | '/admin/repositories/new'
+    | '/admin/users/$userId'
     | '/packages/$repo/$id'
     | '/admin/repositories/$repo/members'
   id:
@@ -135,8 +157,10 @@ export interface FileRouteTypes {
     | '/_app/admin'
     | '/_app/admin/'
     | '/_app/admin/repositories'
+    | '/_app/admin/users'
     | '/_app/admin/repositories/$repo'
     | '/_app/admin/repositories/new'
+    | '/_app/admin/users/$userId'
     | '/_app/packages/$repo/$id'
     | '/_app/admin/repositories/$repo/members'
   fileRoutesById: FileRoutesById
@@ -176,6 +200,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BrowseRouteImport
       parentRoute: typeof AppLayoutRoute
     }
+    '/_app/admin/users': {
+      id: '/_app/admin/users'
+      path: '/users'
+      fullPath: '/admin/users'
+      preLoaderRoute: typeof adminUsersListRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/admin/repositories': {
       id: '/_app/admin/repositories'
       path: '/repositories'
@@ -196,6 +227,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/packages/$repo/$id'
       preLoaderRoute: typeof PackageDetailRouteImport
       parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/admin/users/$userId': {
+      id: '/_app/admin/users/$userId'
+      path: '/users/$userId'
+      fullPath: '/admin/users/$userId'
+      preLoaderRoute: typeof adminUsersEditRouteImport
+      parentRoute: typeof AdminLayoutRoute
     }
     '/_app/admin/repositories/new': {
       id: '/_app/admin/repositories/new'
@@ -224,16 +262,20 @@ declare module '@tanstack/react-router' {
 interface AdminLayoutRouteChildren {
   adminAdminHomeRoute: typeof adminAdminHomeRoute
   adminRepositoriesListRoute: typeof adminRepositoriesListRoute
+  adminUsersListRoute: typeof adminUsersListRoute
   adminRepositoriesEditRoute: typeof adminRepositoriesEditRoute
   adminRepositoriesCreateRoute: typeof adminRepositoriesCreateRoute
+  adminUsersEditRoute: typeof adminUsersEditRoute
   adminRepositoriesGroupMembersRoute: typeof adminRepositoriesGroupMembersRoute
 }
 
 const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminAdminHomeRoute: adminAdminHomeRoute,
   adminRepositoriesListRoute: adminRepositoriesListRoute,
+  adminUsersListRoute: adminUsersListRoute,
   adminRepositoriesEditRoute: adminRepositoriesEditRoute,
   adminRepositoriesCreateRoute: adminRepositoriesCreateRoute,
+  adminUsersEditRoute: adminUsersEditRoute,
   adminRepositoriesGroupMembersRoute: adminRepositoriesGroupMembersRoute,
 }
 
