@@ -1,0 +1,142 @@
+//! E2E: `GET /admin/me` identity + capabilities (plan §12.6 Phase 0).
+//!
+//! Verifies the endpoint is reachable by *any* authenticated user (not only
+//! admins — it lives outside the admin `require_admin` gate), returns the right
+//! `is_admin` flag + capability list, and rejects unauthenticated / anonymous
+//! callers with 401.
+
+mod common;
+
+use serde_json::{json, Value};
+
+/// The bootstrap admin sees `is_admin: true` and the admin capability set.
+#[tokio::test]
+async fn me_returns_admin_identity() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(body["user"]["username"], json!(u));
+    assert_eq!(body["user"]["is_admin"], json!(true));
+    assert_eq!(body["user"]["active"], json!(true));
+    assert_eq!(body["is_admin"], json!(true));
+    let caps: Vec<String> = body["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert!(caps.contains(&"repo.read".to_string()));
+    assert!(caps.contains(&"repo.admin".to_string()));
+}
+
+/// A non-admin user can call `/admin/me` (it is NOT admin-gated) and sees
+/// `is_admin: false` with only the reader capability.
+#[tokio::test]
+async fn me_reachable_by_non_admin() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("plain{}", common::unique());
+
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // The non-admin is forbidden from the admin API but CAN read /admin/me.
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "non-admin may read /admin/me");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["is_admin"], json!(false));
+    let caps: Vec<String> = body["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(caps, vec!["repo.read".to_string()]);
+
+    // Sanity: the same user is still 403 on the admin API.
+    let resp = client
+        .get(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+/// An unauthenticated caller (no credentials, anon mode off) gets 401.
+#[tokio::test]
+async fn me_unauthenticated_is_401() {
+    let srv = common::start().await;
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// An anonymous caller (anon mode all) is still not a *user*, so `/admin/me`
+/// returns 401 — the SPA treats this as "no session".
+#[tokio::test]
+async fn me_anonymous_is_401() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            anonymous_mode: "all".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            ..Default::default()
+        },
+    )
+    .await;
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "anonymous principal is not a user session"
+    );
+}
+
+/// A token authenticates `/admin/me` (X-NuGet-ApiKey path).
+#[tokio::test]
+async fn me_with_token() {
+    let srv = common::start().await;
+    let token = srv.admin_token().await;
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["is_admin"], json!(true));
+}

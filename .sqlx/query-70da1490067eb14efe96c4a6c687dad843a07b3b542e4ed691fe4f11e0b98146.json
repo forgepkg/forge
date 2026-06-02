@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT version, listed, first_seen_at\n        FROM proxy_cached_version\n        WHERE repository_id = $1 AND name = $2 AND version <> '*' AND not_found = false\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "listed",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "first_seen_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "70da1490067eb14efe96c4a6c687dad843a07b3b542e4ed691fe4f11e0b98146"
+}

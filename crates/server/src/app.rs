@@ -11,8 +11,10 @@ use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 
 use crate::admin::admin_router;
+use crate::browse::browse_router;
 use crate::config::Config;
 use crate::dispatch::dispatch;
+use crate::me::me_router;
 use crate::middleware::{attach_principal, PrincipalLayer};
 use crate::state::AppState;
 
@@ -40,16 +42,28 @@ pub fn principal_layer(config: &Config, pool: &PgPool) -> anyhow::Result<Princip
 }
 
 /// Build the full application router:
+/// * `/admin/me` — authenticated principal identity + capabilities (NOT
+///   admin-gated; any authenticated user may read it).
 /// * `/admin/...` — admin REST API (admin-only).
+/// * `/browse/...` — read-side browse / search (per-repo `anonymous_read`
+///   authz enforced inside the handlers).
 /// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
 ///
-/// Both branches run behind the principal middleware so every handler sees a
+/// All branches run behind the principal middleware so every handler sees a
 /// resolved [`forge_core::auth::principal::Principal`] extension.
+///
+/// Route precedence note: `/admin/me` is merged as its own route and the
+/// admin-only API is `nest`ed at `/admin`. A nested router only matches paths
+/// *under* its prefix that the nest itself defines, so the standalone
+/// `/admin/me` route is matched directly (and is not subject to the admin
+/// router's `require_admin` gate).
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router();
 
     Router::new()
+        .merge(me_router())
         .nest("/admin", admin)
+        .merge(browse_router())
         // Everything under /v3/{repo} is handled by the dispatcher (which builds
         // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
         // /DELETE; the dispatcher enforces authz per method.
