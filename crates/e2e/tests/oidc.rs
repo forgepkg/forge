@@ -12,6 +12,13 @@
 //! 4. session **logout** revokes the cookie cluster-wide.
 //! 5. a session-authenticated user **mints a repository token** and uses it as
 //!    `X-NuGet-ApiKey` against a real NuGet repo endpoint.
+//! 6. **session expiry** (plan §5 scenario 6): a session created with a tiny
+//!    idle TTL is accepted while fresh and `401`s on the next request once it
+//!    lapses (the validity predicate is evaluated on read, in SQL).
+//! 7. **auth reaper** (plan §5 Phase-6 requirement): against a running stack
+//!    with the wired reaper worker, expired `oidc_flow` rows and dead
+//!    (expired/revoked) `session` rows are deleted while the live ones survive
+//!    and stay usable.
 //!
 //! Requires Docker.
 
@@ -44,6 +51,19 @@ async fn start_oidc_stack(idp: &MockOidc) -> TestServer {
 /// The `[oidc]` block (standalone copy of `MockOidc::oidc_block`, so the same
 /// closure can be cloned for a peer with its own base URL).
 fn oidc_block(issuer: &str, client_id: &str, public_base_url: &str) -> String {
+    oidc_block_with_ttls(issuer, client_id, public_base_url, 28800, 604800)
+}
+
+/// Like [`oidc_block`] but with caller-chosen session TTLs, so a test can inject
+/// a deliberately tiny idle/absolute lifetime (plan §5 scenario 6: a short-TTL
+/// session is rejected on the next request once it lapses).
+fn oidc_block_with_ttls(
+    issuer: &str,
+    client_id: &str,
+    public_base_url: &str,
+    idle_ttl_seconds: u64,
+    absolute_ttl_seconds: u64,
+) -> String {
     format!(
         r#"
 [oidc]
@@ -54,8 +74,8 @@ redirect_url = "{public_base_url}/auth/oidc/callback"
 allow_private_issuer = true
 admin_groups = ["forge-admins"]
 admin_claim = "roles"
-session_idle_ttl_seconds = 28800
-session_absolute_ttl_seconds = 604800
+session_idle_ttl_seconds = {idle_ttl_seconds}
+session_absolute_ttl_seconds = {absolute_ttl_seconds}
 "#,
     )
 }
@@ -422,4 +442,216 @@ async fn session_minted_token_authenticates_nuget_endpoint() {
         .await
         .unwrap();
     assert_eq!(read.status(), 200, "session-minted token reads the repo");
+}
+
+// ── 6a. session expiry: a short-TTL session is 401 on the next request ────────
+
+#[tokio::test]
+async fn short_ttl_session_is_rejected_after_it_lapses() {
+    let idp = MockOidc::start(CLIENT_ID).await;
+    let issuer = idp.issuer().to_string();
+    let client_id = CLIENT_ID.to_string();
+    // Idle TTL of 1s: the session is valid right after login but lapses within a
+    // second. (Absolute TTL is comfortably long so we isolate the idle path.)
+    let srv = StackBuilder::default()
+        .bootstrap_admin("root", "rootpw")
+        .with_oidc(move |base| oidc_block_with_ttls(&issuer, &client_id, base, 1, 604800))
+        .start()
+        .await;
+
+    let (state, nonce) = begin_login(&srv).await;
+    idp.set_next_id_token(idp.id_claims("sub-heidi", "heidi", &nonce, json!([])))
+        .await;
+    let resp = callback(&srv, &state).await;
+    assert_eq!(resp.status(), 302, "login succeeds");
+    let cookie = session_cookie_from(resp.headers().get("set-cookie").unwrap().to_str().unwrap());
+
+    // While fresh, the session authenticates /auth/me.
+    let fresh = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), 200, "fresh short-TTL session is accepted");
+
+    // Wait past the 1s idle TTL. The validity predicate is enforced in SQL
+    // (`now() < idle_expiry`), so the next request with the same cookie is 401 —
+    // no reaper involvement needed; expiry is evaluated on read.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let lapsed = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        lapsed.status(),
+        401,
+        "an idle-expired session is rejected on the next request"
+    );
+}
+
+// ── 6b. reaper: deletes expired oidc_flow/session rows, leaves valid ones ─────
+
+/// Count live `oidc_flow` rows for a given `state` (0 or 1).
+async fn flow_exists(pool: &sqlx::PgPool, state: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM oidc_flow WHERE state = $1")
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .expect("count flow")
+        > 0
+}
+
+/// Whether a `session` row with the given id still exists.
+async fn session_exists(pool: &sqlx::PgPool, id: i64) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM session WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count session")
+        > 0
+}
+
+#[tokio::test]
+async fn reaper_removes_expired_flows_and_sessions_keeps_valid() {
+    use forge_core::auth::token::hash_token;
+    use forge_db::oidc_flow_dao::{self, NewOidcFlow};
+    use forge_db::session_dao::{self, NewSession};
+
+    let idp = MockOidc::start(CLIENT_ID).await;
+    // Workers on: this stack actually spawns the wired auth reaper loop. The
+    // sweep is driven directly below (the live worker cadence is ~60s, too slow
+    // for a deterministic test), exercising the exact DAO calls the loop runs
+    // against a real migrated Postgres + a running server instance.
+    let srv = StackBuilder::default()
+        .bootstrap_admin("root", "rootpw")
+        .workers(true)
+        .with_oidc({
+            let issuer = idp.issuer().to_string();
+            move |base| oidc_block(&issuer, CLIENT_ID, base)
+        })
+        .start()
+        .await;
+    let pool = srv.pool.clone();
+
+    // --- oidc_flow: one live (unexpired) row + one already-expired row. ---
+    // The live one comes from a real begin_login (so it is a genuine flow row).
+    let (live_state, _nonce) = begin_login(&srv).await;
+    // The expired one is inserted directly with a past `expires_at`.
+    let expired_state = "expired-state-reaper-test".to_string();
+    oidc_flow_dao::begin(
+        &pool,
+        NewOidcFlow {
+            state: expired_state.clone(),
+            nonce: "n".into(),
+            pkce_verifier: "v".into(),
+            redirect_to: "/".into(),
+            expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
+        },
+    )
+    .await
+    .expect("insert expired flow");
+
+    assert!(flow_exists(&pool, &live_state).await, "live flow present");
+    assert!(
+        flow_exists(&pool, &expired_state).await,
+        "expired flow present before reap"
+    );
+
+    // --- session: one live row (via a real login) + one expired + one revoked. ---
+    let (state, nonce) = begin_login(&srv).await;
+    idp.set_next_id_token(idp.id_claims("sub-ivan", "ivan", &nonce, json!([])))
+        .await;
+    let resp = callback(&srv, &state).await;
+    assert_eq!(resp.status(), 302, "live-session login succeeds");
+    let live_cookie =
+        session_cookie_from(resp.headers().get("set-cookie").unwrap().to_str().unwrap());
+    let (live_session_id, live_user_id) =
+        sqlx::query_as::<_, (i64, i64)>("SELECT id, user_id FROM session WHERE token_hash = $1")
+            .bind(hash_token(&live_cookie))
+            .fetch_one(&pool)
+            .await
+            .expect("live session row");
+
+    let now = chrono::Utc::now();
+    // An idle/absolute-expired session (both expiries in the past).
+    let expired_session = session_dao::create(
+        &pool,
+        NewSession {
+            user_id: live_user_id,
+            external_identity_id: None,
+            token_hash: hash_token("expired-cookie"),
+            csrf_secret: "c".into(),
+            user_agent_hash: None,
+            idle_expiry: now - chrono::Duration::hours(1),
+            absolute_expiry: now - chrono::Duration::hours(1),
+        },
+    )
+    .await
+    .expect("insert expired session");
+    // A revoked-but-not-yet-expired session.
+    let revoked_session = session_dao::create(
+        &pool,
+        NewSession {
+            user_id: live_user_id,
+            external_identity_id: None,
+            token_hash: hash_token("revoked-cookie"),
+            csrf_secret: "c".into(),
+            user_agent_hash: None,
+            idle_expiry: now + chrono::Duration::hours(8),
+            absolute_expiry: now + chrono::Duration::days(7),
+        },
+    )
+    .await
+    .expect("insert revoked session");
+    assert!(
+        session_dao::revoke(&pool, revoked_session.id)
+            .await
+            .expect("revoke"),
+        "session revoked"
+    );
+
+    // --- tick the reaper: exactly the two DELETEs the wired worker loop runs. ---
+    let flows_reaped = oidc_flow_dao::reap_expired(&pool).await.expect("flow reap");
+    let sessions_reaped = session_dao::reap_expired(&pool)
+        .await
+        .expect("session reap");
+    assert!(flows_reaped >= 1, "at least the expired flow was reaped");
+    assert!(
+        sessions_reaped >= 2,
+        "at least the expired + revoked sessions were reaped"
+    );
+
+    // --- expired/dead rows gone; valid rows survive. ---
+    assert!(
+        !flow_exists(&pool, &expired_state).await,
+        "expired flow deleted by reaper"
+    );
+    assert!(
+        flow_exists(&pool, &live_state).await,
+        "valid flow survives the reaper"
+    );
+    assert!(
+        !session_exists(&pool, expired_session.id).await,
+        "expired session deleted by reaper"
+    );
+    assert!(
+        !session_exists(&pool, revoked_session.id).await,
+        "revoked session deleted by reaper"
+    );
+    assert!(
+        session_exists(&pool, live_session_id).await,
+        "valid session row survives the reaper"
+    );
+
+    // The surviving session is still usable end-to-end on the live server.
+    let me = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={live_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), 200, "the reaper left the valid session usable");
 }
