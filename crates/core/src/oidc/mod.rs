@@ -31,9 +31,6 @@ pub mod claims;
 pub mod flow;
 pub mod jwks;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::SaltString;
-use argon2::{Argon2, PasswordHasher};
 use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use forge_db::{external_identity_dao, oidc_flow_dao, session_dao};
@@ -69,9 +66,6 @@ pub enum ResolveError {
     /// A database error during resolution.
     #[error("oidc resolve db error: {0}")]
     Db(String),
-    /// Password hashing for the auto-provisioned sentinel failed.
-    #[error("oidc provision hash error: {0}")]
-    Hash(String),
 }
 
 /// How identity resolution should provision / link users. Built by the server
@@ -149,11 +143,16 @@ pub async fn resolve_user(
             pool,
             NewUser {
                 username,
-                // No-login sentinel: a random argon2 hash no password verifies
-                // against, so password-basic can never authenticate this user.
-                password_hash: no_login_password_hash()?,
+                // No local password: slice 12.3 made password_hash nullable and
+                // records provenance instead. A NULL hash means password-basic
+                // can never authenticate this user (token.rs short-circuits on
+                // None); the (issuer, subject) link in external_identity is the
+                // authority for OIDC logins.
+                password_hash: None,
                 is_admin: mapped.is_admin,
                 active: true,
+                auth_source: "oidc".to_string(),
+                external_subject: Some(login.subject.clone()),
             },
         )
         .await
@@ -229,17 +228,4 @@ async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveErr
     Err(ResolveError::Db(
         "could not allocate a unique username".into(),
     ))
-}
-
-/// Produce an argon2 PHC hash of a random secret that is never disclosed — a
-/// "no password login possible" sentinel for auto-provisioned OIDC users.
-fn no_login_password_hash() -> Result<String, ResolveError> {
-    use rand::RngCore;
-    let mut secret = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret);
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(&secret, &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| ResolveError::Hash(e.to_string()))
 }

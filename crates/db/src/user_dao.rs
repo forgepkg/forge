@@ -5,12 +5,33 @@ use sqlx::PgPool;
 use crate::model::AppUser;
 
 /// All settable fields when creating a user row.
+///
+/// `password_hash` is `None` for users with no local password (upstream-basic /
+/// oidc). `auth_source` defaults conceptually to `'local'`; callers provisioning
+/// a non-local user set it explicitly along with `external_subject`. The DB
+/// CHECK enforces that a `'local'` user has a non-null `password_hash`.
 #[derive(Debug, Clone)]
 pub struct NewUser {
     pub username: String,
-    pub password_hash: String,
+    pub password_hash: Option<String>,
     pub is_admin: bool,
     pub active: bool,
+    pub auth_source: String,
+    pub external_subject: Option<String>,
+}
+
+impl NewUser {
+    /// Convenience constructor for a slice-1 local (argon2 password) user.
+    pub fn local(username: String, password_hash: String, is_admin: bool, active: bool) -> Self {
+        Self {
+            username,
+            password_hash: Some(password_hash),
+            is_admin,
+            active,
+            auth_source: "local".to_string(),
+            external_subject: None,
+        }
+    }
 }
 
 /// Insert a user, returning the persisted row.
@@ -18,14 +39,19 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
     sqlx::query_as!(
         AppUser,
         r#"
-        INSERT INTO app_user (username, password_hash, is_admin, active)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, username, password_hash, is_admin, active, created_at, updated_at
+        INSERT INTO app_user
+            (username, password_hash, is_admin, active, auth_source, external_subject)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
         "#,
         new.username,
         new.password_hash,
         new.is_admin,
         new.active,
+        new.auth_source,
+        new.external_subject,
     )
     .fetch_one(pool)
     .await
@@ -36,7 +62,9 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Resul
     sqlx::query_as!(
         AppUser,
         r#"
-        SELECT id, username, password_hash, is_admin, active, created_at, updated_at
+        SELECT
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
         FROM app_user
         WHERE username = $1
         "#,
@@ -51,7 +79,9 @@ pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppU
     sqlx::query_as!(
         AppUser,
         r#"
-        SELECT id, username, password_hash, is_admin, active, created_at, updated_at
+        SELECT
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
         FROM app_user
         WHERE id = $1
         "#,
@@ -66,7 +96,9 @@ pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
     sqlx::query_as!(
         AppUser,
         r#"
-        SELECT id, username, password_hash, is_admin, active, created_at, updated_at
+        SELECT
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
         FROM app_user
         ORDER BY username
         "#,
@@ -89,7 +121,9 @@ pub async fn update_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> sqlx::Re
         SET is_admin = $2,
             updated_at = CASE WHEN is_admin <> $2 THEN now() ELSE updated_at END
         WHERE id = $1
-        RETURNING id, username, password_hash, is_admin, active, created_at, updated_at
+        RETURNING
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
         "#,
         id,
         is_admin,

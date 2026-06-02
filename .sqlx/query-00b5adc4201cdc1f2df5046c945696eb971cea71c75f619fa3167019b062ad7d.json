@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, username, password_hash, is_admin, active, created_at, updated_at\n        FROM app_user\n        ORDER BY username\n        ",
+  "query": "\n        UPDATE app_user\n        SET is_admin = $2,\n            updated_at = CASE WHEN is_admin <> $2 THEN now() ELSE updated_at END\n        WHERE id = $1\n        RETURNING\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -30,27 +30,42 @@
       },
       {
         "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "external_subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8",
+        "Bool"
+      ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "34f0b9902339709647eac5c0fe84e8e2281e233e67be07ccfb1c1582a220c2b3"
+  "hash": "00b5adc4201cdc1f2df5046c945696eb971cea71c75f619fa3167019b062ad7d"
 }

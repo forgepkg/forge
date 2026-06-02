@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO app_user (username, password_hash, is_admin, active)\n        VALUES ($1, $2, $3, $4)\n        RETURNING id, username, password_hash, is_admin, active, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -30,32 +30,41 @@
       },
       {
         "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "external_subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Bool",
-        "Bool"
+        "Int8"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "a1a625fbb32845424518095041ae842a04bcaacd5c7e17b4c3cf6bf5d53886ca"
+  "hash": "ffa6565be0c828e3a7bf353e84f00221dadec4d0880adcede38a0431acee0a9b"
 }

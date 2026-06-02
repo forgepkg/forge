@@ -198,13 +198,21 @@ pub struct ProxyUpstreamIndex {
 }
 
 /// A row of `app_user`.
+///
+/// `password_hash` is `None` for users with no local password (auth_source
+/// `'upstream-basic'` or `'oidc'`); a `'local'` user always has one (DB CHECK
+/// `app_user_local_password_hash_check`, slice 12.3). `auth_source` records how
+/// the user last authenticated / was provisioned; `external_subject` is the
+/// opaque upstream identifier for non-local sources.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AppUser {
     pub id: i64,
     pub username: String,
-    pub password_hash: String,
+    pub password_hash: Option<String>,
     pub is_admin: bool,
     pub active: bool,
+    pub auth_source: String,
+    pub external_subject: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

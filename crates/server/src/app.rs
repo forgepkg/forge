@@ -147,12 +147,7 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
 
     user_dao::insert_user(
         pool,
-        NewUser {
-            username: ba.username.clone(),
-            password_hash,
-            is_admin: true,
-            active: true,
-        },
+        NewUser::local(ba.username.clone(), password_hash, true, true),
     )
     .await
     .context("insert bootstrap admin")?;

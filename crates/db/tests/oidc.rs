@@ -26,12 +26,7 @@ use common::{pool, unique};
 async fn make_user(pool: &sqlx::PgPool, n: u64) -> AppUser {
     user_dao::insert_user(
         pool,
-        NewUser {
-            username: format!("oidc-user-{n}"),
-            password_hash: "x".to_string(),
-            is_admin: false,
-            active: true,
-        },
+        NewUser::local(format!("oidc-user-{n}"), "x".to_string(), false, true),
     )
     .await
     .expect("insert user")

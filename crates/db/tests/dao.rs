@@ -478,12 +478,7 @@ async fn user_and_token_round_trip() {
 
     let user = user_dao::insert_user(
         pool,
-        NewUser {
-            username: username.clone(),
-            password_hash: "argon2-hash".to_string(),
-            is_admin: true,
-            active: true,
-        },
+        NewUser::local(username.clone(), "argon2-hash".to_string(), true, true),
     )
     .await
     .expect("user");
@@ -504,6 +499,12 @@ async fn user_and_token_round_trip() {
             .username,
         username
     );
+
+    // A local user carries its provenance: source 'local', a password hash, and
+    // no external subject.
+    assert_eq!(user.auth_source, "local");
+    assert_eq!(user.password_hash.as_deref(), Some("argon2-hash"));
+    assert_eq!(user.external_subject, None);
 
     let hash = format!("token-hash-{n}");
     let token = token_dao::insert_token(
@@ -534,6 +535,43 @@ async fn user_and_token_round_trip() {
         .expect("by hash")
         .expect("present");
     assert!(touched.last_used_at.is_some());
+}
+
+#[tokio::test]
+async fn upstream_basic_user_has_no_local_password() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let username = format!("nexus-{n}");
+
+    // An upstream-basic user is provisioned with NO local password hash and
+    // carries provenance (source + external subject).
+    let user = user_dao::insert_user(
+        pool,
+        NewUser {
+            username: username.clone(),
+            password_hash: None,
+            is_admin: false,
+            active: true,
+            auth_source: "upstream-basic".to_string(),
+            external_subject: Some(username.clone()),
+        },
+    )
+    .await
+    .expect("upstream user inserts with NULL password_hash");
+
+    assert_eq!(user.password_hash, None);
+    assert_eq!(user.auth_source, "upstream-basic");
+    assert_eq!(user.external_subject.as_deref(), Some(username.as_str()));
+
+    // Provenance round-trips through a fresh read.
+    let reread = user_dao::find_user_by_username(pool, &username)
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(reread.password_hash, None);
+    assert_eq!(reread.auth_source, "upstream-basic");
+    assert_eq!(reread.external_subject.as_deref(), Some(username.as_str()));
 }
 
 // ── proxy_dao ─────────────────────────────────────────────────────────────────

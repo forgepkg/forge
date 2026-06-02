@@ -71,12 +71,12 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(resp) => return resp,
     };
 
-    let new = NewUser {
-        username: body.username.clone(),
+    let new = NewUser::local(
+        body.username.clone(),
         password_hash,
-        is_admin: body.is_admin,
-        active: body.active,
-    };
+        body.is_admin,
+        body.active,
+    );
     match user_dao::insert_user(&state.pool, new).await {
         Ok(u) => (StatusCode::CREATED, Json(UserView::from(&u))).into_response(),
         Err(e) if is_unique_violation(&e) => {

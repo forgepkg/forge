@@ -403,12 +403,7 @@ async fn resolve_user_links_existing_local_user_by_username() {
     // Pre-create a local user (a bootstrap admin) with this username.
     let local = user_dao::insert_user(
         &pool,
-        NewUser {
-            username: username.clone(),
-            password_hash: "argon2-hash".into(),
-            is_admin: true,
-            active: true,
-        },
+        NewUser::local(username.clone(), "argon2-hash".into(), true, true),
     )
     .await
     .expect("local user");
@@ -471,12 +466,7 @@ async fn resolve_user_rejects_inactive_linked_user() {
     // active check rejects the login.
     user_dao::insert_user(
         &pool,
-        NewUser {
-            username: username.clone(),
-            password_hash: "x".into(),
-            is_admin: false,
-            active: false,
-        },
+        NewUser::local(username.clone(), "x".into(), false, false),
     )
     .await
     .expect("inactive user");
@@ -498,12 +488,7 @@ async fn session_create_validate_revoke_round_trip() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser {
-            username: format!("sess-user-{n}"),
-            password_hash: "x".into(),
-            is_admin: false,
-            active: true,
-        },
+        NewUser::local(format!("sess-user-{n}"), "x".into(), false, true),
     )
     .await
     .expect("user");
@@ -552,12 +537,7 @@ async fn session_rotate_issues_new_and_revokes_old() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser {
-            username: format!("rot-user-{n}"),
-            password_hash: "x".into(),
-            is_admin: false,
-            active: true,
-        },
+        NewUser::local(format!("rot-user-{n}"), "x".into(), false, true),
     )
     .await
     .expect("user");

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, username, password_hash, is_admin, active, created_at, updated_at\n        FROM app_user\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -30,29 +30,41 @@
       },
       {
         "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "external_subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "556c8549c7fd4460cca63ade1559127890d3a93efca877077ed79e7279900736"
+  "hash": "9337f98f69181c215bdad96ac1bd91567c31979a1380661086333b707d844b7a"
 }

@@ -30,6 +30,14 @@ const EXPECTED_TABLES: &[&str] = &[
     "external_identity",
     "session",
     "oidc_flow",
+    // 0004_credforward.sql
+    "validated_credential",
+];
+
+/// Columns `0004_credforward.sql` adds to `app_user` (provenance): (table, column).
+const EXPECTED_CREDFORWARD_COLUMNS: &[(&str, &str)] = &[
+    ("app_user", "auth_source"),
+    ("app_user", "external_subject"),
 ];
 
 /// Unique constraints `0003_oidc.sql` is expected to enforce: (table, columns).
@@ -115,6 +123,40 @@ async fn migrations_create_all_expected_tables() {
             "expected column `{table}.{column}` to exist after the retention migration"
         );
     }
+
+    // Assert the credential-forwarding provenance columns exist (0004).
+    for (table, column) in EXPECTED_CREDFORWARD_COLUMNS {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2\
+             )",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .expect("failed to query information_schema.columns");
+
+        assert!(
+            exists,
+            "expected column `{table}.{column}` to exist after the credforward migration"
+        );
+    }
+
+    // `app_user.password_hash` must now be NULLABLE (0004 dropped NOT NULL).
+    let password_hash_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'app_user' \
+           AND column_name = 'password_hash'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed to query password_hash nullability");
+    assert_eq!(
+        password_hash_nullable, "YES",
+        "app_user.password_hash should be nullable after 0004"
+    );
 
     // `repository.retention_policy` is jsonb and accepts a well-formed policy
     // document (sanity check that the column type is usable from SQL).
@@ -266,5 +308,111 @@ async fn migrations_create_all_expected_tables() {
     assert!(
         second.is_none(),
         "second consume returns nothing (single-use / replay protection)"
+    );
+
+    // -----------------------------------------------------------------------
+    // 0004_credforward.sql: app_user provenance + validated_credential
+    // -----------------------------------------------------------------------
+
+    // Existing rows backfilled to auth_source = 'local' via the DEFAULT.
+    let backfilled: String =
+        sqlx::query_scalar("SELECT auth_source FROM app_user WHERE username = 'oidc-user'")
+            .fetch_one(&pool)
+            .await
+            .expect("read backfilled auth_source");
+    assert_eq!(
+        backfilled, "local",
+        "existing app_user rows backfill to auth_source = 'local'"
+    );
+
+    // CHECK app_user_local_password_hash_check: a 'local' user with a NULL
+    // password_hash is rejected.
+    let local_null = sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source) \
+         VALUES ('local-no-hash', NULL, 'local')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        local_null.is_err(),
+        "a local user with NULL password_hash must violate the CHECK"
+    );
+
+    // ... but an upstream-basic user with a NULL password_hash is allowed
+    // (no local password), and external_subject is settable.
+    sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source, external_subject) \
+         VALUES ('nexus-user', NULL, 'upstream-basic', 'nexus-user')",
+    )
+    .execute(&pool)
+    .await
+    .expect("upstream-basic user with NULL password_hash should be insertable");
+
+    // CHECK app_user_auth_source_check: an unknown auth_source is rejected.
+    let bad_source = sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source) \
+         VALUES ('bad-source', NULL, 'ldap')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_source.is_err(),
+        "an unknown auth_source value must violate the CHECK"
+    );
+
+    // validated_credential round-trips a verdict; the plaintext password is
+    // never a column — only the HMAC.
+    sqlx::query(
+        "INSERT INTO validated_credential \
+             (provider_id, username, cred_hmac, verdict, expires_at) \
+         VALUES ('upstream-basic', 'nexus-user', 'deadbeefhmac', true, now() + interval '5 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("validated_credential row should be insertable");
+
+    // UNIQUE (provider_id, username, cred_hmac) is enforced.
+    let dup_vc = sqlx::query(
+        "INSERT INTO validated_credential \
+             (provider_id, username, cred_hmac, verdict, expires_at) \
+         VALUES ('upstream-basic', 'nexus-user', 'deadbeefhmac', false, now() + interval '5 minutes')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        dup_vc.is_err(),
+        "validated_credential must enforce UNIQUE (provider_id, username, cred_hmac)"
+    );
+
+    // The expiry sweep deletes only expired rows. Insert an already-expired row,
+    // then DELETE ... WHERE expires_at < now() and assert it removes exactly the
+    // expired one (the unexpired row above survives).
+    sqlx::query(
+        "INSERT INTO validated_credential \
+             (provider_id, username, cred_hmac, verdict, expires_at) \
+         VALUES ('upstream-basic', 'nexus-user', 'expiredhmac', true, now() - interval '1 minute')",
+    )
+    .execute(&pool)
+    .await
+    .expect("expired validated_credential row should be insertable");
+
+    let reaped = sqlx::query("DELETE FROM validated_credential WHERE expires_at < now()")
+        .execute(&pool)
+        .await
+        .expect("sweep query runs");
+    assert_eq!(
+        reaped.rows_affected(),
+        1,
+        "sweep deletes exactly the one expired validated_credential row"
+    );
+
+    let survivors: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential WHERE expires_at >= now()")
+            .fetch_one(&pool)
+            .await
+            .expect("count surviving rows");
+    assert_eq!(
+        survivors, 1,
+        "the unexpired validated_credential row survives the sweep"
     );
 }

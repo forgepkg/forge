@@ -113,7 +113,9 @@ pub async fn verify_password(
         return None;
     }
 
-    let stored = user.password_hash.clone();
+    // Users with no local password (auth_source upstream-basic / oidc) can never
+    // authenticate via password-basic against the local store.
+    let stored = user.password_hash.clone()?;
     let candidate = password.to_string();
     let verified = tokio::task::spawn_blocking(move || {
         let parsed = match PasswordHash::new(&stored) {
