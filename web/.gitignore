@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.local
 .vite/
+
+# Playwright e2e artifacts
+/test-results/
+/playwright-report/
+/blob-report/
+/.last-run.json
+e2e/.harness-facts.json
