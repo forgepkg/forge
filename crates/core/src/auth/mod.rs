@@ -11,11 +11,13 @@
 pub mod authz;
 pub mod client_ip;
 pub mod principal;
+pub mod session_source;
 pub mod token;
 
 pub use authz::{can_admin, can_read, can_write};
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
 pub use principal::{Principal, UserPrincipal};
+pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
 pub use token::{
     generate_token_secret, hash_token, resolve_principal, verify_password, verify_token, AuthError,
     BasicAuthSource, PrincipalSource, SourceOutcome, TokenHeaderSource,
