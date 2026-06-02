@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use forge_core::format::Format;
 use forge_core::repo::proxy::ProxyRepo;
+use forge_core::retention::worker::{RetentionConfig, RetentionWorker};
 use forge_db::model::RepoKind;
 use forge_db::repository_dao;
 use forge_storage::{outbox_worker, reconciler, BlobStore, Cas};
@@ -43,6 +44,8 @@ pub struct WorkerHandles {
     pub reconciler: JoinHandle<()>,
     /// Proxy metadata-refresh loop.
     pub proxy_refresh: JoinHandle<()>,
+    /// Retention-evaluation loop (slice 12.1).
+    pub retention: JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -51,6 +54,7 @@ impl WorkerHandles {
         self.outbox.abort();
         self.reconciler.abort();
         self.proxy_refresh.abort();
+        self.retention.abort();
     }
 }
 
@@ -82,10 +86,31 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         poll.saturating_mul(6).max(Duration::from_secs(60)),
     );
 
+    // Retention worker (slice 12.1): runs on every instance, claims one due
+    // repository per tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its
+    // policy, and applies decisions through the same blob outbox the outbox
+    // worker above drains — no parallel S3-delete path. Cross-instance
+    // exclusivity is the lease, not leader election.
+    let retention = RetentionWorker::new(
+        state.pool.clone(),
+        state.formats.nuget(),
+        state.cache_invalidator(),
+        RetentionConfig {
+            poll_interval: state.config.retention.poll_interval(),
+            default_run_interval: state.config.retention.default_run_interval(),
+            lease: state.config.retention.lease(),
+            // Reuse the outbox grace so a retention-dereferenced blob and a
+            // redeploy-dereferenced one share the same S3-delete deferral.
+            delete_grace: grace,
+        },
+    )
+    .spawn_loop();
+
     WorkerHandles {
         outbox,
         reconciler,
         proxy_refresh,
+        retention,
     }
 }
 

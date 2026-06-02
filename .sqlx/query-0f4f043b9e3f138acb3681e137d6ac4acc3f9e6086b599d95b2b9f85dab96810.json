@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE asset a\n        SET download_count = a.download_count + 1,\n            last_downloaded_at = now()\n        FROM proxy_cached_version pcv\n        JOIN component c\n          ON c.repository_id = pcv.repository_id\n         AND c.name = pcv.name\n         AND c.version = pcv.version\n        WHERE pcv.id = $1\n          AND a.component_id = c.id\n          AND a.path LIKE '%.nupkg'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0f4f043b9e3f138acb3681e137d6ac4acc3f9e6086b599d95b2b9f85dab96810"
+}

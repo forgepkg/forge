@@ -39,6 +39,9 @@ pub struct Config {
     /// Background outbox worker tuning.
     #[serde(default)]
     pub outbox: OutboxConfig,
+    /// Background retention worker tuning.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -208,6 +211,53 @@ impl OutboxConfig {
     }
 }
 
+/// `retention.*` — background retention worker tuning (slice 12.1).
+///
+/// The worker runs on every instance, claims one due repository per tick via
+/// `FOR UPDATE SKIP LOCKED` + a lease, evaluates its policy, and applies
+/// decisions through the slice-1 blob outbox. `default_run_interval` is the
+/// floor between automatic runs (a larger per-repo `min_run_interval_seconds`
+/// in the policy wins); `lease_seconds` is the crash-safe lease; `delete_grace`
+/// defaults to the outbox grace when unset and is the deferral before a
+/// dereferenced blob is S3-deleted.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// How often each instance polls for a due repository (seconds).
+    #[serde(default = "default_retention_poll")]
+    pub poll_interval_seconds: u64,
+    /// Default floor between automatic runs per repo (seconds).
+    #[serde(default = "default_retention_run_interval")]
+    pub default_run_interval_seconds: i64,
+    /// Crash-safe lease held while a repo is evaluated (seconds).
+    #[serde(default = "default_retention_lease")]
+    pub lease_seconds: i64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        RetentionConfig {
+            poll_interval_seconds: default_retention_poll(),
+            default_run_interval_seconds: default_retention_run_interval(),
+            lease_seconds: default_retention_lease(),
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Poll interval as a [`Duration`].
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_interval_seconds)
+    }
+    /// Default run interval as a chrono [`chrono::Duration`].
+    pub fn default_run_interval(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.default_run_interval_seconds)
+    }
+    /// Lease as a chrono [`chrono::Duration`].
+    pub fn lease(&self) -> chrono::Duration {
+        chrono::Duration::seconds(self.lease_seconds)
+    }
+}
+
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -269,6 +319,15 @@ fn default_outbox_grace() -> i64 {
 }
 fn default_outbox_poll() -> u64 {
     10
+}
+fn default_retention_poll() -> u64 {
+    30
+}
+fn default_retention_run_interval() -> i64 {
+    3600
+}
+fn default_retention_lease() -> i64 {
+    300
 }
 
 /// Configuration load / validation errors.
@@ -403,6 +462,9 @@ mod tests {
         assert!(cfg.redis.url.is_none());
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
+        assert_eq!(cfg.retention.poll_interval_seconds, 30);
+        assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
+        assert_eq!(cfg.retention.lease_seconds, 300);
         assert!(matches!(cfg.anon_policy().unwrap(), AnonPolicy::Off));
         // Web UI: enabled by default, served from `web/dist`.
         assert!(cfg.web.enabled);
@@ -466,6 +528,9 @@ mod tests {
             jail.set_env("FORGE_OUTBOX__BATCH_SIZE", "7");
             jail.set_env("FORGE_OUTBOX__GRACE_SECONDS", "60");
             jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
+            jail.set_env("FORGE_RETENTION__POLL_INTERVAL_SECONDS", "11");
+            jail.set_env("FORGE_RETENTION__DEFAULT_RUN_INTERVAL_SECONDS", "7200");
+            jail.set_env("FORGE_RETENTION__LEASE_SECONDS", "120");
             jail.set_env("FORGE_WEB__ENABLED", "false");
             jail.set_env("FORGE_WEB__ASSETS_DIR", "/srv/ui");
 
@@ -498,6 +563,9 @@ mod tests {
             assert_eq!(cfg.outbox.batch_size, 7);
             assert_eq!(cfg.outbox.grace_seconds, 60);
             assert_eq!(cfg.outbox.poll_interval_seconds, 3);
+            assert_eq!(cfg.retention.poll_interval_seconds, 11);
+            assert_eq!(cfg.retention.default_run_interval_seconds, 7200);
+            assert_eq!(cfg.retention.lease_seconds, 120);
             assert!(!cfg.web.enabled);
             assert_eq!(cfg.web.assets_dir, "/srv/ui");
             Ok(())

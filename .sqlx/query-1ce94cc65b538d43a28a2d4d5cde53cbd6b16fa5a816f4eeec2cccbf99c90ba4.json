@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE asset a\n        SET download_count = a.download_count + 1,\n            last_downloaded_at = now()\n        FROM component c\n        WHERE c.repository_id = $1\n          AND c.name = $2\n          AND c.version = $3\n          AND a.component_id = c.id\n          AND a.path LIKE '%.nupkg'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1ce94cc65b538d43a28a2d4d5cde53cbd6b16fa5a816f4eeec2cccbf99c90ba4"
+}

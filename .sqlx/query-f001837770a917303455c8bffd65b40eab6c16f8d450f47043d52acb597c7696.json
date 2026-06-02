@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE component c\n        SET last_downloaded_at = now()\n        FROM proxy_cached_version pcv\n        WHERE pcv.id = $1\n          AND c.repository_id = pcv.repository_id\n          AND c.name = pcv.name\n          AND c.version = pcv.version\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f001837770a917303455c8bffd65b40eab6c16f8d450f47043d52acb597c7696"
+}

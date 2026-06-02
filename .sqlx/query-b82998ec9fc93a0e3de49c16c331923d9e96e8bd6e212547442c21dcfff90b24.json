@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version\n        SET last_downloaded_at = now()\n        WHERE repository_id = $1 AND name = $2 AND version = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b82998ec9fc93a0e3de49c16c331923d9e96e8bd6e212547442c21dcfff90b24"
+}
