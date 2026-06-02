@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE retention_run\n        SET next_run_at = now()\n        WHERE repository_id = $1 AND state = 'idle'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "172be51c622606da80133362d26c6dcb19fed858f1a6031b9e12ec895910aa7f"
+}

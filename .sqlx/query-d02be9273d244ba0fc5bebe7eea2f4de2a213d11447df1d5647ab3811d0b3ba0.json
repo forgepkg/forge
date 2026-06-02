@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE retention_run\n        SET state = 'idle',\n            locked_until = NULL,\n            current_run_id = NULL,\n            last_error = COALESCE(last_error, 'lease expired; reclaimed')\n        WHERE state = 'running'\n          AND locked_until IS NOT NULL\n          AND locked_until < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d02be9273d244ba0fc5bebe7eea2f4de2a213d11447df1d5647ab3811d0b3ba0"
+}

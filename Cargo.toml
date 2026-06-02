@@ -32,6 +32,9 @@ sqlx = { version = "0.8", features = [
     "uuid",
 ] }
 
+# UUIDs (retention run grouping)
+uuid = { version = "1", features = ["v4", "serde"] }
+
 # S3
 aws-sdk-s3 = { version = "1.85" }
 aws-config = { version = "1.8" }

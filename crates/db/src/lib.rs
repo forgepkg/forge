@@ -15,6 +15,7 @@ pub mod model;
 pub mod outbox_dao;
 pub mod proxy_dao;
 pub mod repository_dao;
+pub mod retention_dao;
 pub mod token_dao;
 pub mod user_dao;
 

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO retention_run (repository_id)\n        VALUES ($1)\n        ON CONFLICT (repository_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b263e2b932e60ea9eff83537390628862e82c574edd07f3c1b0daa8c9734eae8"
+}

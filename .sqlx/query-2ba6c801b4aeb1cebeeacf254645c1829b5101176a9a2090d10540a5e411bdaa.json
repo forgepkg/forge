@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH due AS (\n            SELECT rr.repository_id\n            FROM retention_run rr\n            JOIN repository r ON r.id = rr.repository_id\n            WHERE rr.next_run_at <= $1\n              AND (rr.state = 'idle' OR rr.locked_until IS NULL OR rr.locked_until < $1)\n              AND r.retention_policy IS NOT NULL\n              AND ($4::bigint IS NULL OR rr.repository_id = $4)\n            ORDER BY rr.next_run_at\n            FOR UPDATE OF rr SKIP LOCKED\n            LIMIT 1\n        )\n        UPDATE retention_run rr\n        SET state = 'running',\n            started_at = $1,\n            finished_at = NULL,\n            locked_until = $1 + make_interval(secs => $2),\n            current_run_id = $3,\n            last_error = NULL\n        FROM due\n        WHERE rr.repository_id = due.repository_id\n        RETURNING rr.repository_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Float8",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2ba6c801b4aeb1cebeeacf254645c1829b5101176a9a2090d10540a5e411bdaa"
+}
