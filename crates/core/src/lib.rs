@@ -14,11 +14,14 @@
 //! * [`net`] — outbound-networking helpers, notably the [`net::ssrf`] guard.
 //! * [`retention`] — the slice-12.1 retention policy model + pure evaluator
 //!   (decides which versions to delete/unlist; no I/O).
+//! * [`oidc`] — the slice-12.2 OpenID Connect support: discovery + JWKS fetch
+//!   (cached via [`forge_cache`]) and ID-token verification.
 
 pub mod auth;
 pub mod domain;
 pub mod format;
 pub mod net;
+pub mod oidc;
 pub mod repo;
 pub mod retention;
 

@@ -27,6 +27,10 @@ base64 = { workspace = true }
 http = { workspace = true }
 async-trait = { workspace = true }
 
+# OIDC ID-token verification (slice 12.2 Phase 2): explicit JWT decode + RSA
+# JWKS key construction + iss/aud/exp/nonce validation with an alg allowlist.
+jsonwebtoken = { workspace = true }
+
 # Networking / SSRF guard
 ipnet = { workspace = true }
 reqwest = { workspace = true }
@@ -46,3 +50,10 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 axum = { workspace = true }
 forge-cache = { path = "../cache" }
+# Mock HTTP server for discovery/JWKS unit tests (no real network).
+wiremock = "0.6"
+# Generate a throwaway RSA keypair in-test: sign a self-signed ID token and
+# publish its public n/e in a static JWKS. Verifier is exercised end-to-end
+# without touching the network.
+rsa = { version = "0.9", features = ["sha2"] }
+rand = { workspace = true }

@@ -93,6 +93,14 @@ async-trait = { version = "0.1" }
 # Base64 (RFC 4648 standard alphabet)
 base64 = { version = "0.22" }
 
+# JWT decode/verify (OIDC ID-token signature + claim validation, slice 12.2).
+# We use `jsonwebtoken` (not the heavier `openidconnect`) for Phase 2: it gives
+# explicit control over the signing-key (RSA n/e from JWKS), the algorithm
+# allowlist (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots
+# cleanly behind the existing SSRF `guarded_client` + `forge-cache` rather than
+# bringing its own HTTP-client abstraction.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+
 # Temp files
 tempfile = { version = "3" }
 
