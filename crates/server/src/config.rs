@@ -222,6 +222,12 @@ impl OutboxConfig {
 /// dereferenced blob is S3-deleted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionConfig {
+    /// Run the background retention worker on this instance. When `false`, the
+    /// worker loop is not spawned (the admin REST surface — including manual
+    /// "run now" scheduling and dry-run preview — still works; scheduled rows
+    /// simply accumulate until an instance with the worker enabled drains them).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// How often each instance polls for a due repository (seconds).
     #[serde(default = "default_retention_poll")]
     pub poll_interval_seconds: u64,
@@ -236,6 +242,7 @@ pub struct RetentionConfig {
 impl Default for RetentionConfig {
     fn default() -> Self {
         RetentionConfig {
+            enabled: default_true(),
             poll_interval_seconds: default_retention_poll(),
             default_run_interval_seconds: default_retention_run_interval(),
             lease_seconds: default_retention_lease(),
@@ -462,6 +469,7 @@ mod tests {
         assert!(cfg.redis.url.is_none());
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
+        assert!(cfg.retention.enabled);
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
         assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
         assert_eq!(cfg.retention.lease_seconds, 300);
@@ -528,6 +536,7 @@ mod tests {
             jail.set_env("FORGE_OUTBOX__BATCH_SIZE", "7");
             jail.set_env("FORGE_OUTBOX__GRACE_SECONDS", "60");
             jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
+            jail.set_env("FORGE_RETENTION__ENABLED", "false");
             jail.set_env("FORGE_RETENTION__POLL_INTERVAL_SECONDS", "11");
             jail.set_env("FORGE_RETENTION__DEFAULT_RUN_INTERVAL_SECONDS", "7200");
             jail.set_env("FORGE_RETENTION__LEASE_SECONDS", "120");
@@ -563,6 +572,7 @@ mod tests {
             assert_eq!(cfg.outbox.batch_size, 7);
             assert_eq!(cfg.outbox.grace_seconds, 60);
             assert_eq!(cfg.outbox.poll_interval_seconds, 3);
+            assert!(!cfg.retention.enabled);
             assert_eq!(cfg.retention.poll_interval_seconds, 11);
             assert_eq!(cfg.retention.default_run_interval_seconds, 7200);
             assert_eq!(cfg.retention.lease_seconds, 120);

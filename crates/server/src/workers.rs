@@ -90,21 +90,28 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     // repository per tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its
     // policy, and applies decisions through the same blob outbox the outbox
     // worker above drains — no parallel S3-delete path. Cross-instance
-    // exclusivity is the lease, not leader election.
-    let retention = RetentionWorker::new(
-        state.pool.clone(),
-        state.formats.nuget(),
-        state.cache_invalidator(),
-        RetentionConfig {
-            poll_interval: state.config.retention.poll_interval(),
-            default_run_interval: state.config.retention.default_run_interval(),
-            lease: state.config.retention.lease(),
-            // Reuse the outbox grace so a retention-dereferenced blob and a
-            // redeploy-dereferenced one share the same S3-delete deferral.
-            delete_grace: grace,
-        },
-    )
-    .spawn_loop();
+    // exclusivity is the lease, not leader election. Disabling it
+    // (`FORGE_RETENTION__ENABLED=false`) leaves the admin REST surface intact;
+    // due repositories simply wait for an instance that runs the worker.
+    let retention = if state.config.retention.enabled {
+        RetentionWorker::new(
+            state.pool.clone(),
+            state.formats.nuget(),
+            state.cache_invalidator(),
+            RetentionConfig {
+                poll_interval: state.config.retention.poll_interval(),
+                default_run_interval: state.config.retention.default_run_interval(),
+                lease: state.config.retention.lease(),
+                // Reuse the outbox grace so a retention-dereferenced blob and a
+                // redeploy-dereferenced one share the same S3-delete deferral.
+                delete_grace: grace,
+            },
+        )
+        .spawn_loop()
+    } else {
+        tracing::info!("retention worker disabled (FORGE_RETENTION__ENABLED=false)");
+        tokio::spawn(async {})
+    };
 
     WorkerHandles {
         outbox,
