@@ -279,7 +279,24 @@ pub async fn package_detail(
         Ok(v) => v,
         Err(e) => return read_err(e),
     };
-    if versions.is_empty() {
+
+    // For a proxy, also gather versions discovered upstream that are still inside
+    // the package-delay window. These are intentionally absent from
+    // `list_versions` (which only returns downloadable versions); we surface them
+    // so the UI can render a delay badge for content that exists but is not yet
+    // downloadable. A package whose *only* versions are delayed is still a real
+    // package, so we must not 404 it just because `versions` is empty.
+    let is_proxy = repo.kind() == RepoKind::Proxy;
+    let delayed = if is_proxy {
+        match delayed_proxy_versions(&state, &repo, &lower).await {
+            Ok(d) => d,
+            Err(e) => return db_error(e),
+        }
+    } else {
+        Vec::new()
+    };
+
+    if versions.is_empty() && delayed.is_empty() {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
 
@@ -289,6 +306,9 @@ pub async fn package_detail(
         Err(e) => return read_err(e),
     };
 
+    // Original-cased id from a visible version when there is one; for a
+    // delayed-only proxy package we have no cached casing yet, so fall back to
+    // the requested id.
     let original_id = versions
         .first()
         .map(|v| v.original_id.clone())
@@ -319,8 +339,7 @@ pub async fn package_detail(
     }
 
     // Per-version size / published_at from the local component row when present.
-    let is_proxy = repo.kind() == RepoKind::Proxy;
-    let mut detail_versions = Vec::with_capacity(versions.len());
+    let mut detail_versions = Vec::with_capacity(versions.len() + delayed.len());
     for v in &versions {
         let (size, published_at) =
             match component_dao::find_component(&state.pool, repo.id, &lower, &v.version).await {
@@ -357,16 +376,9 @@ pub async fn package_detail(
         });
     }
 
-    // Surface still-delayed proxy versions too, so the UI can show a delay badge
-    // for content that exists upstream but is not yet downloadable. These are
-    // intentionally absent from `list_versions` (which only returns visible
-    // versions); we add them from `proxy_cached_version` with their ETA.
-    if is_proxy {
-        match delayed_proxy_versions(&state, &repo, &lower).await {
-            Ok(delayed) => detail_versions.extend(delayed),
-            Err(e) => return db_error(e),
-        }
-    }
+    // Append the still-delayed proxy versions gathered above (with their ETA) so
+    // the UI can render a delay badge alongside any downloadable versions.
+    detail_versions.extend(delayed);
 
     Json(PackageDetail {
         repo: repo.name.clone(),

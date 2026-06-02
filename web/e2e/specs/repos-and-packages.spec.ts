@@ -89,11 +89,13 @@ test('a pushed package appears in Browse and in package detail', async ({
   expect([200, 201, 202, 204]).toContain(res.status)
   await waitForPackage(repo, 'Sample.Lib')
 
-  // Browse shows it.
+  // Browse shows it. Other specs (group/proxy) also publish Sample.Lib to this
+  // shared server, so scope to THIS repo's row rather than the id alone.
   await page.goto('/')
   await page.getByRole('searchbox').fill('Sample.Lib')
-  const pkgLink = page.getByRole('link', { name: 'Sample.Lib' })
-  await expect(pkgLink).toBeVisible({ timeout: 15_000 })
+  const pkgRow = page.getByRole('row', { name: new RegExp(`\\b${repo}\\b`) })
+  await expect(pkgRow).toBeVisible({ timeout: 15_000 })
+  const pkgLink = pkgRow.getByRole('link', { name: 'Sample.Lib' })
 
   // Package detail shows the version + a dependency.
   await pkgLink.click()

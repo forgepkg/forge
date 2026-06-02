@@ -13,9 +13,11 @@
  * facts (base URL, admin token) are handed to specs via env vars + a JSON file.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { rmSync, writeFileSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { startMockUpstream, type MockUpstream } from './mock-upstream'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(here, '..', '..')
@@ -45,11 +47,23 @@ export interface HarnessFacts {
   adminUser: string
   adminPass: string
   adminToken: string
+  /**
+   * Service-index URL of the in-process mock upstream NuGet feed (loopback).
+   * Configured as a proxy repo's `remote_url` by the proxy-delay spec. It is a
+   * fake *upstream registry*, not a proxy of the forge API.
+   */
+  upstreamIndexUrl: string
 }
 
 export const FACTS_PATH = path.join(here, '.harness-facts.json')
 
 let serverProc: ChildProcess | null = null
+let mockUpstream: MockUpstream | null = null
+
+/** Read a fixture `.nupkg` from the repo's fixtures/ dir. */
+function readFixture(rel: string): Buffer {
+  return readFileSync(path.join(repoRoot, 'fixtures', rel))
+}
 
 function run(cmd: string, args: string[], opts: { cwd?: string } = {}) {
   const res = spawnSync(cmd, args, {
@@ -225,18 +239,37 @@ export async function setup(): Promise<HarnessFacts> {
   // 6. Mint an admin token for the token-sign-in spec.
   const adminToken = await mintAdminToken()
 
+  // 7. Boot the mock upstream feed (loopback) for the proxy-delay spec. It
+  //    serves the `Sample.Lib` fixture at the upstream's original version casing
+  //    (`1.02.3`), which the proxy normalizes to `1.2.3` on discovery.
+  mockUpstream = await startMockUpstream([
+    {
+      id: 'Sample.Lib',
+      versions: { '1.02.3': readFixture('nuget/sample.lib.1.0.0.nupkg') },
+    },
+  ])
+
   const facts: HarnessFacts = {
     baseUrl: BASE_URL,
     adminUser: ADMIN_USER,
     adminPass: ADMIN_PASS,
     adminToken,
+    upstreamIndexUrl: mockUpstream.indexUrl,
   }
   writeFileSync(FACTS_PATH, JSON.stringify(facts, null, 2))
   return facts
 }
 
-/** Tear everything down: stop the server, then the containers. */
+/** Tear everything down: stop the mock upstream, the server, then containers. */
 export async function teardown() {
+  if (mockUpstream) {
+    try {
+      await mockUpstream.close()
+    } catch {
+      // best-effort
+    }
+    mockUpstream = null
+  }
   if (serverProc && !serverProc.killed) {
     serverProc.kill('SIGTERM')
     // Give it a moment to exit cleanly before compose down.

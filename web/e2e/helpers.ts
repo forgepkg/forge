@@ -14,6 +14,8 @@ export interface HarnessFacts {
   adminUser: string
   adminPass: string
   adminToken: string
+  /** Service-index URL of the loopback mock upstream feed (proxy-delay spec). */
+  upstreamIndexUrl: string
 }
 
 let cached: HarnessFacts | null = null
@@ -38,6 +40,51 @@ export async function createRepo(body: Record<string, unknown>): Promise<Respons
     headers: { authorization: adminBasic(), 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+/** Add a member (a repo name + a unique priority) to a group via the admin API. */
+export async function addGroupMember(
+  group: string,
+  member: string,
+  priority: number,
+): Promise<Response> {
+  const f = facts()
+  return fetch(`${f.baseUrl}/admin/repositories/${group}/members`, {
+    method: 'POST',
+    headers: { authorization: adminBasic(), 'content-type': 'application/json' },
+    body: JSON.stringify({ member, priority }),
+  })
+}
+
+/**
+ * Fetch a package's browse detail (the read endpoint the SPA's detail page
+ * uses). For a proxy this also drives upstream **discovery** (it runs the
+ * slice-1 read ops), so calling it stamps `first_seen_at` and surfaces a
+ * still-delayed version with `delay_status = "delayed_until"`.
+ */
+export async function fetchPackageDetail(
+  repo: string,
+  id: string,
+): Promise<{
+  repo: string
+  repo_kind: string
+  versions: Array<{
+    version: string
+    version_original: string
+    delay_status: string | null
+    delayed_until?: string | null
+  }>
+  dependency_groups_by_version: Record<
+    string,
+    Array<{ dependencies: Array<{ id: string }> }>
+  >
+}> {
+  const f = facts()
+  const res = await fetch(
+    `${f.baseUrl}/browse/packages/${encodeURIComponent(repo)}/${encodeURIComponent(id)}`,
+  )
+  if (!res.ok) throw new Error(`GET package detail ${repo}/${id} -> ${res.status}`)
+  return res.json()
 }
 
 /** Push a `.nupkg` (bytes) to a hosted repo via the NuGet multipart PUT. */

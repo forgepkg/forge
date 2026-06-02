@@ -41,6 +41,27 @@ SAMPLE_LIB_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
 </package>
 """
 
+# A variant of Sample.Lib with the SAME id + version (1.02.3 -> 1.2.3) but a
+# DISTINCT dependency id. Used by the web e2e group scenario: when two group
+# members carry the same (id, version), the highest-priority member wins, and
+# its dependency group (`WinnerMarker.Dependency`) is what the group's package
+# detail must surface — making the winner observable end to end.
+SAMPLE_LIB_WINNER_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Sample.Lib</id>
+    <version>1.02.3</version>
+    <authors>envisia</authors>
+    <description>Group winner variant of Sample.Lib (distinct dependency).</description>
+    <dependencies>
+      <group targetFramework="net8.0">
+        <dependency id="WinnerMarker.Dependency" version="[1.0.0, )" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>
+"""
+
 # A 2011-schema nuspec (different xmlns) with flat (groupless) dependencies and
 # a prerelease version that must be lowercased on normalization.
 OTHER_PKG_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
@@ -95,6 +116,11 @@ def main():
         os.path.join(HERE, "sample.lib.1.0.0.nupkg"),
         "Sample.Lib.nuspec",
         SAMPLE_LIB_NUSPEC,
+    )
+    write_nupkg(
+        os.path.join(HERE, "sample.lib.winner.1.0.0.nupkg"),
+        "Sample.Lib.nuspec",
+        SAMPLE_LIB_WINNER_NUSPEC,
     )
     write_nupkg(
         os.path.join(HERE, "other.package.2.0.0-beta.1.nupkg"),
