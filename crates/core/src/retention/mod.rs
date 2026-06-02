@@ -14,6 +14,7 @@
 pub mod apply;
 pub mod evaluate;
 pub mod model;
+pub mod worker;
 
 pub use apply::{apply, ApplyContext};
 pub use evaluate::{
@@ -24,3 +25,4 @@ pub use model::{
     validate_policy, Action, Criteria, PolicyError, ReleaseType, RetentionPolicy, RetentionRule,
     Scope, POLICY_VERSION,
 };
+pub use worker::{RetentionConfig, RetentionWorker, WorkerError};
