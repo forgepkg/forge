@@ -454,6 +454,13 @@ impl StackBuilder {
             workers: worker_handles,
         };
 
+        // `axum::serve` runs in a spawned task, so the listener may not yet be
+        // accepting (and routing) when the first request fires. Under load —
+        // many concurrent test processes contending for CPU/Docker — that race
+        // surfaces as an empty/non-JSON body on the first call. Gate on a real
+        // HTTP response before handing the stack back to the test.
+        srv.wait_until_ready().await;
+
         if mint_token && srv.admin_user.is_some() {
             srv.admin_token = srv.issue_admin_token().await;
         }
@@ -505,6 +512,59 @@ impl TestServer {
     /// A reqwest client (no default auth).
     pub fn client(&self) -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    /// Block until the server is accepting connections and routing requests.
+    ///
+    /// `/admin/me` always routes and returns a proper HTTP status (200 when
+    /// authenticated, 401 otherwise) once the router is live, so any structured
+    /// status — as opposed to a connection error — proves readiness. Polls for
+    /// up to ~10s before giving up.
+    async fn wait_until_ready(&self) {
+        let client = self.client();
+        let url = format!("{}/admin/me", self.base_url);
+        for _ in 0..200 {
+            if let Ok(resp) = client.get(&url).send().await {
+                // Any real HTTP status means the router is serving requests.
+                if resp.status().as_u16() != 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("server at {} never became ready", self.base_url);
+    }
+
+    /// GET a basic-auth-protected endpoint and decode its JSON body, retrying a
+    /// few times on transport errors or a non-JSON body. Belt-and-braces on top
+    /// of [`Self::wait_until_ready`]: even a routed request can momentarily race
+    /// the body if the connection was accepted mid-startup.
+    async fn get_json_with_retry(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        user: &str,
+        pass: &str,
+    ) -> serde_json::Value {
+        let mut last_err = String::from("no attempt made");
+        for _ in 0..40 {
+            match client.get(url).basic_auth(user, Some(pass)).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => return v,
+                        Err(e) => {
+                            last_err =
+                                format!("{status}: non-JSON body ({e}): {:?}", text.get(..200))
+                        }
+                    }
+                }
+                Err(e) => last_err = format!("transport error: {e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("GET {url} never returned JSON: {last_err}");
     }
 
     /// Basic-auth credentials for the bootstrap admin.
@@ -574,15 +634,9 @@ impl TestServer {
     async fn issue_admin_token(&self) -> String {
         let (u, p) = self.admin_basic();
         let client = self.client();
-        let users: serde_json::Value = client
-            .get(format!("{}/admin/users", self.base_url))
-            .basic_auth(&u, Some(&p))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let users = self
+            .get_json_with_retry(&client, &format!("{}/admin/users", self.base_url), &u, &p)
+            .await;
         let admin_id = users
             .as_array()
             .unwrap()
