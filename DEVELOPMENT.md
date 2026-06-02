@@ -9,6 +9,7 @@ for S3).
 
 - **Docker** (for Postgres + versitygw, and for the test suites).
 - **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`).
+- **Node 22 + npm 10** (for the web UI in `web/`).
 - *Optional:* the **.NET SDK** (`dotnet`) to drive the feed with a real client.
 - *Optional:* `sqlx-cli` (`cargo install sqlx-cli --no-default-features --features postgres,rustls`)
   only if you change SQL queries and need to regenerate the offline data.
@@ -40,6 +41,68 @@ This creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
 `http://localhost:3000/v3/nuget/index.json`.
+
+## Web UI (admin + browse SPA)
+
+The UI is a **TanStack Router SPA** in [`web/`](./web), built by Vite into
+`web/dist/`. There is **no Node server in production**: the Rust `forge-server`
+serves `web/dist/` directly (a `ServeDir` with an `index.html` SPA fallback,
+mounted *after* `/admin`, `/browse`, `/v3`), and the browser calls the Rust HTTP
+API on the **same origin** with relative URLs. Auth today is token-paste (slice
+1 has no sessions yet): paste a repository token on the login screen; it is
+verified via `GET /admin/me` and stored in `localStorage`.
+
+### Production-like run (single origin)
+
+Build the UI first, then run the server — the build order matters because the
+server serves the built directory:
+
+```bash
+make web     # npm ci && npm run build  -> web/dist/
+make run     # forge-server serves web/dist at http://localhost:3000
+```
+
+`make dev` does both for you (infra → build UI → run server), so the UI is live
+at **http://localhost:3000** alongside the API.
+
+### Frontend dev server (HMR)
+
+For fast iteration on the UI, run Vite's dev server (assets + hot reload) against
+a running `forge-server`:
+
+```bash
+make up && make run            # terminal 1: infra + API on :3000
+make web-dev                   # terminal 2: Vite on http://localhost:5173
+```
+
+The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
+origin (default `http://localhost:3000`, override with `FORGE_DEV_API_TARGET`)
+so the same relative API URLs work in dev — this is a dev-only static route, not
+a production API proxy.
+
+### Frontend tests
+
+```bash
+make web-test                  # Vitest + React Testing Library (unit/component)
+make web-e2e                   # Playwright e2e (needs Docker; builds the UI first)
+cd web && npm run tsc          # typecheck
+cd web && npm run e2e:install  # one-time: download the Playwright browser
+```
+
+The Playwright suite (`web/e2e/`) drives a **real `forge-server` serving the
+built UI** against an isolated Postgres + versitygw stack (its own compose
+project + ports, see `web/e2e/docker-compose.e2e.yml`), brought up automatically
+in the suite's global setup. It covers single-origin serving, the SPA fallback,
+token sign-in, admin gating, creating a repo, and push-then-see-package. If
+Playwright can't download a browser in a restricted environment, `npm run
+e2e:list` still enumerates the specs and `npm run e2e:tsc` typechecks them.
+
+> **Known limitation:** the admin UI routes reuse the `/admin/*` paths owned by
+> the admin REST API, so a **hard refresh / bookmark / deep-link** of an
+> `/admin/<sub>` page is answered by the API, not the SPA. In-app navigation
+> (clicking through the nav) is unaffected. Pinned by
+> `web/e2e/specs/admin-deeplink.spec.ts`; a fix (move the admin UI off `/admin/*`)
+> is a tracked follow-up.
 
 ## Doing it by hand
 
@@ -137,3 +200,6 @@ The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 `up` · `down` · `dev` · `run` · `seed` · `test` · `e2e` · `check` · `fmt` ·
 `clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
 `ps` · `clean`.
+
+Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
+(Vitest) · `web-e2e` (Playwright).
