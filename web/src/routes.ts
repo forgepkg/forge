@@ -22,6 +22,7 @@ export const routes = rootRoute('root.tsx', [
   route('/login', 'Login.tsx'),
   layout('app', 'AppLayout.tsx', [
     index('Browse.tsx'),
+    route('/packages/$repo/$id', 'PackageDetail.tsx'),
     route('/admin', 'AdminLayout.tsx', [
       //
       index('admin/AdminHome.tsx'),

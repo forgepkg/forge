@@ -14,6 +14,7 @@ import { Route as AppLayoutRouteImport } from './routes/AppLayout'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as BrowseRouteImport } from './routes/Browse'
 import { Route as adminAdminHomeRouteImport } from './routes/admin/AdminHome'
+import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
 
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
@@ -39,17 +40,24 @@ const adminAdminHomeRoute = adminAdminHomeRouteImport.update({
   path: '/',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const PackageDetailRoute = PackageDetailRouteImport.update({
+  id: '/packages/$repo/$id',
+  path: '/packages/$repo/$id',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof BrowseRoute
   '/login': typeof LoginRoute
   '/admin': typeof AdminLayoutRouteWithChildren
   '/admin/': typeof adminAdminHomeRoute
+  '/packages/$repo/$id': typeof PackageDetailRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof BrowseRoute
   '/admin': typeof adminAdminHomeRoute
+  '/packages/$repo/$id': typeof PackageDetailRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -58,12 +66,13 @@ export interface FileRoutesById {
   '/_app/': typeof BrowseRoute
   '/_app/admin': typeof AdminLayoutRouteWithChildren
   '/_app/admin/': typeof adminAdminHomeRoute
+  '/_app/packages/$repo/$id': typeof PackageDetailRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/login' | '/admin' | '/admin/'
+  fullPaths: '/' | '/login' | '/admin' | '/admin/' | '/packages/$repo/$id'
   fileRoutesByTo: FileRoutesByTo
-  to: '/login' | '/' | '/admin'
+  to: '/login' | '/' | '/admin' | '/packages/$repo/$id'
   id:
     | '__root__'
     | '/_app'
@@ -71,6 +80,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/admin'
     | '/_app/admin/'
+    | '/_app/packages/$repo/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -115,6 +125,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminAdminHomeRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/packages/$repo/$id': {
+      id: '/_app/packages/$repo/$id'
+      path: '/packages/$repo/$id'
+      fullPath: '/packages/$repo/$id'
+      preLoaderRoute: typeof PackageDetailRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
   }
 }
 
@@ -133,11 +150,13 @@ const AdminLayoutRouteWithChildren = AdminLayoutRoute._addFileChildren(
 interface AppLayoutRouteChildren {
   BrowseRoute: typeof BrowseRoute
   AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
+  PackageDetailRoute: typeof PackageDetailRoute
 }
 
 const AppLayoutRouteChildren: AppLayoutRouteChildren = {
   BrowseRoute: BrowseRoute,
   AdminLayoutRoute: AdminLayoutRouteWithChildren,
+  PackageDetailRoute: PackageDetailRoute,
 }
 
 const AppLayoutRouteWithChildren = AppLayoutRoute._addFileChildren(
