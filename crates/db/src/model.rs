@@ -286,6 +286,30 @@ pub struct OidcFlow {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A row of `validated_credential` (slice 12.3): the durable, authoritative
+/// record of one forwarded credential-validation decision.
+///
+/// The plaintext password is **never** stored — `cred_hmac` is
+/// `HMAC-SHA256(pepper, provider_id | username | password)` (hex), so a DB-only
+/// compromise cannot brute-force passwords without the server-held pepper, and
+/// the same password for two users yields distinct hmacs (no cross-user
+/// inference). `verdict` is the boolean decision (`true` = valid, `false` =
+/// definitively rejected). Infrastructure errors / timeouts are fail-closed and
+/// are never written here. `expires_at` bounds the trust window.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ValidatedCredential {
+    pub id: i64,
+    pub provider_id: String,
+    pub username: String,
+    /// `HMAC-SHA256(pepper, provider_id | username | password)`, hex-encoded.
+    /// Never the plaintext password.
+    pub cred_hmac: String,
+    /// `true` = valid (positive cache), `false` = rejected (negative cache).
+    pub verdict: bool,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

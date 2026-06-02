@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM validated_credential\n        WHERE username = $1\n          AND ($2::text IS NULL OR provider_id = $2)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e50f14495caf0d6d48d22eecd9147400b1ab5511a5a20e95b8af7475cb90c7a8"
+}
