@@ -81,6 +81,24 @@ fn is_prerelease(version: &str) -> bool {
     version.contains('-')
 }
 
+/// Fire a best-effort download-tracking bump for a served hosted `.nupkg`,
+/// off the response hot path (slice 12.1 §3.7).
+///
+/// Spawned so the tracking write — `asset.download_count` /
+/// `last_downloaded_at` + `component.last_downloaded_at` — never blocks the
+/// download response and a failure is logged rather than propagated. The data
+/// is non-authoritative (only feeds retention's download-sensitive criteria),
+/// so an occasional lost increment under load is acceptable.
+fn spawn_download_bump(pool: PgPool, asset_id: i64, component_id: i64) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            forge_db::download_dao::bump_hosted_download(&pool, asset_id, component_id).await
+        {
+            tracing::warn!(error = %e, asset_id, component_id, "download tracking bump failed");
+        }
+    });
+}
+
 #[async_trait]
 impl RepoReadOps for HostedRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
@@ -116,6 +134,13 @@ impl RepoReadOps for HostedRepo {
         let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
             return Ok(None);
         };
+
+        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
+        // A resolved `.nupkg` is a download; bump asynchronously so a tracking
+        // write never blocks (or fails) the response. Non-authoritative —
+        // failures are logged, not propagated.
+        spawn_download_bump(self.pool.clone(), asset.id, comp.id);
+
         Ok(Some(NupkgLocation {
             blob_s3_key: blob.s3_key,
             size: asset.size,

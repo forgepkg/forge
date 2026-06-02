@@ -695,6 +695,20 @@ impl ProxyRepo {
     }
 }
 
+/// Fire a best-effort proxy download-tracking bump off the response hot path
+/// (slice 12.1 §3.7). Failures are logged, not propagated — the data only feeds
+/// retention's download-sensitive criteria and is non-authoritative.
+fn spawn_proxy_download_bump(pool: PgPool, repo_id: i64, name: String, version: String) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            forge_db::download_dao::bump_proxy_download_by_name(&pool, repo_id, &name, &version)
+                .await
+        {
+            tracing::warn!(error = %e, repo_id, %name, %version, "proxy download tracking bump failed");
+        }
+    });
+}
+
 /// Parse a stored `resources` JSON into [`UpstreamResources`], tolerating a
 /// shape mismatch by falling back to an empty resource set.
 fn parse_resources(value: JsonValue) -> UpstreamResources {
@@ -879,7 +893,16 @@ impl RepoReadOps for ProxyRepo {
             .format
             .normalize_version(version)
             .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
-        self.ensure_downloaded(&repo_row, &lower, &norm).await
+        let loc = self.ensure_downloaded(&repo_row, &lower, &norm).await?;
+        if loc.is_some() {
+            // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
+            // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
+            // proxy "not pulled in X days" eviction) + mirror onto the parallel
+            // component/asset. Best-effort, off the hot path — never blocks or
+            // fails the download.
+            spawn_proxy_download_bump(self.pool.clone(), repo_row.id, lower, norm);
+        }
+        Ok(loc)
     }
 
     async fn resolve_nuspec(
