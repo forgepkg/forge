@@ -11,10 +11,14 @@
 //!   for the password-style auth path (slice 12.3). The local-password and
 //!   upstream-basic providers plug in here; OIDC stays its own interactive
 //!   path.
+//! * [`cred_cache`] — the validated-credential cache (slice 12.3): an HMAC-keyed
+//!   L1/L2 + Postgres cache of upstream verdicts so NuGet's per-request Basic
+//!   auth does not hammer the upstream. Plaintext is never stored; fail-closed.
 
 pub mod authz;
 pub mod chain;
 pub mod client_ip;
+pub mod cred_cache;
 pub mod local_password;
 pub mod principal;
 pub mod provider;
@@ -24,6 +28,9 @@ pub mod token;
 pub use authz::{can_admin, can_read, can_write};
 pub use chain::{map_identity_to_principal, Chain, ChainOutcome};
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
+pub use cred_cache::{
+    cred_key, CredCacheError, CredKeyPepper, UpstreamVerdict, ValidatedCredentialCache,
+};
 pub use local_password::LocalPasswordProvider;
 pub use principal::{Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};

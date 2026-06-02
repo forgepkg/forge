@@ -66,6 +66,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Hashing
 sha2 = { version = "0.10" }
 
+# Keyed hashing (validated-credential cache key: HMAC-SHA256 with a server pepper)
+hmac = { version = "0.12" }
+
 # Hex encoding (token hashes)
 hex = { version = "0.4" }
 

@@ -82,10 +82,7 @@ pub async fn get_verdict(
 /// Called by the singleflight winner after a *real* upstream success/reject.
 /// An infrastructure error / timeout must **never** be persisted (fail-closed),
 /// so callers only invoke this for a definitive `true`/`false` verdict.
-pub async fn upsert_verdict(
-    pool: &PgPool,
-    new: NewVerdict,
-) -> sqlx::Result<ValidatedCredential> {
+pub async fn upsert_verdict(pool: &PgPool, new: NewVerdict) -> sqlx::Result<ValidatedCredential> {
     sqlx::query_as!(
         ValidatedCredential,
         r#"
@@ -234,10 +231,8 @@ pub async fn revoke_by_username(
 
 /// Delete all expired rows (the background sweeper). Returns the count removed.
 pub async fn sweep_expired(pool: &PgPool) -> sqlx::Result<u64> {
-    let res = sqlx::query!(
-        r#"DELETE FROM validated_credential WHERE expires_at <= now()"#,
-    )
-    .execute(pool)
-    .await?;
+    let res = sqlx::query!(r#"DELETE FROM validated_credential WHERE expires_at <= now()"#,)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }

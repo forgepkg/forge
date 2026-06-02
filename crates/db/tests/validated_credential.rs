@@ -267,19 +267,22 @@ async fn singleflight_row_lock_serializes_concurrent_checks() {
 
     // Give the peer a moment to reach the blocking SELECT ... FOR UPDATE.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!peer.is_finished(), "peer must block on the winner's row lock");
+    assert!(
+        !peer.is_finished(),
+        "peer must block on the winner's row lock"
+    );
 
     // Winner forwards (simulated) and writes a positive verdict, then commits.
-    vc::finalize_singleflight(
-        &mut winner_tx,
-        new_verdict(&user, &hmac, true, 300),
-    )
-    .await
-    .unwrap();
+    vc::finalize_singleflight(&mut winner_tx, new_verdict(&user, &hmac, true, 300))
+        .await
+        .unwrap();
     winner_tx.commit().await.unwrap();
 
     // Peer unblocks and sees the fresh verdict → it would NOT forward upstream.
     let peer_result = peer.await.unwrap().unwrap();
     let peer_row = peer_result.expect("peer observes the winner's fresh verdict");
-    assert!(peer_row.verdict, "peer reads the positive verdict, not a sentinel");
+    assert!(
+        peer_row.verdict,
+        "peer reads the positive verdict, not a sentinel"
+    );
 }

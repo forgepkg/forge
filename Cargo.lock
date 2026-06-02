@@ -1484,6 +1484,7 @@ dependencies = [
  "forge-nuget",
  "forge-storage",
  "hex",
+ "hmac 0.12.1",
  "http 1.4.1",
  "ipnet",
  "jsonwebtoken",
