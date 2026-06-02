@@ -142,10 +142,23 @@ async fn blob_store() -> BlobStore {
 
 /// A built TOML config string for the harness, parameterized by the bootstrap
 /// admin credentials and anonymous mode.
-fn config_toml(db_url: &str, s3_endpoint: &str, admin: Option<(&str, &str)>, anon: &str) -> String {
+fn config_toml(
+    db_url: &str,
+    s3_endpoint: &str,
+    admin: Option<(&str, &str)>,
+    anon: &str,
+    web_assets_dir: Option<&str>,
+) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
+    };
+    // Default to a disabled web UI in tests so a missing `web/dist` never
+    // affects API behaviour; tests that exercise SPA serving pass an explicit
+    // assets dir.
+    let web = match web_assets_dir {
+        Some(dir) => format!("[web]\nenabled = true\nassets_dir = {dir:?}\n"),
+        None => "[web]\nenabled = false\n".to_string(),
     };
     format!(
         r#"
@@ -176,6 +189,8 @@ default_ttl_seconds = 5
 batch_size = 50
 grace_seconds = 0
 poll_interval_seconds = 1
+
+{web}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
@@ -208,6 +223,9 @@ pub struct ServerOpts {
     pub bootstrap_admin: Option<(String, String)>,
     pub anonymous_mode: String,
     pub spawn_workers: bool,
+    /// When set, the static SPA is served from this directory; otherwise the
+    /// web UI is disabled for the test.
+    pub web_assets_dir: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -216,6 +234,7 @@ impl Default for ServerOpts {
             bootstrap_admin: Some(("admin".into(), "adminpw".into())),
             anonymous_mode: "off".into(),
             spawn_workers: false,
+            web_assets_dir: None,
         }
     }
 }
@@ -232,7 +251,13 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .bootstrap_admin
         .as_ref()
         .map(|(u, p)| (u.as_str(), p.as_str()));
-    let toml = config_toml(&db_url, s3, admin_ref, &opts.anonymous_mode);
+    let toml = config_toml(
+        &db_url,
+        s3,
+        admin_ref,
+        &opts.anonymous_mode,
+        opts.web_assets_dir.as_deref(),
+    );
     use figment::providers::Format as _;
     let config = Config::from_figment(
         figment::Figment::new().merge(figment::providers::Toml::string(&toml)),

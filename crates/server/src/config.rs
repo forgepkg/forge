@@ -39,6 +39,9 @@ pub struct Config {
     /// Background outbox worker tuning.
     #[serde(default)]
     pub outbox: OutboxConfig,
+    /// Static web UI (SPA) serving.
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 /// `server.*`
@@ -205,6 +208,41 @@ impl OutboxConfig {
     }
 }
 
+/// `web.*` — static SPA serving.
+///
+/// When `enabled`, the server serves the built TanStack Start SPA from
+/// `assets_dir` (a directory containing `index.html` + `assets/*`), mounted as
+/// the router's fallback **after** the `/admin`, `/v3`, and `/browse` API
+/// routers so API paths always win. Unknown paths fall back to `index.html` so
+/// client-side (TanStack Router) deep links resolve.
+///
+/// `assets_dir` defaults to the relative path `web/dist`, matching the
+/// repository layout (`web/` is built by Vite into `web/dist/`). Container
+/// images set `FORGE_WEB__ASSETS_DIR` to the in-image asset path. A headless
+/// deployment sets `FORGE_WEB__ENABLED=false`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebConfig {
+    /// Serve the SPA. When false, only the API routers are mounted.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Directory holding the built SPA (`index.html` + `assets/`).
+    #[serde(default = "default_web_assets_dir")]
+    pub assets_dir: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            enabled: default_true(),
+            assets_dir: default_web_assets_dir(),
+        }
+    }
+}
+
+fn default_web_assets_dir() -> String {
+    "web/dist".into()
+}
+
 fn default_region() -> String {
     "us-east-1".into()
 }
@@ -366,6 +404,20 @@ mod tests {
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
         assert!(matches!(cfg.anon_policy().unwrap(), AnonPolicy::Off));
+        // Web UI: enabled by default, served from `web/dist`.
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.assets_dir, "web/dist");
+    }
+
+    #[test]
+    fn web_block_overrides_defaults() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[web]\nenabled = false\nassets_dir = \"/srv/ui\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.assets_dir, "/srv/ui");
     }
 
     #[test]
@@ -414,6 +466,8 @@ mod tests {
             jail.set_env("FORGE_OUTBOX__BATCH_SIZE", "7");
             jail.set_env("FORGE_OUTBOX__GRACE_SECONDS", "60");
             jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
+            jail.set_env("FORGE_WEB__ENABLED", "false");
+            jail.set_env("FORGE_WEB__ASSETS_DIR", "/srv/ui");
 
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
 
@@ -431,7 +485,11 @@ mod tests {
                 vec!["loopback".to_string(), "private".to_string()]
             );
             assert!(cfg.auth.allow_password_basic);
-            let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin set via env");
+            let ba = cfg
+                .auth
+                .bootstrap_admin
+                .as_ref()
+                .expect("bootstrap admin set via env");
             assert_eq!(ba.username, "root");
             assert_eq!(ba.password, "s3cret");
             assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
@@ -440,6 +498,8 @@ mod tests {
             assert_eq!(cfg.outbox.batch_size, 7);
             assert_eq!(cfg.outbox.grace_seconds, 60);
             assert_eq!(cfg.outbox.poll_interval_seconds, 3);
+            assert!(!cfg.web.enabled);
+            assert_eq!(cfg.web.assets_dir, "/srv/ui");
             Ok(())
         });
     }

@@ -17,6 +17,7 @@ use crate::dispatch::dispatch;
 use crate::me::me_router;
 use crate::middleware::{attach_principal, PrincipalLayer};
 use crate::state::AppState;
+use crate::web_ui::spa_service;
 
 /// Build the principal middleware layer from config + pool.
 ///
@@ -60,7 +61,7 @@ pub fn principal_layer(config: &Config, pool: &PgPool) -> anyhow::Result<Princip
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router();
 
-    Router::new()
+    let mut app = Router::new()
         .merge(me_router())
         .nest("/admin", admin)
         .merge(browse_router())
@@ -68,12 +69,20 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
         // /DELETE; the dispatcher enforces authz per method.
         .route("/v3/{repo}", any(dispatch))
-        .route("/v3/{repo}/{*rest}", any(dispatch))
-        .layer(axum::middleware::from_fn_with_state(
-            layer.clone(),
-            attach_principal,
-        ))
-        .with_state(state)
+        .route("/v3/{repo}/{*rest}", any(dispatch));
+
+    // Static SPA fallback, installed LAST so the API routers above always win
+    // and only genuine UI paths fall through to `index.html`. Skipped for a
+    // headless deployment (`web.enabled = false`).
+    if state.config.web.enabled {
+        app = app.fallback_service(spa_service(&state.config.web));
+    }
+
+    app.layer(axum::middleware::from_fn_with_state(
+        layer.clone(),
+        attach_principal,
+    ))
+    .with_state(state)
 }
 
 /// Create the bootstrap admin user if it does not already exist.

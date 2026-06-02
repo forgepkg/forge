@@ -21,6 +21,7 @@ forge-nuget = { path = "../format-nuget" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
 tower = { version = "0.5", features = ["util"] }
+tower-http = { workspace = true }
 sqlx = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
@@ -50,3 +51,4 @@ tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

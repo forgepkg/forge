@@ -10,4 +10,5 @@ pub mod dispatch;
 pub mod me;
 pub mod middleware;
 pub mod state;
+pub mod web_ui;
 pub mod workers;
