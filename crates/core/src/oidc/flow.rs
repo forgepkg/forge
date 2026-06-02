@@ -71,12 +71,13 @@ pub enum FlowError {
 /// Built by the server from its `OidcConfig`; kept separate from
 /// [`super::OidcMetadataClient`] (which owns discovery/JWKS/verification) so the
 /// flow functions stay pure given a DB handle + a metadata client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientParams {
     /// OAuth client (application) id; also the expected ID-token `aud`.
     pub client_id: String,
-    /// OAuth client secret. **Never logged** (callers redact); sent only to the
-    /// token endpoint over the SSRF-guarded TLS client.
+    /// OAuth client secret. **Never logged** — the manual [`std::fmt::Debug`]
+    /// impl below redacts it; it is sent only to the token endpoint over the
+    /// SSRF-guarded TLS client.
     pub client_secret: String,
     /// Absolute redirect URL registered with the IdP
     /// (`{public_base_url}/auth/oidc/callback`).
@@ -85,6 +86,21 @@ pub struct ClientParams {
     pub scopes: Vec<String>,
     /// Clock-skew leeway (seconds) for ID-token `exp`/`nbf`/`iat`.
     pub leeway_seconds: u64,
+}
+
+/// Manual `Debug` that **redacts `client_secret`** so a stray `{:?}` (a log
+/// line, a `dbg!`, an error wrapper) can never spill it — defense in depth on
+/// top of the "never logged" discipline, mirroring `OidcConfig`'s treatment.
+impl std::fmt::Debug for ClientParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientParams")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", &self.redirect_url)
+            .field("scopes", &self.scopes)
+            .field("leeway_seconds", &self.leeway_seconds)
+            .finish()
+    }
 }
 
 /// The outcome of [`begin_login`]: the URL to 302 the browser to, plus the
@@ -396,5 +412,21 @@ mod tests {
         assert_eq!(pairs["redirect_uri"], client.redirect_url);
         // The secret is never in the authorize URL.
         assert!(!url.contains("shh"));
+    }
+
+    #[test]
+    fn client_params_debug_redacts_secret() {
+        let client = ClientParams {
+            client_id: "client-abc".into(),
+            client_secret: "super-secret-value".into(),
+            redirect_url: "https://forge.test/auth/oidc/callback".into(),
+            scopes: vec!["openid".into()],
+            leeway_seconds: 60,
+        };
+        let dbg = format!("{client:?}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(!dbg.contains("super-secret-value"), "{dbg}");
+        // Non-secret fields are still visible for diagnostics.
+        assert!(dbg.contains("client-abc"));
     }
 }

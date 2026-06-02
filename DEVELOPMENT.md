@@ -168,6 +168,87 @@ Key knobs:
 > local browsing, keep `anonymous_mode = "all"` and create repos with
 > `"anonymous_read": true`.
 
+## OIDC / Microsoft Entra login (optional)
+
+Browser login uses the **OpenID Connect authorization-code flow with PKCE**.
+A successful login creates a server-side **session** (an opaque `forge_session`
+cookie → a `session` row; the DB stores only `sha256(cookie)`, like API tokens)
+and maps the IdP identity to an `app_user`. NuGet protocol endpoints are
+unchanged — clients still authenticate with `X-NuGet-ApiKey`/Basic; humans mint
+those keys after logging in (`POST /auth/tokens`).
+
+Configure a single provider via the `[oidc]` TOML section or `FORGE_OIDC__*`
+env vars (see [`forge.toml.example`](./forge.toml.example) / `.env.example`).
+Omitting the section disables login entirely (no `/auth/oidc/*` routes).
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/auth/oidc/login?redirect_to=/path` | Start login; 302 → IdP. Writes an `oidc_flow` row (state/nonce/PKCE). |
+| `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
+| `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
+| `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
+| `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens. |
+
+State-changing cookie endpoints (`logout`, token mint/revoke) require a
+**double-submit CSRF token**: read `csrf_token` from `/auth/me` and echo it in
+the `X-CSRF-Token` header.
+
+### Microsoft Entra setup
+
+1. **App registration** (Entra admin center → *App registrations* → *New*):
+   - *Redirect URI* (type **Web**): `https://forge.example.com/auth/oidc/callback`
+     — must equal `server.public_base_url` host + the exact callback path.
+   - Note the **Application (client) ID** and **Directory (tenant) ID**.
+2. **Client secret**: *Certificates & secrets* → *New client secret*; copy the
+   value (it is redacted from forge logs and never echoed by any API).
+3. **Admin assignment (recommended: app roles, not raw groups)**: *App roles* →
+   add e.g. `forge-admins`, then assign users/groups under *Enterprise
+   applications* → *Users and roles*. App roles arrive in the `roles` claim and
+   avoid the Entra "groups overage" Graph callout. Set `admin_groups =
+   ["forge-admins"]` and `admin_claim = "roles"`. Empty `admin_groups` ⇒ OIDC
+   never grants admin (admins stay locally managed).
+
+```toml
+[oidc]
+enabled       = true
+issuer        = "https://login.microsoftonline.com/<tenant-id>/v2.0"  # must be https
+client_id     = "00000000-0000-0000-0000-000000000000"
+client_secret = "<application-client-secret>"        # redacted from APIs/logs
+redirect_url  = "https://forge.example.com/auth/oidc/callback"
+scopes        = ["openid", "profile", "email"]
+# admin via Entra app role:
+admin_groups  = ["forge-admins"]
+admin_claim   = "roles"
+```
+
+`is_admin` is **recomputed on every login** from the current claims (a user
+removed from the admin role loses admin on next login; existing sessions are not
+downgraded mid-session). With `auto_provision = true` (default) a first-time
+login creates an `app_user`; `link_existing_by_username = true` lets the matching
+Entra identity claim an existing local user (the **bootstrap admin** interplay) —
+set it `false` if the username claim is not trustworthy.
+
+### Multi-instance / scale-out
+
+All ephemeral flow state (`state`/`nonce`/PKCE verifier/redirect) and all
+sessions live in **Postgres**, never process memory, so a callback can be
+completed by a **different** instance than the one that began the login. The
+`oidc_flow` row is single-use (`DELETE … RETURNING`). JWKS/discovery are cached
+through the `cache` crate (no Postgres advisory locks); a background **auth
+reaper** (one of the workers in `crates/server/src/workers.rs`) periodically
+deletes expired/used flow rows and dead sessions on any instance.
+
+### Local testing against the in-process mock IdP
+
+The e2e suite (`make e2e`) stands up an in-process mock OIDC provider
+(discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
+be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
+on a private/dev network (e.g. Keycloak over plain `http`), set
+`oidc.allow_private_issuer = true` to relax both the SSRF guard and the
+https-issuer check.
+
 ## Tests
 
 The integration/e2e suites use **testcontainers** — they start their own
