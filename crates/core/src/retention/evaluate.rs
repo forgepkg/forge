@@ -72,7 +72,7 @@ pub struct ProxyCandidate {
 }
 
 /// The action plus provenance the apply path / audit needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Decision {
     /// `component.id` to act on.
     pub component_id: i64,
@@ -89,7 +89,7 @@ pub struct Decision {
 }
 
 /// A proxy eviction decision (always a delete).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProxyDecision {
     /// `proxy_cached_version.id` to evict.
     pub cached_version_id: i64,

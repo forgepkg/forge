@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, run_id, rule_id, action, target_kind, package_name, version,\n               component_id, blob_sha256, ref_count_after, blob_delete_enqueued,\n               dry_run, reason, created_at\n        FROM retention_audit\n        WHERE repository_id = $1\n          AND ($2::uuid   IS NULL OR run_id = $2)\n          AND ($3::bigint IS NULL OR id < $3)\n        ORDER BY id DESC\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "rule_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "target_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "package_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "component_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "blob_sha256",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "ref_count_after",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "blob_delete_enqueued",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "dry_run",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "reason",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5deeb93fd1f4f4feb98616314988c9ce2d117b96ff9f04150514efea5ac196e6"
+}
