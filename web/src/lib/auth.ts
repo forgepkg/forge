@@ -22,6 +22,35 @@ export type AuthMode = 'token' | 'cookie'
 /** The active auth mode. Flip to `'cookie'` when §12.2 sessions land. */
 export const authMode: AuthMode = 'token'
 
+/**
+ * In-tab subscribers notified whenever the stored credential changes
+ * (`setToken`/`clearToken`). The app shell uses this to re-run the `me` query
+ * after a same-tab sign-in/sign-out without a full page reload. Cross-tab
+ * changes already arrive via the `storage` event; this covers the same tab.
+ */
+const subscribers = new Set<() => void>()
+
+function notify(): void {
+  for (const fn of subscribers) fn()
+}
+
+/**
+ * Subscribe to credential changes. Returns an unsubscribe function. Combined
+ * with the `storage` event (other tabs), this lets the UI react to any change
+ * in the active credential regardless of which tab made it.
+ */
+export function onAuthChange(listener: () => void): () => void {
+  subscribers.add(listener)
+  const onStorage = (e: StorageEvent) => {
+    if (e.key === null || e.key === TOKEN_KEY) listener()
+  }
+  window.addEventListener('storage', onStorage)
+  return () => {
+    subscribers.delete(listener)
+    window.removeEventListener('storage', onStorage)
+  }
+}
+
 /** Base64-encode a UTF-8 string (token-in-Basic). */
 function base64(input: string): string {
   // btoa expects latin1; encode UTF-8 first so non-ASCII secrets survive.
@@ -48,6 +77,7 @@ export function setToken(token: string): void {
   } catch {
     /* storage unavailable (private mode); auth simply won't persist */
   }
+  notify()
 }
 
 /** Clear stored credentials (called on logout or a 401). */
@@ -57,6 +87,7 @@ export function clearToken(): void {
   } catch {
     /* ignore */
   }
+  notify()
 }
 
 /** Whether we currently hold a credential the API will accept. */

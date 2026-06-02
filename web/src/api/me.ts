@@ -1,4 +1,6 @@
-import { httpClient } from '~/lib/httpClient'
+import { queryOptions } from '@tanstack/react-query'
+
+import { httpClient, ApiError } from '~/lib/httpClient'
 
 /**
  * `GET /admin/me` — the authenticated principal's identity + capability flags.
@@ -27,3 +29,18 @@ export const meKeys = {
 export function fetchMe(): Promise<Me> {
   return httpClient.get<Me>('/admin/me')
 }
+
+/**
+ * Shared TanStack Query options for the current-principal resource. Reused by
+ * the `useMe` hook (rendering) and the router's admin `beforeLoad` guard
+ * (`queryClient.ensureQueryData`), so both consult the same cache entry and an
+ * auth failure (401/403) is never retried.
+ */
+export const meQueryOptions = queryOptions<Me, ApiError>({
+  queryKey: meKeys.self(),
+  queryFn: fetchMe,
+  retry: (failureCount, error) => {
+    if (error instanceof ApiError && error.isAuthError) return false
+    return failureCount < 2
+  },
+})
