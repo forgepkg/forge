@@ -258,6 +258,12 @@ default_ttl_seconds = {cache_ttl_seconds}
 batch_size = 50
 grace_seconds = 0
 poll_interval_seconds = 1
+
+[retention]
+enabled = true
+poll_interval_seconds = 1
+default_run_interval_seconds = 3600
+lease_seconds = 30
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
