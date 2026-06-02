@@ -45,6 +45,10 @@ pub struct Config {
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
+    /// Optional OpenID Connect / Microsoft Entra interactive login (slice 12.2).
+    /// Absent ⇒ OIDC disabled, no `/auth/oidc/*` routes.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
 }
 
 /// `server.*`
@@ -300,6 +304,166 @@ fn default_web_assets_dir() -> String {
     "web/dist".into()
 }
 
+/// `oidc.*` — OpenID Connect / Microsoft Entra interactive login (slice 12.2).
+///
+/// The whole `[oidc]` section is **optional**: when it is absent the feature is
+/// off and the server mounts no `/auth/oidc/*` routes. When present, it
+/// configures the authorization-code + PKCE flow against a single OIDC provider
+/// (Entra-first, but generic OIDC). All ephemeral flow state and sessions live
+/// in Postgres (`oidc_flow` / `session`), never in process memory, so any
+/// instance can complete a callback another instance started.
+///
+/// `client_secret` is read from env/file and **redacted** from the `Debug`
+/// impl (and must be redacted from any admin API that echoes config), mirroring
+/// the slice-1 proxy `upstream_password` treatment. Encrypting it at rest is
+/// slice 12.5.
+#[derive(Clone, Deserialize)]
+pub struct OidcConfig {
+    /// Master switch. When `false`, the section parses but the feature stays off
+    /// (lets an operator keep the block while disabling login).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// OIDC issuer URL (must be `https`). For Entra v2 this includes the tenant,
+    /// e.g. `https://login.microsoftonline.com/<tenant-id>/v2.0`. Discovery is
+    /// fetched from `{issuer}/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// OAuth client (application) id.
+    pub client_id: String,
+    /// OAuth client secret. **Redacted** from `Debug`/API output.
+    pub client_secret: String,
+    /// Absolute redirect URL registered with the IdP; must equal
+    /// `{public_base_url}/auth/oidc/callback` (host is validated against
+    /// `server.public_base_url`).
+    pub redirect_url: String,
+    /// Requested scopes. `openid` is always required and is added implicitly if
+    /// missing.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Allowed leeway (seconds) on `exp`/`nbf`/`iat` ID-token validation.
+    #[serde(default = "default_oidc_clock_skew")]
+    pub clock_skew_seconds: u64,
+
+    // ---- claim → user mapping ----
+    /// Claim used as the `app_user.username` (fallback chain handled in code:
+    /// this claim → `email` → `sub`).
+    #[serde(default = "default_username_claim")]
+    pub username_claim: String,
+    /// Claim carrying the user's email.
+    #[serde(default = "default_email_claim")]
+    pub email_claim: String,
+    /// Claim carrying the user's display name.
+    #[serde(default = "default_display_name_claim")]
+    pub display_name_claim: String,
+
+    // ---- provisioning ----
+    /// Create an `app_user` on first successful login when no link exists.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
+    /// Link an OIDC identity to an existing local `app_user` whose `username`
+    /// matches the resolved username claim (bootstrap-admin interplay). Risky if
+    /// the username claim is attacker-influenced — set `false` in hardened
+    /// deployments.
+    #[serde(default = "default_true")]
+    pub link_existing_by_username: bool,
+
+    // ---- admin assignment ----
+    /// Values (group object-ids/names or app-role names) that grant
+    /// `is_admin`. Empty ⇒ OIDC never grants admin (admins stay locally
+    /// managed) — the safe default.
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+    /// Claim whose values are matched against [`Self::admin_groups`] (Entra: app
+    /// roles arrive in `roles`, security groups in `groups`; `roles` is
+    /// recommended to avoid the Graph "groups overage" callout).
+    #[serde(default = "default_admin_claim")]
+    pub admin_claim: String,
+
+    // ---- session lifecycle ----
+    /// Idle timeout (seconds): a session expires this long after its last use.
+    #[serde(default = "default_session_idle_ttl")]
+    pub session_idle_ttl_seconds: u64,
+    /// Absolute lifetime (seconds): a session expires this long after creation
+    /// regardless of activity.
+    #[serde(default = "default_session_absolute_ttl")]
+    pub session_absolute_ttl_seconds: u64,
+}
+
+/// Manual `Debug` that **redacts `client_secret`** so it never lands in logs.
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("enabled", &self.enabled)
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", &self.redirect_url)
+            .field("scopes", &self.scopes)
+            .field("clock_skew_seconds", &self.clock_skew_seconds)
+            .field("username_claim", &self.username_claim)
+            .field("email_claim", &self.email_claim)
+            .field("display_name_claim", &self.display_name_claim)
+            .field("auto_provision", &self.auto_provision)
+            .field("link_existing_by_username", &self.link_existing_by_username)
+            .field("admin_groups", &self.admin_groups)
+            .field("admin_claim", &self.admin_claim)
+            .field("session_idle_ttl_seconds", &self.session_idle_ttl_seconds)
+            .field(
+                "session_absolute_ttl_seconds",
+                &self.session_absolute_ttl_seconds,
+            )
+            .finish()
+    }
+}
+
+impl OidcConfig {
+    /// Idle timeout as a [`Duration`].
+    pub fn session_idle_ttl(&self) -> Duration {
+        Duration::from_secs(self.session_idle_ttl_seconds)
+    }
+    /// Absolute lifetime as a [`Duration`].
+    pub fn session_absolute_ttl(&self) -> Duration {
+        Duration::from_secs(self.session_absolute_ttl_seconds)
+    }
+    /// Clock-skew leeway as a [`Duration`].
+    pub fn clock_skew(&self) -> Duration {
+        Duration::from_secs(self.clock_skew_seconds)
+    }
+    /// Scopes with `openid` guaranteed present (added first if missing).
+    pub fn effective_scopes(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.scopes.len() + 1);
+        if !self.scopes.iter().any(|s| s == "openid") {
+            out.push("openid".to_string());
+        }
+        out.extend(self.scopes.iter().cloned());
+        out
+    }
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+fn default_oidc_clock_skew() -> u64 {
+    60
+}
+fn default_username_claim() -> String {
+    "preferred_username".into()
+}
+fn default_email_claim() -> String {
+    "email".into()
+}
+fn default_display_name_claim() -> String {
+    "name".into()
+}
+fn default_admin_claim() -> String {
+    "roles".into()
+}
+fn default_session_idle_ttl() -> u64 {
+    8 * 60 * 60 // 8h
+}
+fn default_session_absolute_ttl() -> u64 {
+    7 * 24 * 60 * 60 // 7d
+}
+
 fn default_region() -> String {
     "us-east-1".into()
 }
@@ -378,6 +542,72 @@ impl Config {
         // at startup rather than mid-request.
         self.anon_policy()?;
         self.trusted_proxy_cidrs()?;
+        self.validate_oidc()?;
+        Ok(())
+    }
+
+    /// Validate the optional `[oidc]` section when present and enabled.
+    ///
+    /// Checks (per plan §3.5/§4 Phase 0): issuer is a non-empty `https` URL,
+    /// `client_id`/`client_secret`/`redirect_url` are non-empty, and the
+    /// `redirect_url` shares scheme+host (+port) with `server.public_base_url`
+    /// and ends in the canonical `/auth/oidc/callback` path. A disabled section
+    /// is not validated (an operator may keep an incomplete block while off).
+    fn validate_oidc(&self) -> Result<(), ConfigError> {
+        let Some(oidc) = &self.oidc else {
+            return Ok(());
+        };
+        if !oidc.enabled {
+            return Ok(());
+        }
+
+        let issuer = url::Url::parse(oidc.issuer.trim()).map_err(|e| {
+            ConfigError::Invalid(format!("invalid oidc.issuer {:?}: {e}", oidc.issuer))
+        })?;
+        if issuer.scheme() != "https" {
+            return Err(ConfigError::Invalid(format!(
+                "oidc.issuer must be https, got {:?}",
+                oidc.issuer
+            )));
+        }
+        if oidc.client_id.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "oidc.client_id must not be empty".into(),
+            ));
+        }
+        if oidc.client_secret.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "oidc.client_secret must not be empty".into(),
+            ));
+        }
+
+        let redirect = url::Url::parse(oidc.redirect_url.trim()).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "invalid oidc.redirect_url {:?}: {e}",
+                oidc.redirect_url
+            ))
+        })?;
+        let base = url::Url::parse(&self.public_base_url()).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "invalid server.public_base_url {:?}: {e}",
+                self.server.public_base_url
+            ))
+        })?;
+        if redirect.scheme() != base.scheme()
+            || redirect.host_str() != base.host_str()
+            || redirect.port_or_known_default() != base.port_or_known_default()
+        {
+            return Err(ConfigError::Invalid(format!(
+                "oidc.redirect_url host {:?} must match server.public_base_url host {:?}",
+                oidc.redirect_url, self.server.public_base_url
+            )));
+        }
+        if redirect.path() != "/auth/oidc/callback" {
+            return Err(ConfigError::Invalid(format!(
+                "oidc.redirect_url path must be /auth/oidc/callback, got {:?}",
+                redirect.path()
+            )));
+        }
         Ok(())
     }
 
@@ -542,6 +772,25 @@ mod tests {
             jail.set_env("FORGE_RETENTION__LEASE_SECONDS", "120");
             jail.set_env("FORGE_WEB__ENABLED", "false");
             jail.set_env("FORGE_WEB__ASSETS_DIR", "/srv/ui");
+            // OIDC section (redirect host must match public_base_url = https://forge.test).
+            jail.set_env("FORGE_OIDC__ISSUER", "https://idp.test/v2.0");
+            jail.set_env("FORGE_OIDC__CLIENT_ID", "cid");
+            jail.set_env("FORGE_OIDC__CLIENT_SECRET", "csecret");
+            jail.set_env(
+                "FORGE_OIDC__REDIRECT_URL",
+                "https://forge.test/auth/oidc/callback",
+            );
+            jail.set_env("FORGE_OIDC__SCOPES", "[openid,profile,email]");
+            jail.set_env("FORGE_OIDC__CLOCK_SKEW_SECONDS", "30");
+            jail.set_env("FORGE_OIDC__USERNAME_CLAIM", "preferred_username");
+            jail.set_env("FORGE_OIDC__EMAIL_CLAIM", "email");
+            jail.set_env("FORGE_OIDC__DISPLAY_NAME_CLAIM", "name");
+            jail.set_env("FORGE_OIDC__AUTO_PROVISION", "false");
+            jail.set_env("FORGE_OIDC__LINK_EXISTING_BY_USERNAME", "false");
+            jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
+            jail.set_env("FORGE_OIDC__ADMIN_CLAIM", "groups");
+            jail.set_env("FORGE_OIDC__SESSION_IDLE_TTL_SECONDS", "3600");
+            jail.set_env("FORGE_OIDC__SESSION_ABSOLUTE_TTL_SECONDS", "86400");
 
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
 
@@ -578,6 +827,22 @@ mod tests {
             assert_eq!(cfg.retention.lease_seconds, 120);
             assert!(!cfg.web.enabled);
             assert_eq!(cfg.web.assets_dir, "/srv/ui");
+            let oidc = cfg.oidc.as_ref().expect("oidc set via env");
+            assert_eq!(oidc.issuer, "https://idp.test/v2.0");
+            assert_eq!(oidc.client_id, "cid");
+            assert_eq!(oidc.client_secret, "csecret");
+            assert_eq!(oidc.redirect_url, "https://forge.test/auth/oidc/callback");
+            assert_eq!(oidc.scopes, vec!["openid", "profile", "email"]);
+            assert_eq!(oidc.clock_skew_seconds, 30);
+            assert_eq!(oidc.username_claim, "preferred_username");
+            assert_eq!(oidc.email_claim, "email");
+            assert_eq!(oidc.display_name_claim, "name");
+            assert!(!oidc.auto_provision);
+            assert!(!oidc.link_existing_by_username);
+            assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
+            assert_eq!(oidc.admin_claim, "groups");
+            assert_eq!(oidc.session_idle_ttl_seconds, 3600);
+            assert_eq!(oidc.session_absolute_ttl_seconds, 86400);
             Ok(())
         });
     }
@@ -659,6 +924,158 @@ mod tests {
         let toml = MINIMAL.replace("[auth]", "[auth]\ntrusted_proxy_cidrs = [\"nope\"]");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("trusted_proxy_cidr"), "{err}");
+    }
+
+    /// A valid `[oidc]` block (Entra-shaped) appended to the minimal config.
+    /// `public_base_url` is overridden to a plain-host https URL so the redirect
+    /// host check passes.
+    const OIDC_BLOCK: &str = r#"
+        [oidc]
+        issuer = "https://login.microsoftonline.com/tenant-id/v2.0"
+        client_id = "abc-123"
+        client_secret = "shhh-secret"
+        redirect_url = "https://forge.example.com/auth/oidc/callback"
+    "#;
+
+    fn minimal_with_oidc(extra: &str) -> String {
+        // Use an https base URL whose host matches the redirect_url.
+        let base = MINIMAL.replace(
+            "public_base_url = \"https://forge.example.com/\"",
+            "public_base_url = \"https://forge.example.com\"",
+        );
+        format!("{base}{OIDC_BLOCK}{extra}")
+    }
+
+    #[test]
+    fn oidc_absent_means_disabled() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(cfg.oidc.is_none());
+    }
+
+    #[test]
+    fn oidc_valid_block_parses_with_defaults() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
+        let oidc = cfg.oidc.expect("present");
+        assert!(oidc.enabled);
+        assert_eq!(oidc.client_id, "abc-123");
+        assert_eq!(oidc.client_secret, "shhh-secret");
+        // Defaults.
+        assert_eq!(oidc.scopes, vec!["openid", "profile", "email"]);
+        assert_eq!(oidc.clock_skew_seconds, 60);
+        assert_eq!(oidc.username_claim, "preferred_username");
+        assert_eq!(oidc.email_claim, "email");
+        assert_eq!(oidc.display_name_claim, "name");
+        assert!(oidc.auto_provision);
+        assert!(oidc.link_existing_by_username);
+        assert!(oidc.admin_groups.is_empty());
+        assert_eq!(oidc.admin_claim, "roles");
+        assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);
+        assert_eq!(oidc.session_absolute_ttl_seconds, 7 * 24 * 60 * 60);
+        // effective_scopes keeps openid; idempotent when already present.
+        assert_eq!(oidc.effective_scopes(), vec!["openid", "profile", "email"]);
+    }
+
+    #[test]
+    fn oidc_effective_scopes_inserts_openid_when_missing() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(
+            "\nscopes = [\"profile\", \"email\"]",
+        )))
+        .expect("valid");
+        let oidc = cfg.oidc.expect("present");
+        assert_eq!(oidc.effective_scopes(), vec!["openid", "profile", "email"]);
+    }
+
+    #[test]
+    fn oidc_debug_redacts_client_secret() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
+        let dbg = format!("{:?}", cfg.oidc.as_ref().unwrap());
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(!dbg.contains("shhh-secret"), "{dbg}");
+        // And the top-level Config Debug must not leak it either.
+        let full = format!("{cfg:?}");
+        assert!(!full.contains("shhh-secret"), "{full}");
+    }
+
+    #[test]
+    fn oidc_missing_client_id_rejected() {
+        let toml = minimal_with_oidc("").replace("client_id = \"abc-123\"", "client_id = \"\"");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("oidc.client_id"), "{err}");
+    }
+
+    #[test]
+    fn oidc_non_https_issuer_rejected() {
+        let toml = minimal_with_oidc("").replace(
+            "https://login.microsoftonline.com",
+            "http://login.microsoftonline.com",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("oidc.issuer"), "{err}");
+    }
+
+    #[test]
+    fn oidc_mismatched_redirect_host_rejected() {
+        let toml = minimal_with_oidc("").replace(
+            "https://forge.example.com/auth/oidc/callback",
+            "https://evil.example.org/auth/oidc/callback",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("oidc.redirect_url"), "{err}");
+    }
+
+    #[test]
+    fn oidc_wrong_redirect_path_rejected() {
+        let toml = minimal_with_oidc("").replace(
+            "https://forge.example.com/auth/oidc/callback",
+            "https://forge.example.com/callback",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("oidc.redirect_url"), "{err}");
+    }
+
+    #[test]
+    fn oidc_disabled_block_skips_validation() {
+        // A disabled section with an otherwise-invalid (http) issuer must parse.
+        let toml = minimal_with_oidc("")
+            .replace("[oidc]", "[oidc]\nenabled = false")
+            .replace(
+                "https://login.microsoftonline.com",
+                "http://login.microsoftonline.com",
+            );
+        let cfg =
+            Config::from_figment(fig_from_toml(&toml)).expect("disabled section is not validated");
+        assert!(!cfg.oidc.unwrap().enabled);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn oidc_env_overrides_nested_keys() {
+        figment::Jail::expect_with(|jail| {
+            let base = MINIMAL.replace(
+                "public_base_url = \"https://forge.example.com/\"",
+                "public_base_url = \"https://forge.test\"",
+            );
+            jail.create_file("forge.toml", &base)?;
+            jail.set_env(
+                "FORGE_OIDC__ISSUER",
+                "https://login.microsoftonline.com/t/v2.0",
+            );
+            jail.set_env("FORGE_OIDC__CLIENT_ID", "cid");
+            jail.set_env("FORGE_OIDC__CLIENT_SECRET", "csecret");
+            jail.set_env(
+                "FORGE_OIDC__REDIRECT_URL",
+                "https://forge.test/auth/oidc/callback",
+            );
+            jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
+            jail.set_env("FORGE_OIDC__AUTO_PROVISION", "false");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            let oidc = cfg.oidc.expect("present via env");
+            assert_eq!(oidc.client_id, "cid");
+            assert_eq!(oidc.client_secret, "csecret");
+            assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
+            assert!(!oidc.auto_provision);
+            Ok(())
+        });
     }
 
     #[test]

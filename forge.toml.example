@@ -51,3 +51,30 @@ default_ttl_seconds = 30        # (default: 30)
 batch_size = 100                # (default: 100)
 grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted
 poll_interval_seconds = 10      # (default: 10)
+
+# Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
+# Omit the whole [oidc] section to disable login (no /auth/oidc/* routes).
+# All flow state and sessions live in Postgres, so any instance can complete a
+# callback another instance started. The client_secret is redacted from logs
+# and admin API output.
+# [oidc]
+# enabled        = true                                                        # (default: true)
+# issuer         = "https://login.microsoftonline.com/<tenant-id>/v2.0"        # must be https
+# client_id      = "00000000-0000-0000-0000-000000000000"
+# client_secret  = "<application-client-secret>"                               # redacted from APIs/logs
+# redirect_url   = "http://localhost:3000/auth/oidc/callback"                  # must match public_base_url host + this path
+# scopes         = ["openid", "profile", "email"]                              # (default) openid is always added
+# clock_skew_seconds = 60                                                      # (default: 60) exp/nbf/iat leeway
+# # claim → user mapping (fallback chain: username_claim → email → sub)
+# username_claim     = "preferred_username"  # (default)
+# email_claim        = "email"               # (default)
+# display_name_claim = "name"                # (default)
+# # provisioning
+# auto_provision             = true          # (default) create app_user on first login
+# link_existing_by_username  = true          # (default) link matching local user (bootstrap-admin interplay)
+# # admin assignment — empty admin_groups means OIDC never grants admin (safe default)
+# admin_groups = ["forge-admins"]            # group/role values that grant is_admin
+# admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")
+# # session lifecycle
+# session_idle_ttl_seconds     = 28800       # (default: 8h) idle timeout
+# session_absolute_ttl_seconds = 604800      # (default: 7d) absolute lifetime

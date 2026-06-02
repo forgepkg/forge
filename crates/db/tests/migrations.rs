@@ -26,6 +26,17 @@ const EXPECTED_TABLES: &[&str] = &[
     // 0002_retention.sql
     "retention_run",
     "retention_audit",
+    // 0003_oidc.sql
+    "external_identity",
+    "session",
+    "oidc_flow",
+];
+
+/// Unique constraints `0003_oidc.sql` is expected to enforce: (table, columns).
+/// We assert these by attempting a duplicate insert below.
+const _OIDC_UNIQUE_DOC: &[(&str, &str)] = &[
+    ("external_identity", "(issuer, subject)"),
+    ("session", "(token_hash)"),
 ];
 
 /// Columns `0002_retention.sql` adds to existing slice-1 tables: (table, column).
@@ -157,4 +168,103 @@ async fn migrations_create_all_expected_tables() {
     .execute(&pool)
     .await
     .expect("retention_audit row should be insertable");
+
+    // -----------------------------------------------------------------------
+    // 0003_oidc.sql: external_identity / session / oidc_flow round-trips
+    // -----------------------------------------------------------------------
+
+    // A user to attach an external identity + session to.
+    let user_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('oidc-user', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("app_user insertable");
+
+    // external_identity links (issuer, subject) -> app_user.
+    let ext_id: i64 = sqlx::query_scalar(
+        "INSERT INTO external_identity (user_id, issuer, subject, email, display_name) \
+         VALUES ($1, 'https://issuer.example/v2.0', 'sub-abc', 'u@example.com', 'OIDC User') \
+         RETURNING id",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("external_identity row should be insertable");
+
+    // UNIQUE (issuer, subject) is enforced: a duplicate (iss, sub) must fail.
+    let dup = sqlx::query(
+        "INSERT INTO external_identity (user_id, issuer, subject) \
+         VALUES ($1, 'https://issuer.example/v2.0', 'sub-abc')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        dup.is_err(),
+        "external_identity must enforce UNIQUE (issuer, subject)"
+    );
+
+    // session row referencing the user + external identity, with the hashed
+    // cookie secret (token_hash) and CSRF secret.
+    sqlx::query(
+        "INSERT INTO session \
+             (user_id, external_identity_id, token_hash, csrf_secret, idle_expiry, absolute_expiry) \
+         VALUES ($1, $2, 'sha256-of-cookie', 'csrf-secret', now() + interval '8 hours', now() + interval '7 days')",
+    )
+    .bind(user_id)
+    .bind(ext_id)
+    .execute(&pool)
+    .await
+    .expect("session row should be insertable");
+
+    // UNIQUE (token_hash) is enforced.
+    let dup_session = sqlx::query(
+        "INSERT INTO session (user_id, token_hash, csrf_secret, idle_expiry, absolute_expiry) \
+         VALUES ($1, 'sha256-of-cookie', 'csrf2', now() + interval '8 hours', now() + interval '7 days')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        dup_session.is_err(),
+        "session must enforce UNIQUE (token_hash)"
+    );
+
+    // oidc_flow: text `state` PK is the single-use auth-code-flow row. A DELETE
+    // ... RETURNING consumes it exactly once (the slice's cross-instance crux).
+    sqlx::query(
+        "INSERT INTO oidc_flow (state, nonce, pkce_verifier, redirect_to, expires_at) \
+         VALUES ('state-xyz', 'nonce-1', 'verifier-1', '/', now() + interval '10 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("oidc_flow row should be insertable");
+
+    let first: Option<(String, String)> = sqlx::query_as(
+        "DELETE FROM oidc_flow WHERE state = $1 AND expires_at > now() \
+         RETURNING nonce, pkce_verifier",
+    )
+    .bind("state-xyz")
+    .fetch_optional(&pool)
+    .await
+    .expect("oidc_flow consume query runs");
+    assert_eq!(
+        first,
+        Some(("nonce-1".to_string(), "verifier-1".to_string())),
+        "first consume returns the row"
+    );
+
+    let second: Option<(String, String)> = sqlx::query_as(
+        "DELETE FROM oidc_flow WHERE state = $1 AND expires_at > now() \
+         RETURNING nonce, pkce_verifier",
+    )
+    .bind("state-xyz")
+    .fetch_optional(&pool)
+    .await
+    .expect("oidc_flow consume query runs");
+    assert!(
+        second.is_none(),
+        "second consume returns nothing (single-use / replay protection)"
+    );
 }
