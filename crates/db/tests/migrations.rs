@@ -38,6 +38,7 @@ const EXPECTED_TABLES: &[&str] = &[
 const EXPECTED_CREDFORWARD_COLUMNS: &[(&str, &str)] = &[
     ("app_user", "auth_source"),
     ("app_user", "external_subject"),
+    ("app_user", "last_auth_source_at"),
 ];
 
 /// Unique constraints `0003_oidc.sql` is expected to enforce: (table, columns).

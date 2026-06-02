@@ -43,6 +43,14 @@ ALTER TABLE app_user
 ALTER TABLE app_user
     ADD COLUMN external_subject text;
 
+-- Timestamp of the last successful authentication via a NON-local source
+-- (upstream-basic / oidc). Audit-only: lets an operator see when a user last
+-- proved themselves against the upstream, distinct from the slice-1
+-- updated_at/last_used bookkeeping. NULL until the first non-local auth. Written
+-- by the upstream-basic provision/refresh path in a later phase (plan §2.2/§2.4).
+ALTER TABLE app_user
+    ADD COLUMN last_auth_source_at timestamptz;
+
 -- Constrain auth_source to the known set so a typo can never silently disable
 -- the local-password invariant below.
 ALTER TABLE app_user

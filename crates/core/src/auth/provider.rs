@@ -23,6 +23,7 @@
 //!   grants access.
 //! * [`AuthOutcome::Skip`] ("not my user") simply advances to the next provider.
 
+use std::fmt;
 use std::net::IpAddr;
 
 /// How a principal was authenticated / provisioned.
@@ -59,7 +60,12 @@ impl AuthSource {
 /// `password` is plaintext only for the lifetime of the request; it is never
 /// stored or logged (see the slice 12.3 cache design, which stores only an
 /// HMAC of it).
-#[derive(Debug, Clone, Copy)]
+///
+/// `Debug` is implemented **manually** so the plaintext `password` field is
+/// always redacted: any future caller that logs a `PasswordCredential` with
+/// `{:?}` — or includes it in a `tracing` span — must never emit the cleartext
+/// password. Deriving `Debug` here would be a latent credential-leak.
+#[derive(Clone, Copy)]
 pub struct PasswordCredential<'a> {
     /// The presented username.
     pub username: &'a str,
@@ -68,6 +74,16 @@ pub struct PasswordCredential<'a> {
     /// The resolved client IP, carried for audit / SSRF context. **Never** a
     /// trust signal on its own.
     pub client_ip: IpAddr,
+}
+
+impl fmt::Debug for PasswordCredential<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordCredential")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("client_ip", &self.client_ip)
+            .finish()
+    }
 }
 
 /// The identity a provider vouches for after a successful authentication.
@@ -160,5 +176,26 @@ mod tests {
         assert!(id.external_subject.is_none());
         assert!(id.groups.is_empty());
         assert!(!id.suggested_is_admin);
+    }
+
+    #[test]
+    fn password_credential_debug_redacts_plaintext() {
+        let cred = PasswordCredential {
+            username: "alice",
+            password: "hunter2-super-secret",
+            client_ip: "203.0.113.7".parse().unwrap(),
+        };
+        let rendered = format!("{cred:?}");
+        assert!(
+            !rendered.contains("hunter2-super-secret"),
+            "Debug must never expose the plaintext password: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "expected redaction marker: {rendered}"
+        );
+        // The non-secret fields stay visible for diagnostics.
+        assert!(rendered.contains("alice"));
+        assert!(rendered.contains("203.0.113.7"));
     }
 }
