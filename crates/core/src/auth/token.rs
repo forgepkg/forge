@@ -13,6 +13,7 @@
 //!   returns `Unauthorized` even when anonymous access would otherwise apply.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
@@ -23,7 +24,10 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
+use super::chain::{map_identity_to_principal, Chain, ChainOutcome};
+use super::local_password::LocalPasswordProvider;
 use super::principal::{Principal, UserPrincipal};
+use super::provider::PasswordCredential;
 
 /// Hash a token secret into the lowercase-hex SHA-256 form stored in the DB.
 pub fn hash_token(secret: &str) -> String {
@@ -202,22 +206,55 @@ impl PrincipalSource for TokenHeaderSource {
 }
 
 /// Resolves HTTP Basic auth. The basic secret is tried as a **token** first,
-/// then (only if `allow_password_basic`) as a **password** for the supplied
-/// username.
+/// then (only if password-basic is enabled) as a **password** for the supplied
+/// username — and the password path now runs through the
+/// [`crate::auth::Chain`] of [`crate::auth::AuthProvider`]s.
+///
+/// ## Slice 12.3 refactor (phase 2)
+/// Slice 1 inlined a single argon2id check here (`verify_password`). That check
+/// is now the [`crate::auth::LocalPasswordProvider`], invoked via the chain.
+/// With the default chain (`["local-password"]`) this is **byte-for-byte** the
+/// slice-1 behaviour:
+/// * token-as-basic still wins first and is unchanged;
+/// * the password path is still gated — when no chain is configured (slice-1
+///   `allow_password_basic = false`) the password path is skipped entirely;
+/// * a present-but-wrong / unknown password still yields
+///   [`SourceOutcome::Invalid`] (→ 401, never downgraded to anonymous).
+///
+/// The chain lets `upstream-basic` (phase 4) slot in behind the local provider
+/// without any change to this source.
 pub struct BasicAuthSource {
     pool: PgPool,
-    /// Whether to fall back to password verification when the basic secret is
-    /// not a valid token.
-    pub allow_password_basic: bool,
+    /// The password-style auth chain. `None` reproduces slice-1
+    /// `allow_password_basic = false` (password path disabled); `Some(chain)`
+    /// reproduces `allow_password_basic = true` with the local provider (and,
+    /// from phase 4, any further providers).
+    chain: Option<Arc<Chain>>,
 }
 
 impl BasicAuthSource {
-    /// Build a source over the given pool.
+    /// Build a source over the given pool, reproducing the slice-1
+    /// `allow_password_basic` flag: when `true`, the password path is enabled
+    /// with the default chain (`["local-password"]`); when `false`, only the
+    /// token-as-basic path runs.
+    ///
+    /// Preserved for slice-1 / existing callers and tests. Newer wiring that
+    /// builds a richer chain (phase 4+) should use [`BasicAuthSource::with_chain`].
     pub fn new(pool: PgPool, allow_password_basic: bool) -> Self {
-        Self {
-            pool,
-            allow_password_basic,
-        }
+        let chain = if allow_password_basic {
+            Some(Arc::new(Chain::new(vec![Box::new(
+                LocalPasswordProvider::new(pool.clone()),
+            )])))
+        } else {
+            None
+        };
+        Self { pool, chain }
+    }
+
+    /// Build a source with an explicit password-auth chain (phase 4+ wiring).
+    /// Pass `None` to disable the password path entirely.
+    pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>) -> Self {
+        Self { pool, chain }
     }
 }
 
@@ -238,7 +275,7 @@ fn parse_basic(value: &str) -> Option<(String, String)> {
 
 #[async_trait::async_trait]
 impl PrincipalSource for BasicAuthSource {
-    async fn resolve(&self, headers: &HeaderMap, _peer_ip: IpAddr) -> SourceOutcome {
+    async fn resolve(&self, headers: &HeaderMap, peer_ip: IpAddr) -> SourceOutcome {
         let Some(value) = headers.get(http::header::AUTHORIZATION) else {
             return SourceOutcome::NoCredentials;
         };
@@ -256,14 +293,50 @@ impl PrincipalSource for BasicAuthSource {
             return SourceOutcome::Invalid;
         }
 
-        // Try the secret as a token first.
+        // Try the secret as a token first (unchanged from slice 1, runs ahead
+        // of the password chain).
         if let Some(up) = verify_token(&self.pool, &secret).await {
             return SourceOutcome::Authenticated(Principal::from_user(up));
         }
-        // Then, if allowed, as a password.
-        if self.allow_password_basic {
-            if let Some(up) = verify_password(&self.pool, &username, &secret).await {
-                return SourceOutcome::Authenticated(Principal::from_user(up));
+        // Then, if a password chain is configured, run the secret as a password
+        // through the AuthProvider chain.
+        if let Some(chain) = self.chain.as_ref() {
+            let cred = PasswordCredential {
+                username: &username,
+                password: &secret,
+                client_ip: peer_ip,
+            };
+            match chain.authenticate(&cred).await {
+                ChainOutcome::Authenticated { identity, .. } => {
+                    // Map the vouched-for username back to a concrete principal.
+                    match map_identity_to_principal(&self.pool, &identity).await {
+                        Ok(Some(up)) => {
+                            return SourceOutcome::Authenticated(Principal::from_user(up))
+                        }
+                        // Vouched-for but no (active) app_user row, or a DB
+                        // error during mapping: fail closed. Basic creds were
+                        // presented, so this is an attempted-but-failed login
+                        // (Invalid → 401), never a downgrade to anonymous.
+                        Ok(None) => return SourceOutcome::Invalid,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "principal mapping failed");
+                            return SourceOutcome::Invalid;
+                        }
+                    }
+                }
+                // A definitive rejection (wrong local password) or a fail-closed
+                // outage both mean: credentials were presented and not accepted.
+                // Slice 1 mapped a failed password verify to Invalid (→ 401);
+                // we preserve that for Rejected and Unavailable.
+                ChainOutcome::Rejected | ChainOutcome::Unavailable => {
+                    return SourceOutcome::Invalid
+                }
+                // No provider had anything to say (e.g. unknown user that no
+                // provider owns). Basic creds *were* presented, so this is still
+                // an attempted-but-invalid login — exactly slice 1, where an
+                // unknown username made `verify_password` return `None` and the
+                // basic source fell through to `Invalid`.
+                ChainOutcome::NoCredentials => return SourceOutcome::Invalid,
             }
         }
         SourceOutcome::Invalid

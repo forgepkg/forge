@@ -15,14 +15,16 @@
 pub mod authz;
 pub mod chain;
 pub mod client_ip;
+pub mod local_password;
 pub mod principal;
 pub mod provider;
 pub mod session_source;
 pub mod token;
 
 pub use authz::{can_admin, can_read, can_write};
-pub use chain::{Chain, ChainOutcome};
+pub use chain::{map_identity_to_principal, Chain, ChainOutcome};
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
+pub use local_password::LocalPasswordProvider;
 pub use principal::{Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};

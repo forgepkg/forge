@@ -23,6 +23,9 @@
 //!    its anonymous-access policy (exactly as slice 1 did when password-basic
 //!    was off / the user was unknown).
 
+use sqlx::PgPool;
+
+use super::principal::UserPrincipal;
 use super::provider::{AuthOutcome, AuthProvider, PasswordCredential, ProvenIdentity};
 
 /// The folded result of running the [`AuthProvider`] chain.
@@ -107,6 +110,41 @@ impl Chain {
             ChainOutcome::NoCredentials
         }
     }
+}
+
+/// Map a chain-vouched [`ProvenIdentity`] to a concrete [`UserPrincipal`].
+///
+/// Providers only vouch for a *username*; this resolves that username to a
+/// forge `app_user` (its id and admin flag) so the caller can build a
+/// [`super::principal::Principal::User`].
+///
+/// **Phase 2 (this slice) scope:** the user must already exist and be active.
+/// Auto-provisioning of upstream-vouched users that don't yet have an
+/// `app_user` row is phase 5 (it runs in a `db` transaction with provenance);
+/// here a vouched-for identity with no matching active row resolves to `None`
+/// so the caller denies. For the `local-password` provider this can never
+/// happen — it only authenticates an existing, active user — so this is a
+/// behaviour-preserving lookup for slice 1.
+///
+/// Returns `Ok(None)` when no matching active user exists, `Err` only on a DB
+/// failure (the caller must fail closed on `Err`).
+pub async fn map_identity_to_principal(
+    pool: &PgPool,
+    identity: &ProvenIdentity,
+) -> sqlx::Result<Option<UserPrincipal>> {
+    let Some(user) = forge_db::user_dao::find_user_by_username(pool, &identity.username).await?
+    else {
+        return Ok(None);
+    };
+    if !user.active {
+        return Ok(None);
+    }
+    Ok(Some(UserPrincipal {
+        user_id: user.id,
+        // Password-style auth never carries a token.
+        token_id: None,
+        is_admin: user.is_admin,
+    }))
 }
 
 #[cfg(test)]
