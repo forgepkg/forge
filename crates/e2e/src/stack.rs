@@ -216,6 +216,7 @@ fn config_toml(
     trusted_proxies: &[String],
     cache_ttl_seconds: u64,
     public_base_url: &str,
+    oidc_block: &str,
 ) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
@@ -264,6 +265,7 @@ enabled = true
 poll_interval_seconds = 1
 default_run_interval_seconds = 3600
 lease_seconds = 30
+{oidc_block}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
@@ -275,6 +277,10 @@ lease_seconds = 30
 
 // ── Stack builder ───────────────────────────────────────────────────────────
 
+/// Produces the `[oidc]` TOML block from the (post-bind) public base URL, so the
+/// `redirect_url` can embed the ephemeral address the server actually binds to.
+type OidcBlockFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Builder for a stack ([`start_stack`] is the common case with defaults).
 pub struct StackBuilder {
     anon: AnonMode,
@@ -283,6 +289,8 @@ pub struct StackBuilder {
     use_redis: bool,
     trusted_proxies: Vec<String>,
     cache_ttl_seconds: u64,
+    /// `None` ⇒ OIDC disabled.
+    oidc_block_fn: Option<OidcBlockFn>,
 }
 
 impl Default for StackBuilder {
@@ -296,6 +304,7 @@ impl Default for StackBuilder {
             // client IP from the in-process client.
             trusted_proxies: vec!["127.0.0.1/32".into(), "::1/128".into()],
             cache_ttl_seconds: 5,
+            oidc_block_fn: None,
         }
     }
 }
@@ -332,6 +341,18 @@ impl StackBuilder {
         self
     }
 
+    /// Enable OIDC login, deriving the `[oidc]` config block from the server's
+    /// (post-bind) public base URL via `block_fn` — typically
+    /// `move |base| mock.oidc_block(base)`. The closure runs once the ephemeral
+    /// listener address is known, so the `redirect_url` matches `public_base_url`.
+    pub fn with_oidc<F>(mut self, block_fn: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.oidc_block_fn = Some(Box::new(block_fn));
+        self
+    }
+
     /// Boot a fresh stack: a new database + a server instance.
     pub async fn start(self) -> TestServer {
         let db_url = fresh_database().await;
@@ -363,6 +384,13 @@ impl StackBuilder {
             .bootstrap_admin
             .as_ref()
             .map(|(u, p)| (u.as_str(), p.as_str()));
+        // Build the [oidc] block now that the public base URL is known (the
+        // redirect_url must match it). Empty when OIDC is disabled.
+        let oidc_block = self
+            .oidc_block_fn
+            .as_ref()
+            .map(|f| f(&base_url))
+            .unwrap_or_default();
         let toml = config_toml(
             &db_url,
             s3,
@@ -372,6 +400,7 @@ impl StackBuilder {
             &self.trusted_proxies,
             self.cache_ttl_seconds,
             &base_url,
+            &oidc_block,
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
@@ -504,6 +533,36 @@ impl TestServer {
         }
         let mut peer = builder.serve(self.db_url.clone(), pool, false).await;
         // The peer shares the admin token already minted on the primary.
+        peer.admin_user = self.admin_user.clone();
+        peer.admin_pass = self.admin_pass.clone();
+        peer.admin_token = self.admin_token.clone();
+        peer
+    }
+
+    /// Like [`spawn_peer`](Self::spawn_peer) but the peer also enables OIDC with
+    /// the same provider, so it can complete a callback whose login was started
+    /// on the primary (the headline cross-instance scale-out scenario). The
+    /// `block_fn` is the mock IdP's `oidc_block` closure (it derives the peer's
+    /// own `redirect_url` from the peer's bind address — the token endpoint
+    /// ignores `redirect_uri`, and issuer/client_id are what matter).
+    pub async fn spawn_peer_with_oidc<F>(&self, block_fn: F) -> TestServer
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&self.db_url)
+            .await
+            .expect("peer connect");
+        let mut builder = StackBuilder::default()
+            .no_bootstrap_admin()
+            .workers(true)
+            .cache_ttl_seconds(5)
+            .with_oidc(block_fn);
+        if self.use_redis {
+            builder = builder.with_redis();
+        }
+        let mut peer = builder.serve(self.db_url.clone(), pool, false).await;
         peer.admin_user = self.admin_user.clone();
         peer.admin_pass = self.admin_pass.clone();
         peer.admin_token = self.admin_token.clone();

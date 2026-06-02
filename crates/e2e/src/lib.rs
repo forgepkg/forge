@@ -22,9 +22,11 @@
 
 #![cfg(feature = "forge-e2e")]
 
+mod mock_oidc;
 mod mock_upstream;
 mod stack;
 
+pub use mock_oidc::MockOidc;
 pub use mock_upstream::{MockUpstream, UpstreamPackage};
 pub use stack::{
     make_nupkg, make_nupkg_with_desc, start_stack, AnonMode, StackBuilder, TestServer, S3_ACCESS,
