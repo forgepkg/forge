@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO oidc_flow (state, nonce, pkce_verifier, redirect_to, expires_at)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING state, nonce, pkce_verifier, redirect_to, created_at, expires_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "nonce",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "pkce_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "redirect_to",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fe92ce11e29950e39c00a90363849ef22afb4a7883eb26f046e41af550ed55a7"
+}

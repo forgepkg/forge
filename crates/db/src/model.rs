@@ -222,6 +222,62 @@ pub struct Token {
     pub created_at: DateTime<Utc>,
 }
 
+/// A row of `external_identity` (slice 12.2).
+///
+/// Maps an IdP identity `(issuer, subject)` to an `app_user`. The denormalized
+/// claim columns are for display/debugging only and carry no authority — the
+/// join key is `(issuer, subject)`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ExternalIdentity {
+    pub id: i64,
+    pub user_id: i64,
+    pub issuer: String,
+    pub subject: String,
+    pub preferred_username: Option<String>,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A row of `session` (slice 12.2).
+///
+/// Server-side login session — the authority behind the opaque `forge_session`
+/// cookie. `token_hash` is `sha256(cookie_secret)` (mirrors `token.token_hash`);
+/// the plaintext secret never reaches the DB. A session is valid iff
+/// `revoked_at IS NULL AND now() < idle_expiry AND now() < absolute_expiry`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct Session {
+    pub id: i64,
+    pub user_id: i64,
+    pub external_identity_id: Option<i64>,
+    pub token_hash: String,
+    pub csrf_secret: String,
+    pub user_agent_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub idle_expiry: DateTime<Utc>,
+    pub absolute_expiry: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// A row of `oidc_flow` (slice 12.2).
+///
+/// Ephemeral authorization-code-flow state, shared across instances so any
+/// instance can complete a callback started by another. Rows are single-use:
+/// the callback consumes them with `DELETE ... RETURNING`. `state` is the
+/// natural text PK (the IdP echoes it back, so it cannot be hashed).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OidcFlow {
+    pub state: String,
+    pub nonce: String,
+    pub pkce_verifier: String,
+    pub redirect_to: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

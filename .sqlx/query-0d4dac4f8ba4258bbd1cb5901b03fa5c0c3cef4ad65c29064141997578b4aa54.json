@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE session\n        SET last_seen_at = now(),\n            idle_expiry  = now() + make_interval(secs => $2)\n        WHERE id = $1\n          AND revoked_at IS NULL\n          AND last_seen_at < now() - make_interval(secs => $3)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d4dac4f8ba4258bbd1cb5901b03fa5c0c3cef4ad65c29064141997578b4aa54"
+}

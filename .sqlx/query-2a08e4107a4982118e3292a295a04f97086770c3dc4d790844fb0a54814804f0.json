@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO external_identity (\n            user_id, issuer, subject,\n            preferred_username, email, display_name, last_login_at\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, now())\n        ON CONFLICT (issuer, subject) DO UPDATE\n        SET preferred_username = EXCLUDED.preferred_username,\n            email              = EXCLUDED.email,\n            display_name       = EXCLUDED.display_name,\n            last_login_at      = now(),\n            updated_at         = now()\n        RETURNING\n            id, user_id, issuer, subject,\n            preferred_username, email, display_name,\n            last_login_at, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "issuer",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "preferred_username",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "2a08e4107a4982118e3292a295a04f97086770c3dc4d790844fb0a54814804f0"
+}

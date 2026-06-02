@@ -11,12 +11,15 @@ pub mod asset_dao;
 pub mod blob_dao;
 pub mod component_dao;
 pub mod download_dao;
+pub mod external_identity_dao;
 pub mod ids;
 pub mod model;
+pub mod oidc_flow_dao;
 pub mod outbox_dao;
 pub mod proxy_dao;
 pub mod repository_dao;
 pub mod retention_dao;
+pub mod session_dao;
 pub mod token_dao;
 pub mod user_dao;
 

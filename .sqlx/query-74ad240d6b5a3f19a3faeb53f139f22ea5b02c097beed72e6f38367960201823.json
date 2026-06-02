@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM oidc_flow\n        WHERE state = $1 AND expires_at > now()\n        RETURNING state, nonce, pkce_verifier, redirect_to, created_at, expires_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "nonce",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "pkce_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "redirect_to",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "74ad240d6b5a3f19a3faeb53f139f22ea5b02c097beed72e6f38367960201823"
+}
