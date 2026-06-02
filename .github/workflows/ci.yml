@@ -112,6 +112,39 @@ jobs:
           SQLX_OFFLINE: ""
         run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
+  # ── Frontend (TanStack Start SPA in web/) ──────────────────────────────────
+  # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
+  # output (web/dist/) is what the Rust server serves via ServeDir; building here
+  # guards against TS/Vite breakage and is a prerequisite for the e2e job.
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: npm ci
+      - name: Typecheck (tsc --noEmit)
+        run: npm run tsc
+      - name: Unit tests (Vitest)
+        run: npm run test
+      - name: Production build (vite build -> web/dist)
+        run: npm run build
+      - name: Upload built SPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
   # ── E2E / integration tests (forge-e2e crate, testcontainers) ──────────────
   # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis)
   # containers via testcontainers — the ubuntu-latest runner ships a working

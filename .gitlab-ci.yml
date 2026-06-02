@@ -9,6 +9,7 @@ stages:
   - fmt
   - clippy
   - test
+  - web
   - e2e
 
 default:
@@ -82,6 +83,34 @@ test:
     - cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
     - SQLX_OFFLINE= sqlx migrate run --source migrations
     - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
+
+# ── Frontend (TanStack Start SPA in web/) ────────────────────────────────────
+# Typecheck + unit/component tests (Vitest + RTL) + production build. The build
+# output (web/dist/) is what the Rust server serves via ServeDir; building here
+# guards against TS/Vite breakage. Runs on the node image, independent of the
+# Rust jobs (only `needs: []` so it starts immediately).
+web:
+  stage: web
+  needs: []
+  image: node:22
+  cache:
+    key:
+      files:
+        - web/package-lock.json
+      prefix: "web"
+    paths:
+      - web/node_modules/
+  before_script:
+    - cd web
+  script:
+    - npm ci
+    - npm run tsc
+    - npm run test
+    - npm run build
+  artifacts:
+    paths:
+      - web/dist/
+    expire_in: 1 day
 
 # ── E2E / integration tests (forge-e2e crate, testcontainers) ────────────────
 # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis) containers
