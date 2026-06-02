@@ -1,0 +1,40 @@
+{
+  "name": "forge-web",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "envisia-forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tsc": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.100.14",
+    "@tanstack/react-router": "1.170.8",
+    "clsx": "2.1.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.0",
+    "@tanstack/react-query-devtools": "5.100.14",
+    "@tanstack/react-router-devtools": "1.167.0",
+    "@tanstack/router-plugin": "1.168.11",
+    "@tanstack/virtual-file-routes": "1.162.0",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.1",
+    "@vitejs/plugin-react": "6.0.2",
+    "jsdom": "29.1.1",
+    "tailwindcss": "4.3.0",
+    "typescript": "5.9.3",
+    "vite": "8.0.14",
+    "vitest": "4.1.7"
+  }
+}
