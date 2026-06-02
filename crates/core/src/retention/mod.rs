@@ -11,9 +11,11 @@
 //! the slice-1 transactional blob outbox for all blob GC — this module performs
 //! **no I/O** and is fully unit-testable.
 
+pub mod apply;
 pub mod evaluate;
 pub mod model;
 
+pub use apply::{apply, ApplyContext};
 pub use evaluate::{
     evaluate, evaluate_proxy, CandidateComponent, Decision, DecisionReason, ProxyCandidate,
     ProxyDecision,
