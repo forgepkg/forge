@@ -146,3 +146,40 @@ e2e:
     - docker pull redis:5.0
   script:
     - cargo test --workspace --features forge-e2e
+
+# ── Frontend e2e (Playwright drives the Rust server serving the built UI) ──────
+# Boots Postgres + versitygw via docker compose on the dind daemon, builds the
+# SPA + server, and runs the browser specs. The compose-published ports live on
+# the `docker` (dind) host, so the harness is pointed there via
+# FORGE_E2E_DOCKER_HOST. Default-branch only (slow). Uses the official
+# Playwright image which bundles browsers + a Node + system deps; the Rust
+# toolchain is installed on top via rustup.
+web-e2e:
+  stage: e2e
+  needs: ["web"]
+  image: mcr.microsoft.com/playwright:v1.50.1-jammy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    FORGE_E2E_DOCKER_HOST: "docker"
+    SQLX_OFFLINE: "true"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq docker.io docker-compose-plugin curl build-essential
+    - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+    - docker pull postgres:17
+    - docker pull versity/versitygw:v1.4.1
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - . "$HOME/.cargo/env"
+  script:
+    - cd web && npm ci && cd ..
+    - . "$HOME/.cargo/env" && cd web && npm run e2e
+  artifacts:
+    when: always
+    paths:
+      - web/playwright-report/
+    expire_in: 7 days

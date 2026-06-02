@@ -188,3 +188,53 @@ jobs:
 
       - name: Run e2e tests (forge-e2e feature)
         run: cargo test --workspace --features forge-e2e
+
+  # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ────
+  # Boots Postgres + versitygw via docker compose, builds the SPA + server, and
+  # runs the browser specs. Default-branch only (slow; needs Docker + browsers).
+  web-e2e:
+    name: web-e2e
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-web-e2e-
+      - name: Pre-pull container images
+        run: |
+          docker pull postgres:17
+          docker pull versity/versitygw:v1.4.1
+      - name: npm ci
+        run: npm ci
+        working-directory: web
+      - name: Install Playwright browser (chromium)
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+      - name: Run Playwright e2e
+        run: npm run e2e
+        working-directory: web
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report
+          retention-days: 7

@@ -30,6 +30,11 @@ const S3_PORT = 57070
 // The server under test listens here (distinct from dev :3000).
 const SERVER_PORT = 33000
 
+// Host where the compose-published container ports are reachable. Defaults to
+// loopback (local + GitHub runners). On GitLab dind, published ports live on the
+// `docker` service host — set FORGE_E2E_DOCKER_HOST=docker there.
+const DOCKER_HOST_NAME = process.env.FORGE_E2E_DOCKER_HOST ?? '127.0.0.1'
+
 export const ADMIN_USER = 'admin'
 export const ADMIN_PASS = 'changeme'
 export const BASE_URL = `http://127.0.0.1:${SERVER_PORT}`
@@ -102,9 +107,9 @@ function startServer() {
     ...process.env,
     SQLX_OFFLINE: 'true',
     // database
-    FORGE_DATABASE__URL: `postgres://forge:forge@127.0.0.1:${PG_PORT}/forge`,
+    FORGE_DATABASE__URL: `postgres://forge:forge@${DOCKER_HOST_NAME}:${PG_PORT}/forge`,
     // s3 (versitygw)
-    FORGE_S3__ENDPOINT: `http://127.0.0.1:${S3_PORT}`,
+    FORGE_S3__ENDPOINT: `http://${DOCKER_HOST_NAME}:${S3_PORT}`,
     FORGE_S3__REGION: 'us-east-1',
     FORGE_S3__BUCKET: 'forge',
     FORGE_S3__ACCESS_KEY: 'test',
@@ -201,7 +206,7 @@ export async function setup(): Promise<HarnessFacts> {
   //     proves the gateway is listening before the server's ensure_bucket runs.
   await waitFor('versitygw http', async () => {
     try {
-      await fetch(`http://127.0.0.1:${S3_PORT}/`)
+      await fetch(`http://${DOCKER_HOST_NAME}:${S3_PORT}/`)
       return true
     } catch {
       return false
