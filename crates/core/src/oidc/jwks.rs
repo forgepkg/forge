@@ -198,6 +198,13 @@ impl OidcMetadataClient {
         &self.issuer
     }
 
+    /// The SSRF-guarded HTTP client, for the flow's token-endpoint exchange
+    /// (`flow.rs`). Sharing the same client keeps the SSRF/timeout posture
+    /// consistent across discovery, JWKS, and token calls.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     /// Fetch (or read from cache) the issuer's discovery document.
     ///
     /// The well-known URL is derived from the **configured** issuer (trusted),
