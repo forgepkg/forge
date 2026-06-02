@@ -3,8 +3,10 @@
 
 export SQLX_OFFLINE := true
 COMPOSE := docker compose
+FORGE_URL ?= http://localhost:3000
+ADMIN ?= admin:changeme
 
-.PHONY: help up down logs ps psql run dev build check fmt clippy test e2e prepare clean
+.PHONY: help up down logs ps psql run dev seed build check fmt clippy test e2e prepare clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -28,7 +30,23 @@ psql: ## Open a psql shell on the dev database
 run: ## Run the server (expects `make up` first; loads ./forge.toml)
 	cargo run -p forge-server
 
-dev: up run ## Start infra, then run the server
+dev: up run ## Start infra, then run the server (one-command dev)
+
+seed: ## Demo data: create an anonymous-readable repo + token, push the sample fixture (server must be running)
+	@echo "Creating hosted repo 'nuget' (anonymous_read=true)…"
+	@curl -fsS -u $(ADMIN) -X POST $(FORGE_URL)/admin/repositories \
+		-H 'content-type: application/json' \
+		-d '{"name":"nuget","kind":"hosted","anonymous_read":true}' >/dev/null 2>&1 \
+		|| echo "  (repo already exists — continuing)"
+	@TOKEN=$$(curl -fsS -u $(ADMIN) -X POST $(FORGE_URL)/admin/users/1/tokens \
+		-H 'content-type: application/json' -d '{"name":"dev-seed"}' \
+		| sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); \
+	echo "  push token: $$TOKEN"; \
+	curl -fsS -o /dev/null -w "  push: HTTP %{http_code}\n" \
+		-X PUT $(FORGE_URL)/v3/nuget/package -H "X-NuGet-ApiKey: $$TOKEN" \
+		-F package=@fixtures/nuget/sample.lib.1.0.0.nupkg; \
+	echo "  feed:     $(FORGE_URL)/v3/nuget/index.json"; \
+	echo "  versions: $$(curl -fsS $(FORGE_URL)/v3/nuget/flat/sample.lib/index.json)"
 
 build: ## Build the whole workspace
 	cargo build --workspace
