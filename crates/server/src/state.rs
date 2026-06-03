@@ -177,6 +177,7 @@ impl AppState {
                 principal,
                 Arc::new(self.member_factory()),
                 self.authz.clone(),
+                self.config.groups.max_nesting_depth.max(0) as u32,
             ))),
         }
     }

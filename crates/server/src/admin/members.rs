@@ -1,16 +1,21 @@
-//! Admin group-membership management (plan 10.4).
+//! Admin group-membership management (plan 10.4, nested groups in §12.4 Phase 4).
 //!
-//! Validation (spec §7, Slice 1):
+//! Validation (spec §7 + §12.4):
 //! * The `{name}` repository must be a **group**.
-//! * A member must exist and must **not** itself be a group (no nested groups).
+//! * A member must exist. It **may** itself be a group (nested groups, §12.4) —
+//!   but the resulting group graph must stay an acyclic DAG of bounded depth.
 //! * A member cannot be the group itself.
+//! * Adding an edge that would create a **cycle** or exceed
+//!   `groups.max_nesting_depth` is rejected with **409** (fail-closed; the check
+//!   runs in the same transaction as the insert under a row lock, so concurrent
+//!   edits cannot race a cycle into existence).
 //! * `priority` is unique within a group; a duplicate → **409**.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_db::model::RepoKind;
-use forge_db::repository_dao;
+use forge_db::repository_dao::{self, AddMemberOutcome};
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
@@ -89,18 +94,31 @@ pub async fn add(
     if member.id == group.id {
         return (StatusCode::BAD_REQUEST, "a group cannot contain itself").into_response();
     }
-    // No nested groups in Slice 1.
-    if member.kind() == RepoKind::Group {
-        return (
-            StatusCode::BAD_REQUEST,
-            "nested group members are not supported",
-        )
-            .into_response();
-    }
+    // Nested groups are allowed (§12.4); the checked insert runs the cycle +
+    // depth guard in the same transaction.
+    let max_depth = state.config.groups.max_nesting_depth;
 
-    match repository_dao::add_group_member(&state.pool, group.id, member.id, body.priority).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e) if is_unique_violation(&e) => (
+    match repository_dao::add_group_member_checked(
+        &state.pool,
+        group.id,
+        member.id,
+        body.priority,
+        max_depth,
+    )
+    .await
+    {
+        Ok(AddMemberOutcome::Added) => StatusCode::CREATED.into_response(),
+        Ok(AddMemberOutcome::WouldCycle) => (
+            StatusCode::CONFLICT,
+            "adding this member would create a cycle in the group graph",
+        )
+            .into_response(),
+        Ok(AddMemberOutcome::TooDeep) => (
+            StatusCode::CONFLICT,
+            "adding this member would exceed the maximum group nesting depth",
+        )
+            .into_response(),
+        Ok(AddMemberOutcome::Duplicate) => (
             StatusCode::CONFLICT,
             "duplicate member or priority in this group",
         )
@@ -129,8 +147,4 @@ pub async fn remove(
         Ok(false) => (StatusCode::NOT_FOUND, "membership not found").into_response(),
         Err(e) => db_error(e),
     }
-}
-
-fn is_unique_violation(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }

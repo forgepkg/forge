@@ -403,8 +403,9 @@ async fn delete_hosted_repo_with_packages_refused() {
         .is_some());
 }
 
-/// Group membership: nested-group members and duplicate priorities are
-/// rejected; a hosted member is accepted.
+/// Group membership (§12.4 Phase 4): a hosted member and a **nested group**
+/// member are accepted; an edge that would create a cycle is rejected with 409;
+/// duplicate priorities are rejected with 409.
 #[tokio::test]
 async fn group_member_validation() {
     let srv = common::start().await;
@@ -437,8 +438,8 @@ async fn group_member_validation() {
     assert_eq!(create(&group2, "group").await, 201);
     assert_eq!(create(&hosted, "hosted").await, 201);
 
-    let add = |member: &str, priority: i32| {
-        let url = format!("{}/admin/repositories/{group}/members", srv.base_url);
+    let add = |into_group: String, member: String, priority: i32| {
+        let url = format!("{}/admin/repositories/{into_group}/members", srv.base_url);
         let (u, p) = (u.clone(), p.clone());
         let body = json!({"member": member, "priority": priority});
         let client = client.clone();
@@ -456,12 +457,22 @@ async fn group_member_validation() {
     };
 
     // Hosted member at priority 10 → created.
-    assert_eq!(add(&hosted, 10).await, 201);
-    // Nested group member → 400.
-    assert_eq!(add(&group2, 20).await, 400, "nested group must be rejected");
-    // Duplicate priority → 409.
+    assert_eq!(add(group.clone(), hosted.clone(), 10).await, 201);
+    // Nested group member is now ALLOWED (§12.4): group2 nested under group.
     assert_eq!(
-        add(&hosted, 10).await,
+        add(group.clone(), group2.clone(), 20).await,
+        201,
+        "nested group member must be accepted"
+    );
+    // Closing a cycle (group nested back under group2) → 409.
+    assert_eq!(
+        add(group2.clone(), group.clone(), 30).await,
+        409,
+        "edge creating a cycle must be rejected"
+    );
+    // Duplicate priority/member → 409.
+    assert_eq!(
+        add(group.clone(), hosted.clone(), 10).await,
         409,
         "duplicate priority/member must be rejected"
     );

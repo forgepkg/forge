@@ -42,6 +42,9 @@ pub struct Config {
     /// Background retention worker tuning.
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Group-repository nesting limits (slice 12.4).
+    #[serde(default)]
+    pub groups: GroupsConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -440,6 +443,35 @@ impl RetentionConfig {
     pub fn lease(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.lease_seconds)
     }
+}
+
+/// `groups.*` — nested group-repository limits (slice 12.4 Phase 4).
+///
+/// Nested group repositories (a group whose member is itself a group) are
+/// allowed, but the graph must stay an acyclic DAG of bounded depth. The
+/// config-time admin guard rejects an edge that would create a cycle or exceed
+/// `max_nesting_depth`; the resolve-time walk independently enforces the same
+/// depth bound and a visited-set so a cycle injected by a raw DB write still
+/// terminates (fail-closed).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupsConfig {
+    /// Maximum nesting depth of the group graph: the longest member-path from a
+    /// group to a leaf (a direct hosted/proxy member is depth 1). Both the
+    /// config-time insert guard and the resolve-time walk enforce this bound.
+    #[serde(default = "default_max_nesting_depth")]
+    pub max_nesting_depth: i32,
+}
+
+impl Default for GroupsConfig {
+    fn default() -> Self {
+        GroupsConfig {
+            max_nesting_depth: default_max_nesting_depth(),
+        }
+    }
+}
+
+fn default_max_nesting_depth() -> i32 {
+    20
 }
 
 /// `web.*` — static SPA serving.
@@ -1522,5 +1554,17 @@ mod tests {
         let ba = cfg.auth.bootstrap_admin.expect("present");
         assert_eq!(ba.username, "admin");
         assert_eq!(ba.password, "changeme");
+    }
+
+    #[test]
+    fn groups_max_nesting_depth_defaults_and_overrides() {
+        // Absent [groups] section ⇒ the secure-enough default depth bound.
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.groups.max_nesting_depth, 20);
+
+        // Explicit override is honored.
+        let toml = format!("{MINIMAL}\n[groups]\nmax_nesting_depth = 3\n");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.groups.max_nesting_depth, 3);
     }
 }
