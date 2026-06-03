@@ -327,3 +327,129 @@ async fn apply_legacy_migration_is_idempotent() {
         .expect("query")
         .is_some());
 }
+
+/// §12.4 Phase 5 per-creation semantics: on an UPGRADED (legacy_open_access)
+/// install a user created *after* boot — by the admin API, OIDC/upstream
+/// auto-provision — must inherit the `authenticated` role *immediately* via
+/// [`authz_dao::assign_authenticated_if_legacy_open`], not only at the next
+/// restart. Without this, a freshly-created user on a slice-1-compatible install
+/// would silently lose its read/write reach until the server restarts.
+#[tokio::test]
+async fn legacy_open_assigns_authenticated_to_new_user() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0006");
+
+    // Seed a pre-existing user so 0007 detects an UPGRADE (opens access).
+    sqlx::query("INSERT INTO app_user (username, password_hash) VALUES ('old', 'x')")
+        .execute(&pool)
+        .await
+        .expect("seed pre-existing user");
+    migrator().await.run(&pool).await.expect("migrate 0007");
+    assert!(
+        authz_dao::legacy_open_access(&pool)
+            .await
+            .expect("read flag"),
+        "precondition: this is an upgraded (open) install"
+    );
+
+    // A user created AFTER the migration ran (the bug scenario: post-boot create).
+    let new_user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('post-boot', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert post-boot user");
+
+    // Before the per-creation hook runs it holds no role (proves the hook, not the
+    // one-shot migration, is what grants it).
+    assert!(
+        !authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
+            .await
+            .expect("query"),
+        "freshly inserted user has no role until the creation hook runs"
+    );
+
+    // The creation hook every user-create path invokes.
+    let assigned = authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
+        .await
+        .expect("assign on legacy-open install");
+    assert!(assigned, "must report it assigned the authenticated role");
+
+    assert!(
+        authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
+            .await
+            .expect("query"),
+        "new user must hold authenticated immediately, not after a restart"
+    );
+    let eff = authz_dao::load_user_effective(&pool, new_user)
+        .await
+        .expect("effective");
+    let has = |action: &str| {
+        eff.grants
+            .iter()
+            .any(|g| g.action == action && g.repository_id.is_none())
+    };
+    assert!(
+        has("read") && has("write"),
+        "new user reads/writes everywhere"
+    );
+
+    // Idempotent: a second call is a harmless no-op (still true, no dup row).
+    assert!(
+        authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
+            .await
+            .expect("idempotent re-call")
+    );
+    let role_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM user_role ur JOIN role r ON r.id = ur.role_id WHERE ur.user_id = $1 AND r.name = 'authenticated'",
+    )
+    .bind(new_user)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(role_rows, 1, "no duplicate authenticated assignment");
+}
+
+/// On a FRESH (fail-closed) install the per-creation hook must be a no-op: a new
+/// user gets no automatic role, preserving deny-by-default.
+#[tokio::test]
+async fn fresh_install_create_hook_is_noop() {
+    let (pool, _container) = fresh_pool().await;
+    migrator().await.run(&pool).await.expect("migrate all");
+    assert!(
+        !authz_dao::legacy_open_access(&pool)
+            .await
+            .expect("read flag"),
+        "precondition: fresh install is closed"
+    );
+
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('fresh', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert user");
+
+    let assigned = authz_dao::assign_authenticated_if_legacy_open(&pool, user)
+        .await
+        .expect("hook on closed install");
+    assert!(!assigned, "closed install must not auto-assign anything");
+    assert!(
+        !authz_dao::user_has_role(&pool, user, AUTHENTICATED_ROLE)
+            .await
+            .expect("query"),
+        "fresh-install new user stays roleless (deny-by-default)"
+    );
+    assert!(
+        authz_dao::load_user_effective(&pool, user)
+            .await
+            .expect("effective")
+            .grants
+            .is_empty(),
+        "fresh-install new user has an empty effective set"
+    );
+}

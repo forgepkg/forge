@@ -423,6 +423,42 @@ pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Per-creation half of the `legacy_open_access` rule: when this install opted
+/// into slice-1 open access, a freshly-created user must inherit the
+/// `authenticated` role *immediately* — not only at the next boot when
+/// [`apply_legacy_migration`] re-runs. Every user-creation path (admin
+/// `POST /admin/users`, OIDC auto-provision, upstream-basic auto-provision)
+/// calls this right after inserting the user so the new principal has the same
+/// read/write reach a slice-1 authenticated user had, with no restart gap.
+///
+/// On a fresh (fail-closed) install the flag is `false` and this is a no-op, so
+/// new users default to deny-by-default. The assignment is idempotent
+/// ([`assign_role`] upserts), so a redundant call (e.g. the user already holds
+/// the role) is harmless. Returns `true` when the role was (or already would
+/// be) assigned, `false` when the install is closed and nothing was done — the
+/// boolean lets callers decide whether to invalidate any cached effective set.
+///
+/// Fails closed on a missing built-in role: if `legacy_open_access` is set but
+/// the `authenticated` role is somehow absent, this errors rather than silently
+/// leaving the user without the legacy grant.
+pub async fn assign_authenticated_if_legacy_open(
+    pool: &PgPool,
+    user_id: i64,
+) -> sqlx::Result<bool> {
+    if !legacy_open_access(pool).await? {
+        return Ok(false);
+    }
+    let role_id = role_id_by_name(pool, AUTHENTICATED_ROLE)
+        .await?
+        .ok_or_else(|| {
+            sqlx::Error::Protocol(
+                "legacy_open_access is set but the built-in `authenticated` role is missing".into(),
+            )
+        })?;
+    assign_role(pool, user_id, role_id).await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -33,7 +33,7 @@ pub mod jwks;
 
 use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
-use forge_db::{external_identity_dao, oidc_flow_dao, session_dao};
+use forge_db::{authz_dao, external_identity_dao, oidc_flow_dao, session_dao};
 use sqlx::PgPool;
 
 pub use claims::{map_claims, ClaimMapping, MappedClaims};
@@ -157,6 +157,15 @@ pub async fn resolve_user(
         )
         .await
         .map_err(|e| ResolveError::Db(e.to_string()))?;
+        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
+        // freshly auto-provisioned OIDC user must inherit the `authenticated` role
+        // immediately so it has the slice-1 "read/write everywhere" reach —
+        // `ensure_legacy_rbac` only folds in new users at the next boot. The
+        // assignment is idempotent and gated on the install-wide flag, so a fresh
+        // (fail-closed) install leaves the user with no automatic grants.
+        authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
+            .await
+            .map_err(|e| ResolveError::Db(e.to_string()))?;
         return finalize(pool, user, login, &identity_claims, mapped.is_admin).await;
     }
 
