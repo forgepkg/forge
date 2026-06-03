@@ -22,6 +22,7 @@
 //!   table so sessions are correct and revocable across instances.
 
 pub mod auth;
+pub mod authz;
 pub mod domain;
 pub mod format;
 pub mod net;

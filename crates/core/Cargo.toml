@@ -17,6 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
+# RBAC content-selector glob matching (slice 12.4 Phase 2): compile include/exclude
+# globs once into a GlobSet held behind Arc in the cached effective set.
+globset = { workspace = true }
+
 # Auth
 argon2 = { workspace = true }
 sha2 = { workspace = true }
