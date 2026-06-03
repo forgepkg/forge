@@ -15,6 +15,7 @@ use forge_core::auth::{
 };
 use forge_core::net::ssrf::{guarded_client, SystemResolver};
 use forge_core::session::SessionService;
+use forge_db::authz_dao;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 
@@ -232,16 +233,49 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     .context("hashing task")?
     .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?;
 
-    user_dao::insert_user(
+    let user = user_dao::insert_user(
         pool,
         NewUser::local(ba.username.clone(), password_hash, true, true),
     )
     .await
     .context("insert bootstrap admin")?;
 
+    // §12.4 Phase 5: the bootstrap admin is granted the built-in `admin` role,
+    // not just the slice-1 `is_admin` flag, so it is an admin under fine-grained
+    // RBAC even after the `is_admin` column is eventually dropped. Idempotent.
+    if let Some(admin_role_id) = authz_dao::role_id_by_name(pool, authz_dao::ADMIN_ROLE)
+        .await
+        .context("look up admin role")?
+    {
+        authz_dao::assign_role(pool, user.id, admin_role_id)
+            .await
+            .context("grant admin role to bootstrap admin")?;
+    }
+
     tracing::warn!(
         username = %ba.username,
         "created bootstrap admin from config; change its password as soon as possible"
     );
+    Ok(())
+}
+
+/// Re-apply the idempotent behavior-preserving RBAC legacy mapping on boot
+/// (§12.4 Phase 5).
+///
+/// Migration `0007` already ran this once and recorded the install-wide
+/// `legacy_open_access` default (open on upgrade, closed on a fresh install).
+/// Calling it again here folds in rows that arrived *after* that migration —
+/// e.g. a repository whose `anonymous_read` was flipped on, an `is_admin` user
+/// created out-of-band, or (on a legacy-open install) any newly-created user
+/// that should inherit the `authenticated` role. Every write is an idempotent
+/// upsert, so on a fresh / already-converged install this is a cheap no-op.
+///
+/// It never *opens* a fresh install: the `authenticated` auto-assignment inside
+/// the routine is gated on the `legacy_open_access` setting, which is `false`
+/// for fresh installs.
+pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
+    authz_dao::apply_legacy_migration(pool)
+        .await
+        .context("apply legacy RBAC migration")?;
     Ok(())
 }

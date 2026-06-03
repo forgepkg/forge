@@ -382,6 +382,47 @@ where
     .await
 }
 
+// --- install-wide settings + legacy behavior-preserving migration (Phase 5) --
+
+/// The `forge_setting` key recording whether this install defaults to the
+/// slice-1 "open access" behavior. `true` ⇒ upgrade (existing users keep
+/// read/write everywhere and NEW users are auto-assigned the `authenticated`
+/// role); `false`/absent ⇒ fresh install, fail-closed default.
+pub const LEGACY_OPEN_ACCESS_KEY: &str = "legacy_open_access";
+
+/// Read a `forge_setting` value by key. Returns `None` when the key is unset.
+/// Accepts any executor so it composes inside a transaction.
+pub async fn get_setting<'e, E>(executor: E, key: &str) -> sqlx::Result<Option<String>>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_scalar!(r#"SELECT value FROM forge_setting WHERE key = $1"#, key)
+        .fetch_optional(executor)
+        .await
+}
+
+/// Whether this install opted into legacy open access (slice-1 behavior). A
+/// missing key is treated as `false` (fail-closed): a corrupted/old DB without
+/// the setting defaults to the secure, closed behavior.
+pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
+    Ok(get_setting(pool, LEGACY_OPEN_ACCESS_KEY).await? == Some("true".to_string()))
+}
+
+/// Re-apply the idempotent behavior-preserving legacy mapping (the same
+/// PL/pgSQL routine migration 0007 installs and runs once). Safe to call on
+/// every boot: it maps is_admin→admin role, anonymous_read→anonymous read
+/// grants, and — only when `legacy_open_access` is set — assigns the
+/// `authenticated` role to every user. All writes are upserts, so a no-op once
+/// applied. The boot path calls this so rows that arrive after the one-shot
+/// migration (a late anonymous_read flip, a manually-added user on a legacy
+/// install) are folded in without a new migration.
+pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
+    sqlx::query!(r#"SELECT forge_rbac_apply_legacy_migration()"#)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
