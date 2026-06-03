@@ -144,9 +144,12 @@ async fn package_delay_hides_then_reveals() {
     let nupkg = make_nupkg("Delay.Lib", "1.0.0");
     let mock =
         MockUpstream::start(vec![UpstreamPackage::single("delay.lib", "1.0.0", nupkg)]).await;
-    create_proxy(&srv, "px-delay", &mock.index_url(), 1).await;
+    // Large delay window so the "inside window" assertions are immune to
+    // CI-runner slowness — a tiny (1s) window can elapse between discovery and
+    // the download check on a loaded runner, which made this test flaky.
+    create_proxy(&srv, "px-delay", &mock.index_url(), 3600).await;
 
-    // Inside the 1s window: hidden + 404.
+    // Inside the window: discovery records first_seen_at; hidden + 404.
     assert!(
         list_versions(&srv, "px-delay", "delay.lib")
             .await
@@ -159,8 +162,19 @@ async fn package_delay_hides_then_reveals() {
         "direct download 404s inside delay window"
     );
 
+    // Simulate the window elapsing DETERMINISTICALLY (no real sleep): backdate
+    // the discovered version's first_seen_at past the delay. This also proves
+    // the in-window 404 was NOT negatively cached — the next download must
+    // succeed by fetching from upstream.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' WHERE name = $1",
+    )
+    .bind("delay.lib")
+    .execute(&srv.pool)
+    .await
+    .expect("backdate proxy_cached_version.first_seen_at");
+
     // After the window: visible + downloadable.
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     assert_eq!(
         list_versions(&srv, "px-delay", "delay.lib").await,
         vec!["1.0.0".to_string()],
