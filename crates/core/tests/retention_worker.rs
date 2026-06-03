@@ -173,7 +173,11 @@ async fn tick_prunes_per_policy_and_drives_outbox() {
     .await;
 
     let w = worker(&pool, config());
-    let summary = w.tick().await.expect("tick").expect("a repo was due");
+    let summary = w
+        .tick_repo(repo.id)
+        .await
+        .expect("tick")
+        .expect("a repo was due");
 
     assert_eq!(summary.deleted, 2, "two oldest hard-deleted");
     assert_eq!(summary.blobs_enqueued, 2);
@@ -224,13 +228,13 @@ async fn second_tick_is_a_noop_after_pruning() {
     .await;
 
     let w = worker(&pool, config());
-    let s1 = w.tick().await.unwrap().unwrap();
+    let s1 = w.tick_repo(repo.id).await.unwrap().unwrap();
     assert_eq!(s1.deleted, 1);
     assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
 
     // Force it due again (the schedule pushed it into the future).
     retention_dao::schedule_now(&pool, repo.id).await.unwrap();
-    let s2 = w.tick().await.unwrap().unwrap();
+    let s2 = w.tick_repo(repo.id).await.unwrap().unwrap();
     assert_eq!(s2.deleted, 0, "nothing left to delete");
     assert_eq!(s2.evaluated, 0);
 }
@@ -255,7 +259,7 @@ async fn next_run_at_respects_per_repo_min_interval() {
 
     let before = Utc::now();
     let w = worker(&pool, config()); // default_run_interval = 1s
-    w.tick().await.unwrap().unwrap();
+    w.tick_repo(repo.id).await.unwrap().unwrap();
 
     let run = retention_dao::get_run(&pool, repo.id)
         .await
@@ -289,7 +293,7 @@ async fn dry_run_only_audits_but_mutates_nothing() {
     .await;
 
     let w = worker(&pool, config());
-    let summary = w.tick().await.unwrap().unwrap();
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
     assert_eq!(summary.deleted, 1, "summary counts the would-be delete");
 
     // Nothing mutated: component present, blob untouched, no outbox.
@@ -333,7 +337,7 @@ async fn shared_blob_not_enqueued_until_last_reference_removed() {
     .await;
 
     let w = worker(&pool, config());
-    let summary = w.tick().await.unwrap().unwrap();
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
 
     assert_eq!(summary.deleted, 2);
     // Both versions deleted, but the shared blob was only enqueued once (when

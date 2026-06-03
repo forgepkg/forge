@@ -102,13 +102,33 @@ impl RetentionWorker {
     /// error recorded and the repo rescheduled, then the error is returned (the
     /// loop logs + continues).
     pub async fn tick(&self) -> Result<Option<RunSummary>, WorkerError> {
+        self.tick_inner(None).await
+    }
+
+    /// Run one tick restricted to a single repository.
+    ///
+    /// Identical to [`Self::tick`] but the claim is scoped to `repository_id`
+    /// (`claim_next_due_repo`'s `only_repo`), so the caller is guaranteed to act
+    /// on *that* repo or `Ok(None)` if it is not due — never on some other due
+    /// repo. The admin "run now" path and tests use this to avoid racing the
+    /// global scan; production loops still call the unscoped [`Self::tick`].
+    pub async fn tick_repo(&self, repository_id: i64) -> Result<Option<RunSummary>, WorkerError> {
+        self.tick_inner(Some(repository_id)).await
+    }
+
+    /// Shared claim-then-process body for [`Self::tick`] / [`Self::tick_repo`].
+    async fn tick_inner(&self, only_repo: Option<i64>) -> Result<Option<RunSummary>, WorkerError> {
         // Claim inside a short tx; the row is leased on commit so the network/CPU
         // work below happens with NO transaction held (mirrors the proxy A7 rule).
         let claimed = {
             let mut tx = self.pool.begin().await?;
-            let claimed =
-                retention_dao::claim_next_due_repo(&mut tx, Utc::now(), self.config.lease, None)
-                    .await?;
+            let claimed = retention_dao::claim_next_due_repo(
+                &mut tx,
+                Utc::now(),
+                self.config.lease,
+                only_repo,
+            )
+            .await?;
             tx.commit().await?;
             claimed
         };
