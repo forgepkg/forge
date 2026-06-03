@@ -167,7 +167,7 @@ fn build_password_chain(
 /// `/admin/me` route is matched directly (and is not subject to the admin
 /// router's `require_admin` gate).
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
-    let admin = admin_router();
+    let admin = admin_router(state.clone());
 
     let mut app = Router::new()
         .merge(me_router())

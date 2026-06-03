@@ -49,6 +49,11 @@ pub struct CreateToken {
     pub name: String,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Optional per-token privilege scope (§12.4): a subset that **narrows** the
+    /// owner's effective set (it can never widen it). Omit / `null` ⇒ the token
+    /// inherits the owner's full set.
+    #[serde(default)]
+    pub scope: Option<forge_core::authz::TokenScope>,
 }
 
 /// Issue-token response — the only time the plaintext `token` is ever returned.
@@ -93,16 +98,35 @@ pub async fn create(
         token_hash,
         expires_at: body.expires_at,
     };
-    match token_dao::insert_token(&state.pool, new).await {
-        Ok(t) => {
-            let resp = CreatedToken {
-                view: TokenView::from(&t),
-                token: secret,
-            };
-            (StatusCode::CREATED, Json(resp)).into_response()
+    let t = match token_dao::insert_token(&state.pool, new).await {
+        Ok(t) => t,
+        Err(e) => return db_error(e),
+    };
+
+    // Persist the optional per-token scope (§12.4). Validated by deserialization
+    // into `TokenScope`; re-serialized to the canonical jsonb. A scope can only
+    // narrow at evaluation time, so no validation against the owner's set is
+    // needed here. No cache invalidation: the scope is read outside the per-user
+    // effective-set cache and intersected per request.
+    if let Some(scope) = &body.scope {
+        match serde_json::to_value(scope) {
+            Ok(v) => {
+                if let Err(e) = token_dao::set_token_scope(&state.pool, t.id, Some(&v)).await {
+                    return db_error(e);
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "serializing token scope failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
         }
-        Err(e) => db_error(e),
     }
+
+    let resp = CreatedToken {
+        view: TokenView::from(&t),
+        token: secret,
+    };
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
 /// `DELETE /admin/tokens/{id}` — revoke (sets `revoked_at`).
