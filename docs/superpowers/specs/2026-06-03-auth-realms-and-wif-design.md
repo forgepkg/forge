@@ -94,7 +94,16 @@ The workload principal is granted the role(s) the matched rule specifies (via 12
 - sqlx compile-time macros + committed `.sqlx`; `SQLX_OFFLINE` build green; clippy `--all-targets` green.
 - Secrets (OIDC client secret, etc.) redacted from APIs now; encrypted at rest once **12.5** lands.
 
-## 7. Out of scope / later
+## 8. Security considerations (review hardening)
+
+- **Dropping SSRF is a deliberate, admin-scoped risk.** With the restriction gone, an admin who configures a proxy `remote_url` or a credential-forwarding upstream can make forge connect to internal/metadata addresses (and credential-forwarding **sends a user's password** there). This is acceptable ONLY because realm/repo config is **admin-only** (RBAC `can_admin`); the threat model is a trusted/compromised admin. Document this prominently; keep the `http`/`https` scheme check; log the configured upstream host on save. (If this proves too loose, the fallback is the global `ssrf.allow_private` toggle from the earlier option — not built now.)
+- **WIF token routing (no misrouting, no fall-through).** A presented secret is treated as a WIF `id_token` ONLY if it structurally parses as a JWT (three base64url segments; header decodes with a real `alg` + `kid`) AND its `iss` matches a configured `workload_identity` realm. Then: reject `alg: none`/unsigned; require signature validation against the issuer JWKS; require `aud` ∈ the realm's `allowed_audiences` (no wildcard); check `exp`/`nbf`/`iat`. A JWT that matches a WIF issuer but fails validation returns **401 and does NOT fall through** to the password realms (so a JWT is never forwarded to an upstream IdP as a "password"). A secret that is not a WIF-issuer JWT is never sent through WIF.
+- **`/auth/identify` anti-enumeration.** Routing is decided by **public realm config** (e.g. an OIDC realm's configured email-domain/hint rule), NOT by whether an `app_user` exists. Unknown/ambiguous identifiers return `mode: "password"` (identical to a local user), so the endpoint never reveals account existence. Apply the same rate limiting as login.
+- **Open-redirect.** The OIDC authorize URL is built server-side from realm config (never from client input); the post-login `redirect` target keeps the 12.2 allowlist/same-origin guard.
+- **Credential resolution — avoid stuffing amplification & upstream lockout.** Prefer routing an identifier to a **single** realm (identifier-first does this). In `combined` mode where multiple password realms are tried in order: a definitive **`Rejected`** (authoritative bad-credentials) **stops the chain** (don't try the same password against every upstream); only `Skip`/`Unavailable` continues. Negative verdicts are cached (12.3 cred cache) to avoid hammering upstreams, and the number of forwarding realms tried per attempt is bounded. Keep auth responses timing-consistent where feasible.
+- **No `alg:none`, no JWKS-by-`jku`-from-token** — issuer JWKS URL comes only from the realm's configured discovery document, never from the token.
+
+## 9. Out of scope / later
 - A bundled client-side NuGet credential provider package (doc the "pass id_token as password" approach instead).
 - SAML / non-OIDC federation.
 - 12.5 double-envelope encryption (separate slice) will wrap realm secrets.
