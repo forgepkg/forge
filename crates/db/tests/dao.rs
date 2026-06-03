@@ -98,6 +98,158 @@ async fn group_members_ordered_by_priority_desc() {
     assert_eq!(after.len(), 2);
 }
 
+// ── nested groups: cycle + depth guard (§12.4 Phase 4) ──────────────────────
+
+#[tokio::test]
+async fn add_group_member_checked_allows_valid_nesting() {
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+
+    // g1 -> g2 -> leaf. Both edges are acyclic and within depth.
+    let g1 = repository_dao::insert_repository(pool, NewRepository::group(format!("g1-{n}")))
+        .await
+        .expect("g1");
+    let g2 = repository_dao::insert_repository(pool, NewRepository::group(format!("g2-{n}")))
+        .await
+        .expect("g2");
+    let leaf = repository_dao::insert_repository(pool, NewRepository::hosted(format!("leaf-{n}")))
+        .await
+        .expect("leaf");
+
+    // g2 -> leaf (depth 1 below g2).
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g2.id, leaf.id, 10, 20)
+            .await
+            .expect("g2->leaf"),
+        AddMemberOutcome::Added
+    );
+    // g1 -> g2 (nested group member): valid, no cycle.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, 20)
+            .await
+            .expect("g1->g2"),
+        AddMemberOutcome::Added
+    );
+}
+
+#[tokio::test]
+async fn add_group_member_checked_rejects_cycle() {
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+
+    let g1 = repository_dao::insert_repository(pool, NewRepository::group(format!("cyc-g1-{n}")))
+        .await
+        .expect("g1");
+    let g2 = repository_dao::insert_repository(pool, NewRepository::group(format!("cyc-g2-{n}")))
+        .await
+        .expect("g2");
+
+    // g1 -> g2 is fine.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, 20)
+            .await
+            .expect("g1->g2"),
+        AddMemberOutcome::Added
+    );
+    // g2 -> g1 would close a cycle (g1 reachable from g2) ⇒ rejected, not inserted.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g2.id, g1.id, 10, 20)
+            .await
+            .expect("g2->g1 checked"),
+        AddMemberOutcome::WouldCycle
+    );
+    // And nothing was persisted on g2.
+    let g2_members = repository_dao::group_members(pool, g2.id)
+        .await
+        .expect("g2 members");
+    assert!(g2_members.is_empty(), "cycle edge must not be persisted");
+
+    // Direct self-cycle (g1 -> g1) is also a cycle.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g1.id, g1.id, 5, 20)
+            .await
+            .expect("self checked"),
+        AddMemberOutcome::WouldCycle
+    );
+}
+
+#[tokio::test]
+async fn add_group_member_checked_enforces_depth() {
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+
+    // Build a chain g_top -> g_mid -> leaf, then with max_depth = 2 attempting
+    // to nest g_mid under a new g_top must be rejected (its subtree is depth 2,
+    // the new edge makes depth 3 > 2).
+    let top = repository_dao::insert_repository(pool, NewRepository::group(format!("d-top-{n}")))
+        .await
+        .expect("top");
+    let mid = repository_dao::insert_repository(pool, NewRepository::group(format!("d-mid-{n}")))
+        .await
+        .expect("mid");
+    let leaf =
+        repository_dao::insert_repository(pool, NewRepository::hosted(format!("d-leaf-{n}")))
+            .await
+            .expect("leaf");
+
+    // mid -> leaf (depth 1).
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, mid.id, leaf.id, 1, 5)
+            .await
+            .expect("mid->leaf"),
+        AddMemberOutcome::Added
+    );
+    // top -> mid with max_depth = 1 ⇒ new path top->mid->leaf is length 2 > 1.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, 1)
+            .await
+            .expect("too deep checked"),
+        AddMemberOutcome::TooDeep
+    );
+    // With a generous depth it is fine.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, 5)
+            .await
+            .expect("ok at depth 5"),
+        AddMemberOutcome::Added
+    );
+}
+
+#[tokio::test]
+async fn add_group_member_checked_reports_duplicate() {
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+
+    let g = repository_dao::insert_repository(pool, NewRepository::group(format!("dup-g-{n}")))
+        .await
+        .expect("g");
+    let m = repository_dao::insert_repository(pool, NewRepository::hosted(format!("dup-m-{n}")))
+        .await
+        .expect("m");
+
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g.id, m.id, 10, 20)
+            .await
+            .expect("first"),
+        AddMemberOutcome::Added
+    );
+    // Same member again ⇒ unique violation surfaced as Duplicate.
+    assert_eq!(
+        repository_dao::add_group_member_checked(pool, g.id, m.id, 11, 20)
+            .await
+            .expect("dup"),
+        AddMemberOutcome::Duplicate
+    );
+}
+
 // ── blob ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
