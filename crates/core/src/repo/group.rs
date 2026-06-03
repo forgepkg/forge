@@ -36,7 +36,7 @@ use forge_db::model::Repository;
 use forge_db::repository_dao;
 use sqlx::PgPool;
 
-use crate::auth::authz;
+use crate::auth::authz::Authz;
 use crate::auth::principal::Principal;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
@@ -67,6 +67,7 @@ pub struct GroupRepo {
     pool: PgPool,
     principal: Principal,
     factory: Arc<dyn MemberOpsFactory>,
+    authz: Authz,
 }
 
 /// A visible member: its repository row (carrying its own `name`) and the ops to
@@ -78,12 +79,19 @@ struct VisibleMember {
 
 impl GroupRepo {
     /// Build a group resolver for `principal` over `pool`, using `factory` to
-    /// construct each member's read ops.
-    pub fn new(pool: PgPool, principal: Principal, factory: Arc<dyn MemberOpsFactory>) -> Self {
+    /// construct each member's read ops and `authz` to filter members the
+    /// principal may read.
+    pub fn new(
+        pool: PgPool,
+        principal: Principal,
+        factory: Arc<dyn MemberOpsFactory>,
+        authz: Authz,
+    ) -> Self {
         GroupRepo {
             pool,
             principal,
             factory,
+            authz,
         }
     }
 
@@ -112,7 +120,7 @@ impl GroupRepo {
         for (member, _priority) in members {
             // Identity filter: skip members this principal cannot read. An
             // anonymous caller therefore sees only `anonymous_read` members.
-            if !authz::can_read(&self.principal, &member).await {
+            if !self.authz.can_read(&self.principal, &member).await {
                 continue;
             }
             let ops = self.factory.ops_for(&member)?;

@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use forge_cache::Cache;
+use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
@@ -74,7 +76,8 @@ fn group_repo(pool: &PgPool, blobs: StubBlobs, principal: Principal) -> GroupRep
         pool: pool.clone(),
         blobs,
     });
-    GroupRepo::new(pool.clone(), principal, factory)
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    GroupRepo::new(pool.clone(), principal, factory, authz)
 }
 
 fn user() -> Principal {
