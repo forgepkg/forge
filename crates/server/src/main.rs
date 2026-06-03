@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure bootstrap admin")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let layer = principal_layer(&config, &pool)?;
+    let layer = principal_layer(&config, &pool, &cache)?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let state = AppState::new(pool, blob_store, cache, nuget, config);
 

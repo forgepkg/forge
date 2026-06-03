@@ -134,6 +134,179 @@ pub struct AuthConfig {
     /// First-run bootstrap admin credentials.
     #[serde(default)]
     pub bootstrap_admin: Option<BootstrapAdmin>,
+    /// Ordered password-style auth provider chain (slice 12.3). Each entry is a
+    /// provider id; the chain is walked in order and the first to authenticate
+    /// wins. Known ids: `local-password`, `upstream-basic`. The default keeps the
+    /// local provider first so a locally-created admin survives an upstream
+    /// outage. An entry of `upstream-basic` requires `[auth.upstream_basic]` to be
+    /// present and enabled (validated at startup).
+    #[serde(default = "default_providers")]
+    pub providers: Vec<String>,
+    /// Optional credential-forwarding upstream-basic provider (slice 12.3).
+    /// Present + enabled ⇒ the `upstream-basic` provider can appear in
+    /// [`Self::providers`].
+    #[serde(default)]
+    pub upstream_basic: Option<UpstreamBasicAuthConfig>,
+}
+
+fn default_providers() -> Vec<String> {
+    vec!["local-password".to_string()]
+}
+
+/// `auth.upstream_basic.*` — credential-forwarding authentication (slice 12.3).
+///
+/// Forwards a user's `username:password` to a configured upstream over HTTP
+/// Basic (the verdaccio-nexus-auth-proxy pattern; for a Nexus this is the
+/// status/whoami endpoint). The `key_pepper` is a **secret**: it keys the
+/// validated-credential cache HMAC and is **redacted** from `Debug` (and any
+/// config dump), mirroring the slice-1 `upstream_password` / OIDC `client_secret`
+/// treatment, and is forward-compatible with §12.5 encryption at rest.
+#[derive(Clone, Deserialize)]
+pub struct UpstreamBasicAuthConfig {
+    /// Master switch. When `false`, the provider is not built even if it appears
+    /// in `auth.providers` (that combination is a startup error — see validate).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Upstream endpoint hit with the user's Basic credentials. Must be http/https
+    /// and pass the SSRF scheme check; for a Nexus, e.g.
+    /// `https://nexus.internal/service/rest/v1/status`.
+    pub url: String,
+    /// HTTP method (Nexus status is `GET`).
+    #[serde(default = "default_upstream_method")]
+    pub method: String,
+    /// Status codes meaning "credentials valid".
+    #[serde(default = "default_success_status")]
+    pub success_status: Vec<u16>,
+    /// Status codes meaning "definitively rejected".
+    #[serde(default = "default_reject_status")]
+    pub reject_status: Vec<u16>,
+    /// Connect timeout (ms).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Total request timeout (ms).
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+    /// Permit the upstream URL to resolve to a private/loopback address (an
+    /// internal Nexus is usually on RFC1918). Off blocks them via the SSRF guard.
+    #[serde(default)]
+    pub allow_private_upstream: bool,
+    /// Optional coarse allow-gate: only accept a success when the user holds one
+    /// of these groups. Empty ⇒ any success accepted. Requires `groups_path`.
+    #[serde(default)]
+    pub required_groups: Vec<String>,
+    /// `.`-separated path into the JSON body locating the user's groups
+    /// (e.g. `user.roles`). Empty ⇒ no group parsing.
+    #[serde(default)]
+    pub groups_path: String,
+    /// Optional upstream group that maps to forge admin on provision (grant only).
+    #[serde(default)]
+    pub admin_group: String,
+    /// Auto-provision an `app_user` on first successful upstream login.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
+    /// Validated-credential cache TTLs + the secret pepper.
+    #[serde(default)]
+    pub cache: CredCacheConfig,
+}
+
+/// Manual `Debug` that **redacts** the cache pepper (which lives under
+/// [`Self::cache`]) so it can never land in a log line or error body.
+impl std::fmt::Debug for UpstreamBasicAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamBasicAuthConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("success_status", &self.success_status)
+            .field("reject_status", &self.reject_status)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("required_groups", &self.required_groups)
+            .field("groups_path", &self.groups_path)
+            .field("admin_group", &self.admin_group)
+            .field("auto_provision", &self.auto_provision)
+            .field("cache", &self.cache) // cache's own Debug redacts the pepper
+            .finish()
+    }
+}
+
+impl UpstreamBasicAuthConfig {
+    /// Build the `forge-core` provider config from this block.
+    pub fn to_core(&self) -> forge_core::auth::UpstreamBasicConfig {
+        forge_core::auth::UpstreamBasicConfig {
+            url: self.url.clone(),
+            method: self.method.to_ascii_uppercase(),
+            success_status: self.success_status.clone(),
+            reject_status: self.reject_status.clone(),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            request_timeout: Duration::from_millis(self.request_timeout_ms),
+            allow_private_upstream: self.allow_private_upstream,
+            required_groups: self.required_groups.clone(),
+            groups_path: self.groups_path.clone(),
+            admin_group: self.admin_group.clone(),
+        }
+    }
+}
+
+/// `auth.upstream_basic.cache.*` — the validated-credential cache tuning.
+#[derive(Clone, Deserialize)]
+pub struct CredCacheConfig {
+    /// How long a *good* credential is trusted without re-forwarding (seconds).
+    #[serde(default = "default_positive_ttl")]
+    pub positive_ttl_secs: u64,
+    /// How long a *bad* credential is remembered (seconds). Kept short so a user
+    /// who fixes their password is not locked out for long.
+    #[serde(default = "default_negative_ttl")]
+    pub negative_ttl_secs: u64,
+    /// Server-held secret keying the cache HMAC. **Redacted** from `Debug`.
+    /// High-entropy; rotating it invalidates the whole cache (causes re-forwards).
+    /// Required (non-empty) when the provider is enabled — validated at startup.
+    #[serde(default)]
+    pub key_pepper: String,
+}
+
+impl Default for CredCacheConfig {
+    fn default() -> Self {
+        CredCacheConfig {
+            positive_ttl_secs: default_positive_ttl(),
+            negative_ttl_secs: default_negative_ttl(),
+            key_pepper: String::new(),
+        }
+    }
+}
+
+/// Manual `Debug` that **redacts** the `key_pepper`.
+impl std::fmt::Debug for CredCacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredCacheConfig")
+            .field("positive_ttl_secs", &self.positive_ttl_secs)
+            .field("negative_ttl_secs", &self.negative_ttl_secs)
+            .field("key_pepper", &"<redacted>")
+            .finish()
+    }
+}
+
+fn default_upstream_method() -> String {
+    "GET".into()
+}
+fn default_success_status() -> Vec<u16> {
+    vec![200]
+}
+fn default_reject_status() -> Vec<u16> {
+    vec![401, 403]
+}
+fn default_connect_timeout_ms() -> u64 {
+    2000
+}
+fn default_request_timeout_ms() -> u64 {
+    5000
+}
+fn default_positive_ttl() -> u64 {
+    300
+}
+fn default_negative_ttl() -> u64 {
+    30
 }
 
 /// `auth.bootstrap_admin.*`
@@ -551,6 +724,88 @@ impl Config {
         self.anon_policy()?;
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
+        self.validate_auth_providers()?;
+        Ok(())
+    }
+
+    /// Validate the slice-12.3 provider chain + `[auth.upstream_basic]` block.
+    ///
+    /// Checks (plan §2.3 startup validation):
+    /// * every `auth.providers` id is known (`local-password` / `upstream-basic`)
+    ///   and not duplicated;
+    /// * if `upstream-basic` is in the chain, `[auth.upstream_basic]` is present
+    ///   and `enabled`, its `url` parses as an http/https URL (the SSRF scheme
+    ///   check), its `key_pepper` is non-empty, and `required_groups` is empty
+    ///   unless `groups_path` is set;
+    /// * conversely, an enabled `[auth.upstream_basic]` block that is NOT in the
+    ///   chain is rejected (a likely misconfiguration that would silently never
+    ///   forward).
+    fn validate_auth_providers(&self) -> Result<(), ConfigError> {
+        let mut seen = std::collections::HashSet::new();
+        for id in &self.auth.providers {
+            if !matches!(id.as_str(), "local-password" | "upstream-basic") {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown auth.providers id {id:?} (expected local-password|upstream-basic)"
+                )));
+            }
+            if !seen.insert(id.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate auth.providers id {id:?}"
+                )));
+            }
+        }
+
+        let chain_has_upstream = self.auth.providers.iter().any(|p| p == "upstream-basic");
+        let block_enabled = self
+            .auth
+            .upstream_basic
+            .as_ref()
+            .map(|u| u.enabled)
+            .unwrap_or(false);
+
+        if chain_has_upstream && !block_enabled {
+            return Err(ConfigError::Invalid(
+                "auth.providers includes 'upstream-basic' but [auth.upstream_basic] is absent or disabled".into(),
+            ));
+        }
+        if block_enabled && !chain_has_upstream {
+            return Err(ConfigError::Invalid(
+                "[auth.upstream_basic] is enabled but 'upstream-basic' is not in auth.providers"
+                    .into(),
+            ));
+        }
+
+        if let Some(u) = self.auth.upstream_basic.as_ref().filter(|u| u.enabled) {
+            let url = url::Url::parse(u.url.trim()).map_err(|e| {
+                ConfigError::Invalid(format!("invalid auth.upstream_basic.url {:?}: {e}", u.url))
+            })?;
+            match url.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "auth.upstream_basic.url scheme {other:?} is not http/https"
+                    )))
+                }
+            }
+            // Warn loudly about plaintext credential forwarding over http (plan
+            // §5): the user's password rides the outbound Basic header.
+            if url.scheme() == "http" {
+                tracing::warn!(
+                    "auth.upstream_basic.url is http://; the user's password is forwarded in cleartext — use https in production"
+                );
+            }
+            if u.cache.key_pepper.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "auth.upstream_basic.cache.key_pepper must not be empty (it keys the validated-credential cache HMAC)".into(),
+                ));
+            }
+            if !u.required_groups.is_empty() && u.groups_path.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "auth.upstream_basic.required_groups is set but groups_path is empty".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1108,6 +1363,153 @@ mod tests {
             assert!(!oidc.auto_provision);
             Ok(())
         });
+    }
+
+    // ── slice 12.3: auth.providers + [auth.upstream_basic] ──────────────────
+
+    /// A minimal valid upstream-basic block + matching provider chain appended.
+    fn minimal_with_upstream(extra: &str) -> String {
+        let providers = "providers = [\"local-password\", \"upstream-basic\"]\n";
+        let block = r#"
+            [auth.upstream_basic]
+            url = "https://nexus.internal/service/rest/v1/status"
+            [auth.upstream_basic.cache]
+            key_pepper = "a-high-entropy-pepper"
+        "#;
+        MINIMAL.replace("[auth]", &format!("[auth]\n{providers}{block}{extra}"))
+    }
+
+    #[test]
+    fn default_providers_is_local_only() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.auth.providers, vec!["local-password".to_string()]);
+        assert!(cfg.auth.upstream_basic.is_none());
+    }
+
+    #[test]
+    fn upstream_basic_block_parses_with_defaults() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_upstream(""))).expect("valid");
+        let ub = cfg.auth.upstream_basic.as_ref().expect("present");
+        assert!(ub.enabled);
+        assert_eq!(ub.url, "https://nexus.internal/service/rest/v1/status");
+        assert_eq!(ub.method, "GET");
+        assert_eq!(ub.success_status, vec![200]);
+        assert_eq!(ub.reject_status, vec![401, 403]);
+        assert_eq!(ub.connect_timeout_ms, 2000);
+        assert_eq!(ub.request_timeout_ms, 5000);
+        assert!(!ub.allow_private_upstream);
+        assert!(ub.auto_provision);
+        assert_eq!(ub.cache.positive_ttl_secs, 300);
+        assert_eq!(ub.cache.negative_ttl_secs, 30);
+        // to_core mirrors the block.
+        let core = ub.to_core();
+        assert_eq!(core.url, ub.url);
+        assert_eq!(core.method, "GET");
+        assert_eq!(core.connect_timeout, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn upstream_basic_pepper_redacted_in_debug() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_upstream(""))).expect("valid");
+        let dbg = format!("{:?}", cfg.auth.upstream_basic.as_ref().unwrap());
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(!dbg.contains("a-high-entropy-pepper"), "{dbg}");
+        // And the full Config Debug must not leak it either.
+        let full = format!("{cfg:?}");
+        assert!(!full.contains("a-high-entropy-pepper"), "{full}");
+    }
+
+    #[test]
+    fn unknown_provider_id_rejected() {
+        let toml = MINIMAL.replace("[auth]", "[auth]\nproviders = [\"ldap\"]");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("auth.providers"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_provider_id_rejected() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\nproviders = [\"local-password\", \"local-password\"]",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn upstream_in_chain_without_block_rejected() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\nproviders = [\"local-password\", \"upstream-basic\"]",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("upstream-basic"), "{err}");
+    }
+
+    #[test]
+    fn enabled_block_not_in_chain_rejected() {
+        // Block present + enabled, but providers stays the default local-only.
+        let block = r#"
+            [auth.upstream_basic]
+            url = "https://nexus.internal/status"
+            [auth.upstream_basic.cache]
+            key_pepper = "p"
+        "#;
+        let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{block}"));
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("not in auth.providers"), "{err}");
+    }
+
+    #[test]
+    fn empty_pepper_rejected() {
+        let toml = minimal_with_upstream("").replace(
+            "key_pepper = \"a-high-entropy-pepper\"",
+            "key_pepper = \"\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("key_pepper"), "{err}");
+    }
+
+    #[test]
+    fn required_groups_without_groups_path_rejected() {
+        // required_groups set but groups_path empty → config error.
+        let block = r#"
+            [auth.upstream_basic]
+            url = "https://nexus.internal/status"
+            required_groups = ["nuget-users"]
+            [auth.upstream_basic.cache]
+            key_pepper = "p"
+        "#;
+        let toml = MINIMAL.replace(
+            "[auth]",
+            &format!("[auth]\nproviders = [\"local-password\", \"upstream-basic\"]\n{block}"),
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("groups_path"), "{err}");
+    }
+
+    #[test]
+    fn non_http_upstream_url_rejected() {
+        let toml = minimal_with_upstream("").replace(
+            "https://nexus.internal/service/rest/v1/status",
+            "ftp://nexus.internal/status",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("upstream_basic.url"), "{err}");
+    }
+
+    #[test]
+    fn disabled_upstream_block_not_in_chain_ok() {
+        // A disabled block with the default (local-only) chain is fine.
+        let block = r#"
+            [auth.upstream_basic]
+            enabled = false
+            url = "ftp://whatever"
+            [auth.upstream_basic.cache]
+        "#;
+        let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{block}"));
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("disabled block is inert");
+        assert!(!cfg.auth.upstream_basic.unwrap().enabled);
     }
 
     #[test]

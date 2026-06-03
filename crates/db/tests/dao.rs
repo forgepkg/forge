@@ -574,6 +574,62 @@ async fn upstream_basic_user_has_no_local_password() {
     assert_eq!(reread.external_subject.as_deref(), Some(username.as_str()));
 }
 
+#[tokio::test]
+async fn provision_upstream_user_inserts_then_is_idempotent_and_grant_only() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let username = format!("up-prov-{n}");
+
+    // First call inserts a passwordless upstream-basic user (non-admin).
+    let u1 = user_dao::provision_upstream_user(pool, &username, false)
+        .await
+        .expect("provision");
+    assert_eq!(u1.auth_source, "upstream-basic");
+    assert!(u1.password_hash.is_none());
+    assert!(u1.active);
+    assert!(!u1.is_admin);
+    assert_eq!(u1.external_subject.as_deref(), Some(username.as_str()));
+
+    // Second call (admin suggested) reuses the row AND grants admin.
+    let u2 = user_dao::provision_upstream_user(pool, &username, true)
+        .await
+        .expect("re-provision grants admin");
+    assert_eq!(u2.id, u1.id, "same row");
+    assert!(u2.is_admin, "admin granted on refresh");
+
+    // Third call (non-admin) must NOT downgrade the granted admin (grant-only).
+    let u3 = user_dao::provision_upstream_user(pool, &username, false)
+        .await
+        .expect("re-provision");
+    assert_eq!(u3.id, u1.id);
+    assert!(u3.is_admin, "grant-only: admin never revoked here");
+}
+
+#[tokio::test]
+async fn provision_upstream_user_does_not_clobber_local_user() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let username = format!("up-prov-local-{n}");
+
+    // Pre-existing LOCAL user with a password.
+    user_dao::insert_user(
+        pool,
+        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), false, true),
+    )
+    .await
+    .expect("insert local");
+
+    // An upstream provision for the same username must NOT null the password or
+    // flip auth_source.
+    let u = user_dao::provision_upstream_user(pool, &username, false)
+        .await
+        .expect("provision over local");
+    assert_eq!(u.auth_source, "local", "local provenance preserved");
+    assert!(u.password_hash.is_some(), "local password preserved");
+}
+
 // ── proxy_dao ─────────────────────────────────────────────────────────────────
 
 /// Helper: insert a proxy repository and return its id.

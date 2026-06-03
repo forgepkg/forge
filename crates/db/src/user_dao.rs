@@ -57,6 +57,58 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
     .await
 }
 
+/// Provision (or refresh) a user authenticated by the `upstream-basic` provider
+/// (slice 12.3, phase 5).
+///
+/// Called by the auth chain after the upstream **definitively accepts** a
+/// credential. Idempotent and **never destructive to a local account**:
+///
+/// * **New username** → insert a fresh user with `auth_source = 'upstream-basic'`,
+///   `password_hash = NULL` (no local password — the DB CHECK only requires one
+///   for `'local'` users), `external_subject = username`, `active = true`, and
+///   `is_admin = suggested_is_admin` (the upstream's admin-group mapping; grant
+///   only on first provision).
+/// * **Existing username** → only stamp `last_auth_source_at = now()` and, when
+///   `suggested_is_admin` is true, **grant** `is_admin` (never revoke it here —
+///   admin downgrade is operator-managed / §12.4). The row's `auth_source`,
+///   `password_hash`, and `external_subject` are left untouched, so an existing
+///   `'local'` admin is never downgraded to a passwordless upstream account by an
+///   upstream login (plan §2.4 / §6 username-collision note).
+///
+/// Returns the resulting (post-provision) row. The unique constraint on
+/// `username` makes the `ON CONFLICT` path race-safe across instances.
+pub async fn provision_upstream_user(
+    pool: &PgPool,
+    username: &str,
+    suggested_is_admin: bool,
+) -> sqlx::Result<AppUser> {
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        INSERT INTO app_user
+            (username, password_hash, is_admin, active, auth_source,
+             external_subject, last_auth_source_at)
+        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now())
+        ON CONFLICT (username) DO UPDATE SET
+            -- Grant-only admin: never flip an existing admin off here.
+            is_admin = app_user.is_admin OR EXCLUDED.is_admin,
+            last_auth_source_at = now(),
+            -- Touch updated_at only when the admin grant actually changes the row.
+            updated_at = CASE
+                WHEN EXCLUDED.is_admin AND NOT app_user.is_admin THEN now()
+                ELSE app_user.updated_at
+            END
+        RETURNING
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
+        "#,
+        username,
+        suggested_is_admin,
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Find a user by their unique username.
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Result<Option<AppUser>> {
     sqlx::query_as!(

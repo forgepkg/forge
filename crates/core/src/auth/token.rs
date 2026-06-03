@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
-use super::chain::{map_identity_to_principal, Chain, ChainOutcome};
+use super::chain::{provision_and_map, Chain, ChainOutcome};
 use super::local_password::LocalPasswordProvider;
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
@@ -230,6 +230,10 @@ pub struct BasicAuthSource {
     /// reproduces `allow_password_basic = true` with the local provider (and,
     /// from phase 4, any further providers).
     chain: Option<Arc<Chain>>,
+    /// Whether an upstream-vouched identity with no matching `app_user` is
+    /// auto-provisioned (slice 12.3, phase 5). Only the `upstream-basic` provider
+    /// can produce such an identity; `false` requires the user to pre-exist.
+    auto_provision: bool,
 }
 
 impl BasicAuthSource {
@@ -248,13 +252,26 @@ impl BasicAuthSource {
         } else {
             None
         };
-        Self { pool, chain }
+        // The default chain is local-only, which never auto-provisions; the flag
+        // is inert here.
+        Self {
+            pool,
+            chain,
+            auto_provision: false,
+        }
     }
 
     /// Build a source with an explicit password-auth chain (phase 4+ wiring).
-    /// Pass `None` to disable the password path entirely.
-    pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>) -> Self {
-        Self { pool, chain }
+    /// Pass `None` to disable the password path entirely. `auto_provision`
+    /// controls whether an upstream-vouched identity with no existing `app_user`
+    /// is created on first success (slice 12.3, phase 5) — it is meaningful only
+    /// when the chain contains the `upstream-basic` provider.
+    pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>, auto_provision: bool) -> Self {
+        Self {
+            pool,
+            chain,
+            auto_provision,
+        }
     }
 }
 
@@ -308,8 +325,10 @@ impl PrincipalSource for BasicAuthSource {
             };
             match chain.authenticate(&cred).await {
                 ChainOutcome::Authenticated { identity, .. } => {
-                    // Map the vouched-for username back to a concrete principal.
-                    match map_identity_to_principal(&self.pool, &identity).await {
+                    // Map the vouched-for username back to a concrete principal,
+                    // auto-provisioning an upstream-vouched user on first login
+                    // when configured (phase 5).
+                    match provision_and_map(&self.pool, &identity, self.auto_provision).await {
                         Ok(Some(up)) => {
                             return SourceOutcome::Authenticated(Principal::from_user(up))
                         }

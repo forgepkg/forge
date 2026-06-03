@@ -95,6 +95,33 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     }
 }
 
+/// `POST /admin/users/{id}/reauth` — force re-validation of a user's forwarded
+/// credentials (slice 12.3, plan §2.5/§2.7).
+///
+/// Purges every cached `validated_credential` verdict for the user (across all
+/// providers) and broadcasts a cache-layer invalidation, so the **next**
+/// password-Basic request for that user re-forwards to the upstream instead of
+/// serving a possibly-stale cached positive. Use after disabling the user
+/// upstream, after a password change, or to shrink the trust window. `204` on
+/// success (idempotent — a user with no cached verdicts still returns `204`).
+pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let user = match user_dao::find_user_by_id(&state.pool, id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+
+    match forge_core::auth::revoke_credentials_for_user(&state.cache, &state.pool, &user.username)
+        .await
+    {
+        Ok(_deleted) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, user_id = id, "reauth credential revoke failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }

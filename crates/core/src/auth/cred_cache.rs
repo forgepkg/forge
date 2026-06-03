@@ -309,6 +309,37 @@ impl ValidatedCredentialCache {
     }
 }
 
+/// The cache namespace for a provider's verdicts — used by the standalone
+/// [`revoke_credentials_for_user`] (which has no [`ValidatedCredentialCache`]
+/// instance and therefore no pepper, but does not need one to invalidate).
+fn cred_namespace(provider_id: &str) -> String {
+    format!("{NS_CRED}:{provider_id}")
+}
+
+/// Revoke every cached verdict for `username` **without** needing a
+/// [`ValidatedCredentialCache`] (and thus without the pepper).
+///
+/// This is the admin "force re-auth user X" / deactivate-user path: it deletes
+/// the authoritative `validated_credential` rows for the username (across all
+/// providers) and broadcasts a cache-layer invalidation of the `upstream-basic`
+/// namespace so peer instances drop their L1/L2 entries on the next read. The
+/// pepper is irrelevant here — revocation is keyed by username, not by the
+/// credential HMAC. Returns the number of authoritative rows deleted.
+///
+/// Correctness without the pepper: the row deletes are authoritative, and the
+/// namespace invalidation is coarse (drops the whole provider namespace), so the
+/// next request for any of that user's credentials misses the cache and
+/// re-derives from the now-purged Postgres store.
+pub async fn revoke_credentials_for_user(
+    cache: &Cache,
+    pool: &PgPool,
+    username: &str,
+) -> Result<u64, CredCacheError> {
+    let deleted = vc_dao::revoke_by_username(pool, username, None).await?;
+    cache.invalidate_ns(&cred_namespace("upstream-basic")).await;
+    Ok(deleted)
+}
+
 /// The cache factory: read the authoritative Postgres verdict; on a true miss,
 /// run the singleflighted upstream forward and persist the definitive verdict.
 ///

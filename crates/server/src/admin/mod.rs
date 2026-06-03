@@ -96,6 +96,7 @@ pub fn admin_router() -> Router<AppState> {
         )
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", axum::routing::delete(users::delete))
+        .route("/users/{id}/reauth", axum::routing::post(users::reauth))
         .route(
             "/users/{id}/tokens",
             get(tokens::list_for_user).post(tokens::create),

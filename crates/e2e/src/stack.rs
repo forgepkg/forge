@@ -412,7 +412,6 @@ impl StackBuilder {
             .await
             .expect("bootstrap admin");
 
-        let layer = principal_layer(&config, &pool).expect("principal layer");
         let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
         let cache = match &redis {
             Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
@@ -420,6 +419,7 @@ impl StackBuilder {
                 .expect("connect redis L2"),
             None => Cache::l1_only(config.cache.l1_max_capacity),
         };
+        let layer = principal_layer(&config, &pool, &cache).expect("principal layer");
         let state = AppState::new(pool.clone(), store, cache, nuget, config);
 
         let worker_handles = if self.spawn_workers {

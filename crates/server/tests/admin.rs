@@ -69,6 +69,58 @@ async fn non_admin_forbidden() {
     assert_eq!(resp.status(), 403, "non-admin must be 403");
 }
 
+/// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
+/// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
+/// for a non-admin caller.
+#[tokio::test]
+async fn reauth_endpoint_admin_only_and_idempotent() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let suffix = common::unique();
+    let username = format!("reauth{suffix}");
+
+    // Admin creates a non-admin user and discovers its id.
+    let created: Value = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_id = created["id"].as_i64().expect("user id");
+
+    // Admin reauth → 204 (no cached verdicts, but still succeeds idempotently).
+    let resp = client
+        .post(format!("{}/admin/users/{user_id}/reauth", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "admin reauth succeeds");
+
+    // Unknown id → 404.
+    let resp = client
+        .post(format!("{}/admin/users/9999999/reauth", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown user → 404");
+
+    // Non-admin caller → 403 (gated by require_admin).
+    let resp = client
+        .post(format!("{}/admin/users/{user_id}/reauth", srv.base_url))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "non-admin reauth → 403");
+}
+
 /// Create a proxy repository; `upstream_password` is accepted but REDACTED in
 /// all responses (write-only).
 #[tokio::test]

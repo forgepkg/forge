@@ -276,9 +276,9 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .await
         .expect("bootstrap admin");
 
-    let layer = principal_layer(&config, &pool).expect("principal layer");
-    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
+    let layer = principal_layer(&config, &pool, &cache).expect("principal layer");
+    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let state = AppState::new(pool.clone(), store, cache, nuget, config);
 
     let workers = if opts.spawn_workers {

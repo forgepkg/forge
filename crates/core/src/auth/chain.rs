@@ -26,7 +26,7 @@
 use sqlx::PgPool;
 
 use super::principal::UserPrincipal;
-use super::provider::{AuthOutcome, AuthProvider, PasswordCredential, ProvenIdentity};
+use super::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 
 /// The folded result of running the [`AuthProvider`] chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +145,54 @@ pub async fn map_identity_to_principal(
         token_id: None,
         is_admin: user.is_admin,
     }))
+}
+
+/// Resolve a chain-vouched [`ProvenIdentity`] to a [`UserPrincipal`],
+/// **auto-provisioning** an `app_user` when the source allows it (slice 12.3,
+/// phase 5).
+///
+/// This is [`map_identity_to_principal`] plus the upstream auto-provision step:
+///
+/// * [`AuthSource::UpstreamBasic`] with `auto_provision = true` → upsert the
+///   user via [`forge_db::user_dao::provision_upstream_user`] (creates a
+///   passwordless `'upstream-basic'` account on first login, grants admin if the
+///   identity's `suggested_is_admin` is set, never downgrades a local account)
+///   and return its principal. The user is always `active = true` on insert; an
+///   operator who later sets `active = false` is honored on the next call.
+/// * [`AuthSource::UpstreamBasic`] with `auto_provision = false` → behave like
+///   [`map_identity_to_principal`]: the user must already exist and be active,
+///   else `Ok(None)` (caller denies).
+/// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → never provisioned here;
+///   delegate to [`map_identity_to_principal`] (a behaviour-preserving lookup —
+///   local users always pre-exist, OIDC has its own interactive provision path).
+///
+/// Returns `Ok(None)` when no usable principal results (unknown/inactive and not
+/// auto-provisioned), `Err` only on a DB failure (caller must fail closed).
+pub async fn provision_and_map(
+    pool: &PgPool,
+    identity: &ProvenIdentity,
+    auto_provision: bool,
+) -> sqlx::Result<Option<UserPrincipal>> {
+    if identity.source == AuthSource::UpstreamBasic && auto_provision {
+        let user = forge_db::user_dao::provision_upstream_user(
+            pool,
+            &identity.username,
+            identity.suggested_is_admin,
+        )
+        .await?;
+        // A provisioned/refreshed user could have been deactivated by an operator
+        // between logins; honor that (the upsert does not reactivate).
+        if !user.active {
+            return Ok(None);
+        }
+        return Ok(Some(UserPrincipal {
+            user_id: user.id,
+            token_id: None,
+            is_admin: user.is_admin,
+        }));
+    }
+
+    map_identity_to_principal(pool, identity).await
 }
 
 #[cfg(test)]
