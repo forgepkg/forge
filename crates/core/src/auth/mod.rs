@@ -24,6 +24,7 @@ pub mod principal;
 pub mod provider;
 pub mod session_source;
 pub mod token;
+pub mod upstream_basic;
 
 pub use authz::{can_admin, can_read, can_write};
 pub use chain::{map_identity_to_principal, Chain, ChainOutcome};
@@ -39,3 +40,4 @@ pub use token::{
     generate_token_secret, hash_token, resolve_principal, verify_password, verify_token, AuthError,
     BasicAuthSource, PrincipalSource, SourceOutcome, TokenHeaderSource,
 };
+pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
