@@ -14,9 +14,14 @@
 //!
 //! [`Authz`]: crate::auth::authz::Authz
 
+pub mod cache;
 pub mod eval;
 
+pub use cache::{
+    invalidate_all, invalidate_anonymous, invalidate_user, load_anonymous_effective,
+    load_user_effective, LoadError, DEFAULT_TTL, NS_AUTHZ,
+};
 pub use eval::{
-    Action, CompiledSelector, EffectiveSet, Grant, PackageFilter, RawEffectiveSet, RawGrant,
-    SelectorCompileError, SelectorPatterns, TokenScope,
+    parse_token_scope, Action, CompiledSelector, EffectiveSet, Grant, PackageFilter,
+    RawEffectiveSet, RawGrant, SelectorCompileError, SelectorPatterns, TokenScope,
 };

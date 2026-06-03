@@ -419,6 +419,34 @@ pub struct TokenScope {
     pub repositories: Option<Vec<i64>>,
 }
 
+/// Parse a token's raw `scope` jsonb (`Option<serde_json::Value>` as loaded from
+/// the DB) into a [`TokenScope`].
+///
+/// * `None` (NULL column) ⇒ `None`: the token is **unscoped** and inherits the
+///   owner's full effective set.
+/// * `Some(value)` that fails to deserialize into a [`TokenScope`] ⇒ a
+///   [`TokenScopeParseError`]. The caller treats this **fail-closed**: a token
+///   carrying a malformed scope must not fall back to the owner's full set (that
+///   would silently widen it), so it is denied / treated as an empty scope by the
+///   seam.
+/// * `Some(value)` that parses ⇒ `Some(scope)`.
+pub fn parse_token_scope(
+    raw: Option<serde_json::Value>,
+) -> Result<Option<TokenScope>, TokenScopeParseError> {
+    match raw {
+        None => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| TokenScopeParseError(e.to_string())),
+    }
+}
+
+/// A token's stored `scope` jsonb was not a valid [`TokenScope`]. Fail-closed:
+/// the seam denies rather than ignoring the (broken) scope.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("invalid token scope: {0}")]
+pub struct TokenScopeParseError(String);
+
 #[cfg(test)]
 mod tests {
     use super::*;
