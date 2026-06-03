@@ -217,6 +217,7 @@ fn config_toml(
     cache_ttl_seconds: u64,
     public_base_url: &str,
     oidc_block: &str,
+    auth_block: &str,
 ) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
@@ -249,7 +250,7 @@ force_path_style = true
 [auth]
 anonymous_mode = "{anon_mode}"
 allow_password_basic = true
-{allowlist}{trusted}{bootstrap}
+{allowlist}{trusted}{auth_block}{bootstrap}
 {redis_block}
 [cache]
 l1_max_capacity = 1000
@@ -291,6 +292,10 @@ pub struct StackBuilder {
     cache_ttl_seconds: u64,
     /// `None` ⇒ OIDC disabled.
     oidc_block_fn: Option<OidcBlockFn>,
+    /// `None` ⇒ default local-only provider chain (slice 12.3 disabled). When
+    /// set, this is the `providers = [...]` line plus the `[auth.upstream_basic]`
+    /// table injected into the `[auth]` config section.
+    auth_block: Option<String>,
 }
 
 impl Default for StackBuilder {
@@ -305,6 +310,7 @@ impl Default for StackBuilder {
             trusted_proxies: vec!["127.0.0.1/32".into(), "::1/128".into()],
             cache_ttl_seconds: 5,
             oidc_block_fn: None,
+            auth_block: None,
         }
     }
 }
@@ -350,6 +356,15 @@ impl StackBuilder {
         F: Fn(&str) -> String + Send + Sync + 'static,
     {
         self.oidc_block_fn = Some(Box::new(block_fn));
+        self
+    }
+
+    /// Enable the slice-12.3 credential-forwarding auth chain. `block` is the
+    /// `providers = [...]` line plus the `[auth.upstream_basic]` table (typically
+    /// `mock.upstream_basic_block(...)`). Injected into the `[auth]` config
+    /// section so the server builds the real `AuthProvider` chain at startup.
+    pub fn with_upstream_basic(mut self, block: impl Into<String>) -> Self {
+        self.auth_block = Some(block.into());
         self
     }
 
@@ -401,6 +416,7 @@ impl StackBuilder {
             self.cache_ttl_seconds,
             &base_url,
             &oidc_block,
+            self.auth_block.as_deref().unwrap_or_default(),
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
@@ -619,6 +635,33 @@ impl TestServer {
             .workers(true)
             .cache_ttl_seconds(5)
             .with_oidc(block_fn);
+        if self.use_redis {
+            builder = builder.with_redis();
+        }
+        let mut peer = builder.serve(self.db_url.clone(), pool, false).await;
+        peer.admin_user = self.admin_user.clone();
+        peer.admin_pass = self.admin_pass.clone();
+        peer.admin_token = self.admin_token.clone();
+        peer
+    }
+
+    /// Like [`spawn_peer`](Self::spawn_peer) but the peer also enables the
+    /// slice-12.3 credential-forwarding chain with the same `[auth.upstream_basic]`
+    /// block, so a first-time login can be raced across both instances (the
+    /// scale-out singleflight scenario) and a reauth on one instance invalidates
+    /// the cached verdict on the other (the shared validated_credential table +
+    /// cache backplane).
+    pub async fn spawn_peer_with_upstream_basic(&self, block: impl Into<String>) -> TestServer {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&self.db_url)
+            .await
+            .expect("peer connect");
+        let mut builder = StackBuilder::default()
+            .no_bootstrap_admin()
+            .workers(true)
+            .cache_ttl_seconds(5)
+            .with_upstream_basic(block);
         if self.use_redis {
             builder = builder.with_redis();
         }

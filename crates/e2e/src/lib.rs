@@ -22,10 +22,12 @@
 
 #![cfg(feature = "forge-e2e")]
 
+mod mock_basic_upstream;
 mod mock_oidc;
 mod mock_upstream;
 mod stack;
 
+pub use mock_basic_upstream::MockBasicUpstream;
 pub use mock_oidc::MockOidc;
 pub use mock_upstream::{MockUpstream, UpstreamPackage};
 pub use stack::{
