@@ -13,7 +13,7 @@ import { BASE_URL } from './e2e/harness'
  * Requirements to run locally / in CI:
  *   - Docker (for Postgres + versitygw containers)
  *   - a built server (`cargo build -p forge-server`) — globalSetup builds it
- *   - Playwright browsers installed (`npm run e2e:install`)
+ *   - Playwright browsers installed (`pnpm run e2e:install`)
  *
  * If browsers can't be downloaded in a sandbox, `tsc`/`playwright test --list`
  * still type-check and enumerate the specs (see DEVELOPMENT.md).

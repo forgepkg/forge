@@ -8,10 +8,15 @@ and no API proxy in production.
 
 ## Develop
 
+This project uses **pnpm** (pinned via `packageManager` in `package.json`; run
+`corepack enable` to activate it). The default npm registry is configured with a
+7-day `minimumReleaseAge` cooldown in `pnpm-workspace.yaml` — pnpm will not pull
+a dependency version published within the last week (supply-chain hardening).
+
 ```bash
-npm install
+pnpm install
 # Run the Rust server (forge-server) on http://localhost:3000 in another shell.
-FORGE_DEV_API_TARGET=http://localhost:3000 npm run dev   # Vite on :5173
+FORGE_DEV_API_TARGET=http://localhost:3000 pnpm run dev   # Vite on :5173
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to
@@ -22,8 +27,8 @@ equivalent.
 ## Build
 
 ```bash
-npm ci
-npm run build      # tsc --noEmit + vite build -> dist/
+pnpm install --frozen-lockfile
+pnpm run build     # tsc --noEmit + vite build -> dist/
 ```
 
 The Rust server serves `dist/` when `web.enabled = true` (config) with
@@ -33,7 +38,7 @@ The Rust server serves `dist/` when `web.enabled = true` (config) with
 ## Test
 
 ```bash
-npm test           # vitest (jsdom + React Testing Library)
+pnpm test          # vitest (jsdom + React Testing Library)
 ```
 
 ## Layout
