@@ -102,7 +102,6 @@ fn build_password_chain(
     cache: &Cache,
 ) -> anyhow::Result<(Option<Arc<Chain>>, bool)> {
     let providers = &config.auth.providers;
-    let has_upstream = providers.iter().any(|p| p == UPSTREAM_BASIC_ID);
     let only_default_local = providers.len() == 1 && providers[0] == LocalPasswordProvider::ID;
 
     // Slice-1 parity: when password-basic is off and the chain is just the
@@ -147,7 +146,6 @@ fn build_password_chain(
         }
     }
 
-    let _ = has_upstream; // kept for clarity; provider loop handles it.
     Ok((Some(Arc::new(Chain::new(built))), auto_provision))
 }
 
