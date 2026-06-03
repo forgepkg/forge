@@ -37,20 +37,20 @@ run: ## Run the server (expects `make up` first; loads ./forge.toml)
 # Build order for a production-like run: `make web` first (emits web/dist/),
 # then `make run` (the server serves web/dist/ via ServeDir at the same origin).
 
-web-install: ## Install web dependencies (npm ci, reproducible from package-lock.json)
-	cd $(WEB) && npm ci
+web-install: ## Install web dependencies (pnpm, reproducible from pnpm-lock.yaml)
+	cd $(WEB) && pnpm install --frozen-lockfile
 
 web: ## Build the SPA into web/dist/ (run before `make run` for a single-origin prod-like server)
-	cd $(WEB) && npm ci && npm run build
+	cd $(WEB) && pnpm install --frozen-lockfile && pnpm run build
 
 web-test: ## Run frontend unit/component tests (Vitest + RTL)
-	cd $(WEB) && npm ci && npm run test
+	cd $(WEB) && pnpm install --frozen-lockfile && pnpm run test
 
 web-dev: ## Run the Vite dev server (HMR); proxies /admin,/browse,/v3,/auth to FORGE_DEV_API_TARGET
-	cd $(WEB) && npm run dev
+	cd $(WEB) && pnpm run dev
 
 web-e2e: ## Run the Playwright e2e suite (needs Docker; builds the UI first)
-	cd $(WEB) && npm ci && npm run build && npm run e2e
+	cd $(WEB) && pnpm install --frozen-lockfile && pnpm run build && pnpm run e2e
 
 dev: up web run ## Start infra, build the UI, then run the server (one-command dev, single origin)
 
