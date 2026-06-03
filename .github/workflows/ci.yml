@@ -80,6 +80,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry + build artefacts
@@ -101,8 +105,10 @@ jobs:
       # sqlx cache drift guard (A1). Runs migrations against the live Postgres
       # service, then verifies the committed .sqlx/ dir matches the current
       # queries + schema. SQLX_OFFLINE is unset here so the check talks to the DB.
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+      - name: Install sqlx-cli (prebuilt, no source compile)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli@0.8.6
       - name: Run migrations
         env:
           SQLX_OFFLINE: ""
@@ -160,13 +166,17 @@ jobs:
     name: e2e
     runs-on: ubuntu-latest
     # Only run on pushes to main/master; skipping on every PR keeps CI fast.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/pnpm-web'
 
     env:
       SQLX_OFFLINE: "true"
 
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install .NET SDK (for the optional dotnet smoke test)
@@ -200,11 +210,15 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/pnpm-web'
     env:
       SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Setup pnpm
