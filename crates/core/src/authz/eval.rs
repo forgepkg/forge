@@ -123,6 +123,14 @@ impl SelectorPatterns {
             excludes,
         })
     }
+
+    /// Validate that every include/exclude pattern compiles, without returning
+    /// the compiled form. Used by the admin API to reject an uncompilable
+    /// selector at write time (a selector that won't compile would fail-closed
+    /// at evaluation, so persisting one is never useful).
+    pub fn compile_check(&self) -> Result<(), SelectorCompileError> {
+        self.compile().map(|_| ())
+    }
 }
 
 /// Build a [`GlobSet`] from a list of patterns, lowercasing each (package names

@@ -92,6 +92,22 @@ impl Authz {
         self.allows(principal, Action::Admin, repo.id).await
     }
 
+    /// Is `principal` a **global admin** — i.e. a member of the built-in `admin`
+    /// role (or the slice-1 `is_admin` dual-read fallback)?
+    ///
+    /// This is the repo-less admin gate used by the privilege-management admin
+    /// API (`/admin/roles`, `/admin/users/{id}/roles`, …), which has no single
+    /// repository to scope against. It is satisfied **only** by the allow-all
+    /// `admin` short-circuit, never by a per-repo `admin` grant — managing roles
+    /// and grants is a server-wide capability. Fail-closed: an evaluation error
+    /// (or an anonymous / unauthenticated principal) denies.
+    pub async fn is_global_admin(&self, principal: &Principal) -> bool {
+        match self.effective(principal).await {
+            Ok(eff) => eff.is_admin(),
+            Err(()) => false,
+        }
+    }
+
     /// The package-visibility predicate for `principal` reading `repo`.
     ///
     /// Used when listing/serving packages and **re-applied on direct download**
