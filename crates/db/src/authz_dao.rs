@@ -236,6 +236,27 @@ fn map_grant_row(r: EffectiveQueryRow) -> EffectiveGrantRow {
     }
 }
 
+/// Load a token's raw `scope` jsonb by token id, for per-token privilege
+/// scoping (§12.4 Phase 3).
+///
+/// Returns `Ok(None)` when the token does not exist **or** its `scope` column is
+/// NULL — both mean "no scoping" to the caller, which then uses the owner's full
+/// effective set. The value is the raw [`serde_json::Value`]; the `forge-core`
+/// evaluator parses it into a `TokenScope` (a parse failure there is fail-closed:
+/// a malformed scope grants nothing).
+///
+/// This is read **outside** the per-user effective-set cache (the cache holds the
+/// owner set, shared across the user's tokens); the scope is intersected in code
+/// after the cache lookup so a token can only ever narrow its owner.
+pub async fn load_token_scope(pool: &PgPool, token_id: i64) -> sqlx::Result<Option<JsonValue>> {
+    let scope = sqlx::query_scalar!(r#"SELECT scope FROM token WHERE id = $1"#, token_id)
+        .fetch_optional(pool)
+        .await?
+        // outer Option: row present? inner Option: column NULL? flatten both.
+        .flatten();
+    Ok(scope)
+}
+
 // --- role / selector lookups (used by the admin API + bootstrap) ------------
 
 /// Look up a role id by its unique `name`. Returns `None` if absent. Accepts any
