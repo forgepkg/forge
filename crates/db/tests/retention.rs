@@ -33,6 +33,19 @@ async fn armed_hosted_repo(pool: &sqlx::PgPool, suffix: u64) -> i64 {
     retention_dao::write_policy(pool, repo.id, Some(&hosted_policy_json()))
         .await
         .expect("write policy");
+    // `write_policy` upserts the ledger row with `next_run_at DEFAULT now()`
+    // using the **database** clock. Tests then capture `now = Utc::now()` on the
+    // **host** clock and claim with it; under testcontainers the container clock
+    // can drift slightly ahead of the host, making `next_run_at > now` so the
+    // freshly-armed repo is (wrongly) not yet due and the claim no-ops. Backdate
+    // the row a minute into the past so it is unambiguously due for any host
+    // clock within a sane skew window. This changes nothing about claim/lease
+    // semantics — tests that finish/fail a run rewrite `next_run_at` forward.
+    sqlx::query("UPDATE retention_run SET next_run_at = now() - interval '60 seconds' WHERE repository_id = $1")
+        .bind(repo.id)
+        .execute(pool)
+        .await
+        .expect("backdate next_run_at");
     repo.id
 }
 

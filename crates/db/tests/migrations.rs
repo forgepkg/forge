@@ -428,11 +428,10 @@ async fn migrations_create_all_expected_tables() {
     // -----------------------------------------------------------------------
 
     // The privilege action set is seeded with exactly the four verbs.
-    let actions: Vec<String> =
-        sqlx::query_scalar("SELECT action FROM privilege ORDER BY action")
-            .fetch_all(&pool)
-            .await
-            .expect("read privilege actions");
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM privilege ORDER BY action")
+        .fetch_all(&pool)
+        .await
+        .expect("read privilege actions");
     assert_eq!(
         actions,
         vec![
@@ -462,12 +461,11 @@ async fn migrations_create_all_expected_tables() {
 
     // The three built-in roles exist and are flagged builtin = true.
     for name in ["admin", "authenticated", "anonymous"] {
-        let builtin: bool =
-            sqlx::query_scalar("SELECT builtin FROM role WHERE name = $1")
-                .bind(name)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or_else(|_| panic!("built-in role `{name}` must exist"));
+        let builtin: bool = sqlx::query_scalar("SELECT builtin FROM role WHERE name = $1")
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|_| panic!("built-in role `{name}` must exist"));
         assert!(builtin, "role `{name}` must be flagged builtin");
     }
 
