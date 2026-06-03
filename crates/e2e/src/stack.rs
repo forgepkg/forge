@@ -713,6 +713,28 @@ impl TestServer {
             .unwrap()
     }
 
+    /// Grant the built-in `anonymous` role `read` on `repo` directly in the DB,
+    /// mirroring the §12.4 data migration that converts the slice-1
+    /// `anonymous_read` flag into an anonymous-role grant. Under fine-grained
+    /// RBAC, anonymous read flows through this grant (not the column), so a test
+    /// that wants an anonymously-readable repo creates it with
+    /// `anonymous_read: true` **and** calls this. Done before any anonymous
+    /// request, so the (cold) anonymous cache entry loads the grant on first use.
+    pub async fn grant_anonymous_read(&self, repo: &str) {
+        let repo_id = forge_db::repository_dao::find_repository_by_name(&self.pool, repo)
+            .await
+            .expect("repo lookup")
+            .expect("repo exists")
+            .id;
+        let anon_role = forge_db::authz_dao::role_id_by_name(&self.pool, "anonymous")
+            .await
+            .expect("role lookup")
+            .expect("anonymous role seeded");
+        forge_db::authz_dao::add_grant(&self.pool, anon_role, Some(repo_id), "read", None)
+            .await
+            .expect("add anonymous read grant");
+    }
+
     /// Push a `.nupkg` to a hosted repo via the NuGet multipart PUT endpoint,
     /// authenticating with the admin API key.
     pub async fn push_nupkg(&self, repo: &str, bytes: Vec<u8>) -> reqwest::Response {

@@ -182,7 +182,24 @@ async fn anonymous_read_when_allowed() {
         .await
         .unwrap();
 
-    // No credentials, anon mode all + anonymous_read → 200.
+    // Under §12.4 RBAC, anonymous read flows through a grant on the built-in
+    // `anonymous` role (what the data migration converts the slice-1
+    // `anonymous_read` flag into), not the column. Seed that grant directly,
+    // mirroring the migration, so the seam permits the anonymous read.
+    let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, &repo)
+        .await
+        .unwrap()
+        .expect("repo created")
+        .id;
+    let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
+        .await
+        .unwrap()
+        .expect("anonymous role seeded");
+    forge_db::authz_dao::add_grant(&srv.pool, anon_role, Some(repo_id), "read", None)
+        .await
+        .unwrap();
+
+    // No credentials, anon mode all + anonymous-role read grant → 200.
     let resp = client
         .get(format!("{}/v3/{repo}/index.json", srv.base_url))
         .send()

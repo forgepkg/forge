@@ -28,10 +28,12 @@ use forge_core::repo::{
     NupkgLocation, RepoError, RepoReadOps, SearchParams, NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH,
 };
 use forge_db::asset_dao::{self, NewAsset};
+use forge_db::authz_dao::{self, AUTHENTICATED_ROLE};
 use forge_db::blob_dao;
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::repository_dao::{self, NewRepository};
+use forge_db::user_dao::{self, NewUser};
 use forge_nuget::NugetFormat;
 use sqlx::PgPool;
 
@@ -80,9 +82,32 @@ fn group_repo(pool: &PgPool, blobs: StubBlobs, principal: Principal) -> GroupRep
     GroupRepo::new(pool.clone(), principal, factory, authz)
 }
 
-fn user() -> Principal {
+/// A real (non-admin) authenticated user holding the seeded `authenticated`
+/// role — the role the §12.4 data migration assigns to preserve slice-1
+/// "any authenticated user reads/writes everywhere". This is what makes the
+/// authenticated-sees-all assertions hold under fine-grained RBAC: visibility
+/// now flows through `can_read`, so the user must actually be granted read.
+async fn user(pool: &PgPool) -> Principal {
+    let u = user_dao::insert_user(
+        pool,
+        NewUser::local(
+            format!("groupuser-{}", common::unique()),
+            "x".into(),
+            false,
+            true,
+        ),
+    )
+    .await
+    .expect("insert user");
+    let role = authz_dao::role_id_by_name(pool, AUTHENTICATED_ROLE)
+        .await
+        .expect("query")
+        .expect("authenticated role seeded");
+    authz_dao::assign_role(pool, u.id, role)
+        .await
+        .expect("assign authenticated");
     Principal::User {
-        user_id: 1,
+        user_id: u.id,
         token_id: None,
         is_admin: false,
     }
@@ -106,16 +131,30 @@ async fn seed_blob(pool: &PgPool, sha: &str, s3_key: &str, size: i64) {
     tx.commit().await.expect("commit");
 }
 
-/// Seed a hosted member repository with the given anonymous-read flag.
+/// Seed a hosted member repository. When `anonymous_read` is set, also grant the
+/// built-in `anonymous` role `read` on it — under §12.4 RBAC anonymous
+/// visibility flows through that grant (what the data migration converts the
+/// slice-1 `anonymous_read` flag into), not the column. The column is still set
+/// for parity but is no longer consulted by the seam.
 async fn seed_member(pool: &PgPool, anonymous_read: bool) -> Repository {
     let name = format!("member-{}", common::unique());
     let new = NewRepository {
         anonymous_read,
         ..NewRepository::hosted(name)
     };
-    repository_dao::insert_repository(pool, new)
+    let repo = repository_dao::insert_repository(pool, new)
         .await
-        .expect("insert member")
+        .expect("insert member");
+    if anonymous_read {
+        let anon_role = authz_dao::role_id_by_name(pool, authz_dao::ANONYMOUS_ROLE)
+            .await
+            .expect("query")
+            .expect("anonymous role seeded");
+        authz_dao::add_grant(pool, anon_role, Some(repo.id), "read", None)
+            .await
+            .expect("anon read grant");
+    }
+    repo
 }
 
 /// Seed a group repository.
@@ -231,7 +270,7 @@ async fn highest_priority_member_serves_overlapping_version() {
         .await
         .unwrap();
 
-    let g = group_repo(&pool, blobs.clone(), user());
+    let g = group_repo(&pool, blobs.clone(), user(&pool).await);
     let loc = g
         .resolve_nupkg(&group.name, "sample", "1.0.0")
         .await
@@ -271,7 +310,7 @@ async fn list_versions_is_union_across_members() {
         .await
         .unwrap();
 
-    let g = group_repo(&pool, blobs, user());
+    let g = group_repo(&pool, blobs, user(&pool).await);
     let versions = g.list_versions(&group.name, "sample").await.unwrap();
     let mut vs: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
     vs.sort_unstable();
@@ -325,7 +364,7 @@ async fn mixed_anon_group_filters_by_principal() {
         .is_none());
 
     // Authenticated user: both members visible.
-    let g_user = group_repo(&pool, blobs, user());
+    let g_user = group_repo(&pool, blobs, user(&pool).await);
     assert_eq!(
         g_user
             .list_versions(&group.name, "priv")
@@ -363,7 +402,7 @@ async fn search_merges_and_dedups_highest_priority_wins() {
         .await
         .unwrap();
 
-    let g = group_repo(&pool, blobs, user());
+    let g = group_repo(&pool, blobs, user(&pool).await);
     let res = g
         .search(&group.name, &SearchParams::default())
         .await
@@ -386,7 +425,7 @@ async fn search_merges_and_dedups_highest_priority_wins() {
 #[tokio::test]
 async fn unknown_group_errors() {
     let pool = common::pool().await;
-    let g = group_repo(&pool, StubBlobs::default(), user());
+    let g = group_repo(&pool, StubBlobs::default(), user(&pool).await);
     let err = g.list_versions("no-such-group", "x").await.unwrap_err();
     assert!(matches!(err, RepoError::RepoNotFound(_)));
 }
@@ -396,7 +435,7 @@ async fn wrong_kind_errors() {
     let pool = common::pool().await;
     // A hosted repo is not a group → WrongKind.
     let hosted = seed_member(&pool, false).await;
-    let g = group_repo(&pool, StubBlobs::default(), user());
+    let g = group_repo(&pool, StubBlobs::default(), user(&pool).await);
     let err = g.list_versions(&hosted.name, "x").await.unwrap_err();
     assert!(matches!(err, RepoError::WrongKind { .. }));
 }
