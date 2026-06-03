@@ -17,9 +17,24 @@
 //! * **Registration / search** merge across visible members, dedup by
 //!   `id + version` (registration) / `id` (search), **highest-priority wins**.
 //!
-//! Groups are **read-only** and (in slice 1) have **no nested members** —
-//! nested-group membership is rejected at config time in the server admin layer
-//! (Phase 10), so resolution here only ever sees hosted/proxy members.
+//! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
+//! a group** (nested groups). Resolution flattens the nested graph into the
+//! ordered list of **leaf** (hosted/proxy) members before reading: the
+//! [`MemberOpsFactory`] is only ever asked for a leaf. Two guards keep this
+//! safe even against a cycle injected by a raw DB write:
+//!
+//! * a **visited-set** (group ids already on the current descent) — a re-visit
+//!   is treated as an empty subtree (fail-closed) and logged, never followed;
+//! * a **depth bound** (`max_depth`, from `groups.max_nesting_depth`) — descent
+//!   past it stops (fail-closed).
+//!
+//! Identity-aware filtering is applied at **every** level: a member (group or
+//! leaf) is descended-into / included only if the principal [`can_read`] it
+//! ([`Authz::can_read`]). Being able to read an outer group grants **no**
+//! transitive read on an inner member — only a `read` grant on the actual leaf
+//! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
+//! stable pre-order walk; a leaf reachable by several paths is kept once, at its
+//! highest-priority (first) sighting.
 //!
 //! ## Decoupling from concrete member kinds
 //! `forge-core` must not hard-wire how a hosted vs. proxy member is constructed
@@ -68,6 +83,9 @@ pub struct GroupRepo {
     principal: Principal,
     factory: Arc<dyn MemberOpsFactory>,
     authz: Authz,
+    /// Maximum nesting depth followed when flattening nested groups
+    /// (`groups.max_nesting_depth`). Descent past this bound stops, fail-closed.
+    max_depth: u32,
 }
 
 /// A visible member: its repository row (carrying its own `name`) and the ops to
@@ -80,18 +98,21 @@ struct VisibleMember {
 impl GroupRepo {
     /// Build a group resolver for `principal` over `pool`, using `factory` to
     /// construct each member's read ops and `authz` to filter members the
-    /// principal may read.
+    /// principal may read. `max_depth` bounds nested-group descent
+    /// (`groups.max_nesting_depth`).
     pub fn new(
         pool: PgPool,
         principal: Principal,
         factory: Arc<dyn MemberOpsFactory>,
         authz: Authz,
+        max_depth: u32,
     ) -> Self {
         GroupRepo {
             pool,
             principal,
             factory,
             authz,
+            max_depth,
         }
     }
 
@@ -110,23 +131,88 @@ impl GroupRepo {
         Ok(row)
     }
 
-    /// The members `self.principal` may read, in **descending priority** order
-    /// (the DAO already orders `priority DESC`), each paired with its read ops.
+    /// The **leaf** (hosted/proxy) members `self.principal` may read, flattened
+    /// across nested groups in **descending priority** pre-order (the DAO orders
+    /// each level `priority DESC`), each paired with its read ops.
+    ///
+    /// Nested groups are descended into (subject to `can_read` at every level);
+    /// a leaf reachable by several paths is kept once, at its first (highest
+    /// effective priority) sighting. The walk is bounded by a visited-set (group
+    /// ids on the current path) and [`Self::max_depth`]; hitting either treats
+    /// that subtree as empty (fail-closed) and logs, so a cycle injected by a
+    /// raw DB write terminates rather than looping.
     async fn visible_members(&self, group: &str) -> Result<Vec<VisibleMember>, RepoError> {
         let group_row = self.group_row(group).await?;
-        let members = repository_dao::group_members(&self.pool, group_row.id).await?;
 
-        let mut out = Vec::with_capacity(members.len());
-        for (member, _priority) in members {
-            // Identity filter: skip members this principal cannot read. An
-            // anonymous caller therefore sees only `anonymous_read` members.
-            if !self.authz.can_read(&self.principal, &member).await {
-                continue;
-            }
-            let ops = self.factory.ops_for(&member)?;
-            out.push(VisibleMember { repo: member, ops });
-        }
+        let mut out: Vec<VisibleMember> = Vec::new();
+        let mut seen_leaves: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        visited.insert(group_row.id);
+
+        self.flatten_into(group_row.id, 0, &mut visited, &mut seen_leaves, &mut out)
+            .await?;
         Ok(out)
+    }
+
+    /// Recursive worker for [`Self::visible_members`]. Walks `group_id`'s direct
+    /// members (priority DESC); for each member the principal `can_read`:
+    /// * a **group** member is descended into (cycle/depth-guarded);
+    /// * a **leaf** member is appended (deduped by repo id).
+    ///
+    /// `visited` holds the group ids on the current descent path; `seen_leaves`
+    /// dedups leaves across the whole flatten. Boxed future because the async fn
+    /// is recursive.
+    fn flatten_into<'a>(
+        &'a self,
+        group_id: i64,
+        depth: u32,
+        visited: &'a mut std::collections::HashSet<i64>,
+        seen_leaves: &'a mut std::collections::HashSet<i64>,
+        out: &'a mut Vec<VisibleMember>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RepoError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if depth >= self.max_depth {
+                tracing::error!(
+                    group_id,
+                    depth,
+                    max_depth = self.max_depth,
+                    "group nesting depth bound hit; treating subtree as empty (fail-closed)"
+                );
+                return Ok(());
+            }
+
+            let members = repository_dao::group_members(&self.pool, group_id).await?;
+            for (member, _priority) in members {
+                // Identity filter at every level: skip members this principal
+                // cannot read. Reading an outer group grants no transitive read.
+                if !self.authz.can_read(&self.principal, &member).await {
+                    continue;
+                }
+
+                if member.kind() == forge_db::model::RepoKind::Group {
+                    // Cycle guard: a group already on the descent path is a
+                    // back-edge — log and skip (fail-closed), never follow it.
+                    if !visited.insert(member.id) {
+                        tracing::error!(
+                            cyclic_group_id = member.id,
+                            "group membership cycle detected at resolve time; treating subtree as empty (fail-closed)"
+                        );
+                        continue;
+                    }
+                    self.flatten_into(member.id, depth + 1, visited, seen_leaves, out)
+                        .await?;
+                    // Pop off the path so a diamond (two paths to the same group
+                    // via distinct parents) is still resolvable, while a true
+                    // back-edge on the *current* path stays blocked.
+                    visited.remove(&member.id);
+                } else if seen_leaves.insert(member.id) {
+                    let ops = self.factory.ops_for(&member)?;
+                    out.push(VisibleMember { repo: member, ops });
+                }
+            }
+            Ok(())
+        })
     }
 }
 

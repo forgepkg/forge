@@ -72,14 +72,28 @@ impl MemberOpsFactory for HostedFactory {
     }
 }
 
+/// Default nesting depth bound used by the test resolver (generous; the
+/// dedicated depth/cycle tests below pass a tighter bound or inject a cycle).
+const TEST_MAX_DEPTH: u32 = 20;
+
 /// Build a `GroupRepo` for `principal` over the pool + stub blobs.
 fn group_repo(pool: &PgPool, blobs: StubBlobs, principal: Principal) -> GroupRepo {
+    group_repo_depth(pool, blobs, principal, TEST_MAX_DEPTH)
+}
+
+/// Like [`group_repo`] but with an explicit nesting-depth bound.
+fn group_repo_depth(
+    pool: &PgPool,
+    blobs: StubBlobs,
+    principal: Principal,
+    max_depth: u32,
+) -> GroupRepo {
     let factory = Arc::new(HostedFactory {
         pool: pool.clone(),
         blobs,
     });
     let authz = Authz::new(pool.clone(), Cache::l1_only(16));
-    GroupRepo::new(pool.clone(), principal, factory, authz)
+    GroupRepo::new(pool.clone(), principal, factory, authz, max_depth)
 }
 
 /// A real (non-admin) authenticated user holding the seeded `authenticated`
@@ -420,6 +434,262 @@ async fn search_merges_and_dedups_highest_priority_wins() {
         .hits
         .iter()
         .any(|h| h.original_id.eq_ignore_ascii_case("onlylow")));
+}
+
+// ── nested groups (§12.4 Phase 4) ───────────────────────────────────────────
+
+#[tokio::test]
+async fn nested_group_flattens_leaves_through_inner_group() {
+    // g_outer -> g_inner -> { high, low }, plus g_outer -> direct.
+    // A nested-group member is descended into; all leaves flatten out.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let high = seed_member(&pool, false).await;
+    let low = seed_member(&pool, false).await;
+    let direct = seed_member(&pool, false).await;
+    let inner = seed_group(&pool).await;
+    let outer = seed_group(&pool).await;
+
+    seed_version(&pool, &mut blobs, high.id, "Sample", "2.0.0", "high").await;
+    seed_version(&pool, &mut blobs, low.id, "Sample", "1.0.0", "low").await;
+    seed_version(&pool, &mut blobs, direct.id, "Other", "1.0.0", "direct").await;
+
+    // inner: high (prio 100) > low (prio 10).
+    repository_dao::add_group_member(&pool, inner.id, high.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, inner.id, low.id, 10)
+        .await
+        .unwrap();
+    // outer: inner (prio 100) then direct (prio 10).
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, direct.id, 10)
+        .await
+        .unwrap();
+
+    let g = group_repo(&pool, blobs.clone(), user(&pool).await);
+
+    // Sample 1.0.0 + 2.0.0 reachable via the inner group; Other via direct.
+    let sample = g.list_versions(&outer.name, "sample").await.unwrap();
+    let mut vs: Vec<&str> = sample.iter().map(|v| v.version.as_str()).collect();
+    vs.sort_unstable();
+    assert_eq!(vs, vec!["1.0.0", "2.0.0"], "both inner leaves flatten out");
+
+    assert_eq!(
+        g.list_versions(&outer.name, "other").await.unwrap().len(),
+        1,
+        "direct leaf also resolves"
+    );
+
+    // Priority across nesting: high (2.0.0) wins the overlap within inner.
+    let loc = g
+        .resolve_nupkg(&outer.name, "sample", "2.0.0")
+        .await
+        .unwrap()
+        .expect("2.0.0 resolved");
+    assert_eq!(served_tag(&blobs, &loc), "nupkg-high");
+}
+
+#[tokio::test]
+async fn nested_group_filtering_honors_privileges_per_level() {
+    // outer -> inner -> { pub (anon_read), priv }. Anonymous descends into the
+    // inner group but only sees the anonymous-granted leaf; the private leaf is
+    // hidden even though it is reachable through nesting.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let public = seed_member(&pool, true).await;
+    let private = seed_member(&pool, false).await;
+    let inner = seed_group(&pool).await;
+    let outer = seed_group(&pool).await;
+
+    seed_version(&pool, &mut blobs, public.id, "Pub", "1.0.0", "pub").await;
+    seed_version(&pool, &mut blobs, private.id, "Priv", "1.0.0", "priv").await;
+
+    repository_dao::add_group_member(&pool, inner.id, public.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, inner.id, private.id, 10)
+        .await
+        .unwrap();
+    // The inner group itself must be anon-readable for an anonymous caller to
+    // descend into it (read on the outer/inner group != read on the leaves).
+    let anon_role = authz_dao::role_id_by_name(&pool, authz_dao::ANONYMOUS_ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    authz_dao::add_grant(&pool, anon_role, Some(inner.id), "read", None)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 100)
+        .await
+        .unwrap();
+    authz_dao::add_grant(&pool, anon_role, Some(outer.id), "read", None)
+        .await
+        .unwrap();
+
+    // Anonymous: only the public leaf (reachable through two group levels).
+    let g_anon = group_repo(&pool, blobs.clone(), anon());
+    assert_eq!(
+        g_anon
+            .list_versions(&outer.name, "pub")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "anon sees public leaf through nesting"
+    );
+    assert!(
+        g_anon
+            .list_versions(&outer.name, "priv")
+            .await
+            .unwrap()
+            .is_empty(),
+        "anon cannot see the private leaf inside the nested group"
+    );
+
+    // Authenticated user: both leaves visible.
+    let g_user = group_repo(&pool, blobs, user(&pool).await);
+    assert_eq!(
+        g_user
+            .list_versions(&outer.name, "priv")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "authenticated user sees the private leaf through nesting"
+    );
+}
+
+#[tokio::test]
+async fn nested_group_inner_unreadable_blocks_descent() {
+    // outer -> inner (NOT anon-readable) -> pub (anon-readable leaf). An
+    // anonymous caller cannot read the inner group, so it must not descend and
+    // therefore never reaches the public leaf: reading an outer group grants no
+    // transitive read past an unreadable intermediate group.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let public = seed_member(&pool, true).await;
+    let inner = seed_group(&pool).await; // no anon grant
+    let outer = seed_group(&pool).await;
+
+    seed_version(&pool, &mut blobs, public.id, "Pub", "1.0.0", "pub").await;
+
+    repository_dao::add_group_member(&pool, inner.id, public.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 100)
+        .await
+        .unwrap();
+    let anon_role = authz_dao::role_id_by_name(&pool, authz_dao::ANONYMOUS_ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    authz_dao::add_grant(&pool, anon_role, Some(outer.id), "read", None)
+        .await
+        .unwrap();
+
+    let g_anon = group_repo(&pool, blobs, anon());
+    assert!(
+        g_anon
+            .list_versions(&outer.name, "pub")
+            .await
+            .unwrap()
+            .is_empty(),
+        "unreadable intermediate group blocks descent to its leaves"
+    );
+}
+
+#[tokio::test]
+async fn resolve_time_cycle_is_fail_closed_and_terminates() {
+    // Inject a cycle directly via raw SQL (bypassing the config-time guard):
+    // g_a -> g_b -> g_a, with a leaf hung off g_b. Resolution must terminate
+    // (no hang) and serve the reachable leaf without looping.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let leaf = seed_member(&pool, false).await;
+    let g_a = seed_group(&pool).await;
+    let g_b = seed_group(&pool).await;
+
+    seed_version(&pool, &mut blobs, leaf.id, "Sample", "1.0.0", "leaf").await;
+
+    // g_a -> g_b (raw, no guard), g_b -> leaf, g_b -> g_a (the back-edge).
+    sqlx::query!(
+        "INSERT INTO group_member (group_id, member_id, priority) VALUES ($1,$2,$3)",
+        g_a.id,
+        g_b.id,
+        100
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "INSERT INTO group_member (group_id, member_id, priority) VALUES ($1,$2,$3)",
+        g_b.id,
+        leaf.id,
+        50
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "INSERT INTO group_member (group_id, member_id, priority) VALUES ($1,$2,$3)",
+        g_b.id,
+        g_a.id,
+        10
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let g = group_repo(&pool, blobs, user(&pool).await);
+
+    // The visited-set breaks the back-edge; the leaf still resolves. A 5s
+    // timeout guards against a regression that would loop forever.
+    let versions = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        g.list_versions(&g_a.name, "sample"),
+    )
+    .await
+    .expect("resolution must terminate (no infinite loop)")
+    .expect("ok");
+    assert_eq!(versions.len(), 1, "reachable leaf still served once");
+}
+
+#[tokio::test]
+async fn resolve_time_depth_bound_is_fail_closed() {
+    // outer -> inner -> leaf, but with max_depth = 1 the resolver stops before
+    // descending into `inner` (depth bound hit), serving nothing — fail-closed.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let leaf = seed_member(&pool, false).await;
+    let inner = seed_group(&pool).await;
+    let outer = seed_group(&pool).await;
+
+    seed_version(&pool, &mut blobs, leaf.id, "Sample", "1.0.0", "leaf").await;
+    repository_dao::add_group_member(&pool, inner.id, leaf.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 100)
+        .await
+        .unwrap();
+
+    // depth bound 1: outer's direct members are walked at depth 0; descending
+    // into `inner` would be depth 1 >= max ⇒ stop, fail-closed.
+    let g = group_repo_depth(&pool, blobs, user(&pool).await, 1);
+    assert!(
+        g.list_versions(&outer.name, "sample")
+            .await
+            .unwrap()
+            .is_empty(),
+        "depth bound stops descent (fail-closed)"
+    );
 }
 
 #[tokio::test]
