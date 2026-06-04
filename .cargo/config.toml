@@ -1,0 +1,5 @@
+# `cargo xtask <cmd>` runs the project task runner (xtask/). This replaces the
+# old Makefile + Justfile with a single Rust binary. `--quiet` keeps cargo's own
+# build chatter out of the way so the subcommand's streamed output is clean.
+[alias]
+xtask = "run --quiet --package xtask --"
