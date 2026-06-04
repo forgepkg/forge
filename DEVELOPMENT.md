@@ -33,15 +33,17 @@ The `cargo xtask` alias is wired up in [`.cargo/config.toml`](./.cargo/config.to
 ### Picking where Postgres comes from (`--db`)
 
 ```bash
-cargo xtask dev                # --db docker (default): docker-compose Postgres on :5433
-cargo xtask dev --db local     # host Postgres on :5432 (forge role+db auto-created)
+cargo xtask dev                # --db local (default): host Postgres on :5432 (forge role+db auto-created)
+cargo xtask dev --db docker    # self-contained docker-compose Postgres on :5433
 cargo xtask dev --db none      # assume the DB is already up; don't start one
 ```
 
-`--db local` points the server at a host Postgres on **:5432** (creating the
-`forge` role + `forge` database if missing) via `FORGE_DATABASE__URL`; versitygw
-(S3) still comes up via docker. `--db none` starts no infra at all. Run
-`cargo xtask help` for the full command list.
+By default (`--db local`) the server points at a host Postgres on **:5432**
+(creating the `forge` role + `forge` database if missing) via
+`FORGE_DATABASE__URL`; versitygw (S3) still comes up via docker. Use `--db
+docker` for a fully self-contained stack (Postgres on :5433) if you don't run a
+local PostgreSQL. `--db none` starts no infra at all. Run `cargo xtask help` for
+the full command list.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
 > automatically. A bootstrap admin **`admin` / `changeme`** is created (the server

@@ -92,9 +92,10 @@ fn print_help() {
 
 One-command dev:
   dev [--db local|docker|none]  Bring up infra, build the SPA, run forge-server.
-                                --db docker (default): docker-compose Postgres (:5433).
-                                --db local:  host Postgres on :5432 (role+db auto-created),
-                                             server pointed there via FORGE_DATABASE__URL.
+                                --db local (default): host Postgres on :5432
+                                             (forge role+db auto-created), server pointed
+                                             there via FORGE_DATABASE__URL.
+                                --db docker: docker-compose Postgres (:5433).
                                 --db none:   assume a DB is already up (no Postgres started).
                                 versitygw (S3) always comes up via docker unless --db none.
 
@@ -189,7 +190,9 @@ enum DbMode {
 
 fn parse_db_mode(rest: &[String]) -> Result<DbMode, String> {
     let mut i = 0;
-    let mut mode = DbMode::Docker;
+    // Default to the host's local Postgres (:5432); pass `--db docker` for the
+    // self-contained docker-compose DB, or `--db none` to use an already-running one.
+    let mut mode = DbMode::Local;
     while i < rest.len() {
         match rest[i].as_str() {
             "--db" => {

@@ -48,10 +48,12 @@ drive the feed with a real client.
 cargo xtask dev
 ```
 
-That one command brings up Postgres (host **:5433**) + an S3 gateway (**:7070**)
-via `docker-compose.yml`, builds the SPA, runs migrations, and starts the server
-on **http://localhost:3000**. A bootstrap admin **`admin` / `changeme`** is
-created on first run.
+That one command uses your **local Postgres on :5432** (creating the `forge`
+role + database if missing), brings up an S3 gateway (**:7070**) via
+`docker-compose.yml`, builds the SPA, runs migrations, and starts the server on
+**http://localhost:3000**. A bootstrap admin **`admin` / `changeme`** is created
+on first run. (Requires a running local PostgreSQL with permission to create the
+role/db; use `--db docker` if you don't have one — see below.)
 
 - **UI:** http://localhost:3000
 - **NuGet feed:** `http://localhost:3000/v3/{repo}/index.json`
@@ -64,11 +66,12 @@ cargo xtask seed
 # feed: http://localhost:3000/v3/nuget/index.json
 ```
 
-### Use a host Postgres instead of Docker
+### Choosing where Postgres comes from
 
 ```bash
-cargo xtask dev --db local   # host Postgres on :5432 (forge role+db auto-created)
-cargo xtask dev --db none    # assume DB + S3 are already up
+cargo xtask dev              # default: host Postgres on :5432 (forge role+db auto-created)
+cargo xtask dev --db docker  # self-contained docker-compose Postgres on :5433
+cargo xtask dev --db none    # assume the DB is already up; don't start one
 ```
 
 ### Run via the Docker image
