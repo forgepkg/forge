@@ -150,6 +150,57 @@ async fn connect_migrated(db_url: &str) -> PgPool {
     pool
 }
 
+/// A [`Migrator`] over the workspace `migrations/` dir, optionally truncated to
+/// migrations with `version <= target`.
+async fn migrator_up_to(target: Option<i64>) -> sqlx::migrate::Migrator {
+    let mut m = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations"
+    )))
+    .await
+    .expect("load migrations");
+    if let Some(t) = target {
+        let subset: Vec<_> = m.iter().filter(|mig| mig.version <= t).cloned().collect();
+        m.migrations = std::borrow::Cow::Owned(subset);
+    }
+    m
+}
+
+/// `0007_rbac_migrate.sql` (the behavior-preserving data migration) carries
+/// version 7; bringing a DB up to 6 leaves the RBAC schema present but inert,
+/// exactly the state an upgrading slice-1 deployment is in before 0007 runs.
+const RBAC_MIGRATE_VERSION: i64 = 7;
+
+/// Bring a fresh DB up to the pre-RBAC-data schema (migrations `0001..0006`),
+/// run `seed` to inject slice-1-shaped rows (users with `is_admin`, repos with
+/// `anonymous_read`), then run the remaining migrations (`0007`). Because
+/// `app_user` is **non-empty** when `0007` runs, the data migration detects an
+/// UPGRADE and preserves slice-1 open-access behavior — faithfully reproducing
+/// what an upgrading deployment experiences, end-to-end through a real server.
+async fn connect_migrated_upgrade<F, Fut>(db_url: &str, seed: F) -> PgPool
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(db_url)
+        .await
+        .expect("connect fresh db");
+    migrator_up_to(Some(RBAC_MIGRATE_VERSION - 1))
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0006");
+    seed(pool.clone()).await;
+    migrator_up_to(None)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0007 (upgrade)");
+    pool
+}
+
 async fn blob_store() -> BlobStore {
     let endpoint = s3_endpoint().await.to_string();
     let store = BlobStore::new(S3Config {
@@ -372,6 +423,26 @@ impl StackBuilder {
     pub async fn start(self) -> TestServer {
         let db_url = fresh_database().await;
         let pool = connect_migrated(&db_url).await;
+        self.serve(db_url, pool, true).await
+    }
+
+    /// Boot a stack over a DB that was migrated as an **upgrade** from a slice-1
+    /// deployment: migrations `0001..0006` run, then `seed` injects slice-1-shaped
+    /// rows (users with `is_admin`, repos with `anonymous_read`) while RBAC is
+    /// still inert, then `0007` runs and — seeing a non-empty `app_user` — detects
+    /// an upgrade and preserves slice-1 open access. Used by the
+    /// UPGRADE-PRESERVES-BEHAVIOR e2e scenario.
+    ///
+    /// `seed` receives a pool over the upgrading DB. The bootstrap admin is still
+    /// created normally afterwards (and additionally inherits the `admin` role via
+    /// the now-applied migration).
+    pub async fn start_upgrade_seeded<F, Fut>(self, seed: F) -> TestServer
+    where
+        F: FnOnce(PgPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let db_url = fresh_database().await;
+        let pool = connect_migrated_upgrade(&db_url, seed).await;
         self.serve(db_url, pool, true).await
     }
 
@@ -713,6 +784,28 @@ impl TestServer {
             .unwrap()
     }
 
+    /// Grant the built-in `anonymous` role `read` on `repo` directly in the DB,
+    /// mirroring the §12.4 data migration that converts the slice-1
+    /// `anonymous_read` flag into an anonymous-role grant. Under fine-grained
+    /// RBAC, anonymous read flows through this grant (not the column), so a test
+    /// that wants an anonymously-readable repo creates it with
+    /// `anonymous_read: true` **and** calls this. Done before any anonymous
+    /// request, so the (cold) anonymous cache entry loads the grant on first use.
+    pub async fn grant_anonymous_read(&self, repo: &str) {
+        let repo_id = forge_db::repository_dao::find_repository_by_name(&self.pool, repo)
+            .await
+            .expect("repo lookup")
+            .expect("repo exists")
+            .id;
+        let anon_role = forge_db::authz_dao::role_id_by_name(&self.pool, "anonymous")
+            .await
+            .expect("role lookup")
+            .expect("anonymous role seeded");
+        forge_db::authz_dao::add_grant(&self.pool, anon_role, Some(repo_id), "read", None)
+            .await
+            .expect("add anonymous read grant");
+    }
+
     /// Push a `.nupkg` to a hosted repo via the NuGet multipart PUT endpoint,
     /// authenticating with the admin API key.
     pub async fn push_nupkg(&self, repo: &str, bytes: Vec<u8>) -> reqwest::Response {
@@ -740,6 +833,174 @@ impl TestServer {
             ))
             .basic_auth(&u, Some(&p))
             .json(&serde_json::json!({"member": member, "priority": priority}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    // ── §12.4 RBAC admin helpers (Phase 7 e2e) ───────────────────────────────
+
+    /// Create a non-admin user via the admin API and return its numeric id.
+    pub async fn create_user(&self, username: &str, password: &str) -> i64 {
+        let (u, p) = self.admin_basic();
+        let body: serde_json::Value = self
+            .client()
+            .post(format!("{}/admin/users", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({
+                "username": username, "password": password, "is_admin": false
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["id"].as_i64().expect("created user id")
+    }
+
+    /// Issue an API token for `user_id`, optionally with a per-token `scope`
+    /// (`{"actions":[..],"repositories":[..]}`). Returns the plaintext secret.
+    pub async fn issue_token(&self, user_id: i64, scope: Option<serde_json::Value>) -> String {
+        let (u, p) = self.admin_basic();
+        let mut body = serde_json::json!({"name": "e2e"});
+        if let Some(s) = scope {
+            body["scope"] = s;
+        }
+        let resp: serde_json::Value = self
+            .client()
+            .post(format!("{}/admin/users/{user_id}/tokens", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        resp["token"].as_str().expect("plaintext token").to_string()
+    }
+
+    /// Create a role with the given name via the admin API; returns its id.
+    pub async fn create_role(&self, name: &str) -> i64 {
+        let (u, p) = self.admin_basic();
+        let body: serde_json::Value = self
+            .client()
+            .post(format!("{}/admin/roles", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"name": name}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["id"].as_i64().expect("created role id")
+    }
+
+    /// Add a grant `(repository|ANY, action, selector?)` to a role. `repository`
+    /// `None` ⇒ an ANY-repo (wildcard) grant. Returns the HTTP response so callers
+    /// can assert on the status.
+    pub async fn add_grant(
+        &self,
+        role_id: i64,
+        repository: Option<&str>,
+        action: &str,
+        selector_id: Option<i64>,
+    ) -> reqwest::Response {
+        let (u, p) = self.admin_basic();
+        let mut body = serde_json::json!({"action": action});
+        if let Some(r) = repository {
+            body["repository"] = serde_json::json!(r);
+        }
+        if let Some(s) = selector_id {
+            body["selector_id"] = serde_json::json!(s);
+        }
+        self.client()
+            .put(format!("{}/admin/roles/{role_id}/grants", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Assign `role_id` to `user_id` via the admin API.
+    pub async fn assign_role(&self, user_id: i64, role_id: i64) -> reqwest::Response {
+        let (u, p) = self.admin_basic();
+        self.client()
+            .put(format!("{}/admin/users/{user_id}/roles", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"role_id": role_id}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Look up the numeric id of a role by name (built-in or otherwise).
+    pub async fn role_id(&self, name: &str) -> i64 {
+        forge_db::authz_dao::role_id_by_name(&self.pool, name)
+            .await
+            .expect("role lookup")
+            .expect("role exists")
+    }
+
+    /// Create a content selector with include/exclude globs; returns its id.
+    pub async fn create_content_selector(
+        &self,
+        name: &str,
+        includes: &[&str],
+        excludes: &[&str],
+    ) -> i64 {
+        let (u, p) = self.admin_basic();
+        let body: serde_json::Value = self
+            .client()
+            .post(format!("{}/admin/content-selectors", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({
+                "name": name,
+                "includes": includes,
+                "excludes": excludes,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["id"].as_i64().expect("created selector id")
+    }
+
+    /// GET `/v3/{repo}/index.json` authenticating with an API token; returns the
+    /// HTTP status (the repo-level read gate's verdict).
+    pub async fn read_index_with_token(&self, repo: &str, token: &str) -> reqwest::StatusCode {
+        self.client()
+            .get(format!("{}/v3/{repo}/index.json", self.base_url))
+            .header("X-NuGet-ApiKey", token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Push a `.nupkg` to `repo` authenticating with the given API token (rather
+    /// than the admin token), returning the HTTP response. Used to probe the
+    /// write gate for a scoped / role-limited token.
+    pub async fn push_nupkg_with_token(
+        &self,
+        repo: &str,
+        token: &str,
+        bytes: Vec<u8>,
+    ) -> reqwest::Response {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name("package.nupkg")
+            .mime_str("application/octet-stream")
+            .unwrap();
+        let form = reqwest::multipart::Form::new().part("package", part);
+        self.client()
+            .put(format!("{}/v3/{repo}/package", self.base_url))
+            .header("X-NuGet-ApiKey", token)
+            .multipart(form)
             .send()
             .await
             .unwrap()

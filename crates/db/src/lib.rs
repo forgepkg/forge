@@ -8,6 +8,7 @@
 mod pool;
 
 pub mod asset_dao;
+pub mod authz_dao;
 pub mod blob_dao;
 pub mod component_dao;
 pub mod download_dao;

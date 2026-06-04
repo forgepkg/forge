@@ -4,6 +4,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use forge_db::authz_dao;
 use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use serde::{Deserialize, Serialize};
@@ -77,13 +78,31 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         body.is_admin,
         body.active,
     );
-    match user_dao::insert_user(&state.pool, new).await {
-        Ok(u) => (StatusCode::CREATED, Json(UserView::from(&u))).into_response(),
+    let u = match user_dao::insert_user(&state.pool, new).await {
+        Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "username already exists").into_response()
+            return (StatusCode::CONFLICT, "username already exists").into_response();
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+
+    // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a brand
+    // new authenticated user must inherit the `authenticated` role *now*, not
+    // only at the next boot when `ensure_legacy_rbac` re-runs — otherwise a freshly
+    // created user would silently lose the slice-1 "read/write everywhere"
+    // behavior until a restart. Fail-closed installs leave the flag false and skip
+    // this. Idempotent.
+    match authz_dao::assign_authenticated_if_legacy_open(&state.pool, u.id).await {
+        Ok(true) => {
+            // No cached effective set should exist for a just-created id, but
+            // invalidate defensively in case the id was reused within a TTL window.
+            forge_core::authz::cache::invalidate_user(&state.cache, u.id).await;
+        }
+        Ok(false) => {}
+        Err(e) => return db_error(e),
     }
+
+    (StatusCode::CREATED, Json(UserView::from(&u))).into_response()
 }
 
 /// `DELETE /admin/users/{id}`

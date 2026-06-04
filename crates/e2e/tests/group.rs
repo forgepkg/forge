@@ -138,6 +138,13 @@ async fn mixed_anon_group_filters_members() {
     assert_eq!(srv.add_member("mgrp", "m-pub", 10).await.status(), 201);
     assert_eq!(srv.add_member("mgrp", "m-priv", 20).await.status(), 201);
 
+    // §12.4 RBAC: anonymous read flows through anonymous-role grants (what the
+    // data migration converts the slice-1 anonymous_read flag into). Grant the
+    // group and the *public* member only — `m-priv` is deliberately ungranted,
+    // so the identity-aware group filter hides it from the anonymous caller.
+    srv.grant_anonymous_read("mgrp").await;
+    srv.grant_anonymous_read("m-pub").await;
+
     assert_eq!(
         srv.push_nupkg("m-pub", make_nupkg(id, "1.0.0"))
             .await

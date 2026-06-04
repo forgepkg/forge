@@ -33,7 +33,6 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
-use forge_core::auth::authz::can_read;
 use forge_core::auth::principal::Principal;
 use forge_core::repo::SearchParams;
 use forge_db::model::{RepoKind, Repository};
@@ -140,7 +139,7 @@ pub async fn search_packages(
                 continue;
             }
         }
-        if !can_read(&principal, repo).await {
+        if !state.authz.can_read(&principal, repo).await {
             continue;
         }
         let ops = match state.read_ops_for(repo, principal) {
@@ -259,7 +258,7 @@ pub async fn package_detail(
     };
 
     // Slice-1 read authz: a denied caller is anonymous/unauthenticated → 401.
-    if !can_read(&principal, &repo).await {
+    if !state.authz.can_read(&principal, &repo).await {
         return match principal {
             Principal::User { .. } => (StatusCode::FORBIDDEN, "forbidden").into_response(),
             _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),

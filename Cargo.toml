@@ -45,6 +45,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
 
+# Glob matching for RBAC content selectors (slice 12.4): compile a GlobSet once
+# per selector and match lowercased package names. Audited, standard choice.
+globset = { version = "0.4" }
+
 # Redis (optional)
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 

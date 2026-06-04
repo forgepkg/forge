@@ -1,7 +1,7 @@
 //! Data access for `repository` and `group_member`.
 
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 
 use crate::model::Repository;
 
@@ -229,6 +229,127 @@ pub async fn add_group_member(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Outcome of a guarded group-member insert ([`add_group_member_checked`]).
+///
+/// The guard runs **before** the insert inside one transaction so a rejected
+/// edge is never persisted. `Added` is the only success; the other variants are
+/// fail-closed rejections the admin API maps to HTTP errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddMemberOutcome {
+    /// The edge was inserted.
+    Added,
+    /// Adding `(group_id -> member_id)` would create a cycle in the group graph
+    /// (`group_id` is reachable from `member_id`), so the edge was rejected.
+    WouldCycle,
+    /// Adding the edge would create a nesting path deeper than `max_depth`.
+    TooDeep,
+    /// An identical `(group_id, member_id)` edge (or `priority`) already exists.
+    Duplicate,
+}
+
+/// Add a member to a group **with cycle + depth guards**, atomically.
+///
+/// Nested-group members are allowed (a member may itself be a group), but the
+/// resulting graph must stay a DAG within a bounded depth. The whole check +
+/// insert runs in **one transaction** that first takes a row-level lock
+/// (`SELECT ... FOR UPDATE`) on the **group's** `repository` row. That lock
+/// serializes concurrent edge mutations *touching this group* across instances
+/// without any `pg_advisory_*` lock, closing the check-then-insert race: two
+/// concurrent inserts that would each individually be acyclic but jointly form a
+/// cycle cannot both pass, because they contend on the same locked row.
+///
+/// The guard is a recursive CTE over `group_member`: starting from `member_id`
+/// it walks `member -> member` edges (i.e. descends into nested groups). Adding
+/// `(group_id -> member_id)` closes a cycle **iff `group_id` is reachable from
+/// `member_id`**. The same walk bounds depth: if the deepest reachable path from
+/// `member_id` plus the new edge would exceed `max_depth`, the edge is rejected.
+/// `max_depth` counts edges on a path (a direct hosted/proxy member is depth 1).
+///
+/// Returns the [`AddMemberOutcome`]; a unique-constraint violation surfaces as
+/// [`AddMemberOutcome::Duplicate`] rather than a raw `sqlx::Error`.
+pub async fn add_group_member_checked(
+    pool: &PgPool,
+    group_id: i64,
+    member_id: i64,
+    priority: i32,
+    max_depth: i32,
+) -> sqlx::Result<AddMemberOutcome> {
+    let mut tx = pool.begin().await?;
+    let conn = tx.acquire().await?;
+
+    // Serialize group-graph edits touching this group across instances. Group
+    // edits are rare, so a per-group row lock is cheap and race-free — no
+    // pg_advisory lock. The selected value is unused; the lock is the point.
+    let _locked: i64 = sqlx::query_scalar!(
+        r#"SELECT id FROM repository WHERE id = $1 FOR UPDATE"#,
+        group_id,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    // Reachability + depth walk from the prospective member. `depth` counts the
+    // edges already below `member_id`; the new `(group -> member)` edge adds one
+    // more, so the new path length through `member_id` is `MAX(depth) + 1`.
+    // `path` only breaks an already-existing cycle defensively (a cycle should
+    // not exist, but a raw DB write could have created one); cycle *creation* is
+    // detected by `group_id` being reachable.
+    let row = sqlx::query!(
+        r#"
+        WITH RECURSIVE reach(id, depth, path) AS (
+            SELECT $1::bigint, 0, ARRAY[$1::bigint]
+          UNION ALL
+            SELECT gm.member_id, reach.depth + 1, reach.path || gm.member_id
+            FROM group_member gm
+            JOIN reach ON gm.group_id = reach.id
+            WHERE NOT gm.member_id = ANY(reach.path)
+              AND reach.depth < $3
+        )
+        SELECT
+            EXISTS (SELECT 1 FROM reach WHERE id = $2)        AS "would_cycle!",
+            COALESCE(MAX(depth), 0) + 1 > $3                  AS "too_deep!"
+        FROM reach
+        "#,
+        member_id,
+        group_id,
+        max_depth,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    if row.would_cycle {
+        // Drop the tx (rollback) without persisting anything.
+        return Ok(AddMemberOutcome::WouldCycle);
+    }
+    if row.too_deep {
+        return Ok(AddMemberOutcome::TooDeep);
+    }
+
+    let insert = sqlx::query!(
+        r#"
+        INSERT INTO group_member (group_id, member_id, priority)
+        VALUES ($1, $2, $3)
+        "#,
+        group_id,
+        member_id,
+        priority,
+    )
+    .execute(&mut *conn)
+    .await;
+
+    match insert {
+        Ok(_) => {
+            tx.commit().await?;
+            Ok(AddMemberOutcome::Added)
+        }
+        Err(e) if is_unique_violation(&e) => Ok(AddMemberOutcome::Duplicate),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
 /// Remove a member from a group. Returns whether a row was deleted.

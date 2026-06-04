@@ -108,6 +108,36 @@ pub async fn revoke_token(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
+/// Set (or clear) a token's per-token privilege `scope` jsonb (§12.4 Phase 6).
+///
+/// `scope = None` clears the column (the token then inherits its owner's full
+/// effective set); `Some(value)` stores the raw jsonb (the caller validates its
+/// shape against [`forge_core`'s `TokenScope`] before persisting). Only an
+/// **unrevoked** token is updated — scoping a revoked token is a no-op. Returns
+/// `true` iff a row was updated.
+///
+/// The token `scope` is read outside the per-user effective-set cache (the seam
+/// loads it per request and intersects post-cache), so a scope change needs **no
+/// cache invalidation** — the next request reads the new value directly.
+pub async fn set_token_scope(
+    pool: &PgPool,
+    id: i64,
+    scope: Option<&serde_json::Value>,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE token
+        SET scope = $2
+        WHERE id = $1 AND revoked_at IS NULL
+        "#,
+        id,
+        scope,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Update a token's `last_used_at` to `now()`.
 pub async fn touch_last_used(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     sqlx::query!(

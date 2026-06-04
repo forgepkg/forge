@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use forge_cache::Cache;
+use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
 use forge_core::format::Format;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
@@ -49,6 +50,9 @@ pub struct AppState {
     pub cas: Cas,
     /// Two-tier read cache (L1 always; L2 Redis when configured).
     pub cache: Cache,
+    /// Authorization decision service (§12.4 seam): every read/write/admin gate
+    /// routes through this.
+    pub authz: Authz,
     /// Package-format registry. Slice 1 ships a single NuGet format; the map is
     /// keyed by `Format::id()` so additional formats slot in without a refactor.
     pub formats: Arc<FormatRegistry>,
@@ -118,11 +122,14 @@ impl AppState {
             _ => None,
         };
 
+        let authz = Authz::new(pool.clone(), cache.clone());
+
         AppState {
             pool,
             blob_store,
             cas,
             cache,
+            authz,
             formats: Arc::new(FormatRegistry::new(nuget)),
             config: Arc::new(config),
             oidc,
@@ -169,6 +176,8 @@ impl AppState {
                 self.pool.clone(),
                 principal,
                 Arc::new(self.member_factory()),
+                self.authz.clone(),
+                self.config.groups.max_nesting_depth.max(0) as u32,
             ))),
         }
     }

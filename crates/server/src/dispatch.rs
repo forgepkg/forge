@@ -22,7 +22,6 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::authz::{can_read, can_write};
 use forge_core::auth::principal::Principal;
 use forge_core::repo::RepoKind;
 use forge_db::model::Repository;
@@ -105,10 +104,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     // Authorization gate (before any handler runs).
     if is_write(&method) {
-        if !can_write(&principal, &repo).await {
+        if !state.authz.can_write(&principal, &repo).await {
             return authz_denied(&principal);
         }
-    } else if !can_read(&principal, &repo).await {
+    } else if !state.authz.can_read(&principal, &repo).await {
         return authz_denied(&principal);
     }
 

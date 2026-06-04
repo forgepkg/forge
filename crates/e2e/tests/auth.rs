@@ -52,6 +52,7 @@ async fn anon_mode_all_allows_anonymous_read_repos() {
         serde_json::json!({"name": "all-pub", "kind": "hosted", "anonymous_read": true}),
     )
     .await;
+    srv.grant_anonymous_read("all-pub").await;
     srv.create_repo(
         serde_json::json!({"name": "all-priv", "kind": "hosted", "anonymous_read": false}),
     )
@@ -91,6 +92,7 @@ async fn anon_mode_allowlist_gates_by_ip() {
         serde_json::json!({"name": "al-repo", "kind": "hosted", "anonymous_read": true}),
     )
     .await;
+    srv.grant_anonymous_read("al-repo").await;
 
     // Allowed IP → 200.
     let resp = client

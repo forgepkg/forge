@@ -5,8 +5,9 @@
 //!   [`PrincipalSource`] chain that turns request headers into a principal.
 //! * [`client_ip`] — client-IP resolution behind trusted proxies and the
 //!   anonymous-access policy ([`AnonPolicy`]).
-//! * [`authz`] — the coarse Slice-1 authorization seam (`can_read` /
-//!   `can_write` / `can_admin`), the single extension point §12.4 replaces.
+//! * [`authz`] — the authorization seam: the [`Authz`] service whose
+//!   `can_read` / `can_write` / `can_admin` methods are the single decision
+//!   point every gate routes through (§12.4).
 //! * [`provider`] / [`chain`] — the pluggable, ordered [`AuthProvider`] chain
 //!   for the password-style auth path (slice 12.3). The local-password and
 //!   upstream-basic providers plug in here; OIDC stays its own interactive
@@ -26,7 +27,7 @@ pub mod session_source;
 pub mod token;
 pub mod upstream_basic;
 
-pub use authz::{can_admin, can_read, can_write};
+pub use authz::Authz;
 pub use chain::{map_identity_to_principal, provision_and_map, Chain, ChainOutcome};
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
 pub use cred_cache::{
