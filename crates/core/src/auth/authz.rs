@@ -70,8 +70,17 @@ impl Authz {
 
     /// May `principal` read (download / list / search) `repo`?
     ///
+    /// `repo.anonymous_read` is a first-class toggle (exposed by the admin
+    /// API/UI and honored independently of RBAC grants): when set, the anonymous
+    /// principal may read the repo. This preserves slice-1 semantics for repos
+    /// created with `anonymous_read = true` even on a fresh, default-deny RBAC
+    /// install. RBAC grants are still consulted for everything else.
+    ///
     /// Fail-closed: an evaluation error logs and denies.
     pub async fn can_read(&self, principal: &Principal, repo: &Repository) -> bool {
+        if repo.anonymous_read && matches!(principal, Principal::Anonymous { .. }) {
+            return true;
+        }
         self.allows(principal, Action::Read, repo.id).await
     }
 
@@ -115,6 +124,13 @@ impl Authz {
     /// (the caller returns 404, not 403, to avoid leaking existence). An
     /// evaluation error fails closed to [`PackageFilter::DenyAll`].
     pub async fn package_filter(&self, principal: &Principal, repo: &Repository) -> PackageFilter {
+        // `anonymous_read` grants the anonymous principal full package visibility
+        // (mirrors the repo-level fast-path in `can_read`); without this, an
+        // anon-readable repo's gate would pass but every package would be
+        // filtered out on a default-deny RBAC install.
+        if repo.anonymous_read && matches!(principal, Principal::Anonymous { .. }) {
+            return PackageFilter::AllowAll;
+        }
         match self.effective(principal).await {
             Ok(eff) => eff.package_filter(repo.id),
             Err(()) => PackageFilter::DenyAll,
