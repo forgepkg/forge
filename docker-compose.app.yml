@@ -1,0 +1,36 @@
+# Run the BUILT single-container image against the dev Postgres + versitygw.
+#
+# This composes ON TOP of the base docker-compose.yml (db + s3), so bring both:
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up --build
+# or via the task runner:
+#   cargo xtask docker-build && cargo xtask docker-run
+#
+# The `app` service builds the root Dockerfile (web SPA + Rust server in one
+# image) and serves the API + SPA on http://localhost:3000. It talks to the
+# compose `db` (5432 inside the network) and `s3` (versitygw on :7070) services
+# — note the IN-NETWORK ports/hostnames differ from the host-published ones.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: envisia-forge:latest
+    depends_on:
+      db:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+    environment:
+      # Override the baked, secret-free defaults with the in-network coordinates
+      # of the compose db + versitygw services.
+      FORGE_DATABASE__URL: "postgres://forge:forge@db:5432/forge"
+      FORGE_S3__ENDPOINT: "http://s3:7070"
+      FORGE_S3__BUCKET: "forge"
+      FORGE_S3__ACCESS_KEY: "minioadmin"
+      FORGE_S3__SECRET_KEY: "minioadmin"
+      FORGE_S3__FORCE_PATH_STYLE: "true"
+      FORGE_SERVER__PUBLIC_BASE_URL: "http://localhost:3000"
+      RUST_LOG: "info"
+    ports:
+      - "3000:3000"

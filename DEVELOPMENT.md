@@ -309,3 +309,45 @@ Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
 
 Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
+
+## Single-container Docker image
+
+The root `Dockerfile` is a multi-stage build that packages the TanStack Router
+SPA **and** the Rust `forge-server` into ONE image. The server serves the API
+and the static SPA on a single port (no Node in prod):
+
+1. **web** — Node 22 + pnpm (corepack): `pnpm install --frozen-lockfile` +
+   `pnpm run build` → `web/dist`.
+2. **builder** — `rust:1.95` with cargo-chef for dependency-layer caching;
+   `cargo build --release -p forge-server` with `SQLX_OFFLINE=true` against the
+   committed `.sqlx/` cache (no DB needed at build time).
+3. **runtime** — `debian:bookworm-slim` (+ `ca-certificates`) running as an
+   unprivileged `forge` user, with the binary, the built SPA at `/app/web/dist`,
+   the `migrations/` dir, and a baked secret-free base config at `/app/forge.toml`
+   (migrations are also embedded into the binary via `sqlx::migrate!`).
+
+```bash
+cargo xtask docker-build       # docker build -t envisia-forge:latest .
+cargo xtask docker-run         # run the image against the compose db + s3 on :3000
+```
+
+`docker-run` composes `docker-compose.yml` (db + versitygw) with
+`docker-compose.app.yml` (the `app` service) and serves API + SPA on
+http://localhost:3000.
+
+**Runtime configuration.** The baked `forge.toml` carries non-secret defaults
+(`bind 0.0.0.0:3000`, SPA at `/app/web/dist`, `anonymous_mode=all`,
+`allow_password_basic`, bootstrap admin `admin/changeme`). Override anything via
+`FORGE_*` env vars (double-underscore nesting). Required at runtime (no safe
+default):
+
+| Env var | Example |
+| --- | --- |
+| `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
+| `FORGE_S3__ENDPOINT` | `http://s3:7070` |
+| `FORGE_S3__BUCKET` | `forge` |
+| `FORGE_S3__ACCESS_KEY` | `…` |
+| `FORGE_S3__SECRET_KEY` | `…` |
+
+Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
+URLs) and `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` (change the seeded password).

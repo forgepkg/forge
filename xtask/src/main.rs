@@ -129,9 +129,11 @@ Rust build & quality:
   prepare-check Migrate, then verify the committed .sqlx/ cache is in sync (CI's drift guard).
   clean         Remove build artifacts (cargo clean).
 
-Docker image:
-  docker-build  Build the application Docker image (uses ./Dockerfile).
-  docker-run    Run the built application image.
+Docker image (single container: web SPA + Rust server):
+  docker-build  Build the application image from ./Dockerfile (multi-stage:
+                pnpm builds the SPA, cargo builds forge-server release).
+  docker-run    Run the built image against the dev Postgres + versitygw
+                (docker-compose.yml + docker-compose.app.yml), API + SPA on :3000.
 
   help          Show this help.
 "#
@@ -494,8 +496,12 @@ fn clean() -> Result<(), String> {
     Cmd::new("cargo").arg("clean").run()
 }
 
-// ── Docker image (Dockerfile arrives in phase 2) ─────────────────────────────
+// ── Docker image (single-container web SPA + Rust server) ────────────────────
 
+/// Build the single application image from the root Dockerfile (multi-stage:
+/// pnpm builds the SPA, cargo builds forge-server release, slim runtime bundles
+/// both). The build is self-contained (SQLX_OFFLINE inside the image) and does
+/// not need a live DB.
 fn docker_build() -> Result<(), String> {
     Cmd::new("docker")
         .args([
@@ -509,15 +515,23 @@ fn docker_build() -> Result<(), String> {
         .run()
 }
 
+/// Run the built image against the dev Postgres + versitygw. Composes the base
+/// docker-compose.yml (db + s3) with docker-compose.app.yml (the app service),
+/// building the image if needed. Serves the API + SPA on http://localhost:3000.
 fn docker_run() -> Result<(), String> {
+    compose_app(&["up", "--build"]).run()
+}
+
+/// `docker compose -f docker-compose.yml -f docker-compose.app.yml <sub...>`:
+/// the base infra stack plus the built application image.
+fn compose_app(sub: &[&str]) -> Cmd {
     Cmd::new("docker")
         .args([
-            "run",
-            "--rm",
-            "-it",
-            "-p",
-            "3000:3000",
-            "envisia-forge:latest",
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.app.yml",
         ])
-        .run()
+        .args(sub)
 }

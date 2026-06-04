@@ -1,0 +1,39 @@
+# Keep the Docker build context small + reproducible. The image is built from
+# committed sources only; everything regenerated inside the build (Rust target,
+# node_modules, the SPA bundle) is excluded so a dirty local tree can't leak in.
+
+# Rust build artifacts (the builder stage runs its own `cargo build`).
+/target
+**/*.rs.bk
+
+# Node / pnpm (the web build stage runs `pnpm install` fresh from the lockfile).
+**/node_modules
+# Locally-built SPA output — the node stage rebuilds web/dist from source.
+web/dist
+web/.vite
+web/.tanstack
+
+# Playwright / test artifacts.
+web/test-results
+web/playwright-report
+web/blob-report
+web/.last-run.json
+web/e2e/.harness-facts.json
+
+# VCS + local env / editor cruft (secrets must never enter the image layers).
+.git
+.gitignore
+.github
+.gitlab-ci.yml
+.env
+.env.*
+forge.toml
+*.local
+.DS_Store
+
+# Docs / compose / the Dockerfile itself aren't needed inside the build.
+*.md
+docs
+docker-compose*.yml
+Dockerfile
+.dockerignore
