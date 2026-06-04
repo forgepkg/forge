@@ -238,10 +238,13 @@ async fn token_scope_cannot_widen_owner() {
 async fn anonymous_role_grant_enables_anon_read() {
     let srv = StackBuilder::default().anon(AnonMode::All).start().await;
 
+    // Created with anonymous_read = FALSE so the ONLY path to anonymous access
+    // is the RBAC anonymous-role grant — this isolates the grant path from the
+    // `anonymous_read` fast-path (asserted separately at the end).
     for repo in ["anon-pub", "anon-priv"] {
         assert_eq!(
             srv.create_repo(
-                serde_json::json!({"name": repo, "kind": "hosted", "anonymous_read": true})
+                serde_json::json!({"name": repo, "kind": "hosted", "anonymous_read": false})
             )
             .await
             .status(),
@@ -280,6 +283,29 @@ async fn anonymous_role_grant_enables_anon_read() {
         resp.status(),
         401,
         "a repo with no anonymous grant denies anonymous (401)"
+    );
+
+    // The `anonymous_read` toggle grants anonymous read directly (a first-class
+    // fast-path independent of RBAC grants): a repo with anonymous_read=true and
+    // NO anonymous-role grant is still anon-readable.
+    assert_eq!(
+        srv.create_repo(
+            serde_json::json!({"name": "anon-flag", "kind": "hosted", "anonymous_read": true})
+        )
+        .await
+        .status(),
+        201
+    );
+    let resp = srv
+        .client()
+        .get(format!("{}/v3/anon-flag/index.json", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "anonymous_read=true grants anonymous read without an RBAC grant (fast-path)"
     );
 }
 
