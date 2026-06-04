@@ -1,0 +1,12 @@
+packages:
+  - '.'
+
+# Supply-chain hardening: hold back package versions published within the last
+# 7 days (7 * 24 * 60 = 10080 minutes). Newly published versions are a common
+# vector for compromised releases; the cooldown gives time for detection.
+minimumReleaseAge: 10080
+
+# pnpm blocks dependency install/build scripts by default. List only the
+# packages that legitimately need to run a build script during install.
+onlyBuiltDependencies:
+  - esbuild

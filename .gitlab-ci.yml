@@ -93,20 +93,25 @@ web:
   stage: web
   needs: []
   image: node:22
+  variables:
+    PNPM_HOME: "$CI_PROJECT_DIR/.pnpm-store"
   cache:
     key:
       files:
-        - web/package-lock.json
+        - web/pnpm-lock.yaml
       prefix: "web"
     paths:
-      - web/node_modules/
+      - .pnpm-store/
   before_script:
+    - corepack enable
+    - corepack prepare pnpm@11.5.0 --activate
     - cd web
+    - pnpm config set store-dir "$PNPM_HOME"
   script:
-    - npm ci
-    - npm run tsc
-    - npm run test
-    - npm run build
+    - pnpm install --frozen-lockfile
+    - pnpm run tsc
+    - pnpm run test
+    - pnpm run build
   artifacts:
     paths:
       - web/dist/
@@ -175,9 +180,10 @@ web-e2e:
     - docker pull versity/versitygw:v1.4.1
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     - . "$HOME/.cargo/env"
+    - corepack enable && corepack prepare pnpm@11.5.0 --activate
   script:
-    - cd web && npm ci && cd ..
-    - . "$HOME/.cargo/env" && cd web && npm run e2e
+    - cd web && pnpm install --frozen-lockfile && cd ..
+    - . "$HOME/.cargo/env" && cd web && pnpm run e2e
   artifacts:
     when: always
     paths:

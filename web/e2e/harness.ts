@@ -106,7 +106,7 @@ async function waitFor(
 
 /** Build the SPA into web/dist (the server serves this directory). */
 function buildSpa() {
-  run('npm', ['run', 'build'], { cwd: webDir })
+  run('pnpm', ['run', 'build'], { cwd: webDir })
 }
 
 /** Build the server binary once up front so the boot wait isn't a compile wait. */

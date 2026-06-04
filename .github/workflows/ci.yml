@@ -80,6 +80,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry + build artefacts
@@ -101,8 +105,10 @@ jobs:
       # sqlx cache drift guard (A1). Runs migrations against the live Postgres
       # service, then verifies the committed .sqlx/ dir matches the current
       # queries + schema. SQLX_OFFLINE is unset here so the check talks to the DB.
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+      - name: Install sqlx-cli (prebuilt, no source compile)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli@0.8.6
       - name: Run migrations
         env:
           SQLX_OFFLINE: ""
@@ -124,20 +130,25 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.0"
+          package_json_file: web/package.json
       - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: npm ci
-        run: npm ci
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install deps (frozen lockfile)
+        run: pnpm install --frozen-lockfile
       - name: Typecheck (tsc --noEmit)
-        run: npm run tsc
+        run: pnpm run tsc
       - name: Unit tests (Vitest)
-        run: npm run test
+        run: pnpm run test
       - name: Production build (vite build -> web/dist)
-        run: npm run build
+        run: pnpm run build
       - name: Upload built SPA
         uses: actions/upload-artifact@v4
         with:
@@ -162,6 +173,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Install .NET SDK (for the optional dotnet smoke test)
@@ -200,14 +215,23 @@ jobs:
       SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          df -h /
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.5.0"
+          package_json_file: web/package.json
       - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
         with:
@@ -222,14 +246,14 @@ jobs:
         run: |
           docker pull postgres:17
           docker pull versity/versitygw:v1.4.1
-      - name: npm ci
-        run: npm ci
+      - name: Install deps (frozen lockfile)
+        run: pnpm install --frozen-lockfile
         working-directory: web
       - name: Install Playwright browser (chromium)
-        run: npx playwright install --with-deps chromium
+        run: pnpm exec playwright install --with-deps chromium
         working-directory: web
       - name: Run Playwright e2e
-        run: npm run e2e
+        run: pnpm run e2e
         working-directory: web
       - name: Upload Playwright report
         if: always()

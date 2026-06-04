@@ -691,6 +691,22 @@ async fn preview_then_run_then_audit_endpoints() {
     let rid = repo_id(&srv.pool, repo).await;
     age_all_components(&srv.pool, rid, 2).await;
 
+    // Pin the schedule far in the future BEFORE arming the policy so the
+    // autonomous retention worker cannot claim this repo before the manual
+    // `preview` below. (Otherwise, on a slow CI runner, the worker's ~1s poll
+    // prunes the 3 eligible versions first, and preview then sees only the 2
+    // kept ones — flaky.) `set_policy`'s run-row upsert is ON CONFLICT DO
+    // NOTHING, so this future `next_run_at` survives arming; `trigger_run` below
+    // resets it to now() to drive the real pass deterministically.
+    sqlx::query(
+        "INSERT INTO retention_run (repository_id, next_run_at) VALUES ($1, now() + interval '1 day') \
+         ON CONFLICT (repository_id) DO UPDATE SET next_run_at = now() + interval '1 day'",
+    )
+    .bind(rid)
+    .execute(&srv.pool)
+    .await
+    .expect("pin retention_run schedule");
+
     assert_eq!(
         put_policy(
             &srv,

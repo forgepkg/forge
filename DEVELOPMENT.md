@@ -9,7 +9,8 @@ for S3).
 
 - **Docker** (for Postgres + versitygw, and for the test suites).
 - **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`).
-- **Node 22 + npm 10** (for the web UI in `web/`).
+- **Node 22 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
+  pinned `pnpm@11.5.0` from `web/package.json`).
 - *Optional:* the **.NET SDK** (`dotnet`) to drive the feed with a real client.
 - *Optional:* `sqlx-cli` (`cargo install sqlx-cli --no-default-features --features postgres,rustls`)
   only if you change SQL queries and need to regenerate the offline data.
@@ -52,13 +53,18 @@ API on the **same origin** with relative URLs. Auth today is token-paste (slice
 1 has no sessions yet): paste a repository token on the login screen; it is
 verified via `GET /admin/me` and stored in `localStorage`.
 
+The web project uses **pnpm** (pinned via `packageManager` in `web/package.json`)
+with a 7-day `minimumReleaseAge` cooldown (`web/pnpm-workspace.yaml`): pnpm will
+not install a dependency version published within the last week, a supply-chain
+hardening measure against freshly compromised releases.
+
 ### Production-like run (single origin)
 
 Build the UI first, then run the server — the build order matters because the
 server serves the built directory:
 
 ```bash
-make web     # npm ci && npm run build  -> web/dist/
+make web     # pnpm install --frozen-lockfile && pnpm run build  -> web/dist/
 make run     # forge-server serves web/dist at http://localhost:3000
 ```
 
@@ -85,8 +91,8 @@ a production API proxy.
 ```bash
 make web-test                  # Vitest + React Testing Library (unit/component)
 make web-e2e                   # Playwright e2e (needs Docker; builds the UI first)
-cd web && npm run tsc          # typecheck
-cd web && npm run e2e:install  # one-time: download the Playwright browser
+cd web && pnpm run tsc         # typecheck
+cd web && pnpm run e2e:install # one-time: download the Playwright browser
 ```
 
 The Playwright suite (`web/e2e/`) drives a **real `forge-server` serving the
@@ -94,8 +100,8 @@ built UI** against an isolated Postgres + versitygw stack (its own compose
 project + ports, see `web/e2e/docker-compose.e2e.yml`), brought up automatically
 in the suite's global setup. It covers single-origin serving, the SPA fallback,
 token sign-in, admin gating, creating a repo, and push-then-see-package. If
-Playwright can't download a browser in a restricted environment, `npm run
-e2e:list` still enumerates the specs and `npm run e2e:tsc` typechecks them.
+Playwright can't download a browser in a restricted environment, `pnpm run
+e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 
 > **Known limitation:** the admin UI routes reuse the `/admin/*` paths owned by
 > the admin REST API, so a **hard refresh / bookmark / deep-link** of an
