@@ -25,7 +25,7 @@ url = "postgres://forge:forge@db:5432/forge"
 
 [s3]
 # Placeholders — override the endpoint/keys/bucket via FORGE_S3__* at runtime.
-endpoint = "http://s3:7070"
+endpoint = "http://s3:8422"
 region = "us-east-1"
 bucket = "forge"
 access_key = "minioadmin"

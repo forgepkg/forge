@@ -49,7 +49,7 @@ cargo xtask dev
 ```
 
 That one command uses your **local Postgres on :5432** (creating the `forge`
-role + database if missing), brings up an S3 gateway (**:7070**) via
+role + database if missing), brings up an S3 gateway (**:8422**) via
 `docker-compose.yml`, builds the SPA, runs migrations, and starts the server on
 **http://localhost:8420**. A bootstrap admin **`admin` / `changeme`** is created
 on first run. (Requires a running local PostgreSQL with permission to create the
@@ -90,7 +90,7 @@ Or directly, against your own infra (configure with `FORGE_*` env vars, e.g.
 ```bash
 docker run --rm -p 8420:8420 \
   -e FORGE_DATABASE__URL=postgres://forge:forge@db:5432/forge \
-  -e FORGE_S3__ENDPOINT=http://s3:7070 -e FORGE_S3__BUCKET=forge \
+  -e FORGE_S3__ENDPOINT=http://s3:8422 -e FORGE_S3__BUCKET=forge \
   -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
   envisia-forge:latest
 ```

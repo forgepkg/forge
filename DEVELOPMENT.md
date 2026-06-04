@@ -21,7 +21,7 @@ for S3).
 cargo xtask dev
 ```
 
-`cargo xtask dev` starts Postgres (host port **5433**) + versitygw (**:7070**),
+`cargo xtask dev` starts Postgres (host port **5433**) + versitygw (**:8422**),
 waits for both to be healthy, builds the web SPA, then runs the server on
 **http://localhost:8420** using the checked-in [`forge.toml`](./forge.toml).
 Press **Ctrl-C** to stop the server; `cargo xtask down` stops the containers.
@@ -346,7 +346,7 @@ default):
 | Env var | Example |
 | --- | --- |
 | `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
-| `FORGE_S3__ENDPOINT` | `http://s3:7070` |
+| `FORGE_S3__ENDPOINT` | `http://s3:8422` |
 | `FORGE_S3__BUCKET` | `forge` |
 | `FORGE_S3__ACCESS_KEY` | `…` |
 | `FORGE_S3__SECRET_KEY` | `…` |

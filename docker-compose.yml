@@ -24,7 +24,7 @@ services:
   #
   # CLI reference (discovered via `docker run --rm versity/versitygw --help`):
   #   versitygw [global options] <backend-command> [backend options]
-  #   Global:  --port/-p <addr>  (default ":7070")
+  #   Global:  --port/-p <addr>  (default ":7070"; we use :8422)
   #            --access/-a <key>   (also ROOT_ACCESS_KEY_ID)
   #            --secret/-s <key>   (also ROOT_SECRET_ACCESS_KEY)
   #   Backend: posix <root-dir>
@@ -38,17 +38,17 @@ services:
   # Or with the AWS CLI against the endpoint:
   #   AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   #     aws s3 mb s3://forge \
-  #     --endpoint-url http://localhost:7070 \
+  #     --endpoint-url http://localhost:8422 \
   #     --region us-east-1
   s3:
     image: versity/versitygw:v1.4.1
-    command: ["--port", ":7070", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
+    command: ["--port", ":8422", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
     ports:
-      - "7070:7070"
+      - "8422:8422"
     volumes:
       - s3_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 7070 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 8422 || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10

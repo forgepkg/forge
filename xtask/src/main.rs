@@ -228,7 +228,7 @@ fn dev(rest: &[String]) -> Result<(), String> {
 
     match mode {
         DbMode::Docker => {
-            // Full docker-compose stack (Postgres :5433 + versitygw :7070).
+            // Full docker-compose stack (Postgres :5433 + versitygw :8422).
             up()?;
             web_build()?;
             run_server()

@@ -7,7 +7,7 @@
 #
 # The `app` service builds the root Dockerfile (web SPA + Rust server in one
 # image) and serves the API + SPA on http://localhost:8420. It talks to the
-# compose `db` (5432 inside the network) and `s3` (versitygw on :7070) services
+# compose `db` (5432 inside the network) and `s3` (versitygw on :8422) services
 # — note the IN-NETWORK ports/hostnames differ from the host-published ones.
 
 services:
@@ -25,7 +25,7 @@ services:
       # Override the baked, secret-free defaults with the in-network coordinates
       # of the compose db + versitygw services.
       FORGE_DATABASE__URL: "postgres://forge:forge@db:5432/forge"
-      FORGE_S3__ENDPOINT: "http://s3:7070"
+      FORGE_S3__ENDPOINT: "http://s3:8422"
       FORGE_S3__BUCKET: "forge"
       FORGE_S3__ACCESS_KEY: "minioadmin"
       FORGE_S3__SECRET_KEY: "minioadmin"

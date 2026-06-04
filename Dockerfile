@@ -106,7 +106,7 @@ ENV FORGE_CONFIG=/app/forge.toml \
 
 # Required at runtime (no safe default — must be supplied):
 #   FORGE_DATABASE__URL          postgres://user:pass@host:5432/forge
-#   FORGE_S3__ENDPOINT           http://s3:7070  (or a real S3 endpoint)
+#   FORGE_S3__ENDPOINT           http://s3:8422  (or a real S3 endpoint)
 #   FORGE_S3__BUCKET             forge
 #   FORGE_S3__ACCESS_KEY         <s3 access key>
 #   FORGE_S3__SECRET_KEY         <s3 secret key>

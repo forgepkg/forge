@@ -83,7 +83,7 @@ pub struct DatabaseConfig {
 /// `s3.*`
 #[derive(Debug, Clone, Deserialize)]
 pub struct S3Config {
-    /// S3 endpoint URL (e.g. `http://localhost:7070` for versitygw).
+    /// S3 endpoint URL (e.g. `http://localhost:8422` for versitygw).
     pub endpoint: String,
     /// AWS region (any value for versitygw; `us-east-1` is fine).
     #[serde(default = "default_region")]
