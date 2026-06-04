@@ -166,7 +166,7 @@ jobs:
     name: e2e
     runs-on: ubuntu-latest
     # Only run on pushes to main/master; skipping on every PR keeps CI fast.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/pnpm-web'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
 
     env:
       SQLX_OFFLINE: "true"
@@ -210,7 +210,7 @@ jobs:
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/pnpm-web'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     env:
       SQLX_OFFLINE: "true"
     steps:
