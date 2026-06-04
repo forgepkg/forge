@@ -1,0 +1,116 @@
+# envisia-forge
+
+A self-hosted **NuGet package registry** written in Rust. It speaks the NuGet
+**V3** protocol and supports the three repository types you expect from an
+enterprise registry:
+
+- **hosted** — push and restore your own `.nupkg` packages.
+- **proxy** — cache packages on demand from an upstream feed (e.g.
+  `api.nuget.org`), with an optional publication delay.
+- **group** — fan a single feed URL out across several member repos by priority.
+
+Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
+store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
+RBAC** (users, nested groups, roles, package/content selectors) with optional
+**OIDC / Microsoft Entra** browser login and a credential-forwarding auth chain.
+A **retention** engine reaps cold versions and garbage-collects dereferenced
+blobs. The admin + browse UI is a **TanStack Router SPA** served by the same Rust
+process on a single origin — there is no Node server in production.
+
+## Architecture
+
+A Cargo workspace of small crates plus the web SPA:
+
+| Crate (`crates/…`) | Package | Responsibility |
+| --- | --- | --- |
+| `db` | `forge-db` | PostgreSQL data access (sqlx), row models, DAOs. |
+| `storage` | `forge-storage` | CAS over S3, blob outbox / GC reconciler. |
+| `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
+| `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
+| `format-nuget` | `forge-nuget` | NuGet V3 protocol + `.nupkg`/`.nuspec` parsing. |
+| `server` | `forge-server` | Axum HTTP server: NuGet feed, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
+| `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
+| `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
+
+**Single-origin serving.** `forge-server` mounts the NuGet feed (`/v3`), the
+admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
+from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
+the same origin with relative URLs; no reverse proxy is required.
+
+## Quickstart
+
+Prerequisites: **Docker**, a **Rust** toolchain (pinned in `rust-toolchain.toml`),
+and **Node 22 + pnpm 11** (`corepack enable`). Optionally the **.NET SDK** to
+drive the feed with a real client.
+
+```bash
+cargo xtask dev
+```
+
+That one command brings up Postgres (host **:5433**) + an S3 gateway (**:7070**)
+via `docker-compose.yml`, builds the SPA, runs migrations, and starts the server
+on **http://localhost:3000**. A bootstrap admin **`admin` / `changeme`** is
+created on first run.
+
+- **UI:** http://localhost:3000
+- **NuGet feed:** `http://localhost:3000/v3/{repo}/index.json`
+
+Add demo data (anonymous-readable `nuget` repo + a pushed sample package) in a
+second terminal:
+
+```bash
+cargo xtask seed
+# feed: http://localhost:3000/v3/nuget/index.json
+```
+
+### Use a host Postgres instead of Docker
+
+```bash
+cargo xtask dev --db local   # host Postgres on :5432 (forge role+db auto-created)
+cargo xtask dev --db none    # assume DB + S3 are already up
+```
+
+### Run via the Docker image
+
+The root `Dockerfile` packages the SPA **and** the Rust server into one image
+(no Node in prod):
+
+```bash
+cargo xtask docker-build     # docker build -t envisia-forge:latest .
+cargo xtask docker-run       # run the image against the compose db + s3 on :3000
+```
+
+Or directly, against your own infra (configure with `FORGE_*` env vars, e.g.
+`FORGE_DATABASE__URL`, `FORGE_S3__ENDPOINT`/`__BUCKET`/`__ACCESS_KEY`/`__SECRET_KEY`):
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e FORGE_DATABASE__URL=postgres://forge:forge@db:5432/forge \
+  -e FORGE_S3__ENDPOINT=http://s3:7070 -e FORGE_S3__BUCKET=forge \
+  -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
+  envisia-forge:latest
+```
+
+### Point a `dotnet` client at it
+
+```bash
+dotnet nuget add source http://localhost:3000/v3/nuget/index.json -n forge
+dotnet nuget push -s forge -k <TOKEN> your.1.0.0.nupkg
+dotnet add package <PackageId>          # in a project
+```
+
+For a non-anonymous repo, pass `--username admin --password <TOKEN>
+--store-password-in-clear-text` to the source (the password is a **token**, not
+the user password).
+
+## Documentation
+
+- **[DEVELOPMENT.md](./DEVELOPMENT.md)** — full local-dev guide: every
+  `cargo xtask` command, configuration knobs, OIDC/Entra setup, the web UI dev
+  server, tests, and Docker packaging details.
+- **Design specs** — `docs/superpowers/specs/` (NuGet registry design;
+  auth-realms & workload-identity design) and implementation plans in
+  `docs/superpowers/plans/`.
+
+Run `cargo xtask help` for the complete command list.
