@@ -18,13 +18,30 @@ for S3).
 ## One command
 
 ```bash
-make dev
+cargo xtask dev
 ```
 
-`make dev` starts Postgres (host port **5433**) + versitygw (**:7070**), waits for
-both to be healthy, then runs the server on **http://localhost:3000** using the
-checked-in [`forge.toml`](./forge.toml). Press **Ctrl-C** to stop the server;
-`make down` stops the containers.
+`cargo xtask dev` starts Postgres (host port **5433**) + versitygw (**:7070**),
+waits for both to be healthy, builds the web SPA, then runs the server on
+**http://localhost:3000** using the checked-in [`forge.toml`](./forge.toml).
+Press **Ctrl-C** to stop the server; `cargo xtask down` stops the containers.
+
+`xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
+Makefile + Justfile — there is nothing extra to install (no `make`, no `just`).
+The `cargo xtask` alias is wired up in [`.cargo/config.toml`](./.cargo/config.toml).
+
+### Picking where Postgres comes from (`--db`)
+
+```bash
+cargo xtask dev                # --db docker (default): docker-compose Postgres on :5433
+cargo xtask dev --db local     # host Postgres on :5432 (forge role+db auto-created)
+cargo xtask dev --db none      # assume the DB is already up; don't start one
+```
+
+`--db local` points the server at a host Postgres on **:5432** (creating the
+`forge` role + `forge` database if missing) via `FORGE_DATABASE__URL`; versitygw
+(S3) still comes up via docker. `--db none` starts no infra at all. Run
+`cargo xtask help` for the full command list.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
 > automatically. A bootstrap admin **`admin` / `changeme`** is created (the server
@@ -35,7 +52,7 @@ checked-in [`forge.toml`](./forge.toml). Press **Ctrl-C** to stop the server;
 With the server running, in a second terminal:
 
 ```bash
-make seed
+cargo xtask seed
 ```
 
 This creates an anonymous-readable hosted repo `nuget`, mints a push token, and
@@ -64,12 +81,12 @@ Build the UI first, then run the server — the build order matters because the
 server serves the built directory:
 
 ```bash
-make web     # pnpm install --frozen-lockfile && pnpm run build  -> web/dist/
-make run     # forge-server serves web/dist at http://localhost:3000
+cargo xtask web     # pnpm install --frozen-lockfile && pnpm run build  -> web/dist/
+cargo xtask run     # forge-server serves web/dist at http://localhost:3000
 ```
 
-`make dev` does both for you (infra → build UI → run server), so the UI is live
-at **http://localhost:3000** alongside the API.
+`cargo xtask dev` does both for you (infra → build UI → run server), so the UI is
+live at **http://localhost:3000** alongside the API.
 
 ### Frontend dev server (HMR)
 
@@ -77,8 +94,8 @@ For fast iteration on the UI, run Vite's dev server (assets + hot reload) agains
 a running `forge-server`:
 
 ```bash
-make up && make run            # terminal 1: infra + API on :3000
-make web-dev                   # terminal 2: Vite on http://localhost:5173
+cargo xtask up && cargo xtask run   # terminal 1: infra + API on :3000
+cargo xtask web-dev                 # terminal 2: Vite on http://localhost:5173
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
@@ -89,8 +106,8 @@ a production API proxy.
 ### Frontend tests
 
 ```bash
-make web-test                  # Vitest + React Testing Library (unit/component)
-make web-e2e                   # Playwright e2e (needs Docker; builds the UI first)
+cargo xtask web-test           # Vitest + React Testing Library (unit/component)
+cargo xtask web-e2e            # Playwright e2e (needs Docker; builds the UI first)
 cd web && pnpm run tsc         # typecheck
 cd web && pnpm run e2e:install # one-time: download the Playwright browser
 ```
@@ -113,8 +130,8 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 ## Doing it by hand
 
 ```bash
-make up                       # infra only
-SQLX_OFFLINE=true cargo run -p forge-server   # or: make run
+cargo xtask up                # infra only
+SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 
 # create a hosted repo (admin API uses HTTP Basic; allow_password_basic=true in forge.toml)
 curl -u admin:changeme -X POST localhost:3000/admin/repositories \
@@ -248,7 +265,7 @@ deletes expired/used flow rows and dead sessions on any instance.
 
 ### Local testing against the in-process mock IdP
 
-The e2e suite (`make e2e`) stands up an in-process mock OIDC provider
+The e2e suite (`cargo xtask e2e`) stands up an in-process mock OIDC provider
 (discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
 be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
 on a private/dev network (e.g. Keycloak over plain `http`), set
@@ -259,12 +276,12 @@ https-issuer check.
 
 The integration/e2e suites use **testcontainers** — they start their own
 Postgres/versitygw/Redis automatically, so you only need Docker running (you do
-**not** need `make up`).
+**not** need `cargo xtask up`).
 
 ```bash
-make test    # unit + integration (cargo test --workspace)
-make e2e     # end-to-end suite (cargo test -p forge-e2e --features forge-e2e)
-make check   # cargo fmt --check + clippy -D warnings
+cargo xtask test    # unit + integration (cargo test --workspace)
+cargo xtask e2e     # end-to-end suite (cargo test -p forge-e2e --features forge-e2e)
+cargo xtask check   # cargo fmt --check + clippy -D warnings
 ```
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
@@ -272,17 +289,17 @@ The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 
 ## Resetting & troubleshooting
 
-- `make down` stops the containers but **keeps** the Postgres volume. To wipe all
-  state (start fresh): `docker compose down -v`.
+- `cargo xtask down` stops the containers but **keeps** the Postgres volume. To
+  wipe all state (start fresh): `docker compose down -v`.
 - **Port 5432 already in use / `role "forge" does not exist`** — you have another
   Postgres on 5432. The dev DB is intentionally mapped to **5433** to avoid this;
   if the server still connects to the wrong one, check `forge.toml`'s
   `database.url` points at `localhost:5433`.
 - **Bucket** — the server auto-creates the S3 bucket on startup; no manual step.
-- **`make logs`** tails the container logs; **`make psql`** opens a psql shell on
-  the dev DB.
+- **`cargo xtask logs`** tails the container logs; **`cargo xtask psql`** opens a
+  psql shell on the dev DB.
 
-## Helper targets (`make help`)
+## Helper commands (`cargo xtask help`)
 
 `up` · `down` · `dev` · `run` · `seed` · `test` · `e2e` · `check` · `fmt` ·
 `clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
@@ -290,3 +307,5 @@ The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
+
+Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
