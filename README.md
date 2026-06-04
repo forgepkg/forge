@@ -51,19 +51,19 @@ cargo xtask dev
 That one command uses your **local Postgres on :5432** (creating the `forge`
 role + database if missing), brings up an S3 gateway (**:7070**) via
 `docker-compose.yml`, builds the SPA, runs migrations, and starts the server on
-**http://localhost:3000**. A bootstrap admin **`admin` / `changeme`** is created
+**http://localhost:8420**. A bootstrap admin **`admin` / `changeme`** is created
 on first run. (Requires a running local PostgreSQL with permission to create the
 role/db; use `--db docker` if you don't have one — see below.)
 
-- **UI:** http://localhost:3000
-- **NuGet feed:** `http://localhost:3000/v3/{repo}/index.json`
+- **UI:** http://localhost:8420
+- **NuGet feed:** `http://localhost:8420/v3/{repo}/index.json`
 
 Add demo data (anonymous-readable `nuget` repo + a pushed sample package) in a
 second terminal:
 
 ```bash
 cargo xtask seed
-# feed: http://localhost:3000/v3/nuget/index.json
+# feed: http://localhost:8420/v3/nuget/index.json
 ```
 
 ### Choosing where Postgres comes from
@@ -81,14 +81,14 @@ The root `Dockerfile` packages the SPA **and** the Rust server into one image
 
 ```bash
 cargo xtask docker-build     # docker build -t envisia-forge:latest .
-cargo xtask docker-run       # run the image against the compose db + s3 on :3000
+cargo xtask docker-run       # run the image against the compose db + s3 on :8420
 ```
 
 Or directly, against your own infra (configure with `FORGE_*` env vars, e.g.
 `FORGE_DATABASE__URL`, `FORGE_S3__ENDPOINT`/`__BUCKET`/`__ACCESS_KEY`/`__SECRET_KEY`):
 
 ```bash
-docker run --rm -p 3000:3000 \
+docker run --rm -p 8420:8420 \
   -e FORGE_DATABASE__URL=postgres://forge:forge@db:5432/forge \
   -e FORGE_S3__ENDPOINT=http://s3:7070 -e FORGE_S3__BUCKET=forge \
   -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
@@ -98,7 +98,7 @@ docker run --rm -p 3000:3000 \
 ### Point a `dotnet` client at it
 
 ```bash
-dotnet nuget add source http://localhost:3000/v3/nuget/index.json -n forge
+dotnet nuget add source http://localhost:8420/v3/nuget/index.json -n forge
 dotnet nuget push -s forge -k <TOKEN> your.1.0.0.nupkg
 dotnet add package <PackageId>          # in a project
 ```

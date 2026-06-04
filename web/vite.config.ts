@@ -18,9 +18,9 @@ import { tanstackRouter } from '@tanstack/router-plugin/vite'
  * proxies the Rust API prefixes verbatim to a running `forge-server`. This is a
  * dev-only static-routing convenience, NOT an API proxy in the architectural
  * sense — it adds no logic and has no production equivalent. Point it at the
- * Rust origin with `FORGE_DEV_API_TARGET` (defaults to http://localhost:3000).
+ * Rust origin with `FORGE_DEV_API_TARGET` (defaults to http://localhost:8420).
  */
-const apiTarget = process.env.FORGE_DEV_API_TARGET ?? 'http://localhost:3000'
+const apiTarget = process.env.FORGE_DEV_API_TARGET ?? 'http://localhost:8420'
 
 export default defineConfig({
   plugins: [
@@ -39,7 +39,7 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: 8421,
     proxy: {
       '/admin': { target: apiTarget, changeOrigin: false },
       '/browse': { target: apiTarget, changeOrigin: false },

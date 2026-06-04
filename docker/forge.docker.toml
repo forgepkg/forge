@@ -13,11 +13,11 @@
 #   FORGE_SERVER__PUBLIC_BASE_URL   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 
 [server]
-# Listen on all interfaces inside the container; EXPOSE 3000 in the Dockerfile.
-bind = "0.0.0.0:3000"
+# Listen on all interfaces inside the container; EXPOSE 8420 in the Dockerfile.
+bind = "0.0.0.0:8420"
 # Override per-deployment with FORGE_SERVER__PUBLIC_BASE_URL so the NuGet V3
 # service index emits correct absolute @id URLs behind your real hostname.
-public_base_url = "http://localhost:3000"
+public_base_url = "http://localhost:8420"
 
 [database]
 # Placeholder — MUST be overridden via FORGE_DATABASE__URL at runtime.

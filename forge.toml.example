@@ -9,9 +9,9 @@
 # Keys marked "(default: …)" may be omitted entirely.
 
 [server]
-bind = "0.0.0.0:3000"
+bind = "0.0.0.0:8420"
 # Public base URL for absolute NuGet V3 service-index @id values. No trailing slash.
-public_base_url = "http://localhost:3000"
+public_base_url = "http://localhost:8420"
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
@@ -62,7 +62,7 @@ poll_interval_seconds = 10      # (default: 10)
 # issuer         = "https://login.microsoftonline.com/<tenant-id>/v2.0"        # must be https
 # client_id      = "00000000-0000-0000-0000-000000000000"
 # client_secret  = "<application-client-secret>"                               # redacted from APIs/logs
-# redirect_url   = "http://localhost:3000/auth/oidc/callback"                  # must match public_base_url host + this path
+# redirect_url   = "http://localhost:8420/auth/oidc/callback"                  # must match public_base_url host + this path
 # scopes         = ["openid", "profile", "email"]                              # (default) openid is always added
 # clock_skew_seconds = 60                                                      # (default: 60) exp/nbf/iat leeway
 # # claim → user mapping (fallback chain: username_claim → email → sub)

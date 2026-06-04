@@ -23,7 +23,7 @@ const DOCKER_DB_URL: &str = "postgres://forge:forge@localhost:5433/forge";
 const LOCAL_DB_URL: &str = "postgres://forge:forge@localhost:5432/forge";
 
 /// Default base URL of a running forge-server (used by `seed`).
-const DEFAULT_FORGE_URL: &str = "http://localhost:3000";
+const DEFAULT_FORGE_URL: &str = "http://localhost:8420";
 
 /// Default bootstrap admin credentials from forge.toml (used by `seed`).
 const DEFAULT_ADMIN: &str = "admin:changeme";
@@ -134,7 +134,7 @@ Docker image (single container: web SPA + Rust server):
   docker-build  Build the application image from ./Dockerfile (multi-stage:
                 pnpm builds the SPA, cargo builds forge-server release).
   docker-run    Run the built image against the dev Postgres + versitygw
-                (docker-compose.yml + docker-compose.app.yml), API + SPA on :3000.
+                (docker-compose.yml + docker-compose.app.yml), API + SPA on :8420.
 
   help          Show this help.
 "#
@@ -520,7 +520,7 @@ fn docker_build() -> Result<(), String> {
 
 /// Run the built image against the dev Postgres + versitygw. Composes the base
 /// docker-compose.yml (db + s3) with docker-compose.app.yml (the app service),
-/// building the image if needed. Serves the API + SPA on http://localhost:3000.
+/// building the image if needed. Serves the API + SPA on http://localhost:8420.
 fn docker_run() -> Result<(), String> {
     compose_app(&["up", "--build"]).run()
 }
