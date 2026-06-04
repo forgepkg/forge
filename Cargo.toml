@@ -8,6 +8,7 @@ members = [
     "crates/format-nuget",
     "crates/server",
     "crates/e2e",
+    "xtask",
 ]
 
 [workspace.dependencies]
