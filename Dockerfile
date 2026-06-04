@@ -98,7 +98,7 @@ COPY docker/forge.docker.toml /app/forge.toml
 USER forge
 
 # ── Runtime configuration (FORGE_* override the baked forge.toml) ─────────────
-# Baked defaults (see docker/forge.docker.toml): bind 0.0.0.0:8420, SPA at
+# Baked defaults (see docker/forge.docker.toml): bind 0.0.0.0:8421, SPA at
 # /app/web/dist, anonymous_mode=all, allow_password_basic, bootstrap admin.
 ENV FORGE_CONFIG=/app/forge.toml \
     FORGE_WEB__ASSETS_DIR=/app/web/dist \
@@ -113,6 +113,6 @@ ENV FORGE_CONFIG=/app/forge.toml \
 # Strongly recommended:
 #   FORGE_SERVER__PUBLIC_BASE_URL   https://forge.example.com (for absolute @id URLs)
 #   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   <change me>
-EXPOSE 8420
+EXPOSE 8421
 
 ENTRYPOINT ["/usr/local/bin/forge-server"]

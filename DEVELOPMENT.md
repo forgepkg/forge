@@ -23,7 +23,7 @@ cargo xtask dev
 
 `cargo xtask dev` starts Postgres (host port **5433**) + versitygw (**:8422**),
 waits for both to be healthy, builds the web SPA, then runs the server on
-**http://localhost:8420** using the checked-in [`forge.toml`](./forge.toml).
+**http://localhost:8421** using the checked-in [`forge.toml`](./forge.toml).
 Press **Ctrl-C** to stop the server; `cargo xtask down` stops the containers.
 
 `xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
@@ -60,7 +60,7 @@ cargo xtask seed
 This creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
-`http://localhost:8420/v3/nuget/index.json`.
+`http://localhost:8421/v3/nuget/index.json`.
 
 ## Web UI (admin + browse SPA)
 
@@ -84,11 +84,11 @@ server serves the built directory:
 
 ```bash
 cargo xtask web     # pnpm install --frozen-lockfile && pnpm run build  -> web/dist/
-cargo xtask run     # forge-server serves web/dist at http://localhost:8420
+cargo xtask run     # forge-server serves web/dist at http://localhost:8421
 ```
 
 `cargo xtask dev` does both for you (infra → build UI → run server), so the UI is
-live at **http://localhost:8420** alongside the API.
+live at **http://localhost:8421** alongside the API.
 
 ### Frontend dev server (HMR)
 
@@ -96,12 +96,12 @@ For fast iteration on the UI, run Vite's dev server (assets + hot reload) agains
 a running `forge-server`:
 
 ```bash
-cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8420
-cargo xtask web-dev                 # terminal 2: Vite on http://localhost:8421
+cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
+cargo xtask web-dev                 # terminal 2: Vite on http://localhost:8420
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
-origin (default `http://localhost:8420`, override with `FORGE_DEV_API_TARGET`)
+origin (default `http://localhost:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
 
@@ -136,26 +136,26 @@ cargo xtask up                # infra only
 SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 
 # create a hosted repo (admin API uses HTTP Basic; allow_password_basic=true in forge.toml)
-curl -u admin:changeme -X POST localhost:8420/admin/repositories \
+curl -u admin:changeme -X POST localhost:8421/admin/repositories \
   -H 'content-type: application/json' \
   -d '{"name":"nuget","kind":"hosted","anonymous_read":true}'
 
 # mint a push token (admin is user id 1)
-curl -u admin:changeme -X POST localhost:8420/admin/users/1/tokens \
+curl -u admin:changeme -X POST localhost:8421/admin/users/1/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
 
 # push a package, then read it back
-curl -X PUT localhost:8420/v3/nuget/package \
+curl -X PUT localhost:8421/v3/nuget/package \
   -H "X-NuGet-ApiKey: <SECRET>" -F package=@fixtures/nuget/sample.lib.1.0.0.nupkg   # 201
-curl localhost:8420/v3/nuget/index.json                          # service index
-curl localhost:8420/v3/nuget/flat/sample.lib/index.json          # {"versions":["1.2.3"]}
+curl localhost:8421/v3/nuget/index.json                          # service index
+curl localhost:8421/v3/nuget/flat/sample.lib/index.json          # {"versions":["1.2.3"]}
 ```
 
 ### Use it from the `dotnet` client
 
 ```bash
-dotnet nuget add source http://localhost:8420/v3/nuget/index.json -n forge
+dotnet nuget add source http://localhost:8421/v3/nuget/index.json -n forge
 dotnet nuget push -s forge -k <SECRET> your.1.0.0.nupkg
 # in a project:
 dotnet add package <PackageId>
@@ -330,15 +330,15 @@ and the static SPA on a single port (no Node in prod):
 
 ```bash
 cargo xtask docker-build       # docker build -t envisia-forge:latest .
-cargo xtask docker-run         # run the image against the compose db + s3 on :8420
+cargo xtask docker-run         # run the image against the compose db + s3 on :8421
 ```
 
 `docker-run` composes `docker-compose.yml` (db + versitygw) with
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
-http://localhost:8420.
+http://localhost:8421.
 
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8420`, SPA at `/app/web/dist`, `anonymous_mode=all`,
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=all`,
 `allow_password_basic`, bootstrap admin `admin/changeme`). Override anything via
 `FORGE_*` env vars (double-underscore nesting). Required at runtime (no safe
 default):

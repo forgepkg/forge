@@ -6,7 +6,7 @@
 #   cargo xtask docker-build && cargo xtask docker-run
 #
 # The `app` service builds the root Dockerfile (web SPA + Rust server in one
-# image) and serves the API + SPA on http://localhost:8420. It talks to the
+# image) and serves the API + SPA on http://localhost:8421. It talks to the
 # compose `db` (5432 inside the network) and `s3` (versitygw on :8422) services
 # — note the IN-NETWORK ports/hostnames differ from the host-published ones.
 
@@ -30,7 +30,7 @@ services:
       FORGE_S3__ACCESS_KEY: "minioadmin"
       FORGE_S3__SECRET_KEY: "minioadmin"
       FORGE_S3__FORCE_PATH_STYLE: "true"
-      FORGE_SERVER__PUBLIC_BASE_URL: "http://localhost:8420"
+      FORGE_SERVER__PUBLIC_BASE_URL: "http://localhost:8421"
       RUST_LOG: "info"
     ports:
-      - "8420:8420"
+      - "8421:8421"

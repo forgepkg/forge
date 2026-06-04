@@ -11,9 +11,9 @@
 #     $FORGE_CONFIG at a real file (or use FORGE_* env vars) with real secrets.
 
 [server]
-bind = "0.0.0.0:8420"
+bind = "0.0.0.0:8421"
 # Used to build absolute NuGet V3 @id URLs in the service index. No trailing slash.
-public_base_url = "http://localhost:8420"
+public_base_url = "http://localhost:8421"
 
 [database]
 # docker-compose maps the dev Postgres to host port 5433 (see docker-compose.yml).

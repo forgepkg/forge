@@ -29,7 +29,7 @@ const COMPOSE_FILE = path.join(here, 'docker-compose.e2e.yml')
 // Distinct host ports from the dev stack (5433 / 7070) so e2e never collides.
 const PG_PORT = 55432
 const S3_PORT = 57070
-// The server under test listens here (distinct from dev :8420).
+// The server under test listens here (distinct from dev :8421).
 const SERVER_PORT = 33000
 
 // Host where the compose-published container ports are reachable. Defaults to
