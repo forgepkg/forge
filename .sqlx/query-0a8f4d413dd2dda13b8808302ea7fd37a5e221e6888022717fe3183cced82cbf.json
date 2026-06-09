@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "upstream_password",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "0a8f4d413dd2dda13b8808302ea7fd37a5e221e6888022717fe3183cced82cbf"
+}

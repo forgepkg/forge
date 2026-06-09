@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE name = $1\n        ",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password, upstream_password_enc,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE name = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -60,31 +60,36 @@
       },
       {
         "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 12,
         "name": "allow_private_upstream",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -106,6 +111,7 @@
       false,
       true,
       true,
+      true,
       false,
       true,
       true,
@@ -114,5 +120,5 @@
       false
     ]
   },
-  "hash": "45afb32ed064e3435ab0b7269fbf1f01799bca3943cfebe2ae29a128684bf012"
+  "hash": "679e0e4d12db1f0b5cbda6ffb8b91cd148a48c5edfc485cdf74ac7d520791f0d"
 }

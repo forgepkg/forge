@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE repository SET\n            name = $2,\n            anonymous_read = $3,\n            online = $4,\n            config = $5,\n            remote_url = $6,\n            package_delay_seconds = $7,\n            upstream_username = $8,\n            upstream_password = $9,\n            allow_private_upstream = $10,\n            metadata_ttl_seconds = $11,\n            not_found_ttl_seconds = $12,\n            allow_redeploy = $13,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            r.id, r.name, r.format, r.kind, r.anonymous_read, r.online, r.config,\n            r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password, r.upstream_password_enc,\n            r.allow_private_upstream, r.metadata_ttl_seconds, r.not_found_ttl_seconds,\n            r.allow_redeploy, r.created_at, r.updated_at,\n            gm.priority\n        FROM group_member gm\n        JOIN repository r ON r.id = gm.member_id\n        WHERE gm.group_id = $1\n        ORDER BY gm.priority DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -60,50 +60,48 @@
       },
       {
         "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 12,
         "name": "allow_private_upstream",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "priority",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Text",
-        "Bool",
-        "Bool",
-        "Jsonb",
-        "Text",
-        "Int4",
-        "Text",
-        "Text",
-        "Bool",
-        "Int4",
-        "Int4",
-        "Bool"
+        "Int8"
       ]
     },
     "nullable": [
@@ -118,13 +116,15 @@
       false,
       true,
       true,
+      true,
       false,
       true,
       true,
+      false,
       false,
       false,
       false
     ]
   },
-  "hash": "096bd52e52a5c4dec523f9d8118f2a661252674cd63bc6a40920ffa144227336"
+  "hash": "9f0b5ec61ad80983c9a5e903a7466249f2cc0c08dd2e8897d320012c98430856"
 }

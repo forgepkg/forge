@@ -78,7 +78,7 @@ impl std::fmt::Display for BlobState {
 ///
 /// `kind` and `format` are kept as the raw `text` from the DB; use
 /// [`Repository::kind`] for the parsed [`RepoKind`].
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct Repository {
     pub id: i64,
     pub name: String,
@@ -90,7 +90,17 @@ pub struct Repository {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
+    /// Legacy plaintext upstream password. Slice 12.5 supersedes it with
+    /// [`Self::upstream_password_enc`]: new writes go through the envelope
+    /// service (which clears this column), existing values are backfilled by
+    /// the startup job, and a later migration drops the column entirely. Until
+    /// then it remains the read fallback for not-yet-backfilled rows.
     pub upstream_password: Option<String>,
+    /// Envelope-encrypted upstream password (slice 12.5): an opaque AEAD blob
+    /// bound to this row. Decrypted **only** via
+    /// [`crate::secret_dao::get_upstream_password`] at the proxy upstream
+    /// fetch; everywhere else only its presence matters.
+    pub upstream_password_enc: Option<Vec<u8>>,
     pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
@@ -99,10 +109,53 @@ pub struct Repository {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Manual `Debug` that **redacts the upstream password**: the plaintext column
+/// value must never land in a log line, and the ciphertext blob is reduced to
+/// its byte length (its content is opaque and only adds noise).
+impl std::fmt::Debug for Repository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repository")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("format", &self.format)
+            .field("kind", &self.kind)
+            .field("anonymous_read", &self.anonymous_read)
+            .field("online", &self.online)
+            .field("config", &self.config)
+            .field("remote_url", &self.remote_url)
+            .field("package_delay_seconds", &self.package_delay_seconds)
+            .field("upstream_username", &self.upstream_username)
+            .field(
+                "upstream_password",
+                &self.upstream_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "upstream_password_enc",
+                &self
+                    .upstream_password_enc
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            .field("allow_private_upstream", &self.allow_private_upstream)
+            .field("metadata_ttl_seconds", &self.metadata_ttl_seconds)
+            .field("not_found_ttl_seconds", &self.not_found_ttl_seconds)
+            .field("allow_redeploy", &self.allow_redeploy)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 impl Repository {
     /// Parsed repository kind.
     pub fn kind(&self) -> RepoKind {
         RepoKind::from(self.kind.as_str())
+    }
+
+    /// Whether an upstream password is stored (encrypted or, pre-backfill,
+    /// plaintext). The value itself is never exposed through the model.
+    pub fn has_upstream_password(&self) -> bool {
+        self.upstream_password_enc.is_some() || self.upstream_password.is_some()
     }
 }
 

@@ -37,6 +37,10 @@ pub mod service;
 pub mod store;
 
 pub use envelope::{AeadBinding, Algorithm};
+// Re-exported so downstream crates read a [`PlaintextSecret`] without adding
+// their own `secrecy` dependency. `expose_secret` call sites stay grep-ably
+// few — the only sanctioned one is the proxy upstream fetch.
+pub use secrecy::ExposeSecret;
 pub use error::CryptoError;
 pub use kms::{KmsProvider, StaticRootProvider};
 pub use secret::{KeyBytes, PlaintextSecret};

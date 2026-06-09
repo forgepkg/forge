@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE encryption_key\n            SET state = 'retiring', rotated_at = now()\n            WHERE layer = $1 AND scope = $2 AND state = 'active'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7394c4723beaa42f934bf9a831405ea4c0f78570d2b2f2f04cb1d2e5c4fa6262"
+}

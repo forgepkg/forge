@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, layer, version, algorithm, wrapped_key,\n                   root_key_id, root_key_version, wrapping_kek_version,\n                   state, scope, created_at, rotated_at\n            FROM encryption_key\n            WHERE layer = $1 AND scope = $2 AND state = 'active'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "layer",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "algorithm",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "wrapped_key",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "root_key_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "root_key_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "wrapping_kek_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "rotated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "df0b6cbf212bf0ecef1bfe17eda0b0006d620870b0a128b0e9e042bdac98d8c0"
+}

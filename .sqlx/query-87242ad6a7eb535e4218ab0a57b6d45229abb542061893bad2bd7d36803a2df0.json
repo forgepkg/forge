@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO repository (\n            name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds, allow_redeploy\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
+  "query": "\n        UPDATE repository SET\n            name = $2,\n            anonymous_read = $3,\n            online = $4,\n            config = $5,\n            remote_url = $6,\n            package_delay_seconds = $7,\n            upstream_username = $8,\n            upstream_password = $9,\n            allow_private_upstream = $10,\n            metadata_ttl_seconds = $11,\n            not_found_ttl_seconds = $12,\n            allow_redeploy = $13,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password, upstream_password_enc,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -60,39 +60,43 @@
       },
       {
         "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 12,
         "name": "allow_private_upstream",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
+        "Int8",
         "Text",
         "Bool",
         "Bool",
@@ -119,6 +123,7 @@
       false,
       true,
       true,
+      true,
       false,
       true,
       true,
@@ -127,5 +132,5 @@
       false
     ]
   },
-  "hash": "11545c73c35ac78b9cc26747ef9fb0afd531ad73d975830c3974596d4ab70042"
+  "hash": "87242ad6a7eb535e4218ab0a57b6d45229abb542061893bad2bd7d36803a2df0"
 }

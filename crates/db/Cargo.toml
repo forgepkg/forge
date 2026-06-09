@@ -4,15 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Secret encryption at rest (slice 12.5): the Postgres KeyStore over
+# `encryption_key` and the encrypted-column helpers go through forge-crypto.
+forge-crypto = { path = "../crypto" }
+
 sqlx = { workspace = true, features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 sqlx = { workspace = true, features = ["json"] }
 testcontainers = "0.27"
