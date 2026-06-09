@@ -18,7 +18,6 @@
 //! `session`), so any instance can complete a callback another started, and a
 //! revocation is visible cluster-wide on the next request.
 
-use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -29,7 +28,7 @@ use chrono::{DateTime, Utc};
 use forge_cache::Cache;
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{generate_token_secret, hash_token};
-use forge_core::net::ssrf::{guarded_client, SystemResolver};
+use forge_core::net::ssrf::outbound_client;
 use forge_core::oidc::{
     begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
     ClientParams, OidcMetadataClient, ResolvePolicy,
@@ -71,16 +70,15 @@ impl OidcRuntime {
     /// public base URL (which decides the cookie `Secure` attribute) + the
     /// shared cache.
     ///
-    /// The HTTP client is the slice-1 SSRF-guarded `reqwest` client (private
-    /// ranges blocked) so discovery/JWKS/token calls share the proxy's posture.
+    /// The HTTP client is the shared redirect-capped outbound client (12.7
+    /// §3.6: scheme-only guard) used for discovery/JWKS/token calls.
     pub fn build(
         oidc: &OidcConfig,
         pool: sqlx::PgPool,
         public_base_url: &str,
         cache: Cache,
     ) -> anyhow::Result<Self> {
-        let http = guarded_client(Arc::new(SystemResolver), oidc.allow_private_issuer)
-            .map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
+        let http = outbound_client().map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
         let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache);
 
         let client = ClientParams {

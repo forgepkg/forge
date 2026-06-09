@@ -7,9 +7,10 @@
 //! are served locally.
 //!
 //! ## Hard invariants enforced here
-//! * **SSRF guard** — every upstream request goes through
-//!   [`crate::net::ssrf::guarded_client`], honoring the per-proxy
-//!   `allow_private_upstream` flag; redirects are re-validated per hop.
+//! * **Outbound scheme guard** — upstream URLs are validated to be http/https
+//!   at config time ([`crate::net::ssrf::validate_url`]) and every upstream
+//!   request uses the redirect-capped [`crate::net::ssrf::outbound_client`].
+//!   Private/loopback upstreams are permitted (12.7 §3.6 — admin-only config).
 //! * **NO advisory locks** — first-time fetch singleflight is a plain row lock:
 //!   [`proxy_dao::upsert_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
 //!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
@@ -49,7 +50,7 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
 use crate::format::Format;
-use crate::net::ssrf::{guarded_client, IpResolver, SystemResolver};
+use crate::net::ssrf::outbound_client;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
     SearchResult, VersionEntry, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE,
@@ -151,7 +152,6 @@ pub struct ProxyRepo {
     format: Arc<dyn Format>,
     cas: Cas,
     cache: Cache,
-    resolver: Arc<dyn IpResolver>,
     /// Grace period passed to blob deref (unused on the read path today, kept for
     /// symmetry with the hosted facade should proxy eviction land later).
     #[allow(dead_code)]
@@ -159,28 +159,13 @@ pub struct ProxyRepo {
 }
 
 impl ProxyRepo {
-    /// Build a proxy read facade using the default system DNS resolver for the
-    /// SSRF guard.
+    /// Build a proxy read facade.
     pub fn new(pool: PgPool, format: Arc<dyn Format>, cas: Cas, cache: Cache) -> Self {
-        Self::with_resolver(pool, format, cas, cache, Arc::new(SystemResolver))
-    }
-
-    /// Build a proxy read facade with an injectable DNS resolver (tests pin
-    /// upstream hostnames to loopback while keeping the SSRF policy honest by
-    /// flipping `allow_private_upstream`).
-    pub fn with_resolver(
-        pool: PgPool,
-        format: Arc<dyn Format>,
-        cas: Cas,
-        cache: Cache,
-        resolver: Arc<dyn IpResolver>,
-    ) -> Self {
         ProxyRepo {
             pool,
             format,
             cas,
             cache,
-            resolver,
             delete_grace: Duration::seconds(0),
         }
     }
@@ -222,10 +207,10 @@ impl ProxyRepo {
         now - first_seen_at >= delay
     }
 
-    /// Build an SSRF-guarded client for this proxy's privacy policy.
-    fn client(&self, repo: &Repository) -> Result<reqwest::Client, RepoError> {
-        guarded_client(self.resolver.clone(), repo.allow_private_upstream)
-            .map_err(|e| RepoError::Storage(format!("build upstream client: {e}")))
+    /// Build the outbound client for upstream fetches (scheme-only guard,
+    /// redirect-capped — 12.7 §3.6).
+    fn client(&self, _repo: &Repository) -> Result<reqwest::Client, RepoError> {
+        outbound_client().map_err(|e| RepoError::Storage(format!("build upstream client: {e}")))
     }
 
     // ── Upstream service-index discovery (Task 8.1) ──────────────────────────
@@ -255,10 +240,6 @@ impl ProxyRepo {
             .ok_or_else(|| RepoError::Storage("proxy repository has no remote_url".into()))?;
         let client = self.client(repo)?;
         let online = repo.online;
-        let allow_private = repo.allow_private_upstream;
-        let resolver = self.resolver.clone();
-
-        let _ = (&resolver, allow_private); // policy is enforced inside `client`.
 
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,

@@ -16,9 +16,9 @@
 //!   point of view ⇒ `Unavailable` ⇒ fail-closed, nothing cached), so the
 //!   fail-closed scenario can be driven deterministically.
 //!
-//! The forge server reaches this over its **SSRF-guarded** client, so the stack
-//! must set `allow_private_upstream = true` (the loopback address is otherwise
-//! blocked) — [`MockBasicUpstream::upstream_basic_block`] does that.
+//! The forge server reaches this over its outbound client; loopback upstreams
+//! are permitted since 12.7 §3.6 (scheme-only guard), so no special opt-out is
+//! needed.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -172,7 +172,6 @@ url = "{url}"
 method = "GET"
 success_status = [200]
 reject_status = [401, 403]
-allow_private_upstream = true
 auto_provision = true
 required_groups = [{required}]
 {groups_path}admin_group = "{admin_group}"

@@ -5,14 +5,15 @@
 //! a `null`/absent password leaves the stored secret unchanged; a present value
 //! replaces it.
 //!
-//! `remote_url` on a proxy is **SSRF-validated** at create/update time
-//! (scheme + resolved-IP policy, honoring `allow_private_upstream`) so a bad
-//! upstream is rejected before any fetch.
+//! `remote_url` on a proxy is **scheme-validated** at create/update time
+//! (http/https only — 12.7 §3.6 dropped the private-range restriction) so a bad
+//! upstream is rejected before any fetch. The configured host is logged on save
+//! for operator visibility (the URL may point at internal addresses).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use forge_core::net::ssrf::{validate_url, SystemResolver};
+use forge_core::net::ssrf::validate_url;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{asset_dao, blob_dao, component_dao};
@@ -37,7 +38,6 @@ pub struct RepoView {
     /// `true` when an `upstream_password` is stored; the value itself is never
     /// returned.
     pub has_upstream_password: bool,
-    pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -56,7 +56,6 @@ impl From<&Repository> for RepoView {
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
             has_upstream_password: r.upstream_password.is_some(),
-            allow_private_upstream: r.allow_private_upstream,
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
@@ -86,8 +85,6 @@ pub struct CreateRepo {
     #[serde(default)]
     pub upstream_password: Option<String>,
     #[serde(default)]
-    pub allow_private_upstream: bool,
-    #[serde(default)]
     pub metadata_ttl_seconds: Option<i32>,
     #[serde(default)]
     pub not_found_ttl_seconds: Option<i32>,
@@ -107,7 +104,6 @@ pub struct UpdateRepo {
     pub package_delay_seconds: Option<i32>,
     pub upstream_username: Option<String>,
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: Option<bool>,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: Option<bool>,
@@ -124,13 +120,17 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
 
-/// SSRF-validate a proxy `remote_url` against the privacy policy. `None` is OK
-/// at this layer (proxy-without-url is rejected separately).
-async fn validate_remote_url(url: &str, allow_private: bool) -> Result<(), Response> {
-    validate_url(url, allow_private, &SystemResolver)
-        .await
-        .map(|_| ())
-        .map_err(|e| bad_request(format!("invalid remote_url: {e}")))
+/// Scheme-validate a proxy `remote_url` (http/https only). `None` is OK at this
+/// layer (proxy-without-url is rejected separately). Logs the configured host
+/// (12.7 §3.6: the URL may legitimately point at internal addresses; the log
+/// line gives operators an audit trail of where forge was pointed).
+#[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
+fn validate_remote_url(url: &str) -> Result<(), Response> {
+    validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
+    if let Ok(parsed) = url::Url::parse(url) {
+        tracing::info!(host = parsed.host_str().unwrap_or(""), %url, "proxy remote_url configured");
+    }
+    Ok(())
 }
 
 /// `GET /admin/repositories`
@@ -166,7 +166,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         let Some(url) = body.remote_url.as_deref() else {
             return bad_request("proxy repository requires remote_url");
         };
-        if let Err(resp) = validate_remote_url(url, body.allow_private_upstream).await {
+        if let Err(resp) = validate_remote_url(url) {
             return resp;
         }
     } else if body.remote_url.is_some() {
@@ -184,7 +184,6 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         package_delay_seconds: body.package_delay_seconds,
         upstream_username: body.upstream_username.clone(),
         upstream_password: body.upstream_password.clone(),
-        allow_private_upstream: body.allow_private_upstream,
         metadata_ttl_seconds: body.metadata_ttl_seconds,
         not_found_ttl_seconds: body.not_found_ttl_seconds,
         allow_redeploy: body.allow_redeploy,
@@ -213,19 +212,16 @@ pub async fn update(
 
     // Merge: each absent field keeps the existing value. `upstream_password`
     // absent ⇒ keep stored secret; present ⇒ replace.
-    let allow_private = body
-        .allow_private_upstream
-        .unwrap_or(existing.allow_private_upstream);
     let remote_url = match &body.remote_url {
         Some(u) => Some(u.clone()),
         None => existing.remote_url.clone(),
     };
 
-    // Re-validate the remote_url for proxies whenever url or privacy changed.
+    // Re-validate the remote_url for proxies whenever it changed.
     if existing.kind() == RepoKind::Proxy {
         if let Some(url) = remote_url.as_deref() {
-            if body.remote_url.is_some() || body.allow_private_upstream.is_some() {
-                if let Err(resp) = validate_remote_url(url, allow_private).await {
+            if body.remote_url.is_some() {
+                if let Err(resp) = validate_remote_url(url) {
                     return resp;
                 }
             }
@@ -249,7 +245,6 @@ pub async fn update(
             Some(p) => Some(p.clone()),
             None => existing.upstream_password.clone(),
         },
-        allow_private_upstream: allow_private,
         metadata_ttl_seconds: body.metadata_ttl_seconds.or(existing.metadata_ttl_seconds),
         not_found_ttl_seconds: body
             .not_found_ttl_seconds

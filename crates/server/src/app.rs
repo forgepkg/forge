@@ -13,7 +13,7 @@ use forge_core::auth::{
     AuthProvider, Chain, CredKeyPepper, LocalPasswordProvider, UpstreamBasicProvider,
     ValidatedCredentialCache, UPSTREAM_BASIC_ID,
 };
-use forge_core::net::ssrf::{guarded_client, SystemResolver};
+use forge_core::net::ssrf::outbound_client;
 use forge_core::session::SessionService;
 use forge_db::authz_dao;
 use forge_db::user_dao::{self, NewUser};
@@ -128,7 +128,7 @@ fn build_password_chain(
                     .context("upstream_basic config present (validated)")?;
                 auto_provision = ub.auto_provision;
 
-                let client = guarded_client(Arc::new(SystemResolver), ub.allow_private_upstream)
+                let client = outbound_client()
                     .map_err(|e| anyhow::anyhow!("build upstream-basic http client: {e}"))?;
                 let cred_cache = ValidatedCredentialCache::new(
                     cache.clone(),

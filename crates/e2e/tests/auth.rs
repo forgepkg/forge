@@ -168,37 +168,40 @@ async fn admin_api_requires_admin_and_bootstrap_works() {
     );
 }
 
-/// SSRF: creating a proxy whose `remote_url` resolves to a private/loopback
-/// address is rejected by default (no `allow_private_upstream`).
+/// Outbound guard (12.7 §3.6): a proxy `remote_url` is only scheme-checked —
+/// a non-http(s) scheme is rejected, while private/loopback addresses are now
+/// permitted (the slice-1 SSRF range restriction was dropped; upstream config
+/// is admin-only).
 #[tokio::test]
-async fn ssrf_private_upstream_rejected_by_default() {
+async fn remote_url_scheme_checked_private_allowed() {
     let srv = start_stack().await;
 
-    // Loopback upstream without allow_private_upstream → rejected.
+    // A non-http(s) scheme → rejected.
     let resp = srv
         .create_repo(serde_json::json!({
-            "name": "ssrf-proxy",
+            "name": "scheme-proxy",
+            "kind": "proxy",
+            "remote_url": "ftp://example.com/index.json",
+        }))
+        .await;
+    assert!(
+        resp.status().is_client_error(),
+        "non-http scheme must be rejected (got {})",
+        resp.status()
+    );
+
+    // A loopback upstream is accepted (no allow_private_upstream flag exists
+    // anymore — the column and the restriction are gone).
+    let resp = srv
+        .create_repo(serde_json::json!({
+            "name": "loopback-proxy",
             "kind": "proxy",
             "remote_url": "http://127.0.0.1:9/index.json",
         }))
         .await;
     assert!(
-        resp.status().is_client_error(),
-        "private remote_url must be rejected (got {})",
-        resp.status()
-    );
-
-    // A link-local / cloud-metadata address is also rejected.
-    let resp = srv
-        .create_repo(serde_json::json!({
-            "name": "ssrf-meta",
-            "kind": "proxy",
-            "remote_url": "http://169.254.169.254/latest/meta-data/",
-        }))
-        .await;
-    assert!(
-        resp.status().is_client_error(),
-        "cloud-metadata remote_url must be rejected (got {})",
+        resp.status().is_success(),
+        "loopback remote_url must be accepted (got {})",
         resp.status()
     );
 }

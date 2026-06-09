@@ -162,8 +162,8 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("read fixture {}: {e}", p.display()))
 }
 
-/// Create a proxy repository pointing at `remote_url`, with `allow_private_upstream`
-/// so the SSRF guard permits the loopback mock, and the given delay.
+/// Create a proxy repository pointing at `remote_url` (loopback mocks are fine
+/// since 12.7 §3.6 — only the scheme is checked) with the given delay.
 async fn make_proxy(
     pool: &PgPool,
     remote_url: &str,
@@ -173,7 +173,6 @@ async fn make_proxy(
     let name = format!("proxy{}", common::unique());
     let mut new = NewRepository::proxy(name.clone());
     new.remote_url = Some(remote_url.to_string());
-    new.allow_private_upstream = true;
     new.package_delay_seconds = package_delay_seconds;
     new.online = online;
     new.metadata_ttl_seconds = Some(600);

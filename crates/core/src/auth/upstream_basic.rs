@@ -22,13 +22,13 @@
 //! **no `pg_advisory_*`**). The plaintext password leaves the process only here,
 //! over the outbound `Authorization: Basic` header; it is never persisted.
 //!
-//! ## SSRF
+//! ## Outbound guard
 //!
-//! The outbound request uses [`forge_core::net::ssrf::guarded_client`]
-//! ([`crate::net::ssrf`]): scheme is restricted to http/https, private/loopback/
-//! link-local ranges are blocked unless `allow_private_upstream`, and **every
-//! redirect hop is re-validated** by the guard's custom resolver. The `url` is
-//! also pre-validated at config time (server wiring, phase 5).
+//! The outbound request uses [`crate::net::ssrf::outbound_client`]: the scheme
+//! is restricted to http/https (pre-validated at config time via
+//! [`crate::net::ssrf::validate_url`]) and redirects are capped. Private /
+//! loopback upstreams are permitted — the upstream URL is admin-only config
+//! (12.7 §3.6), and an internal Nexus on RFC1918 is the common case.
 //!
 //! ## Auto-provision
 //!
@@ -100,9 +100,6 @@ pub struct UpstreamBasicConfig {
     pub connect_timeout: Duration,
     /// Total request timeout.
     pub request_timeout: Duration,
-    /// Permit the upstream to resolve to a private/loopback address (internal
-    /// Nexus). Off blocks them via the SSRF guard.
-    pub allow_private_upstream: bool,
     /// Optional coarse allow-gate: a 200 is only accepted when the user has at
     /// least one of these groups. Empty ⇒ any success is accepted. Requires
     /// `groups_path` to be set (validated at config time).
@@ -118,9 +115,8 @@ pub struct UpstreamBasicConfig {
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
 ///
-/// Holds an SSRF-guarded [`reqwest::Client`] (built once with the configured
-/// timeouts + private-range policy) and the [`ValidatedCredentialCache`] so the
-/// hot path is a cache hit.
+/// Holds a redirect-capped [`reqwest::Client`] (built once) and the
+/// [`ValidatedCredentialCache`] so the hot path is a cache hit.
 pub struct UpstreamBasicProvider {
     config: UpstreamBasicConfig,
     client: Client,
@@ -128,14 +124,10 @@ pub struct UpstreamBasicProvider {
 }
 
 impl UpstreamBasicProvider {
-    /// Build the provider from its config, a pre-built SSRF-guarded client, and
-    /// the validated-credential cache.
-    ///
-    /// The `client` MUST be a [`crate::net::ssrf::guarded_client`] configured
-    /// with `config.allow_private_upstream` and the connect/request timeouts —
-    /// the server wiring (phase 5) builds it; tests build one against a public
-    /// (or `allow_private`) mock. Keeping client construction out of here lets
-    /// tests inject a client pointed at an in-process mock upstream.
+    /// Build the provider from its config, a pre-built outbound client
+    /// ([`crate::net::ssrf::outbound_client`]), and the validated-credential
+    /// cache. Keeping client construction out of here lets tests inject a
+    /// client pointed at an in-process mock upstream.
     pub fn new(
         config: UpstreamBasicConfig,
         client: Client,

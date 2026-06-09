@@ -271,8 +271,9 @@ The e2e suite (`cargo xtask e2e`) stands up an in-process mock OIDC provider
 (discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
 be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
 on a private/dev network (e.g. Keycloak over plain `http`), set
-`oidc.allow_private_issuer = true` to relax both the SSRF guard and the
-https-issuer check.
+`oidc.allow_private_issuer = true` to relax the https-issuer check. (Since the
+12.7 auth-realms slice the old SSRF private-range guard is gone entirely —
+outbound upstream/issuer URLs are only restricted to http/https.)
 
 ## Tests
 

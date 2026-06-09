@@ -8,7 +8,7 @@ import type { CreateRepo, RepoKind, RepoView } from '~/api/repositories'
  *
  *  - **hosted** → `allow_redeploy`
  *  - **proxy**  → `remote_url`, `package_delay_seconds`, metadata/not-found TTLs,
- *                 `allow_private_upstream`, and **write-only** upstream creds
+ *                 and **write-only** upstream creds
  *                 (the password is never populated from a GET — slice-1
  *                 redaction; the form offers a "set new password" affordance and
  *                 only sends it when the admin types one)
@@ -35,7 +35,6 @@ export interface RepoFormValues {
   upstream_username: string
   /** Newly-typed password; blank ⇒ "leave unchanged" on edit / "none" on create. */
   upstream_password: string
-  allow_private_upstream: boolean
   metadata_ttl_seconds: string
   not_found_ttl_seconds: string
 }
@@ -67,7 +66,6 @@ function seed(existing?: RepoView): RepoFormValues {
     upstream_username: existing?.upstream_username ?? '',
     // Never seed the password — it is write-only and redacted on read.
     upstream_password: '',
-    allow_private_upstream: existing?.allow_private_upstream ?? false,
     metadata_ttl_seconds:
       existing?.metadata_ttl_seconds != null
         ? String(existing.metadata_ttl_seconds)
@@ -294,13 +292,6 @@ export function RepositoryForm({
                 : 'Write-only. The stored secret is never shown after saving.'}
             </p>
           </Field>
-
-          <Checkbox
-            id="repo-allow-private"
-            checked={values.allow_private_upstream}
-            onChange={(c) => set('allow_private_upstream', c)}
-            label="Allow private / internal upstream IPs (SSRF override)"
-          />
         </fieldset>
       )}
 
@@ -418,7 +409,6 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()
     body.package_delay_seconds = Number(values.package_delay_seconds) || 0
-    body.allow_private_upstream = values.allow_private_upstream
     body.metadata_ttl_seconds = parseTtl(values.metadata_ttl_seconds)
     body.not_found_ttl_seconds = parseTtl(values.not_found_ttl_seconds)
     if (values.upstream_username.trim() !== '') {

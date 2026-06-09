@@ -18,7 +18,6 @@ async fn create_proxy(srv: &TestServer, name: &str, remote_url: &str, delay_seco
             "name": name,
             "kind": "proxy",
             "remote_url": remote_url,
-            "allow_private_upstream": true,
             "package_delay_seconds": delay_seconds,
             "metadata_ttl_seconds": 600,
             "not_found_ttl_seconds": 600,

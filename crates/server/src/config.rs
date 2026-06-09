@@ -189,10 +189,6 @@ pub struct UpstreamBasicAuthConfig {
     /// Total request timeout (ms).
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    /// Permit the upstream URL to resolve to a private/loopback address (an
-    /// internal Nexus is usually on RFC1918). Off blocks them via the SSRF guard.
-    #[serde(default)]
-    pub allow_private_upstream: bool,
     /// Optional coarse allow-gate: only accept a success when the user holds one
     /// of these groups. Empty ⇒ any success accepted. Requires `groups_path`.
     #[serde(default)]
@@ -224,7 +220,6 @@ impl std::fmt::Debug for UpstreamBasicAuthConfig {
             .field("reject_status", &self.reject_status)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("request_timeout_ms", &self.request_timeout_ms)
-            .field("allow_private_upstream", &self.allow_private_upstream)
             .field("required_groups", &self.required_groups)
             .field("groups_path", &self.groups_path)
             .field("admin_group", &self.admin_group)
@@ -244,7 +239,6 @@ impl UpstreamBasicAuthConfig {
             reject_status: self.reject_status.clone(),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             request_timeout: Duration::from_millis(self.request_timeout_ms),
-            allow_private_upstream: self.allow_private_upstream,
             required_groups: self.required_groups.clone(),
             groups_path: self.groups_path.clone(),
             admin_group: self.admin_group.clone(),
@@ -547,11 +541,11 @@ pub struct OidcConfig {
     /// Allowed leeway (seconds) on `exp`/`nbf`/`iat` ID-token validation.
     #[serde(default = "default_oidc_clock_skew")]
     pub clock_skew_seconds: u64,
-    /// Permit the OIDC HTTP client (discovery / JWKS / token endpoint) to reach
-    /// **private / loopback** addresses. Off by default — the SSRF guard blocks
-    /// them. Set `true` only when the IdP is self-hosted on a private network
-    /// (mirrors the proxy's per-repo `allow_private_upstream`). Also enables the
-    /// in-process mock IdP used by the integration tests.
+    /// Permit a plain-`http` issuer URL. Off by default — a production issuer
+    /// must be `https`. Set `true` only for a self-hosted/dev IdP without TLS
+    /// (this is what the integration tests' in-process mock IdP uses). Since
+    /// 12.7 §3.6 dropped the private-range SSRF restriction, this flag no
+    /// longer affects which *addresses* are reachable — only the scheme rule.
     #[serde(default)]
     pub allow_private_issuer: bool,
 
@@ -1429,7 +1423,6 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert!(!ub.allow_private_upstream);
         assert!(ub.auto_provision);
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);

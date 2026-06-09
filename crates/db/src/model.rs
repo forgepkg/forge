@@ -91,7 +91,6 @@ pub struct Repository {
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,

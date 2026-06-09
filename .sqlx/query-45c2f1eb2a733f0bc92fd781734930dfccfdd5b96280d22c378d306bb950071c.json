@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE id = $1\n        ",
+  "query": "\n        INSERT INTO repository (\n            name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            metadata_ttl_seconds, not_found_ttl_seconds, allow_redeploy\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -60,38 +60,45 @@
       },
       {
         "ordinal": 11,
-        "name": "allow_private_upstream",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 12,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool",
+        "Jsonb",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Bool"
       ]
     },
     "nullable": [
@@ -106,7 +113,6 @@
       false,
       true,
       true,
-      false,
       true,
       true,
       false,
@@ -114,5 +120,5 @@
       false
     ]
   },
-  "hash": "d02ef82b00bb2a8a87195bfb3c8a358fc9587209574f57b4f625c1be6eef9eb0"
+  "hash": "45c2f1eb2a733f0bc92fd781734930dfccfdd5b96280d22c378d306bb950071c"
 }

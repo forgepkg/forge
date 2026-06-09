@@ -105,7 +105,6 @@ async fn concurrent_proxy_misses_across_instances_converge() {
             "name": "xo-proxy",
             "kind": "proxy",
             "remote_url": mock.index_url(),
-            "allow_private_upstream": true,
             "metadata_ttl_seconds": 600,
             "not_found_ttl_seconds": 600,
         }))

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE name = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -60,37 +60,34 @@
       },
       {
         "ordinal": 11,
-        "name": "allow_private_upstream",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 12,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Text"
+      ]
     },
     "nullable": [
       false,
@@ -104,7 +101,6 @@
       false,
       true,
       true,
-      false,
       true,
       true,
       false,
@@ -112,5 +108,5 @@
       false
     ]
   },
-  "hash": "326360e3f48d357a2a3237ecef494b281364312ee2e35b730d327acc68561967"
+  "hash": "9863c9e9952045cb01793049ad03415125aae4e3605a1ba0f2d6fca960ac6208"
 }
