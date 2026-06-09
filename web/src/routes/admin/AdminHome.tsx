@@ -15,7 +15,8 @@ function AdminHome() {
       <div>
         <h1 className="text-2xl font-semibold">Administration</h1>
         <p className="mt-1 text-slate-600">
-          Manage repositories, users, and their API tokens.
+          Manage repositories, users and their API tokens, and authentication
+          realms.
         </p>
       </div>
       <ul className="grid gap-3 sm:grid-cols-2">
@@ -33,6 +34,14 @@ function AdminHome() {
             className="block rounded-lg border border-slate-200 bg-white p-4 font-medium text-sky-700 hover:border-slate-300 hover:bg-slate-50"
           >
             Users &amp; tokens
+          </Link>
+        </li>
+        <li>
+          <Link
+            to="/admin/realms"
+            className="block rounded-lg border border-slate-200 bg-white p-4 font-medium text-sky-700 hover:border-slate-300 hover:bg-slate-50"
+          >
+            Authentication
           </Link>
         </li>
       </ul>

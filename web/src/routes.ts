@@ -34,6 +34,9 @@ export const routes = rootRoute('root.tsx', [
       ),
       route('/users', 'admin/users/List.tsx'),
       route('/users/$userId', 'admin/users/Edit.tsx'),
+      route('/realms', 'admin/realms/List.tsx'),
+      route('/realms/new', 'admin/realms/Create.tsx'),
+      route('/realms/$realmId', 'admin/realms/Edit.tsx'),
     ]),
   ]),
 ])

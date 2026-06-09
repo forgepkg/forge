@@ -1,32 +1,38 @@
 /**
- * Browser authentication — the single module that swapping to §12.2 cookie
- * sessions will touch.
+ * Browser authentication — the single module that knows which credential the
+ * SPA holds and how to attach it to requests.
  *
- * **Today (slice 1, token):** the user pastes a registry token (created in the
- * Tokens screen or out-of-band). Slice 1's principal middleware accepts a token
- * as the HTTP Basic *secret* (`Authorization: Basic base64("token:" + secret)`)
+ * **Token mode (slice 1):** the user pastes a registry token (created in the
+ * Tokens screen or out-of-band). The principal middleware accepts a token as
+ * the HTTP Basic *secret* (`Authorization: Basic base64("token:" + secret)`)
  * or as `X-NuGet-ApiKey`. We use Basic for the admin/browse API. The token is
  * stored in `localStorage` (an accepted risk for an internal admin tool).
  *
- * **Post-§12.2 (session cookie):** when a session cookie is present the browser
- * sends it automatically (same-origin). The swap is contained here: `authMode`
- * flips to `'cookie'`, `authHeaders()` returns `{}`, and `httpClient` already
- * sends `credentials: 'same-origin'`. No other module changes.
+ * **Session mode (§12.7 realms):** after `POST /auth/login` (or an OIDC
+ * redirect) the server sets a `forge_session` cookie that the browser sends
+ * automatically (same-origin; `httpClient` uses `credentials: 'same-origin'`).
+ * We only persist the **CSRF token** from the login//auth/me response and send
+ * it as `X-CSRF-Token` (required by the server on mutating requests; harmless
+ * on reads). No Authorization header is emitted in session mode.
  */
 
 const TOKEN_KEY = 'forge.token'
+const CSRF_KEY = 'forge.session.csrf'
 
-/** Which credential mechanism is active. Slice 1 is always `'token'`. */
-export type AuthMode = 'token' | 'cookie'
+/** Which credential mechanism is active. */
+export type AuthMode = 'token' | 'session'
 
-/** The active auth mode. Flip to `'cookie'` when §12.2 sessions land. */
-export const authMode: AuthMode = 'token'
+/** The stored credential: a registry token or a cookie-session CSRF token. */
+export type StoredAuth =
+  | { mode: 'token'; token: string }
+  | { mode: 'session'; csrf: string }
 
 /**
  * In-tab subscribers notified whenever the stored credential changes
- * (`setToken`/`clearToken`). The app shell uses this to re-run the `me` query
- * after a same-tab sign-in/sign-out without a full page reload. Cross-tab
- * changes already arrive via the `storage` event; this covers the same tab.
+ * (`setToken`/`setSession`/`clearToken`). The app shell uses this to re-run
+ * the `me` query after a same-tab sign-in/sign-out without a full page reload.
+ * Cross-tab changes already arrive via the `storage` event; this covers the
+ * same tab.
  */
 const subscribers = new Set<() => void>()
 
@@ -42,7 +48,7 @@ function notify(): void {
 export function onAuthChange(listener: () => void): () => void {
   subscribers.add(listener)
   const onStorage = (e: StorageEvent) => {
-    if (e.key === null || e.key === TOKEN_KEY) listener()
+    if (e.key === null || e.key === TOKEN_KEY || e.key === CSRF_KEY) listener()
   }
   window.addEventListener('storage', onStorage)
   return () => {
@@ -60,30 +66,78 @@ function base64(input: string): string {
   return btoa(binary)
 }
 
-/** The stored token secret, or null if the user has not authenticated. */
-export function getToken(): string | null {
-  if (authMode !== 'token') return null
+function read(key: string): string | null {
   try {
-    return localStorage.getItem(TOKEN_KEY)
+    return localStorage.getItem(key)
   } catch {
     return null
   }
 }
 
-/** Persist a token secret (called from the Login screen). */
+/**
+ * The stored credential, or null when unauthenticated. A cookie session wins
+ * over a leftover token (setting one clears the other, so both present only
+ * happens after a partial storage failure).
+ */
+export function getAuth(): StoredAuth | null {
+  const csrf = read(CSRF_KEY)
+  if (csrf) return { mode: 'session', csrf }
+  const token = read(TOKEN_KEY)
+  if (token) return { mode: 'token', token }
+  return null
+}
+
+/** The active auth mode, or null when unauthenticated. */
+export function getAuthMode(): AuthMode | null {
+  return getAuth()?.mode ?? null
+}
+
+/** The stored token secret (token mode only), or null. */
+export function getToken(): string | null {
+  const auth = getAuth()
+  return auth?.mode === 'token' ? auth.token : null
+}
+
+/** The stored CSRF token (session mode only), or null. */
+export function getCsrfToken(): string | null {
+  const auth = getAuth()
+  return auth?.mode === 'session' ? auth.csrf : null
+}
+
+/** Persist a registry token (called from the Login screen's token form). */
 export function setToken(token: string): void {
   try {
     localStorage.setItem(TOKEN_KEY, token)
+    localStorage.removeItem(CSRF_KEY)
   } catch {
     /* storage unavailable (private mode); auth simply won't persist */
   }
   notify()
 }
 
-/** Clear stored credentials (called on logout or a 401). */
+/**
+ * Enter session mode: the session itself lives in the `forge_session` cookie;
+ * we only persist the CSRF token from `POST /auth/login` / `GET /auth/me`.
+ */
+export function setSession(csrf: string): void {
+  try {
+    localStorage.setItem(CSRF_KEY, csrf)
+    localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    /* storage unavailable (private mode); auth simply won't persist */
+  }
+  notify()
+}
+
+/**
+ * Clear stored credentials — token and session CSRF alike (called on logout
+ * or a 401). In session mode the caller is responsible for `POST /auth/logout`
+ * (the cookie is httpOnly; only the server can invalidate it).
+ */
 export function clearToken(): void {
   try {
     localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(CSRF_KEY)
   } catch {
     /* ignore */
   }
@@ -92,21 +146,22 @@ export function clearToken(): void {
 
 /** Whether we currently hold a credential the API will accept. */
 export function isAuthenticated(): boolean {
-  // Under cookie mode the browser sends the cookie implicitly, so we optimistic
-  // -ally report "authenticated" and let `GET /admin/me` be the source of truth.
-  if (authMode === 'cookie') return true
-  return getToken() !== null
+  return getAuth() !== null
 }
 
 /**
  * Headers to attach to API requests for the active auth mode. Token mode emits
- * an HTTP Basic header with the token as the secret; cookie mode emits nothing
- * (the cookie travels automatically).
+ * an HTTP Basic header with the token as the secret; session mode emits the
+ * CSRF header (the session cookie travels automatically) — the server only
+ * checks it on mutating requests, sending it on reads is harmless.
  */
 export function authHeaders(): Record<string, string> {
-  if (authMode === 'token') {
-    const token = getToken()
-    if (token) return { Authorization: `Basic ${base64(`token:${token}`)}` }
+  const auth = getAuth()
+  if (auth?.mode === 'token') {
+    return { Authorization: `Basic ${base64(`token:${auth.token}`)}` }
+  }
+  if (auth?.mode === 'session') {
+    return { 'X-CSRF-Token': auth.csrf }
   }
   return {}
 }

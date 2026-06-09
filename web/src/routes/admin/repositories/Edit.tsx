@@ -112,7 +112,6 @@ function toUpdateBody(values: RepoFormValues): UpdateRepo {
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()
     body.package_delay_seconds = Number(values.package_delay_seconds) || 0
-    body.allow_private_upstream = values.allow_private_upstream
     body.metadata_ttl_seconds = parseTtl(values.metadata_ttl_seconds)
     body.not_found_ttl_seconds = parseTtl(values.not_found_ttl_seconds)
     body.upstream_username =
