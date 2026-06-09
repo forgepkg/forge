@@ -56,7 +56,7 @@ impl LocalPasswordProvider {
 
 #[async_trait::async_trait]
 impl AuthProvider for LocalPasswordProvider {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         Self::ID
     }
 

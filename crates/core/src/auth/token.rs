@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
-use super::chain::{provision_and_map, Chain, ChainOutcome};
+use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
 use super::local_password::LocalPasswordProvider;
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
@@ -225,15 +225,12 @@ impl PrincipalSource for TokenHeaderSource {
 /// without any change to this source.
 pub struct BasicAuthSource {
     pool: PgPool,
-    /// The password-style auth chain. `None` reproduces slice-1
-    /// `allow_password_basic = false` (password path disabled); `Some(chain)`
-    /// reproduces `allow_password_basic = true` with the local provider (and,
-    /// from phase 4, any further providers).
-    chain: Option<Arc<Chain>>,
-    /// Whether an upstream-vouched identity with no matching `app_user` is
-    /// auto-provisioned (slice 12.3, phase 5). Only the `upstream-basic` provider
-    /// can produce such an identity; `false` requires the user to pre-exist.
-    auto_provision: bool,
+    /// Where the *current* password chain comes from. A [`StaticChainSource`]
+    /// reproduces the slice-12.3 startup-built chain; the realm-driven server
+    /// wiring (12.7) plugs in a snapshot-cached source rebuilt from the
+    /// `auth_realm` table. `password_chain() == None` reproduces slice-1
+    /// `allow_password_basic = false` (password path disabled).
+    chain: Arc<dyn ChainSource>,
 }
 
 impl BasicAuthSource {
@@ -242,36 +239,31 @@ impl BasicAuthSource {
     /// with the default chain (`["local-password"]`); when `false`, only the
     /// token-as-basic path runs.
     ///
-    /// Preserved for slice-1 / existing callers and tests. Newer wiring that
-    /// builds a richer chain (phase 4+) should use [`BasicAuthSource::with_chain`].
+    /// Preserved for slice-1 / existing callers and tests. Newer wiring should
+    /// use [`BasicAuthSource::with_chain`] / [`BasicAuthSource::with_source`].
     pub fn new(pool: PgPool, allow_password_basic: bool) -> Self {
         let chain = if allow_password_basic {
             Some(Arc::new(Chain::new(vec![Box::new(
                 LocalPasswordProvider::new(pool.clone()),
-            )])))
+            ) as Box<dyn super::provider::AuthProvider>])))
         } else {
             None
         };
-        // The default chain is local-only, which never auto-provisions; the flag
-        // is inert here.
-        Self {
-            pool,
-            chain,
-            auto_provision: false,
-        }
+        Self::with_chain(pool, chain)
     }
 
-    /// Build a source with an explicit password-auth chain (phase 4+ wiring).
-    /// Pass `None` to disable the password path entirely. `auto_provision`
-    /// controls whether an upstream-vouched identity with no existing `app_user`
-    /// is created on first success (slice 12.3, phase 5) — it is meaningful only
-    /// when the chain contains the `upstream-basic` provider.
-    pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>, auto_provision: bool) -> Self {
-        Self {
-            pool,
-            chain,
-            auto_provision,
-        }
+    /// Build a source with an explicit, fixed password-auth chain. Pass `None`
+    /// to disable the password path entirely. Auto-provisioning of
+    /// upstream-vouched users is decided per identity (the vouching provider
+    /// stamps its realm's flag onto the [`crate::auth::ProvenIdentity`]).
+    pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>) -> Self {
+        Self::with_source(pool, Arc::new(StaticChainSource(chain)))
+    }
+
+    /// Build a source whose chain is re-resolved per attempt (12.7: the
+    /// realm-driven server wiring hands in its snapshot-cached source).
+    pub fn with_source(pool: PgPool, chain: Arc<dyn ChainSource>) -> Self {
+        Self { pool, chain }
     }
 }
 
@@ -316,8 +308,9 @@ impl PrincipalSource for BasicAuthSource {
             return SourceOutcome::Authenticated(Principal::from_user(up));
         }
         // Then, if a password chain is configured, run the secret as a password
-        // through the AuthProvider chain.
-        if let Some(chain) = self.chain.as_ref() {
+        // through the AuthProvider chain. The chain is re-resolved per attempt
+        // so runtime realm edits (12.7) take effect without a restart.
+        if let Some(chain) = self.chain.password_chain().await {
             let cred = PasswordCredential {
                 username: &username,
                 password: &secret,
@@ -328,7 +321,7 @@ impl PrincipalSource for BasicAuthSource {
                     // Map the vouched-for username back to a concrete principal,
                     // auto-provisioning an upstream-vouched user on first login
                     // when configured (phase 5).
-                    match provision_and_map(&self.pool, &identity, self.auto_provision).await {
+                    match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             return SourceOutcome::Authenticated(Principal::from_user(up))
                         }

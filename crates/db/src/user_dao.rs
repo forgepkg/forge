@@ -191,3 +191,21 @@ pub async fn delete_user(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
         .await?;
     Ok(res.rows_affected() > 0)
 }
+
+/// Record which auth realm last vouched for / provisioned this user (12.7
+/// provenance — informational, never an authorization input). A no-op write
+/// when the value is unchanged.
+pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE app_user
+        SET realm_id = $2
+        WHERE id = $1 AND realm_id IS DISTINCT FROM $2
+        "#,
+        user_id,
+        realm_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}

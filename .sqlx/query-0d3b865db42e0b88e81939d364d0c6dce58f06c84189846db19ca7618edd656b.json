@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SET CONSTRAINTS auth_realm_priority_key DEFERRED",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "0d3b865db42e0b88e81939d364d0c6dce58f06c84189846db19ca7618edd656b"
+}

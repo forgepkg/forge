@@ -111,6 +111,17 @@ pub struct UpstreamBasicConfig {
     /// only, never revoke — see chain provisioning). Empty ⇒ never suggests
     /// admin.
     pub admin_group: String,
+    /// Stable provider id keying the validated-credential cache and logged as
+    /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
+    /// realm-driven wiring (12.7) uses a realm-scoped id (`"realm:<name>"`).
+    pub provider_id: String,
+    /// Auto-provision an `app_user` on first successful upstream login.
+    /// Stamped onto every [`ProvenIdentity`] this provider vouches for (the
+    /// chain caller acts on it — per-realm since 12.7).
+    pub auto_provision: bool,
+    /// The `auth_realm.id` this provider was built from, recorded as
+    /// provenance on provisioned users. `None` for static-config wiring.
+    pub realm_id: Option<i64>,
 }
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
@@ -263,8 +274,8 @@ struct ForwardResult {
 
 #[async_trait]
 impl AuthProvider for UpstreamBasicProvider {
-    fn id(&self) -> &'static str {
-        UPSTREAM_BASIC_ID
+    fn id(&self) -> &str {
+        &self.config.provider_id
     }
 
     fn source(&self) -> AuthSource {
@@ -309,6 +320,8 @@ impl AuthProvider for UpstreamBasicProvider {
                     external_subject: Some(cred.username.to_string()),
                     groups,
                     suggested_is_admin,
+                    auto_provision: self.config.auto_provision,
+                    realm_id: self.config.realm_id,
                 })
             }
             Ok(false) => AuthOutcome::Rejected,

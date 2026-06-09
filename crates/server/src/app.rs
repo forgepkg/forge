@@ -48,14 +48,10 @@ pub fn principal_layer(
     pool: &PgPool,
     cache: &Cache,
 ) -> anyhow::Result<PrincipalLayer> {
-    let (chain, auto_provision) = build_password_chain(config, pool, cache)?;
+    let chain = build_password_chain(config, pool, cache)?;
     let mut sources: Vec<Box<dyn PrincipalSource>> = vec![
         Box::new(TokenHeaderSource::new(pool.clone())),
-        Box::new(BasicAuthSource::with_chain(
-            pool.clone(),
-            chain,
-            auto_provision,
-        )),
+        Box::new(BasicAuthSource::with_chain(pool.clone(), chain)),
     ];
 
     // Append the session-cookie source only when OIDC login is enabled (it is
@@ -82,37 +78,34 @@ pub fn principal_layer(
 
 /// Build the password-style auth [`Chain`] from config (slice 12.3, phase 5).
 ///
-/// Returns `(chain, auto_provision)`:
-/// * `chain = None` reproduces slice-1 `allow_password_basic = false` — the
-///   password path is disabled entirely (only token-as-basic runs). This is the
-///   case when `allow_password_basic` is off **and** the provider chain is just
-///   the default local-only one (so there is no reason to run a password chain).
-/// * Otherwise the providers in `auth.providers` are instantiated in order:
-///   `local-password` → [`LocalPasswordProvider`]; `upstream-basic` →
-///   [`UpstreamBasicProvider`] over an SSRF-guarded client + the
-///   validated-credential cache.
-/// * `auto_provision` is the upstream-basic block's flag (only meaningful when
-///   that provider is in the chain).
+/// Returns the chain, where `None` reproduces slice-1 `allow_password_basic =
+/// false` — the password path is disabled entirely (only token-as-basic runs).
+/// This is the case when `allow_password_basic` is off **and** the provider
+/// chain is just the default local-only one (so there is no reason to run a
+/// password chain). Otherwise the providers in `auth.providers` are
+/// instantiated in order: `local-password` → [`LocalPasswordProvider`];
+/// `upstream-basic` → [`UpstreamBasicProvider`] over the outbound client + the
+/// validated-credential cache (auto-provisioning rides on each vouched
+/// identity per its provider config).
 ///
 /// Config validation (unknown ids, missing/disabled `[auth.upstream_basic]`,
 /// empty pepper, …) already ran in [`Config::validate`]; this function trusts it
-/// and only fails on an infrastructure error (building the guarded client).
+/// and only fails on an infrastructure error (building the outbound client).
 fn build_password_chain(
     config: &Config,
     pool: &PgPool,
     cache: &Cache,
-) -> anyhow::Result<(Option<Arc<Chain>>, bool)> {
+) -> anyhow::Result<Option<Arc<Chain>>> {
     let providers = &config.auth.providers;
     let only_default_local = providers.len() == 1 && providers[0] == LocalPasswordProvider::ID;
 
     // Slice-1 parity: when password-basic is off and the chain is just the
     // default local provider, there is no password path at all.
     if !config.auth.allow_password_basic && only_default_local {
-        return Ok((None, false));
+        return Ok(None);
     }
 
     let mut built: Vec<Box<dyn AuthProvider>> = Vec::with_capacity(providers.len());
-    let mut auto_provision = false;
 
     for id in providers {
         match id.as_str() {
@@ -126,7 +119,6 @@ fn build_password_chain(
                     .upstream_basic
                     .as_ref()
                     .context("upstream_basic config present (validated)")?;
-                auto_provision = ub.auto_provision;
 
                 let client = outbound_client()
                     .map_err(|e| anyhow::anyhow!("build upstream-basic http client: {e}"))?;
@@ -147,7 +139,7 @@ fn build_password_chain(
         }
     }
 
-    Ok((Some(Arc::new(Chain::new(built))), auto_provision))
+    Ok(Some(Arc::new(Chain::new(built))))
 }
 
 /// Build the full application router:

@@ -268,6 +268,9 @@ impl UpstreamBasicAuthConfig {
             required_groups: self.required_groups.clone(),
             groups_path: self.groups_path.clone(),
             admin_group: self.admin_group.clone(),
+            provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
+            auto_provision: self.auto_provision,
+            realm_id: None,
         }
     }
 }

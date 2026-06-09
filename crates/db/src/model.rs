@@ -309,6 +309,30 @@ pub struct ValidatedCredential {
     pub created_at: DateTime<Utc>,
 }
 
+/// A configured authentication realm (slice 12.7, design doc 2026-06-03 §3).
+///
+/// One row per authentication mechanism instance: the built-in `local`
+/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or (12.8,
+/// reserved) a `workload_identity` issuer. `priority` orders the realms — LOWER
+/// tries/lists first; `config` is kind-specific jsonb whose secrets are
+/// write-only at the API layer (redacted from every response).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuthRealm {
+    pub id: i64,
+    /// `'local'` | `'oidc'` | `'credential_forwarding'` | `'workload_identity'`.
+    pub kind: String,
+    /// Unique display name + URL slug (lowercase, dns-label-ish; DB CHECK).
+    pub name: String,
+    pub enabled: bool,
+    /// Total order (unique): lower tries first.
+    pub priority: i32,
+    /// Kind-specific configuration. May contain secrets — never serialize this
+    /// field into an API response as-is.
+    pub config: JsonValue,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
