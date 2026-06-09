@@ -52,6 +52,14 @@ pub struct Config {
     /// Absent ⇒ OIDC disabled, no `/auth/oidc/*` routes.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    /// Optional secret encryption at rest (slice 12.5). Absent/disabled ⇒
+    /// slice-1 behavior (secrets stay in the legacy plaintext columns; no key
+    /// bootstrap, rotation worker, or backfill). Present + enabled ⇒ proxy
+    /// `upstream_password` writes are envelope-encrypted under the root → KEK
+    /// → DEK hierarchy, existing plaintext is backfilled at startup, and the
+    /// `/admin/crypto/*` endpoints are live.
+    #[serde(default)]
+    pub crypto: Option<CryptoConfig>,
 }
 
 /// `server.*`
@@ -677,6 +685,146 @@ fn default_session_absolute_ttl() -> u64 {
     7 * 24 * 60 * 60 // 7d
 }
 
+/// `crypto.*` — secret encryption at rest (slice 12.5).
+///
+/// No field here is itself a secret: the **env provider** stores the *name* of
+/// the environment variable holding the base64 root key and the **file
+/// provider** stores a *path* — the key bytes are only ever read by the root
+/// provider at startup (and never logged; `forge-crypto` wraps them in
+/// zeroizing, Debug-redacted newtypes). The derived `Debug` is therefore safe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CryptoConfig {
+    /// Master switch. `false` parses but keeps encryption off (lets an
+    /// operator stage the block before flipping it on).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// AEAD for new keys and new secret envelopes:
+    /// `aes-256-gcm` (default) or `xchacha20-poly1305`. Existing material
+    /// keeps the algorithm recorded on its key row / blob header.
+    #[serde(default = "default_crypto_algorithm")]
+    pub algorithm: String,
+    /// Where the root key lives.
+    pub root: CryptoRootConfig,
+    /// Unwrapped-key cache tuning.
+    #[serde(default)]
+    pub cache: CryptoCacheConfig,
+    /// Rotation worker tuning.
+    #[serde(default)]
+    pub rotation: CryptoRotationConfig,
+}
+
+/// `crypto.root.*` — the root-key provider.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CryptoRootConfig {
+    /// `"env"` | `"file"`. (`"aws-kms"` is reserved for the later KMS provider
+    /// and is rejected at startup until it ships.)
+    pub provider: String,
+    /// env provider: name of the env var holding the base64 32-byte root key.
+    #[serde(default = "default_root_key_env")]
+    pub root_key_env: String,
+    /// env provider: optional env var holding the **previous** root key,
+    /// reachable during a root-rotation window (until the KEK re-wrap sweep
+    /// completes; see the rotation runbook in the plan).
+    #[serde(default)]
+    pub root_key_env_previous: Option<String>,
+    /// file provider: path of the file holding the base64 32-byte root key
+    /// (e.g. a mounted Kubernetes secret).
+    #[serde(default)]
+    pub root_key_path: Option<String>,
+    /// file provider: optional path of the **previous** root key.
+    #[serde(default)]
+    pub root_key_path_previous: Option<String>,
+}
+
+/// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys (§2.6).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CryptoCacheConfig {
+    /// TTL (seconds) of unwrapped key bytes in RAM. Bounds both root-provider
+    /// traffic and the window revoked keys may linger on other instances.
+    #[serde(default = "default_unwrapped_key_ttl")]
+    pub unwrapped_key_ttl_secs: u64,
+    /// Max cached unwrapped keys.
+    #[serde(default = "default_unwrapped_key_max")]
+    pub unwrapped_key_max: u64,
+}
+
+impl Default for CryptoCacheConfig {
+    fn default() -> Self {
+        CryptoCacheConfig {
+            unwrapped_key_ttl_secs: default_unwrapped_key_ttl(),
+            unwrapped_key_max: default_unwrapped_key_max(),
+        }
+    }
+}
+
+/// `crypto.rotation.*` — the cluster-coordinated rotation/backfill worker.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CryptoRotationConfig {
+    /// Run the background worker (backfill, sweeps, age-based rotation) on
+    /// this instance. Admin-triggered rotation works regardless.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Worker poll interval (seconds).
+    #[serde(default = "default_crypto_poll")]
+    pub poll_interval_seconds: u64,
+    /// Auto-rotate the active DEK once it is older than this many days.
+    /// `0` disables age-based DEK rotation.
+    #[serde(default = "default_dek_max_age_days")]
+    pub dek_max_age_days: i64,
+    /// Auto-rotate the active KEK once it is older than this many days.
+    /// `0` disables age-based KEK rotation.
+    #[serde(default = "default_kek_max_age_days")]
+    pub kek_max_age_days: i64,
+    /// Rows per backfill / re-encrypt sweep batch (each batch is its own
+    /// transaction-free unit; the sweep is keyset-paginated and resumable).
+    #[serde(default = "default_sweep_batch_size")]
+    pub sweep_batch_size: i64,
+}
+
+impl Default for CryptoRotationConfig {
+    fn default() -> Self {
+        CryptoRotationConfig {
+            enabled: default_true(),
+            poll_interval_seconds: default_crypto_poll(),
+            dek_max_age_days: default_dek_max_age_days(),
+            kek_max_age_days: default_kek_max_age_days(),
+            sweep_batch_size: default_sweep_batch_size(),
+        }
+    }
+}
+
+impl CryptoConfig {
+    /// Poll interval as a [`Duration`].
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.rotation.poll_interval_seconds)
+    }
+}
+
+fn default_crypto_algorithm() -> String {
+    "aes-256-gcm".into()
+}
+fn default_root_key_env() -> String {
+    "FORGE_ROOT_KEY".into()
+}
+fn default_unwrapped_key_ttl() -> u64 {
+    300
+}
+fn default_unwrapped_key_max() -> u64 {
+    64
+}
+fn default_crypto_poll() -> u64 {
+    300
+}
+fn default_dek_max_age_days() -> i64 {
+    30
+}
+fn default_kek_max_age_days() -> i64 {
+    365
+}
+fn default_sweep_batch_size() -> i64 {
+    500
+}
+
 fn default_region() -> String {
     "us-east-1".into()
 }
@@ -757,6 +905,66 @@ impl Config {
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
+        self.validate_crypto()?;
+        Ok(())
+    }
+
+    /// Validate the optional `[crypto]` section when present and enabled
+    /// (slice 12.5): the algorithm name must parse and the root provider must
+    /// be a supported kind with the fields it needs. The root key **bytes**
+    /// are deliberately not read here — that happens once at startup when the
+    /// provider is built, so a missing/short key still refuses to boot, just
+    /// with the more precise root-provider error.
+    fn validate_crypto(&self) -> Result<(), ConfigError> {
+        let Some(crypto) = &self.crypto else {
+            return Ok(());
+        };
+        if !crypto.enabled {
+            return Ok(());
+        }
+
+        forge_crypto::Algorithm::parse(&crypto.algorithm).map_err(|_| {
+            ConfigError::Invalid(format!(
+                "unknown crypto.algorithm {:?} (expected aes-256-gcm|xchacha20-poly1305)",
+                crypto.algorithm
+            ))
+        })?;
+
+        match crypto.root.provider.as_str() {
+            "env" => {
+                if crypto.root.root_key_env.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "crypto.root.root_key_env must not be empty for the env provider".into(),
+                    ));
+                }
+            }
+            "file" => {
+                if crypto
+                    .root
+                    .root_key_path
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(ConfigError::Invalid(
+                        "crypto.root.root_key_path is required for the file provider".into(),
+                    ));
+                }
+            }
+            "aws-kms" => {
+                return Err(ConfigError::Invalid(
+                    "crypto.root.provider \"aws-kms\" is not supported yet (the KmsProvider \
+                     trait is the seam; use \"env\" or \"file\")"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown crypto.root.provider {other:?} (expected env|file)"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1554,6 +1762,103 @@ mod tests {
         let ba = cfg.auth.bootstrap_admin.expect("present");
         assert_eq!(ba.username, "admin");
         assert_eq!(ba.password, "changeme");
+    }
+
+    // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────
+
+    #[test]
+    fn crypto_absent_means_disabled() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(cfg.crypto.is_none());
+    }
+
+    #[test]
+    fn crypto_env_provider_parses_with_defaults() {
+        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let crypto = cfg.crypto.expect("present");
+        assert!(crypto.enabled);
+        assert_eq!(crypto.algorithm, "aes-256-gcm");
+        assert_eq!(crypto.root.provider, "env");
+        assert_eq!(crypto.root.root_key_env, "FORGE_ROOT_KEY");
+        assert!(crypto.root.root_key_env_previous.is_none());
+        assert_eq!(crypto.cache.unwrapped_key_ttl_secs, 300);
+        assert_eq!(crypto.cache.unwrapped_key_max, 64);
+        assert!(crypto.rotation.enabled);
+        assert_eq!(crypto.rotation.poll_interval_seconds, 300);
+        assert_eq!(crypto.rotation.dek_max_age_days, 30);
+        assert_eq!(crypto.rotation.kek_max_age_days, 365);
+        assert_eq!(crypto.rotation.sweep_batch_size, 500);
+    }
+
+    #[test]
+    fn crypto_file_provider_requires_path() {
+        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"file\"\n");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("root_key_path"), "{err}");
+
+        let toml = format!(
+            "{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"file\"\nroot_key_path = \"/run/secrets/forge_root_key\"\n"
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(
+            cfg.crypto.unwrap().root.root_key_path.as_deref(),
+            Some("/run/secrets/forge_root_key")
+        );
+    }
+
+    #[test]
+    fn crypto_unknown_provider_and_algorithm_rejected() {
+        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"vault\"\n");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("crypto.root.provider"), "{err}");
+
+        let toml = format!(
+            "{MINIMAL}\n[crypto]\nalgorithm = \"rot13\"\n[crypto.root]\nprovider = \"env\"\n"
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("crypto.algorithm"), "{err}");
+    }
+
+    #[test]
+    fn crypto_aws_kms_rejected_until_it_ships() {
+        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"aws-kms\"\n");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("not supported yet"), "{err}");
+    }
+
+    #[test]
+    fn crypto_disabled_block_skips_validation() {
+        // A staged-but-disabled block with an invalid provider must parse.
+        let toml = format!(
+            "{MINIMAL}\n[crypto]\nenabled = false\n[crypto.root]\nprovider = \"vault\"\n"
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("disabled block is inert");
+        assert!(!cfg.crypto.unwrap().enabled);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn crypto_env_overrides_nested_keys() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_CRYPTO__ALGORITHM", "xchacha20-poly1305");
+            jail.set_env("FORGE_CRYPTO__ROOT__PROVIDER", "env");
+            jail.set_env("FORGE_CRYPTO__ROOT__ROOT_KEY_ENV", "MY_ROOT_KEY");
+            jail.set_env("FORGE_CRYPTO__ROOT__ROOT_KEY_ENV_PREVIOUS", "MY_OLD_ROOT_KEY");
+            jail.set_env("FORGE_CRYPTO__CACHE__UNWRAPPED_KEY_TTL_SECS", "60");
+            jail.set_env("FORGE_CRYPTO__ROTATION__DEK_MAX_AGE_DAYS", "7");
+            jail.set_env("FORGE_CRYPTO__ROTATION__ENABLED", "false");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            let crypto = cfg.crypto.expect("present via env");
+            assert_eq!(crypto.algorithm, "xchacha20-poly1305");
+            assert_eq!(crypto.root.root_key_env, "MY_ROOT_KEY");
+            assert_eq!(crypto.root.root_key_env_previous.as_deref(), Some("MY_OLD_ROOT_KEY"));
+            assert_eq!(crypto.cache.unwrapped_key_ttl_secs, 60);
+            assert_eq!(crypto.rotation.dek_max_age_days, 7);
+            assert!(!crypto.rotation.enabled);
+            Ok(())
+        });
     }
 
     #[test]

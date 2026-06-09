@@ -61,6 +61,12 @@ pub struct AppState {
     /// Interactive OIDC login runtime (slice 12.2). `None` ⇒ OIDC disabled and
     /// no `/auth/oidc/*` routes are mounted.
     pub oidc: Option<crate::auth::OidcRuntime>,
+    /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
+    /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
+    /// Built fallibly by [`crate::crypto::build_envelope`] **before**
+    /// [`AppState::new`] (a configured-but-broken root key must abort startup)
+    /// and attached via [`AppState::with_envelope`].
+    pub envelope: Option<std::sync::Arc<forge_crypto::service::EnvelopeService>>,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -133,7 +139,19 @@ impl AppState {
             formats: Arc::new(FormatRegistry::new(nuget)),
             config: Arc::new(config),
             oidc,
+            envelope: None,
         }
+    }
+
+    /// Attach the secret-encryption envelope service (slice 12.5). Kept out of
+    /// [`AppState::new`] because building it reads the root key and must be
+    /// able to fail startup; `None` keeps encryption disabled.
+    pub fn with_envelope(
+        mut self,
+        envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    ) -> Self {
+        self.envelope = envelope;
+        self
     }
 
     /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`NupkgBytes`).
@@ -166,12 +184,16 @@ impl AppState {
                 format,
                 self.blob_bytes(),
             ))),
-            RepoKind::Proxy => Ok(Arc::new(ProxyRepo::new(
-                self.pool.clone(),
-                format,
-                self.cas.clone(),
-                self.cache.clone(),
-            ))),
+            RepoKind::Proxy => Ok(Arc::new(
+                ProxyRepo::new(
+                    self.pool.clone(),
+                    format,
+                    self.cas.clone(),
+                    self.cache.clone(),
+                )
+                // §12.5: lets the upstream fetch decrypt an encrypted password.
+                .with_envelope(self.envelope.clone()),
+            )),
             RepoKind::Group => Ok(Arc::new(GroupRepo::new(
                 self.pool.clone(),
                 principal,
@@ -190,6 +212,7 @@ impl AppState {
             cas: self.cas.clone(),
             cache: self.cache.clone(),
             formats: self.formats.clone(),
+            envelope: self.envelope.clone(),
         }
     }
 }
@@ -255,6 +278,8 @@ pub struct MemberFactory {
     cas: Cas,
     cache: Cache,
     formats: Arc<FormatRegistry>,
+    /// §12.5: proxy members decrypt their upstream password through this.
+    envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
 }
 
 impl MemberOpsFactory for MemberFactory {
@@ -268,12 +293,15 @@ impl MemberOpsFactory for MemberFactory {
                     store: self.blob_store.clone(),
                 }),
             ))),
-            RepoKind::Proxy => Ok(Arc::new(ProxyRepo::new(
-                self.pool.clone(),
-                format,
-                self.cas.clone(),
-                self.cache.clone(),
-            ))),
+            RepoKind::Proxy => Ok(Arc::new(
+                ProxyRepo::new(
+                    self.pool.clone(),
+                    format,
+                    self.cas.clone(),
+                    self.cache.clone(),
+                )
+                .with_envelope(self.envelope.clone()),
+            )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),
                 kind: member.kind.clone(),

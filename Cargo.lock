@@ -1570,6 +1570,7 @@ dependencies = [
  "base64",
  "chrono",
  "forge-cache",
+ "forge-crypto",
  "forge-db",
  "forge-nuget",
  "forge-storage",
@@ -1623,7 +1624,9 @@ dependencies = [
 name = "forge-db"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "forge-crypto",
  "serde",
  "serde_json",
  "sqlx",
@@ -1702,6 +1705,7 @@ dependencies = [
  "figment",
  "forge-cache",
  "forge-core",
+ "forge-crypto",
  "forge-db",
  "forge-nuget",
  "forge-storage",

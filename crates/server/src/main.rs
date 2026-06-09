@@ -68,10 +68,23 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure legacy RBAC mapping")?;
 
+    // §12.5: secret encryption at rest. Building the envelope service reads
+    // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
+    // operator who configured encryption never gets a silently-plaintext
+    // instance. Bootstrap then idempotently creates the active KEK/DEK and
+    // backfills any pre-12.5 plaintext upstream passwords.
+    let envelope = forge_server::crypto::build_envelope(&config, &pool)
+        .context("build secret-encryption envelope service")?;
+    if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
+        forge_server::crypto::bootstrap(&pool, env, crypto_cfg)
+            .await
+            .context("bootstrap secret encryption")?;
+    }
+
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     let layer = principal_layer(&config, &pool, &cache)?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let state = AppState::new(pool, blob_store, cache, nuget, config);
+    let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
 
     // Background workers (outbox / reconciler / proxy refresh).
     let _workers = workers::spawn_all(&state);
