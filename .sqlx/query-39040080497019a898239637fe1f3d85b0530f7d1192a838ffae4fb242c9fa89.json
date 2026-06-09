@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            r.id, r.name, r.format, r.kind, r.anonymous_read, r.online, r.config,\n            r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password,\n            r.upstream_password_enc, r.metadata_ttl_seconds, r.not_found_ttl_seconds,\n            r.allow_redeploy, r.created_at, r.updated_at,\n            gm.priority\n        FROM group_member gm\n        JOIN repository r ON r.id = gm.member_id\n        WHERE gm.group_id = $1\n        ORDER BY gm.priority DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -60,28 +60,38 @@
       },
       {
         "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 12,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "priority",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -103,10 +113,12 @@
       true,
       true,
       true,
+      true,
+      false,
       false,
       false,
       false
     ]
   },
-  "hash": "cfc78488c8ab5a8bb8300fb51f924e215cf135b7d2a5e68d29a0da9d706837b3"
+  "hash": "39040080497019a898239637fe1f3d85b0530f7d1192a838ffae4fb242c9fa89"
 }

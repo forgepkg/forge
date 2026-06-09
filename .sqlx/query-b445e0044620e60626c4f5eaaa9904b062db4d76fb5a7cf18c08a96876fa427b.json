@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
   "describe": {
     "columns": [
       {
@@ -60,26 +60,31 @@
       },
       {
         "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 12,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4"
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "allow_redeploy",
         "type_info": "Bool"
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -101,10 +106,11 @@
       true,
       true,
       true,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "70d1e738f43fd5458a5fb81208ec19bdbfb6a6e366583d870eda777281031678"
+  "hash": "b445e0044620e60626c4f5eaaa9904b062db4d76fb5a7cf18c08a96876fa427b"
 }

@@ -150,6 +150,7 @@ fn config_toml(
     anon: &str,
     web_assets_dir: Option<&str>,
     oidc_block: Option<&str>,
+    crypto_block: Option<&str>,
 ) -> String {
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
@@ -194,11 +195,13 @@ poll_interval_seconds = 1
 
 {web}
 {oidc}
+{crypto}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
         secret = S3_SECRET,
         oidc = oidc_block.unwrap_or(""),
+        crypto = crypto_block.unwrap_or(""),
     )
 }
 
@@ -233,6 +236,10 @@ pub struct ServerOpts {
     /// When set, this raw TOML is appended as the `[oidc]` section so the server
     /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes (slice 12.2).
     pub oidc_block: Option<String>,
+    /// When set, this raw TOML is appended as the `[crypto]` section so the
+    /// server builds the secret-encryption envelope service (slice 12.5). The
+    /// caller is responsible for exporting the root-key env var it references.
+    pub crypto_block: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -243,6 +250,7 @@ impl Default for ServerOpts {
             spawn_workers: false,
             web_assets_dir: None,
             oidc_block: None,
+            crypto_block: None,
         }
     }
 }
@@ -266,6 +274,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         &opts.anonymous_mode,
         opts.web_assets_dir.as_deref(),
         opts.oidc_block.as_deref(),
+        opts.crypto_block.as_deref(),
     );
     use figment::providers::Format as _;
     let config = Config::from_figment(
@@ -278,14 +287,24 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .expect("bootstrap admin");
 
     // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
-    // (one-shot, marker-guarded) so the realm-driven runtime sees them.
+    // (drift-detected) so the realm-driven runtime sees them.
     forge_server::app::ensure_auth_realms(&config, &pool)
         .await
         .expect("seed auth realms");
 
+    // §12.5: build + bootstrap the envelope service when the test enabled the
+    // [crypto] block (no-op otherwise).
+    let envelope =
+        forge_server::crypto::build_envelope(&config, &pool).expect("build envelope service");
+    if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
+        forge_server::crypto::bootstrap(&pool, env, crypto_cfg)
+            .await
+            .expect("bootstrap secret encryption");
+    }
+
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let state = AppState::new(pool.clone(), store, cache, nuget, config);
+    let state = AppState::new(pool.clone(), store, cache, nuget, config).with_envelope(envelope);
     let layer = principal_layer(&state).expect("principal layer");
 
     let workers = if opts.spawn_workers {

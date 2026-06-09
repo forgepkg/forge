@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, upstream_password_enc AS \"upstream_password_enc!\"\n            FROM repository\n            WHERE upstream_password_enc IS NOT NULL AND id > $1\n            ORDER BY id\n            LIMIT 500\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_password_enc!",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "f36cd4e91d1ab20ec06d8eee92a212039b513e0f8ee8c17aa993e16cc626a6ec"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE encryption_key\n            SET state = $2,\n                rotated_at = CASE\n                    WHEN $2 <> 'active' AND rotated_at IS NULL THEN now()\n                    ELSE rotated_at\n                END\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16d76c1a2df1822777d1bdf5e157269bcef13f16cb1e5072519012aa8072ffbc"
+}

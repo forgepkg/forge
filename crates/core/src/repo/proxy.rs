@@ -156,6 +156,12 @@ pub struct ProxyRepo {
     /// symmetry with the hosted facade should proxy eviction land later).
     #[allow(dead_code)]
     delete_grace: Duration,
+    /// Envelope service decrypting the encrypted `upstream_password_enc`
+    /// (slice 12.5). `None` ⇒ secret encryption is not configured; only the
+    /// legacy plaintext column can be used and a row that holds an encrypted
+    /// blob fails the fetch (fail closed — never a silent unauthenticated
+    /// request against a credentialed upstream).
+    envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
 }
 
 impl ProxyRepo {
@@ -167,6 +173,46 @@ impl ProxyRepo {
             cas,
             cache,
             delete_grace: Duration::seconds(0),
+            envelope: None,
+        }
+    }
+
+    /// Attach the envelope service so this proxy can decrypt an encrypted
+    /// `upstream_password_enc` (slice 12.5). Without it, only legacy plaintext
+    /// passwords work and encrypted rows fail closed.
+    pub fn with_envelope(
+        mut self,
+        envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    ) -> Self {
+        self.envelope = envelope;
+        self
+    }
+
+    /// Resolve the upstream password for the outbound Basic header — the
+    /// **single sanctioned decrypt site** of the proxy credential (plan §2.4):
+    /// an encrypted row decrypts through `forge_db::secret_dao` (re-reading the
+    /// row so the AAD binds to fresh data); a not-yet-backfilled row falls back
+    /// to the legacy plaintext column. Fail closed: an encrypted blob without a
+    /// configured envelope service is an error, not an anonymous fetch.
+    async fn upstream_password(
+        &self,
+        repo: &Repository,
+    ) -> Result<Option<forge_crypto::PlaintextSecret>, RepoError> {
+        match (&repo.upstream_password_enc, &self.envelope) {
+            (Some(_), Some(envelope)) => {
+                forge_db::secret_dao::get_upstream_password(&self.pool, envelope, repo.id)
+                    .await
+                    .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
+            }
+            (Some(_), None) => Err(RepoError::Storage(
+                "repository stores an encrypted upstream password but secret encryption is not \
+                 configured (missing [crypto] config)"
+                    .into(),
+            )),
+            (None, _) => Ok(repo
+                .upstream_password
+                .clone()
+                .map(forge_crypto::PlaintextSecret::from)),
         }
     }
 
@@ -505,8 +551,12 @@ impl ProxyRepo {
         // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
         let mut req = client.get(&url);
-        if let (Some(u), Some(p)) = (&repo.upstream_username, &repo.upstream_password) {
-            req = req.basic_auth(u, Some(p));
+        // §12.5: decrypt-on-use; the plaintext lives only inside this request
+        // builder (and the zeroizing secret wrapper) — never in a log or model.
+        let upstream_password = self.upstream_password(repo).await?;
+        if let (Some(u), Some(p)) = (&repo.upstream_username, &upstream_password) {
+            use forge_crypto::ExposeSecret;
+            req = req.basic_auth(u, Some(p.expose_secret()));
         }
         let resp = req
             .send()

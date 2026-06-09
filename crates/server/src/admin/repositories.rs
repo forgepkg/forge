@@ -55,7 +55,8 @@ impl From<&Repository> for RepoView {
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
-            has_upstream_password: r.upstream_password.is_some(),
+            // §12.5: true for an encrypted blob OR a (pre-backfill) plaintext.
+            has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
@@ -173,6 +174,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         return bad_request("remote_url is only valid for proxy repositories");
     }
 
+    // §12.5: with encryption enabled the password is NOT inserted as plaintext;
+    // the row is created first (the AAD binds the ciphertext to the row id,
+    // which does not exist before the INSERT) and the secret is sealed below.
+    let encrypting = state.envelope.is_some();
     let new = NewRepository {
         name: body.name.clone(),
         format: body.format.clone(),
@@ -183,19 +188,61 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         remote_url: body.remote_url.clone(),
         package_delay_seconds: body.package_delay_seconds,
         upstream_username: body.upstream_username.clone(),
-        upstream_password: body.upstream_password.clone(),
+        upstream_password: if encrypting {
+            None
+        } else {
+            body.upstream_password.clone()
+        },
         metadata_ttl_seconds: body.metadata_ttl_seconds,
         not_found_ttl_seconds: body.not_found_ttl_seconds,
         allow_redeploy: body.allow_redeploy,
     };
 
-    match repository_dao::insert_repository(&state.pool, new).await {
-        Ok(r) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+    let repo = match repository_dao::insert_repository(&state.pool, new).await {
+        Ok(r) => r,
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "repository name already exists").into_response()
+            return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+
+    match (&state.envelope, &body.upstream_password) {
+        (Some(envelope), Some(pw)) => {
+            if let Err(resp) = store_encrypted_password(&state, envelope, repo.id, pw.clone()).await
+            {
+                return resp;
+            }
+            // Re-fetch so the view reflects the sealed secret.
+            match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
+                Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+                Ok(None) => db_error(sqlx::Error::RowNotFound),
+                Err(e) => db_error(e),
+            }
+        }
+        _ => (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response(),
     }
+}
+
+/// Seal `password` under the active DEK and store it on `repo_id`
+/// (`secret_dao::set_upstream_password`); map failures to a 500 response. The
+/// error string carries no key material or plaintext by construction.
+async fn store_encrypted_password(
+    state: &AppState,
+    envelope: &forge_crypto::service::EnvelopeService,
+    repo_id: i64,
+    password: String,
+) -> Result<(), Response> {
+    let secret = forge_crypto::PlaintextSecret::from(password);
+    forge_db::secret_dao::set_upstream_password(&state.pool, envelope, repo_id, Some(&secret))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, repo_id, "failed to store encrypted upstream password");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to store encrypted upstream password",
+            )
+                .into_response()
+        })
 }
 
 /// `PUT /admin/repositories/{name}`
@@ -241,9 +288,16 @@ pub async fn update(
             Some(u) => Some(u.clone()),
             None => existing.upstream_username.clone(),
         },
-        upstream_password: match &body.upstream_password {
-            Some(p) => Some(p.clone()),
-            None => existing.upstream_password.clone(),
+        // §12.5: with encryption enabled the plaintext column is only ever
+        // carried through unchanged (preserving a not-yet-backfilled value); a
+        // *new* password is sealed via secret_dao below, never stored here.
+        upstream_password: if state.envelope.is_some() {
+            existing.upstream_password.clone()
+        } else {
+            match &body.upstream_password {
+                Some(p) => Some(p.clone()),
+                None => existing.upstream_password.clone(),
+            }
         },
         metadata_ttl_seconds: body.metadata_ttl_seconds.or(existing.metadata_ttl_seconds),
         not_found_ttl_seconds: body
@@ -252,13 +306,31 @@ pub async fn update(
         allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
     };
 
-    match repository_dao::update_repository(&state.pool, existing.id, upd).await {
-        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let updated = match repository_dao::update_repository(&state.pool, existing.id, upd).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "repository name already exists").into_response()
+            return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+
+    // §12.5: a present password replaces the stored secret through the
+    // envelope (clearing any legacy plaintext for this row); absent keeps it.
+    match (&state.envelope, &body.upstream_password) {
+        (Some(envelope), Some(pw)) => {
+            if let Err(resp) =
+                store_encrypted_password(&state, envelope, updated.id, pw.clone()).await
+            {
+                return resp;
+            }
+            match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
+                Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+                Ok(None) => db_error(sqlx::Error::RowNotFound),
+                Err(e) => db_error(e),
+            }
+        }
+        _ => Json(RepoView::from(&updated)).into_response(),
     }
 }
 
