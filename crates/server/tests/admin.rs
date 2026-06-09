@@ -162,14 +162,28 @@ async fn proxy_password_is_write_only_and_redacted() {
     assert_eq!(body["has_upstream_password"], json!(true));
 }
 
-/// Creating a proxy whose `remote_url` resolves to a private address is
-/// rejected by the SSRF guard (400) by default.
+/// 12.7 §3.6: a proxy `remote_url` is only scheme-checked — a non-http(s)
+/// scheme is rejected (400), while a private/loopback address is accepted
+/// (the slice-1 SSRF range guard is gone; upstream config is admin-only).
 #[tokio::test]
-async fn ssrf_private_remote_url_rejected() {
+async fn remote_url_scheme_guarded_private_accepted() {
     let srv = common::start().await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let name = format!("ssrf{}", common::unique());
+
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": "ftp://example.com/index.json",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "non-http scheme must be rejected");
 
     let resp = client
         .post(format!("{}/admin/repositories", srv.base_url))
@@ -182,7 +196,7 @@ async fn ssrf_private_remote_url_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "private remote_url must be rejected");
+    assert_eq!(resp.status(), 201, "loopback remote_url is accepted");
 }
 
 /// Token issue returns the plaintext **once**; the issued token then
