@@ -11,8 +11,10 @@ enterprise registry:
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
-RBAC** (users, nested groups, roles, package/content selectors) with optional
-**OIDC / Microsoft Entra** browser login and a credential-forwarding auth chain.
+RBAC** (users, nested groups, roles, package/content selectors). Authentication
+is organized into ordered, web-managed **auth realms** — local passwords,
+**OIDC / Microsoft Entra** browser login, and credential-forwarding against an
+existing registry — with an identifier-first login flow.
 A **retention** engine reaps cold versions and garbage-collects dereferenced
 blobs. The admin + browse UI is a **TanStack Router SPA** served by the same Rust
 process on a single origin — there is no Node server in production.

@@ -37,6 +37,16 @@ anonymous_ip_allowlist = ["loopback"]   # (default: [])
 # CIDRs of reverse proxies whose X-Forwarded-For is trusted.
 trusted_proxy_cidrs = []        # (default: [])
 allow_password_basic = false    # (default: false)
+# 12.7 login UX: "identifier_first" (ask username, then route to a password
+# prompt or an OIDC redirect) or "combined" (always show username+password +
+# a button per enabled OIDC realm).
+login_mode = "identifier_first" # (default: "identifier_first")
+# Browser-session lifetimes (apply to local-password AND OIDC logins). When
+# unset, falls back to the legacy oidc.session_* keys, then 8h / 7d.
+# session_idle_ttl_seconds     = 28800
+# session_absolute_ttl_seconds = 604800
+# How long an instance trusts its cached snapshot of the auth_realm table.
+realm_cache_ttl_seconds = 10    # (default: 10)
 
 # Optional: bootstrap admin created on first run if no admin users exist.
 # Omit the whole section to skip.
@@ -58,7 +68,9 @@ grace_seconds = 3600            # (default: 3600) grace before a dereferenced bl
 poll_interval_seconds = 10      # (default: 10)
 
 # Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
-# Omit the whole [oidc] section to disable login (no /auth/oidc/* routes).
+# 12.7: this block is a one-shot SEED — on first boot it is imported into an
+# `auth_realm` row and authentication is managed in the admin UI from then on
+# (the block is ignored afterwards; the same applies to [auth.upstream_basic]).
 # All flow state and sessions live in Postgres, so any instance can complete a
 # callback another instance started. The client_secret is redacted from logs
 # and admin API output.
