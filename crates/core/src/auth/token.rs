@@ -243,9 +243,10 @@ impl BasicAuthSource {
     /// use [`BasicAuthSource::with_chain`] / [`BasicAuthSource::with_source`].
     pub fn new(pool: PgPool, allow_password_basic: bool) -> Self {
         let chain = if allow_password_basic {
-            Some(Arc::new(Chain::new(vec![Box::new(
-                LocalPasswordProvider::new(pool.clone()),
-            ) as Box<dyn super::provider::AuthProvider>])))
+            Some(Arc::new(Chain::new(vec![
+                Box::new(LocalPasswordProvider::new(pool.clone()))
+                    as Box<dyn super::provider::AuthProvider>,
+            ])))
         } else {
             None
         };

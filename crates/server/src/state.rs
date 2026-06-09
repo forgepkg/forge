@@ -27,8 +27,8 @@ use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{CacheInvalidator, RepoError, RepoReadOps};
-use forge_db::model::{RepoKind, Repository};
 use forge_core::session::SessionService;
+use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 

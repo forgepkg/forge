@@ -38,7 +38,9 @@ async fn migration_seeds_builtin_local_realm() {
         .expect("local realm seeded by migration 0010");
     assert_eq!(local.kind, "local");
     assert!(local.enabled);
-    assert!(auth_realm_dao::kind_exists(&pool, "local").await.expect("query"));
+    assert!(auth_realm_dao::kind_exists(&pool, "local")
+        .await
+        .expect("query"));
 }
 
 #[tokio::test]
@@ -50,12 +52,10 @@ async fn insert_list_update_delete_round_trip() {
     // A fixed per-test offset avoids racing other tests for the same
     // next_priority slot (tests share one database).
     let prio = 200_000 + n as i32;
-    let realm = auth_realm_dao::insert_realm(
-        &pool,
-        new_realm(&name, "credential_forwarding", prio),
-    )
-    .await
-    .expect("insert");
+    let realm =
+        auth_realm_dao::insert_realm(&pool, new_realm(&name, "credential_forwarding", prio))
+            .await
+            .expect("insert");
     assert_eq!(realm.name, name);
     assert_eq!(realm.priority, prio);
 
@@ -81,11 +81,17 @@ async fn insert_list_update_delete_round_trip() {
     .expect("row exists");
     assert!(!updated.enabled);
     assert!(updated.updated_at >= realm.updated_at);
-    let enabled = auth_realm_dao::list_enabled_realms(&pool).await.expect("list");
+    let enabled = auth_realm_dao::list_enabled_realms(&pool)
+        .await
+        .expect("list");
     assert!(enabled.iter().all(|r| r.name != name));
 
-    assert!(auth_realm_dao::delete_realm(&pool, realm.id).await.expect("delete"));
-    assert!(!auth_realm_dao::delete_realm(&pool, realm.id).await.expect("idempotent"));
+    assert!(auth_realm_dao::delete_realm(&pool, realm.id)
+        .await
+        .expect("delete"));
+    assert!(!auth_realm_dao::delete_realm(&pool, realm.id)
+        .await
+        .expect("idempotent"));
 }
 
 #[tokio::test]
@@ -99,12 +105,10 @@ async fn duplicate_name_and_bad_slug_rejected() {
         .expect("insert");
 
     // Same name again → unique violation (23505).
-    let err = auth_realm_dao::insert_realm(
-        &pool,
-        new_realm(&name, "credential_forwarding", prio + 1),
-    )
-    .await
-    .expect_err("duplicate name");
+    let err =
+        auth_realm_dao::insert_realm(&pool, new_realm(&name, "credential_forwarding", prio + 1))
+            .await
+            .expect_err("duplicate name");
     assert!(
         matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")),
         "{err}"
@@ -129,13 +133,21 @@ async fn reorder_swaps_priorities_transactionally() {
     let n = unique();
     let a = auth_realm_dao::insert_realm(
         &pool,
-        new_realm(&format!("ra-{n}"), "credential_forwarding", 100_000 + n as i32),
+        new_realm(
+            &format!("ra-{n}"),
+            "credential_forwarding",
+            100_000 + n as i32,
+        ),
     )
     .await
     .expect("insert a");
     let b = auth_realm_dao::insert_realm(
         &pool,
-        new_realm(&format!("rb-{n}"), "credential_forwarding", 100_001 + n as i32),
+        new_realm(
+            &format!("rb-{n}"),
+            "credential_forwarding",
+            100_001 + n as i32,
+        ),
     )
     .await
     .expect("insert b");
@@ -152,7 +164,9 @@ async fn reorder_swaps_priorities_transactionally() {
         .collect();
     order.push(b.id);
     order.push(a.id);
-    auth_realm_dao::reorder_realms(&pool, &order).await.expect("reorder");
+    auth_realm_dao::reorder_realms(&pool, &order)
+        .await
+        .expect("reorder");
 
     let all = auth_realm_dao::list_realms(&pool).await.expect("list");
     let pos_a = all.iter().position(|r| r.id == a.id).unwrap();

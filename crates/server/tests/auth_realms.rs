@@ -58,7 +58,10 @@ async fn identify_does_not_reveal_account_existence() {
         assert_eq!(resp.status(), 200);
         answers.push(resp.json::<Value>().await.unwrap());
     }
-    assert_eq!(answers[0], answers[1], "identical decision for known/unknown");
+    assert_eq!(
+        answers[0], answers[1],
+        "identical decision for known/unknown"
+    );
     assert_eq!(answers[0]["mode"], json!("password"));
 }
 
@@ -137,7 +140,11 @@ async fn password_login_session_round_trip() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "revoked session no longer authenticates");
+    assert_eq!(
+        resp.status(),
+        401,
+        "revoked session no longer authenticates"
+    );
 }
 
 /// `/admin/realms` CRUD: the seeded local realm is listed and protected,
@@ -202,7 +209,10 @@ async fn admin_realm_crud_with_write_only_secrets() {
     assert_eq!(resp.status(), 201);
     let created: Value = resp.json().await.unwrap();
     let realm_id = created["id"].as_i64().unwrap();
-    assert!(created["config"].get("key_pepper").is_none(), "secret redacted");
+    assert!(
+        created["config"].get("key_pepper").is_none(),
+        "secret redacted"
+    );
     assert_eq!(created["config"]["key_pepper_set"], json!(true));
 
     // Update without the secret keeps it stored (marker stays true).
@@ -217,7 +227,10 @@ async fn admin_realm_crud_with_write_only_secrets() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let updated: Value = resp.json().await.unwrap();
-    assert_eq!(updated["config"]["url"], json!("https://nexus2.internal/status"));
+    assert_eq!(
+        updated["config"]["url"],
+        json!("https://nexus2.internal/status")
+    );
     assert_eq!(updated["config"]["key_pepper_set"], json!(true));
 
     // The local realm cannot be deleted.

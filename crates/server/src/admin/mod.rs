@@ -159,10 +159,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         // --- 12.7: auth realm management -------------------------------------
         .route("/realms", get(realms::list).post(realms::create))
-        .route(
-            "/realms/order",
-            axum::routing::put(realms::reorder),
-        )
+        .route("/realms/order", axum::routing::put(realms::reorder))
         .route(
             "/realms/{id}",
             get(realms::get)

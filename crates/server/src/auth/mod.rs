@@ -27,7 +27,6 @@
 //! OIDC-independent: `/auth/me`, `/auth/tokens` and logout work for
 //! local-password logins too.
 
-
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -170,7 +169,11 @@ pub fn auth_router() -> Router<AppState> {
 async fn snapshot_or_resp(state: &AppState) -> Result<Arc<realms::RealmSnapshot>, Response> {
     state.realms.snapshot().await.map_err(|e| {
         tracing::error!(error = %e, "realm snapshot failed");
-        (StatusCode::SERVICE_UNAVAILABLE, "authentication temporarily unavailable").into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication temporarily unavailable",
+        )
+            .into_response()
     })
 }
 
@@ -660,7 +663,11 @@ async fn password_login(
     };
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
-    let issued = match state.sessions.create_for_user(principal.user_id, None, None).await {
+    let issued = match state
+        .sessions
+        .create_for_user(principal.user_id, None, None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
@@ -695,9 +702,7 @@ fn login_client_ip(
     let peer = connect
         .map(|Extension(ci)| ci.0.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok());
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     let trusted = state.config.trusted_proxy_cidrs().unwrap_or_default();
     resolve_client_ip(peer, xff, &trusted)
 }

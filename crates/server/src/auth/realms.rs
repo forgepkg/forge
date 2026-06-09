@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use forge_cache::Cache;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, CredKeyPepper, LocalPasswordProvider,
-    UpstreamBasicProvider, ValidatedCredentialCache,
+    AuthProvider, Chain, ChainSource, CredKeyPepper, LocalPasswordProvider, UpstreamBasicProvider,
+    ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_db::model::AuthRealm;
@@ -246,11 +246,14 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
     match kind {
         KIND_LOCAL => Ok(JsonValue::Object(Default::default())),
         KIND_CRED_FORWARD => {
-            let cfg: CredForwardRealmConfig =
-                serde_json::from_value(config.clone()).map_err(|e| format!("invalid config: {e}"))?;
+            let cfg: CredForwardRealmConfig = serde_json::from_value(config.clone())
+                .map_err(|e| format!("invalid config: {e}"))?;
             ssrf::validate_url(&cfg.url).map_err(|e| format!("invalid url: {e}"))?;
             if cfg.key_pepper.trim().is_empty() {
-                return Err("key_pepper must not be empty (it keys the validated-credential cache HMAC)".into());
+                return Err(
+                    "key_pepper must not be empty (it keys the validated-credential cache HMAC)"
+                        .into(),
+                );
             }
             if !cfg.required_groups.is_empty() && cfg.groups_path.trim().is_empty() {
                 return Err("required_groups is set but groups_path is empty".into());
@@ -264,8 +267,8 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
         KIND_OIDC => {
-            let cfg: OidcRealmConfig =
-                serde_json::from_value(config.clone()).map_err(|e| format!("invalid config: {e}"))?;
+            let cfg: OidcRealmConfig = serde_json::from_value(config.clone())
+                .map_err(|e| format!("invalid config: {e}"))?;
             let issuer = url::Url::parse(cfg.issuer.trim())
                 .map_err(|e| format!("invalid issuer {:?}: {e}", cfg.issuer))?;
             match issuer.scheme() {
@@ -476,8 +479,7 @@ impl RealmAuth {
         } else {
             Some(Arc::new(Chain::new(providers)))
         };
-        let wire_password_enabled =
-            self.config.auth.allow_password_basic || has_cred_forward;
+        let wire_password_enabled = self.config.auth.allow_password_basic || has_cred_forward;
 
         Ok(RealmSnapshot {
             built_at: Instant::now(),
@@ -492,8 +494,8 @@ impl RealmAuth {
     fn build_cred_forward(&self, realm: &AuthRealm) -> anyhow::Result<Box<dyn AuthProvider>> {
         let cfg: CredForwardRealmConfig = serde_json::from_value(realm.config.clone())
             .map_err(|e| anyhow::anyhow!("config: {e}"))?;
-        let client = ssrf::outbound_client()
-            .map_err(|e| anyhow::anyhow!("build outbound client: {e}"))?;
+        let client =
+            ssrf::outbound_client().map_err(|e| anyhow::anyhow!("build outbound client: {e}"))?;
         let cred_cache = ValidatedCredentialCache::new(
             self.cache.clone(),
             self.pool.clone(),
@@ -516,7 +518,9 @@ impl RealmAuth {
             auto_provision: cfg.auto_provision,
             realm_id: Some(realm.id),
         };
-        Ok(Box::new(UpstreamBasicProvider::new(core, client, cred_cache)))
+        Ok(Box::new(UpstreamBasicProvider::new(
+            core, client, cred_cache,
+        )))
     }
 
     /// Build the OIDC login runtime from a realm row.
@@ -546,7 +550,8 @@ impl RealmAuth {
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
-        let runtime = OidcRuntime::build(&oidc_config, self.pool.clone(), &base, self.cache.clone())?;
+        let runtime =
+            OidcRuntime::build(&oidc_config, self.pool.clone(), &base, self.cache.clone())?;
         Ok(OidcRealmRuntime {
             realm_name: realm.name.clone(),
             label: cfg
@@ -741,7 +746,8 @@ async fn apply_seed(
         }
         Some(existing) if existing.kind == kind => {
             let last_seed = authz_dao::get_setting(pool, &key).await?;
-            let unmodified = last_seed.as_deref() == Some(&config_fingerprint(&existing.config) as &str);
+            let unmodified =
+                last_seed.as_deref() == Some(&config_fingerprint(&existing.config) as &str);
             if unmodified && existing.config != config {
                 auth_realm_dao::update_realm(
                     pool,
