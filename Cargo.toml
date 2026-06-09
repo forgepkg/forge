@@ -5,6 +5,7 @@ members = [
     "crates/storage",
     "crates/cache",
     "crates/core",
+    "crates/crypto",
     "crates/format-nuget",
     "crates/server",
     "crates/e2e",
@@ -82,6 +83,20 @@ argon2 = { version = "0.5" }
 
 # Constant-time comparison
 subtle = { version = "2.6" }
+
+# AEAD ciphers for secret encryption at rest (slice 12.5). AES-256-GCM is the
+# default (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the
+# opt-in alternative whose 192-bit extended nonce makes pure-random nonces
+# collision-safe without any per-key counter state.
+aes-gcm = { version = "0.10" }
+chacha20poly1305 = { version = "0.10" }
+
+# Scrub unwrapped key bytes / transient plaintext from memory on drop (12.5).
+zeroize = { version = "1.8" }
+
+# Secret wrappers that redact Debug/Display and zeroize on drop (12.5): the
+# plaintext-secret type handed to callers so it can never leak into logs.
+secrecy = { version = "0.10" }
 
 # CSPRNG for token secrets
 rand = { version = "0.8" }

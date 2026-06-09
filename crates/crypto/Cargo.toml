@@ -1,0 +1,32 @@
+[package]
+name = "forge-crypto"
+version = "0.1.0"
+edition = "2021"
+
+# Secret encryption at rest (spec §12.5): the double-envelope key hierarchy
+# (root → KEK → DEK), the versioned AEAD envelope format, the `KmsProvider`
+# root-layer abstraction (env/file static root today; real KMS later), and the
+# `EnvelopeService` that seals/opens secret values. Depends on nothing else in
+# the workspace so it is unit-testable in isolation; `forge-db` implements the
+# `KeyStore` trait over Postgres and `forge-core`/`forge-server` consume the
+# service.
+
+[dependencies]
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+moka = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile = { workspace = true }
