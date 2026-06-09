@@ -24,6 +24,11 @@ access_key = "minioadmin"
 secret_key = "minioadmin"
 force_path_style = true         # (default: true) required for versitygw/MinIO
 multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above this many bytes
+# Dedup PUTs with `If-None-Match: *` instead of HEAD-then-PUT: auto | on | off.
+# "auto" tries the conditional PUT and falls back to HEAD-then-PUT for the
+# process lifetime if the backend rejects it (versitygw); "on" forces it (AWS
+# S3/MinIO); "off" disables it. Pure optimization — behavior is identical.
+conditional_writes = "auto"     # (default: "auto")
 
 [auth]
 anonymous_mode = "off"          # (default: "off") off | allowlist | all

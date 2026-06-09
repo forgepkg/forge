@@ -100,6 +100,27 @@ pub struct S3Config {
     /// Switch to multipart upload above this many bytes.
     #[serde(default = "default_multipart_threshold")]
     pub multipart_threshold: u64,
+    /// Conditional-write dedup PUTs (`If-None-Match: *`): `auto` | `on` | `off`.
+    /// `auto` (default) tries the conditional PUT and permanently falls back to
+    /// HEAD-then-PUT if the backend rejects it with `NotImplemented` (versitygw
+    /// does); `on` forces conditional (real AWS S3/MinIO); `off` keeps
+    /// HEAD-then-PUT. Pure optimization — behavior is identical either way.
+    #[serde(default)]
+    pub conditional_writes: ConditionalWritesMode,
+}
+
+/// `s3.conditional_writes` values (lowercase in TOML/env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConditionalWritesMode {
+    /// Try `If-None-Match: *`; fall back for the process lifetime on a
+    /// `NotImplemented`-style rejection.
+    #[default]
+    Auto,
+    /// Always send `If-None-Match: *` (unsupported backends surface errors).
+    On,
+    /// Always HEAD-then-PUT.
+    Off,
 }
 
 impl S3Config {
@@ -113,6 +134,11 @@ impl S3Config {
             secret_key: self.secret_key.clone(),
             force_path_style: self.force_path_style,
             multipart_threshold: self.multipart_threshold,
+            conditional_writes: match self.conditional_writes {
+                ConditionalWritesMode::Auto => forge_storage::ConditionalWrites::Auto,
+                ConditionalWritesMode::On => forge_storage::ConditionalWrites::On,
+                ConditionalWritesMode::Off => forge_storage::ConditionalWrites::Off,
+            },
         }
     }
 }
@@ -1196,6 +1222,54 @@ mod tests {
         let toml = MINIMAL.replace("[auth]", "[auth]\nanonymous_mode = \"sometimes\"");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("anonymous_mode"), "{err}");
+    }
+
+    #[test]
+    fn s3_conditional_writes_defaults_to_auto_and_maps() {
+        // Absent ⇒ `auto`, and `to_storage()` carries the mode across.
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.s3.conditional_writes, ConditionalWritesMode::Auto);
+        assert_eq!(
+            cfg.s3.to_storage().conditional_writes,
+            forge_storage::ConditionalWrites::Auto
+        );
+
+        for (value, mode, storage) in [
+            (
+                "on",
+                ConditionalWritesMode::On,
+                forge_storage::ConditionalWrites::On,
+            ),
+            (
+                "off",
+                ConditionalWritesMode::Off,
+                forge_storage::ConditionalWrites::Off,
+            ),
+            (
+                "auto",
+                ConditionalWritesMode::Auto,
+                forge_storage::ConditionalWrites::Auto,
+            ),
+        ] {
+            let toml = MINIMAL.replace(
+                "secret_key = \"test\"",
+                &format!("secret_key = \"test\"\nconditional_writes = \"{value}\""),
+            );
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+            assert_eq!(cfg.s3.conditional_writes, mode, "{value}");
+            assert_eq!(cfg.s3.to_storage().conditional_writes, storage, "{value}");
+        }
+    }
+
+    #[test]
+    fn unknown_s3_conditional_writes_rejected() {
+        let toml = MINIMAL.replace(
+            "secret_key = \"test\"",
+            "secret_key = \"test\"\nconditional_writes = \"sometimes\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        // serde rejects the unknown variant at extract time.
+        assert!(err.to_string().contains("sometimes"), "{err}");
     }
 
     #[test]
