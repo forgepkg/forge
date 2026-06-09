@@ -1,14 +1,21 @@
-//! Interactive OIDC login surface (slice 12.2, Phase 5).
+//! Browser login + session surface (slice 12.2 OIDC, reworked by 12.7 realms).
 //!
-//! This module wires the `core` OIDC flow + session service into the server:
+//! This module wires the `core` OIDC flow + session service into the server
+//! and owns the login UX endpoints:
 //!
-//! * [`OidcRuntime`] — built once at startup from the `[oidc]` config; holds the
-//!   discovery/JWKS metadata client, the static client params, the claim-mapping
-//!   and resolve policy, and the [`SessionService`]. Stored as an optional field
-//!   on [`crate::state::AppState`] (absent means OIDC is disabled and no
-//!   `/auth/oidc/*` routes are mounted).
-//! * [`auth_router`] — the `/auth/...` browser endpoints:
-//!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP).
+//! * [`RealmAuth`] (see [`realms`]) — the DB-driven source of truth: the
+//!   password chain and the [`OidcRuntime`] are rebuilt from `auth_realm` rows
+//!   (snapshot-cached), so admin edits apply at runtime.
+//! * [`OidcRuntime`] — the auth-code+PKCE flow runtime (discovery/JWKS client,
+//!   claim mapping, resolve policy, sessions), built per enabled `oidc` realm.
+//! * [`auth_router`] — the `/auth/...` browser endpoints, always mounted:
+//!   * `POST /auth/login`         — username/password through the realm chain;
+//!     mints the session cookie (uniform 401 — no user-exists oracle).
+//!   * `POST /auth/identify`      — identifier-first routing (12.7 §3.4),
+//!     decided ONLY by public realm config (anti-enumeration).
+//!   * `GET  /auth/login-options` — what the login screen should render.
+//!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP);
+//!     404 when no enabled oidc realm exists.
 //!   * `GET  /auth/oidc/callback` — complete it, set the session cookie, 302 to a
 //!     validated relative target.
 //!   * `POST /auth/logout`        — revoke the session + clear the cookie (CSRF
@@ -16,7 +23,9 @@
 //!
 //! All ephemeral flow state and the sessions live in Postgres (`oidc_flow` /
 //! `session`), so any instance can complete a callback another started, and a
-//! revocation is visible cluster-wide on the next request.
+//! revocation is visible cluster-wide on the next request. Sessions are
+//! OIDC-independent: `/auth/me`, `/auth/tokens` and logout work for
+//! local-password logins too.
 
 
 use std::net::{IpAddr, SocketAddr};
