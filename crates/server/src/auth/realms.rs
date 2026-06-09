@@ -12,10 +12,11 @@
 //!   writes invalidate the local snapshot immediately; other instances
 //!   converge within `auth.realm_cache_ttl_seconds` (the table is the shared
 //!   authority — no in-memory-only state, no advisory locks);
-//! * the one-shot **legacy-config import** ([`seed_auth_realms`]): the 12.2
-//!   `[oidc]` and 12.3 `[auth.upstream_basic]` TOML blocks become realm rows on
-//!   the first boot after the upgrade (recorded in `forge_setting`), after
-//!   which the database — not the TOML — is what operators edit.
+//! * the **legacy-config import** ([`seed_auth_realms`]): the 12.2 `[oidc]`
+//!   and 12.3 `[auth.upstream_basic]` TOML blocks become realm rows, with
+//!   drift detection — a changed block keeps re-applying only while the row is
+//!   untouched since the last seed; the moment an admin edits the row through
+//!   the API, the database is the authority and the TOML stops clobbering it.
 //!
 //! ## Fail-closed posture
 //! A snapshot rebuild error (DB down, malformed realm config) never *grants*:
@@ -41,7 +42,9 @@ use sqlx::PgPool;
 use super::OidcRuntime;
 use crate::config::{Config, OidcConfig};
 
-/// `forge_setting` key marking the one-shot legacy-config import as done.
+/// `forge_setting` key marking the first realm import as done. Gates only the
+/// initial `local`-realm priority adjustment; per-kind seed fingerprints (see
+/// [`seed_auth_realms`]) govern config re-application.
 pub const REALMS_SEEDED_KEY: &str = "auth_realms_seeded";
 
 /// Realm kinds (string forms match the `auth_realm.kind` CHECK).
@@ -580,114 +583,186 @@ impl ChainSource for RealmAuth {
     }
 }
 
-// ─── legacy-config import (one-shot seeding) ────────────────────────────────
+// ─── legacy-config import (seed with drift detection) ───────────────────────
+
+/// Fingerprint a realm config document (canonical serde_json string → sha256
+/// hex, via the token hasher). Used to detect whether a seeded realm row has
+/// been modified through the admin API since the last import.
+fn config_fingerprint(config: &JsonValue) -> String {
+    forge_core::auth::token::hash_token(&config.to_string())
+}
+
+/// The `forge_setting` key holding the seed fingerprint for a realm kind.
+fn seed_fingerprint_key(kind: &str) -> String {
+    format!("auth_realm_seed_{kind}")
+}
 
 /// Import the legacy `[oidc]` / `[auth.upstream_basic]` TOML blocks into
-/// `auth_realm` rows, once.
+/// `auth_realm` rows.
 ///
-/// Idempotency is two-layered: a `forge_setting` marker makes the whole import
-/// one-shot, and each kind is additionally only seeded when no realm of that
-/// kind exists (so a re-run after a partial failure cannot duplicate). The
-/// relative order of `local` / `upstream-basic` follows `auth.providers`; an
-/// OIDC realm is appended after the password realms (it is not part of the
-/// password chain).
+/// Semantics ("config-as-seed with drift detection"):
+/// * **First boot** (no realm of the kind): insert a realm row from the block
+///   and record a fingerprint of the seeded config in `forge_setting`.
+/// * **Later boots with the block still present**: if the seeded row's config
+///   still matches the recorded fingerprint (i.e. nobody edited it through the
+///   admin API), a *changed* block re-applies — operators who manage forge
+///   purely through TOML keep working the way they always did. The moment the
+///   row is edited via the API the fingerprint no longer matches and the TOML
+///   block stops clobbering it (the database is the authority).
+/// * A renamed/deleted seeded row is left alone (the operator took over).
+///
+/// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
+/// initial `local`-realm priority adjustment (which must not fight later
+/// manual reorders).
 pub async fn seed_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
-    if authz_dao::get_setting(pool, REALMS_SEEDED_KEY).await? == Some("true".to_string()) {
-        return Ok(());
-    }
+    let first_import =
+        authz_dao::get_setting(pool, REALMS_SEEDED_KEY).await? != Some("true".to_string());
 
     // Priority slots follow the configured provider order: (index + 1) * 10.
     let slot = |idx: usize| ((idx + 1) * 10) as i32;
     let provider_idx = |id: &str| config.auth.providers.iter().position(|p| p == id);
 
-    // The built-in local row was created by migration 0010 at priority 10;
-    // move it to its configured slot when the order says otherwise.
-    if let Some(local) = auth_realm_dao::find_realm_by_name(pool, "local").await? {
-        let desired = provider_idx("local-password").map(slot).unwrap_or(10);
-        if local.priority != desired {
-            auth_realm_dao::update_realm(
-                pool,
-                local.id,
-                forge_db::auth_realm_dao::AuthRealmUpdate {
-                    name: local.name.clone(),
-                    enabled: local.enabled,
-                    priority: desired,
-                    config: local.config.clone(),
-                },
-            )
-            .await?;
+    if first_import {
+        // The built-in local row was created by migration 0010 at priority 10;
+        // move it to its configured slot when the order says otherwise.
+        if let Some(local) = auth_realm_dao::find_realm_by_name(pool, "local").await? {
+            let desired = provider_idx("local-password").map(slot).unwrap_or(10);
+            if local.priority != desired {
+                auth_realm_dao::update_realm(
+                    pool,
+                    local.id,
+                    forge_db::auth_realm_dao::AuthRealmUpdate {
+                        name: local.name.clone(),
+                        enabled: local.enabled,
+                        priority: desired,
+                        config: local.config.clone(),
+                    },
+                )
+                .await?;
+            }
         }
     }
 
     if let Some(ub) = config.auth.upstream_basic.as_ref().filter(|u| u.enabled) {
-        if !auth_realm_dao::kind_exists(pool, KIND_CRED_FORWARD).await? {
-            let cfg = CredForwardRealmConfig {
-                url: ub.url.clone(),
-                method: ub.method.to_ascii_uppercase(),
-                success_status: ub.success_status.clone(),
-                reject_status: ub.reject_status.clone(),
-                connect_timeout_ms: ub.connect_timeout_ms,
-                request_timeout_ms: ub.request_timeout_ms,
-                required_groups: ub.required_groups.clone(),
-                groups_path: ub.groups_path.clone(),
-                admin_group: ub.admin_group.clone(),
-                auto_provision: ub.auto_provision,
-                positive_ttl_secs: ub.cache.positive_ttl_secs,
-                negative_ttl_secs: ub.cache.negative_ttl_secs,
-                key_pepper: ub.cache.key_pepper.clone(),
-            };
-            let priority = provider_idx("upstream-basic").map(slot).unwrap_or(20);
-            auth_realm_dao::insert_realm(
-                pool,
-                forge_db::auth_realm_dao::NewAuthRealm {
-                    kind: KIND_CRED_FORWARD.to_string(),
-                    name: "upstream-basic".to_string(),
-                    enabled: true,
-                    priority,
-                    config: serde_json::to_value(&cfg).expect("serializable"),
-                },
-            )
-            .await?;
-            tracing::info!("imported [auth.upstream_basic] into auth_realm 'upstream-basic'");
-        }
+        let cfg = CredForwardRealmConfig {
+            url: ub.url.clone(),
+            method: ub.method.to_ascii_uppercase(),
+            success_status: ub.success_status.clone(),
+            reject_status: ub.reject_status.clone(),
+            connect_timeout_ms: ub.connect_timeout_ms,
+            request_timeout_ms: ub.request_timeout_ms,
+            required_groups: ub.required_groups.clone(),
+            groups_path: ub.groups_path.clone(),
+            admin_group: ub.admin_group.clone(),
+            auto_provision: ub.auto_provision,
+            positive_ttl_secs: ub.cache.positive_ttl_secs,
+            negative_ttl_secs: ub.cache.negative_ttl_secs,
+            key_pepper: ub.cache.key_pepper.clone(),
+        };
+        let priority = provider_idx("upstream-basic").map(slot).unwrap_or(20);
+        apply_seed(
+            pool,
+            KIND_CRED_FORWARD,
+            "upstream-basic",
+            priority,
+            serde_json::to_value(&cfg).expect("serializable"),
+        )
+        .await?;
     }
 
     if let Some(o) = config.oidc.as_ref().filter(|o| o.enabled) {
-        if !auth_realm_dao::kind_exists(pool, KIND_OIDC).await? {
-            let cfg = OidcRealmConfig {
-                issuer: o.issuer.clone(),
-                client_id: o.client_id.clone(),
-                client_secret: o.client_secret.clone(),
-                scopes: o.scopes.clone(),
-                clock_skew_seconds: o.clock_skew_seconds,
-                allow_http_issuer: o.allow_private_issuer,
-                username_claim: o.username_claim.clone(),
-                email_claim: o.email_claim.clone(),
-                display_name_claim: o.display_name_claim.clone(),
-                auto_provision: o.auto_provision,
-                link_existing_by_username: o.link_existing_by_username,
-                admin_groups: o.admin_groups.clone(),
-                admin_claim: o.admin_claim.clone(),
-                login_domains: Vec::new(),
-                button_label: None,
-            };
-            let priority = auth_realm_dao::next_priority(pool).await?;
-            auth_realm_dao::insert_realm(
-                pool,
-                forge_db::auth_realm_dao::NewAuthRealm {
-                    kind: KIND_OIDC.to_string(),
-                    name: "oidc".to_string(),
-                    enabled: true,
-                    priority,
-                    config: serde_json::to_value(&cfg).expect("serializable"),
-                },
-            )
-            .await?;
-            tracing::info!("imported [oidc] into auth_realm 'oidc'");
-        }
+        let cfg = OidcRealmConfig {
+            issuer: o.issuer.clone(),
+            client_id: o.client_id.clone(),
+            client_secret: o.client_secret.clone(),
+            scopes: o.scopes.clone(),
+            clock_skew_seconds: o.clock_skew_seconds,
+            allow_http_issuer: o.allow_private_issuer,
+            username_claim: o.username_claim.clone(),
+            email_claim: o.email_claim.clone(),
+            display_name_claim: o.display_name_claim.clone(),
+            auto_provision: o.auto_provision,
+            link_existing_by_username: o.link_existing_by_username,
+            admin_groups: o.admin_groups.clone(),
+            admin_claim: o.admin_claim.clone(),
+            login_domains: Vec::new(),
+            button_label: None,
+        };
+        let priority = auth_realm_dao::next_priority(pool).await?;
+        apply_seed(
+            pool,
+            KIND_OIDC,
+            "oidc",
+            priority,
+            serde_json::to_value(&cfg).expect("serializable"),
+        )
+        .await?;
     }
 
-    authz_dao::set_setting(pool, REALMS_SEEDED_KEY, "true").await?;
+    if first_import {
+        authz_dao::set_setting(pool, REALMS_SEEDED_KEY, "true").await?;
+    }
+    Ok(())
+}
+
+/// Insert or fingerprint-refresh one seeded realm row (see
+/// [`seed_auth_realms`] for the drift-detection contract).
+async fn apply_seed(
+    pool: &PgPool,
+    kind: &str,
+    name: &str,
+    priority: i32,
+    config: JsonValue,
+) -> anyhow::Result<()> {
+    let fingerprint = config_fingerprint(&config);
+    let key = seed_fingerprint_key(kind);
+
+    match auth_realm_dao::find_realm_by_name(pool, name).await? {
+        None => {
+            // No seeded row (first boot, or the operator deleted/renamed it).
+            // Only insert when the kind is absent entirely — an operator who
+            // renamed the row or created their own realm of this kind has
+            // taken over and the TOML block is ignored.
+            if !auth_realm_dao::kind_exists(pool, kind).await? {
+                auth_realm_dao::insert_realm(
+                    pool,
+                    forge_db::auth_realm_dao::NewAuthRealm {
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        enabled: true,
+                        priority,
+                        config,
+                    },
+                )
+                .await?;
+                authz_dao::set_setting(pool, &key, &fingerprint).await?;
+                tracing::info!(realm = %name, %kind, "imported legacy config into auth_realm");
+            }
+        }
+        Some(existing) if existing.kind == kind => {
+            let last_seed = authz_dao::get_setting(pool, &key).await?;
+            let unmodified = last_seed.as_deref() == Some(&config_fingerprint(&existing.config) as &str);
+            if unmodified && existing.config != config {
+                auth_realm_dao::update_realm(
+                    pool,
+                    existing.id,
+                    forge_db::auth_realm_dao::AuthRealmUpdate {
+                        name: existing.name.clone(),
+                        enabled: existing.enabled,
+                        priority: existing.priority,
+                        config,
+                    },
+                )
+                .await?;
+                authz_dao::set_setting(pool, &key, &fingerprint).await?;
+                tracing::info!(realm = %name, %kind, "re-applied changed legacy config (row unmodified since seed)");
+            }
+        }
+        Some(_) => {
+            // A realm with the seed name but a different kind: operator-made;
+            // never touch it.
+        }
+    }
     Ok(())
 }
 
