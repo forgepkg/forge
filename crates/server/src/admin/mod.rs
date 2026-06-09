@@ -20,6 +20,7 @@ pub mod content_selectors;
 pub mod effective;
 pub mod grants;
 pub mod members;
+pub mod realms;
 pub mod repositories;
 pub mod retention;
 pub mod roles;
@@ -155,6 +156,18 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(content_selectors::get)
                 .patch(content_selectors::update)
                 .delete(content_selectors::delete),
+        )
+        // --- 12.7: auth realm management -------------------------------------
+        .route("/realms", get(realms::list).post(realms::create))
+        .route(
+            "/realms/order",
+            axum::routing::put(realms::reorder),
+        )
+        .route(
+            "/realms/{id}",
+            get(realms::get)
+                .patch(realms::update)
+                .delete(realms::delete),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route("/users/{id}/effective", get(effective::for_user))

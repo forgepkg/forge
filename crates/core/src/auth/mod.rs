@@ -28,7 +28,10 @@ pub mod token;
 pub mod upstream_basic;
 
 pub use authz::Authz;
-pub use chain::{map_identity_to_principal, provision_and_map, Chain, ChainOutcome};
+pub use chain::{
+    map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
+    StaticChainSource,
+};
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, UpstreamVerdict,

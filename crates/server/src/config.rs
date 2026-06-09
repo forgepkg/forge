@@ -174,8 +174,42 @@ pub struct AuthConfig {
     /// Optional credential-forwarding upstream-basic provider (slice 12.3).
     /// Present + enabled ⇒ the `upstream-basic` provider can appear in
     /// [`Self::providers`].
+    ///
+    /// Since 12.7 this block (like `[oidc]`) is a **seed**: on first boot it is
+    /// imported into an `auth_realm` row and the database becomes the
+    /// authority (edit realms in the admin UI; the block is ignored afterwards).
     #[serde(default)]
     pub upstream_basic: Option<UpstreamBasicAuthConfig>,
+    /// Login-screen behavior (12.7 §3.4): `identifier_first` (default — ask for
+    /// the username, then route to a password prompt or an OIDC redirect) or
+    /// `combined` (always show username+password plus a button per enabled
+    /// OIDC realm).
+    #[serde(default = "default_login_mode")]
+    pub login_mode: String,
+    /// Idle timeout (seconds) for browser sessions: a session expires this long
+    /// after its last use. Applies to ALL sessions (local-password logins and
+    /// OIDC). When unset, falls back to the legacy `oidc.session_idle_ttl_seconds`
+    /// if an `[oidc]` block is present, else 8h.
+    #[serde(default)]
+    pub session_idle_ttl_seconds: Option<u64>,
+    /// Absolute lifetime (seconds) for browser sessions, regardless of
+    /// activity. Fallback mirrors [`Self::session_idle_ttl_seconds`]; default 7d.
+    #[serde(default)]
+    pub session_absolute_ttl_seconds: Option<u64>,
+    /// How long (seconds) an instance trusts its in-process snapshot of the
+    /// `auth_realm` table before re-reading it. Admin realm edits invalidate
+    /// the local snapshot immediately; OTHER instances converge within this
+    /// window. Keep small — the rebuild is two cheap queries.
+    #[serde(default = "default_realm_cache_ttl")]
+    pub realm_cache_ttl_seconds: u64,
+}
+
+fn default_login_mode() -> String {
+    "identifier_first".into()
+}
+
+fn default_realm_cache_ttl() -> u64 {
+    10
 }
 
 fn default_providers() -> Vec<String> {
@@ -780,6 +814,14 @@ impl Config {
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
+        match self.auth.login_mode.as_str() {
+            "identifier_first" | "combined" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "unknown auth.login_mode {other:?} (expected identifier_first|combined)"
+                )))
+            }
+        }
         Ok(())
     }
 
@@ -971,6 +1013,25 @@ impl Config {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve the browser-session TTLs `(idle, absolute)` in seconds.
+    ///
+    /// Precedence: explicit `auth.session_*` → legacy `oidc.session_*` (when an
+    /// `[oidc]` block is present — preserves pre-12.7 deployments that tuned
+    /// them there) → defaults (8h idle / 7d absolute).
+    pub fn session_ttls(&self) -> (u64, u64) {
+        let idle = self
+            .auth
+            .session_idle_ttl_seconds
+            .or_else(|| self.oidc.as_ref().map(|o| o.session_idle_ttl_seconds))
+            .unwrap_or_else(default_session_idle_ttl);
+        let absolute = self
+            .auth
+            .session_absolute_ttl_seconds
+            .or_else(|| self.oidc.as_ref().map(|o| o.session_absolute_ttl_seconds))
+            .unwrap_or_else(default_session_absolute_ttl);
+        (idle, absolute)
     }
 
     /// Public base URL with any trailing slash removed.

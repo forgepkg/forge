@@ -28,9 +28,11 @@ use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{CacheInvalidator, RepoError, RepoReadOps};
 use forge_db::model::{RepoKind, Repository};
+use forge_core::session::SessionService;
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 
+use crate::auth::RealmAuth;
 use crate::config::Config;
 
 /// Namespace under which hosted read responses are cached / invalidated.
@@ -58,9 +60,13 @@ pub struct AppState {
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
-    /// Interactive OIDC login runtime (slice 12.2). `None` ⇒ OIDC disabled and
-    /// no `/auth/oidc/*` routes are mounted.
-    pub oidc: Option<crate::auth::OidcRuntime>,
+    /// DB-backed auth realms (12.7): the snapshot cache the password chain,
+    /// the OIDC login runtime and the login UX endpoints are built from.
+    pub realms: Arc<RealmAuth>,
+    /// Browser-session lifecycle, shared by local-password login and OIDC.
+    pub sessions: SessionService,
+    /// Whether session cookies carry `Secure` (https `public_base_url`).
+    pub cookie_secure: bool,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -90,11 +96,10 @@ impl FormatRegistry {
 impl AppState {
     /// Construct state from its parts.
     ///
-    /// When the config has an **enabled** `[oidc]` section, the OIDC login
-    /// runtime is built here (SSRF-guarded HTTP client + discovery/JWKS metadata
-    /// client + session service); on a build failure we log and disable OIDC
-    /// rather than failing startup. A disabled/absent section leaves `oidc =
-    /// None` and mounts no `/auth/oidc/*` routes.
+    /// Authentication runtimes (the password chain, the OIDC login flow) are
+    /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
+    /// from the `auth_realm` table on demand (12.7). The session service and
+    /// cookie security bit are config-derived and shared by every login path.
     pub fn new(
         pool: PgPool,
         blob_store: BlobStore,
@@ -103,26 +108,17 @@ impl AppState {
         config: Config,
     ) -> Self {
         let cas = Cas::new(blob_store.clone(), pool.clone());
-
-        let oidc = match &config.oidc {
-            Some(o) if o.enabled => {
-                match crate::auth::OidcRuntime::build(
-                    o,
-                    pool.clone(),
-                    &config.public_base_url(),
-                    cache.clone(),
-                ) {
-                    Ok(rt) => Some(rt),
-                    Err(e) => {
-                        tracing::error!(error = %e, "OIDC runtime build failed; OIDC disabled");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-
         let authz = Authz::new(pool.clone(), cache.clone());
+        let config = Arc::new(config);
+
+        let (idle, absolute) = config.session_ttls();
+        let sessions = SessionService::new(
+            pool.clone(),
+            chrono::Duration::seconds(idle as i64),
+            chrono::Duration::seconds(absolute as i64),
+        );
+        let cookie_secure = config.public_base_url().starts_with("https://");
+        let realms = Arc::new(RealmAuth::new(pool.clone(), cache.clone(), config.clone()));
 
         AppState {
             pool,
@@ -131,8 +127,10 @@ impl AppState {
             cache,
             authz,
             formats: Arc::new(FormatRegistry::new(nuget)),
-            config: Arc::new(config),
-            oidc,
+            config,
+            realms,
+            sessions,
+            cookie_secure,
         }
     }
 

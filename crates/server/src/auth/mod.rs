@@ -19,15 +19,21 @@
 //! revocation is visible cluster-wide on the next request.
 
 
-use axum::extract::{Path, Query, State};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
 use forge_cache::Cache;
+use forge_core::auth::chain::{provision_and_map, ChainOutcome};
+use forge_core::auth::client_ip::resolve_client_ip;
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{generate_token_secret, hash_token};
+use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_client;
 use forge_core::oidc::{
     begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
@@ -42,8 +48,13 @@ use serde::{Deserialize, Serialize};
 use crate::config::OidcConfig;
 use crate::state::AppState;
 
+mod realms;
 mod redirect;
 
+pub use realms::{
+    merge_secrets, redact_config, seed_auth_realms, validate_config, OidcRealmRuntime, RealmAuth,
+    RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+};
 pub use redirect::sanitize_redirect_to;
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to
@@ -130,9 +141,14 @@ pub struct LoginQuery {
     pub redirect_to: Option<String>,
 }
 
-/// Build the `/auth` router. Mounted only when OIDC is configured.
+/// Build the `/auth` router. Always mounted (12.7): sessions exist for local
+/// password logins too, and the OIDC endpoints answer 404/503 by themselves
+/// when no enabled `oidc` realm is configured.
 pub fn auth_router() -> Router<AppState> {
     Router::new()
+        .route("/auth/login", post(password_login))
+        .route("/auth/identify", post(identify))
+        .route("/auth/login-options", get(login_options))
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/auth/logout", post(logout))
@@ -141,11 +157,24 @@ pub fn auth_router() -> Router<AppState> {
         .route("/auth/tokens/{id}", delete(revoke_token))
 }
 
+/// Resolve the realm snapshot or produce the fail-closed error response.
+async fn snapshot_or_resp(state: &AppState) -> Result<Arc<realms::RealmSnapshot>, Response> {
+    state.realms.snapshot().await.map_err(|e| {
+        tracing::error!(error = %e, "realm snapshot failed");
+        (StatusCode::SERVICE_UNAVAILABLE, "authentication temporarily unavailable").into_response()
+    })
+}
+
 /// `GET /auth/oidc/login` — begin the auth-code + PKCE flow and 302 to the IdP.
 async fn oidc_login(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
+    let snap = match snapshot_or_resp(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(orr) = snap.oidc() else {
         return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
     };
+    let rt = &orr.runtime;
     let redirect_to = sanitize_redirect_to(q.redirect_to.as_deref());
 
     match begin_login(&state.pool, &rt.meta, &rt.client, &redirect_to).await {
@@ -173,9 +202,14 @@ pub struct CallbackQuery {
 
 /// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target.
 async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQuery>) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
+    let snap = match snapshot_or_resp(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(orr) = snap.oidc() else {
         return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
     };
+    let rt = &orr.runtime;
 
     let params = CallbackParams {
         code: q.code,
@@ -240,9 +274,9 @@ struct LogoutResult {
 /// `X-CSRF-Token` header (double-submit, §3.8). A request without a session
 /// cookie is a no-op `204`.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
-    };
+    // Sessions are minted by BOTH the local login endpoint and OIDC (12.7),
+    // so logout works whenever sessions do — independent of any oidc realm.
+    let rt = SessionAuthCtx::of(&state);
 
     let Some(secret) = cookie_value(&headers, SESSION_COOKIE) else {
         // No session to revoke; clearing a non-existent cookie is harmless.
@@ -331,10 +365,27 @@ impl IntoResponse for SessionAuthError {
     }
 }
 
+/// What the session-authenticated endpoints need: the shared session service
+/// plus the cookie-security bit. OIDC-independent since 12.7 (local password
+/// logins mint sessions too).
+struct SessionAuthCtx {
+    sessions: SessionService,
+    cookie_secure: bool,
+}
+
+impl SessionAuthCtx {
+    fn of(state: &AppState) -> Self {
+        SessionAuthCtx {
+            sessions: state.sessions.clone(),
+            cookie_secure: state.cookie_secure,
+        }
+    }
+}
+
 /// Validate the `forge_session` cookie and return the live session row. `None`
 /// of the error variants leaks whether the cookie was malformed vs unknown.
 async fn require_session(
-    rt: &OidcRuntime,
+    rt: &SessionAuthCtx,
     headers: &HeaderMap,
 ) -> Result<Session, SessionAuthError> {
     let Some(secret) = cookie_value(headers, SESSION_COOKIE).filter(|s| !s.is_empty()) else {
@@ -354,7 +405,7 @@ async fn require_session(
 /// (`X-CSRF-Token` must equal the session's stored `csrf_secret`). Use on every
 /// state-changing cookie-authenticated endpoint (§3.8).
 async fn require_session_csrf(
-    rt: &OidcRuntime,
+    rt: &SessionAuthCtx,
     headers: &HeaderMap,
 ) -> Result<Session, SessionAuthError> {
     let session = require_session(rt, headers).await?;
@@ -384,10 +435,8 @@ struct AuthMe {
 /// incl. token/basic), this is **cookie-only** and additionally returns the
 /// CSRF token, so the SPA can bootstrap its mutating-request defense.
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
-    };
-    let session = match require_session(rt, &headers).await {
+    let rt = SessionAuthCtx::of(&state);
+    let session = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -451,10 +500,8 @@ struct CreatedToken {
 
 /// `GET /auth/tokens` — list the logged-in user's repository tokens (no secret).
 async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
-    };
-    let session = match require_session(rt, &headers).await {
+    let rt = SessionAuthCtx::of(&state);
+    let session = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -478,10 +525,8 @@ async fn create_token(
     headers: HeaderMap,
     Json(body): Json<CreateTokenBody>,
 ) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
-    };
-    let session = match require_session_csrf(rt, &headers).await {
+    let rt = SessionAuthCtx::of(&state);
+    let session = match require_session_csrf(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -518,10 +563,8 @@ async fn revoke_token(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    let Some(rt) = state.oidc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "oidc not configured").into_response();
-    };
-    let session = match require_session_csrf(rt, &headers).await {
+    let rt = SessionAuthCtx::of(&state);
+    let session = match require_session_csrf(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -544,6 +587,229 @@ async fn revoke_token(
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
         }
     }
+}
+
+// ── password login + identifier-first UX (12.7 §3.4) ────────────────────────
+
+/// `POST /auth/login` request body.
+#[derive(Debug, Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+/// `POST /auth/login` — authenticate a username/password through the realm
+/// chain (local + credential-forwarding realms, in priority order) and mint a
+/// browser session.
+///
+/// This is the form-login counterpart of the wire Basic path: it runs the SAME
+/// chain with the same fail-closed semantics, but is **not** gated by
+/// `auth.allow_password_basic` (that flag governs API Basic auth only). The
+/// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
+/// are a uniform 401 (no username-exists oracle).
+async fn password_login(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    let snap = match snapshot_or_resp(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(chain) = snap.chain.clone() else {
+        // No enabled password-capable realm. Uniform denial (the UI learns
+        // whether to even offer the form from /auth/login-options).
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    };
+    if body.username.trim().is_empty() || body.password.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    let client_ip = login_client_ip(&state, connect, &headers);
+    let cred = PasswordCredential {
+        username: &body.username,
+        password: &body.password,
+        client_ip,
+    };
+    let identity = match chain.authenticate(&cred).await {
+        ChainOutcome::Authenticated { identity, .. } => identity,
+        // Uniform wire response for rejected / outage / unknown (fail-closed;
+        // upstream health goes to logs, not to the caller).
+        ChainOutcome::Rejected | ChainOutcome::Unavailable | ChainOutcome::NoCredentials => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+    };
+
+    let principal = match provision_and_map(&state.pool, &identity).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "login principal mapping failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    // Fresh session per login (fixation-proof), same as the OIDC callback.
+    let issued = match state.sessions.create_for_user(principal.user_id, None, None).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "session creation failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(
+            header::SET_COOKIE,
+            set_cookie_value(&issued, state.cookie_secure),
+        )],
+        Json(AuthMe {
+            user_id: principal.user_id,
+            username: body.username.clone(),
+            is_admin: principal.is_admin,
+            csrf_token: issued.session.csrf_secret.clone(),
+        }),
+    )
+        .into_response()
+}
+
+/// Resolve the client IP for the login audit trail: honors `X-Forwarded-For`
+/// behind the configured trusted proxies, mirroring the principal middleware.
+/// Loopback when no connect info is available (in-process router tests).
+fn login_client_ip(
+    state: &AppState,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> IpAddr {
+    let peer = connect
+        .map(|Extension(ci)| ci.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let trusted = state.config.trusted_proxy_cidrs().unwrap_or_default();
+    resolve_client_ip(peer, xff, &trusted)
+}
+
+/// `POST /auth/identify` request body.
+#[derive(Debug, Deserialize)]
+struct IdentifyBody {
+    username: String,
+}
+
+/// `POST /auth/identify` response: how the login UI should proceed for this
+/// identifier.
+#[derive(Debug, Serialize)]
+struct IdentifyResult {
+    /// `password` → show the password prompt; `oidc_redirect` → navigate to
+    /// `login_url` (which 302s to the IdP).
+    mode: &'static str,
+    /// The realm the decision routed to (display only).
+    realm: String,
+    /// Where to go for `oidc_redirect` (starts the auth-code flow).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login_url: Option<String>,
+}
+
+/// `POST /auth/identify` — identifier-first routing (12.7 §3.4).
+///
+/// **Anti-enumeration:** the decision is a pure function of *public realm
+/// configuration* (an OIDC realm's `login_domains` rule), never of whether an
+/// `app_user` exists — an unknown identifier gets the same `password` answer
+/// as a real local user.
+async fn identify(State(state): State<AppState>, Json(body): Json<IdentifyBody>) -> Response {
+    let snap = match snapshot_or_resp(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let domain = body
+        .username
+        .rsplit_once('@')
+        .map(|(_, d)| d.trim().to_ascii_lowercase());
+    if let (Some(domain), Some(orr)) = (domain, snap.oidc()) {
+        if orr.login_domains.iter().any(|d| d == &domain) {
+            return Json(IdentifyResult {
+                mode: "oidc_redirect",
+                realm: orr.realm_name.clone(),
+                login_url: Some("/auth/oidc/login".to_string()),
+            })
+            .into_response();
+        }
+    }
+
+    // No domain rule matched. Default to the password prompt against the
+    // ordered password realms — unless none is enabled and OIDC is the only
+    // way in, in which case identifier-first can only mean "go to the IdP".
+    if snap.chain.is_none() {
+        if let Some(orr) = snap.oidc() {
+            return Json(IdentifyResult {
+                mode: "oidc_redirect",
+                realm: orr.realm_name.clone(),
+                login_url: Some("/auth/oidc/login".to_string()),
+            })
+            .into_response();
+        }
+    }
+    let realm = snap
+        .realms
+        .iter()
+        .find(|r| r.enabled && matches!(r.kind.as_str(), KIND_LOCAL | KIND_CRED_FORWARD))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "local".to_string());
+    Json(IdentifyResult {
+        mode: "password",
+        realm,
+        login_url: None,
+    })
+    .into_response()
+}
+
+/// One OIDC login option in [`LoginOptions`].
+#[derive(Debug, Serialize)]
+struct OidcLoginOption {
+    name: String,
+    label: String,
+    login_url: String,
+}
+
+/// `GET /auth/login-options` response: what the login screen should render.
+#[derive(Debug, Serialize)]
+struct LoginOptions {
+    /// `identifier_first` | `combined` (`auth.login_mode`).
+    mode: String,
+    /// Whether any password-capable realm is enabled (show the password form).
+    password: bool,
+    /// Enabled OIDC realm buttons (at most one in 12.7).
+    oidc: Vec<OidcLoginOption>,
+}
+
+/// `GET /auth/login-options` — public, unauthenticated: the login screen asks
+/// this before rendering. Exposes only realm *presence* and labels, never
+/// configuration.
+async fn login_options(State(state): State<AppState>) -> Response {
+    let snap = match snapshot_or_resp(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let oidc = snap
+        .oidc()
+        .map(|orr| {
+            vec![OidcLoginOption {
+                name: orr.realm_name.clone(),
+                label: orr.label.clone(),
+                login_url: "/auth/oidc/login".to_string(),
+            }]
+        })
+        .unwrap_or_default();
+    Json(LoginOptions {
+        mode: state.config.auth.login_mode.clone(),
+        password: snap.chain.is_some(),
+        oidc,
+    })
+    .into_response()
 }
 
 /// Build the `Set-Cookie` value that installs the session cookie.

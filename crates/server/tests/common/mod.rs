@@ -277,10 +277,16 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .await
         .expect("bootstrap admin");
 
+    // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
+    // (one-shot, marker-guarded) so the realm-driven runtime sees them.
+    forge_server::app::ensure_auth_realms(&config, &pool)
+        .await
+        .expect("seed auth realms");
+
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
-    let layer = principal_layer(&config, &pool, &cache).expect("principal layer");
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let state = AppState::new(pool.clone(), store, cache, nuget, config);
+    let layer = principal_layer(&state).expect("principal layer");
 
     let workers = if opts.spawn_workers {
         Some(workers::spawn_all(&state))
