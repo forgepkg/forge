@@ -211,6 +211,7 @@ async fn blob_store() -> BlobStore {
         secret_key: S3_SECRET.into(),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
+        conditional_writes: Default::default(),
     });
     let mut last = None;
     for _ in 0..30 {
