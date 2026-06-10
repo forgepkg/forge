@@ -22,13 +22,13 @@
 //! **no `pg_advisory_*`**). The plaintext password leaves the process only here,
 //! over the outbound `Authorization: Basic` header; it is never persisted.
 //!
-//! ## SSRF
+//! ## Outbound guard
 //!
-//! The outbound request uses [`forge_core::net::ssrf::guarded_client`]
-//! ([`crate::net::ssrf`]): scheme is restricted to http/https, private/loopback/
-//! link-local ranges are blocked unless `allow_private_upstream`, and **every
-//! redirect hop is re-validated** by the guard's custom resolver. The `url` is
-//! also pre-validated at config time (server wiring, phase 5).
+//! The outbound request uses [`crate::net::ssrf::outbound_client`]: the scheme
+//! is restricted to http/https (pre-validated at config time via
+//! [`crate::net::ssrf::validate_url`]) and redirects are capped. Private /
+//! loopback upstreams are permitted — the upstream URL is admin-only config
+//! (12.7 §3.6), and an internal Nexus on RFC1918 is the common case.
 //!
 //! ## Auto-provision
 //!
@@ -100,9 +100,6 @@ pub struct UpstreamBasicConfig {
     pub connect_timeout: Duration,
     /// Total request timeout.
     pub request_timeout: Duration,
-    /// Permit the upstream to resolve to a private/loopback address (internal
-    /// Nexus). Off blocks them via the SSRF guard.
-    pub allow_private_upstream: bool,
     /// Optional coarse allow-gate: a 200 is only accepted when the user has at
     /// least one of these groups. Empty ⇒ any success is accepted. Requires
     /// `groups_path` to be set (validated at config time).
@@ -114,13 +111,23 @@ pub struct UpstreamBasicConfig {
     /// only, never revoke — see chain provisioning). Empty ⇒ never suggests
     /// admin.
     pub admin_group: String,
+    /// Stable provider id keying the validated-credential cache and logged as
+    /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
+    /// realm-driven wiring (12.7) uses a realm-scoped id (`"realm:<name>"`).
+    pub provider_id: String,
+    /// Auto-provision an `app_user` on first successful upstream login.
+    /// Stamped onto every [`ProvenIdentity`] this provider vouches for (the
+    /// chain caller acts on it — per-realm since 12.7).
+    pub auto_provision: bool,
+    /// The `auth_realm.id` this provider was built from, recorded as
+    /// provenance on provisioned users. `None` for static-config wiring.
+    pub realm_id: Option<i64>,
 }
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
 ///
-/// Holds an SSRF-guarded [`reqwest::Client`] (built once with the configured
-/// timeouts + private-range policy) and the [`ValidatedCredentialCache`] so the
-/// hot path is a cache hit.
+/// Holds a redirect-capped [`reqwest::Client`] (built once) and the
+/// [`ValidatedCredentialCache`] so the hot path is a cache hit.
 pub struct UpstreamBasicProvider {
     config: UpstreamBasicConfig,
     client: Client,
@@ -128,14 +135,10 @@ pub struct UpstreamBasicProvider {
 }
 
 impl UpstreamBasicProvider {
-    /// Build the provider from its config, a pre-built SSRF-guarded client, and
-    /// the validated-credential cache.
-    ///
-    /// The `client` MUST be a [`crate::net::ssrf::guarded_client`] configured
-    /// with `config.allow_private_upstream` and the connect/request timeouts —
-    /// the server wiring (phase 5) builds it; tests build one against a public
-    /// (or `allow_private`) mock. Keeping client construction out of here lets
-    /// tests inject a client pointed at an in-process mock upstream.
+    /// Build the provider from its config, a pre-built outbound client
+    /// ([`crate::net::ssrf::outbound_client`]), and the validated-credential
+    /// cache. Keeping client construction out of here lets tests inject a
+    /// client pointed at an in-process mock upstream.
     pub fn new(
         config: UpstreamBasicConfig,
         client: Client,
@@ -271,8 +274,8 @@ struct ForwardResult {
 
 #[async_trait]
 impl AuthProvider for UpstreamBasicProvider {
-    fn id(&self) -> &'static str {
-        UPSTREAM_BASIC_ID
+    fn id(&self) -> &str {
+        &self.config.provider_id
     }
 
     fn source(&self) -> AuthSource {
@@ -317,6 +320,8 @@ impl AuthProvider for UpstreamBasicProvider {
                     external_subject: Some(cred.username.to_string()),
                     groups,
                     suggested_is_admin,
+                    auto_provision: self.config.auto_provision,
+                    realm_id: self.config.realm_id,
                 })
             }
             Ok(false) => AuthOutcome::Rejected,

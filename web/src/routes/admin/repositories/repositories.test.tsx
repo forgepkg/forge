@@ -41,7 +41,6 @@ function repo(over: Partial<RepoView>): RepoView {
     package_delay_seconds: 0,
     upstream_username: null,
     has_upstream_password: false,
-    allow_private_upstream: false,
     metadata_ttl_seconds: null,
     not_found_ttl_seconds: null,
     allow_redeploy: false,

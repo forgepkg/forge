@@ -15,11 +15,15 @@
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
+//! * [`crypto`] — §12.5 secret-encryption key **metadata** + per-layer rotation
+//!   triggers (never returns key bytes or decrypted secrets).
 
 pub mod content_selectors;
+pub mod crypto;
 pub mod effective;
 pub mod grants;
 pub mod members;
+pub mod realms;
 pub mod repositories;
 pub mod retention;
 pub mod roles;
@@ -156,9 +160,24 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .patch(content_selectors::update)
                 .delete(content_selectors::delete),
         )
+        // --- 12.7: auth realm management -------------------------------------
+        .route("/realms", get(realms::list).post(realms::create))
+        .route("/realms/order", axum::routing::put(realms::reorder))
+        .route(
+            "/realms/{id}",
+            get(realms::get)
+                .patch(realms::update)
+                .delete(realms::delete),
+        )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route("/users/{id}/effective", get(effective::for_user))
         .route("/anonymous/effective", get(effective::for_anonymous))
+        // --- §12.5: secret encryption at rest -------------------------------
+        .route("/crypto/keys", get(crypto::list_keys))
+        .route(
+            "/crypto/rotate/{layer}",
+            axum::routing::post(crypto::rotate),
+        )
         .layer(axum::middleware::from_fn_with_state(state, require_admin))
 }
 

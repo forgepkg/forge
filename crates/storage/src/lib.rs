@@ -18,4 +18,4 @@ pub mod reconciler;
 pub mod s3;
 
 pub use cas::{Cas, CasError, StoredBlob};
-pub use s3::{BlobStore, S3Config, S3Error};
+pub use s3::{BlobStore, ConditionalWrites, S3Config, S3Error};

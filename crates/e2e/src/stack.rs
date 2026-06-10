@@ -211,6 +211,7 @@ async fn blob_store() -> BlobStore {
         secret_key: S3_SECRET.into(),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
+        conditional_writes: Default::default(),
     });
     let mut last = None;
     for _ in 0..30 {
@@ -499,6 +500,11 @@ impl StackBuilder {
             .await
             .expect("bootstrap admin");
 
+        // 12.7: one-shot import of [oidc]/[auth.upstream_basic] into realms.
+        forge_server::app::ensure_auth_realms(&config, &pool)
+            .await
+            .expect("seed auth realms");
+
         let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
         let cache = match &redis {
             Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
@@ -506,8 +512,8 @@ impl StackBuilder {
                 .expect("connect redis L2"),
             None => Cache::l1_only(config.cache.l1_max_capacity),
         };
-        let layer = principal_layer(&config, &pool, &cache).expect("principal layer");
         let state = AppState::new(pool.clone(), store, cache, nuget, config);
+        let layer = principal_layer(&state).expect("principal layer");
 
         let worker_handles = if self.spawn_workers {
             Some(workers::spawn_all(&state))

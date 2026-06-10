@@ -78,7 +78,7 @@ impl std::fmt::Display for BlobState {
 ///
 /// `kind` and `format` are kept as the raw `text` from the DB; use
 /// [`Repository::kind`] for the parsed [`RepoKind`].
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct Repository {
     pub id: i64,
     pub name: String,
@@ -90,8 +90,17 @@ pub struct Repository {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
+    /// Legacy plaintext upstream password. Slice 12.5 supersedes it with
+    /// [`Self::upstream_password_enc`]: new writes go through the envelope
+    /// service (which clears this column), existing values are backfilled by
+    /// the startup job, and a later migration drops the column entirely. Until
+    /// then it remains the read fallback for not-yet-backfilled rows.
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: bool,
+    /// Envelope-encrypted upstream password (slice 12.5): an opaque AEAD blob
+    /// bound to this row. Decrypted **only** via
+    /// [`crate::secret_dao::get_upstream_password`] at the proxy upstream
+    /// fetch; everywhere else only its presence matters.
+    pub upstream_password_enc: Option<Vec<u8>>,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -99,10 +108,52 @@ pub struct Repository {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Manual `Debug` that **redacts the upstream password**: the plaintext column
+/// value must never land in a log line, and the ciphertext blob is reduced to
+/// its byte length (its content is opaque and only adds noise).
+impl std::fmt::Debug for Repository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repository")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("format", &self.format)
+            .field("kind", &self.kind)
+            .field("anonymous_read", &self.anonymous_read)
+            .field("online", &self.online)
+            .field("config", &self.config)
+            .field("remote_url", &self.remote_url)
+            .field("package_delay_seconds", &self.package_delay_seconds)
+            .field("upstream_username", &self.upstream_username)
+            .field(
+                "upstream_password",
+                &self.upstream_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "upstream_password_enc",
+                &self
+                    .upstream_password_enc
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            .field("metadata_ttl_seconds", &self.metadata_ttl_seconds)
+            .field("not_found_ttl_seconds", &self.not_found_ttl_seconds)
+            .field("allow_redeploy", &self.allow_redeploy)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 impl Repository {
     /// Parsed repository kind.
     pub fn kind(&self) -> RepoKind {
         RepoKind::from(self.kind.as_str())
+    }
+
+    /// Whether an upstream password is stored (encrypted or, pre-backfill,
+    /// plaintext). The value itself is never exposed through the model.
+    pub fn has_upstream_password(&self) -> bool {
+        self.upstream_password_enc.is_some() || self.upstream_password.is_some()
     }
 }
 
@@ -308,6 +359,30 @@ pub struct ValidatedCredential {
     pub verdict: bool,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A configured authentication realm (slice 12.7, design doc 2026-06-03 §3).
+///
+/// One row per authentication mechanism instance: the built-in `local`
+/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or (12.8,
+/// reserved) a `workload_identity` issuer. `priority` orders the realms — LOWER
+/// tries/lists first; `config` is kind-specific jsonb whose secrets are
+/// write-only at the API layer (redacted from every response).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuthRealm {
+    pub id: i64,
+    /// `'local'` | `'oidc'` | `'credential_forwarding'` | `'workload_identity'`.
+    pub kind: String,
+    /// Unique display name + URL slug (lowercase, dns-label-ish; DB CHECK).
+    pub name: String,
+    pub enabled: bool,
+    /// Total order (unique): lower tries first.
+    pub priority: i32,
+    /// Kind-specific configuration. May contain secrets — never serialize this
+    /// field into an API response as-is.
+    pub config: JsonValue,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

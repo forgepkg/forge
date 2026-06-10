@@ -162,14 +162,28 @@ async fn proxy_password_is_write_only_and_redacted() {
     assert_eq!(body["has_upstream_password"], json!(true));
 }
 
-/// Creating a proxy whose `remote_url` resolves to a private address is
-/// rejected by the SSRF guard (400) by default.
+/// 12.7 §3.6: a proxy `remote_url` is only scheme-checked — a non-http(s)
+/// scheme is rejected (400), while a private/loopback address is accepted
+/// (the slice-1 SSRF range guard is gone; upstream config is admin-only).
 #[tokio::test]
-async fn ssrf_private_remote_url_rejected() {
+async fn remote_url_scheme_guarded_private_accepted() {
     let srv = common::start().await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let name = format!("ssrf{}", common::unique());
+
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": "ftp://example.com/index.json",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "non-http scheme must be rejected");
 
     let resp = client
         .post(format!("{}/admin/repositories", srv.base_url))
@@ -182,7 +196,7 @@ async fn ssrf_private_remote_url_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "private remote_url must be rejected");
+    assert_eq!(resp.status(), 201, "loopback remote_url is accepted");
 }
 
 /// Token issue returns the plaintext **once**; the issued token then
@@ -476,4 +490,200 @@ async fn group_member_validation() {
         409,
         "duplicate priority/member must be rejected"
     );
+}
+
+// ── §12.5: secret encryption at rest ────────────────────────────────────────
+
+/// Root-key env var for the crypto-enabled server below. One fixed key for the
+/// whole test binary: the Postgres container (and so the `encryption_key`
+/// rows) is shared, so every crypto-enabled server must reach the same root.
+fn ensure_crypto_root_env() -> &'static str {
+    const VAR: &str = "FORGE_TEST_SERVER_ROOT_KEY";
+    // 32 fixed bytes, base64 — a *test* root key, never used outside tests.
+    std::env::set_var(VAR, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+    VAR
+}
+
+/// With `[crypto]` enabled: a created proxy password is stored as an envelope
+/// blob (plaintext column NULL, ciphertext free of the plaintext), responses
+/// stay redacted, `/admin/crypto/keys` returns metadata only (and is
+/// admin-gated), and a DEK rotation re-seals the stored secret while it keeps
+/// decrypting to the original value.
+#[tokio::test]
+async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}", common::unique());
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("cryptoproxy{}", common::unique());
+
+    // Create a proxy with a password → redacted response, encrypted at rest.
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": "https://api.nuget.org/v3/index.json",
+            "upstream_username": "svc",
+            "upstream_password": "s3cret-at-rest",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["has_upstream_password"], json!(true));
+    assert!(body.get("upstream_password").is_none());
+    let repo_id = body["id"].as_i64().expect("repo id");
+
+    // At rest: plaintext column NULL, envelope blob present + plaintext-free.
+    let row = sqlx::query!(
+        r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
+        repo_id
+    )
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(row.upstream_password.is_none(), "no plaintext column value");
+    let blob = row.upstream_password_enc.expect("envelope blob stored");
+    assert!(
+        !blob.windows(14).any(|w| w == b"s3cret-at-rest"),
+        "ciphertext must not contain the plaintext"
+    );
+
+    // The sanctioned decrypt path returns the original plaintext.
+    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, repo_id)
+        .await
+        .unwrap()
+        .expect("password stored");
+    assert_eq!(
+        forge_crypto::ExposeSecret::expose_secret(&secret),
+        "s3cret-at-rest"
+    );
+
+    // /admin/crypto/keys: admin-gated, metadata only, never key bytes/secrets.
+    let resp = client
+        .get(format!("{}/admin/crypto/keys", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "anonymous crypto-keys call must be 401");
+    let resp = client
+        .get(format!("{}/admin/crypto/keys", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let raw = resp.text().await.unwrap();
+    assert!(!raw.contains("wrapped_key"), "no key bytes in {raw}");
+    assert!(!raw.contains("s3cret-at-rest"), "no plaintext in {raw}");
+    let keys: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(keys["enabled"], json!(true));
+    assert!(keys["keys"]
+        .as_array()
+        .expect("keys array")
+        .iter()
+        .any(|k| k["layer"] == "dek"));
+    assert!(keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k["layer"] == "kek"));
+
+    // DEK rotation re-seals the stored blob; the secret still decrypts.
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rot: Value = resp.json().await.unwrap();
+    assert_eq!(rot["rotated"], json!("dek"));
+    assert!(rot["resealed_secrets"].as_u64().unwrap() >= 1);
+
+    let row = sqlx::query!(
+        r#"SELECT upstream_password_enc AS "b!" FROM repository WHERE id = $1"#,
+        repo_id
+    )
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_ne!(row.b, blob, "rotation must re-seal the blob");
+    let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, repo_id)
+        .await
+        .unwrap()
+        .expect("still stored");
+    assert_eq!(
+        forge_crypto::ExposeSecret::expose_secret(&secret),
+        "s3cret-at-rest"
+    );
+
+    // KEK rotation leaves the secret ciphertext untouched and decryptable.
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/kek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let after_kek = sqlx::query!(
+        r#"SELECT upstream_password_enc AS "b!" FROM repository WHERE id = $1"#,
+        repo_id
+    )
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(after_kek.b, row.b, "KEK rotation must not touch ciphertext");
+    let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, repo_id)
+        .await
+        .unwrap()
+        .expect("still stored");
+    assert_eq!(
+        forge_crypto::ExposeSecret::expose_secret(&secret),
+        "s3cret-at-rest"
+    );
+}
+
+/// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
+/// disabled (slice-1 plaintext behavior stays untouched).
+#[tokio::test]
+async fn crypto_disabled_reports_and_rejects() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+
+    let resp = client
+        .get(format!("{}/admin/crypto/keys", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], json!(false));
+
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "rotation without [crypto] must 409");
 }

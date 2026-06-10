@@ -724,6 +724,23 @@ where
         .await
 }
 
+/// Upsert a `forge_setting` value by key (e.g. one-shot import markers like
+/// the 12.7 `auth_realms_seeded` flag).
+pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO forge_setting (key, value)
+        VALUES ($1, $2)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        "#,
+        key,
+        value,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Whether this install opted into legacy open access (slice-1 behavior). A
 /// missing key is treated as `false` (fail-closed): a corrupted/old DB without
 /// the setting defaults to the secure, closed behavior.

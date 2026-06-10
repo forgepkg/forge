@@ -23,6 +23,8 @@
 //!    its anonymous-access policy (exactly as slice 1 did when password-basic
 //!    was off / the user was unknown).
 
+use std::sync::Arc;
+
 use sqlx::PgPool;
 
 use super::principal::UserPrincipal;
@@ -36,8 +38,9 @@ pub enum ChainOutcome {
     Authenticated {
         /// The identity the winning provider vouched for.
         identity: ProvenIdentity,
-        /// The `id()` of the provider that authenticated.
-        provider_id: &'static str,
+        /// The `id()` of the provider that authenticated (owned: realm-driven
+        /// providers carry per-realm ids, 12.7).
+        provider_id: String,
     },
     /// No provider authenticated and at least one definitively **rejected** the
     /// credential. The caller returns 401 (bad credentials), never anonymous.
@@ -71,8 +74,8 @@ impl Chain {
     }
 
     /// The configured provider ids, in order (for operator visibility / logs).
-    pub fn provider_ids(&self) -> Vec<&'static str> {
-        self.providers.iter().map(|p| p.id()).collect()
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.providers.iter().map(|p| p.id().to_string()).collect()
     }
 
     /// Run the credential through the chain and fold the outcomes.
@@ -89,7 +92,7 @@ impl Chain {
                     // First acceptance wins; later providers are not consulted.
                     return ChainOutcome::Authenticated {
                         identity,
-                        provider_id: provider.id(),
+                        provider_id: provider.id().to_string(),
                     };
                 }
                 AuthOutcome::Rejected => saw_rejected = true,
@@ -109,6 +112,31 @@ impl Chain {
         } else {
             ChainOutcome::NoCredentials
         }
+    }
+}
+
+/// Supplies the *current* password-auth [`Chain`] to the Basic source.
+///
+/// Slice 12.3 built the chain once at startup from static config. With 12.7
+/// the realms live in the database and are editable at runtime, so the source
+/// asks this seam on every password attempt and the server hands back its
+/// (snapshot-cached) realm-built chain. `None` means the password path is
+/// disabled entirely (slice-1 `allow_password_basic = false` parity).
+#[async_trait::async_trait]
+pub trait ChainSource: Send + Sync {
+    /// The chain to run a password credential through right now, or `None`
+    /// when the password path is disabled.
+    async fn password_chain(&self) -> Option<Arc<Chain>>;
+}
+
+/// A fixed [`ChainSource`]: the startup-built chain (or a disabled path).
+/// Used by tests and any wiring without DB-driven realms.
+pub struct StaticChainSource(pub Option<Arc<Chain>>);
+
+#[async_trait::async_trait]
+impl ChainSource for StaticChainSource {
+    async fn password_chain(&self) -> Option<Arc<Chain>> {
+        self.0.clone()
     }
 }
 
@@ -148,18 +176,20 @@ pub async fn map_identity_to_principal(
 }
 
 /// Resolve a chain-vouched [`ProvenIdentity`] to a [`UserPrincipal`],
-/// **auto-provisioning** an `app_user` when the source allows it (slice 12.3,
-/// phase 5).
+/// **auto-provisioning** an `app_user` when the identity's vouching provider
+/// allows it (slice 12.3 phase 5; per-realm since 12.7 — the flag rides on the
+/// identity instead of a chain-global setting).
 ///
 /// This is [`map_identity_to_principal`] plus the upstream auto-provision step:
 ///
-/// * [`AuthSource::UpstreamBasic`] with `auto_provision = true` → upsert the
+/// * [`AuthSource::UpstreamBasic`] with `identity.auto_provision` → upsert the
 ///   user via [`forge_db::user_dao::provision_upstream_user`] (creates a
 ///   passwordless `'upstream-basic'` account on first login, grants admin if the
-///   identity's `suggested_is_admin` is set, never downgrades a local account)
+///   identity's `suggested_is_admin` is set, never downgrades a local account),
+///   record the vouching realm as `app_user.realm_id` provenance when known,
 ///   and return its principal. The user is always `active = true` on insert; an
 ///   operator who later sets `active = false` is honored on the next call.
-/// * [`AuthSource::UpstreamBasic`] with `auto_provision = false` → behave like
+/// * [`AuthSource::UpstreamBasic`] without `auto_provision` → behave like
 ///   [`map_identity_to_principal`]: the user must already exist and be active,
 ///   else `Ok(None)` (caller denies).
 /// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → never provisioned here;
@@ -171,9 +201,8 @@ pub async fn map_identity_to_principal(
 pub async fn provision_and_map(
     pool: &PgPool,
     identity: &ProvenIdentity,
-    auto_provision: bool,
 ) -> sqlx::Result<Option<UserPrincipal>> {
-    if identity.source == AuthSource::UpstreamBasic && auto_provision {
+    if identity.source == AuthSource::UpstreamBasic && identity.auto_provision {
         let user = forge_db::user_dao::provision_upstream_user(
             pool,
             &identity.username,
@@ -193,6 +222,11 @@ pub async fn provision_and_map(
         // closed install (flag false) it does nothing. No cache invalidation is
         // needed: a re-resolve happens before the next authz lookup.
         forge_db::authz_dao::assign_authenticated_if_legacy_open(pool, user.id).await?;
+        // Provenance: remember which realm vouched for / provisioned this user
+        // (informational only; cheap no-op when unchanged).
+        if let Some(realm_id) = identity.realm_id {
+            forge_db::user_dao::set_user_realm(pool, user.id, realm_id).await?;
+        }
         return Ok(Some(UserPrincipal {
             user_id: user.id,
             token_id: None,
@@ -241,7 +275,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuthProvider for StubProvider {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             self.id
         }
         fn source(&self) -> AuthSource {
@@ -272,6 +306,8 @@ mod tests {
             external_subject: None,
             groups: Vec::new(),
             suggested_is_admin: false,
+            auto_provision: false,
+            realm_id: None,
         })
     }
 
@@ -487,7 +523,7 @@ mod tests {
         let chain = Chain::new(vec![Box::new(p1), Box::new(p2)]);
         assert_eq!(
             chain.provider_ids(),
-            vec!["local-password", "upstream-basic"]
+            vec!["local-password".to_string(), "upstream-basic".to_string()]
         );
         assert!(!chain.is_empty());
     }

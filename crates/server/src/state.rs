@@ -27,10 +27,12 @@ use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{CacheInvalidator, RepoError, RepoReadOps};
+use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 
+use crate::auth::RealmAuth;
 use crate::config::Config;
 
 /// Namespace under which hosted read responses are cached / invalidated.
@@ -58,9 +60,19 @@ pub struct AppState {
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
-    /// Interactive OIDC login runtime (slice 12.2). `None` ⇒ OIDC disabled and
-    /// no `/auth/oidc/*` routes are mounted.
-    pub oidc: Option<crate::auth::OidcRuntime>,
+    /// DB-backed auth realms (12.7): the snapshot cache the password chain,
+    /// the OIDC login runtime and the login UX endpoints are built from.
+    pub realms: Arc<RealmAuth>,
+    /// Browser-session lifecycle, shared by local-password login and OIDC.
+    pub sessions: SessionService,
+    /// Whether session cookies carry `Secure` (https `public_base_url`).
+    pub cookie_secure: bool,
+    /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
+    /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
+    /// Built fallibly by [`crate::crypto::build_envelope`] **before**
+    /// [`AppState::new`] (a configured-but-broken root key must abort startup)
+    /// and attached via [`AppState::with_envelope`].
+    pub envelope: Option<std::sync::Arc<forge_crypto::service::EnvelopeService>>,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -90,11 +102,10 @@ impl FormatRegistry {
 impl AppState {
     /// Construct state from its parts.
     ///
-    /// When the config has an **enabled** `[oidc]` section, the OIDC login
-    /// runtime is built here (SSRF-guarded HTTP client + discovery/JWKS metadata
-    /// client + session service); on a build failure we log and disable OIDC
-    /// rather than failing startup. A disabled/absent section leaves `oidc =
-    /// None` and mounts no `/auth/oidc/*` routes.
+    /// Authentication runtimes (the password chain, the OIDC login flow) are
+    /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
+    /// from the `auth_realm` table on demand (12.7). The session service and
+    /// cookie security bit are config-derived and shared by every login path.
     pub fn new(
         pool: PgPool,
         blob_store: BlobStore,
@@ -103,26 +114,17 @@ impl AppState {
         config: Config,
     ) -> Self {
         let cas = Cas::new(blob_store.clone(), pool.clone());
-
-        let oidc = match &config.oidc {
-            Some(o) if o.enabled => {
-                match crate::auth::OidcRuntime::build(
-                    o,
-                    pool.clone(),
-                    &config.public_base_url(),
-                    cache.clone(),
-                ) {
-                    Ok(rt) => Some(rt),
-                    Err(e) => {
-                        tracing::error!(error = %e, "OIDC runtime build failed; OIDC disabled");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-
         let authz = Authz::new(pool.clone(), cache.clone());
+        let config = Arc::new(config);
+
+        let (idle, absolute) = config.session_ttls();
+        let sessions = SessionService::new(
+            pool.clone(),
+            chrono::Duration::seconds(idle as i64),
+            chrono::Duration::seconds(absolute as i64),
+        );
+        let cookie_secure = config.public_base_url().starts_with("https://");
+        let realms = Arc::new(RealmAuth::new(pool.clone(), cache.clone(), config.clone()));
 
         AppState {
             pool,
@@ -131,9 +133,23 @@ impl AppState {
             cache,
             authz,
             formats: Arc::new(FormatRegistry::new(nuget)),
-            config: Arc::new(config),
-            oidc,
+            config,
+            realms,
+            sessions,
+            cookie_secure,
+            envelope: None,
         }
+    }
+
+    /// Attach the secret-encryption envelope service (slice 12.5). Kept out of
+    /// [`AppState::new`] because building it reads the root key and must be
+    /// able to fail startup; `None` keeps encryption disabled.
+    pub fn with_envelope(
+        mut self,
+        envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    ) -> Self {
+        self.envelope = envelope;
+        self
     }
 
     /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`NupkgBytes`).
@@ -166,12 +182,16 @@ impl AppState {
                 format,
                 self.blob_bytes(),
             ))),
-            RepoKind::Proxy => Ok(Arc::new(ProxyRepo::new(
-                self.pool.clone(),
-                format,
-                self.cas.clone(),
-                self.cache.clone(),
-            ))),
+            RepoKind::Proxy => Ok(Arc::new(
+                ProxyRepo::new(
+                    self.pool.clone(),
+                    format,
+                    self.cas.clone(),
+                    self.cache.clone(),
+                )
+                // §12.5: lets the upstream fetch decrypt an encrypted password.
+                .with_envelope(self.envelope.clone()),
+            )),
             RepoKind::Group => Ok(Arc::new(GroupRepo::new(
                 self.pool.clone(),
                 principal,
@@ -190,6 +210,7 @@ impl AppState {
             cas: self.cas.clone(),
             cache: self.cache.clone(),
             formats: self.formats.clone(),
+            envelope: self.envelope.clone(),
         }
     }
 }
@@ -255,6 +276,8 @@ pub struct MemberFactory {
     cas: Cas,
     cache: Cache,
     formats: Arc<FormatRegistry>,
+    /// §12.5: proxy members decrypt their upstream password through this.
+    envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
 }
 
 impl MemberOpsFactory for MemberFactory {
@@ -268,12 +291,15 @@ impl MemberOpsFactory for MemberFactory {
                     store: self.blob_store.clone(),
                 }),
             ))),
-            RepoKind::Proxy => Ok(Arc::new(ProxyRepo::new(
-                self.pool.clone(),
-                format,
-                self.cas.clone(),
-                self.cache.clone(),
-            ))),
+            RepoKind::Proxy => Ok(Arc::new(
+                ProxyRepo::new(
+                    self.pool.clone(),
+                    format,
+                    self.cas.clone(),
+                    self.cache.clone(),
+                )
+                .with_envelope(self.envelope.clone()),
+            )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),
                 kind: member.kind.clone(),

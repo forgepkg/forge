@@ -15,7 +15,7 @@
 //!   nonce/`aud`/expiry/`kid`).
 //!
 //! Because the forge server reaches this over its **SSRF-guarded** HTTP client,
-//! the stack must set `oidc.allow_private_issuer = true` (the loopback address
+//! the stack must set `oidc.allow_private_issuer = true` (the plain-http issuer
 //! is otherwise blocked) — [`MockOidc::oidc_block`] does that.
 //!
 //! The mock signs ID tokens with a throwaway RSA key it holds; `kid` rotation is

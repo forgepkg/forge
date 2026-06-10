@@ -5,14 +5,15 @@
 //! a `null`/absent password leaves the stored secret unchanged; a present value
 //! replaces it.
 //!
-//! `remote_url` on a proxy is **SSRF-validated** at create/update time
-//! (scheme + resolved-IP policy, honoring `allow_private_upstream`) so a bad
-//! upstream is rejected before any fetch.
+//! `remote_url` on a proxy is **scheme-validated** at create/update time
+//! (http/https only — 12.7 §3.6 dropped the private-range restriction) so a bad
+//! upstream is rejected before any fetch. The configured host is logged on save
+//! for operator visibility (the URL may point at internal addresses).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use forge_core::net::ssrf::{validate_url, SystemResolver};
+use forge_core::net::ssrf::validate_url;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{asset_dao, blob_dao, component_dao};
@@ -37,7 +38,6 @@ pub struct RepoView {
     /// `true` when an `upstream_password` is stored; the value itself is never
     /// returned.
     pub has_upstream_password: bool,
-    pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -55,8 +55,8 @@ impl From<&Repository> for RepoView {
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
-            has_upstream_password: r.upstream_password.is_some(),
-            allow_private_upstream: r.allow_private_upstream,
+            // §12.5: true for an encrypted blob OR a (pre-backfill) plaintext.
+            has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
@@ -86,8 +86,6 @@ pub struct CreateRepo {
     #[serde(default)]
     pub upstream_password: Option<String>,
     #[serde(default)]
-    pub allow_private_upstream: bool,
-    #[serde(default)]
     pub metadata_ttl_seconds: Option<i32>,
     #[serde(default)]
     pub not_found_ttl_seconds: Option<i32>,
@@ -107,7 +105,6 @@ pub struct UpdateRepo {
     pub package_delay_seconds: Option<i32>,
     pub upstream_username: Option<String>,
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: Option<bool>,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: Option<bool>,
@@ -124,13 +121,17 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
 
-/// SSRF-validate a proxy `remote_url` against the privacy policy. `None` is OK
-/// at this layer (proxy-without-url is rejected separately).
-async fn validate_remote_url(url: &str, allow_private: bool) -> Result<(), Response> {
-    validate_url(url, allow_private, &SystemResolver)
-        .await
-        .map(|_| ())
-        .map_err(|e| bad_request(format!("invalid remote_url: {e}")))
+/// Scheme-validate a proxy `remote_url` (http/https only). `None` is OK at this
+/// layer (proxy-without-url is rejected separately). Logs the configured host
+/// (12.7 §3.6: the URL may legitimately point at internal addresses; the log
+/// line gives operators an audit trail of where forge was pointed).
+#[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
+fn validate_remote_url(url: &str) -> Result<(), Response> {
+    validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
+    if let Ok(parsed) = url::Url::parse(url) {
+        tracing::info!(host = parsed.host_str().unwrap_or(""), %url, "proxy remote_url configured");
+    }
+    Ok(())
 }
 
 /// `GET /admin/repositories`
@@ -166,13 +167,17 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         let Some(url) = body.remote_url.as_deref() else {
             return bad_request("proxy repository requires remote_url");
         };
-        if let Err(resp) = validate_remote_url(url, body.allow_private_upstream).await {
+        if let Err(resp) = validate_remote_url(url) {
             return resp;
         }
     } else if body.remote_url.is_some() {
         return bad_request("remote_url is only valid for proxy repositories");
     }
 
+    // §12.5: with encryption enabled the password is NOT inserted as plaintext;
+    // the row is created first (the AAD binds the ciphertext to the row id,
+    // which does not exist before the INSERT) and the secret is sealed below.
+    let encrypting = state.envelope.is_some();
     let new = NewRepository {
         name: body.name.clone(),
         format: body.format.clone(),
@@ -183,20 +188,61 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         remote_url: body.remote_url.clone(),
         package_delay_seconds: body.package_delay_seconds,
         upstream_username: body.upstream_username.clone(),
-        upstream_password: body.upstream_password.clone(),
-        allow_private_upstream: body.allow_private_upstream,
+        upstream_password: if encrypting {
+            None
+        } else {
+            body.upstream_password.clone()
+        },
         metadata_ttl_seconds: body.metadata_ttl_seconds,
         not_found_ttl_seconds: body.not_found_ttl_seconds,
         allow_redeploy: body.allow_redeploy,
     };
 
-    match repository_dao::insert_repository(&state.pool, new).await {
-        Ok(r) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+    let repo = match repository_dao::insert_repository(&state.pool, new).await {
+        Ok(r) => r,
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "repository name already exists").into_response()
+            return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+
+    match (&state.envelope, &body.upstream_password) {
+        (Some(envelope), Some(pw)) => {
+            if let Err(resp) = store_encrypted_password(&state, envelope, repo.id, pw.clone()).await
+            {
+                return resp;
+            }
+            // Re-fetch so the view reflects the sealed secret.
+            match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
+                Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+                Ok(None) => db_error(sqlx::Error::RowNotFound),
+                Err(e) => db_error(e),
+            }
+        }
+        _ => (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response(),
     }
+}
+
+/// Seal `password` under the active DEK and store it on `repo_id`
+/// (`secret_dao::set_upstream_password`); map failures to a 500 response. The
+/// error string carries no key material or plaintext by construction.
+async fn store_encrypted_password(
+    state: &AppState,
+    envelope: &forge_crypto::service::EnvelopeService,
+    repo_id: i64,
+    password: String,
+) -> Result<(), Response> {
+    let secret = forge_crypto::PlaintextSecret::from(password);
+    forge_db::secret_dao::set_upstream_password(&state.pool, envelope, repo_id, Some(&secret))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, repo_id, "failed to store encrypted upstream password");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to store encrypted upstream password",
+            )
+                .into_response()
+        })
 }
 
 /// `PUT /admin/repositories/{name}`
@@ -213,19 +259,16 @@ pub async fn update(
 
     // Merge: each absent field keeps the existing value. `upstream_password`
     // absent ⇒ keep stored secret; present ⇒ replace.
-    let allow_private = body
-        .allow_private_upstream
-        .unwrap_or(existing.allow_private_upstream);
     let remote_url = match &body.remote_url {
         Some(u) => Some(u.clone()),
         None => existing.remote_url.clone(),
     };
 
-    // Re-validate the remote_url for proxies whenever url or privacy changed.
+    // Re-validate the remote_url for proxies whenever it changed.
     if existing.kind() == RepoKind::Proxy {
         if let Some(url) = remote_url.as_deref() {
-            if body.remote_url.is_some() || body.allow_private_upstream.is_some() {
-                if let Err(resp) = validate_remote_url(url, allow_private).await {
+            if body.remote_url.is_some() {
+                if let Err(resp) = validate_remote_url(url) {
                     return resp;
                 }
             }
@@ -245,11 +288,17 @@ pub async fn update(
             Some(u) => Some(u.clone()),
             None => existing.upstream_username.clone(),
         },
-        upstream_password: match &body.upstream_password {
-            Some(p) => Some(p.clone()),
-            None => existing.upstream_password.clone(),
+        // §12.5: with encryption enabled the plaintext column is only ever
+        // carried through unchanged (preserving a not-yet-backfilled value); a
+        // *new* password is sealed via secret_dao below, never stored here.
+        upstream_password: if state.envelope.is_some() {
+            existing.upstream_password.clone()
+        } else {
+            match &body.upstream_password {
+                Some(p) => Some(p.clone()),
+                None => existing.upstream_password.clone(),
+            }
         },
-        allow_private_upstream: allow_private,
         metadata_ttl_seconds: body.metadata_ttl_seconds.or(existing.metadata_ttl_seconds),
         not_found_ttl_seconds: body
             .not_found_ttl_seconds
@@ -257,13 +306,31 @@ pub async fn update(
         allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
     };
 
-    match repository_dao::update_repository(&state.pool, existing.id, upd).await {
-        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let updated = match repository_dao::update_repository(&state.pool, existing.id, upd).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "repository name already exists").into_response()
+            return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+
+    // §12.5: a present password replaces the stored secret through the
+    // envelope (clearing any legacy plaintext for this row); absent keeps it.
+    match (&state.envelope, &body.upstream_password) {
+        (Some(envelope), Some(pw)) => {
+            if let Err(resp) =
+                store_encrypted_password(&state, envelope, updated.id, pw.clone()).await
+            {
+                return resp;
+            }
+            match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
+                Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+                Ok(None) => db_error(sqlx::Error::RowNotFound),
+                Err(e) => db_error(e),
+            }
+        }
+        _ => Json(RepoView::from(&updated)).into_response(),
     }
 }
 

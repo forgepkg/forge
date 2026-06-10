@@ -144,6 +144,7 @@ async fn orphan_reconciler_reclaims_pending_blob() {
         secret_key: S3_SECRET.into(),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
+        conditional_writes: Default::default(),
     });
     let cas = Cas::new(store.clone(), srv.pool.clone());
 

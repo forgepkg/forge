@@ -9,14 +9,27 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, getToken } from '~/lib/auth'
+import { clearToken, getAuthMode, getCsrfToken, getToken } from '~/lib/auth'
+import { assignLocation } from '~/lib/navigation'
+import type { LoginOptions } from '~/api/auth'
 import type { Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
 
+// jsdom cannot perform real navigation; mock the one-line indirection the
+// OIDC redirect uses so we can assert on the target URL.
+vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
+
 /**
- * Login behavior (plan §3, §Testing): pasting a *valid* token verifies it via
- * `GET /admin/me`, persists it, and lands on the requested page; an *invalid*
- * token is never left in storage and surfaces an inline error.
+ * Login behavior (§12.7 realms + the slice-1 token fallback):
+ *  - identifier-first renders two steps (username -> /auth/identify ->
+ *    password -> /auth/login) and enters session mode on success;
+ *  - an oidc_redirect decision leaves the SPA for the IdP, carrying the
+ *    `redirect` target through as `redirect_to`;
+ *  - combined mode renders username+password plus one button per OIDC entry;
+ *  - a 401 from /auth/login shows the uniform inline error;
+ *  - the registry-token paste stays available as a secondary option: a valid
+ *    token is verified via `GET /admin/me` and persisted, an invalid one is
+ *    never left in storage.
  */
 
 const readerMe: Me = {
@@ -25,22 +38,79 @@ const readerMe: Me = {
   capabilities: ['repo.read'],
 }
 
-const fetchMock = vi.fn()
+const identifierFirst: LoginOptions = {
+  mode: 'identifier_first',
+  password: true,
+  oidc: [],
+}
 
-function meEndpoint(handler: () => Response) {
-  fetchMock.mockImplementation((input: RequestInfo | URL) => {
-    const url = typeof input === 'string' ? input : input.toString()
-    if (url.endsWith('/admin/me')) return Promise.resolve(handler())
-    return Promise.resolve(new Response('not found', { status: 404 }))
+const combined: LoginOptions = {
+  mode: 'combined',
+  password: true,
+  oidc: [
+    { name: 'corp', label: 'Corp SSO', login_url: '/auth/oidc/login?realm=corp' },
+  ],
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
   })
 }
 
-async function renderLogin() {
+const fetchMock = vi.fn()
+
+interface AuthHandlers {
+  options?: LoginOptions
+  onIdentify?: (body: unknown) => Response
+  onLogin?: (body: unknown) => Response
+  onMe?: () => Response
+}
+
+/** Route the mock by method + pathname against the auth + me endpoints. */
+function mockAuthApi(h: AuthHandlers) {
+  fetchMock.mockImplementation(
+    (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = typeof input === 'string' ? input : input.toString()
+      const url = new URL(raw, 'http://localhost')
+      const method = (init?.method ?? 'GET').toUpperCase()
+      const path = url.pathname
+      const body = () => (init?.body ? JSON.parse(init.body as string) : {})
+
+      if (path.endsWith('/auth/login-options') && method === 'GET') {
+        return Promise.resolve(
+          h.options ? json(h.options) : new Response('error', { status: 500 }),
+        )
+      }
+      if (path.endsWith('/auth/identify') && method === 'POST') {
+        return Promise.resolve(
+          h.onIdentify
+            ? h.onIdentify(body())
+            : new Response('not found', { status: 404 }),
+        )
+      }
+      if (path.endsWith('/auth/login') && method === 'POST') {
+        return Promise.resolve(
+          h.onLogin
+            ? h.onLogin(body())
+            : new Response('not found', { status: 404 }),
+        )
+      }
+      if (path.endsWith('/admin/me') && method === 'GET') {
+        return Promise.resolve(h.onMe ? h.onMe() : json(readerMe))
+      }
+      return Promise.resolve(new Response('not found', { status: 404 }))
+    },
+  )
+}
+
+async function renderLogin(initialPath = '/login') {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
     context: { queryClient },
-    history: createMemoryHistory({ initialEntries: ['/login'] }),
+    history: createMemoryHistory({ initialEntries: [initialPath] }),
   })
   render(
     <QueryClientProvider client={queryClient}>
@@ -55,6 +125,7 @@ describe('Login', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
+    vi.mocked(assignLocation).mockReset()
     clearToken()
   })
 
@@ -63,36 +134,196 @@ describe('Login', () => {
     clearToken()
   })
 
-  it('stores a valid token and navigates to Browse', async () => {
-    const user = userEvent.setup()
-    meEndpoint(
-      () =>
-        new Response(JSON.stringify(readerMe), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-    )
+  describe('identifier-first mode', () => {
+    it('walks username -> password steps, POSTs /auth/login, and enters session mode', async () => {
+      const user = userEvent.setup()
+      let identified: unknown = null
+      let loggedIn: unknown = null
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: (body) => {
+          identified = body
+          return json({ mode: 'password', realm: 'local' })
+        },
+        onLogin: (body) => {
+          loggedIn = body
+          return json({
+            user_id: 2,
+            username: 'alice',
+            is_admin: false,
+            csrf_token: 'csrf-abc',
+          })
+        },
+      })
 
-    const router = await renderLogin()
+      const router = await renderLogin()
 
-    await user.type(screen.getByLabelText('Registry token'), 'good-token')
-    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+      // Step 1: only the username is asked for.
+      await user.type(await screen.findByLabelText('Username'), 'alice')
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
 
-    await waitFor(() => expect(router.state.location.pathname).toBe('/'))
-    expect(getToken()).toBe('good-token')
+      await waitFor(() => expect(identified).toEqual({ username: 'alice' }))
+
+      // Step 2: the username is shown (changeable) and the password asked for.
+      expect(await screen.findByText('alice')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Change' })).toBeInTheDocument()
+      await user.type(screen.getByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(loggedIn).toEqual({ username: 'alice', password: 'hunter2' }),
+      )
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      // Session mode: the CSRF token is stored, no registry token.
+      expect(getAuthMode()).toBe('session')
+      expect(getCsrfToken()).toBe('csrf-abc')
+      expect(getToken()).toBeNull()
+    })
+
+    it('shows the uniform inline error on a 401 from /auth/login', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () => json({ mode: 'password', realm: 'local' }),
+        onLogin: () => new Response('unauthorized', { status: 401 }),
+      })
+
+      const router = await renderLogin()
+
+      await user.type(await screen.findByLabelText('Username'), 'alice')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+      await user.type(await screen.findByLabelText('Password'), 'wrong')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Invalid username or password',
+      )
+      expect(router.state.location.pathname).toBe('/login')
+      expect(getAuthMode()).toBeNull()
+    })
+
+    it('navigates the browser to the IdP on an oidc_redirect decision, carrying redirect_to', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () =>
+          json({
+            mode: 'oidc_redirect',
+            realm: 'corp',
+            login_url: '/auth/oidc/login?realm=corp',
+          }),
+      })
+
+      await renderLogin('/login?redirect=%2Fadmin')
+
+      await user.type(await screen.findByLabelText('Username'), 'bob@example.com')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+
+      await waitFor(() =>
+        expect(assignLocation).toHaveBeenCalledWith(
+          '/auth/oidc/login?realm=corp&redirect_to=%2Fadmin',
+        ),
+      )
+      // No password step was revealed.
+      expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+    })
   })
 
-  it('rejects an invalid token: clears storage and shows an error', async () => {
-    const user = userEvent.setup()
-    meEndpoint(() => new Response('unauthorized', { status: 401 }))
+  describe('combined mode', () => {
+    it('renders username+password and one button per OIDC entry', async () => {
+      const user = userEvent.setup()
+      let loggedIn: unknown = null
+      mockAuthApi({
+        options: combined,
+        onLogin: (body) => {
+          loggedIn = body
+          return json({
+            user_id: 2,
+            username: 'alice',
+            is_admin: false,
+            csrf_token: 'csrf-xyz',
+          })
+        },
+      })
 
-    const router = await renderLogin()
+      const router = await renderLogin()
 
-    await user.type(screen.getByLabelText('Registry token'), 'bad-token')
-    await user.click(screen.getByRole('button', { name: 'Sign in' }))
+      // Both credential fields and the IdP button are visible at once.
+      const username = await screen.findByLabelText('Username')
+      const password = screen.getByLabelText('Password')
+      const oidcButton = screen.getByRole('button', { name: 'Login with Corp SSO' })
+      expect(oidcButton).toBeInTheDocument()
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/not accepted/i)
-    expect(getToken()).toBeNull()
-    expect(router.state.location.pathname).toBe('/login')
+      await user.type(username, 'alice')
+      await user.type(password, 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(loggedIn).toEqual({ username: 'alice', password: 'hunter2' }),
+      )
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(getAuthMode()).toBe('session')
+    })
+
+    it('sends the browser to the IdP when the OIDC button is clicked', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: combined })
+
+      await renderLogin()
+
+      await user.click(
+        await screen.findByRole('button', { name: 'Login with Corp SSO' }),
+      )
+
+      expect(assignLocation).toHaveBeenCalledWith('/auth/oidc/login?realm=corp')
+    })
+  })
+
+  describe('registry-token fallback', () => {
+    it('stores a valid token and navigates to Browse', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: identifierFirst })
+
+      const router = await renderLogin()
+
+      await user.click(
+        await screen.findByRole('button', { name: 'Use a registry token instead' }),
+      )
+      await user.type(screen.getByLabelText('Registry token'), 'good-token')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(getToken()).toBe('good-token')
+      expect(getAuthMode()).toBe('token')
+    })
+
+    it('rejects an invalid token: clears storage and shows an error', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onMe: () => new Response('unauthorized', { status: 401 }),
+      })
+
+      const router = await renderLogin()
+
+      await user.click(
+        await screen.findByRole('button', { name: 'Use a registry token instead' }),
+      )
+      await user.type(screen.getByLabelText('Registry token'), 'bad-token')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(/not accepted/i)
+      expect(getToken()).toBeNull()
+      expect(router.state.location.pathname).toBe('/login')
+    })
+
+    it('falls back to the token form when login-options is unavailable', async () => {
+      mockAuthApi({ options: undefined }) // 500 from /auth/login-options
+
+      await renderLogin()
+
+      expect(await screen.findByLabelText('Registry token')).toBeInTheDocument()
+    })
   })
 })

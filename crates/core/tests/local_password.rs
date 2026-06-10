@@ -350,14 +350,14 @@ async fn basic_with_explicit_chain_matches_default() {
     let chain = Arc::new(Chain::new(vec![Box::new(LocalPasswordProvider::new(
         pool.clone(),
     ))]));
-    let src = BasicAuthSource::with_chain(pool.clone(), Some(chain), false);
+    let src = BasicAuthSource::with_chain(pool.clone(), Some(chain));
     assert!(matches!(
         src.resolve(&basic_header(&username, "pw"), ip()).await,
         SourceOutcome::Authenticated(_)
     ));
 
     // None chain disables the password path entirely.
-    let src_off = BasicAuthSource::with_chain(pool.clone(), None, false);
+    let src_off = BasicAuthSource::with_chain(pool.clone(), None);
     assert_eq!(
         src_off.resolve(&basic_header(&username, "pw"), ip()).await,
         SourceOutcome::Invalid

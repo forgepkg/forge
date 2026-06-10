@@ -7,6 +7,7 @@ pub mod app;
 pub mod auth;
 pub mod browse;
 pub mod config;
+pub mod crypto;
 pub mod dispatch;
 pub mod me;
 pub mod middleware;

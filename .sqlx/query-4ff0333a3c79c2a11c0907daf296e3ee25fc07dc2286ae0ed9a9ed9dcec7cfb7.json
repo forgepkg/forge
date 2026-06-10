@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository SET upstream_password_enc = $2 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4ff0333a3c79c2a11c0907daf296e3ee25fc07dc2286ae0ed9a9ed9dcec7cfb7"
+}

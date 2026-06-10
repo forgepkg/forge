@@ -1,0 +1,217 @@
+//! Auth-realm data access (slice 12.7).
+//!
+//! The `auth_realm` table is the **authority** for the server's authentication
+//! configuration: the password chain and the OIDC login runtime are rebuilt
+//! from these rows (snapshot-cached per instance, short TTL + invalidation on
+//! admin writes). Multi-instance correctness follows from re-reading the table
+//! — there is no in-memory-only authoritative state and no advisory locks.
+//!
+//! `config` may contain secrets (OIDC `client_secret`, credential-forwarding
+//! `key_pepper`). This module moves the jsonb around opaquely; redaction is the
+//! API layer's job, encryption at rest is slice 12.5.
+
+use chrono::{DateTime, Utc};
+use serde_json::Value as JsonValue;
+use sqlx::PgPool;
+
+use crate::model::AuthRealm;
+
+/// Insert payload for a realm.
+#[derive(Debug, Clone)]
+pub struct NewAuthRealm {
+    /// `'local'` | `'oidc'` | `'credential_forwarding'` | `'workload_identity'`.
+    pub kind: String,
+    /// Unique slug/display name (DB CHECK enforces the shape).
+    pub name: String,
+    pub enabled: bool,
+    /// Unique order; lower tries first. Use [`next_priority`] for "append".
+    pub priority: i32,
+    pub config: JsonValue,
+}
+
+/// Mutable fields of a realm. `kind` is immutable (a different mechanism is a
+/// different realm); `config` is the **full** replacement document — the API
+/// layer is responsible for merging write-only secrets into it first.
+#[derive(Debug, Clone)]
+pub struct AuthRealmUpdate {
+    pub name: String,
+    pub enabled: bool,
+    pub priority: i32,
+    pub config: JsonValue,
+}
+
+/// List all realms ordered by `priority` ascending (try-order).
+pub async fn list_realms(pool: &PgPool) -> sqlx::Result<Vec<AuthRealm>> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        FROM auth_realm
+        ORDER BY priority
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// List only the enabled realms, ordered by `priority` ascending.
+pub async fn list_enabled_realms(pool: &PgPool) -> sqlx::Result<Vec<AuthRealm>> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        FROM auth_realm
+        WHERE enabled
+        ORDER BY priority
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Find a realm by id.
+pub async fn find_realm_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AuthRealm>> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        FROM auth_realm
+        WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Find a realm by its unique name.
+pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<AuthRealm>> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        FROM auth_realm
+        WHERE name = $1
+        "#,
+        name,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Whether any realm of `kind` exists (enabled or not). Used by the one-shot
+/// legacy-config import to avoid re-seeding a kind the operator already
+/// manages.
+pub async fn kind_exists(pool: &PgPool, kind: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS(SELECT 1 FROM auth_realm WHERE kind = $1) AS "exists!""#,
+        kind,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// The next free priority slot (max + 10, so manual inserts between rows stay
+/// possible). `10` on an empty table — though the table is never empty in
+/// practice (migration 0010 seeds the `local` row).
+pub async fn next_priority(pool: &PgPool) -> sqlx::Result<i32> {
+    let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
+        .fetch_one(pool)
+        .await?;
+    Ok(max.map_or(10, |m| m.saturating_add(10)))
+}
+
+/// Insert a realm, returning the persisted row. A duplicate `name` or
+/// `priority` surfaces as a unique violation for the caller to map to 409.
+pub async fn insert_realm(pool: &PgPool, new: NewAuthRealm) -> sqlx::Result<AuthRealm> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        INSERT INTO auth_realm (kind, name, enabled, priority, config)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, kind, name, enabled, priority, config, created_at, updated_at
+        "#,
+        new.kind,
+        new.name,
+        new.enabled,
+        new.priority,
+        new.config,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Update a realm's mutable fields by id. Returns the updated row, or `None`
+/// when the id does not exist. Bumps `updated_at`.
+pub async fn update_realm(
+    pool: &PgPool,
+    id: i64,
+    upd: AuthRealmUpdate,
+) -> sqlx::Result<Option<AuthRealm>> {
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        UPDATE auth_realm SET
+            name = $2,
+            enabled = $3,
+            priority = $4,
+            config = $5,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING id, kind, name, enabled, priority, config, created_at, updated_at
+        "#,
+        id,
+        upd.name,
+        upd.enabled,
+        upd.priority,
+        upd.config,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Delete a realm by id. Returns whether a row was deleted. (Refusing to
+/// delete the built-in `local` realm is an API-layer rule, not enforced here.)
+pub async fn delete_realm(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query!(r#"DELETE FROM auth_realm WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Reassign priorities in one transaction. `order` is the full desired
+/// try-order (every realm id, first = highest precedence); each row gets
+/// `(index + 1) * 10`. The unique constraint is DEFERRABLE, so intermediate
+/// duplicates inside the transaction are fine. Ids not present in the table
+/// are ignored (the realm was deleted concurrently); extra rows not listed
+/// keep their priority — callers should pass the complete set.
+pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query!(r#"SET CONSTRAINTS auth_realm_priority_key DEFERRED"#)
+        .execute(&mut *tx)
+        .await?;
+    for (idx, id) in order.iter().enumerate() {
+        let priority = ((idx + 1) * 10) as i32;
+        sqlx::query!(
+            r#"UPDATE auth_realm SET priority = $2, updated_at = now() WHERE id = $1"#,
+            id,
+            priority,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// A cheap change marker for the per-instance snapshot cache: `(row count,
+/// max(updated_at))`. Two reads with the same marker saw the same realm set
+/// (updates bump `updated_at`; inserts/deletes change the count — a delete
+/// alone could collide with an old max, hence the count too).
+pub async fn change_marker(pool: &PgPool) -> sqlx::Result<(i64, Option<DateTime<Utc>>)> {
+    let row = sqlx::query!(
+        r#"SELECT count(*) AS "count!", max(updated_at) AS "max_updated" FROM auth_realm"#
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((row.count, row.max_updated))
+}

@@ -4,7 +4,8 @@ import { createFileRoute, Link, Outlet, useRouter } from '@tanstack/react-router
 import clsx from 'clsx'
 
 import { meKeys } from '~/api/me'
-import { clearToken, onAuthChange } from '~/lib/auth'
+import { logout } from '~/api/auth'
+import { clearToken, getAuthMode, onAuthChange } from '~/lib/auth'
 import { useMe } from '~/queries/useMe'
 
 export const Route = createFileRoute('/_app')({
@@ -34,7 +35,17 @@ function AppLayout() {
 
   const isAdmin = me.data?.is_admin === true
 
-  function signOut() {
+  async function signOut() {
+    // Session mode: only the server can invalidate the httpOnly cookie, so
+    // POST /auth/logout (CSRF-guarded) before clearing local state. Token mode
+    // has no server-side session — clearing storage is the whole logout.
+    if (getAuthMode() === 'session') {
+      try {
+        await logout()
+      } catch {
+        /* clear local state regardless; the cookie may already be dead */
+      }
+    }
     clearToken()
     void router.navigate({ to: '/login' })
   }

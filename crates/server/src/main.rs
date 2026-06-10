@@ -8,7 +8,7 @@ use anyhow::Context;
 use forge_cache::Cache;
 use forge_nuget::NugetFormat;
 use forge_server::app::{
-    build_router, ensure_bootstrap_admin, ensure_legacy_rbac, principal_layer,
+    build_router, ensure_auth_realms, ensure_bootstrap_admin, ensure_legacy_rbac, principal_layer,
 };
 use forge_server::config::Config;
 use forge_server::state::AppState;
@@ -68,10 +68,29 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure legacy RBAC mapping")?;
 
+    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // auth_realm rows (drift-detected); the DB is the authority.
+    ensure_auth_realms(&config, &pool)
+        .await
+        .context("ensure auth realms")?;
+
+    // §12.5: secret encryption at rest. Building the envelope service reads
+    // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
+    // operator who configured encryption never gets a silently-plaintext
+    // instance. Bootstrap then idempotently creates the active KEK/DEK and
+    // backfills any pre-12.5 plaintext upstream passwords.
+    let envelope = forge_server::crypto::build_envelope(&config, &pool)
+        .context("build secret-encryption envelope service")?;
+    if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
+        forge_server::crypto::bootstrap(&pool, env, crypto_cfg)
+            .await
+            .context("bootstrap secret encryption")?;
+    }
+
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let layer = principal_layer(&config, &pool, &cache)?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let state = AppState::new(pool, blob_store, cache, nuget, config);
+    let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
+    let layer = principal_layer(&state)?;
 
     // Background workers (outbox / reconciler / proxy refresh).
     let _workers = workers::spawn_all(&state);

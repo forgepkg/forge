@@ -10,15 +10,14 @@
 //!   * 5xx / unexpected status → `Unavailable`, **nothing cached** (re-forwards);
 //!   * `required_groups` unmet → `Rejected` despite a 200;
 //!   * `admin_group` present in the body → `suggested_is_admin = true`;
-//!   * SSRF: a private upstream URL with `allow_private_upstream = false` makes
-//!     the forward fail → `Unavailable` (fail-closed), nothing cached.
+//!   * an unreachable upstream makes the forward fail → `Unavailable`
+//!     (fail-closed), nothing cached.
 //!
 //! Requires Docker (Postgres testcontainer) on the host.
 
 mod common;
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use forge_cache::Cache;
@@ -26,7 +25,7 @@ use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, Password
 use forge_core::auth::{
     CredKeyPepper, UpstreamBasicConfig, UpstreamBasicProvider, ValidatedCredentialCache,
 };
-use forge_core::net::ssrf::{guarded_client, SystemResolver};
+use forge_core::net::ssrf::outbound_client;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -60,10 +59,7 @@ async fn make_provider(
         positive_ttl,
         Duration::from_secs(30),
     );
-    // allow_private must match the config so the loopback mock is reachable
-    // (except in the dedicated SSRF-block test, which uses a non-allowing client).
-    let client = guarded_client(Arc::new(SystemResolver), config.allow_private_upstream)
-        .expect("guarded client");
+    let client = outbound_client().expect("outbound client");
     UpstreamBasicProvider::new(config, client, cache)
 }
 
@@ -77,10 +73,12 @@ fn config_for(url: String) -> UpstreamBasicConfig {
         reject_status: vec![401, 403],
         connect_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(5),
-        allow_private_upstream: true,
         required_groups: Vec::new(),
         groups_path: String::new(),
         admin_group: String::new(),
+        provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
+        auto_provision: true,
+        realm_id: None,
     }
 }
 
@@ -288,18 +286,15 @@ async fn admin_group_sets_suggested_is_admin() {
 }
 
 #[tokio::test]
-async fn ssrf_blocked_private_upstream_is_unavailable() {
-    // A loopback upstream with allow_private_upstream = false: the SSRF-guarded
-    // client refuses to connect → forward errors → Unavailable (fail-closed),
-    // nothing cached. We point at a real (but disallowed) loopback address.
-    let server = MockServer::start().await;
-    let mut config = config_for(format!("{}/status", server.uri()));
-    config.allow_private_upstream = false;
-
-    // make_provider builds the client with `config.allow_private_upstream`
-    // (false here), so the guard blocks the loopback resolution.
+async fn unreachable_upstream_is_unavailable() {
+    // An upstream that refuses connections (an unbound port on loopback):
+    // forward errors → Unavailable (fail-closed), nothing cached. (The slice-1
+    // SSRF private-range test lived here; 12.7 §3.6 dropped that restriction —
+    // only the scheme is checked, and scheme rejection is covered by the ssrf
+    // module's unit tests + config validation.)
+    let config = config_for("http://127.0.0.1:1/status".to_string());
     let provider = make_provider(config, Duration::from_secs(300)).await;
-    let user = unique_user("up-ssrf");
+    let user = unique_user("up-unreachable");
 
     assert_eq!(
         provider.authenticate(&cred(&user, "pw")).await,

@@ -28,13 +28,17 @@ fn unique_user(prefix: &str) -> String {
     format!("{prefix}-{}", unique())
 }
 
-fn upstream_identity(username: &str, admin: bool) -> ProvenIdentity {
+/// An upstream-vouched identity whose provider allows auto-provisioning
+/// (`auto_provision` rides on the identity since 12.7 — per-realm).
+fn upstream_identity(username: &str, admin: bool, auto_provision: bool) -> ProvenIdentity {
     ProvenIdentity {
         username: username.to_string(),
         source: AuthSource::UpstreamBasic,
         external_subject: Some(username.to_string()),
         groups: Vec::new(),
         suggested_is_admin: admin,
+        auto_provision,
+        realm_id: None,
     }
 }
 
@@ -49,7 +53,7 @@ async fn first_success_provisions_passwordless_upstream_user() {
         .unwrap()
         .is_none());
 
-    let principal = provision_and_map(&pool, &upstream_identity(&username, false), true)
+    let principal = provision_and_map(&pool, &upstream_identity(&username, false, true))
         .await
         .unwrap()
         .expect("provisioned principal");
@@ -71,11 +75,11 @@ async fn second_login_reuses_user_no_duplicate() {
     let pool = pool().await;
     let username = unique_user("prov-reuse");
 
-    let p1 = provision_and_map(&pool, &upstream_identity(&username, false), true)
+    let p1 = provision_and_map(&pool, &upstream_identity(&username, false, true))
         .await
         .unwrap()
         .unwrap();
-    let p2 = provision_and_map(&pool, &upstream_identity(&username, false), true)
+    let p2 = provision_and_map(&pool, &upstream_identity(&username, false, true))
         .await
         .unwrap()
         .unwrap();
@@ -94,14 +98,14 @@ async fn admin_group_grants_admin_on_provision() {
     let pool = pool().await;
     let username = unique_user("prov-admin");
 
-    let principal = provision_and_map(&pool, &upstream_identity(&username, true), true)
+    let principal = provision_and_map(&pool, &upstream_identity(&username, true, true))
         .await
         .unwrap()
         .unwrap();
     assert!(principal.is_admin, "suggested_is_admin grants admin");
 
     // A subsequent NON-admin login must NOT downgrade the granted admin.
-    let principal2 = provision_and_map(&pool, &upstream_identity(&username, false), true)
+    let principal2 = provision_and_map(&pool, &upstream_identity(&username, false, true))
         .await
         .unwrap()
         .unwrap();
@@ -123,7 +127,7 @@ async fn existing_local_user_is_not_clobbered() {
 
     // An upstream login with the same username must reuse the row WITHOUT
     // dropping its local password or flipping auth_source to upstream-basic.
-    let principal = provision_and_map(&pool, &upstream_identity(&username, false), true)
+    let principal = provision_and_map(&pool, &upstream_identity(&username, false, true))
         .await
         .unwrap()
         .expect("resolves to the existing local user");
@@ -145,7 +149,7 @@ async fn no_auto_provision_does_not_create_user() {
     let pool = pool().await;
     let username = unique_user("prov-off");
 
-    let resolved = provision_and_map(&pool, &upstream_identity(&username, false), false)
+    let resolved = provision_and_map(&pool, &upstream_identity(&username, false, false))
         .await
         .unwrap();
     assert!(resolved.is_none(), "unknown user not provisioned");
@@ -180,7 +184,7 @@ async fn deactivated_user_resolves_to_none() {
     .unwrap();
 
     // With auto_provision = false, an inactive existing user is denied.
-    let resolved = provision_and_map(&pool, &upstream_identity(&username, false), false)
+    let resolved = provision_and_map(&pool, &upstream_identity(&username, false, false))
         .await
         .unwrap();
     assert!(resolved.is_none(), "inactive user denied");

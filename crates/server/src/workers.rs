@@ -58,6 +58,12 @@ pub struct WorkerHandles {
     /// Expired-`oidc_flow` / `session` reaper loop (slice 12.2). Present only
     /// when OIDC login is enabled (the only path that writes those tables).
     pub auth_reaper: Option<JoinHandle<()>>,
+    /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
+    /// when `[crypto]` is enabled and its rotation worker is not turned off.
+    /// Cluster-coordinated via a Postgres advisory lock (see
+    /// [`crate::crypto::spawn_worker`]) — the documented exception to the
+    /// no-advisory-locks slice-1 style, per the §12.5 plan.
+    pub crypto_rotation: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandles {
@@ -68,6 +74,9 @@ impl WorkerHandles {
         self.proxy_refresh.abort();
         self.retention.abort();
         if let Some(h) = &self.auth_reaper {
+            h.abort();
+        }
+        if let Some(h) = &self.crypto_rotation {
             h.abort();
         }
     }
@@ -140,12 +149,23 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         )
     });
 
+    // Crypto rotation/backfill worker (slice 12.5): only when secret
+    // encryption is enabled. One instance at a time performs a pass (advisory
+    // lock); every step is idempotent/resumable so crashes are harmless.
+    let crypto_rotation = match (&state.envelope, state.config.crypto.as_ref()) {
+        (Some(envelope), Some(crypto_cfg)) => {
+            crate::crypto::spawn_worker(state.pool.clone(), envelope.clone(), crypto_cfg)
+        }
+        _ => None,
+    };
+
     WorkerHandles {
         outbox,
         reconciler,
         proxy_refresh,
         retention,
         auth_reaper,
+        crypto_rotation,
     }
 }
 

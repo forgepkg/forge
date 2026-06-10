@@ -19,8 +19,12 @@ pub struct NewRepository {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
+    /// **Plaintext** upstream password — the legacy (crypto-disabled) write
+    /// path only. With encryption at rest enabled (slice 12.5) callers insert
+    /// with `None` here and store the secret afterwards via
+    /// [`crate::secret_dao::set_upstream_password`], which seals it under the
+    /// row-bound AAD (the row id does not exist before the INSERT).
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -40,7 +44,6 @@ impl NewRepository {
             package_delay_seconds: 0,
             upstream_username: None,
             upstream_password: None,
-            allow_private_upstream: false,
             metadata_ttl_seconds: None,
             not_found_ttl_seconds: None,
             allow_redeploy: false,
@@ -72,13 +75,13 @@ pub async fn insert_repository(pool: &PgPool, new: NewRepository) -> sqlx::Resul
         INSERT INTO repository (
             name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds, allow_redeploy
+            metadata_ttl_seconds, not_found_ttl_seconds, allow_redeploy
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING
             id, name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         "#,
         new.name,
@@ -91,7 +94,6 @@ pub async fn insert_repository(pool: &PgPool, new: NewRepository) -> sqlx::Resul
         new.package_delay_seconds,
         new.upstream_username,
         new.upstream_password,
-        new.allow_private_upstream,
         new.metadata_ttl_seconds,
         new.not_found_ttl_seconds,
         new.allow_redeploy,
@@ -111,7 +113,7 @@ pub async fn find_repository_by_name(
         SELECT
             id, name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         FROM repository
         WHERE name = $1
@@ -130,7 +132,7 @@ pub async fn find_repository_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Optio
         SELECT
             id, name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         FROM repository
         WHERE id = $1
@@ -149,7 +151,7 @@ pub async fn list_repositories(pool: &PgPool) -> sqlx::Result<Vec<Repository>> {
         SELECT
             id, name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         FROM repository
         ORDER BY name
@@ -168,7 +170,7 @@ pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Re
         SELECT
             r.id, r.name, r.format, r.kind, r.anonymous_read, r.online, r.config,
             r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password,
-            r.allow_private_upstream, r.metadata_ttl_seconds, r.not_found_ttl_seconds,
+            r.upstream_password_enc, r.metadata_ttl_seconds, r.not_found_ttl_seconds,
             r.allow_redeploy, r.created_at, r.updated_at,
             gm.priority
         FROM group_member gm
@@ -197,7 +199,7 @@ pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Re
                     package_delay_seconds: row.package_delay_seconds,
                     upstream_username: row.upstream_username,
                     upstream_password: row.upstream_password,
-                    allow_private_upstream: row.allow_private_upstream,
+                    upstream_password_enc: row.upstream_password_enc,
                     metadata_ttl_seconds: row.metadata_ttl_seconds,
                     not_found_ttl_seconds: row.not_found_ttl_seconds,
                     allow_redeploy: row.allow_redeploy,
@@ -386,8 +388,12 @@ pub struct RepositoryUpdate {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
+    /// **Plaintext** upstream password column value (legacy path). With
+    /// encryption at rest enabled, callers pass the existing value through
+    /// unchanged (preserving a not-yet-backfilled plaintext) and store a *new*
+    /// password via [`crate::secret_dao::set_upstream_password`] instead;
+    /// `upstream_password_enc` is never touched by this update.
     pub upstream_password: Option<String>,
-    pub allow_private_upstream: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -412,16 +418,15 @@ pub async fn update_repository(
             package_delay_seconds = $7,
             upstream_username = $8,
             upstream_password = $9,
-            allow_private_upstream = $10,
-            metadata_ttl_seconds = $11,
-            not_found_ttl_seconds = $12,
-            allow_redeploy = $13,
+            metadata_ttl_seconds = $10,
+            not_found_ttl_seconds = $11,
+            allow_redeploy = $12,
             updated_at = now()
         WHERE id = $1
         RETURNING
             id, name, format, kind, anonymous_read, online, config,
             remote_url, package_delay_seconds, upstream_username, upstream_password,
-            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,
+            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         "#,
         id,
@@ -433,7 +438,6 @@ pub async fn update_repository(
         upd.package_delay_seconds,
         upd.upstream_username,
         upd.upstream_password,
-        upd.allow_private_upstream,
         upd.metadata_ttl_seconds,
         upd.not_found_ttl_seconds,
         upd.allow_redeploy,

@@ -16,6 +16,7 @@ forge-db = { path = "../db" }
 forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
+forge-crypto = { path = "../crypto" }
 forge-nuget = { path = "../format-nuget" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }

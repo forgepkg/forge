@@ -7,6 +7,9 @@ edition = "2021"
 forge-db = { path = "../db" }
 forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
+# Secret encryption at rest (slice 12.5): the proxy upstream fetch decrypts the
+# upstream password through the envelope service (the single sanctioned site).
+forge-crypto = { path = "../crypto" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }

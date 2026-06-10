@@ -193,6 +193,51 @@ Key knobs:
 > local browsing, keep `anonymous_mode = "all"` and create repos with
 > `"anonymous_read": true`.
 
+## Authentication realms (12.7)
+
+Authentication is driven by ordered, web-managed **auth realms** stored in the
+`auth_realm` table: the built-in `local` password realm, optional `oidc`
+realms (interactive IdP login) and `credential_forwarding` realms (validate a
+login by forwarding it to an upstream like a Nexus over HTTP Basic). Manage
+them under **Admin → Authentication** or via `/admin/realms` (CRUD +
+`PUT /admin/realms/order`); changes apply at runtime — no redeploy. Secrets in
+a realm config (`client_secret`, `key_pepper`) are write-only: responses carry
+`<key>_set` markers, and an update that omits/blanks a secret keeps the stored
+one.
+
+Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
+block is imported into realm rows on the first boot after the upgrade (one-shot,
+recorded in `forge_setting`); afterwards the database is the authority.
+
+The login screen is **identifier-first** by default (username → password
+prompt, or a 302 to the IdP when the identifier's email domain matches an OIDC
+realm's `login_domains`); set `auth.login_mode = "combined"` for a classic
+combined form with per-realm OIDC buttons.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/auth/login-options` | Public: `{mode, password, oidc: [{name,label,login_url}]}` for the login screen. |
+| `POST` | `/auth/identify` | Identifier-first routing: `{mode: password\|oidc_redirect, realm, login_url?}`. Decided by realm config only (never reveals account existence). |
+| `POST` | `/auth/login` | Username/password through the realm chain; mints the session cookie; uniform 401 on failure. |
+| `GET` | `/auth/oidc/login?redirect_to=/path` | Start OIDC login; 302 → IdP. Writes an `oidc_flow` row (state/nonce/PKCE). |
+| `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
+| `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
+| `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
+| `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens. |
+
+State-changing cookie endpoints (`logout`, token mint/revoke) require a
+**double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the
+`/auth/login` response) and echo it in the `X-CSRF-Token` header.
+
+> **Security note (12.7 §3.6).** The slice-1 SSRF private-range guard is gone:
+> upstream URLs (proxy `remote_url`, credential-forwarding upstreams, OIDC
+> issuers) are restricted to `http`/`https` only and **may point at internal
+> addresses**. Realm/repository configuration is admin-only by design;
+> credential-forwarding sends the user's password to its configured upstream,
+> so treat realm admin rights accordingly. Configured hosts are logged on save.
+
 ## OIDC / Microsoft Entra login (optional)
 
 Browser login uses the **OpenID Connect authorization-code flow with PKCE**.
@@ -202,23 +247,11 @@ and maps the IdP identity to an `app_user`. NuGet protocol endpoints are
 unchanged — clients still authenticate with `X-NuGet-ApiKey`/Basic; humans mint
 those keys after logging in (`POST /auth/tokens`).
 
-Configure a single provider via the `[oidc]` TOML section or `FORGE_OIDC__*`
-env vars (see [`forge.toml.example`](./forge.toml.example) / `.env.example`).
-Omitting the section disables login entirely (no `/auth/oidc/*` routes).
-
-### Endpoints
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/auth/oidc/login?redirect_to=/path` | Start login; 302 → IdP. Writes an `oidc_flow` row (state/nonce/PKCE). |
-| `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
-| `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
-| `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
-| `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens. |
-
-State-changing cookie endpoints (`logout`, token mint/revoke) require a
-**double-submit CSRF token**: read `csrf_token` from `/auth/me` and echo it in
-the `X-CSRF-Token` header.
+Configure the provider as an `oidc` **auth realm** (Admin → Authentication), or
+seed it via the legacy `[oidc]` TOML section / `FORGE_OIDC__*` env vars (see
+[`forge.toml.example`](./forge.toml.example) / `.env.example`) — imported into
+a realm row on first boot. With no enabled oidc realm the `/auth/oidc/*`
+endpoints answer 404.
 
 ### Microsoft Entra setup
 
@@ -271,8 +304,9 @@ The e2e suite (`cargo xtask e2e`) stands up an in-process mock OIDC provider
 (discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
 be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
 on a private/dev network (e.g. Keycloak over plain `http`), set
-`oidc.allow_private_issuer = true` to relax both the SSRF guard and the
-https-issuer check.
+`oidc.allow_private_issuer = true` to relax the https-issuer check. (Since the
+12.7 auth-realms slice the old SSRF private-range guard is gone entirely —
+outbound upstream/issuer URLs are only restricted to http/https.)
 
 ## Tests
 

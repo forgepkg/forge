@@ -42,7 +42,6 @@ export interface RepoView {
   /** Whether an upstream password is stored (the value is never returned). */
   has_upstream_password: boolean
   /** Whether the proxy may resolve to private IPs (SSRF policy override). */
-  allow_private_upstream: boolean
   /** Proxy metadata cache TTL in seconds (`null` = server default). */
   metadata_ttl_seconds: number | null
   /** Proxy not-found cache TTL in seconds (`null` = server default). */
@@ -63,7 +62,6 @@ export interface CreateRepo {
   package_delay_seconds?: number
   upstream_username?: string | null
   upstream_password?: string | null
-  allow_private_upstream?: boolean
   metadata_ttl_seconds?: number | null
   not_found_ttl_seconds?: number | null
   // Hosted field:
@@ -84,7 +82,6 @@ export interface UpdateRepo {
   package_delay_seconds?: number
   upstream_username?: string | null
   upstream_password?: string | null
-  allow_private_upstream?: boolean
   metadata_ttl_seconds?: number | null
   not_found_ttl_seconds?: number | null
   allow_redeploy?: boolean

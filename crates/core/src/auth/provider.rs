@@ -106,6 +106,15 @@ pub struct ProvenIdentity {
     /// Whether an admin-group mapping suggests this identity is an admin. Only
     /// ever used to *grant* admin on provision, never to revoke (see §12.3).
     pub suggested_is_admin: bool,
+    /// Whether the vouching provider is configured to auto-provision an
+    /// `app_user` for this identity on first success (12.7: per-realm — each
+    /// credential-forwarding realm carries its own flag, so the chain caller no
+    /// longer needs a chain-global setting). Always `false` for local.
+    pub auto_provision: bool,
+    /// The `auth_realm.id` of the vouching realm, when the provider was built
+    /// from a realm row (12.7). Recorded as `app_user.realm_id` provenance on
+    /// provision; `None` for the built-in/static wiring.
+    pub realm_id: Option<i64>,
 }
 
 impl ProvenIdentity {
@@ -117,6 +126,8 @@ impl ProvenIdentity {
             external_subject: None,
             groups: Vec::new(),
             suggested_is_admin: false,
+            auto_provision: false,
+            realm_id: None,
         }
     }
 }
@@ -147,8 +158,10 @@ pub enum AuthOutcome {
 /// itself so that NuGet's per-request Basic auth does not hammer the upstream.
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
-    /// Stable provider id, e.g. `"local-password"` / `"upstream-basic"`.
-    fn id(&self) -> &'static str;
+    /// Stable provider id, e.g. `"local-password"` / `"upstream-basic"`, or a
+    /// realm-scoped id like `"realm:corp-nexus"` (12.7). Keys the
+    /// validated-credential cache, so it must be stable for a given realm.
+    fn id(&self) -> &str;
 
     /// The [`AuthSource`] identities from this provider carry.
     fn source(&self) -> AuthSource;
@@ -176,6 +189,8 @@ mod tests {
         assert!(id.external_subject.is_none());
         assert!(id.groups.is_empty());
         assert!(!id.suggested_is_admin);
+        assert!(!id.auto_provision);
+        assert!(id.realm_id.is_none());
     }
 
     #[test]

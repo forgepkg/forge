@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            allow_private_upstream, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE name = $1\n        ",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
   "describe": {
     "columns": [
       {
@@ -60,8 +60,8 @@
       },
       {
         "ordinal": 11,
-        "name": "allow_private_upstream",
-        "type_info": "Bool"
+        "name": "upstream_password_enc",
+        "type_info": "Bytea"
       },
       {
         "ordinal": 12,
@@ -90,9 +90,7 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
@@ -106,7 +104,7 @@
       false,
       true,
       true,
-      false,
+      true,
       true,
       true,
       false,
@@ -114,5 +112,5 @@
       false
     ]
   },
-  "hash": "45afb32ed064e3435ab0b7269fbf1f01799bca3943cfebe2ae29a128684bf012"
+  "hash": "b445e0044620e60626c4f5eaaa9904b062db4d76fb5a7cf18c08a96876fa427b"
 }

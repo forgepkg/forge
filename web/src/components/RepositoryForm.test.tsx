@@ -103,7 +103,6 @@ describe('RepositoryForm', () => {
       package_delay_seconds: 0,
       upstream_username: 'svc',
       has_upstream_password: true,
-      allow_private_upstream: false,
       metadata_ttl_seconds: null,
       not_found_ttl_seconds: null,
       allow_redeploy: false,

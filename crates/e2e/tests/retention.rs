@@ -828,7 +828,6 @@ async fn proxy_evicts_cold_cached_versions_only() {
             "name": repo,
             "kind": "proxy",
             "remote_url": mock.index_url(),
-            "allow_private_upstream": true,
             "metadata_ttl_seconds": 600,
             "not_found_ttl_seconds": 600,
         }))
