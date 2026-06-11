@@ -53,9 +53,21 @@ function PackageDetailPage() {
   return (
     <section className="space-y-8">
       <div>
-        <Link to="/" className="text-sm text-sky-700 hover:underline">
-          ← Back to browse
-        </Link>
+        <nav className="text-sm text-slate-500">
+          <Link to="/" className="text-sky-700 hover:underline">
+            Repositories
+          </Link>
+          <span className="mx-1">/</span>
+          <Link
+            to="/repos/$repo"
+            params={{ repo: pkg.repo }}
+            className="text-sky-700 hover:underline"
+          >
+            {pkg.repo}
+          </Link>
+          <span className="mx-1">/</span>
+          <span className="font-medium text-slate-700">{pkg.original_id}</span>
+        </nav>
         <div className="mt-2 flex flex-wrap items-center gap-3">
           <h1 className="text-2xl font-semibold">{pkg.original_id}</h1>
           <span className="flex items-center gap-2 text-sm text-slate-600">

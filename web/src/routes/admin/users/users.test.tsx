@@ -9,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, setToken } from '~/lib/auth'
+import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { UserView } from '~/api/users'
 import type { TokenView } from '~/api/tokens'
@@ -155,11 +155,11 @@ describe('admin users', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    setToken('admin-token')
+    setSession('admin-csrf')
   })
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('lists users with their role and status', async () => {
@@ -235,11 +235,11 @@ describe('admin tokens', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    setToken('admin-token')
+    setSession('admin-csrf')
   })
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('creates a token and shows the plaintext secret once', async () => {

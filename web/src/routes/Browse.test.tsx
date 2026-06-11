@@ -8,22 +8,28 @@ import {
   createRouter,
 } from '@tanstack/react-router'
 
-import { clearToken } from '~/lib/auth'
+import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { BrowseResult } from '~/api/packages'
+import type { BrowseRepo, BrowseResult } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Browse screen (plan §Phase 3 testing): search renders results + paginates;
- * the empty and error states render; a new query resets paging. Drives the real
- * route tree + `usePackageSearch`, so URL-search-param wiring is exercised too.
+ * Folder-view browse: the root lists the readable repositories; a repository
+ * screen searches + paginates that repo's packages. Drives the real route tree
+ * + `useBrowseRepos` / `usePackageSearch`, so URL-search-param wiring is
+ * exercised too.
  */
 
-const anonMe: Me = {
-  user: { id: 0, username: 'anonymous', is_admin: false, active: true },
+const readerMe: Me = {
+  user: { id: 2, username: 'alice', is_admin: false, active: true },
   is_admin: false,
   capabilities: ['repo.read'],
 }
+
+const repos: BrowseRepo[] = [
+  { name: 'nuget', kind: 'proxy' },
+  { name: 'internal', kind: 'hosted' },
+]
 
 function page(total: number, ids: string[]): BrowseResult {
   return {
@@ -41,18 +47,19 @@ function page(total: number, ids: string[]): BrowseResult {
 
 const fetchMock = vi.fn()
 
-/** Route the mock by URL: `/admin/me` -> identity, `/browse/packages` -> handler. */
+/**
+ * Route the mock by URL: `/admin/me` -> identity, `/browse/repos` -> repo list,
+ * `/browse/packages` -> handler.
+ */
 function mockApi(browse: (url: URL) => Response) {
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
     if (url.pathname.endsWith('/admin/me')) {
-      return Promise.resolve(
-        new Response(JSON.stringify(anonMe), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      )
+      return Promise.resolve(jsonResponse(readerMe))
+    }
+    if (url.pathname.endsWith('/browse/repos')) {
+      return Promise.resolve(jsonResponse(repos))
     }
     if (url.pathname.endsWith('/browse/packages')) {
       return Promise.resolve(browse(url))
@@ -91,26 +98,74 @@ async function renderBrowse(initialPath = '/') {
   return router
 }
 
-describe('Browse', () => {
+describe('Browse root (repository folders)', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    clearToken()
+    clearSession()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
-  it('renders search results in the table', async () => {
+  it('lists the readable repositories as folder links', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/')
+
+    const nugetLink = await screen.findByRole('link', { name: /nuget/ })
+    expect(nugetLink).toHaveAttribute('href', '/repos/nuget')
+    expect(screen.getByRole('link', { name: /internal/ })).toBeInTheDocument()
+  })
+
+  it('navigates into a repository when its folder is clicked', async () => {
+    mockApi(() => jsonResponse(page(1, ['Alpha'])))
+
+    const user = userEvent.setup()
+    const router = await renderBrowse('/')
+
+    await user.click(await screen.findByRole('link', { name: /nuget/ }))
+
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe('/repos/nuget'),
+    )
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
+  })
+})
+
+describe('RepoBrowse (per-repo search)', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    clearSession()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  it('scopes the search to the repository from the URL', async () => {
     mockApi(() => jsonResponse(page(2, ['Alpha', 'Beta'])))
 
-    await renderBrowse()
+    await renderBrowse('/repos/nuget')
 
-    expect(await screen.findByRole('link', { name: 'Alpha' })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Beta' })).toBeInTheDocument()
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /Beta/ })).toBeInTheDocument()
     expect(screen.getByText(/Page 1 of 1 · 2 total/)).toBeInTheDocument()
+
+    // Every package request carried the repo filter.
+    const pkgCalls = fetchMock.mock.calls
+      .map(([input]) =>
+        new URL(String(input), 'http://localhost'),
+      )
+      .filter((u) => u.pathname.endsWith('/browse/packages'))
+    expect(pkgCalls.length).toBeGreaterThan(0)
+    for (const u of pkgCalls) {
+      expect(u.searchParams.get('repo')).toBe('nuget')
+    }
   })
 
   it('paginates: Next requests the next page and updates skip', async () => {
@@ -122,20 +177,20 @@ describe('Browse', () => {
     })
 
     const user = userEvent.setup()
-    const router = await renderBrowse()
+    const router = await renderBrowse('/repos/nuget')
 
-    expect(await screen.findByRole('link', { name: 'Alpha' })).toBeInTheDocument()
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: 'Next' }))
 
-    expect(await screen.findByRole('link', { name: 'Omega' })).toBeInTheDocument()
+    expect(await screen.findByRole('link', { name: /Omega/ })).toBeInTheDocument()
     expect(router.state.location.search).toMatchObject({ skip: 20 })
   })
 
   it('shows an empty state when there are no results', async () => {
     mockApi(() => jsonResponse(page(0, [])))
 
-    await renderBrowse()
+    await renderBrowse('/repos/nuget')
 
     expect(await screen.findByText('No packages found')).toBeInTheDocument()
   })
@@ -143,7 +198,7 @@ describe('Browse', () => {
   it('shows an error state with a retry on failure', async () => {
     mockApi(() => new Response('boom', { status: 500 }))
 
-    await renderBrowse()
+    await renderBrowse('/repos/nuget')
 
     const alert = await screen.findByRole('alert')
     expect(within(alert).getByText('Could not load packages')).toBeInTheDocument()
@@ -154,7 +209,7 @@ describe('Browse', () => {
     mockApi(() => jsonResponse(page(0, [])))
 
     const user = userEvent.setup()
-    const router = await renderBrowse()
+    const router = await renderBrowse('/repos/nuget')
 
     await user.type(screen.getByLabelText('Search packages'), 'json')
 

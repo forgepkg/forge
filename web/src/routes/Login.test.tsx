@@ -9,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, getAuthMode, getCsrfToken, getToken } from '~/lib/auth'
+import { clearSession, getCsrfToken, isAuthenticated } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import type { LoginOptions } from '~/api/auth'
 import type { Me } from '~/api/me'
@@ -20,16 +20,15 @@ import { routeTree } from '~/routeTree.gen'
 vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
 
 /**
- * Login behavior (§12.7 realms + the slice-1 token fallback):
+ * Login behavior (§12.7 realms):
  *  - identifier-first renders two steps (username -> /auth/identify ->
  *    password -> /auth/login) and enters session mode on success;
  *  - an oidc_redirect decision leaves the SPA for the IdP, carrying the
  *    `redirect` target through as `redirect_to`;
  *  - combined mode renders username+password plus one button per OIDC entry;
  *  - a 401 from /auth/login shows the uniform inline error;
- *  - the registry-token paste stays available as a secondary option: a valid
- *    token is verified via `GET /admin/me` and persisted, an invalid one is
- *    never left in storage.
+ *  - there is **no** registry-token sign-in: the UI always authenticates with
+ *    username+password or via a realm.
  */
 
 const readerMe: Me = {
@@ -126,12 +125,12 @@ describe('Login', () => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
     vi.mocked(assignLocation).mockReset()
-    clearToken()
+    clearSession()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   describe('identifier-first mode', () => {
@@ -175,10 +174,8 @@ describe('Login', () => {
         expect(loggedIn).toEqual({ username: 'alice', password: 'hunter2' }),
       )
       await waitFor(() => expect(router.state.location.pathname).toBe('/'))
-      // Session mode: the CSRF token is stored, no registry token.
-      expect(getAuthMode()).toBe('session')
+      // Session mode: the CSRF token is stored.
       expect(getCsrfToken()).toBe('csrf-abc')
-      expect(getToken()).toBeNull()
     })
 
     it('shows the uniform inline error on a 401 from /auth/login', async () => {
@@ -200,7 +197,7 @@ describe('Login', () => {
         'Invalid username or password',
       )
       expect(router.state.location.pathname).toBe('/login')
-      expect(getAuthMode()).toBeNull()
+      expect(isAuthenticated()).toBe(false)
     })
 
     it('navigates the browser to the IdP on an oidc_redirect decision, carrying redirect_to', async () => {
@@ -263,7 +260,7 @@ describe('Login', () => {
         expect(loggedIn).toEqual({ username: 'alice', password: 'hunter2' }),
       )
       await waitFor(() => expect(router.state.location.pathname).toBe('/'))
-      expect(getAuthMode()).toBe('session')
+      expect(getCsrfToken()).toBe('csrf-xyz')
     })
 
     it('sends the browser to the IdP when the OIDC button is clicked', async () => {
@@ -280,50 +277,31 @@ describe('Login', () => {
     })
   })
 
-  describe('registry-token fallback', () => {
-    it('stores a valid token and navigates to Browse', async () => {
-      const user = userEvent.setup()
+  describe('no token sign-in', () => {
+    it('never offers a registry-token form', async () => {
       mockAuthApi({ options: identifierFirst })
 
-      const router = await renderLogin()
+      await renderLogin()
 
-      await user.click(
-        await screen.findByRole('button', { name: 'Use a registry token instead' }),
-      )
-      await user.type(screen.getByLabelText('Registry token'), 'good-token')
-      await user.click(screen.getByRole('button', { name: 'Sign in' }))
-
-      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
-      expect(getToken()).toBe('good-token')
-      expect(getAuthMode()).toBe('token')
+      await screen.findByLabelText('Username')
+      expect(screen.queryByLabelText('Registry token')).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole('button', { name: 'Use a registry token instead' }),
+      ).not.toBeInTheDocument()
     })
 
-    it('rejects an invalid token: clears storage and shows an error', async () => {
-      const user = userEvent.setup()
-      mockAuthApi({
-        options: identifierFirst,
-        onMe: () => new Response('unauthorized', { status: 401 }),
-      })
-
-      const router = await renderLogin()
-
-      await user.click(
-        await screen.findByRole('button', { name: 'Use a registry token instead' }),
-      )
-      await user.type(screen.getByLabelText('Registry token'), 'bad-token')
-      await user.click(screen.getByRole('button', { name: 'Sign in' }))
-
-      expect(await screen.findByRole('alert')).toHaveTextContent(/not accepted/i)
-      expect(getToken()).toBeNull()
-      expect(router.state.location.pathname).toBe('/login')
-    })
-
-    it('falls back to the token form when login-options is unavailable', async () => {
+    it('shows an error with a retry when login-options is unavailable', async () => {
       mockAuthApi({ options: undefined }) // 500 from /auth/login-options
 
       await renderLogin()
 
-      expect(await screen.findByLabelText('Registry token')).toBeInTheDocument()
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        /could not load the sign-in options/i,
+      )
+      expect(
+        screen.getByRole('button', { name: 'Try again' }),
+      ).toBeInTheDocument()
+      expect(screen.queryByLabelText('Registry token')).not.toBeInTheDocument()
     })
   })
 })

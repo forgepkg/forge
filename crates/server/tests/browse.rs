@@ -1,9 +1,11 @@
 //! E2E: read-side browse / search endpoints (plan §12.6 Phase 0, §8).
 //!
 //! Exercises the full HTTP stack: publish a package, then browse + view detail;
-//! anonymous-vs-authed visibility honoring `anonymous_read`; group-repo merge;
-//! dependency-group rendering; and that mounting `/browse` + `/admin/me` did not
-//! shadow the admin-only `/admin/*` API.
+//! the signed-in-users-only rule (anonymous browse is 401 even for
+//! `anonymous_read` repos — those stay readable on the `/v3` feed only);
+//! the `/browse/repos` folder root; group-repo merge; dependency-group
+//! rendering; and that mounting `/browse` + `/admin/me` did not shadow the
+//! admin-only `/admin/*` API.
 
 mod common;
 
@@ -178,11 +180,11 @@ async fn browse_detail_unknown_repo_404() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Anonymous visibility: with `anonymous_mode = all`, an anonymous caller sees
-/// only `anonymous_read` repos in browse search; a non-anon repo is hidden from
-/// the cross-repo listing and 401s on its detail.
+/// Browsing is for signed-in users only: even with `anonymous_mode = all` and
+/// an `anonymous_read` repo, an anonymous caller gets 401 from every `/browse`
+/// endpoint, while the same repo stays anonymously readable on the `/v3` feed.
 #[tokio::test]
-async fn browse_honors_anonymous_read() {
+async fn browse_requires_login() {
     let srv = common::start_with(
         common::pool().await,
         ServerOpts {
@@ -192,63 +194,78 @@ async fn browse_honors_anonymous_read() {
         },
     )
     .await;
+    let (u, p) = srv.admin_basic();
     let suffix = common::unique();
     let pub_repo = format!("pub{suffix}");
-    let priv_repo = format!("priv{suffix}");
     let pub_id = format!("Pub.Pkg{suffix}");
-    let priv_id = format!("Priv.Pkg{suffix}");
 
     publish_one(&srv, &pub_repo, &pub_id, "1.0.0", true).await;
-    publish_one(&srv, &priv_repo, &priv_id, "1.0.0", false).await;
 
-    // Anonymous cross-repo search shows only the anonymous_read repo's package.
+    // Anonymous search / detail / repo list → 401, anonymous_read or not.
+    for url in [
+        format!("{}/browse/packages", srv.base_url),
+        format!("{}/browse/packages/{pub_repo}/{pub_id}", srv.base_url),
+        format!("{}/browse/repos", srv.base_url),
+    ] {
+        let resp = srv.client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "anonymous {url} must be 401");
+    }
+
+    // The same anonymous caller can still read the repo through the NuGet feed.
     let resp = srv
         .client()
-        .get(format!("{}/browse/packages", srv.base_url))
+        .get(format!("{}/v3/{pub_repo}/index.json", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "anonymous_read still applies to /v3");
+
+    // A signed-in user browses normally.
+    let resp = srv
+        .client()
+        .get(format!("{}/browse/packages?repo={pub_repo}", srv.base_url))
+        .basic_auth(&u, Some(&p))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    let repos: Vec<String> = body["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["repo"].as_str().unwrap().to_string())
-        .collect();
-    assert!(repos.contains(&pub_repo), "anon sees anonymous_read repo");
-    assert!(
-        !repos.contains(&priv_repo),
-        "anon must NOT see non-anon repo {priv_repo}: {repos:?}"
-    );
+    assert_eq!(body["total"], json!(1));
+}
 
-    // Anonymous detail of the public repo → 200.
+/// `/browse/repos` lists the repositories the signed-in caller may read,
+/// sorted by name, with their kinds.
+#[tokio::test]
+async fn browse_repos_folder_root() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let suffix = common::unique();
+    let repo = format!("root{suffix}");
+    let id = format!("Root.Pkg{suffix}");
+
+    publish_one(&srv, &repo, &id, "1.0.0", false).await;
+
     let resp = srv
         .client()
-        .get(format!(
-            "{}/browse/packages/{pub_repo}/{pub_id}",
-            srv.base_url
-        ))
+        .get(format!("{}/browse/repos", srv.base_url))
+        .basic_auth(&u, Some(&p))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let repos = body.as_array().unwrap();
+    let entry = repos
+        .iter()
+        .find(|r| r["name"] == json!(repo))
+        .expect("created repo listed in /browse/repos");
+    assert_eq!(entry["kind"], json!("hosted"));
 
-    // Anonymous detail of the private repo → 401.
-    let resp = srv
-        .client()
-        .get(format!(
-            "{}/browse/packages/{priv_repo}/{priv_id}",
-            srv.base_url
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        401,
-        "anon detail of non-anon repo must be 401"
-    );
+    // Sorted by name.
+    let names: Vec<&str> = repos.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "repo folder list is sorted by name");
 }
 
 /// A group repository merges its members: a package published into a hosted

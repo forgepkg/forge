@@ -1,14 +1,40 @@
 import { useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { createFileRoute, Link, Outlet, useRouter } from '@tanstack/react-router'
+import {
+  createFileRoute,
+  Link,
+  Outlet,
+  redirect,
+  useRouter,
+} from '@tanstack/react-router'
 import clsx from 'clsx'
 
-import { meKeys } from '~/api/me'
+import { meKeys, meQueryOptions } from '~/api/me'
 import { logout } from '~/api/auth'
-import { clearToken, getAuthMode, onAuthChange } from '~/lib/auth'
+import { ApiError } from '~/lib/httpClient'
+import { clearSession, onAuthChange } from '~/lib/auth'
 import { useMe } from '~/queries/useMe'
 
 export const Route = createFileRoute('/_app')({
+  /**
+   * Login gate for the whole app: browsing (and everything else under the
+   * shell) is for signed-in users only. An unauthenticated caller is sent to
+   * /login with a redirect back to the attempted URL; the server enforces the
+   * same rule (401 on /browse/*), this is the navigation half.
+   */
+  beforeLoad: async ({ context, location }) => {
+    try {
+      await context.queryClient.ensureQueryData(meQueryOptions)
+    } catch (error) {
+      if (error instanceof ApiError && error.isAuthError) {
+        throw redirect({
+          to: '/login',
+          search: { redirect: location.href },
+        })
+      }
+      throw error
+    }
+  },
   component: AppLayout,
 })
 
@@ -36,17 +62,14 @@ function AppLayout() {
   const isAdmin = me.data?.is_admin === true
 
   async function signOut() {
-    // Session mode: only the server can invalidate the httpOnly cookie, so
-    // POST /auth/logout (CSRF-guarded) before clearing local state. Token mode
-    // has no server-side session — clearing storage is the whole logout.
-    if (getAuthMode() === 'session') {
-      try {
-        await logout()
-      } catch {
-        /* clear local state regardless; the cookie may already be dead */
-      }
+    // Only the server can invalidate the httpOnly cookie, so POST /auth/logout
+    // (CSRF-guarded) before clearing local state.
+    try {
+      await logout()
+    } catch {
+      /* clear local state regardless; the cookie may already be dead */
     }
-    clearToken()
+    clearSession()
     void router.navigate({ to: '/login' })
   }
 
@@ -59,6 +82,7 @@ function AppLayout() {
           </Link>
           <nav className="flex items-center gap-4 text-sm">
             <NavLink to="/">Browse</NavLink>
+            <NavLink to="/tokens">Tokens</NavLink>
             {isAdmin && <NavLink to="/admin">Admin</NavLink>}
           </nav>
           <div className="ml-auto flex items-center gap-3 text-sm">

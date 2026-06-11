@@ -6,23 +6,24 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  * generated into `src/routeTree.gen.ts` by `@tanstack/router-plugin`. Do not
  * hand-author route files or the generated tree.
  *
- * Phase 2 (plan §5) lands the auth layer + app shell + admin route gate:
+ * Structure:
  *
  *   root.tsx
- *     /login            -> Login.tsx           (token paste; OIDC stub for §12.2)
- *     layout 'app'      -> AppLayout.tsx        (nav shell + current user)
- *       index           -> Browse.tsx          (browse placeholder; Phase 3)
+ *     /login            -> Login.tsx            (user+password or realm login)
+ *     layout 'app'      -> AppLayout.tsx        (login-gated nav shell)
+ *       index           -> Browse.tsx           (folder view root: repositories)
+ *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages + search)
+ *       /packages/...   -> PackageDetail.tsx    (versions + dependencies)
+ *       /tokens         -> Tokens.tsx           (self-service registry tokens)
  *       /admin          -> AdminLayout.tsx      (beforeLoad: require is_admin)
- *         index         -> admin/AdminHome.tsx  (admin landing placeholder)
- *
- * Browse and the admin sub-screens (repositories/users/tokens) are filled in by
- * Phases 3–5; the structure here is what those phases extend.
  */
 export const routes = rootRoute('root.tsx', [
   route('/login', 'Login.tsx'),
   layout('app', 'AppLayout.tsx', [
     index('Browse.tsx'),
+    route('/repos/$repo', 'RepoBrowse.tsx'),
     route('/packages/$repo/$id', 'PackageDetail.tsx'),
+    route('/tokens', 'Tokens.tsx'),
     route('/admin', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),
       route('/repositories', 'admin/repositories/List.tsx'),

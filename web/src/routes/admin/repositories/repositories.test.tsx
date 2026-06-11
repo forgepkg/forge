@@ -9,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, setToken } from '~/lib/auth'
+import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { MemberView, RepoView } from '~/api/repositories'
 import { routeTree } from '~/routeTree.gen'
@@ -125,11 +125,11 @@ describe('admin repositories', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    setToken('admin-token')
+    setSession('admin-csrf')
   })
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('lists repositories with their kind and status', async () => {

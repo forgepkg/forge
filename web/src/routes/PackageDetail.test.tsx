@@ -7,7 +7,7 @@ import {
   createRouter,
 } from '@tanstack/react-router'
 
-import { clearToken } from '~/lib/auth'
+import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
@@ -115,12 +115,12 @@ describe('PackageDetail', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    clearToken()
+    clearSession()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('renders versions and dependency groups', async () => {

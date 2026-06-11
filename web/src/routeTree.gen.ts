@@ -11,8 +11,10 @@
 import { Route as rootRouteImport } from './routes/root'
 import { Route as LoginRouteImport } from './routes/Login'
 import { Route as AppLayoutRouteImport } from './routes/AppLayout'
+import { Route as TokensRouteImport } from './routes/Tokens'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as BrowseRouteImport } from './routes/Browse'
+import { Route as RepoBrowseRouteImport } from './routes/RepoBrowse'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
 import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
@@ -34,6 +36,11 @@ const AppLayoutRoute = AppLayoutRouteImport.update({
   id: '/_app',
   getParentRoute: () => rootRouteImport,
 } as any)
+const TokensRoute = TokensRouteImport.update({
+  id: '/tokens',
+  path: '/tokens',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
 const AdminLayoutRoute = AdminLayoutRouteImport.update({
   id: '/admin',
   path: '/admin',
@@ -42,6 +49,11 @@ const AdminLayoutRoute = AdminLayoutRouteImport.update({
 const BrowseRoute = BrowseRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
+const RepoBrowseRoute = RepoBrowseRouteImport.update({
+  id: '/repos/$repo',
+  path: '/repos/$repo',
   getParentRoute: () => AppLayoutRoute,
 } as any)
 const adminUsersListRoute = adminUsersListRouteImport.update({
@@ -105,10 +117,12 @@ export interface FileRoutesByFullPath {
   '/': typeof BrowseRoute
   '/login': typeof LoginRoute
   '/admin': typeof AdminLayoutRouteWithChildren
+  '/tokens': typeof TokensRoute
   '/admin/': typeof adminAdminHomeRoute
   '/admin/realms': typeof adminRealmsListRoute
   '/admin/repositories': typeof adminRepositoriesListRoute
   '/admin/users': typeof adminUsersListRoute
+  '/repos/$repo': typeof RepoBrowseRoute
   '/admin/realms/$realmId': typeof adminRealmsEditRoute
   '/admin/realms/new': typeof adminRealmsCreateRoute
   '/admin/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -120,10 +134,12 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/': typeof BrowseRoute
+  '/tokens': typeof TokensRoute
   '/admin': typeof adminAdminHomeRoute
   '/admin/realms': typeof adminRealmsListRoute
   '/admin/repositories': typeof adminRepositoriesListRoute
   '/admin/users': typeof adminUsersListRoute
+  '/repos/$repo': typeof RepoBrowseRoute
   '/admin/realms/$realmId': typeof adminRealmsEditRoute
   '/admin/realms/new': typeof adminRealmsCreateRoute
   '/admin/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -138,10 +154,12 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/_app/': typeof BrowseRoute
   '/_app/admin': typeof AdminLayoutRouteWithChildren
+  '/_app/tokens': typeof TokensRoute
   '/_app/admin/': typeof adminAdminHomeRoute
   '/_app/admin/realms': typeof adminRealmsListRoute
   '/_app/admin/repositories': typeof adminRepositoriesListRoute
   '/_app/admin/users': typeof adminUsersListRoute
+  '/_app/repos/$repo': typeof RepoBrowseRoute
   '/_app/admin/realms/$realmId': typeof adminRealmsEditRoute
   '/_app/admin/realms/new': typeof adminRealmsCreateRoute
   '/_app/admin/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -156,10 +174,12 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/admin'
+    | '/tokens'
     | '/admin/'
     | '/admin/realms'
     | '/admin/repositories'
     | '/admin/users'
+    | '/repos/$repo'
     | '/admin/realms/$realmId'
     | '/admin/realms/new'
     | '/admin/repositories/$repo'
@@ -171,10 +191,12 @@ export interface FileRouteTypes {
   to:
     | '/login'
     | '/'
+    | '/tokens'
     | '/admin'
     | '/admin/realms'
     | '/admin/repositories'
     | '/admin/users'
+    | '/repos/$repo'
     | '/admin/realms/$realmId'
     | '/admin/realms/new'
     | '/admin/repositories/$repo'
@@ -188,10 +210,12 @@ export interface FileRouteTypes {
     | '/login'
     | '/_app/'
     | '/_app/admin'
+    | '/_app/tokens'
     | '/_app/admin/'
     | '/_app/admin/realms'
     | '/_app/admin/repositories'
     | '/_app/admin/users'
+    | '/_app/repos/$repo'
     | '/_app/admin/realms/$realmId'
     | '/_app/admin/realms/new'
     | '/_app/admin/repositories/$repo'
@@ -222,6 +246,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppLayoutRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_app/tokens': {
+      id: '/_app/tokens'
+      path: '/tokens'
+      fullPath: '/tokens'
+      preLoaderRoute: typeof TokensRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
     '/_app/admin': {
       id: '/_app/admin'
       path: '/admin'
@@ -234,6 +265,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof BrowseRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/repos/$repo': {
+      id: '/_app/repos/$repo'
+      path: '/repos/$repo'
+      fullPath: '/repos/$repo'
+      preLoaderRoute: typeof RepoBrowseRouteImport
       parentRoute: typeof AppLayoutRoute
     }
     '/_app/admin/users': {
@@ -349,12 +387,16 @@ const AdminLayoutRouteWithChildren = AdminLayoutRoute._addFileChildren(
 interface AppLayoutRouteChildren {
   BrowseRoute: typeof BrowseRoute
   AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
+  TokensRoute: typeof TokensRoute
+  RepoBrowseRoute: typeof RepoBrowseRoute
   PackageDetailRoute: typeof PackageDetailRoute
 }
 
 const AppLayoutRouteChildren: AppLayoutRouteChildren = {
   BrowseRoute: BrowseRoute,
   AdminLayoutRoute: AdminLayoutRouteWithChildren,
+  TokensRoute: TokensRoute,
+  RepoBrowseRoute: RepoBrowseRoute,
   PackageDetailRoute: PackageDetailRoute,
 }
 

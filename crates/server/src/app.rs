@@ -18,6 +18,7 @@ use crate::browse::browse_router;
 use crate::config::Config;
 use crate::dispatch::dispatch;
 use crate::me::me_router;
+use crate::me_tokens::me_tokens_router;
 use crate::middleware::{attach_principal, PrincipalLayer};
 use crate::state::AppState;
 use crate::web_ui::spa_service;
@@ -66,9 +67,11 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// Build the full application router:
 /// * `/admin/me` — authenticated principal identity + capabilities (NOT
 ///   admin-gated; any authenticated user may read it).
+/// * `/admin/me/tokens` — self-service token management (any signed-in session
+///   user; NOT admin-gated).
 /// * `/admin/...` — admin REST API (admin-only).
-/// * `/browse/...` — read-side browse / search (per-repo `anonymous_read`
-///   authz enforced inside the handlers).
+/// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
+///   read authz enforced inside the handlers).
 /// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
 ///
 /// All branches run behind the principal middleware so every handler sees a
@@ -84,6 +87,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
 
     let mut app = Router::new()
         .merge(me_router())
+        // Self-service tokens: any signed-in (session) user manages their own
+        // tokens here; mounted like `/admin/me`, outside the admin gate.
+        .merge(me_tokens_router())
         .nest("/admin", admin)
         .merge(browse_router())
         // Login / session surface (12.7): always mounted — local-password

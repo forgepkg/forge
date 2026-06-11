@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useRouter, useSearch } from '@tanstack/react-router'
 
-import { fetchMe, meKeys } from '~/api/me'
+import { meKeys } from '~/api/me'
 import {
   fetchLoginOptions,
   identify,
@@ -12,7 +12,7 @@ import {
   type OidcLoginOption,
 } from '~/api/auth'
 import { ApiError } from '~/lib/httpClient'
-import { clearToken, setSession, setToken } from '~/lib/auth'
+import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 
 interface LoginSearch {
@@ -43,8 +43,9 @@ export const Route = createFileRoute('/login')({
  *
  * A successful password login sets the `forge_session` cookie; we persist the
  * returned CSRF token (session mode) and navigate to the `redirect` target.
- * The slice-1 token-paste form stays available as a secondary option (NuGet
- * registry tokens still work) behind a toggle.
+ * Signing in with a registry token is intentionally not offered: the UI always
+ * authenticates with username+password or via a realm. Tokens are minted on
+ * the Tokens screen for NuGet clients only.
  */
 function Login() {
   const { redirect, expired } = useSearch({ from: '/login' })
@@ -52,15 +53,9 @@ function Login() {
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
     staleTime: 60_000,
-    // Fail fast: an unreachable options endpoint immediately falls back to the
-    // token form instead of retrying in front of a waiting user.
+    // Fail fast in front of a waiting user; a retry button is rendered instead.
     retry: false,
   })
-  const [useToken, setUseToken] = useState(false)
-
-  // The login-options endpoint failing (old server, network) must never lock
-  // the door: fall back to the token form, which needs no options.
-  const tokenOnly = useToken || options.isError
 
   return (
     <div className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
@@ -79,57 +74,28 @@ function Login() {
           </p>
         )}
 
-        {tokenOnly ? (
-          <>
-            <TokenLoginForm redirect={redirect} />
-            {!options.isError && (
-              <SecondaryToggle onClick={() => setUseToken(false)}>
-                Back to username sign-in
-              </SecondaryToggle>
-            )}
-          </>
+        {options.isError ? (
+          <div className="space-y-4">
+            <p role="alert" className="text-sm text-red-600">
+              Could not load the sign-in options. Is the server reachable?
+            </p>
+            <button
+              type="button"
+              onClick={() => void options.refetch()}
+              className={primaryButtonClass}
+            >
+              Try again
+            </button>
+          </div>
         ) : options.isLoading || !options.data ? (
           <p className="text-sm text-slate-500">Loading sign-in options…</p>
+        ) : options.data.mode === 'combined' ? (
+          <CombinedLogin options={options.data} redirect={redirect} />
         ) : (
-          <>
-            {options.data.mode === 'combined' ? (
-              <CombinedLogin options={options.data} redirect={redirect} />
-            ) : (
-              <IdentifierFirstLogin redirect={redirect} />
-            )}
-            <SecondaryToggle onClick={() => setUseToken(true)}>
-              Use a registry token instead
-            </SecondaryToggle>
-          </>
+          <IdentifierFirstLogin redirect={redirect} />
         )}
       </div>
     </div>
-  )
-}
-
-/** "or"-divider + link toggling between the realm login and the token paste. */
-function SecondaryToggle({
-  onClick,
-  children,
-}: {
-  onClick: () => void
-  children: React.ReactNode
-}) {
-  return (
-    <>
-      <div className="my-5 flex items-center gap-3 text-xs uppercase tracking-wide text-slate-400">
-        <span className="h-px flex-1 bg-slate-200" />
-        or
-        <span className="h-px flex-1 bg-slate-200" />
-      </div>
-      <button
-        type="button"
-        onClick={onClick}
-        className="w-full rounded border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-      >
-        {children}
-      </button>
-    </>
   )
 }
 
@@ -390,84 +356,6 @@ function OidcButton({
     >
       Login with {idp.label}
     </button>
-  )
-}
-
-/**
- * The slice-1 token-paste form (secondary option): the token is verified via
- * `GET /admin/me` and only persisted once the API accepts it, so an invalid
- * token never poisons the stored credential.
- */
-function TokenLoginForm({ redirect }: { redirect?: string }) {
-  const router = useRouter()
-  const queryClient = useQueryClient()
-  const [token, setTokenValue] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    const trimmed = token.trim()
-    if (!trimmed) {
-      setError('Enter a registry token.')
-      return
-    }
-    setSubmitting(true)
-    setError(null)
-    // Store first so the verification request carries the credential, then roll
-    // back if the API rejects it.
-    setToken(trimmed)
-    try {
-      const me = await fetchMe()
-      queryClient.setQueryData(meKeys.self(), me)
-      void router.navigate({ to: redirect ?? '/' })
-    } catch (err) {
-      clearToken()
-      queryClient.removeQueries({ queryKey: meKeys.self() })
-      setError(
-        err instanceof ApiError && err.isAuthError
-          ? 'That token was not accepted. Check it and try again.'
-          : 'Could not verify the token. Is the server reachable?',
-      )
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <div>
-        <label
-          htmlFor="forge-token"
-          className="block text-sm font-medium text-slate-700"
-        >
-          Registry token
-        </label>
-        <input
-          id="forge-token"
-          type="password"
-          autoComplete="off"
-          autoFocus
-          value={token}
-          onChange={(e) => setTokenValue(e.target.value)}
-          placeholder="Paste your token"
-          className={inputClass}
-        />
-        <p className="mt-1 text-xs text-slate-500">
-          Create a token from the Tokens screen, or use one provided out of band.
-        </p>
-      </div>
-
-      {error && (
-        <p role="alert" className="text-sm text-red-600">
-          {error}
-        </p>
-      )}
-
-      <button type="submit" disabled={submitting} className={primaryButtonClass}>
-        {submitting ? 'Verifying…' : 'Sign in'}
-      </button>
-    </form>
   )
 }
 

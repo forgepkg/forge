@@ -10,6 +10,7 @@ pub mod config;
 pub mod crypto;
 pub mod dispatch;
 pub mod me;
+pub mod me_tokens;
 pub mod middleware;
 pub mod state;
 pub mod web_ui;
