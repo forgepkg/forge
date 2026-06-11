@@ -7,19 +7,16 @@ export interface RouterContext {
 }
 
 /**
- * Root route. It only provides the router context and a page background; it does
- * **not** render the app navigation, so the `/login` screen can stand on its own
- * outside the authenticated shell. The nav + current-user live in `AppLayout`,
- * which wraps every authenticated screen.
+ * Root route. It only provides the router context; page chrome (background,
+ * dark-mode colors) lives on <body> via styles.css and the Catalyst layouts,
+ * so the `/login` screen can stand on its own outside the authenticated shell.
+ * The nav + current-user live in `AppLayout`, which wraps every authenticated
+ * screen.
  */
 export const Route = createRootRouteWithContext<RouterContext>()({
   component: RootLayout,
 })
 
 function RootLayout() {
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <Outlet />
-    </div>
-  )
+  return <Outlet />
 }

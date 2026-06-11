@@ -1,3 +1,5 @@
+import { Button } from '~/components/catalyst/button'
+
 /**
  * Server-side paginator over a `{ total }` result. Pages are computed from
  * `skip` / `take`; navigation calls back with the new `skip`. Disabled at the
@@ -21,7 +23,7 @@ export function Paginator({
 
   return (
     <nav
-      className="flex items-center justify-between gap-4 text-sm text-slate-600"
+      className="flex items-center justify-between gap-4 text-sm/6 text-zinc-500 dark:text-zinc-400"
       aria-label="Pagination"
     >
       <span>
@@ -30,22 +32,16 @@ export function Paginator({
           : `Page ${currentPage} of ${pageCount} · ${total} total`}
       </span>
       <div className="flex items-center gap-2">
-        <button
-          type="button"
+        <Button
+          outline
           disabled={atStart}
           onClick={() => onSkipChange(Math.max(0, skip - take))}
-          className="rounded border border-slate-300 px-3 py-1.5 font-medium text-slate-700 enabled:hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Previous
-        </button>
-        <button
-          type="button"
-          disabled={atEnd}
-          onClick={() => onSkipChange(skip + take)}
-          className="rounded border border-slate-300 px-3 py-1.5 font-medium text-slate-700 enabled:hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
-        >
+        </Button>
+        <Button outline disabled={atEnd} onClick={() => onSkipChange(skip + take)}>
           Next
-        </button>
+        </Button>
       </div>
     </nav>
   )

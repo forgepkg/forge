@@ -1,6 +1,9 @@
+import { Input, InputGroup } from '~/components/catalyst/input'
+
 /**
- * Controlled search input. Debouncing + URL-state sync live in the parent
- * route; this stays a thin presentational control so it is trivially testable.
+ * Controlled search input (Catalyst input group with a leading magnifier).
+ * Debouncing + URL-state sync live in the parent route; this stays a thin
+ * presentational control so it is trivially testable.
  */
 export function SearchBox({
   value,
@@ -14,13 +17,27 @@ export function SearchBox({
   label?: string
 }) {
   return (
-    <input
-      type="search"
-      aria-label={label}
-      value={value}
-      placeholder={placeholder}
-      onChange={(e) => onChange(e.target.value)}
-      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400"
-    />
+    <InputGroup>
+      <MagnifierIcon />
+      <Input
+        type="search"
+        aria-label={label}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </InputGroup>
+  )
+}
+
+function MagnifierIcon() {
+  return (
+    <svg data-slot="icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+      <path
+        fillRule="evenodd"
+        d="M9 3.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11ZM2 9a7 7 0 1 1 12.452 4.391l3.328 3.329a.75.75 0 1 1-1.06 1.06l-3.329-3.328A7 7 0 0 1 2 9Z"
+        clipRule="evenodd"
+      />
+    </svg>
   )
 }

@@ -3,11 +3,16 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { BrowseItem } from '~/api/packages'
 import { usePackageSearch } from '~/queries/usePackageSearch'
+import { Heading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
+import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
+import { Label } from '~/components/catalyst/fieldset'
 import { SearchBox } from '~/components/SearchBox'
 import { Paginator } from '~/components/Paginator'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
-import { FolderIcon } from './Browse'
+import { Breadcrumbs } from '~/components/Breadcrumbs'
+import { ChevronIcon, FolderIcon } from './Browse'
 
 /**
  * Validated per-repo search params (shareable / deep-linkable URL state). All
@@ -79,31 +84,23 @@ function RepoBrowse() {
 
   return (
     <section className="space-y-6">
-      <div>
-        <nav className="text-sm text-slate-500">
-          <Link to="/" className="text-sky-700 hover:underline">
-            Repositories
-          </Link>
-          <span className="mx-1">/</span>
-          <span className="font-medium text-slate-700">{repo}</span>
-        </nav>
-        <h1 className="mt-2 text-2xl font-semibold">{repo}</h1>
-        <p className="mt-1 text-slate-600">
-          Search and browse the packages in this repository.
-        </p>
+      <div className="space-y-2">
+        <Breadcrumbs
+          items={[{ label: 'Repositories', to: '/' }, { label: repo }]}
+        />
+        <Heading>{repo}</Heading>
+        <Text>Search and browse the packages in this repository.</Text>
       </div>
 
       <div className="space-y-3">
         <SearchBox value={input} onChange={setInput} />
-        <label className="flex items-center gap-2 text-sm text-slate-600">
-          <input
-            type="checkbox"
+        <CheckboxField>
+          <Checkbox
             checked={prerelease}
-            onChange={(e) => togglePrerelease(e.target.checked)}
-            className="rounded border-slate-300"
+            onChange={(checked) => togglePrerelease(checked)}
           />
-          Include prerelease versions
-        </label>
+          <Label>Include prerelease versions</Label>
+        </CheckboxField>
       </div>
 
       <RepoBrowseResults
@@ -154,7 +151,7 @@ function RepoBrowseResults({
 
   // First load (no previous page kept): a simple skeleton-ish hint.
   if (isLoading) {
-    return <p className="text-slate-500">Loading packages…</p>
+    return <Text>Loading packages…</Text>
   }
 
   if (items.length === 0) {
@@ -169,21 +166,22 @@ function RepoBrowseResults({
 
   return (
     <div className="space-y-4">
-      <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
+      <ul className="divide-y divide-zinc-950/5 overflow-hidden rounded-xl ring-1 ring-zinc-950/5 dark:divide-white/5 dark:ring-white/10">
         {items.map((item) => (
           <li key={item.id}>
             <Link
               to="/packages/$repo/$id"
               params={{ repo: item.repo, id: item.id }}
-              className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50"
+              className="group flex items-center gap-3 px-4 py-3.5 transition hover:bg-zinc-950/[2.5%] dark:hover:bg-white/[2.5%]"
             >
               <FolderIcon />
-              <span className="font-medium text-sky-700">
+              <span className="font-medium text-zinc-950 group-hover:text-sky-700 dark:text-white dark:group-hover:text-sky-400">
                 {item.original_id}
               </span>
-              <span className="ml-auto font-mono text-sm text-slate-600">
+              <span className="ml-auto font-mono text-sm text-zinc-500 dark:text-zinc-400">
                 {item.latest_version}
               </span>
+              <ChevronIcon />
             </Link>
           </li>
         ))}

@@ -1,1 +1,17 @@
 @import 'tailwindcss';
+
+/*
+ * Class-driven dark mode: `lib/theme.ts` (and the inline bootstrap script in
+ * index.html, which runs before first paint) toggles `.dark` on <html>. This
+ * variant makes every `dark:` utility — including all of Catalyst's — follow
+ * that class instead of the OS media query, so the in-app theme switch can
+ * force either appearance regardless of the OS preference ("system" simply
+ * mirrors the media query onto the class).
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  body {
+    @apply bg-white text-zinc-950 antialiased dark:bg-zinc-900 dark:text-white;
+  }
+}

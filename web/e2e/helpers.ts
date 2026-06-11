@@ -32,6 +32,34 @@ export function adminBasic(): string {
   return 'Basic ' + Buffer.from(`${f.adminUser}:${f.adminPass}`).toString('base64')
 }
 
+/**
+ * Sign the page's browser context in with a password session (the only UI
+ * credential since token sign-in was removed): POST /auth/login through the
+ * context's request API (so the `forge_session` cookie lands in the context's
+ * cookie jar) and seed the returned CSRF token into localStorage before the
+ * SPA boots — exactly what the Login screen does.
+ */
+export async function signInSession(
+  page: import('@playwright/test').Page,
+  username?: string,
+  password?: string,
+): Promise<void> {
+  const f = facts()
+  const res = await page.request.post(`${f.baseUrl}/auth/login`, {
+    data: {
+      username: username ?? f.adminUser,
+      password: password ?? f.adminPass,
+    },
+  })
+  if (!res.ok()) {
+    throw new Error(`POST /auth/login -> ${res.status()}`)
+  }
+  const body = (await res.json()) as { csrf_token: string }
+  await page.addInitScript((csrf) => {
+    window.localStorage.setItem('forge.session.csrf', csrf)
+  }, body.csrf_token)
+}
+
 /** Create a repository via the admin API (used by specs that need a fixture repo). */
 export async function createRepo(body: Record<string, unknown>): Promise<Response> {
   const f = facts()
@@ -80,8 +108,10 @@ export async function fetchPackageDetail(
   >
 }> {
   const f = facts()
+  // Browsing requires a signed-in user; authenticate the API probe as admin.
   const res = await fetch(
     `${f.baseUrl}/browse/packages/${encodeURIComponent(repo)}/${encodeURIComponent(id)}`,
+    { headers: { authorization: adminBasic() } },
   )
   if (!res.ok) throw new Error(`GET package detail ${repo}/${id} -> ${res.status}`)
   return res.json()
@@ -120,6 +150,7 @@ export async function waitForPackage(
   while (Date.now() < deadline) {
     const res = await fetch(
       `${f.baseUrl}/browse/packages?q=${encodeURIComponent(originalId)}`,
+      { headers: { authorization: adminBasic() } },
     )
     if (res.ok) {
       const body: { items: Array<{ repo: string; original_id: string }> } =

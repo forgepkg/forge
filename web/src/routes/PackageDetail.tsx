@@ -1,12 +1,16 @@
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
 import { usePackageDetail } from '~/queries/usePackageDetail'
+import { Heading, Subheading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
+import { Divider } from '~/components/catalyst/divider'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { VersionTable } from '~/components/VersionTable'
 import { DependencyGroups } from '~/components/DependencyGroups'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import { Breadcrumbs } from '~/components/Breadcrumbs'
 
 export const Route = createFileRoute('/_app/packages/$repo/$id')({
   component: PackageDetailPage,
@@ -22,7 +26,7 @@ function PackageDetailPage() {
   const detail = usePackageDetail(repo, id)
 
   if (detail.isLoading) {
-    return <p className="text-slate-500">Loading package…</p>
+    return <Text>Loading package…</Text>
   }
 
   if (detail.isError) {
@@ -52,25 +56,17 @@ function PackageDetailPage() {
 
   return (
     <section className="space-y-8">
-      <div>
-        <nav className="text-sm text-slate-500">
-          <Link to="/" className="text-sky-700 hover:underline">
-            Repositories
-          </Link>
-          <span className="mx-1">/</span>
-          <Link
-            to="/repos/$repo"
-            params={{ repo: pkg.repo }}
-            className="text-sky-700 hover:underline"
-          >
-            {pkg.repo}
-          </Link>
-          <span className="mx-1">/</span>
-          <span className="font-medium text-slate-700">{pkg.original_id}</span>
-        </nav>
-        <div className="mt-2 flex flex-wrap items-center gap-3">
-          <h1 className="text-2xl font-semibold">{pkg.original_id}</h1>
-          <span className="flex items-center gap-2 text-sm text-slate-600">
+      <div className="space-y-2">
+        <Breadcrumbs
+          items={[
+            { label: 'Repositories', to: '/' },
+            { label: pkg.repo, to: '/repos/$repo', params: { repo: pkg.repo } },
+            { label: pkg.original_id },
+          ]}
+        />
+        <div className="flex flex-wrap items-center gap-3">
+          <Heading>{pkg.original_id}</Heading>
+          <span className="flex items-center gap-2 text-sm/6 text-zinc-500 dark:text-zinc-400">
             {pkg.repo}
             <RepoKindBadge kind={pkg.repo_kind} />
           </span>
@@ -78,11 +74,11 @@ function PackageDetailPage() {
       </div>
 
       <div>
-        <h2 className="text-sm font-medium uppercase tracking-wide text-slate-500">
-          Versions
-        </h2>
+        <Subheading>Versions</Subheading>
         {pkg.versions.length === 0 ? (
-          <EmptyState title="No visible versions" />
+          <div className="mt-3">
+            <EmptyState title="No visible versions" />
+          </div>
         ) : (
           <div className="mt-3">
             <VersionTable versions={pkg.versions} />
@@ -90,20 +86,18 @@ function PackageDetailPage() {
         )}
       </div>
 
+      <Divider />
+
       <div>
-        <h2 className="text-sm font-medium uppercase tracking-wide text-slate-500">
-          Dependencies
-        </h2>
+        <Subheading>Dependencies</Subheading>
         <div className="mt-3 space-y-6">
           {Object.keys(pkg.dependency_groups_by_version).length === 0 ? (
-            <p className="text-sm text-slate-500">
-              No dependency information available.
-            </p>
+            <Text>No dependency information available.</Text>
           ) : (
             Object.entries(pkg.dependency_groups_by_version).map(
               ([version, groups]) => (
                 <div key={version}>
-                  <h3 className="font-mono text-sm font-medium text-slate-700">
+                  <h3 className="font-mono text-sm/6 font-medium text-zinc-700 dark:text-zinc-300">
                     {version}
                   </h3>
                   <div className="mt-2">

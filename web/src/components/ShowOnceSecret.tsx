@@ -1,5 +1,7 @@
 import { useState } from 'react'
 
+import { Button } from '~/components/catalyst/button'
+
 /**
  * Renders a freshly-issued secret (a token plaintext) **once**, with a copy
  * affordance and a prominent warning that it cannot be retrieved again. This
@@ -39,38 +41,30 @@ export function ShowOnceSecret({
   return (
     <div
       role="alert"
-      className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 p-4"
+      className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4"
     >
       <div>
-        <p className="font-medium text-amber-900">{label} created</p>
-        <p className="mt-1 text-sm text-amber-800">
+        <p className="font-medium text-amber-800 dark:text-amber-300">
+          {label} created
+        </p>
+        <p className="mt-1 text-sm/6 text-amber-700 dark:text-amber-400">
           Copy it now — this is the only time it is shown. It cannot be
           retrieved again.
         </p>
       </div>
       <div className="flex items-center gap-2">
-        <code className="flex-1 overflow-x-auto rounded border border-amber-300 bg-white px-3 py-2 font-mono text-sm text-slate-900">
+        <code className="flex-1 overflow-x-auto rounded-lg border border-amber-500/30 bg-white px-3 py-2 font-mono text-sm text-zinc-950 dark:bg-zinc-900 dark:text-white">
           {secret}
         </code>
-        <button
-          type="button"
-          onClick={() => void copy()}
-          className="rounded bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700"
-        >
-          {copied ? 'Copied' : 'Copy'}
-        </button>
+        <Button onClick={() => void copy()}>{copied ? 'Copied' : 'Copy'}</Button>
         {onDismiss && (
-          <button
-            type="button"
-            onClick={onDismiss}
-            className="rounded border border-amber-300 px-3 py-2 text-sm font-medium text-amber-900 hover:bg-amber-100"
-          >
+          <Button outline onClick={onDismiss}>
             Dismiss
-          </button>
+          </Button>
         )}
       </div>
       {copyFailed && (
-        <p className="text-sm text-amber-800">
+        <p className="text-sm/6 text-amber-700 dark:text-amber-400">
           Could not access the clipboard — select the value above and copy it
           manually.
         </p>

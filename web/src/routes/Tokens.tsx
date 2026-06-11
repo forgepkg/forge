@@ -7,6 +7,20 @@ import {
   useMyTokens,
   useRevokeMyToken,
 } from '~/queries/useTokens'
+import { Badge } from '~/components/catalyst/badge'
+import { Button } from '~/components/catalyst/button'
+import { Code, Text } from '~/components/catalyst/text'
+import { Heading } from '~/components/catalyst/heading'
+import { Input } from '~/components/catalyst/input'
+import { Field, Label } from '~/components/catalyst/fieldset'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '~/components/catalyst/table'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
@@ -53,14 +67,13 @@ function MyTokens() {
   return (
     <section className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Your tokens</h1>
-        <p className="mt-1 text-slate-600">
+        <Heading>Your tokens</Heading>
+        <Text className="mt-1">
           Registry tokens authenticate NuGet clients (e.g.{' '}
-          <span className="font-mono">dotnet restore</span> /{' '}
-          <span className="font-mono">push</span>) against the feed. They
-          cannot be used to sign in here. The secret is shown only at creation
-          time.
-        </p>
+          <Code>dotnet restore</Code> / <Code>push</Code>) against the feed.
+          They cannot be used to sign in here. The secret is shown only at
+          creation time.
+        </Text>
       </div>
 
       {created && (
@@ -73,44 +86,27 @@ function MyTokens() {
 
       <form
         onSubmit={issue}
-        className="flex items-end gap-3 rounded-lg border border-slate-200 bg-white p-4"
+        className="flex items-end gap-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
       >
-        <label className="block flex-1 text-sm">
-          <span className="mb-1 block font-medium text-slate-700">
-            Token name
-          </span>
-          <input
+        <Field className="flex-1">
+          <Label>Token name</Label>
+          <Input
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. my-laptop"
-            className="w-full rounded border border-slate-300 px-3 py-2"
           />
-        </label>
-        <button
-          type="submit"
-          disabled={create.isPending || !name.trim()}
-          className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
-        >
+        </Field>
+        <Button type="submit" disabled={create.isPending || !name.trim()}>
           {create.isPending ? 'Creating…' : 'Create token'}
-        </button>
+        </Button>
       </form>
 
       {create.isError && (
-        <p
-          role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {create.error.body || create.error.message}
-        </p>
+        <InlineError>{create.error.body || create.error.message}</InlineError>
       )}
       {revoke.isError && (
-        <p
-          role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {revoke.error.body || revoke.error.message}
-        </p>
+        <InlineError>{revoke.error.body || revoke.error.message}</InlineError>
       )}
 
       {tokens.isError ? (
@@ -120,23 +116,23 @@ function MyTokens() {
           onRetry={() => void tokens.refetch()}
         />
       ) : tokens.isLoading ? (
-        <p className="text-slate-500">Loading tokens…</p>
+        <Text>Loading tokens…</Text>
       ) : (tokens.data?.length ?? 0) === 0 ? (
         <EmptyState title="No tokens yet">
           Create a token above to authenticate your NuGet client.
         </EmptyState>
       ) : (
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 text-left text-slate-500">
-              <th className="py-2 pr-4 font-medium">Name</th>
-              <th className="py-2 pr-4 font-medium">Created</th>
-              <th className="py-2 pr-4 font-medium">Last used</th>
-              <th className="py-2 pr-4 font-medium">Status</th>
-              <th className="py-2 pr-4 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table striped>
+          <TableHead>
+            <TableRow>
+              <TableHeader>Name</TableHeader>
+              <TableHeader>Created</TableHeader>
+              <TableHeader>Last used</TableHeader>
+              <TableHeader>Status</TableHeader>
+              <TableHeader>Actions</TableHeader>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {tokens.data!.map((token) => (
               <TokenRow
                 key={token.id}
@@ -148,10 +144,21 @@ function MyTokens() {
                 onConfirmRevoke={() => confirmRevoke(token.id)}
               />
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       )}
     </section>
+  )
+}
+
+function InlineError({ children }: { children: React.ReactNode }) {
+  return (
+    <p
+      role="alert"
+      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
+    >
+      {children}
+    </p>
   )
 }
 
@@ -178,36 +185,38 @@ function TokenRow({
 }) {
   const revoked = token.revoked_at != null
   return (
-    <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 pr-4 font-medium text-slate-900">{token.name}</td>
-      <td className="py-2 pr-4 text-slate-600">{formatTs(token.created_at)}</td>
-      <td className="py-2 pr-4 text-slate-600">
+    <TableRow>
+      <TableCell className="font-medium">{token.name}</TableCell>
+      <TableCell className="text-zinc-500 dark:text-zinc-400">
+        {formatTs(token.created_at)}
+      </TableCell>
+      <TableCell className="text-zinc-500 dark:text-zinc-400">
         {formatTs(token.last_used_at)}
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
         {revoked ? (
-          <span className="text-slate-400">revoked</span>
+          <Badge color="zinc">revoked</Badge>
         ) : (
-          <span className="text-emerald-700">active</span>
+          <Badge color="emerald">active</Badge>
         )}
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
         {revoked ? (
-          <span className="text-slate-400">—</span>
+          <span className="text-zinc-400 dark:text-zinc-500">—</span>
         ) : pendingRevoke ? (
           <span className="flex items-center gap-2">
             <button
               type="button"
               onClick={onConfirmRevoke}
               disabled={isRevoking}
-              className="text-red-700 hover:underline disabled:opacity-60"
+              className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
             >
               {isRevoking ? 'Revoking…' : 'Confirm'}
             </button>
             <button
               type="button"
               onClick={onCancelRevoke}
-              className="text-slate-500 hover:underline"
+              className="text-zinc-500 hover:underline dark:text-zinc-400"
             >
               Cancel
             </button>
@@ -216,12 +225,12 @@ function TokenRow({
           <button
             type="button"
             onClick={onRequestRevoke}
-            className="text-red-700 hover:underline"
+            className="font-medium text-red-600 hover:underline dark:text-red-400"
           >
             Revoke
           </button>
         )}
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
