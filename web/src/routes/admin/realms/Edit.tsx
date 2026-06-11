@@ -7,6 +7,8 @@ import {
   toRealmConfig,
   type RealmFormValues,
 } from '~/components/RealmForm'
+import { Heading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 
 export const Route = createFileRoute('/_app/admin/realms/$realmId')({
@@ -37,7 +39,7 @@ function EditRealmScreen() {
     )
   }
   if (realm.isLoading || !realm.data) {
-    return <p className="text-slate-500">Loading realm…</p>
+    return <Text>Loading realm…</Text>
   }
 
   function handleSubmit(values: RealmFormValues) {
@@ -55,14 +57,14 @@ function EditRealmScreen() {
 
   return (
     <section className="space-y-6">
-      <h1 className="text-2xl font-semibold">
+      <Heading>
         Edit <span className="font-mono">{realm.data.name}</span>
-      </h1>
+      </Heading>
 
       {update.isSuccess && (
         <p
           role="status"
-          className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"
+          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
         >
           Saved.
         </p>

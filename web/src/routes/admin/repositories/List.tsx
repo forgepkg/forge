@@ -6,6 +6,18 @@ import {
   useDeleteRepository,
   useRepositories,
 } from '~/queries/useRepositories'
+import { Badge } from '~/components/catalyst/badge'
+import { Button } from '~/components/catalyst/button'
+import { Heading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '~/components/catalyst/table'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
@@ -33,25 +45,20 @@ function RepositoriesList() {
 
   return (
     <section className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold">Repositories</h1>
-          <p className="mt-1 text-slate-600">
+          <Heading>Repositories</Heading>
+          <Text className="mt-1">
             Create and manage hosted, proxy, and group repositories.
-          </p>
+          </Text>
         </div>
-        <Link
-          to="/admin/repositories/new"
-          className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
-        >
-          New repository
-        </Link>
+        <Button href="/admin/repositories/new">New repository</Button>
       </div>
 
       {del.isError && (
         <p
           role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
         >
           {del.error.body || del.error.message}
         </p>
@@ -64,22 +71,22 @@ function RepositoriesList() {
           onRetry={() => void repos.refetch()}
         />
       ) : repos.isLoading ? (
-        <p className="text-slate-500">Loading repositories…</p>
+        <Text>Loading repositories…</Text>
       ) : (repos.data?.length ?? 0) === 0 ? (
         <EmptyState title="No repositories yet">
           Create your first repository to start serving packages.
         </EmptyState>
       ) : (
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 text-left text-slate-500">
-              <th className="py-2 pr-4 font-medium">Name</th>
-              <th className="py-2 pr-4 font-medium">Kind</th>
-              <th className="py-2 pr-4 font-medium">Status</th>
-              <th className="py-2 pr-4 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table striped>
+          <TableHead>
+            <TableRow>
+              <TableHeader>Name</TableHeader>
+              <TableHeader>Kind</TableHeader>
+              <TableHeader>Status</TableHeader>
+              <TableHeader>Actions</TableHeader>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {repos.data!.map((repo) => (
               <RepoRow
                 key={repo.id}
@@ -91,8 +98,8 @@ function RepositoriesList() {
                 onConfirmDelete={() => confirmDelete(repo.name)}
               />
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       )}
     </section>
   )
@@ -115,8 +122,8 @@ function RepoRow({
 }) {
   const navigate = useNavigate()
   return (
-    <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 pr-4">
+    <TableRow>
+      <TableCell>
         <button
           type="button"
           onClick={() =>
@@ -125,28 +132,32 @@ function RepoRow({
               params: { repo: repo.name },
             })
           }
-          className="font-medium text-sky-700 hover:underline"
+          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
         >
           {repo.name}
         </button>
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
         <RepoKindBadge kind={repo.kind} />
-      </td>
-      <td className="py-2 pr-4 text-slate-600">
-        <span className={repo.online ? 'text-emerald-700' : 'text-slate-400'}>
-          {repo.online ? 'online' : 'offline'}
-        </span>
-        {repo.anonymous_read && (
-          <span className="ml-2 text-xs text-slate-400">anonymous read</span>
+      </TableCell>
+      <TableCell>
+        {repo.online ? (
+          <Badge color="emerald">online</Badge>
+        ) : (
+          <Badge color="zinc">offline</Badge>
         )}
-      </td>
-      <td className="py-2 pr-4">
+        {repo.anonymous_read && (
+          <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400">
+            anonymous read
+          </span>
+        )}
+      </TableCell>
+      <TableCell>
         <span className="flex items-center gap-3">
           <Link
             to="/admin/repositories/$repo"
             params={{ repo: repo.name }}
-            className="text-sky-700 hover:underline"
+            className="text-sky-600 hover:underline dark:text-sky-400"
           >
             Edit
           </Link>
@@ -154,7 +165,7 @@ function RepoRow({
             <Link
               to="/admin/repositories/$repo/members"
               params={{ repo: repo.name }}
-              className="text-sky-700 hover:underline"
+              className="text-sky-600 hover:underline dark:text-sky-400"
             >
               Members
             </Link>
@@ -165,14 +176,14 @@ function RepoRow({
                 type="button"
                 onClick={onConfirmDelete}
                 disabled={isDeleting}
-                className="text-red-700 hover:underline disabled:opacity-60"
+                className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
               >
                 {isDeleting ? 'Deleting…' : 'Confirm'}
               </button>
               <button
                 type="button"
                 onClick={onCancelDelete}
-                className="text-slate-500 hover:underline"
+                className="text-zinc-500 hover:underline dark:text-zinc-400"
               >
                 Cancel
               </button>
@@ -181,13 +192,13 @@ function RepoRow({
             <button
               type="button"
               onClick={onRequestDelete}
-              className="text-red-700 hover:underline"
+              className="font-medium text-red-600 hover:underline dark:text-red-400"
             >
               Delete
             </button>
           )}
         </span>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }

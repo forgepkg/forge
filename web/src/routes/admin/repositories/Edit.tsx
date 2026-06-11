@@ -9,6 +9,8 @@ import {
   RepositoryForm,
   type RepoFormValues,
 } from '~/components/RepositoryForm'
+import { Heading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 
 export const Route = createFileRoute('/_app/admin/repositories/$repo')({
@@ -38,7 +40,7 @@ function EditRepository() {
     )
   }
   if (repo.isLoading || !repo.data) {
-    return <p className="text-slate-500">Loading repository…</p>
+    return <Text>Loading repository…</Text>
   }
 
   function handleSubmit(values: RepoFormValues) {
@@ -57,15 +59,15 @@ function EditRepository() {
 
   return (
     <section className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">
+      <div className="flex items-center justify-between gap-4">
+        <Heading>
           Edit <span className="font-mono">{repo.data.name}</span>
-        </h1>
+        </Heading>
         {repo.data.kind === 'group' && (
           <Link
             to="/admin/repositories/$repo/members"
             params={{ repo: repo.data.name }}
-            className="rounded border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"
+            className="rounded-lg border border-zinc-950/10 px-3 py-1.5 text-sm/6 font-medium text-zinc-950 hover:bg-zinc-950/[2.5%] dark:border-white/15 dark:text-white dark:hover:bg-white/5"
           >
             Manage members
           </Link>
@@ -75,7 +77,7 @@ function EditRepository() {
       {update.isSuccess && (
         <p
           role="status"
-          className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800"
+          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
         >
           Saved.
         </p>

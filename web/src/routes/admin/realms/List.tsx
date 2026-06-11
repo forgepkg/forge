@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import clsx from 'clsx'
 
 import type { RealmView } from '~/api/realms'
 import {
@@ -9,6 +8,19 @@ import {
   useReorderRealms,
   useUpdateRealm,
 } from '~/queries/useRealms'
+import { Badge } from '~/components/catalyst/badge'
+import { Button } from '~/components/catalyst/button'
+import { Checkbox } from '~/components/catalyst/checkbox'
+import { Heading } from '~/components/catalyst/heading'
+import { Text } from '~/components/catalyst/text'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '~/components/catalyst/table'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
@@ -48,26 +60,21 @@ function RealmsList() {
 
   return (
     <section className="space-y-6">
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold">Authentication</h1>
-          <p className="mt-1 text-slate-600">
+          <Heading>Authentication</Heading>
+          <Text className="mt-1">
             Realms are tried in this order when checking credentials and
             routing sign-ins.
-          </p>
+          </Text>
         </div>
-        <Link
-          to="/admin/realms/new"
-          className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
-        >
-          New realm
-        </Link>
+        <Button href="/admin/realms/new">New realm</Button>
       </div>
 
       {mutationError && (
         <p
           role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
         >
           {mutationError.body || mutationError.message}
         </p>
@@ -80,23 +87,23 @@ function RealmsList() {
           onRetry={() => void realms.refetch()}
         />
       ) : realms.isLoading ? (
-        <p className="text-slate-500">Loading realms…</p>
+        <Text>Loading realms…</Text>
       ) : (realms.data?.length ?? 0) === 0 ? (
         <EmptyState title="No realms configured">
           Create an OIDC or credential-forwarding realm with the button above.
         </EmptyState>
       ) : (
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 text-left text-slate-500">
-              <th className="py-2 pr-4 font-medium">Order</th>
-              <th className="py-2 pr-4 font-medium">Name</th>
-              <th className="py-2 pr-4 font-medium">Kind</th>
-              <th className="py-2 pr-4 font-medium">Enabled</th>
-              <th className="py-2 pr-4 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table striped>
+          <TableHead>
+            <TableRow>
+              <TableHeader>Order</TableHeader>
+              <TableHeader>Name</TableHeader>
+              <TableHeader>Kind</TableHeader>
+              <TableHeader>Enabled</TableHeader>
+              <TableHeader>Actions</TableHeader>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {realms.data!.map((realm, index) => (
               <RealmRow
                 key={realm.id}
@@ -113,8 +120,8 @@ function RealmsList() {
                 onConfirmDelete={() => confirmDelete(realm.id)}
               />
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       )}
     </section>
   )
@@ -148,62 +155,58 @@ function RealmRow({
   const update = useUpdateRealm(realm.id)
 
   return (
-    <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 pr-4">
+    <TableRow>
+      <TableCell>
         <span className="flex items-center gap-1">
-          <button
-            type="button"
+          <Button
+            plain
             onClick={onMoveUp}
             disabled={isFirst || reordering}
             aria-label={`Move ${realm.name} up`}
             title="Move up"
-            className="rounded border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
           >
             ↑
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            plain
             onClick={onMoveDown}
             disabled={isLast || reordering}
             aria-label={`Move ${realm.name} down`}
             title="Move down"
-            className="rounded border border-slate-300 px-2 py-0.5 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
           >
             ↓
-          </button>
+          </Button>
         </span>
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
         <Link
           to="/admin/realms/$realmId"
           params={{ realmId: String(realm.id) }}
-          className="font-medium text-sky-700 hover:underline"
+          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
         >
           {realm.name}
         </Link>
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
         <RealmKindBadge kind={realm.kind} />
-      </td>
-      <td className="py-2 pr-4">
-        <label className="flex items-center gap-2 text-slate-700">
-          <input
-            type="checkbox"
+      </TableCell>
+      <TableCell>
+        <span className="flex items-center gap-2 text-zinc-600 dark:text-zinc-400">
+          <Checkbox
             checked={realm.enabled}
             disabled={update.isPending}
-            onChange={(e) => update.mutate({ enabled: e.target.checked })}
+            onChange={(checked) => update.mutate({ enabled: checked })}
             aria-label={`${realm.name} enabled`}
-            className="rounded border-slate-300"
           />
           {realm.enabled ? 'enabled' : 'disabled'}
-        </label>
-      </td>
-      <td className="py-2 pr-4">
+        </span>
+      </TableCell>
+      <TableCell>
         <span className="flex items-center gap-3">
           <Link
             to="/admin/realms/$realmId"
             params={{ realmId: String(realm.id) }}
-            className="text-sky-700 hover:underline"
+            className="text-sky-600 hover:underline dark:text-sky-400"
           >
             Edit
           </Link>
@@ -214,14 +217,14 @@ function RealmRow({
                   type="button"
                   onClick={onConfirmDelete}
                   disabled={isDeleting}
-                  className="text-red-700 hover:underline disabled:opacity-60"
+                  className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
                 >
                   {isDeleting ? 'Deleting…' : 'Confirm'}
                 </button>
                 <button
                   type="button"
                   onClick={onCancelDelete}
-                  className="text-slate-500 hover:underline"
+                  className="text-zinc-500 hover:underline dark:text-zinc-400"
                 >
                   Cancel
                 </button>
@@ -230,30 +233,28 @@ function RealmRow({
               <button
                 type="button"
                 onClick={onRequestDelete}
-                className="text-red-700 hover:underline"
+                className="font-medium text-red-600 hover:underline dark:text-red-400"
               >
                 Delete
               </button>
             ))}
         </span>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 
 /** Color-coded kind badge (local = built-in, oidc, credential_forwarding). */
+const KIND_COLORS: Record<
+  string,
+  React.ComponentProps<typeof Badge>['color']
+> = {
+  local: 'zinc',
+  oidc: 'sky',
+  credential_forwarding: 'violet',
+  workload_identity: 'amber',
+}
+
 function RealmKindBadge({ kind }: { kind: RealmView['kind'] }) {
-  return (
-    <span
-      className={clsx(
-        'rounded px-1.5 py-0.5 text-xs font-medium',
-        kind === 'local' && 'bg-slate-100 text-slate-700',
-        kind === 'oidc' && 'bg-sky-100 text-sky-800',
-        kind === 'credential_forwarding' && 'bg-violet-100 text-violet-800',
-        kind === 'workload_identity' && 'bg-amber-100 text-amber-800',
-      )}
-    >
-      {kind}
-    </span>
-  )
+  return <Badge color={KIND_COLORS[kind] ?? 'zinc'}>{kind}</Badge>
 }

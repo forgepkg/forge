@@ -1,7 +1,23 @@
 import { useState } from 'react'
-import clsx from 'clsx'
 
 import type { CreateRepo, RepoKind, RepoView } from '~/api/repositories'
+import { Button } from '~/components/catalyst/button'
+import {
+  Checkbox,
+  CheckboxField,
+  CheckboxGroup,
+} from '~/components/catalyst/checkbox'
+import {
+  Description,
+  ErrorMessage,
+  Field,
+  FieldGroup,
+  Fieldset,
+  Label,
+  Legend,
+} from '~/components/catalyst/fieldset'
+import { Input } from '~/components/catalyst/input'
+import { Select } from '~/components/catalyst/select'
 
 /**
  * Shared repository create/edit form (plan §Phase 4). Kind-conditional fields:
@@ -122,272 +138,198 @@ export function RepositoryForm({
 
   return (
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Field label="Name" htmlFor="repo-name" error={errors.name}>
-        <input
-          id="repo-name"
+      <Field>
+        <Label>Name</Label>
+        <Input
           type="text"
           value={values.name}
           onChange={(e) => set('name', e.target.value)}
           autoFocus={mode === 'create'}
-          className={inputClass}
+          invalid={!!errors.name}
         />
+        {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
       </Field>
 
-      <Field label="Kind" htmlFor="repo-kind">
+      <Field>
+        <Label>Kind</Label>
         {mode === 'create' ? (
-          <select
-            id="repo-kind"
+          <Select
             value={values.kind}
             onChange={(e) => set('kind', e.target.value as RepoKind)}
-            className={inputClass}
           >
             <option value="hosted">hosted</option>
             <option value="proxy">proxy</option>
             <option value="group">group</option>
-          </select>
+          </Select>
         ) : (
-          <input
-            id="repo-kind"
+          <Input
             type="text"
             value={values.kind}
             readOnly
             aria-readonly="true"
-            className={clsx(inputClass, 'bg-slate-50 text-slate-500')}
           />
         )}
         {mode === 'edit' && (
-          <p className="mt-1 text-xs text-slate-500">
-            The kind cannot be changed after creation.
-          </p>
+          <Description>The kind cannot be changed after creation.</Description>
         )}
       </Field>
 
-      <fieldset className="space-y-2">
-        <Checkbox
-          id="repo-online"
-          checked={values.online}
-          onChange={(c) => set('online', c)}
-          label="Online (serve requests)"
-        />
-        <Checkbox
-          id="repo-anon"
-          checked={values.anonymous_read}
-          onChange={(c) => set('anonymous_read', c)}
-          label="Allow anonymous read"
-        />
-      </fieldset>
+      <CheckboxGroup>
+        <CheckboxField>
+          <Checkbox
+            checked={values.online}
+            onChange={(c) => set('online', c)}
+          />
+          <Label>Online (serve requests)</Label>
+        </CheckboxField>
+        <CheckboxField>
+          <Checkbox
+            checked={values.anonymous_read}
+            onChange={(c) => set('anonymous_read', c)}
+          />
+          <Label>Allow anonymous read</Label>
+        </CheckboxField>
+      </CheckboxGroup>
 
       {isHosted && (
-        <fieldset className="space-y-2 border-t border-slate-100 pt-4">
-          <legend className="text-sm font-medium text-slate-700">
-            Hosted options
-          </legend>
-          <Checkbox
-            id="repo-redeploy"
-            checked={values.allow_redeploy}
-            onChange={(c) => set('allow_redeploy', c)}
-            label="Allow redeploy (re-push an existing version)"
-          />
-        </fieldset>
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>Hosted options</Legend>
+          <CheckboxGroup>
+            <CheckboxField>
+              <Checkbox
+                checked={values.allow_redeploy}
+                onChange={(c) => set('allow_redeploy', c)}
+              />
+              <Label>Allow redeploy (re-push an existing version)</Label>
+            </CheckboxField>
+          </CheckboxGroup>
+        </Fieldset>
       )}
 
       {isProxy && (
-        <fieldset className="space-y-4 border-t border-slate-100 pt-4">
-          <legend className="text-sm font-medium text-slate-700">
-            Proxy upstream
-          </legend>
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>Proxy upstream</Legend>
+          <FieldGroup>
+            <Field>
+              <Label>Remote URL</Label>
+              <Input
+                type="url"
+                value={values.remote_url}
+                onChange={(e) => set('remote_url', e.target.value)}
+                placeholder="https://api.nuget.org/v3/index.json"
+                invalid={!!errors.remote_url}
+              />
+              {errors.remote_url && (
+                <ErrorMessage role="alert">{errors.remote_url}</ErrorMessage>
+              )}
+            </Field>
 
-          <Field
-            label="Remote URL"
-            htmlFor="repo-remote-url"
-            error={errors.remote_url}
-          >
-            <input
-              id="repo-remote-url"
-              type="url"
-              value={values.remote_url}
-              onChange={(e) => set('remote_url', e.target.value)}
-              placeholder="https://api.nuget.org/v3/index.json"
-              className={inputClass}
-            />
-          </Field>
-
-          <Field
-            label="Package delay (seconds)"
-            htmlFor="repo-delay"
-            error={errors.package_delay_seconds}
-          >
-            <input
-              id="repo-delay"
-              type="number"
-              min={0}
-              value={values.package_delay_seconds}
-              onChange={(e) => set('package_delay_seconds', e.target.value)}
-              className={inputClass}
-            />
-            <p className="mt-1 text-xs text-slate-500">
-              Newly discovered upstream versions stay hidden for this long.
-            </p>
-          </Field>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Metadata TTL (seconds)"
-              htmlFor="repo-meta-ttl"
-            >
-              <input
-                id="repo-meta-ttl"
+            <Field>
+              <Label>Package delay (seconds)</Label>
+              <Input
                 type="number"
                 min={0}
-                value={values.metadata_ttl_seconds}
-                onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
-                placeholder="server default"
-                className={inputClass}
+                value={values.package_delay_seconds}
+                onChange={(e) => set('package_delay_seconds', e.target.value)}
+                invalid={!!errors.package_delay_seconds}
+              />
+              <Description>
+                Newly discovered upstream versions stay hidden for this long.
+              </Description>
+              {errors.package_delay_seconds && (
+                <ErrorMessage role="alert">
+                  {errors.package_delay_seconds}
+                </ErrorMessage>
+              )}
+            </Field>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Metadata TTL (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.metadata_ttl_seconds}
+                  onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
+                  placeholder="server default"
+                />
+              </Field>
+              <Field>
+                <Label>Not-found TTL (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.not_found_ttl_seconds}
+                  onChange={(e) => set('not_found_ttl_seconds', e.target.value)}
+                  placeholder="server default"
+                />
+              </Field>
+            </div>
+
+            <Field>
+              <Label>Upstream username</Label>
+              <Input
+                type="text"
+                autoComplete="off"
+                value={values.upstream_username}
+                onChange={(e) => set('upstream_username', e.target.value)}
               />
             </Field>
-            <Field
-              label="Not-found TTL (seconds)"
-              htmlFor="repo-nf-ttl"
-            >
-              <input
-                id="repo-nf-ttl"
-                type="number"
-                min={0}
-                value={values.not_found_ttl_seconds}
-                onChange={(e) => set('not_found_ttl_seconds', e.target.value)}
-                placeholder="server default"
-                className={inputClass}
+
+            <Field>
+              <Label>Upstream password</Label>
+              <Input
+                type="password"
+                autoComplete="new-password"
+                value={values.upstream_password}
+                onChange={(e) => set('upstream_password', e.target.value)}
+                placeholder={
+                  mode === 'edit' && existing?.has_upstream_password
+                    ? '•••••••• (set to replace)'
+                    : 'Optional'
+                }
               />
+              <Description>
+                {mode === 'edit' && existing?.has_upstream_password
+                  ? 'A password is stored. Leave blank to keep it; type a new one to replace it.'
+                  : 'Write-only. The stored secret is never shown after saving.'}
+              </Description>
             </Field>
-          </div>
-
-          <Field label="Upstream username" htmlFor="repo-up-user">
-            <input
-              id="repo-up-user"
-              type="text"
-              autoComplete="off"
-              value={values.upstream_username}
-              onChange={(e) => set('upstream_username', e.target.value)}
-              className={inputClass}
-            />
-          </Field>
-
-          <Field label="Upstream password" htmlFor="repo-up-pass">
-            <input
-              id="repo-up-pass"
-              type="password"
-              autoComplete="new-password"
-              value={values.upstream_password}
-              onChange={(e) => set('upstream_password', e.target.value)}
-              placeholder={
-                mode === 'edit' && existing?.has_upstream_password
-                  ? '•••••••• (set to replace)'
-                  : 'Optional'
-              }
-              className={inputClass}
-            />
-            <p className="mt-1 text-xs text-slate-500">
-              {mode === 'edit' && existing?.has_upstream_password
-                ? 'A password is stored. Leave blank to keep it; type a new one to replace it.'
-                : 'Write-only. The stored secret is never shown after saving.'}
-            </p>
-          </Field>
-        </fieldset>
+          </FieldGroup>
+        </Fieldset>
       )}
 
       {isGroup && mode === 'edit' && (
-        <p className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
           Group members and their priorities are managed on the{' '}
           <span className="font-medium">Members</span> screen.
         </p>
       )}
       {isGroup && mode === 'create' && (
-        <p className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
           Create the group first, then add members from its Members screen.
         </p>
       )}
 
       {serverError && (
-        <p role="alert" className="text-sm text-red-600">
+        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
           {serverError}
         </p>
       )}
 
       <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={submitting}
-          className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
-        >
+        <Button type="submit" disabled={submitting}>
           {submitting
             ? 'Saving…'
             : mode === 'create'
               ? 'Create repository'
               : 'Save changes'}
-        </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="rounded border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-        >
+        </Button>
+        <Button type="button" outline onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
       </div>
     </form>
-  )
-}
-
-const inputClass =
-  'mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500'
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  children,
-}: {
-  label: string
-  htmlFor: string
-  error?: string
-  children: React.ReactNode
-}) {
-  return (
-    <div>
-      <label htmlFor={htmlFor} className="block text-sm font-medium text-slate-700">
-        {label}
-      </label>
-      {children}
-      {error && (
-        <p role="alert" className="mt-1 text-xs text-red-600">
-          {error}
-        </p>
-      )}
-    </div>
-  )
-}
-
-function Checkbox({
-  id,
-  checked,
-  onChange,
-  label,
-}: {
-  id: string
-  checked: boolean
-  onChange: (checked: boolean) => void
-  label: string
-}) {
-  return (
-    <label htmlFor={id} className="flex items-center gap-2 text-sm text-slate-700">
-      <input
-        id={id}
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="rounded border-slate-300"
-      />
-      {label}
-    </label>
   )
 }
 
