@@ -9,13 +9,14 @@ import { facts } from '../helpers'
  * header (proving the browser uses the same origin — no Node proxy).
  */
 test.describe('single-origin serving', () => {
-  test('root boots the SPA into Browse', async ({ page }) => {
-    // Anonymous reads are enabled, so an unauthenticated visitor lands on the
-    // Browse screen — the SPA shell is alive and client-rendered.
+  test('root boots the SPA and gates anonymous visitors at login', async ({
+    page,
+  }) => {
+    // Browsing requires a signed-in user, so an unauthenticated visitor is
+    // client-side-redirected to the sign-in screen — the SPA shell is alive.
     await page.goto('/')
-    await expect(
-      page.getByRole('heading', { name: /^browse$/i }),
-    ).toBeVisible()
+    await expect(page).toHaveURL(/\/login/)
+    await expect(page.getByLabel(/^username$/i)).toBeVisible()
   })
 
   test('deep link is served by the SPA history fallback', async ({ page }) => {
@@ -23,8 +24,10 @@ test.describe('single-origin serving', () => {
     // and resolve client-side (the SPA app chrome renders), not a 404.
     const res = await page.goto('/packages/does-not-exist/whatever')
     expect(res?.status()).toBe(200)
-    // The SPA took over: the app nav (a Browse link in the shell) is present.
-    await expect(page.getByRole('link', { name: /^browse$/i })).toBeVisible()
+    // The SPA took over: the login gate redirected this anonymous visitor to
+    // the sign-in screen (a 404 would have rendered no SPA at all).
+    await expect(page).toHaveURL(/\/login/)
+    await expect(page.getByLabel(/^username$/i)).toBeVisible()
   })
 
   test('the /admin landing deep link bounces an anonymous user to login', async ({

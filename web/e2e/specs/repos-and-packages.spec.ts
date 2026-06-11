@@ -1,28 +1,24 @@
 import { expect, test } from '@playwright/test'
 
-import { facts, pushNupkg, readFixture, waitForPackage } from '../helpers'
+import {
+  facts,
+  pushNupkg,
+  readFixture,
+  signInSession,
+  waitForPackage,
+} from '../helpers'
 
 /**
  * Create-a-repo flow + push-then-see-package (plan §Testing #4, #5).
  *
  * An admin creates a hosted repo through the UI; it appears in the repositories
  * list and its V3 index advertises PackagePublish. A `.nupkg` pushed via the
- * NuGet API then shows up in Browse and in package detail with its version and
- * dependency groups.
+ * NuGet API then shows up under that repository in the folder-view Browse and
+ * in package detail with its version and dependency groups.
  */
 
-const TOKEN_KEY = 'forge.token'
-
-async function signIn(page: import('@playwright/test').Page) {
-  const f = facts()
-  await page.addInitScript(
-    ({ key, token }) => window.localStorage.setItem(key, token),
-    { key: TOKEN_KEY, token: f.adminToken },
-  )
-}
-
 test.beforeEach(async ({ page }) => {
-  await signIn(page)
+  await signInSession(page)
 })
 
 /**
@@ -37,6 +33,24 @@ async function gotoRepositoriesList(page: import('@playwright/test').Page) {
   await expect(page).toHaveURL(/\/admin\/repositories$/)
 }
 
+/** Create a hosted, anon-readable repo through the real UI form. */
+async function createHostedViaUi(
+  page: import('@playwright/test').Page,
+  name: string,
+) {
+  await gotoRepositoriesList(page)
+  await page.getByRole('link', { name: /new repository/i }).click()
+  await expect(page).toHaveURL(/\/admin\/repositories\/new/)
+
+  await page.getByLabel(/^name$/i).fill(name)
+  await page.getByLabel(/^kind$/i).selectOption('hosted')
+  await page.getByLabel(/allow anonymous read/i).check()
+  await page.getByRole('button', { name: /create repository/i }).click()
+
+  // On success we navigate (client-side) to the new repo's edit page.
+  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${name}`))
+}
+
 test('admin creates a hosted repo via the UI and it appears in the list', async ({
   page,
   request,
@@ -44,19 +58,9 @@ test('admin creates a hosted repo via the UI and it appears in the list', async 
   const f = facts()
   const name = `uihosted${Date.now()}`
 
-  await gotoRepositoriesList(page)
-  await page.getByRole('link', { name: /new repository/i }).click()
-  await expect(page).toHaveURL(/\/admin\/repositories\/new/)
+  await createHostedViaUi(page, name)
 
-  await page.locator('#repo-name').fill(name)
-  await page.locator('#repo-kind').selectOption('hosted')
-  await page.locator('#repo-anon').check()
-  await page.getByRole('button', { name: /create repository/i }).click()
-
-  // On success we navigate (client-side) to the new repo's edit page.
-  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${name}`))
-
-  // It shows in the list (the name is rendered as a table cell, not a link).
+  // It shows in the repositories list.
   await gotoRepositoriesList(page)
   await expect(page.getByRole('cell', { name, exact: true })).toBeVisible()
 
@@ -66,21 +70,12 @@ test('admin creates a hosted repo via the UI and it appears in the list', async 
   expect(JSON.stringify(await idx.json())).toContain('PackagePublish')
 })
 
-test('a pushed package appears in Browse and in package detail', async ({
+test('a pushed package appears in the repo folder view and in package detail', async ({
   page,
 }) => {
-  const f = facts()
   const repo = `pushseen${Date.now()}`
 
-  // Create a hosted, anon-readable repo via the UI (client-side navigation).
-  await gotoRepositoriesList(page)
-  await page.getByRole('link', { name: /new repository/i }).click()
-  await expect(page).toHaveURL(/\/admin\/repositories\/new/)
-  await page.locator('#repo-name').fill(repo)
-  await page.locator('#repo-kind').selectOption('hosted')
-  await page.locator('#repo-anon').check()
-  await page.getByRole('button', { name: /create repository/i }).click()
-  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${repo}`))
+  await createHostedViaUi(page, repo)
 
   // Push the fixture .nupkg (Sample.Lib) via the NuGet API, then wait for the
   // browse index to reflect it (outbox/indexing is async).
@@ -89,13 +84,14 @@ test('a pushed package appears in Browse and in package detail', async ({
   expect([200, 201, 202, 204]).toContain(res.status)
   await waitForPackage(repo, 'Sample.Lib')
 
-  // Browse shows it. Other specs (group/proxy) also publish Sample.Lib to this
-  // shared server, so scope to THIS repo's row rather than the id alone.
+  // Folder view: open the repository from the Browse root, then search within
+  // it — search is per repository now, so there is no cross-repo ambiguity.
   await page.goto('/')
+  await page.getByRole('link', { name: new RegExp(`\\b${repo}\\b`) }).click()
+  await expect(page).toHaveURL(new RegExp(`/repos/${repo}`))
   await page.getByRole('searchbox').fill('Sample.Lib')
-  const pkgRow = page.getByRole('row', { name: new RegExp(`\\b${repo}\\b`) })
-  await expect(pkgRow).toBeVisible({ timeout: 15_000 })
-  const pkgLink = pkgRow.getByRole('link', { name: 'Sample.Lib' })
+  const pkgLink = page.getByRole('link', { name: /Sample\.Lib/ })
+  await expect(pkgLink).toBeVisible({ timeout: 15_000 })
 
   // Package detail shows the version + a dependency.
   await pkgLink.click()

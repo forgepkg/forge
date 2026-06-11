@@ -32,28 +32,36 @@ export function PriorityList({ members, busy, onRemove }: PriorityListProps) {
 
   if (ordered.length === 0) {
     return (
-      <p className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-500">
+      <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-500 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
         This group has no members yet. Add one below.
       </p>
     )
   }
 
   return (
-    <ul className="divide-y divide-slate-100 rounded border border-slate-200">
+    <ul className="divide-y divide-zinc-950/5 overflow-hidden rounded-xl ring-1 ring-zinc-950/5 dark:divide-white/5 dark:ring-white/10">
       {ordered.map((m) => (
-        <li key={m.name} className="flex items-center gap-3 px-3 py-2 text-sm">
-          <span className="w-10 font-mono text-slate-500" aria-label="priority">
+        <li
+          key={m.name}
+          className="flex items-center gap-3 px-3 py-2 text-sm/6"
+        >
+          <span
+            className="w-10 font-mono text-zinc-500 dark:text-zinc-400"
+            aria-label="priority"
+          >
             {m.priority}
           </span>
           <span className="flex items-center gap-2">
-            <span className="font-medium text-slate-800">{m.name}</span>
+            <span className="font-medium text-zinc-950 dark:text-white">
+              {m.name}
+            </span>
             <RepoKindBadge kind={m.kind} />
           </span>
           <button
             type="button"
             disabled={busy}
             onClick={() => onRemove(m.name)}
-            className="ml-auto text-red-700 hover:underline disabled:opacity-60"
+            className="ml-auto font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
           >
             Remove
           </button>

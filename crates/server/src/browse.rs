@@ -4,9 +4,11 @@
 //! JSON DTOs (not the NuGet V3 protocol shapes). They are **additive** and reuse
 //! the existing slice-1 read path:
 //!
-//! * authorization is the slice-1 [`can_read`] predicate (anonymous allowed iff
-//!   `repository.anonymous_read`), evaluated against the request's
-//!   [`Principal`];
+//! * browsing requires a **signed-in user**: every `/browse/*` endpoint rejects
+//!   anonymous / unauthenticated callers with 401, regardless of any repo's
+//!   `anonymous_read` flag (which continues to apply to the `/v3` feed only);
+//! * authorization on top of that is the slice-1 [`can_read`] predicate,
+//!   evaluated against the request's [`Principal`];
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
 //!   [`AppState::read_ops_for`] + [`RepoReadOps`] — the same ops the `/v3/*`
@@ -14,8 +16,12 @@
 //!   hide.
 //!
 //! ## Endpoints
-//! * `GET /browse/packages` — cross-repository search, paginated
-//!   (`q`, `repo`, `prerelease`, `skip`, `take`) → `{ total, items }`.
+//! * `GET /browse/repos` — the repositories the caller may read (the SPA's
+//!   folder-view root).
+//! * `GET /browse/packages` — package search, paginated
+//!   (`q`, `repo`, `prerelease`, `skip`, `take`) → `{ total, items }`. The SPA
+//!   always passes `repo` (search is per repository); the merged cross-repo
+//!   mode remains for API callers.
 //! * `GET /browse/packages/{repo}/{id}` — package detail: visible versions with
 //!   per-version metadata + dependency groups parsed from the stored `.nuspec`.
 //!
@@ -51,6 +57,56 @@ const NUPKG_ASSET_PATH: &str = "package.nupkg";
 const MAX_TAKE: usize = 100;
 /// Default browse page size.
 const DEFAULT_TAKE: usize = 20;
+
+/// Browsing is for signed-in users only: returns the 401 response to send when
+/// the principal is not an authenticated user, `None` when it is.
+///
+/// Per-repo `anonymous_read` still governs the `/v3` feed; the web browse
+/// surface deliberately requires a login (token-authenticated API callers count
+/// — they are a user's credential).
+fn require_user(principal: &Principal) -> Option<Response> {
+    match principal {
+        Principal::User { .. } => None,
+        _ => Some((StatusCode::UNAUTHORIZED, "authentication required").into_response()),
+    }
+}
+
+/// One repository on the browse root (`GET /browse/repos`).
+#[derive(Debug, Serialize)]
+pub struct BrowseRepo {
+    /// Repository name (the folder name).
+    pub name: String,
+    /// Repository kind (`hosted` | `proxy` | `group`).
+    pub kind: String,
+}
+
+/// `GET /browse/repos` — the repositories the caller may read, sorted by name.
+///
+/// This is the root of the SPA's folder view: repositories are the top-level
+/// folders, their packages the entries inside.
+pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let principal = principal_of(&req);
+    if let Some(denied) = require_user(&principal) {
+        return denied;
+    }
+
+    let repos = match repository_dao::list_repositories(&state.pool).await {
+        Ok(r) => r,
+        Err(e) => return db_error(e),
+    };
+
+    let mut out = Vec::new();
+    for repo in &repos {
+        if state.authz.can_read(&principal, repo).await {
+            out.push(BrowseRepo {
+                name: repo.name.clone(),
+                kind: repo.kind.clone(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(out).into_response()
+}
 
 /// Query parameters for `GET /browse/packages`.
 #[derive(Debug, Deserialize)]
@@ -120,6 +176,9 @@ pub async fn search_packages(
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
+    if let Some(denied) = require_user(&principal) {
+        return denied;
+    }
 
     let repos = match repository_dao::list_repositories(&state.pool).await {
         Ok(r) => r,
@@ -250,6 +309,9 @@ pub async fn package_detail(
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
+    if let Some(denied) = require_user(&principal) {
+        return denied;
+    }
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
         Ok(Some(r)) => r,
@@ -257,12 +319,10 @@ pub async fn package_detail(
         Err(e) => return db_error(e),
     };
 
-    // Slice-1 read authz: a denied caller is anonymous/unauthenticated → 401.
+    // Per-repo read authz; the caller is a signed-in user at this point, so a
+    // denial is 403 (401 for anonymous callers was already returned above).
     if !state.authz.can_read(&principal, &repo).await {
-        return match principal {
-            Principal::User { .. } => (StatusCode::FORBIDDEN, "forbidden").into_response(),
-            _ => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
-        };
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
 
     let format = state.formats.for_repository(&repo);
@@ -448,9 +508,11 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
 }
 
 /// Build the `/browse` router (mounted at the top level under the principal
-/// middleware; per-repo `anonymous_read` is enforced inside each handler).
+/// middleware; every handler requires a signed-in user, then enforces per-repo
+/// read authz).
 pub fn browse_router() -> Router<AppState> {
     Router::new()
+        .route("/browse/repos", get(list_repos))
         .route("/browse/packages", get(search_packages))
         .route("/browse/packages/{repo}/{id}", get(package_detail))
 }

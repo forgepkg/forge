@@ -2,8 +2,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
 import {
+  createMyToken,
   createToken,
+  fetchMyTokens,
   fetchTokens,
+  revokeMyToken,
   revokeToken,
   tokenKeys,
   type CreatedToken,
@@ -45,6 +48,36 @@ export function useRevokeToken(userId: number) {
     mutationFn: (id) => revokeToken(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: tokenKeys.list(userId) })
+    },
+  })
+}
+
+/** List the signed-in user's own tokens (`GET /admin/me/tokens`). */
+export function useMyTokens() {
+  return useQuery<TokenView[], ApiError>({
+    queryKey: tokenKeys.mine(),
+    queryFn: ({ signal }) => fetchMyTokens(signal),
+  })
+}
+
+/** Issue a token for the signed-in user; invalidates the own-token list. */
+export function useCreateMyToken() {
+  const queryClient = useQueryClient()
+  return useMutation<CreatedToken, ApiError, CreateToken>({
+    mutationFn: (body) => createMyToken(body),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: tokenKeys.mine() })
+    },
+  })
+}
+
+/** Revoke one of the signed-in user's tokens; invalidates the own-token list. */
+export function useRevokeMyToken() {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, number>({
+    mutationFn: (id) => revokeMyToken(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: tokenKeys.mine() })
     },
   })
 }

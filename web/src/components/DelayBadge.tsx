@@ -1,5 +1,4 @@
-import clsx from 'clsx'
-
+import { Badge } from '~/components/catalyst/badge'
 import type { DelayStatus } from '~/api/packages'
 
 /**
@@ -21,23 +20,19 @@ export function DelayBadge({
   if (!status) return null
 
   if (status === 'available') {
-    return (
-      <span className="inline-block rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-medium text-emerald-800">
-        available
-      </span>
-    )
+    return <Badge color="emerald">available</Badge>
   }
 
   const eta = delayedUntil ? formatEta(delayedUntil) : null
   return (
     <span
-      className={clsx(
-        'inline-block rounded px-1.5 py-0.5 text-xs font-medium',
-        'bg-amber-100 text-amber-800',
-      )}
-      title={delayedUntil ? `available ${new Date(delayedUntil).toLocaleString()}` : undefined}
+      title={
+        delayedUntil
+          ? `available ${new Date(delayedUntil).toLocaleString()}`
+          : undefined
+      }
     >
-      delayed{eta ? ` · ${eta}` : ''}
+      <Badge color="amber">delayed{eta ? ` · ${eta}` : ''}</Badge>
     </span>
   )
 }

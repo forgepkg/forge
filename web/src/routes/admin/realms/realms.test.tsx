@@ -9,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, setToken } from '~/lib/auth'
+import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { RealmView } from '~/api/realms'
 import { routeTree } from '~/routeTree.gen'
@@ -160,11 +160,11 @@ describe('admin realms list', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    setToken('admin-token')
+    setSession('admin-csrf')
   })
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('renders realms in priority order with kind badges; local has no delete', async () => {
@@ -254,11 +254,11 @@ describe('admin realms create', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    setToken('admin-token')
+    setSession('admin-csrf')
   })
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('validates required oidc fields inline and does not POST', async () => {

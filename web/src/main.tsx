@@ -4,8 +4,13 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { createRouter, RouterProvider } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
+import { initTheme } from '~/lib/theme'
 import { routeTree } from './routeTree.gen'
 import './styles.css'
+
+// Re-apply the stored light/dark preference and follow OS changes while in
+// "system" (the index.html bootstrap already painted the right theme).
+initTheme()
 
 const queryClient = makeQueryClient()
 

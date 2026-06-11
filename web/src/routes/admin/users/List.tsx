@@ -3,6 +3,21 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { UserView } from '~/api/users'
 import { useCreateUser, useDeleteUser, useUsers } from '~/queries/useUsers'
+import { Badge } from '~/components/catalyst/badge'
+import { Button } from '~/components/catalyst/button'
+import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
+import { Field, Label } from '~/components/catalyst/fieldset'
+import { Heading, Subheading } from '~/components/catalyst/heading'
+import { Input } from '~/components/catalyst/input'
+import { Text } from '~/components/catalyst/text'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '~/components/catalyst/table'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
@@ -29,21 +44,16 @@ function UsersList() {
   return (
     <section className="space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold">Users</h1>
-        <p className="mt-1 text-slate-600">
+        <Heading>Users</Heading>
+        <Text className="mt-1">
           Create and remove users, and manage each user&apos;s API tokens.
-        </p>
+        </Text>
       </div>
 
       <CreateUserForm />
 
       {del.isError && (
-        <p
-          role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {del.error.body || del.error.message}
-        </p>
+        <InlineError>{del.error.body || del.error.message}</InlineError>
       )}
 
       {users.isError ? (
@@ -53,22 +63,22 @@ function UsersList() {
           onRetry={() => void users.refetch()}
         />
       ) : users.isLoading ? (
-        <p className="text-slate-500">Loading users…</p>
+        <Text>Loading users…</Text>
       ) : (users.data?.length ?? 0) === 0 ? (
         <EmptyState title="No users yet">
           Create the first user with the form above.
         </EmptyState>
       ) : (
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="border-b border-slate-200 text-left text-slate-500">
-              <th className="py-2 pr-4 font-medium">Username</th>
-              <th className="py-2 pr-4 font-medium">Role</th>
-              <th className="py-2 pr-4 font-medium">Status</th>
-              <th className="py-2 pr-4 font-medium">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table striped>
+          <TableHead>
+            <TableRow>
+              <TableHeader>Username</TableHeader>
+              <TableHeader>Role</TableHeader>
+              <TableHeader>Status</TableHeader>
+              <TableHeader>Actions</TableHeader>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {users.data!.map((user) => (
               <UserRow
                 key={user.id}
@@ -80,10 +90,21 @@ function UsersList() {
                 onConfirmDelete={() => confirmDelete(user.id)}
               />
             ))}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       )}
     </section>
+  )
+}
+
+function InlineError({ children }: { children: React.ReactNode }) {
+  return (
+    <p
+      role="alert"
+      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
+    >
+      {children}
+    </p>
   )
 }
 
@@ -104,8 +125,8 @@ function UserRow({
 }) {
   const navigate = useNavigate()
   return (
-    <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 pr-4">
+    <TableRow>
+      <TableCell>
         <button
           type="button"
           onClick={() =>
@@ -114,25 +135,27 @@ function UserRow({
               params: { userId: String(user.id) },
             })
           }
-          className="font-medium text-sky-700 hover:underline"
+          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
         >
           {user.username}
         </button>
-      </td>
-      <td className="py-2 pr-4 text-slate-600">
+      </TableCell>
+      <TableCell className="text-zinc-500 dark:text-zinc-400">
         {user.is_admin ? 'admin' : 'reader'}
-      </td>
-      <td className="py-2 pr-4">
-        <span className={user.active ? 'text-emerald-700' : 'text-slate-400'}>
-          {user.active ? 'active' : 'inactive'}
-        </span>
-      </td>
-      <td className="py-2 pr-4">
+      </TableCell>
+      <TableCell>
+        {user.active ? (
+          <Badge color="emerald">active</Badge>
+        ) : (
+          <Badge color="zinc">inactive</Badge>
+        )}
+      </TableCell>
+      <TableCell>
         <span className="flex items-center gap-3">
           <Link
             to="/admin/users/$userId"
             params={{ userId: String(user.id) }}
-            className="text-sky-700 hover:underline"
+            className="text-sky-600 hover:underline dark:text-sky-400"
           >
             Tokens
           </Link>
@@ -142,14 +165,14 @@ function UserRow({
                 type="button"
                 onClick={onConfirmDelete}
                 disabled={isDeleting}
-                className="text-red-700 hover:underline disabled:opacity-60"
+                className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
               >
                 {isDeleting ? 'Deleting…' : 'Confirm'}
               </button>
               <button
                 type="button"
                 onClick={onCancelDelete}
-                className="text-slate-500 hover:underline"
+                className="text-zinc-500 hover:underline dark:text-zinc-400"
               >
                 Cancel
               </button>
@@ -158,14 +181,14 @@ function UserRow({
             <button
               type="button"
               onClick={onRequestDelete}
-              className="text-red-700 hover:underline"
+              className="font-medium text-red-600 hover:underline dark:text-red-400"
             >
               Delete
             </button>
           )}
         </span>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 
@@ -200,66 +223,46 @@ function CreateUserForm() {
   return (
     <form
       onSubmit={submit}
-      className="space-y-4 rounded-lg border border-slate-200 bg-white p-4"
+      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
     >
-      <h2 className="font-medium text-slate-900">New user</h2>
+      <Subheading>New user</Subheading>
       <div className="grid gap-4 sm:grid-cols-2">
-        <label className="block text-sm">
-          <span className="mb-1 block font-medium text-slate-700">
-            Username
-          </span>
-          <input
+        <Field>
+          <Label>Username</Label>
+          <Input
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            className="w-full rounded border border-slate-300 px-3 py-2"
           />
-        </label>
-        <label className="block text-sm">
-          <span className="mb-1 block font-medium text-slate-700">
-            Password
-          </span>
-          <input
+        </Field>
+        <Field>
+          <Label>Password</Label>
+          <Input
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded border border-slate-300 px-3 py-2"
           />
-        </label>
+        </Field>
       </div>
-      <div className="flex items-center gap-6 text-sm">
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={isAdmin}
-            onChange={(e) => setIsAdmin(e.target.checked)}
-          />
-          <span className="text-slate-700">Administrator</span>
-        </label>
-        <label className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            checked={active}
-            onChange={(e) => setActive(e.target.checked)}
-          />
-          <span className="text-slate-700">Active</span>
-        </label>
+      <div className="flex items-center gap-6">
+        <CheckboxField>
+          <Checkbox checked={isAdmin} onChange={(c) => setIsAdmin(c)} />
+          <Label>Administrator</Label>
+        </CheckboxField>
+        <CheckboxField>
+          <Checkbox checked={active} onChange={(c) => setActive(c)} />
+          <Label>Active</Label>
+        </CheckboxField>
       </div>
       {create.isError && (
-        <p
-          role="alert"
-          className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
-        >
-          {create.error.body || create.error.message}
-        </p>
+        <InlineError>{create.error.body || create.error.message}</InlineError>
       )}
-      <button
+      <Button
         type="submit"
         disabled={create.isPending || !username.trim() || !password}
-        className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
       >
         {create.isPending ? 'Creating…' : 'Create user'}
-      </button>
+      </Button>
     </form>
   )
 }

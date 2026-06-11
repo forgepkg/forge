@@ -7,6 +7,12 @@ import {
   useRemoveMember,
   useRepositories,
 } from '~/queries/useRepositories'
+import { Button } from '~/components/catalyst/button'
+import { Field, Label } from '~/components/catalyst/fieldset'
+import { Heading, Subheading } from '~/components/catalyst/heading'
+import { Input } from '~/components/catalyst/input'
+import { Select } from '~/components/catalyst/select'
+import { Text } from '~/components/catalyst/text'
 import { PriorityList } from '~/components/PriorityList'
 import { ErrorState } from '~/components/ErrorState'
 
@@ -84,21 +90,21 @@ function GroupMembers() {
         <Link
           to="/admin/repositories/$repo"
           params={{ repo: name }}
-          className="text-sm text-sky-700 hover:underline"
+          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
         >
           ← Back to {name}
         </Link>
-        <h1 className="mt-1 text-2xl font-semibold">
+        <Heading className="mt-1">
           Members of <span className="font-mono">{name}</span>
-        </h1>
-        <p className="mt-1 text-slate-600">
+        </Heading>
+        <Text className="mt-1">
           Higher priority wins when the same package id + version is present in
           more than one member.
-        </p>
+        </Text>
       </div>
 
       {members.isLoading ? (
-        <p className="text-slate-500">Loading members…</p>
+        <Text>Loading members…</Text>
       ) : (
         <PriorityList
           members={members.data ?? []}
@@ -108,29 +114,22 @@ function GroupMembers() {
       )}
 
       {remove.isError && (
-        <p role="alert" className="text-sm text-red-600">
+        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
           {remove.error.body || remove.error.message}
         </p>
       )}
 
       <form
         onSubmit={handleAdd}
-        className="space-y-3 border-t border-slate-100 pt-4"
+        className="space-y-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
       >
-        <h2 className="text-sm font-medium text-slate-700">Add a member</h2>
+        <Subheading>Add a member</Subheading>
         <div className="flex flex-wrap items-end gap-3">
-          <div>
-            <label
-              htmlFor="add-member"
-              className="block text-xs font-medium text-slate-600"
-            >
-              Repository
-            </label>
-            <select
-              id="add-member"
+          <Field className="min-w-64">
+            <Label>Repository</Label>
+            <Select
               value={member}
               onChange={(e) => setMember(e.target.value)}
-              className="mt-1 rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500"
             >
               <option value="">Select a repository…</option>
               {candidates.map((r) => (
@@ -138,43 +137,32 @@ function GroupMembers() {
                   {r.name} ({r.kind})
                 </option>
               ))}
-            </select>
-          </div>
-          <div>
-            <label
-              htmlFor="add-priority"
-              className="block text-xs font-medium text-slate-600"
-            >
-              Priority
-            </label>
-            <input
-              id="add-priority"
+            </Select>
+          </Field>
+          <Field className="w-32">
+            <Label>Priority</Label>
+            <Input
               type="number"
               value={priority}
               onChange={(e) => setPriority(e.target.value)}
-              className="mt-1 w-28 rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500"
             />
-          </div>
-          <button
-            type="submit"
-            disabled={add.isPending}
-            className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
-          >
+          </Field>
+          <Button type="submit" disabled={add.isPending}>
             {add.isPending ? 'Adding…' : 'Add member'}
-          </button>
+          </Button>
         </div>
         {formError && (
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
             {formError}
           </p>
         )}
         {add.isError && (
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
             {add.error.body || add.error.message}
           </p>
         )}
         {candidates.length === 0 && !allRepos.isLoading && (
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">
             No eligible repositories to add (groups cannot be nested, and a group
             cannot contain itself).
           </p>
@@ -185,7 +173,7 @@ function GroupMembers() {
         <button
           type="button"
           onClick={() => void navigate({ to: '/admin/repositories' })}
-          className="text-sm text-slate-500 hover:underline"
+          className="text-sm/6 text-zinc-500 hover:underline dark:text-zinc-400"
         >
           Done
         </button>

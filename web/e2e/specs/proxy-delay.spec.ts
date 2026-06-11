@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-import { facts, fetchPackageDetail } from '../helpers'
+import { adminBasic, facts, fetchPackageDetail, signInSession } from '../helpers'
 
 /**
  * Proxy delay status (plan §Testing #7).
@@ -22,14 +22,8 @@ import { facts, fetchPackageDetail } from '../helpers'
  * created via in-app navigation (never a hard `/admin/...` load).
  */
 
-const TOKEN_KEY = 'forge.token'
-
 test.beforeEach(async ({ page }) => {
-  const f = facts()
-  await page.addInitScript(
-    ({ key, token }) => window.localStorage.setItem(key, token),
-    { key: TOKEN_KEY, token: f.adminToken },
-  )
+  await signInSession(page)
 })
 
 test('a delayed proxy version shows the delay badge and is absent from browse', async ({
@@ -46,12 +40,13 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await expect(page).toHaveURL(/\/admin\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
 
-  await page.locator('#repo-name').fill(proxy)
-  await page.locator('#repo-kind').selectOption('proxy')
-  await page.locator('#repo-anon').check()
-  await page.locator('#repo-remote-url').fill(f.upstreamIndexUrl)
-  await page.locator('#repo-delay').fill('3600')
-  await page.locator('#repo-allow-private').check()
+  // (The 12.7 SSRF guard is scheme-only, so the loopback upstream needs no
+  // allow-private flag any more.)
+  await page.getByLabel(/^name$/i).fill(proxy)
+  await page.getByLabel(/^kind$/i).selectOption('proxy')
+  await page.getByLabel(/allow anonymous read/i).check()
+  await page.getByLabel(/remote url/i).fill(f.upstreamIndexUrl)
+  await page.getByLabel(/package delay/i).fill('3600')
   await page.getByRole('button', { name: /create repository/i }).click()
   await expect(page).toHaveURL(new RegExp(`/admin/repositories/${proxy}`))
 
@@ -73,23 +68,18 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await expect(row).toBeVisible()
   await expect(row.getByText(/delayed/)).toBeVisible()
 
-  // 4. The delay-gated version is absent from downloadable browse: search never
-  //    surfaces a delay-gated proxy version, so no Browse row points at THIS
-  //    proxy. (Other specs may have published Sample.Lib to hosted repos in this
-  //    shared server, so we assert on the proxy's row specifically, not on the
-  //    id alone.)
-  await page.goto('/')
-  await page.getByRole('searchbox').fill('Sample.Lib')
-  // Let the debounced search settle and any hosted rows render first.
+  // 4. The delay-gated version is absent from downloadable browse: search in
+  //    THIS proxy's folder view never surfaces a delay-gated version, so the
+  //    repository renders its empty state.
+  await page.goto(`/repos/${proxy}?q=Sample.Lib`)
   await expect(page.getByRole('searchbox')).toHaveValue('Sample.Lib')
-  await page.waitForLoadState('networkidle')
-  // No row mentions this proxy repository while its only version is delayed.
-  await expect(page.getByRole('cell', { name: proxy, exact: true })).toHaveCount(0)
+  await expect(page.getByText('No packages found')).toBeVisible()
 
   // Cross-check via the read API: a repo-scoped search returns nothing for the
   // delayed proxy (the version is delay-gated out of the searchable set).
   const scoped = await fetch(
     `${f.baseUrl}/browse/packages?q=Sample.Lib&repo=${proxy}`,
+    { headers: { authorization: adminBasic() } },
   )
   expect(scoped.ok).toBeTruthy()
   const body: { total: number; items: unknown[] } = await scoped.json()

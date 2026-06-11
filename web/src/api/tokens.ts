@@ -56,6 +56,7 @@ export interface CreatedToken extends TokenView {
 export const tokenKeys = {
   all: () => ['tokens'] as const,
   list: (userId: number) => ['tokens', 'list', userId] as const,
+  mine: () => ['tokens', 'mine'] as const,
 }
 
 /** `GET /admin/users/{id}/tokens` — a user's tokens (bare array). */
@@ -80,4 +81,25 @@ export function createToken(
 /** `DELETE /admin/tokens/{id}` — revoke a token (204). */
 export function revokeToken(id: number): Promise<void> {
   return httpClient.delete<void>(`/admin/tokens/${id}`)
+}
+
+/*
+ * Self-service token API (`/admin/me/tokens`): any signed-in user manages
+ * **their own** tokens — no admin required. The server additionally requires a
+ * password/realm session (a token can never mint further tokens).
+ */
+
+/** `GET /admin/me/tokens` — the caller's own tokens (bare array). */
+export function fetchMyTokens(signal?: AbortSignal): Promise<TokenView[]> {
+  return httpClient.get<TokenView[]>('/admin/me/tokens', { signal })
+}
+
+/** `POST /admin/me/tokens` — issue a token for the caller (201 → `CreatedToken`). */
+export function createMyToken(body: CreateToken): Promise<CreatedToken> {
+  return httpClient.post<CreatedToken>('/admin/me/tokens', body)
+}
+
+/** `DELETE /admin/me/tokens/{id}` — revoke one of the caller's tokens (204). */
+export function revokeMyToken(id: number): Promise<void> {
+  return httpClient.delete<void>(`/admin/me/tokens/${id}`)
 }

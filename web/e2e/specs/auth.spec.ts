@@ -1,59 +1,66 @@
 import { expect, test } from '@playwright/test'
 
-import { adminBasic, facts } from '../helpers'
+import { adminBasic, facts, signInSession } from '../helpers'
 
 /**
- * Token sign-in + admin gating (plan §Testing #2, #3).
+ * Password sign-in + admin gating (plan §Testing #2, #3).
  *
- * Slice 1 has no sessions yet, so auth is token-paste: the Login screen verifies
- * the pasted token via GET /admin/me and only then stores it. An invalid token
- * stays on Login with an error; an admin token reveals the Admin nav; a
- * non-admin token cannot reach /admin/* (the route guard redirects to login).
+ * The UI signs in with username+password (or a realm); registry-token sign-in
+ * does not exist. A wrong password stays on Login with the uniform error; an
+ * admin session reveals the Admin nav; a non-admin session cannot reach
+ * /admin/* (the route guard redirects to Browse); signing out invalidates the
+ * cookie session and clears the stored CSRF token.
  */
 
-/** Seed the token into localStorage before the SPA boots (avoids retyping it). */
-async function signInWithToken(page: import('@playwright/test').Page, token: string) {
-  await page.addInitScript((t) => {
-    window.localStorage.setItem('forge.token', t)
-  }, token)
+/**
+ * Drive the real Login screen. Handles both layouts: identifier-first (type
+ * username, Continue, then password) and combined (both fields at once).
+ */
+async function uiSignIn(
+  page: import('@playwright/test').Page,
+  username: string,
+  password: string,
+) {
+  await page.goto('/login')
+  await page.getByLabel(/^username$/i).fill(username)
+  const passwordField = page.getByLabel(/^password$/i)
+  if (!(await passwordField.isVisible().catch(() => false))) {
+    await page.getByRole('button', { name: /^continue$/i }).click()
+    await passwordField.waitFor()
+  }
+  await passwordField.fill(password)
+  await page.getByRole('button', { name: /^sign in$/i }).click()
 }
 
-/** Create a non-admin user + token via the admin API, return the plaintext token. */
-async function mintNonAdminToken(
+/** Create a non-admin user via the admin API; returns its credentials. */
+async function createReader(
   request: import('@playwright/test').APIRequestContext,
-): Promise<string> {
+): Promise<{ username: string; password: string }> {
   const f = facts()
   const username = `reader_${Date.now()}`
+  const password = 'reader-pw'
   const createUser = await request.post(`${f.baseUrl}/admin/users`, {
     headers: { authorization: adminBasic() },
-    data: { username, password: 'reader-pw', is_admin: false },
+    data: { username, password, is_admin: false },
   })
   expect(createUser.ok()).toBeTruthy()
-  const user = await createUser.json()
-  const createTok = await request.post(
-    `${f.baseUrl}/admin/users/${user.id}/tokens`,
-    { headers: { authorization: adminBasic() }, data: { name: 'e2e-reader' } },
-  )
-  expect(createTok.ok()).toBeTruthy()
-  const body = await createTok.json()
-  return body.token as string
+  return { username, password }
 }
 
-test('invalid token stays on login with an error', async ({ page }) => {
-  await page.goto('/login')
-  await page.getByLabel(/registry token/i).fill('definitely-not-a-real-token')
-  await page.getByRole('button', { name: /^sign in$/i }).click()
+test('a wrong password stays on login with the uniform error', async ({
+  page,
+}) => {
+  const f = facts()
+  await uiSignIn(page, f.adminUser, 'definitely-not-the-password')
   await expect(page.getByRole('alert')).toBeVisible()
   await expect(page).toHaveURL(/\/login/)
 })
 
-test('valid admin token lands on Browse and reveals the Admin nav', async ({
+test('password sign-in lands on Browse and reveals the Admin nav', async ({
   page,
 }) => {
   const f = facts()
-  await page.goto('/login')
-  await page.getByLabel(/registry token/i).fill(f.adminToken)
-  await page.getByRole('button', { name: /^sign in$/i }).click()
+  await uiSignIn(page, f.adminUser, f.adminPass)
   // Lands on Browse.
   await expect(page).toHaveURL(/\/$|\/\?/)
   await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
@@ -62,8 +69,7 @@ test('valid admin token lands on Browse and reveals the Admin nav', async ({
 })
 
 test('admin can navigate to the repositories admin screen', async ({ page }) => {
-  const f = facts()
-  await signInWithToken(page, f.adminToken)
+  await signInSession(page)
   // Drive via in-app (client-side) navigation: land on Browse, then use the
   // Admin nav. (Hard-navigating to /admin/repositories hits the same-named API
   // route — see admin-deeplink.spec.ts for that documented collision.)
@@ -81,8 +87,8 @@ test('a non-admin reader never sees the Admin nav (gating)', async ({
   page,
   request,
 }) => {
-  const token = await mintNonAdminToken(request)
-  await signInWithToken(page, token)
+  const reader = await createReader(request)
+  await signInSession(page, reader.username, reader.password)
   // The reader sees Browse but NOT the Admin nav link (cosmetic gate), so there
   // is no in-app path to any admin screen.
   await page.goto('/')
@@ -94,8 +100,8 @@ test('the admin route guard redirects a non-admin away from /admin (hard nav)', 
   page,
   request,
 }) => {
-  const token = await mintNonAdminToken(request)
-  await signInWithToken(page, token)
+  const reader = await createReader(request)
+  await signInSession(page, reader.username, reader.password)
   // `/admin` (exactly) has no API route, so the SPA serves it; the client-side
   // guard then redirects an authenticated non-admin to Browse.
   await page.goto('/admin')
@@ -103,14 +109,18 @@ test('the admin route guard redirects a non-admin away from /admin (hard nav)', 
   await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
 })
 
-test('sign out clears the credential and returns to login', async ({ page }) => {
-  const f = facts()
-  await signInWithToken(page, f.adminToken)
+test('sign out invalidates the session and returns to login', async ({
+  page,
+}) => {
+  await signInSession(page)
   await page.goto('/')
   await page.getByRole('button', { name: /sign out/i }).click()
   await expect(page).toHaveURL(/\/login/)
   const stored = await page.evaluate(() =>
-    window.localStorage.getItem('forge.token'),
+    window.localStorage.getItem('forge.session.csrf'),
   )
   expect(stored).toBeNull()
+  // The cookie session is dead server-side too: /auth/me is 401 again.
+  const me = await page.request.get(`${facts().baseUrl}/auth/me`)
+  expect(me.status()).toBe(401)
 })

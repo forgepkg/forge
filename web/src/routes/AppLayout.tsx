@@ -1,27 +1,85 @@
 import { useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { createFileRoute, Link, Outlet, useRouter } from '@tanstack/react-router'
-import clsx from 'clsx'
+import {
+  createFileRoute,
+  Outlet,
+  redirect,
+  useRouter,
+  useRouterState,
+} from '@tanstack/react-router'
 
-import { meKeys } from '~/api/me'
+import { meKeys, meQueryOptions } from '~/api/me'
 import { logout } from '~/api/auth'
-import { clearToken, getAuthMode, onAuthChange } from '~/lib/auth'
+import { ApiError } from '~/lib/httpClient'
+import { clearSession, onAuthChange } from '~/lib/auth'
 import { useMe } from '~/queries/useMe'
+import { Badge } from '~/components/catalyst/badge'
+import {
+  Navbar,
+  NavbarDivider,
+  NavbarItem,
+  NavbarLabel,
+  NavbarSection,
+  NavbarSpacer,
+} from '~/components/catalyst/navbar'
+import {
+  Sidebar,
+  SidebarBody,
+  SidebarHeader,
+  SidebarItem,
+  SidebarLabel,
+  SidebarSection,
+} from '~/components/catalyst/sidebar'
+import { StackedLayout } from '~/components/catalyst/stacked-layout'
+import { ThemeToggle } from '~/components/ThemeToggle'
 
 export const Route = createFileRoute('/_app')({
+  /**
+   * Login gate for the whole app: browsing (and everything else under the
+   * shell) is for signed-in users only. An unauthenticated caller is sent to
+   * /login with a redirect back to the attempted URL; the server enforces the
+   * same rule (401 on /browse/*), this is the navigation half.
+   */
+  beforeLoad: async ({ context, location }) => {
+    try {
+      await context.queryClient.ensureQueryData(meQueryOptions)
+    } catch (error) {
+      if (error instanceof ApiError && error.isAuthError) {
+        throw redirect({
+          to: '/login',
+          search: { redirect: location.href },
+        })
+      }
+      throw error
+    }
+  },
   component: AppLayout,
 })
 
+const NAV_ITEMS = [
+  { label: 'Browse', to: '/', adminOnly: false },
+  { label: 'Tokens', to: '/tokens', adminOnly: false },
+  { label: 'Admin', to: '/admin', adminOnly: true },
+] as const
+
+/** Whether a nav target is the current location (Browse only matches exactly). */
+function isCurrent(pathname: string, to: string): boolean {
+  if (to === '/') return pathname === '/'
+  return pathname === to || pathname.startsWith(`${to}/`)
+}
+
 /**
- * The authenticated app shell: top nav + current-user widget wrapping every
- * non-login screen. The admin nav link is rendered **only** when `is_admin` is
- * true (the route guard in `AdminLayout` is the hard enforcement; this is the
- * cosmetic half — readers never see the link).
+ * The authenticated app shell: Catalyst stacked layout with the top navbar
+ * (collapsing into a sidebar drawer on mobile), theme switcher, and the
+ * current-user widget. The Admin nav item is rendered **only** when
+ * `is_admin` is true (the route guard in `AdminLayout` is the hard
+ * enforcement; this is the cosmetic half — readers never see the link).
  */
 function AppLayout() {
   const me = useMe()
   const queryClient = useQueryClient()
   const router = useRouter()
+  const pathname = useRouterState({ select: (s) => s.location.pathname })
 
   // Keep the `me` query in sync with same-tab and cross-tab credential changes.
   // This is a genuine external-system subscription (localStorage + the auth
@@ -34,102 +92,97 @@ function AppLayout() {
   }, [queryClient])
 
   const isAdmin = me.data?.is_admin === true
+  const username = me.data?.user.username ?? null
+  const items = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin)
 
   async function signOut() {
-    // Session mode: only the server can invalidate the httpOnly cookie, so
-    // POST /auth/logout (CSRF-guarded) before clearing local state. Token mode
-    // has no server-side session — clearing storage is the whole logout.
-    if (getAuthMode() === 'session') {
-      try {
-        await logout()
-      } catch {
-        /* clear local state regardless; the cookie may already be dead */
-      }
+    // Only the server can invalidate the httpOnly cookie, so POST /auth/logout
+    // (CSRF-guarded) before clearing local state.
+    try {
+      await logout()
+    } catch {
+      /* clear local state regardless; the cookie may already be dead */
     }
-    clearToken()
+    clearSession()
     void router.navigate({ to: '/login' })
   }
 
   return (
-    <div className="flex min-h-screen flex-col">
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-5xl items-center gap-6 px-6 py-4">
-          <Link to="/" className="text-lg font-semibold text-slate-900">
-            envisia&nbsp;forge
-          </Link>
-          <nav className="flex items-center gap-4 text-sm">
-            <NavLink to="/">Browse</NavLink>
-            {isAdmin && <NavLink to="/admin">Admin</NavLink>}
-          </nav>
-          <div className="ml-auto flex items-center gap-3 text-sm">
-            <CurrentUser
-              username={me.data?.user.username ?? null}
-              isAdmin={isAdmin}
-              onSignOut={signOut}
-            />
-          </div>
-        </div>
-      </header>
-      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
-        <Outlet />
-      </main>
-    </div>
-  )
-}
-
-function NavLink({ to, children }: { to: string; children: React.ReactNode }) {
-  return (
-    <Link
-      to={to}
-      className="text-slate-600 hover:text-slate-900 [&.active]:font-medium [&.active]:text-slate-900"
-      activeOptions={{ exact: to === '/' }}
+    <StackedLayout
+      navbar={
+        <Navbar>
+          <NavbarItem href="/" aria-label="envisia forge home">
+            <BrandMark />
+            <NavbarLabel className="font-semibold tracking-tight">
+              envisia&nbsp;forge
+            </NavbarLabel>
+          </NavbarItem>
+          <NavbarDivider className="max-lg:hidden" />
+          <NavbarSection className="max-lg:hidden">
+            {items.map((item) => (
+              <NavbarItem
+                key={item.to}
+                href={item.to}
+                current={isCurrent(pathname, item.to)}
+              >
+                {item.label}
+              </NavbarItem>
+            ))}
+          </NavbarSection>
+          <NavbarSpacer />
+          <NavbarSection>
+            <ThemeToggle />
+            {username && (
+              <>
+                <span className="flex items-center gap-2 px-2 text-sm/6 text-zinc-950 max-sm:hidden dark:text-white">
+                  {username}
+                  <Badge color={isAdmin ? 'emerald' : 'zinc'}>
+                    {isAdmin ? 'admin' : 'reader'}
+                  </Badge>
+                </span>
+                <NavbarItem onClick={() => void signOut()}>Sign out</NavbarItem>
+              </>
+            )}
+          </NavbarSection>
+        </Navbar>
+      }
+      sidebar={
+        <Sidebar>
+          <SidebarHeader>
+            <span className="flex items-center gap-2 px-2 py-1 font-semibold tracking-tight">
+              <BrandMark />
+              envisia&nbsp;forge
+            </span>
+          </SidebarHeader>
+          <SidebarBody>
+            <SidebarSection>
+              {items.map((item) => (
+                <SidebarItem
+                  key={item.to}
+                  href={item.to}
+                  current={isCurrent(pathname, item.to)}
+                >
+                  <SidebarLabel>{item.label}</SidebarLabel>
+                </SidebarItem>
+              ))}
+            </SidebarSection>
+          </SidebarBody>
+        </Sidebar>
+      }
     >
-      {children}
-    </Link>
+      <Outlet />
+    </StackedLayout>
   )
 }
 
-function CurrentUser({
-  username,
-  isAdmin,
-  onSignOut,
-}: {
-  username: string | null
-  isAdmin: boolean
-  onSignOut: () => void
-}) {
-  if (!username) {
-    return (
-      <Link
-        to="/login"
-        className="rounded bg-slate-900 px-3 py-1.5 font-medium text-white hover:bg-slate-700"
-      >
-        Sign in
-      </Link>
-    )
-  }
+/** Small gradient brand square so the navbar has a visual anchor. */
+function BrandMark() {
   return (
-    <>
-      <span className="text-slate-600">
-        {username}
-        <span
-          className={clsx(
-            'ml-2 rounded px-1.5 py-0.5 text-xs font-medium',
-            isAdmin
-              ? 'bg-emerald-100 text-emerald-800'
-              : 'bg-slate-100 text-slate-700',
-          )}
-        >
-          {isAdmin ? 'admin' : 'reader'}
-        </span>
-      </span>
-      <button
-        type="button"
-        onClick={onSignOut}
-        className="rounded border border-slate-300 px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-100"
-      >
-        Sign out
-      </button>
-    </>
+    <span
+      aria-hidden="true"
+      className="grid size-6 shrink-0 place-items-center rounded-md bg-gradient-to-br from-sky-500 to-indigo-600 text-[11px] font-bold text-white"
+    >
+      ef
+    </span>
   )
 }

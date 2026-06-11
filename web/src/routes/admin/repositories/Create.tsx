@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useCreateRepository } from '~/queries/useRepositories'
+import { Heading } from '~/components/catalyst/heading'
 import {
   RepositoryForm,
   toCreateBody,
@@ -34,7 +35,7 @@ function CreateRepository() {
 
   return (
     <section className="space-y-6">
-      <h1 className="text-2xl font-semibold">New repository</h1>
+      <Heading>New repository</Heading>
       <RepositoryForm
         mode="create"
         submitting={create.isPending}

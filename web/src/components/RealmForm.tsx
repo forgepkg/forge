@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import clsx from 'clsx'
 
 import type {
   CredentialForwardingConfig,
@@ -8,6 +7,23 @@ import type {
   RealmKind,
   RealmView,
 } from '~/api/realms'
+import { Button } from '~/components/catalyst/button'
+import {
+  Checkbox,
+  CheckboxField,
+  CheckboxGroup,
+} from '~/components/catalyst/checkbox'
+import {
+  Description,
+  ErrorMessage,
+  Field,
+  FieldGroup,
+  Fieldset,
+  Label,
+  Legend,
+} from '~/components/catalyst/fieldset'
+import { Input } from '~/components/catalyst/input'
+import { Select } from '~/components/catalyst/select'
 
 /**
  * Shared auth-realm create/edit form (§12.7). Kind-conditional fields:
@@ -202,432 +218,425 @@ export function RealmForm({
 
   return (
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Field label="Name" htmlFor="realm-name" error={errors.name}>
-        <input
-          id="realm-name"
+      <Field>
+        <Label>Name</Label>
+        <Input
           type="text"
           value={values.name}
           onChange={(e) => set('name', e.target.value)}
           autoFocus={mode === 'create'}
-          className={inputClass}
+          invalid={!!errors.name}
         />
+        {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
       </Field>
 
-      <Field label="Kind" htmlFor="realm-kind">
+      <Field>
+        <Label>Kind</Label>
         {mode === 'create' ? (
-          <select
-            id="realm-kind"
+          <Select
             value={values.kind}
             onChange={(e) => set('kind', e.target.value as RealmKind)}
-            className={inputClass}
           >
             <option value="oidc">oidc</option>
             <option value="credential_forwarding">credential_forwarding</option>
-          </select>
+          </Select>
         ) : (
-          <input
-            id="realm-kind"
+          <Input
             type="text"
             value={values.kind}
             readOnly
             aria-readonly="true"
-            className={clsx(inputClass, 'bg-slate-50 text-slate-500')}
           />
         )}
         {mode === 'edit' && (
-          <p className="mt-1 text-xs text-slate-500">
-            The kind cannot be changed after creation.
-          </p>
+          <Description>The kind cannot be changed after creation.</Description>
         )}
       </Field>
 
-      <Checkbox
-        id="realm-enabled"
-        checked={values.enabled}
-        onChange={(c) => set('enabled', c)}
-        label="Enabled (used for sign-in / credential checks)"
-      />
+      <CheckboxField>
+        <Checkbox
+          checked={values.enabled}
+          onChange={(c) => set('enabled', c)}
+        />
+        <Label>Enabled (used for sign-in / credential checks)</Label>
+      </CheckboxField>
 
       {isLocal && (
-        <p className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
           The local realm is built in (argon2 passwords); it has no
           configuration beyond its name and enabled flag.
         </p>
       )}
 
       {isOidc && (
-        <fieldset className="space-y-4 border-t border-slate-100 pt-4">
-          <legend className="text-sm font-medium text-slate-700">
-            OIDC provider
-          </legend>
-
-          <Field label="Issuer URL" htmlFor="realm-issuer" error={errors.issuer}>
-            <input
-              id="realm-issuer"
-              type="text"
-              value={values.issuer}
-              onChange={(e) => set('issuer', e.target.value)}
-              placeholder="https://idp.example.com/realms/main"
-              className={inputClass}
-            />
-          </Field>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Client ID" htmlFor="realm-client-id" error={errors.client_id}>
-              <input
-                id="realm-client-id"
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>OIDC provider</Legend>
+          <FieldGroup>
+            <Field>
+              <Label>Issuer URL</Label>
+              <Input
                 type="text"
-                autoComplete="off"
-                value={values.client_id}
-                onChange={(e) => set('client_id', e.target.value)}
-                className={inputClass}
+                value={values.issuer}
+                onChange={(e) => set('issuer', e.target.value)}
+                placeholder="https://idp.example.com/realms/main"
+                invalid={!!errors.issuer}
               />
+              {errors.issuer && (
+                <ErrorMessage role="alert">{errors.issuer}</ErrorMessage>
+              )}
             </Field>
-            <SecretField
-              id="realm-client-secret"
-              label="Client secret"
-              error={errors.client_secret}
-              value={values.client_secret}
-              onChange={(v) => set('client_secret', v)}
-              stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
-            />
-          </div>
 
-          <Field label="Scopes" htmlFor="realm-scopes">
-            <input
-              id="realm-scopes"
-              type="text"
-              value={values.scopes}
-              onChange={(e) => set('scopes', e.target.value)}
-              placeholder="openid, profile, email"
-              className={inputClass}
-            />
-            <ListHint />
-          </Field>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Client ID</Label>
+                <Input
+                  type="text"
+                  autoComplete="off"
+                  value={values.client_id}
+                  onChange={(e) => set('client_id', e.target.value)}
+                  invalid={!!errors.client_id}
+                />
+                {errors.client_id && (
+                  <ErrorMessage role="alert">{errors.client_id}</ErrorMessage>
+                )}
+              </Field>
+              <SecretField
+                label="Client secret"
+                error={errors.client_secret}
+                value={values.client_secret}
+                onChange={(v) => set('client_secret', v)}
+                stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
+              />
+            </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Clock skew (seconds)"
-              htmlFor="realm-clock-skew"
-              error={errors.clock_skew_seconds}
-            >
-              <input
-                id="realm-clock-skew"
-                type="number"
-                min={0}
-                value={values.clock_skew_seconds}
-                onChange={(e) => set('clock_skew_seconds', e.target.value)}
-                placeholder="60"
-                className={inputClass}
-              />
-            </Field>
-            <Field label="Button label" htmlFor="realm-button-label">
-              <input
-                id="realm-button-label"
+            <Field>
+              <Label>Scopes</Label>
+              <Input
                 type="text"
-                value={values.button_label}
-                onChange={(e) => set('button_label', e.target.value)}
-                placeholder="Login with SSO"
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Field label="Username claim" htmlFor="realm-username-claim">
-              <input
-                id="realm-username-claim"
-                type="text"
-                value={values.username_claim}
-                onChange={(e) => set('username_claim', e.target.value)}
-                placeholder="preferred_username"
-                className={inputClass}
-              />
-            </Field>
-            <Field label="Email claim" htmlFor="realm-email-claim">
-              <input
-                id="realm-email-claim"
-                type="text"
-                value={values.email_claim}
-                onChange={(e) => set('email_claim', e.target.value)}
-                placeholder="email"
-                className={inputClass}
-              />
-            </Field>
-            <Field label="Display-name claim" htmlFor="realm-display-claim">
-              <input
-                id="realm-display-claim"
-                type="text"
-                value={values.display_name_claim}
-                onChange={(e) => set('display_name_claim', e.target.value)}
-                placeholder="name"
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <Field label="Login domains" htmlFor="realm-login-domains">
-            <input
-              id="realm-login-domains"
-              type="text"
-              value={values.login_domains}
-              onChange={(e) => set('login_domains', e.target.value)}
-              placeholder="example.com, corp.example.com"
-              className={inputClass}
-            />
-            <p className="mt-1 text-xs text-slate-500">
-              Email domains routed to this IdP by identifier-first login.
-              Comma-separated.
-            </p>
-          </Field>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Admin groups" htmlFor="realm-admin-groups">
-              <input
-                id="realm-admin-groups"
-                type="text"
-                value={values.admin_groups}
-                onChange={(e) => set('admin_groups', e.target.value)}
-                placeholder="forge-admins"
-                className={inputClass}
+                value={values.scopes}
+                onChange={(e) => set('scopes', e.target.value)}
+                placeholder="openid, profile, email"
               />
               <ListHint />
             </Field>
-            <Field label="Admin claim" htmlFor="realm-admin-claim">
-              <input
-                id="realm-admin-claim"
-                type="text"
-                value={values.admin_claim}
-                onChange={(e) => set('admin_claim', e.target.value)}
-                placeholder="roles"
-                className={inputClass}
-              />
-            </Field>
-          </div>
 
-          <div className="space-y-2">
-            <Checkbox
-              id="realm-auto-provision"
-              checked={values.auto_provision}
-              onChange={(c) => set('auto_provision', c)}
-              label="Auto-provision users on first login"
-            />
-            <Checkbox
-              id="realm-link-existing"
-              checked={values.link_existing_by_username}
-              onChange={(c) => set('link_existing_by_username', c)}
-              label="Link existing users by username"
-            />
-            <Checkbox
-              id="realm-allow-http"
-              checked={values.allow_http_issuer}
-              onChange={(c) => set('allow_http_issuer', c)}
-              label="Allow plain-HTTP issuer (testing only)"
-            />
-          </div>
-        </fieldset>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Clock skew (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.clock_skew_seconds}
+                  onChange={(e) => set('clock_skew_seconds', e.target.value)}
+                  placeholder="60"
+                  invalid={!!errors.clock_skew_seconds}
+                />
+                {errors.clock_skew_seconds && (
+                  <ErrorMessage role="alert">
+                    {errors.clock_skew_seconds}
+                  </ErrorMessage>
+                )}
+              </Field>
+              <Field>
+                <Label>Button label</Label>
+                <Input
+                  type="text"
+                  value={values.button_label}
+                  onChange={(e) => set('button_label', e.target.value)}
+                  placeholder="Login with SSO"
+                />
+              </Field>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field>
+                <Label>Username claim</Label>
+                <Input
+                  type="text"
+                  value={values.username_claim}
+                  onChange={(e) => set('username_claim', e.target.value)}
+                  placeholder="preferred_username"
+                />
+              </Field>
+              <Field>
+                <Label>Email claim</Label>
+                <Input
+                  type="text"
+                  value={values.email_claim}
+                  onChange={(e) => set('email_claim', e.target.value)}
+                  placeholder="email"
+                />
+              </Field>
+              <Field>
+                <Label>Display-name claim</Label>
+                <Input
+                  type="text"
+                  value={values.display_name_claim}
+                  onChange={(e) => set('display_name_claim', e.target.value)}
+                  placeholder="name"
+                />
+              </Field>
+            </div>
+
+            <Field>
+              <Label>Login domains</Label>
+              <Input
+                type="text"
+                value={values.login_domains}
+                onChange={(e) => set('login_domains', e.target.value)}
+                placeholder="example.com, corp.example.com"
+              />
+              <Description>
+                Email domains routed to this IdP by identifier-first login.
+                Comma-separated.
+              </Description>
+            </Field>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Admin groups</Label>
+                <Input
+                  type="text"
+                  value={values.admin_groups}
+                  onChange={(e) => set('admin_groups', e.target.value)}
+                  placeholder="forge-admins"
+                />
+                <ListHint />
+              </Field>
+              <Field>
+                <Label>Admin claim</Label>
+                <Input
+                  type="text"
+                  value={values.admin_claim}
+                  onChange={(e) => set('admin_claim', e.target.value)}
+                  placeholder="roles"
+                />
+              </Field>
+            </div>
+
+            <CheckboxGroup>
+              <CheckboxField>
+                <Checkbox
+                  checked={values.auto_provision}
+                  onChange={(c) => set('auto_provision', c)}
+                />
+                <Label>Auto-provision users on first login</Label>
+              </CheckboxField>
+              <CheckboxField>
+                <Checkbox
+                  checked={values.link_existing_by_username}
+                  onChange={(c) => set('link_existing_by_username', c)}
+                />
+                <Label>Link existing users by username</Label>
+              </CheckboxField>
+              <CheckboxField>
+                <Checkbox
+                  checked={values.allow_http_issuer}
+                  onChange={(c) => set('allow_http_issuer', c)}
+                />
+                <Label>Allow plain-HTTP issuer (testing only)</Label>
+              </CheckboxField>
+            </CheckboxGroup>
+          </FieldGroup>
+        </Fieldset>
       )}
 
       {isForwarding && (
-        <fieldset className="space-y-4 border-t border-slate-100 pt-4">
-          <legend className="text-sm font-medium text-slate-700">
-            Credential-forwarding upstream
-          </legend>
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>Credential-forwarding upstream</Legend>
+          <FieldGroup>
+            <Field>
+              <Label>Upstream URL</Label>
+              <Input
+                type="text"
+                value={values.url}
+                onChange={(e) => set('url', e.target.value)}
+                placeholder="https://auth.example.com/check"
+                invalid={!!errors.url}
+              />
+              {errors.url && (
+                <ErrorMessage role="alert">{errors.url}</ErrorMessage>
+              )}
+            </Field>
 
-          <Field label="Upstream URL" htmlFor="realm-url" error={errors.url}>
-            <input
-              id="realm-url"
-              type="text"
-              value={values.url}
-              onChange={(e) => set('url', e.target.value)}
-              placeholder="https://auth.example.com/check"
-              className={inputClass}
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field>
+                <Label>Method</Label>
+                <Input
+                  type="text"
+                  value={values.method}
+                  onChange={(e) => set('method', e.target.value)}
+                  placeholder="GET"
+                />
+              </Field>
+              <Field>
+                <Label>Success statuses</Label>
+                <Input
+                  type="text"
+                  value={values.success_status}
+                  onChange={(e) => set('success_status', e.target.value)}
+                  placeholder="200"
+                  invalid={!!errors.success_status}
+                />
+                {errors.success_status && (
+                  <ErrorMessage role="alert">
+                    {errors.success_status}
+                  </ErrorMessage>
+                )}
+              </Field>
+              <Field>
+                <Label>Reject statuses</Label>
+                <Input
+                  type="text"
+                  value={values.reject_status}
+                  onChange={(e) => set('reject_status', e.target.value)}
+                  placeholder="401, 403"
+                  invalid={!!errors.reject_status}
+                />
+                {errors.reject_status && (
+                  <ErrorMessage role="alert">
+                    {errors.reject_status}
+                  </ErrorMessage>
+                )}
+              </Field>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Connect timeout (ms)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.connect_timeout_ms}
+                  onChange={(e) => set('connect_timeout_ms', e.target.value)}
+                  placeholder="2000"
+                  invalid={!!errors.connect_timeout_ms}
+                />
+                {errors.connect_timeout_ms && (
+                  <ErrorMessage role="alert">
+                    {errors.connect_timeout_ms}
+                  </ErrorMessage>
+                )}
+              </Field>
+              <Field>
+                <Label>Request timeout (ms)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.request_timeout_ms}
+                  onChange={(e) => set('request_timeout_ms', e.target.value)}
+                  placeholder="5000"
+                  invalid={!!errors.request_timeout_ms}
+                />
+                {errors.request_timeout_ms && (
+                  <ErrorMessage role="alert">
+                    {errors.request_timeout_ms}
+                  </ErrorMessage>
+                )}
+              </Field>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-3">
+              <Field>
+                <Label>Required groups</Label>
+                <Input
+                  type="text"
+                  value={values.required_groups}
+                  onChange={(e) => set('required_groups', e.target.value)}
+                  placeholder="developers"
+                />
+                <ListHint />
+              </Field>
+              <Field>
+                <Label>Groups path</Label>
+                <Input
+                  type="text"
+                  value={values.groups_path}
+                  onChange={(e) => set('groups_path', e.target.value)}
+                  placeholder="user.groups"
+                />
+              </Field>
+              <Field>
+                <Label>Admin group</Label>
+                <Input
+                  type="text"
+                  value={values.admin_group}
+                  onChange={(e) => set('admin_group', e.target.value)}
+                />
+              </Field>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field>
+                <Label>Positive cache TTL (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.positive_ttl_secs}
+                  onChange={(e) => set('positive_ttl_secs', e.target.value)}
+                  placeholder="300"
+                  invalid={!!errors.positive_ttl_secs}
+                />
+                {errors.positive_ttl_secs && (
+                  <ErrorMessage role="alert">
+                    {errors.positive_ttl_secs}
+                  </ErrorMessage>
+                )}
+              </Field>
+              <Field>
+                <Label>Negative cache TTL (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.negative_ttl_secs}
+                  onChange={(e) => set('negative_ttl_secs', e.target.value)}
+                  placeholder="30"
+                  invalid={!!errors.negative_ttl_secs}
+                />
+                {errors.negative_ttl_secs && (
+                  <ErrorMessage role="alert">
+                    {errors.negative_ttl_secs}
+                  </ErrorMessage>
+                )}
+              </Field>
+            </div>
+
+            <SecretField
+              label="Key pepper"
+              error={errors.key_pepper}
+              value={values.key_pepper}
+              onChange={(v) => set('key_pepper', v)}
+              stored={mode === 'edit' && hasStoredSecret(existing, 'key_pepper_set')}
             />
-          </Field>
 
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Field label="Method" htmlFor="realm-method">
-              <input
-                id="realm-method"
-                type="text"
-                value={values.method}
-                onChange={(e) => set('method', e.target.value)}
-                placeholder="GET"
-                className={inputClass}
+            <CheckboxField>
+              <Checkbox
+                checked={values.auto_provision}
+                onChange={(c) => set('auto_provision', c)}
               />
-            </Field>
-            <Field
-              label="Success statuses"
-              htmlFor="realm-success-status"
-              error={errors.success_status}
-            >
-              <input
-                id="realm-success-status"
-                type="text"
-                value={values.success_status}
-                onChange={(e) => set('success_status', e.target.value)}
-                placeholder="200"
-                className={inputClass}
-              />
-            </Field>
-            <Field
-              label="Reject statuses"
-              htmlFor="realm-reject-status"
-              error={errors.reject_status}
-            >
-              <input
-                id="realm-reject-status"
-                type="text"
-                value={values.reject_status}
-                onChange={(e) => set('reject_status', e.target.value)}
-                placeholder="401, 403"
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Connect timeout (ms)"
-              htmlFor="realm-connect-timeout"
-              error={errors.connect_timeout_ms}
-            >
-              <input
-                id="realm-connect-timeout"
-                type="number"
-                min={0}
-                value={values.connect_timeout_ms}
-                onChange={(e) => set('connect_timeout_ms', e.target.value)}
-                placeholder="2000"
-                className={inputClass}
-              />
-            </Field>
-            <Field
-              label="Request timeout (ms)"
-              htmlFor="realm-request-timeout"
-              error={errors.request_timeout_ms}
-            >
-              <input
-                id="realm-request-timeout"
-                type="number"
-                min={0}
-                value={values.request_timeout_ms}
-                onChange={(e) => set('request_timeout_ms', e.target.value)}
-                placeholder="5000"
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-3">
-            <Field label="Required groups" htmlFor="realm-required-groups">
-              <input
-                id="realm-required-groups"
-                type="text"
-                value={values.required_groups}
-                onChange={(e) => set('required_groups', e.target.value)}
-                placeholder="developers"
-                className={inputClass}
-              />
-              <ListHint />
-            </Field>
-            <Field label="Groups path" htmlFor="realm-groups-path">
-              <input
-                id="realm-groups-path"
-                type="text"
-                value={values.groups_path}
-                onChange={(e) => set('groups_path', e.target.value)}
-                placeholder="user.groups"
-                className={inputClass}
-              />
-            </Field>
-            <Field label="Admin group" htmlFor="realm-admin-group">
-              <input
-                id="realm-admin-group"
-                type="text"
-                value={values.admin_group}
-                onChange={(e) => set('admin_group', e.target.value)}
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field
-              label="Positive cache TTL (seconds)"
-              htmlFor="realm-positive-ttl"
-              error={errors.positive_ttl_secs}
-            >
-              <input
-                id="realm-positive-ttl"
-                type="number"
-                min={0}
-                value={values.positive_ttl_secs}
-                onChange={(e) => set('positive_ttl_secs', e.target.value)}
-                placeholder="300"
-                className={inputClass}
-              />
-            </Field>
-            <Field
-              label="Negative cache TTL (seconds)"
-              htmlFor="realm-negative-ttl"
-              error={errors.negative_ttl_secs}
-            >
-              <input
-                id="realm-negative-ttl"
-                type="number"
-                min={0}
-                value={values.negative_ttl_secs}
-                onChange={(e) => set('negative_ttl_secs', e.target.value)}
-                placeholder="30"
-                className={inputClass}
-              />
-            </Field>
-          </div>
-
-          <SecretField
-            id="realm-key-pepper"
-            label="Key pepper"
-            error={errors.key_pepper}
-            value={values.key_pepper}
-            onChange={(v) => set('key_pepper', v)}
-            stored={mode === 'edit' && hasStoredSecret(existing, 'key_pepper_set')}
-          />
-
-          <Checkbox
-            id="realm-auto-provision"
-            checked={values.auto_provision}
-            onChange={(c) => set('auto_provision', c)}
-            label="Auto-provision users on first successful check"
-          />
-        </fieldset>
+              <Label>Auto-provision users on first successful check</Label>
+            </CheckboxField>
+          </FieldGroup>
+        </Fieldset>
       )}
 
       {serverError && (
-        <p role="alert" className="text-sm text-red-600">
+        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
           {serverError}
         </p>
       )}
 
       <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={submitting}
-          className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60"
-        >
+        <Button type="submit" disabled={submitting}>
           {submitting
             ? 'Saving…'
             : mode === 'create'
               ? 'Create realm'
               : 'Save changes'}
-        </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="rounded border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-        >
+        </Button>
+        <Button type="button" outline onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
       </div>
     </form>
   )
@@ -643,14 +652,12 @@ function hasStoredSecret(
 
 /** Write-only secret input mirroring RepositoryForm's upstream-password UX. */
 function SecretField({
-  id,
   label,
   error,
   value,
   onChange,
   stored,
 }: {
-  id: string
   label: string
   error?: string
   value: string
@@ -658,81 +665,28 @@ function SecretField({
   stored: boolean
 }) {
   return (
-    <Field label={label} htmlFor={id} error={error}>
-      <input
-        id={id}
+    <Field>
+      <Label>{label}</Label>
+      <Input
         type="password"
         autoComplete="new-password"
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={stored ? '•••••••• (set to replace)' : 'Required'}
-        className={inputClass}
+        invalid={!!error}
       />
-      <p className="mt-1 text-xs text-slate-500">
+      <Description>
         {stored
           ? 'A secret is stored. Leave blank to keep it; type a new one to replace it.'
           : 'Write-only. The stored secret is never shown after saving.'}
-      </p>
+      </Description>
+      {error && <ErrorMessage role="alert">{error}</ErrorMessage>}
     </Field>
   )
 }
 
-const inputClass =
-  'mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500'
-
 function ListHint() {
-  return <p className="mt-1 text-xs text-slate-500">Comma-separated.</p>
-}
-
-function Field({
-  label,
-  htmlFor,
-  error,
-  children,
-}: {
-  label: string
-  htmlFor: string
-  error?: string
-  children: React.ReactNode
-}) {
-  return (
-    <div>
-      <label htmlFor={htmlFor} className="block text-sm font-medium text-slate-700">
-        {label}
-      </label>
-      {children}
-      {error && (
-        <p role="alert" className="mt-1 text-xs text-red-600">
-          {error}
-        </p>
-      )}
-    </div>
-  )
-}
-
-function Checkbox({
-  id,
-  checked,
-  onChange,
-  label,
-}: {
-  id: string
-  checked: boolean
-  onChange: (checked: boolean) => void
-  label: string
-}) {
-  return (
-    <label htmlFor={id} className="flex items-center gap-2 text-sm text-slate-700">
-      <input
-        id={id}
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="rounded border-slate-300"
-      />
-      {label}
-    </label>
-  )
+  return <Description>Comma-separated.</Description>
 }
 
 /** "" or a parseable non-negative number. */

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useRouter, useSearch } from '@tanstack/react-router'
 
-import { fetchMe, meKeys } from '~/api/me'
+import { meKeys } from '~/api/me'
 import {
   fetchLoginOptions,
   identify,
@@ -12,8 +12,14 @@ import {
   type OidcLoginOption,
 } from '~/api/auth'
 import { ApiError } from '~/lib/httpClient'
-import { clearToken, setSession, setToken } from '~/lib/auth'
+import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
+import { AuthLayout } from '~/components/catalyst/auth-layout'
+import { Button } from '~/components/catalyst/button'
+import { Field, Label } from '~/components/catalyst/fieldset'
+import { Heading } from '~/components/catalyst/heading'
+import { Input } from '~/components/catalyst/input'
+import { Text } from '~/components/catalyst/text'
 
 interface LoginSearch {
   /** Where to return after a successful sign-in (set by the admin guard). */
@@ -43,8 +49,9 @@ export const Route = createFileRoute('/login')({
  *
  * A successful password login sets the `forge_session` cookie; we persist the
  * returned CSRF token (session mode) and navigate to the `redirect` target.
- * The slice-1 token-paste form stays available as a secondary option (NuGet
- * registry tokens still work) behind a toggle.
+ * Signing in with a registry token is intentionally not offered: the UI always
+ * authenticates with username+password or via a realm. Tokens are minted on
+ * the Tokens screen for NuGet clients only.
  */
 function Login() {
   const { redirect, expired } = useSearch({ from: '/login' })
@@ -52,84 +59,51 @@ function Login() {
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
     staleTime: 60_000,
-    // Fail fast: an unreachable options endpoint immediately falls back to the
-    // token form instead of retrying in front of a waiting user.
+    // Fail fast in front of a waiting user; a retry button is rendered instead.
     retry: false,
   })
-  const [useToken, setUseToken] = useState(false)
-
-  // The login-options endpoint failing (old server, network) must never lock
-  // the door: fall back to the token form, which needs no options.
-  const tokenOnly = useToken || options.isError
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12">
-      <div className="mb-8 text-center">
-        <h1 className="text-2xl font-semibold text-slate-900">envisia&nbsp;forge</h1>
-        <p className="mt-1 text-sm text-slate-500">Sign in to the package registry</p>
-      </div>
+    <AuthLayout>
+      <div className="w-full max-w-sm space-y-8">
+        <div className="space-y-2 text-center">
+          <span
+            aria-hidden="true"
+            className="mx-auto grid size-12 place-items-center rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-lg font-bold text-white shadow-lg shadow-sky-500/20"
+          >
+            ef
+          </span>
+          <Heading className="!text-2xl">envisia&nbsp;forge</Heading>
+          <Text>Sign in to the package registry</Text>
+        </div>
 
-      <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
         {expired && (
           <p
             role="alert"
-            className="mb-4 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
           >
             Your session expired. Sign in again to continue.
           </p>
         )}
 
-        {tokenOnly ? (
-          <>
-            <TokenLoginForm redirect={redirect} />
-            {!options.isError && (
-              <SecondaryToggle onClick={() => setUseToken(false)}>
-                Back to username sign-in
-              </SecondaryToggle>
-            )}
-          </>
+        {options.isError ? (
+          <div className="space-y-4">
+            <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
+              Could not load the sign-in options. Is the server reachable?
+            </p>
+            <Button className="w-full" onClick={() => void options.refetch()}>
+              Try again
+            </Button>
+          </div>
         ) : options.isLoading || !options.data ? (
-          <p className="text-sm text-slate-500">Loading sign-in options…</p>
+          <Text>Loading sign-in options…</Text>
+        ) : options.data.mode === 'combined' ? (
+          <CombinedLogin options={options.data} redirect={redirect} />
         ) : (
-          <>
-            {options.data.mode === 'combined' ? (
-              <CombinedLogin options={options.data} redirect={redirect} />
-            ) : (
-              <IdentifierFirstLogin redirect={redirect} />
-            )}
-            <SecondaryToggle onClick={() => setUseToken(true)}>
-              Use a registry token instead
-            </SecondaryToggle>
-          </>
+          <IdentifierFirstLogin redirect={redirect} />
         )}
       </div>
-    </div>
-  )
-}
-
-/** "or"-divider + link toggling between the realm login and the token paste. */
-function SecondaryToggle({
-  onClick,
-  children,
-}: {
-  onClick: () => void
-  children: React.ReactNode
-}) {
-  return (
-    <>
-      <div className="my-5 flex items-center gap-3 text-xs uppercase tracking-wide text-slate-400">
-        <span className="h-px flex-1 bg-slate-200" />
-        or
-        <span className="h-px flex-1 bg-slate-200" />
-      </div>
-      <button
-        type="button"
-        onClick={onClick}
-        className="w-full rounded border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-      >
-        {children}
-      </button>
-    </>
+    </AuthLayout>
   )
 }
 
@@ -173,6 +147,15 @@ function usePasswordLogin(redirect?: string) {
   }
 
   return { signIn, error, setError, submitting, setSubmitting }
+}
+
+/** Inline form error, kept as `role="alert"` for tests + screen readers. */
+function FormError({ children }: { children: React.ReactNode }) {
+  return (
+    <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
+      {children}
+    </p>
+  )
 }
 
 /**
@@ -221,39 +204,28 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 
   if (step === 'identify') {
     return (
-      <form onSubmit={onIdentify} className="space-y-4">
-        <div>
-          <label
-            htmlFor="login-username"
-            className="block text-sm font-medium text-slate-700"
-          >
-            Username
-          </label>
-          <input
-            id="login-username"
+      <form onSubmit={onIdentify} className="space-y-6">
+        <Field>
+          <Label>Username</Label>
+          <Input
             type="text"
             autoComplete="username"
             autoFocus
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            className={inputClass}
           />
-        </div>
-        {error && (
-          <p role="alert" className="text-sm text-red-600">
-            {error}
-          </p>
-        )}
-        <button type="submit" disabled={submitting} className={primaryButtonClass}>
+        </Field>
+        {error && <FormError>{error}</FormError>}
+        <Button type="submit" disabled={submitting} className="w-full">
           {submitting ? 'Checking…' : 'Continue'}
-        </button>
+        </Button>
       </form>
     )
   }
 
   return (
-    <form onSubmit={onPassword} className="space-y-4">
-      <p className="text-sm text-slate-600">
+    <form onSubmit={onPassword} className="space-y-6">
+      <Text>
         Signing in as <span className="font-medium">{username.trim()}</span>{' '}
         <button
           type="button"
@@ -262,36 +234,25 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
             setPassword('')
             setError(null)
           }}
-          className="text-sky-700 hover:underline"
+          className="text-sky-600 hover:underline dark:text-sky-400"
         >
           Change
         </button>
-      </p>
-      <div>
-        <label
-          htmlFor="login-password"
-          className="block text-sm font-medium text-slate-700"
-        >
-          Password
-        </label>
-        <input
-          id="login-password"
+      </Text>
+      <Field>
+        <Label>Password</Label>
+        <Input
           type="password"
           autoComplete="current-password"
           autoFocus
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          className={inputClass}
         />
-      </div>
-      {error && (
-        <p role="alert" className="text-sm text-red-600">
-          {error}
-        </p>
-      )}
-      <button type="submit" disabled={submitting} className={primaryButtonClass}>
+      </Field>
+      {error && <FormError>{error}</FormError>}
+      <Button type="submit" disabled={submitting} className="w-full">
         {submitting ? 'Signing in…' : 'Sign in'}
-      </button>
+      </Button>
     </form>
   )
 }
@@ -321,50 +282,32 @@ function CombinedLogin({
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       {options.password && (
-        <form onSubmit={onSubmit} className="space-y-4">
-          <div>
-            <label
-              htmlFor="login-username"
-              className="block text-sm font-medium text-slate-700"
-            >
-              Username
-            </label>
-            <input
-              id="login-username"
+        <form onSubmit={onSubmit} className="space-y-6">
+          <Field>
+            <Label>Username</Label>
+            <Input
               type="text"
               autoComplete="username"
               autoFocus
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className={inputClass}
             />
-          </div>
-          <div>
-            <label
-              htmlFor="login-password"
-              className="block text-sm font-medium text-slate-700"
-            >
-              Password
-            </label>
-            <input
-              id="login-password"
+          </Field>
+          <Field>
+            <Label>Password</Label>
+            <Input
               type="password"
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className={inputClass}
             />
-          </div>
-          {error && (
-            <p role="alert" className="text-sm text-red-600">
-              {error}
-            </p>
-          )}
-          <button type="submit" disabled={submitting} className={primaryButtonClass}>
+          </Field>
+          {error && <FormError>{error}</FormError>}
+          <Button type="submit" disabled={submitting} className="w-full">
             {submitting ? 'Signing in…' : 'Sign in'}
-          </button>
+          </Button>
         </form>
       )}
 
@@ -383,96 +326,12 @@ function OidcButton({
   redirect?: string
 }) {
   return (
-    <button
-      type="button"
+    <Button
+      outline
+      className="w-full"
       onClick={() => assignLocation(oidcUrl(idp.login_url, redirect))}
-      className="w-full rounded border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
     >
       Login with {idp.label}
-    </button>
+    </Button>
   )
 }
-
-/**
- * The slice-1 token-paste form (secondary option): the token is verified via
- * `GET /admin/me` and only persisted once the API accepts it, so an invalid
- * token never poisons the stored credential.
- */
-function TokenLoginForm({ redirect }: { redirect?: string }) {
-  const router = useRouter()
-  const queryClient = useQueryClient()
-  const [token, setTokenValue] = useState('')
-  const [error, setError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    const trimmed = token.trim()
-    if (!trimmed) {
-      setError('Enter a registry token.')
-      return
-    }
-    setSubmitting(true)
-    setError(null)
-    // Store first so the verification request carries the credential, then roll
-    // back if the API rejects it.
-    setToken(trimmed)
-    try {
-      const me = await fetchMe()
-      queryClient.setQueryData(meKeys.self(), me)
-      void router.navigate({ to: redirect ?? '/' })
-    } catch (err) {
-      clearToken()
-      queryClient.removeQueries({ queryKey: meKeys.self() })
-      setError(
-        err instanceof ApiError && err.isAuthError
-          ? 'That token was not accepted. Check it and try again.'
-          : 'Could not verify the token. Is the server reachable?',
-      )
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  return (
-    <form onSubmit={onSubmit} className="space-y-4">
-      <div>
-        <label
-          htmlFor="forge-token"
-          className="block text-sm font-medium text-slate-700"
-        >
-          Registry token
-        </label>
-        <input
-          id="forge-token"
-          type="password"
-          autoComplete="off"
-          autoFocus
-          value={token}
-          onChange={(e) => setTokenValue(e.target.value)}
-          placeholder="Paste your token"
-          className={inputClass}
-        />
-        <p className="mt-1 text-xs text-slate-500">
-          Create a token from the Tokens screen, or use one provided out of band.
-        </p>
-      </div>
-
-      {error && (
-        <p role="alert" className="text-sm text-red-600">
-          {error}
-        </p>
-      )}
-
-      <button type="submit" disabled={submitting} className={primaryButtonClass}>
-        {submitting ? 'Verifying…' : 'Sign in'}
-      </button>
-    </form>
-  )
-}
-
-const inputClass =
-  'mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500'
-
-const primaryButtonClass =
-  'w-full rounded bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-60'

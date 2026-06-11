@@ -8,7 +8,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearToken, setToken } from '~/lib/auth'
+import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
 
@@ -79,16 +79,16 @@ describe('app routing + admin gating', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
-    clearToken()
+    clearSession()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    clearToken()
+    clearSession()
   })
 
   it('hides the Admin nav link for a reader', async () => {
-    setToken('reader-token')
+    setSession('reader-csrf')
     mockMe(readerMe)
 
     await renderApp('/')
@@ -110,7 +110,7 @@ describe('app routing + admin gating', () => {
   })
 
   it('shows the Admin nav link for an admin', async () => {
-    setToken('admin-token')
+    setSession('admin-csrf')
     mockMe(adminMe)
 
     await renderApp('/')
@@ -122,7 +122,7 @@ describe('app routing + admin gating', () => {
   })
 
   it('redirects a non-admin away from /admin to Browse', async () => {
-    setToken('reader-token')
+    setSession('reader-csrf')
     mockMe(readerMe)
 
     const router = await renderApp('/admin')
@@ -133,7 +133,7 @@ describe('app routing + admin gating', () => {
   })
 
   it('lets an admin reach the admin landing at /admin', async () => {
-    setToken('admin-token')
+    setSession('admin-csrf')
     mockMe(adminMe)
 
     const router = await renderApp('/admin')
@@ -148,7 +148,8 @@ describe('app routing + admin gating', () => {
     const router = await renderApp('/admin')
 
     expect(router.state.location.pathname).toBe('/login')
-    // The guard flags the expired/redirect search so login can return the user.
-    expect(router.state.location.search).toMatchObject({ expired: true })
+    // The app-level login gate records the attempted URL so login can return
+    // the user there after signing in.
+    expect(router.state.location.search).toMatchObject({ redirect: '/admin' })
   })
 })

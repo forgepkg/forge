@@ -1,6 +1,15 @@
 import clsx from 'clsx'
 
 import type { DetailVersion } from '~/api/packages'
+import { Badge } from '~/components/catalyst/badge'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '~/components/catalyst/table'
 import { DelayBadge } from './DelayBadge'
 import { RetentionBadge } from './RetentionBadge'
 
@@ -12,45 +21,40 @@ import { RetentionBadge } from './RetentionBadge'
  */
 export function VersionTable({ versions }: { versions: DetailVersion[] }) {
   return (
-    <table className="w-full border-collapse text-sm">
-      <thead>
-        <tr className="border-b border-slate-200 text-left text-slate-500">
-          <th className="py-2 pr-4 font-medium">Version</th>
-          <th className="py-2 pr-4 font-medium">Published</th>
-          <th className="py-2 pr-4 font-medium">Size</th>
-          <th className="py-2 pr-4 font-medium">Status</th>
-        </tr>
-      </thead>
-      <tbody>
+    <Table striped>
+      <TableHead>
+        <TableRow>
+          <TableHeader>Version</TableHeader>
+          <TableHeader>Published</TableHeader>
+          <TableHeader>Size</TableHeader>
+          <TableHeader>Status</TableHeader>
+        </TableRow>
+      </TableHead>
+      <TableBody>
         {versions.map((v) => (
-          <tr
-            key={v.version}
-            className="border-b border-slate-100 last:border-0"
-          >
-            <td className="py-2 pr-4 font-mono">
-              <span className={clsx(!v.listed && 'text-slate-400')}>
+          <TableRow key={v.version}>
+            <TableCell className="font-mono">
+              <span className={clsx(!v.listed && 'text-zinc-400 dark:text-zinc-500')}>
                 {v.version_original}
               </span>
-            </td>
-            <td className="py-2 pr-4 text-slate-600">
+            </TableCell>
+            <TableCell className="text-zinc-500 dark:text-zinc-400">
               {formatDate(v.published_at)}
-            </td>
-            <td className="py-2 pr-4 text-slate-600">{formatSize(v.size)}</td>
-            <td className="py-2 pr-4">
+            </TableCell>
+            <TableCell className="text-zinc-500 dark:text-zinc-400">
+              {formatSize(v.size)}
+            </TableCell>
+            <TableCell>
               <span className="flex flex-wrap items-center gap-1.5">
-                {!v.listed && (
-                  <span className="inline-block rounded bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">
-                    unlisted
-                  </span>
-                )}
+                {!v.listed && <Badge color="zinc">unlisted</Badge>}
                 <DelayBadge status={v.delay_status} delayedUntil={v.delayed_until} />
                 <RetentionBadge status={v.retention_status} />
               </span>
-            </td>
-          </tr>
+            </TableCell>
+          </TableRow>
         ))}
-      </tbody>
-    </table>
+      </TableBody>
+    </Table>
   )
 }
 

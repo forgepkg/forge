@@ -1,5 +1,5 @@
 import { apiUrl } from './config'
-import { authHeaders, clearToken } from './auth'
+import { authHeaders, clearSession } from './auth'
 
 /**
  * Centralized HTTP client. **Every** API call goes through here so the auth
@@ -66,7 +66,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
 
   if (res.status === 401) {
     // Stale/invalid credentials: clear them so the UI routes back to login.
-    clearToken()
+    clearSession()
   }
 
   if (!res.ok) {

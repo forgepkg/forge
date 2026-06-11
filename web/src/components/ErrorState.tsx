@@ -1,3 +1,5 @@
+import { Button } from '~/components/catalyst/button'
+
 /**
  * Generic error panel with an optional retry. Used by every data screen so the
  * failure UX is consistent (plan §UX). `message` is the human-readable summary;
@@ -15,18 +17,18 @@ export function ErrorState({
   return (
     <div
       role="alert"
-      className="rounded-lg border border-rose-200 bg-rose-50 p-5 text-rose-800"
+      className="rounded-xl border border-red-500/25 bg-red-500/5 p-5 dark:bg-red-500/10"
     >
-      <p className="font-medium">{title}</p>
-      {message && <p className="mt-1 text-sm text-rose-700">{message}</p>}
+      <p className="font-medium text-red-700 dark:text-red-400">{title}</p>
+      {message && (
+        <p className="mt-1 text-sm/6 text-red-600/90 dark:text-red-400/80">
+          {message}
+        </p>
+      )}
       {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="mt-3 rounded border border-rose-300 bg-white px-3 py-1.5 text-sm font-medium text-rose-800 hover:bg-rose-100"
-        >
+        <Button outline className="mt-3" onClick={onRetry}>
           Retry
-        </button>
+        </Button>
       )}
     </div>
   )

@@ -12,9 +12,17 @@ import { httpClient } from '~/lib/httpClient'
  *  - `delay_status` is `"available" | "delayed_until" | null` (snake_case enum).
  *  - `retention_status` is always `null` in slice 1 (reserved for §12.1).
  *
- * These endpoints honor per-repo `anonymous_read`, so browse works for an
- * unauthenticated reader; the `httpClient` attaches a token when one is present.
+ * Every `/browse/*` endpoint requires a signed-in user (401 otherwise); the
+ * `_app` layout's login gate ensures these are only called with a session.
  */
+
+/** One readable repository (`GET /browse/repos` item) — a folder-view root. */
+export interface BrowseRepo {
+  /** Repository name. */
+  name: string
+  /** Repository kind: `hosted` | `proxy` | `group`. */
+  kind: string
+}
 
 /** One cross-repository search hit (`GET /browse/packages` item). */
 export interface BrowseItem {
@@ -106,6 +114,7 @@ export interface SearchParams {
  */
 export const pkgKeys = {
   all: () => ['packages'] as const,
+  repos: () => ['packages', 'repos'] as const,
   search: (params: SearchParams) =>
     ['packages', 'search', normalizeSearchKey(params)] as const,
   detail: (repo: string, id: string) =>
@@ -121,6 +130,11 @@ function normalizeSearchKey(params: SearchParams) {
     skip: params.skip ?? 0,
     take: params.take ?? 0,
   }
+}
+
+/** Fetch the repositories the signed-in user may browse (sorted by name). */
+export function fetchBrowseRepos(signal?: AbortSignal): Promise<BrowseRepo[]> {
+  return httpClient.get<BrowseRepo[]>('/browse/repos', { signal })
 }
 
 /** Fetch a page of cross-repository search hits. */

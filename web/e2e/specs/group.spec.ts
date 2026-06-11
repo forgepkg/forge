@@ -2,10 +2,10 @@ import { expect, test } from '@playwright/test'
 
 import {
   createRepo,
-  facts,
   fetchPackageDetail,
   pushNupkg,
   readFixture,
+  signInSession,
   waitForPackage,
 } from '../helpers'
 
@@ -29,14 +29,8 @@ import {
  * never a hard load of an `/admin/...` deep link.
  */
 
-const TOKEN_KEY = 'forge.token'
-
 test.beforeEach(async ({ page }) => {
-  const f = facts()
-  await page.addInitScript(
-    ({ key, token }) => window.localStorage.setItem(key, token),
-    { key: TOKEN_KEY, token: f.adminToken },
-  )
+  await signInSession(page)
 })
 
 test('a group resolves the highest-priority member for an overlapping id+version', async ({
@@ -70,9 +64,9 @@ test('a group resolves the highest-priority member for an overlapping id+version
   await page.getByRole('link', { name: /repositor/i }).first().click()
   await expect(page).toHaveURL(/\/admin\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
-  await page.locator('#repo-name').fill(group)
-  await page.locator('#repo-kind').selectOption('group')
-  await page.locator('#repo-anon').check()
+  await page.getByLabel(/^name$/i).fill(group)
+  await page.getByLabel(/^kind$/i).selectOption('group')
+  await page.getByLabel(/allow anonymous read/i).check()
   await page.getByRole('button', { name: /create repository/i }).click()
   await expect(page).toHaveURL(new RegExp(`/admin/repositories/${group}`))
 
@@ -83,14 +77,14 @@ test('a group resolves the highest-priority member for an overlapping id+version
     new RegExp(`/admin/repositories/${group}/members`),
   )
 
-  await page.locator('#add-member').selectOption(winner)
-  await page.locator('#add-priority').fill('200')
+  await page.getByLabel(/^repository$/i).selectOption(winner)
+  await page.getByLabel(/^priority$/i).fill('200')
   await page.getByRole('button', { name: /add member/i }).click()
   // The winner row appears in the priority list.
   await expect(page.getByText(winner, { exact: false })).toBeVisible()
 
-  await page.locator('#add-member').selectOption(loser)
-  await page.locator('#add-priority').fill('100')
+  await page.getByLabel(/^repository$/i).selectOption(loser)
+  await page.getByLabel(/^priority$/i).fill('100')
   await page.getByRole('button', { name: /add member/i }).click()
   await expect(page.getByText(loser, { exact: false })).toBeVisible()
 

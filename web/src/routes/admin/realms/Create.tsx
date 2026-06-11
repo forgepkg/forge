@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useCreateRealm } from '~/queries/useRealms'
+import { Heading } from '~/components/catalyst/heading'
 import {
   RealmForm,
   toRealmConfig,
@@ -40,7 +41,7 @@ function CreateRealmScreen() {
 
   return (
     <section className="space-y-6">
-      <h1 className="text-2xl font-semibold">New realm</h1>
+      <Heading>New realm</Heading>
       <RealmForm
         mode="create"
         submitting={create.isPending}
