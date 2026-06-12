@@ -3,12 +3,18 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 
 /// A command builder that remembers a human-readable label for error messages.
 pub struct Cmd {
     inner: Command,
     /// What we print if the command fails (e.g. "docker compose up").
+    label: String,
+}
+
+/// A spawned child process plus the command label used in diagnostics.
+pub struct RunningCmd {
+    child: Child,
     label: String,
 }
 
@@ -79,6 +85,21 @@ impl Cmd {
         }
     }
 
+    /// Spawn the child with inherited stdio and return a handle for orchestration.
+    pub fn spawn(mut self) -> Result<RunningCmd, String> {
+        eprintln!("\x1b[36m$ {}\x1b[0m", self.label);
+        let child = self.inner.spawn().map_err(|e| {
+            format!(
+                "failed to spawn `{}`: {e} (is it installed and on PATH?)",
+                self.label
+            )
+        })?;
+        Ok(RunningCmd {
+            child,
+            label: self.label,
+        })
+    }
+
     /// Run and capture stdout as a trimmed `String` (used by `seed`). Streams
     /// stderr through so the user still sees progress/errors.
     pub fn output_string(mut self) -> Result<String, String> {
@@ -91,5 +112,26 @@ impl Cmd {
             return Err(format!("`{}` exited unsuccessfully", self.label));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+impl RunningCmd {
+    /// Check whether the child has exited without blocking.
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child
+            .try_wait()
+            .map_err(|e| format!("failed to wait for `{}`: {e}", self.label))
+    }
+
+    /// Kill the child if it is still running, then reap it.
+    pub fn kill(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
     }
 }

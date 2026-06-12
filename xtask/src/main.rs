@@ -7,9 +7,12 @@
 
 mod proc;
 
-use proc::Cmd;
+use proc::{Cmd, RunningCmd};
 use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
 
 // ── Shared constants (mirror docker-compose.yml + forge.toml) ────────────────
 
@@ -24,6 +27,12 @@ const LOCAL_DB_URL: &str = "postgres://forge:forge@localhost:5432/forge";
 
 /// Default base URL of a running forge-server (used by `seed`).
 const DEFAULT_FORGE_URL: &str = "http://localhost:8421";
+
+/// Default forge-server HTTP port (mirrors forge.toml).
+const DEFAULT_FORGE_PORT: u16 = 8421;
+
+/// Vite dev-server HTTP port (mirrors web/vite.config.ts).
+const VITE_DEV_PORT: u16 = 8420;
 
 /// Default bootstrap admin credentials from forge.toml (used by `seed`).
 const DEFAULT_ADMIN: &str = "admin:changeme";
@@ -91,7 +100,7 @@ fn print_help() {
         r#"envisia-forge task runner (cargo xtask <command>)
 
 One-command dev:
-  dev [--db local|docker|none]  Bring up infra, build the SPA, run forge-server.
+  dev [--db local|docker|none]  Bring up infra, run forge-server + Vite HMR.
                                 --db local (default): host Postgres on :5432
                                              (forge role+db auto-created), server pointed
                                              there via FORGE_DATABASE__URL.
@@ -171,12 +180,78 @@ fn psql() -> Result<(), String> {
 // ── Server ───────────────────────────────────────────────────────────────────
 
 fn run_server() -> Result<(), String> {
-    cargo(&["run", "-p", "forge-server"]).run()
+    print_forge_portal();
+    run_server_cmd().run()
 }
 
 /// `cargo ...` with SQLX_OFFLINE=true so a live DB isn't needed to build.
 fn cargo(args: &[&str]) -> Cmd {
     Cmd::new("cargo").args(args).env("SQLX_OFFLINE", "true")
+}
+
+fn run_server_cmd() -> Cmd {
+    cargo(&["run", "-p", "forge-server"])
+}
+
+fn print_forge_portal() {
+    print_portal_urls("Forge portal", forge_server_port());
+}
+
+fn print_vite_portal() {
+    println!();
+    println!("Vite portal (HMR):");
+    print_url_lines(VITE_DEV_PORT);
+    let api_target =
+        env::var("FORGE_DEV_API_TARGET").unwrap_or_else(|_| DEFAULT_FORGE_URL.to_string());
+    println!("  API proxy target: {api_target}");
+    println!();
+}
+
+fn print_dev_portals() {
+    println!();
+    println!("Development portal:");
+    println!("  UI:");
+    print_url_lines(VITE_DEV_PORT);
+    println!("  API:");
+    print_url_lines(forge_server_port());
+    println!();
+}
+
+fn print_portal_urls(label: &str, port: u16) {
+    println!();
+    println!("{label}:");
+    print_url_lines(port);
+    println!();
+}
+
+fn print_url_lines(port: u16) {
+    println!("  local:   http://127.0.0.1:{port}");
+    if let Some(ip) = lan_ipv4() {
+        println!("  network: http://{ip}:{port}");
+    }
+}
+
+fn forge_server_port() -> u16 {
+    env::var("FORGE_SERVER__BIND")
+        .ok()
+        .and_then(|bind| bind_port(&bind))
+        .unwrap_or(DEFAULT_FORGE_PORT)
+}
+
+fn bind_port(bind: &str) -> Option<u16> {
+    bind.parse::<SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
+        .or_else(|| bind.rsplit_once(':')?.1.parse().ok())
+}
+
+fn lan_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
 }
 
 // ── dev: the one command ─────────────────────────────────────────────────────
@@ -228,27 +303,70 @@ fn dev(rest: &[String]) -> Result<(), String> {
 
     match mode {
         DbMode::Docker => {
-            // Full docker-compose stack (Postgres :5433 + versitygw :8422).
+            // Full docker-compose stack (Postgres :5433 + versitygw :8422),
+            // then Rust API + Vite HMR.
             up()?;
-            web_build()?;
-            run_server()
+            run_dev_processes(run_server_cmd())
         }
         DbMode::Local => {
             // Host Postgres on :5432: ensure the forge role + db exist, then
-            // bring up ONLY versitygw via compose, build the SPA, and run the
-            // server pointed at the local DB via FORGE_DATABASE__URL.
+            // bring up ONLY versitygw via compose, then run the server pointed
+            // at the local DB plus Vite HMR.
             ensure_local_db()?;
             compose(&["up", "-d", "--wait", "s3"]).run()?;
-            web_build()?;
-            cargo(&["run", "-p", "forge-server"])
-                .env("FORGE_DATABASE__URL", LOCAL_DB_URL)
-                .run()
+            run_dev_processes(run_server_cmd().env("FORGE_DATABASE__URL", LOCAL_DB_URL))
         }
         DbMode::None => {
-            // Assume the DB (and S3) are already up; just build + run.
-            web_build()?;
-            run_server()
+            // Assume the DB (and S3) are already up; run API + Vite HMR.
+            run_dev_processes(run_server_cmd())
         }
+    }
+}
+
+fn run_dev_processes(server_cmd: Cmd) -> Result<(), String> {
+    pnpm_install()?;
+
+    let mut children = vec![server_cmd.spawn()?];
+    match Cmd::new("pnpm")
+        .args(["run", "dev"])
+        .current_dir(WEB)
+        .spawn()
+    {
+        Ok(vite) => children.push(vite),
+        Err(e) => {
+            children[0].kill();
+            return Err(e);
+        }
+    }
+
+    print_dev_portals();
+    wait_for_dev_processes(&mut children)
+}
+
+fn wait_for_dev_processes(children: &mut [RunningCmd]) -> Result<(), String> {
+    loop {
+        for i in 0..children.len() {
+            if let Some(status) = children[i].try_wait()? {
+                for (j, child) in children.iter_mut().enumerate() {
+                    if i != j {
+                        child.kill();
+                    }
+                }
+
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "`{}` exited with {}",
+                    children[i].label(),
+                    status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "a signal".to_string())
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -400,6 +518,8 @@ fn web_build() -> Result<(), String> {
 }
 
 fn web_dev() -> Result<(), String> {
+    pnpm_install()?;
+    print_vite_portal();
     Cmd::new("pnpm").args(["run", "dev"]).current_dir(WEB).run()
 }
 
@@ -522,6 +642,7 @@ fn docker_build() -> Result<(), String> {
 /// docker-compose.yml (db + s3) with docker-compose.app.yml (the app service),
 /// building the image if needed. Serves the API + SPA on http://localhost:8421.
 fn docker_run() -> Result<(), String> {
+    print_forge_portal();
     compose_app(&["up", "--build"]).run()
 }
 

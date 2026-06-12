@@ -21,6 +21,8 @@ FORGE_DEV_API_TARGET=http://localhost:8421 pnpm run dev   # Vite on :8420
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to
 `FORGE_DEV_API_TARGET` so dev is single-origin too (relative URLs, no CORS).
+It binds to IPv4 all-interfaces so the printed network URL can be opened from
+another device on the same network.
 This proxy is a dev-only static-routing convenience with no production
 equivalent.
 

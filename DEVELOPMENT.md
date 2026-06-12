@@ -21,10 +21,10 @@ for S3).
 cargo xtask dev
 ```
 
-`cargo xtask dev` starts Postgres (host port **5433**) + versitygw (**:8422**),
-waits for both to be healthy, builds the web SPA, then runs the server on
-**http://localhost:8421** using the checked-in [`forge.toml`](./forge.toml).
-Press **Ctrl-C** to stop the server; `cargo xtask down` stops the containers.
+`cargo xtask dev` uses local Postgres on **:5432** by default, starts
+versitygw (**:8422**), then runs both the Rust API (**:8421**) and Vite HMR
+(**:8420**). Open the printed Vite portal URL. Press **Ctrl-C** to stop both
+processes; `cargo xtask down` stops the containers.
 
 `xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
 Makefile + Justfile — there is nothing extra to install (no `make`, no `just`).
@@ -87,8 +87,9 @@ cargo xtask web     # pnpm install --frozen-lockfile && pnpm run build  -> web/d
 cargo xtask run     # forge-server serves web/dist at http://localhost:8421
 ```
 
-`cargo xtask dev` does both for you (infra → build UI → run server), so the UI is
-live at **http://localhost:8421** alongside the API.
+For day-to-day development, `cargo xtask dev` runs Vite HMR in front of the Rust
+API. Use **http://localhost:8420** for the UI and **http://localhost:8421** for
+the API/feed.
 
 ### Frontend dev server (HMR)
 
@@ -97,13 +98,15 @@ a running `forge-server`:
 
 ```bash
 cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
-cargo xtask web-dev                 # terminal 2: Vite on http://localhost:8420
+cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
 origin (default `http://localhost:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
+`web-dev` binds Vite to IPv4 all-interfaces and prints local/network portal
+URLs before handing off to Vite.
 
 ### Frontend tests
 

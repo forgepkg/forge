@@ -52,12 +52,12 @@ cargo xtask dev
 
 That one command uses your **local Postgres on :5432** (creating the `forge`
 role + database if missing), brings up an S3 gateway (**:8422**) via
-`docker-compose.yml`, builds the SPA, runs migrations, and starts the server on
-**http://localhost:8421**. A bootstrap admin **`admin` / `changeme`** is created
-on first run. (Requires a running local PostgreSQL with permission to create the
+`docker-compose.yml`, runs migrations, and starts the Rust API on **:8421** plus
+Vite HMR on **:8420**. A bootstrap admin **`admin` / `changeme`** is created on
+first run. (Requires a running local PostgreSQL with permission to create the
 role/db; use `--db docker` if you don't have one — see below.)
 
-- **UI:** http://localhost:8421
+- **UI:** http://localhost:8420
 - **NuGet feed:** `http://localhost:8421/v3/{repo}/index.json`
 
 Add demo data (anonymous-readable `nuget` repo + a pushed sample package) in a

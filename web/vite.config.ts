@@ -23,6 +23,7 @@ import { tanstackRouter } from '@tanstack/router-plugin/vite'
 const apiTarget = process.env.FORGE_DEV_API_TARGET ?? 'http://localhost:8421'
 
 export default defineConfig({
+  clearScreen: false,
   plugins: [
     // Virtual file routes declared in src/routes.ts -> src/routeTree.gen.ts.
     tanstackRouter({
@@ -39,6 +40,7 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0',
     port: 8420,
     proxy: {
       '/admin': { target: apiTarget, changeOrigin: false },
