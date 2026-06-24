@@ -176,6 +176,17 @@ impl Authz {
                     Some(tid) => self.apply_token_scope(owner, *tid).await,
                 }
             }
+            // WIF (slice 12.8): a workload is authorized purely by the single
+            // forge role its realm's claim-rules mapped it to. No `app_user`, no
+            // token scope, no dual-read admin fallback — the role's grants are
+            // the whole story (a deleted role resolves to deny-all).
+            Principal::Workload { role_id, .. } => {
+                authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
+                    .await
+                    .map_err(
+                        |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
+                    )
+            }
         }
     }
 

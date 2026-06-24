@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            rp.action            AS action,\n            rp.repository_id     AS repository_id,\n            cs.id                AS \"selector_id?\",\n            cs.includes          AS \"includes?\",\n            cs.excludes          AS \"excludes?\"\n        FROM repository_privilege rp\n        LEFT JOIN content_selector cs ON cs.id = rp.selector_id\n        WHERE rp.role_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "selector_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "includes?",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
+        "name": "excludes?",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4523f8deddabcd2903081b0ac7e586d42745a733b57b09abf1adccedd9d3392a"
+}

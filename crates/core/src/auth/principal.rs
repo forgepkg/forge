@@ -36,6 +36,19 @@ pub enum Principal {
         /// Admin flag.
         is_admin: bool,
     },
+    /// A verified **workload** (slice 12.8, WIF): a non-interactive CI/automation
+    /// caller authenticated by a validated OIDC `id_token` (no `app_user` row,
+    /// no session). It is authorized solely by the forge **role** its realm's
+    /// claim-rules mapped it to — the role id is resolved at token-validation
+    /// time and the authz seam loads that role's effective set directly.
+    Workload {
+        /// `auth_realm.id` of the `workload_identity` realm that vouched for it
+        /// (audit/diagnostic context).
+        realm_id: i64,
+        /// `role.id` the matched claim-rule granted. The authz seam resolves
+        /// this role's effective set (deny-all if the role was since deleted).
+        role_id: i64,
+    },
 }
 
 impl Principal {

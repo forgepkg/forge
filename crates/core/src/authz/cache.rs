@@ -89,6 +89,11 @@ fn user_key(user_id: i64) -> String {
 /// The single shared cache key for the anonymous role's grants.
 const ANON_KEY: &str = "anon";
 
+/// The cache key for a single role's effective set (WIF workload principals).
+fn role_key(role_id: i64) -> String {
+    format!("role:{role_id}")
+}
+
 /// Load (cached) the **owner** effective set for an authenticated user, building
 /// the compiled [`EffectiveSet`] from the cached raw form.
 ///
@@ -122,6 +127,28 @@ pub async fn load_anonymous_effective(
     let raw = cache
         .get_or_try_insert_with(NS_AUTHZ, ANON_KEY, DEFAULT_TTL, || async {
             let rows = authz_dao::load_anonymous_effective(pool).await?;
+            Ok::<RawEffectiveSet, LoadError>(to_raw_set(rows))
+        })
+        .await?;
+
+    build_set(raw, false)
+}
+
+/// Load (cached) the effective set granted by a **single role**, for a
+/// workload-identity (WIF) principal (slice 12.8). The validated CI token is
+/// mapped to one forge role; this resolves that role's grants directly (no
+/// `app_user` / `user_role` membership). `is_admin` is set iff the role is the
+/// built-in `admin` role — never via a dual-read fallback (a workload has no
+/// `app_user.is_admin` column). A role-grant change invalidates this via the
+/// blanket [`invalidate_all`] "epoch roll", like any other role edit.
+pub async fn load_role_effective(
+    pool: &PgPool,
+    cache: &Cache,
+    role_id: i64,
+) -> Result<EffectiveSet, LoadError> {
+    let raw = cache
+        .get_or_try_insert_with(NS_AUTHZ, &role_key(role_id), DEFAULT_TTL, || async {
+            let rows = authz_dao::load_role_effective(pool, role_id).await?;
             Ok::<RawEffectiveSet, LoadError>(to_raw_set(rows))
         })
         .await?;

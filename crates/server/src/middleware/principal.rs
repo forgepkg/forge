@@ -126,6 +126,7 @@ mod tests {
             let p = principal_of(&req);
             let label = match p {
                 Principal::User { is_admin, .. } => format!("user:{is_admin}"),
+                Principal::Workload { role_id, .. } => format!("workload:{role_id}"),
                 Principal::Anonymous { .. } => "anonymous".to_string(),
                 Principal::Unauthenticated => "unauthenticated".to_string(),
             };

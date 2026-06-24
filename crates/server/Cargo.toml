@@ -33,6 +33,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
 async-trait = { workspace = true }
+# WIF (slice 12.8): decode the unverified JWT header/payload for issuer routing
+# (cryptographic verification stays in forge-core's JWKS verifier) and the HTTP
+# Basic credential when a workload presents its id_token as the password.
+base64 = { workspace = true }
 ipnet = { workspace = true }
 url = { workspace = true }
 argon2 = { workspace = true, features = ["password-hash"] }

@@ -6,6 +6,7 @@ import type {
   RealmConfig,
   RealmKind,
   RealmView,
+  WorkloadIdentityConfig,
 } from '~/api/realms'
 import { Button } from '~/components/catalyst/button'
 import {
@@ -32,6 +33,8 @@ import { Select } from '~/components/catalyst/select'
  *    login domains / button label
  *  - **credential_forwarding** → upstream URL / acceptance criteria /
  *    timeouts / groups / caching TTLs / write-only key pepper
+ *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
+ *    clock skew / ordered claim→role rules (no secrets, no redaction)
  *  - **local** → no config; only name + enabled are editable (built-in realm)
  *
  * On **create** the kind is selectable (local is built-in and cannot be
@@ -82,10 +85,19 @@ export interface RealmFormValues {
   negative_ttl_secs: string
   /** Newly-typed pepper; blank ⇒ "leave unchanged" on edit / invalid on create. */
   key_pepper: string
+  // workload_identity (WIF). Reuses `issuer`, `allow_http_issuer`, and
+  // `clock_skew_seconds` above since only one kind is active at a time.
+  /** Comma/newline-separated allowed audiences (parsed to string[] on submit). */
+  allowed_audiences: string
+  /** Ordered claim→role rules; anyOf is a comma-separated string per condition. */
+  wifRules: Array<{
+    role: string
+    conditions: Array<{ claim: string; anyOf: string }>
+  }>
 }
 
 export interface RealmFormProps {
-  /** Edit mode locks the kind; create mode offers oidc/credential_forwarding. */
+  /** Edit mode locks the kind; create mode offers the non-local kinds. */
   mode: 'create' | 'edit'
   /** Existing realm (edit mode) used to seed defaults; absent in create mode. */
   existing?: RealmView
@@ -108,19 +120,32 @@ function seed(existing?: RealmView): RealmFormValues {
   const fwd = (
     existing?.kind === 'credential_forwarding' ? existing.config : {}
   ) as CredentialForwardingConfig
+  const wif = (
+    existing?.kind === 'workload_identity' ? existing.config : {}
+  ) as WorkloadIdentityConfig
   return {
     kind: existing?.kind ?? 'oidc',
     name: existing?.name ?? '',
     enabled: existing?.enabled ?? true,
     auto_provision:
       (existing?.kind === 'oidc' ? oidc.auto_provision : fwd.auto_provision) ?? true,
-    issuer: oidc.issuer ?? '',
+    issuer: (existing?.kind === 'workload_identity' ? wif.issuer : oidc.issuer) ?? '',
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
     client_secret: '',
     scopes: joinList(oidc.scopes),
-    clock_skew_seconds: oidc.clock_skew_seconds != null ? String(oidc.clock_skew_seconds) : '',
-    allow_http_issuer: oidc.allow_http_issuer ?? false,
+    clock_skew_seconds:
+      existing?.kind === 'workload_identity'
+        ? wif.clock_skew_seconds != null
+          ? String(wif.clock_skew_seconds)
+          : ''
+        : oidc.clock_skew_seconds != null
+          ? String(oidc.clock_skew_seconds)
+          : '',
+    allow_http_issuer:
+      (existing?.kind === 'workload_identity'
+        ? wif.allow_http_issuer
+        : oidc.allow_http_issuer) ?? false,
     username_claim: oidc.username_claim ?? '',
     email_claim: oidc.email_claim ?? '',
     display_name_claim: oidc.display_name_claim ?? '',
@@ -141,6 +166,14 @@ function seed(existing?: RealmView): RealmFormValues {
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
     key_pepper: '',
+    allowed_audiences: joinList(wif.allowed_audiences),
+    wifRules: (wif.rules ?? []).map((rule) => ({
+      role: rule.role ?? '',
+      conditions: (rule.conditions ?? []).map((c) => ({
+        claim: c.claim ?? '',
+        anyOf: joinList(c.any_of),
+      })),
+    })),
   }
 }
 
@@ -202,6 +235,36 @@ export function RealmForm({
         }
       }
     }
+    if (values.kind === 'workload_identity') {
+      if (values.issuer.trim() === '') {
+        next.issuer = 'An issuer URL is required.'
+      } else if (!isUrlIsh(values.issuer)) {
+        next.issuer = 'The issuer must be a valid URL.'
+      }
+      if (parseList(values.allowed_audiences).length === 0) {
+        next.allowed_audiences = 'At least one allowed audience is required.'
+      }
+      if (!isBlankNumber(values.clock_skew_seconds)) {
+        next.clock_skew_seconds = 'Clock skew must be a non-negative number.'
+      }
+      if (values.wifRules.length === 0) {
+        next.wifRules = 'At least one rule is required.'
+      }
+      values.wifRules.forEach((rule, ri) => {
+        if (rule.role.trim() === '') {
+          next[`wifRule.${ri}.role`] = 'A role is required.'
+        }
+        rule.conditions.forEach((cond, ci) => {
+          if (cond.claim.trim() === '') {
+            next[`wifRule.${ri}.cond.${ci}.claim`] = 'A claim is required.'
+          }
+          if (parseList(cond.anyOf).length === 0) {
+            next[`wifRule.${ri}.cond.${ci}.anyOf`] =
+              'At least one value is required.'
+          }
+        })
+      })
+    }
     setErrors(next)
     return Object.keys(next).length === 0
   }
@@ -215,6 +278,45 @@ export function RealmForm({
   const isLocal = values.kind === 'local'
   const isOidc = values.kind === 'oidc'
   const isForwarding = values.kind === 'credential_forwarding'
+  const isWorkloadIdentity = values.kind === 'workload_identity'
+
+  function setRule(
+    index: number,
+    update: (rule: RealmFormValues['wifRules'][number]) => RealmFormValues['wifRules'][number],
+  ) {
+    setValues((v) => ({
+      ...v,
+      wifRules: v.wifRules.map((r, i) => (i === index ? update(r) : r)),
+    }))
+  }
+
+  function addRule() {
+    setValues((v) => ({
+      ...v,
+      wifRules: [...v.wifRules, { role: '', conditions: [] }],
+    }))
+  }
+
+  function removeRule(index: number) {
+    setValues((v) => ({
+      ...v,
+      wifRules: v.wifRules.filter((_, i) => i !== index),
+    }))
+  }
+
+  function addCondition(ruleIndex: number) {
+    setRule(ruleIndex, (r) => ({
+      ...r,
+      conditions: [...r.conditions, { claim: '', anyOf: '' }],
+    }))
+  }
+
+  function removeCondition(ruleIndex: number, condIndex: number) {
+    setRule(ruleIndex, (r) => ({
+      ...r,
+      conditions: r.conditions.filter((_, i) => i !== condIndex),
+    }))
+  }
 
   return (
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
@@ -239,6 +341,7 @@ export function RealmForm({
           >
             <option value="oidc">oidc</option>
             <option value="credential_forwarding">credential_forwarding</option>
+            <option value="workload_identity">workload_identity</option>
           </Select>
         ) : (
           <Input
@@ -620,6 +723,193 @@ export function RealmForm({
         </Fieldset>
       )}
 
+      {isWorkloadIdentity && (
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>Workload-identity federation</Legend>
+          <FieldGroup>
+            <Field>
+              <Label>Issuer URL</Label>
+              <Input
+                type="text"
+                value={values.issuer}
+                onChange={(e) => set('issuer', e.target.value)}
+                placeholder="https://token.actions.githubusercontent.com"
+                invalid={!!errors.issuer}
+              />
+              <Description>
+                The OIDC issuer whose public JWKS validates incoming tokens.
+              </Description>
+              {errors.issuer && (
+                <ErrorMessage role="alert">{errors.issuer}</ErrorMessage>
+              )}
+            </Field>
+
+            <Field>
+              <Label>Allowed audiences</Label>
+              <Input
+                type="text"
+                value={values.allowed_audiences}
+                onChange={(e) => set('allowed_audiences', e.target.value)}
+                placeholder="https://forge.example.com"
+                invalid={!!errors.allowed_audiences}
+              />
+              <ListHint />
+              {errors.allowed_audiences && (
+                <ErrorMessage role="alert">
+                  {errors.allowed_audiences}
+                </ErrorMessage>
+              )}
+            </Field>
+
+            <Field>
+              <Label>Clock skew (seconds)</Label>
+              <Input
+                type="number"
+                min={0}
+                value={values.clock_skew_seconds}
+                onChange={(e) => set('clock_skew_seconds', e.target.value)}
+                placeholder="60"
+                invalid={!!errors.clock_skew_seconds}
+              />
+              {errors.clock_skew_seconds && (
+                <ErrorMessage role="alert">
+                  {errors.clock_skew_seconds}
+                </ErrorMessage>
+              )}
+            </Field>
+
+            <CheckboxField>
+              <Checkbox
+                checked={values.allow_http_issuer}
+                onChange={(c) => set('allow_http_issuer', c)}
+              />
+              <Label>Allow plain-HTTP issuer (testing only)</Label>
+            </CheckboxField>
+
+            <Field>
+              <Label>Rules</Label>
+              <Description>
+                Ordered; the first rule whose conditions all match grants its
+                role. A rule with no conditions is a catch-all.
+              </Description>
+              {errors.wifRules && (
+                <ErrorMessage role="alert">{errors.wifRules}</ErrorMessage>
+              )}
+            </Field>
+
+            <div className="space-y-4">
+              {values.wifRules.map((rule, ri) => (
+                <div
+                  key={ri}
+                  className="rounded-lg border border-zinc-950/10 p-4 dark:border-white/10"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <Field className="flex-1">
+                      <Label>Role</Label>
+                      <Input
+                        type="text"
+                        value={rule.role}
+                        onChange={(e) =>
+                          setRule(ri, (r) => ({ ...r, role: e.target.value }))
+                        }
+                        placeholder="ci-deployer"
+                        invalid={!!errors[`wifRule.${ri}.role`]}
+                      />
+                      {errors[`wifRule.${ri}.role`] && (
+                        <ErrorMessage role="alert">
+                          {errors[`wifRule.${ri}.role`]}
+                        </ErrorMessage>
+                      )}
+                    </Field>
+                    <Button
+                      type="button"
+                      plain
+                      onClick={() => removeRule(ri)}
+                      aria-label={`Remove rule ${ri + 1}`}
+                    >
+                      Remove rule
+                    </Button>
+                  </div>
+
+                  <div className="mt-4 space-y-3">
+                    {rule.conditions.map((cond, ci) => (
+                      <div
+                        key={ci}
+                        className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
+                      >
+                        <Field>
+                          <Label>Claim</Label>
+                          <Input
+                            type="text"
+                            value={cond.claim}
+                            onChange={(e) =>
+                              setRule(ri, (r) => ({
+                                ...r,
+                                conditions: r.conditions.map((c, i) =>
+                                  i === ci ? { ...c, claim: e.target.value } : c,
+                                ),
+                              }))
+                            }
+                            placeholder="repository"
+                            invalid={!!errors[`wifRule.${ri}.cond.${ci}.claim`]}
+                          />
+                          {errors[`wifRule.${ri}.cond.${ci}.claim`] && (
+                            <ErrorMessage role="alert">
+                              {errors[`wifRule.${ri}.cond.${ci}.claim`]}
+                            </ErrorMessage>
+                          )}
+                        </Field>
+                        <Field>
+                          <Label>Any of</Label>
+                          <Input
+                            type="text"
+                            value={cond.anyOf}
+                            onChange={(e) =>
+                              setRule(ri, (r) => ({
+                                ...r,
+                                conditions: r.conditions.map((c, i) =>
+                                  i === ci ? { ...c, anyOf: e.target.value } : c,
+                                ),
+                              }))
+                            }
+                            placeholder="acme/api, acme/web"
+                            invalid={!!errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
+                          />
+                          <ListHint />
+                          {errors[`wifRule.${ri}.cond.${ci}.anyOf`] && (
+                            <ErrorMessage role="alert">
+                              {errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
+                            </ErrorMessage>
+                          )}
+                        </Field>
+                        <Button
+                          type="button"
+                          plain
+                          onClick={() => removeCondition(ri, ci)}
+                          aria-label={`Remove condition ${ci + 1} of rule ${ri + 1}`}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ))}
+                    <Button
+                      type="button"
+                      outline
+                      onClick={() => addCondition(ri)}
+                    >
+                      Add condition
+                    </Button>
+                  </div>
+                </div>
+              ))}
+              <Button type="button" outline onClick={addRule}>
+                Add rule
+              </Button>
+            </div>
+          </FieldGroup>
+        </Fieldset>
+      )}
+
       {serverError && (
         <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
           {serverError}
@@ -701,6 +991,16 @@ function isBlankNumberList(raw: string): boolean {
   return parseList(raw).every((s) => Number.isFinite(Number(s)))
 }
 
+/** A parseable absolute URL (http/https or otherwise). */
+function isUrlIsh(raw: string): boolean {
+  try {
+    new URL(raw.trim())
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Comma-separated text -> trimmed, non-empty entries. */
 export function parseList(raw: string): string[] {
   return raw
@@ -777,6 +1077,25 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     const negative = parseNumber(values.negative_ttl_secs)
     if (negative !== undefined) config.negative_ttl_secs = negative
     if (values.key_pepper !== '') config.key_pepper = values.key_pepper
+    return config
+  }
+  if (values.kind === 'workload_identity') {
+    const config: WorkloadIdentityConfig = {
+      issuer: values.issuer.trim(),
+      allowed_audiences: parseList(values.allowed_audiences),
+      allow_http_issuer: values.allow_http_issuer,
+      rules: values.wifRules.map((rule) => {
+        const conditions = rule.conditions.map((cond) => ({
+          claim: cond.claim.trim(),
+          any_of: parseList(cond.anyOf),
+        }))
+        return conditions.length > 0
+          ? { role: rule.role.trim(), conditions }
+          : { role: rule.role.trim() }
+      }),
+    }
+    const skew = parseNumber(values.clock_skew_seconds)
+    if (skew !== undefined) config.clock_skew_seconds = skew
     return config
   }
   // local (and reserved kinds): no config.

@@ -66,7 +66,9 @@ pub async fn require_admin(
         Principal::Anonymous { .. } | Principal::Unauthenticated => {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         }
-        Principal::User { .. } => {}
+        // A user or a WIF workload may hold the admin role; the RBAC check below
+        // is authoritative.
+        Principal::User { .. } | Principal::Workload { .. } => {}
     }
     if state.authz.is_global_admin(&principal).await {
         next.run(req).await

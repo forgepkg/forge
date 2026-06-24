@@ -146,8 +146,11 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
 /// credentials), authenticated-but-forbidden → 403, anonymous-denied → 401.
 fn authz_denied(principal: &Principal) -> Response {
     match principal {
-        // An authenticated user who is nonetheless denied (future RBAC) → 403.
-        Principal::User { .. } => (StatusCode::FORBIDDEN, "forbidden").into_response(),
+        // An authenticated identity (user or WIF workload) that is nonetheless
+        // denied by RBAC → 403.
+        Principal::User { .. } | Principal::Workload { .. } => {
+            (StatusCode::FORBIDDEN, "forbidden").into_response()
+        }
         // No/insufficient identity → 401 so the client knows to authenticate.
         Principal::Anonymous { .. } | Principal::Unauthenticated => {
             (StatusCode::UNAUTHORIZED, "authentication required").into_response()
