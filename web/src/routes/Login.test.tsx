@@ -290,17 +290,36 @@ describe('Login', () => {
       ).not.toBeInTheDocument()
     })
 
-    it('shows an error with a retry when login-options is unavailable', async () => {
-      mockAuthApi({ options: undefined }) // 500 from /auth/login-options
+    it('falls back to password sign-in when login-options is unavailable', async () => {
+      const user = userEvent.setup()
+      let loggedIn: unknown = null
+      mockAuthApi({
+        options: undefined, // 500 from /auth/login-options
+        onLogin: (body) => {
+          loggedIn = body
+          return json({
+            user_id: 2,
+            username: 'alice',
+            is_admin: false,
+            csrf_token: 'csrf-fallback',
+          })
+        },
+      })
 
-      await renderLogin()
+      const router = await renderLogin()
 
-      expect(await screen.findByRole('alert')).toHaveTextContent(
-        /could not load the sign-in options/i,
+      expect(await screen.findByRole('status')).toHaveTextContent(
+        /password sign-in is available/i,
       )
-      expect(
-        screen.getByRole('button', { name: 'Try again' }),
-      ).toBeInTheDocument()
+      await user.type(screen.getByLabelText('Username'), 'alice')
+      await user.type(screen.getByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(loggedIn).toEqual({ username: 'alice', password: 'hunter2' }),
+      )
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(getCsrfToken()).toBe('csrf-fallback')
       expect(screen.queryByLabelText('Registry token')).not.toBeInTheDocument()
     })
   })

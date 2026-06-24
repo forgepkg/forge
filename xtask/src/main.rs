@@ -9,10 +9,10 @@ mod proc;
 
 use proc::{Cmd, RunningCmd};
 use std::env;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::ExitCode;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::process::{ExitCode, ExitStatus};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Shared constants (mirror docker-compose.yml + forge.toml) ────────────────
 
@@ -26,7 +26,7 @@ const DOCKER_DB_URL: &str = "postgres://forge:forge@localhost:5433/forge";
 const LOCAL_DB_URL: &str = "postgres://forge:forge@localhost:5432/forge";
 
 /// Default base URL of a running forge-server (used by `seed`).
-const DEFAULT_FORGE_URL: &str = "http://localhost:8421";
+const DEFAULT_FORGE_URL: &str = "http://127.0.0.1:8421";
 
 /// Default forge-server HTTP port (mirrors forge.toml).
 const DEFAULT_FORGE_PORT: u16 = 8421;
@@ -327,6 +327,8 @@ fn run_dev_processes(server_cmd: Cmd) -> Result<(), String> {
     pnpm_install()?;
 
     let mut children = vec![server_cmd.spawn()?];
+    wait_for_forge_server(&mut children[0])?;
+
     match Cmd::new("pnpm")
         .args(["run", "dev"])
         .current_dir(WEB)
@@ -341,6 +343,33 @@ fn run_dev_processes(server_cmd: Cmd) -> Result<(), String> {
 
     print_dev_portals();
     wait_for_dev_processes(&mut children)
+}
+
+fn wait_for_forge_server(server: &mut RunningCmd) -> Result<(), String> {
+    let port = forge_server_port();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    eprintln!("waiting for forge-server on http://127.0.0.1:{port} ...");
+    loop {
+        if let Some(status) = server.try_wait()? {
+            return Err(format!(
+                "`{}` exited with {} before listening on {addr}",
+                server.label(),
+                status_desc(status)
+            ));
+        }
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            server.kill();
+            return Err(format!(
+                "timed out waiting for forge-server to listen on {addr}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn wait_for_dev_processes(children: &mut [RunningCmd]) -> Result<(), String> {
@@ -359,15 +388,19 @@ fn wait_for_dev_processes(children: &mut [RunningCmd]) -> Result<(), String> {
                 return Err(format!(
                     "`{}` exited with {}",
                     children[i].label(),
-                    status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "a signal".to_string())
+                    status_desc(status)
                 ));
             }
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn status_desc(status: ExitStatus) -> String {
+    status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "a signal".to_string())
 }
 
 /// For `--db local`: create the `forge` role + `forge` database on the host

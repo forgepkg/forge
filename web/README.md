@@ -16,7 +16,7 @@ a dependency version published within the last week (supply-chain hardening).
 ```bash
 pnpm install
 # Run the Rust server (forge-server) on http://localhost:8421 in another shell.
-FORGE_DEV_API_TARGET=http://localhost:8421 pnpm run dev   # Vite on :8420
+FORGE_DEV_API_TARGET=http://127.0.0.1:8421 pnpm run dev   # Vite on :8420
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to

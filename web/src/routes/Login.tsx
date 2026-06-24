@@ -28,6 +28,12 @@ interface LoginSearch {
   expired?: boolean
 }
 
+const passwordFallbackOptions: LoginOptions = {
+  mode: 'combined',
+  password: true,
+  oidc: [],
+}
+
 export const Route = createFileRoute('/login')({
   component: Login,
   validateSearch: (search: Record<string, unknown>): LoginSearch => ({
@@ -59,9 +65,11 @@ function Login() {
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
     staleTime: 60_000,
-    // Fail fast in front of a waiting user; a retry button is rendered instead.
+    // Fail fast; the page falls back to direct password sign-in.
     retry: false,
   })
+  const loginOptions =
+    options.data ?? (options.isError ? passwordFallbackOptions : undefined)
 
   return (
     <AuthLayout>
@@ -86,19 +94,19 @@ function Login() {
           </p>
         )}
 
-        {options.isError ? (
-          <div className="space-y-4">
-            <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-              Could not load the sign-in options. Is the server reachable?
-            </p>
-            <Button className="w-full" onClick={() => void options.refetch()}>
-              Try again
-            </Button>
-          </div>
-        ) : options.isLoading || !options.data ? (
+        {options.isError && (
+          <p
+            role="status"
+            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
+          >
+            Sign-in options could not be loaded. Password sign-in is available.
+          </p>
+        )}
+
+        {!loginOptions ? (
           <Text>Loading sign-in options…</Text>
-        ) : options.data.mode === 'combined' ? (
-          <CombinedLogin options={options.data} redirect={redirect} />
+        ) : loginOptions.mode === 'combined' ? (
+          <CombinedLogin options={loginOptions} redirect={redirect} />
         ) : (
           <IdentifierFirstLogin redirect={redirect} />
         )}

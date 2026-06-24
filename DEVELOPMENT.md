@@ -102,7 +102,7 @@ cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
 The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
-origin (default `http://localhost:8421`, override with `FORGE_DEV_API_TARGET`)
+origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
 `web-dev` binds Vite to IPv4 all-interfaces and prints local/network portal
