@@ -198,7 +198,12 @@ impl WorkloadIdentitySource {
     }
 
     /// Verify `token` against `realm` and map it to a [`Principal::Workload`].
-    /// Terminal: any failure is [`SourceOutcome::Invalid`] (no fall-through).
+    ///
+    /// **Terminal**: this is only called once a presented secret has been
+    /// positively identified as a JWT for `realm` (its `iss` matched), so every
+    /// failure returns [`SourceOutcome::Reject`] — the chain stops and the token
+    /// is *never* handed to a downstream source (so it cannot be reinterpreted as
+    /// an opaque API token or forwarded upstream as a password — design §8).
     async fn authenticate(&self, realm: &WorkloadIdentityRealm, token: &str) -> SourceOutcome {
         let auds: Vec<&str> = realm
             .config
@@ -214,7 +219,7 @@ impl WorkloadIdentitySource {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(realm = %realm.realm_name, error = %e, "WIF token validation failed");
-                return SourceOutcome::Invalid;
+                return SourceOutcome::Reject;
             }
         };
 
@@ -224,17 +229,28 @@ impl WorkloadIdentitySource {
                 subject = %verified.subject,
                 "WIF token matched no claim rule (default deny)"
             );
-            return SourceOutcome::Invalid;
+            return SourceOutcome::Reject;
         };
 
         match authz_dao::role_id_by_name(&self.pool, role_name).await {
             Ok(Some(role_id)) => {
-                tracing::info!(
-                    realm = %realm.realm_name,
-                    subject = %verified.subject,
-                    role = %role_name,
-                    "WIF workload authenticated"
-                );
+                if role_name == authz_dao::ADMIN_ROLE {
+                    // A WIF rule mapping to the built-in admin role mints a
+                    // full-admin CI principal — surface that prominently so a
+                    // misconfigured rule is auditable, not silent.
+                    tracing::warn!(
+                        realm = %realm.realm_name,
+                        subject = %verified.subject,
+                        "WIF workload authenticated as a GLOBAL ADMIN (rule maps to the admin role)"
+                    );
+                } else {
+                    tracing::info!(
+                        realm = %realm.realm_name,
+                        subject = %verified.subject,
+                        role = %role_name,
+                        "WIF workload authenticated"
+                    );
+                }
                 SourceOutcome::Authenticated(Principal::Workload {
                     realm_id: realm.realm_id,
                     role_id,
@@ -246,11 +262,11 @@ impl WorkloadIdentitySource {
                     role = %role_name,
                     "WIF rule maps to a non-existent role (deny)"
                 );
-                SourceOutcome::Invalid
+                SourceOutcome::Reject
             }
             Err(e) => {
                 tracing::error!(error = %e, "WIF role lookup failed");
-                SourceOutcome::Invalid
+                SourceOutcome::Reject
             }
         }
     }
@@ -264,13 +280,19 @@ impl PrincipalSource for WorkloadIdentitySource {
             return SourceOutcome::NoCredentials;
         }
 
-        // Resolve the realm snapshot. On a snapshot error we cannot route, so we
-        // decline (the request falls through to the token/Basic sources and is
-        // denied there if it carried no other valid credential) — we never grant.
+        // Resolve the realm snapshot. On a snapshot error we cannot route. If any
+        // presented secret structurally parses as a JWT we **reject** (terminal)
+        // rather than let it fall through to the password/token sources — a JWT
+        // must never be reinterpreted as a password, even while the realm table
+        // is unreadable. A request carrying no JWT-shaped secret declines, so the
+        // (separately fail-closed) token/Basic sources handle it as before.
         let snap = match self.realms.snapshot().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "WIF realm snapshot failed");
+                if candidates.iter().any(|s| jwt_issuer(s).is_some()) {
+                    return SourceOutcome::Reject;
+                }
                 return SourceOutcome::NoCredentials;
             }
         };
