@@ -19,7 +19,7 @@ pub mod eval;
 
 pub use cache::{
     invalidate_all, invalidate_anonymous, invalidate_user, load_anonymous_effective,
-    load_user_effective, LoadError, DEFAULT_TTL, NS_AUTHZ,
+    load_role_effective, load_user_effective, LoadError, DEFAULT_TTL, NS_AUTHZ,
 };
 pub use eval::{
     parse_token_scope, Action, CompiledSelector, EffectiveSet, Grant, PackageFilter,

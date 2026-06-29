@@ -360,6 +360,93 @@ describe('admin realms create', () => {
     })
   })
 
+  it('switching to workload_identity builds the rules config', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body
+        return json(realm({ id: 9, kind: 'workload_identity' }), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/admin/realms/new')
+
+    await u.selectOptions(
+      await screen.findByLabelText('Kind'),
+      'workload_identity',
+    )
+    expect(screen.queryByLabelText('Client ID')).not.toBeInTheDocument()
+
+    await u.type(screen.getByLabelText('Name'), 'wif')
+    await u.type(
+      screen.getByLabelText('Issuer URL'),
+      'https://token.actions.githubusercontent.com',
+    )
+    await u.type(
+      screen.getByLabelText('Allowed audiences'),
+      'https://forge.example.com',
+    )
+
+    // Add a rule with one condition.
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    await u.type(screen.getByLabelText('Role'), 'ci-deployer')
+    await u.click(screen.getByRole('button', { name: 'Add condition' }))
+    await u.type(screen.getByLabelText('Claim'), 'repository')
+    await u.type(screen.getByLabelText('Any of'), 'acme/api, acme/web')
+
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      kind: 'workload_identity',
+      name: 'wif',
+      enabled: true,
+      config: {
+        issuer: 'https://token.actions.githubusercontent.com',
+        allowed_audiences: ['https://forge.example.com'],
+        allow_http_issuer: false,
+        rules: [
+          {
+            role: 'ci-deployer',
+            conditions: [
+              { claim: 'repository', any_of: ['acme/api', 'acme/web'] },
+            ],
+          },
+        ],
+      },
+    })
+  })
+
+  it('validates required workload_identity fields inline and does not POST', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body
+        return json(realm(body as Partial<RealmView>), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/admin/realms/new')
+
+    await u.selectOptions(
+      await screen.findByLabelText('Kind'),
+      'workload_identity',
+    )
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    expect(
+      await screen.findByText('At least one allowed audience is required.'),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText('At least one rule is required.'),
+    ).toBeInTheDocument()
+    expect(posted).toBeNull()
+  })
+
   it('surfaces a server 400 inline', async () => {
     mockApi({
       realms: [],

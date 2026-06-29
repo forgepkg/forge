@@ -288,7 +288,7 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             }
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
-        KIND_WORKLOAD_IDENTITY => Err("workload_identity realms land in slice 12.8".into()),
+        KIND_WORKLOAD_IDENTITY => super::wif::validate_workload_identity_config(config),
         other => Err(format!("unknown realm kind {other:?}")),
     }
 }
@@ -367,6 +367,10 @@ pub struct RealmSnapshot {
     pub wire_password_enabled: bool,
     /// The (at most one — admin API invariant) enabled OIDC realm's runtime.
     pub oidc: Option<OidcRealmRuntime>,
+    /// Enabled `workload_identity` (WIF) realms (slice 12.8), each with its
+    /// issuer-scoped JWKS verifier. Multiple issuers are supported (GitLab,
+    /// GitHub Actions, …) — unlike OIDC there is no single-realm invariant.
+    pub workload: Vec<super::wif::WorkloadIdentityRealm>,
 }
 
 impl RealmSnapshot {
@@ -434,6 +438,7 @@ impl RealmAuth {
         let mut providers: Vec<Box<dyn AuthProvider>> = Vec::new();
         let mut has_cred_forward = false;
         let mut oidc: Option<OidcRealmRuntime> = None;
+        let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
 
         for realm in realms.iter().filter(|r| r.enabled) {
             match realm.kind.as_str() {
@@ -466,7 +471,14 @@ impl RealmAuth {
                     }
                 }
                 KIND_WORKLOAD_IDENTITY => {
-                    tracing::debug!(realm = %realm.name, "workload_identity realm present; ignored until slice 12.8");
+                    match super::wif::WorkloadIdentityRealm::build(realm, &self.cache) {
+                        Ok(w) => workload.push(w),
+                        // One malformed WIF realm must not take down the others; its
+                        // own tokens fail (closed) until an admin fixes it.
+                        Err(e) => {
+                            tracing::error!(realm = %realm.name, error = %e, "workload_identity realm skipped");
+                        }
+                    }
                 }
                 other => {
                     tracing::error!(realm = %realm.name, kind = %other, "unknown realm kind skipped");
@@ -487,6 +499,7 @@ impl RealmAuth {
             chain,
             wire_password_enabled,
             oidc,
+            workload,
         })
     }
 
@@ -833,12 +846,24 @@ mod tests {
     }
 
     #[test]
-    fn local_config_is_empty_workload_identity_reserved() {
+    fn local_config_is_empty_and_workload_identity_validates() {
         assert_eq!(
             validate_config(KIND_LOCAL, &json!({"anything": 1})).unwrap(),
             json!({})
         );
+        // workload_identity now validates through the WIF module (slice 12.8):
+        // an empty config is rejected (no issuer/audiences/rules)…
         assert!(validate_config(KIND_WORKLOAD_IDENTITY, &json!({})).is_err());
+        // …and a complete one is accepted.
+        assert!(validate_config(
+            KIND_WORKLOAD_IDENTITY,
+            &json!({
+                "issuer": "https://gitlab.example",
+                "allowed_audiences": ["forge"],
+                "rules": [{"role": "ci", "conditions": [{"claim": "sub", "any_of": ["s"]}]}],
+            }),
+        )
+        .is_ok());
         assert!(validate_config("nope", &json!({})).is_err());
     }
 

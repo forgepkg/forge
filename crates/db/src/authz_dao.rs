@@ -218,6 +218,51 @@ pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRo
     })
 }
 
+/// Load the effective set granted by a **single role** (`role.id = role_id`).
+///
+/// Unlike [`load_user_effective`], this resolves a role directly — used by the
+/// workload-identity (WIF) auth path (slice 12.8), where a validated CI token
+/// is mapped to exactly one forge role and authorized by that role's grants
+/// (no `app_user` row, no `user_role` membership). `is_admin` is true iff the
+/// role *is* the built-in `admin` role. A non-existent `role_id` yields an empty
+/// set (fail-closed deny-all).
+pub async fn load_role_effective(pool: &PgPool, role_id: i64) -> sqlx::Result<EffectiveRows> {
+    let is_admin = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM role WHERE id = $1 AND name = $2
+        ) AS "exists!"
+        "#,
+        role_id,
+        ADMIN_ROLE,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            rp.action            AS action,
+            rp.repository_id     AS repository_id,
+            cs.id                AS "selector_id?",
+            cs.includes          AS "includes?",
+            cs.excludes          AS "excludes?"
+        FROM repository_privilege rp
+        LEFT JOIN content_selector cs ON cs.id = rp.selector_id
+        WHERE rp.role_id = $1
+        "#,
+        role_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let grants = rows
+        .into_iter()
+        .map(|r| map_grant_row(into_query_row!(r)))
+        .collect();
+    Ok(EffectiveRows { is_admin, grants })
+}
+
 /// Map a raw effective-set query row into an [`EffectiveGrantRow`]. The selector
 /// columns are present together (left-join) or all NULL (unscoped grant).
 fn map_grant_row(r: EffectiveQueryRow) -> EffectiveGrantRow {

@@ -58,12 +58,14 @@ use crate::state::AppState;
 
 mod realms;
 mod redirect;
+mod wif;
 
 pub use realms::{
     merge_secrets, redact_config, seed_auth_realms, validate_config, OidcRealmRuntime, RealmAuth,
     RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
+pub use wif::WorkloadIdentitySource;
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to
 /// clone (the metadata client + session service are `Arc`/pool-backed).

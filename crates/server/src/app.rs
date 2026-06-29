@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::auth::WorkloadIdentitySource;
 use anyhow::Context;
 use axum::routing::any;
 use axum::Router;
@@ -41,6 +42,15 @@ use crate::web_ui::spa_service;
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
+        // WIF first (slice 12.8): a presented JWT whose `iss` names a configured
+        // workload_identity realm is claimed here — including one passed as the
+        // `X-NuGet-ApiKey` or the Basic password — so it is never treated as an
+        // opaque token or forwarded upstream as a password. A non-WIF secret
+        // returns NoCredentials and falls through to the sources below.
+        Box::new(WorkloadIdentitySource::new(
+            state.realms.clone(),
+            pool.clone(),
+        )),
         Box::new(TokenHeaderSource::new(pool.clone())),
         Box::new(BasicAuthSource::with_source(
             pool.clone(),

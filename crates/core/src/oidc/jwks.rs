@@ -272,6 +272,36 @@ impl OidcMetadataClient {
         token: &str,
         params: &VerifyParams,
     ) -> Result<Verified, OidcError> {
+        self.verify_jwt(
+            token,
+            &[params.audience.as_str()],
+            params.nonce.as_deref(),
+            params.leeway_seconds,
+        )
+        .await
+    }
+
+    /// Verify a JWT against this issuer, accepting **any** of `audiences`
+    /// (slice 12.8, WIF: a workload realm trusts a set of allowed audiences and
+    /// presents no nonce). This is the shared core of [`verify_id_token`]:
+    /// signature against the cached JWKS (one kid-miss refetch), the RSA-only
+    /// algorithm allowlist, `iss` = configured issuer, `aud` ∈ `audiences`,
+    /// `exp`/`nbf` with leeway, and an optional `nonce` equality check.
+    ///
+    /// `audiences` must be non-empty; an empty slice would make `jsonwebtoken`
+    /// skip the audience check, so callers must pass at least one.
+    pub async fn verify_jwt(
+        &self,
+        token: &str,
+        audiences: &[&str],
+        nonce: Option<&str>,
+        leeway_seconds: u64,
+    ) -> Result<Verified, OidcError> {
+        if audiences.is_empty() {
+            return Err(OidcError::InvalidToken(
+                "no allowed audiences configured".into(),
+            ));
+        }
         // 1. Read the header to find the signing-key id + declared algorithm.
         let header = decode_header(token).map_err(|e| OidcError::InvalidToken(e.to_string()))?;
         let kid = header.kid.clone();
@@ -310,9 +340,9 @@ impl OidcMetadataClient {
             Algorithm::PS512,
         ];
         validation.set_issuer(&[self.issuer.as_str()]);
-        validation.set_audience(&[params.audience.as_str()]);
+        validation.set_audience(audiences);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.leeway = params.leeway_seconds;
+        validation.leeway = leeway_seconds;
         validation.validate_exp = true;
         validation.validate_nbf = true;
 
@@ -322,8 +352,8 @@ impl OidcMetadataClient {
 
         // 5. Manual nonce check (not a registered claim, so jsonwebtoken does not
         //    validate it). Both single-use; the binding is what makes the
-        //    cookieless callback safe.
-        if let Some(expected) = &params.nonce {
+        //    cookieless callback safe. WIF passes `None` (non-interactive).
+        if let Some(expected) = nonce {
             match &claims.nonce {
                 Some(actual) if actual == expected => {}
                 _ => return Err(OidcError::NonceMismatch),

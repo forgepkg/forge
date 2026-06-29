@@ -222,6 +222,40 @@ session_absolute_ttl_seconds = 604800
         })
     }
 
+    /// Sign an arbitrary claim set with the active key and return the compact
+    /// JWT. Used by WIF (slice 12.8) e2e scenarios where a workload presents its
+    /// `id_token` directly (there is no `/token` exchange).
+    pub async fn sign_token(&self, claims: Value) -> String {
+        self.inner.lock().await.signer.sign(&claims)
+    }
+
+    /// Sign `claims` with a throwaway key whose `kid` is **not** in the published
+    /// JWKS — a bad/unknown-signature token for negative WIF tests.
+    pub async fn sign_token_unknown_key(&self, claims: Value) -> String {
+        Signer::new("wif-unknown").sign(&claims)
+    }
+
+    /// Build a WIF-style claim set: `iss` = this issuer, the given `aud`, a fresh
+    /// `exp`/`nbf`/`iat`, plus any extra claims (e.g. `project_path`) merged in.
+    /// No `nonce` (WIF is non-interactive).
+    pub fn wif_claims(&self, sub: &str, aud: &str, extra: Value) -> Value {
+        let now = chrono::Utc::now().timestamp();
+        let mut claims = json!({
+            "sub": sub,
+            "iss": self.base_url,
+            "aud": aud,
+            "exp": now + 3600,
+            "nbf": now - 10,
+            "iat": now - 10,
+        });
+        if let (Some(obj), Some(extra)) = (claims.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        claims
+    }
+
     /// Rotate the signing key: snapshot the **old** signer (so a test can still
     /// sign a token with the now-retired key), publish only the **new** key in
     /// the JWKS, and make it the active signer. Returns the retired signer's

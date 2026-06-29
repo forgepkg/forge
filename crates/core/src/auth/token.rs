@@ -151,8 +151,19 @@ pub enum SourceOutcome {
     Authenticated(Principal),
     /// No credentials of this source's kind were present.
     NoCredentials,
-    /// Credentials were present but invalid (wrong/expired/revoked).
+    /// Credentials were present but invalid (wrong/expired/revoked). This is
+    /// **non-terminal**: later sources are still tried (e.g. an invalid token
+    /// header must not stop a valid Basic password). It only blocks the
+    /// anonymous downgrade.
     Invalid,
+    /// The source **definitively owns** this credential and rejects it: stop the
+    /// chain immediately and return `Unauthorized`. Unlike [`Self::Invalid`],
+    /// **no later source is tried**. Used when a source has positively claimed a
+    /// credential (e.g. WIF recognized a presented JWT by its issuer) and must
+    /// not let it fall through to another source — so a rejected workload JWT can
+    /// never be re-interpreted as an opaque token or forwarded upstream as a
+    /// password.
+    Reject,
 }
 
 /// Errors from principal resolution.
@@ -362,8 +373,13 @@ pub use crate::auth::client_ip::AnonPolicy;
 ///
 /// Semantics (security-critical):
 /// * Sources run in order; the **first** `Authenticated` wins.
-/// * If no source authenticates but **any** reported `Invalid`, return
-///   `Err(Unauthorized)`. Bad credentials are *never* downgraded to anonymous.
+/// * A `Reject` from any source stops the chain immediately with
+///   `Err(Unauthorized)` — the source has positively claimed the credential and
+///   no later source may reinterpret it (WIF uses this so a rejected workload
+///   JWT is never forwarded to a password provider).
+/// * If no source authenticates or rejects but **any** reported `Invalid`,
+///   return `Err(Unauthorized)`. Bad credentials are *never* downgraded to
+///   anonymous.
 /// * If all sources report `NoCredentials`, apply the anonymous policy: become
 ///   [`Principal::Anonymous`] if the client IP is allowed, else
 ///   [`Principal::Unauthenticated`].
@@ -377,6 +393,8 @@ pub async fn resolve_principal(
     for source in sources {
         match source.resolve(headers, client_ip).await {
             SourceOutcome::Authenticated(p) => return Ok(p),
+            // Terminal: the source owns this credential and rejected it.
+            SourceOutcome::Reject => return Err(AuthError::Unauthorized),
             SourceOutcome::Invalid => saw_invalid = true,
             SourceOutcome::NoCredentials => {}
         }
@@ -482,6 +500,25 @@ mod tests {
         ];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off).await;
         assert_eq!(res, Ok(authed));
+    }
+
+    #[tokio::test]
+    async fn reject_is_terminal_and_blocks_a_later_authenticated() {
+        // A `Reject` (the source owns the credential and refuses it) must stop the
+        // chain immediately — a later source that WOULD authenticate is never
+        // reached. This is the WIF "no fall-through" guarantee: a rejected
+        // workload JWT can't be re-accepted (or forwarded) by a downstream source.
+        let authed = Principal::User {
+            user_id: 1,
+            token_id: None,
+            is_admin: true,
+        };
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::Reject)),
+            Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+        ];
+        let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
+        assert_eq!(res, Err(AuthError::Unauthorized));
     }
 
     #[tokio::test]

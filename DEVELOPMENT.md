@@ -26,6 +26,14 @@ versitygw (**:8422**), then runs both the Rust API (**:8421**) and Vite HMR
 (**:8420**). Open the printed Vite portal URL. Press **Ctrl-C** to stop both
 processes; `cargo xtask down` stops the containers.
 
+> **Note on Ctrl-C.** Pressing Ctrl-C is the normal, supported way to stop
+> `cargo xtask dev`. The terminal delivers the interrupt to the whole process
+> group, so `pnpm`/Vite receives it directly and prints `[ELIFECYCLE] Command
+> failed.` (and the command exits non-zero). This is harmless shutdown noise,
+> **not** a real failure — all child processes (Rust API + Vite) are stopped.
+> `xtask` is intentionally dependency-free and `std` offers no signal-handler
+> API, so it does not trap the interrupt to suppress that message.
+
 `xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
 Makefile + Justfile — there is nothing extra to install (no `make`, no `just`).
 The `cargo xtask` alias is wired up in [`.cargo/config.toml`](./.cargo/config.toml).

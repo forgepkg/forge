@@ -55,7 +55,7 @@ impl From<&AuthRealm> for RealmView {
 /// Create-realm request body.
 #[derive(Debug, Deserialize)]
 pub struct CreateRealm {
-    /// `local` | `oidc` | `credential_forwarding` (workload_identity is 12.8).
+    /// `local` | `oidc` | `credential_forwarding` | `workload_identity`.
     pub kind: String,
     pub name: String,
     #[serde(default = "default_true")]

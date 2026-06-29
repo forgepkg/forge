@@ -18,7 +18,7 @@ import { httpClient } from '~/lib/httpClient'
  *  - `PUT /admin/realms/order` must contain **every** realm id exactly once.
  */
 
-/** Realm kinds. `workload_identity` is reserved for §12.8. */
+/** Realm kinds. */
 export type RealmKind = 'local' | 'oidc' | 'credential_forwarding' | 'workload_identity'
 
 /** OIDC realm config (redacted on read: `client_secret` -> `client_secret_set`). */
@@ -64,10 +64,42 @@ export interface CredentialForwardingConfig {
   key_pepper_set?: boolean
 }
 
+/**
+ * A condition within a workload-identity rule: the named claim's value must
+ * equal one of `any_of`.
+ */
+export interface WorkloadIdentityCondition {
+  claim: string
+  any_of: string[]
+}
+
+/**
+ * A workload-identity rule: grants `role` when ALL `conditions` match (AND).
+ * An empty (or omitted) `conditions` list is a catch-all (any token).
+ */
+export interface WorkloadIdentityRule {
+  role: string
+  conditions?: WorkloadIdentityCondition[]
+}
+
+/**
+ * Workload-identity-federation (WIF) realm config. The issuer JWKS is public,
+ * so — unlike oidc/credential_forwarding — there are no write-only secrets and
+ * no read-side redaction.
+ */
+export interface WorkloadIdentityConfig {
+  issuer: string
+  allowed_audiences: string[]
+  allow_http_issuer?: boolean
+  clock_skew_seconds?: number
+  rules: WorkloadIdentityRule[]
+}
+
 /** Kind-specific config; `local` has none. */
 export type RealmConfig =
   | OidcRealmConfig
   | CredentialForwardingConfig
+  | WorkloadIdentityConfig
   | Record<string, never>
 
 /** Redacted realm view (`GET /admin/realms[/{id}]`). */
