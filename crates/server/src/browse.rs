@@ -201,7 +201,7 @@ pub async fn search_packages(
         if !state.authz.can_read(&principal, repo).await {
             continue;
         }
-        let ops = match state.read_ops_for(repo, principal) {
+        let ops = match state.read_ops_for(repo, principal).await {
             Ok(o) => o,
             // A misconfigured repo (e.g. nested group) is skipped, not fatal.
             Err(_) => continue,
@@ -327,8 +327,16 @@ pub async fn package_detail(
 
     let format = state.formats.for_repository(&repo);
     let lower = format.lower_id(&id);
+    if !state
+        .authz
+        .package_filter(&principal, &repo)
+        .await
+        .allows(&lower)
+    {
+        return (StatusCode::NOT_FOUND, "package not found").into_response();
+    }
 
-    let ops = match state.read_ops_for(&repo, principal) {
+    let ops = match state.read_ops_for(&repo, principal).await {
         Ok(o) => o,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };

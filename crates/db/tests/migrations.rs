@@ -16,6 +16,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "repository",
     "group_member",
     "blob",
+    "blob_ingest",
     "blob_outbox",
     "component",
     "asset",
@@ -38,6 +39,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "content_selector",
     "repository_privilege",
     "user_role",
+    // 0012_trusted_publish_audit.sql
+    "trusted_publish_audit",
 ];
 
 /// Columns `0004_credforward.sql` adds to `app_user` (provenance): (table, column).
@@ -527,4 +530,35 @@ async fn migrations_create_all_expected_tables() {
         dup_grant.is_err(),
         "repository_privilege_uq must collapse duplicate (role, ANY, action, no-selector) edges"
     );
+
+    // 0013: issuer routing is unambiguous among enabled WIF realms, including
+    // raw rows that differ only by a trailing slash.
+    sqlx::query(
+        r#"INSERT INTO auth_realm (kind, name, enabled, priority, config)
+           VALUES ('workload_identity', 'wif-one', true, 100,
+                   '{"issuer":"https://issuer.example"}'::jsonb)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("first enabled WIF issuer is accepted");
+    let duplicate_wif_issuer = sqlx::query(
+        r#"INSERT INTO auth_realm (kind, name, enabled, priority, config)
+           VALUES ('workload_identity', 'wif-two', true, 110,
+                   '{"issuer":"  https://issuer.example/  "}'::jsonb)"#,
+    )
+    .execute(&pool)
+    .await;
+    let duplicate_wif_issuer =
+        duplicate_wif_issuer.expect_err("enabled WIF issuer must be unique after normalization");
+    match duplicate_wif_issuer {
+        sqlx::Error::Database(error) => {
+            assert_eq!(error.code().as_deref(), Some("23505"));
+            assert_eq!(
+                error.constraint(),
+                Some("auth_realm_enabled_wif_issuer_uq"),
+                "0013's DB index, not only the API pre-check, must reject the duplicate"
+            );
+        }
+        other => panic!("expected unique-constraint error, got {other:?}"),
+    }
 }

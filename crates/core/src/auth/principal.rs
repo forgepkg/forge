@@ -48,6 +48,25 @@ pub enum Principal {
         /// `role.id` the matched claim-rule granted. The authz seam resolves
         /// this role's effective set (deny-all if the role was since deleted).
         role_id: i64,
+        /// SHA-256 of the normalized trusted issuer. The publish audit hook
+        /// compares this to the current realm row while holding a row lock, so
+        /// a stale realm snapshot cannot be attributed to a reconfigured issuer.
+        issuer_sha256: [u8; 32],
+        /// SHA-256 of the complete normalized workload-realm configuration.
+        /// Publish re-computes it from the locked database row so a peer's stale
+        /// audience, claim-rule, lifetime, or cache-policy snapshot cannot
+        /// authorize a package after an administrator changes the trust policy.
+        config_sha256: [u8; 32],
+        /// SHA-256 of `issuer || 0x00 || sub`. A fixed-size, pseudonymous audit
+        /// identifier that correlates publishes from the same workload without
+        /// putting provider claims into every authorization context.
+        subject_sha256: [u8; 32],
+        /// SHA-256 of the token's `jti`, when present. This supports immutable
+        /// publish provenance without retaining the bearer token or raw `jti`.
+        jti_sha256: Option<[u8; 32]>,
+        /// Validated token `iat` (Unix seconds), recorded with publish audit
+        /// events. WIF validation guarantees it is fresh and not in the future.
+        issued_at: i64,
     },
 }
 

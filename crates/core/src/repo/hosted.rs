@@ -21,11 +21,14 @@ use forge_db::{asset_dao, blob_dao, component_dao};
 use forge_storage::Cas;
 use sqlx::PgPool;
 
+use crate::auth::principal::Principal;
+use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
-    CacheInvalidator, DeleteOutcome, NupkgLocation, PublishOutcome, RegistrationEntry, RepoError,
-    RepoReadOps, SearchHit, SearchParams, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
-    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    CacheInvalidator, DeleteOutcome, NupkgLocation, PublishAuthorizationContext, PublishOutcome,
+    PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE,
+    NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
 /// Fetch raw bytes of a stored blob by its S3 object key.
@@ -73,6 +76,68 @@ impl HostedRepo {
     ) -> Vec<forge_db::model::Component> {
         comps.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
         comps
+    }
+
+    /// Build one exact search result while applying package authorization
+    /// before paging. Hosted search currently loads its small Slice-1 corpus in
+    /// one query, so doing this here avoids reloading that corpus once per
+    /// selector page.
+    async fn search_filtered(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let comps = component_dao::list_components_for_repo(&self.pool, repo_id).await?;
+        let q = params.q.trim().to_lowercase();
+
+        use std::collections::BTreeMap;
+        let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
+        for c in comps {
+            if !filter.allows(&c.name) || (!q.is_empty() && !c.name.contains(&q)) {
+                continue;
+            }
+            by_id.entry(c.name.clone()).or_default().push(c);
+        }
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for (_name, comps) in by_id {
+            let comps = self.sort_versions(comps);
+            let versions: Vec<VersionEntry> = comps
+                .into_iter()
+                .filter(|c| c.listed)
+                .filter(|c| params.prerelease || !is_prerelease(&c.version))
+                .map(|c| VersionEntry {
+                    original_id: c.original_id,
+                    version: c.version,
+                    version_original: c.version_original,
+                    listed: c.listed,
+                })
+                .collect();
+            if versions.is_empty() {
+                continue;
+            }
+            let latest = versions.last().expect("non-empty versions");
+            hits.push(SearchHit {
+                original_id: latest.original_id.clone(),
+                latest_version: latest.version.clone(),
+                versions,
+            });
+        }
+
+        hits.sort_by(|a, b| {
+            a.original_id
+                .to_lowercase()
+                .cmp(&b.original_id.to_lowercase())
+        });
+        let total_hits = hits.len();
+        let hits = hits
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        Ok(SearchResult { total_hits, hits })
     }
 }
 
@@ -210,68 +275,17 @@ impl RepoReadOps for HostedRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        let repo_id = self.repo_id(repo).await?;
-        // Fetch all components for the repo, then group/filter in memory. Slice
-        // 1 corpora are small; a SQL-side search is a later optimization.
-        let comps = component_dao::list_components_for_repo(&self.pool, repo_id).await?;
+        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+            .await
+    }
 
-        let q = params.q.trim().to_lowercase();
-
-        // Group by lowercased package name (the `component.name` column is
-        // already the lowercased id).
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
-        for c in comps {
-            // Free-text query matches the id substring (case-insensitive).
-            if !q.is_empty() && !c.name.contains(&q) {
-                continue;
-            }
-            by_id.entry(c.name.clone()).or_default().push(c);
-        }
-
-        // Build hits: filter versions by listed + prerelease, sort, keep ids
-        // that still have at least one visible version.
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, comps) in by_id {
-            let comps = self.sort_versions(comps);
-            let versions: Vec<VersionEntry> = comps
-                .into_iter()
-                .filter(|c| c.listed)
-                .filter(|c| params.prerelease || !is_prerelease(&c.version))
-                .map(|c| VersionEntry {
-                    original_id: c.original_id,
-                    version: c.version,
-                    version_original: c.version_original,
-                    listed: c.listed,
-                })
-                .collect();
-            if versions.is_empty() {
-                continue;
-            }
-            let latest = versions.last().unwrap();
-            hits.push(SearchHit {
-                original_id: latest.original_id.clone(),
-                latest_version: latest.version.clone(),
-                versions,
-            });
-        }
-
-        // Stable order by id for deterministic paging.
-        hits.sort_by(|a, b| {
-            a.original_id
-                .to_lowercase()
-                .cmp(&b.original_id.to_lowercase())
-        });
-
-        let total_hits = hits.len();
-        let skip = params.skip.min(total_hits);
-        let take = params.effective_take();
-        let page: Vec<SearchHit> = hits.into_iter().skip(skip).take(take).collect();
-
-        Ok(SearchResult {
-            total_hits,
-            hits: page,
-        })
+    async fn search_with_package_filter(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter).await
     }
 }
 
@@ -291,6 +305,11 @@ pub struct HostedWrite {
     /// Grace period before a dereferenced blob's S3 object is deleted (passed to
     /// [`blob_dao::decref_and_maybe_enqueue_delete`]).
     delete_grace: Duration,
+    /// Request actor and post-parse publication policy. Server requests always
+    /// set this; direct core callers retain legacy allow-all behavior.
+    publish_policy: Option<(Principal, Arc<dyn PublishPolicy>)>,
+    /// Action-specific filter for identifier-addressed delete/relist methods.
+    mutation_filter: PackageFilter,
 }
 
 impl HostedWrite {
@@ -312,7 +331,25 @@ impl HostedWrite {
             cas,
             cache,
             delete_grace,
+            publish_policy: None,
+            mutation_filter: PackageFilter::AllowAll,
         }
+    }
+
+    /// Attach request provenance and a post-parse/pre-CAS publication policy.
+    pub fn with_publish_policy(
+        mut self,
+        principal: Principal,
+        policy: Arc<dyn PublishPolicy>,
+    ) -> Self {
+        self.publish_policy = Some((principal, policy));
+        self
+    }
+
+    /// Attach the action-specific package filter used by delete/relist.
+    pub fn with_mutation_filter(mut self, filter: PackageFilter) -> Self {
+        self.mutation_filter = filter;
+        self
     }
 
     /// Resolve the repository row by name, erroring if missing or not hosted.
@@ -334,12 +371,10 @@ impl HostedWrite {
     /// Publish (or redeploy) a package read from `reader`.
     ///
     /// Pipeline (spec §6/§7, plan 7.1):
-    /// 1. Stream the bytes through [`Cas::store`], enforcing `max_upload_bytes`
-    ///    (a [`forge_storage::CasError::TooLarge`] surfaces as
-    ///    [`WriteError::TooLarge`] for the 413 mapping).
-    /// 2. Parse the temp `.nupkg` into a [`ParsedUpload`](crate::ParsedUpload)
-    ///    via the repository [`Format`]; a parse failure is
-    ///    [`WriteError::InvalidPackage`].
+    /// 1. Stage and hash the bytes locally, enforcing `max_upload_bytes`.
+    /// 2. Parse the temp `.nupkg` into a [`ParsedUpload`](crate::ParsedUpload),
+    ///    authorize its canonical id, then promote it into CAS. A parse failure
+    ///    is [`WriteError::InvalidPackage`]; a policy denial mutates no DB/S3.
     /// 3. Store the derived `.nuspec` bytes as their own CAS blob (dedup).
     /// 4. In **one** transaction: commit + incref both blobs, insert the
     ///    `component` and the `.nupkg`/`.nuspec` assets. A duplicate
@@ -358,17 +393,37 @@ impl HostedWrite {
     {
         let repo_row = self.hosted_repo(repo).await?;
 
-        // 1. Ingest the .nupkg through the CAS (temp file kept alive for parse).
-        let nupkg = self.cas.store(reader, max_upload_bytes).await?;
+        // 1. Stage the .nupkg locally. Staging hashes and size-bounds the bytes
+        // but deliberately does not touch the database or S3: authorization
+        // needs the canonical identity extracted by the format parser first.
+        let staged_nupkg = self.cas.stage(reader, max_upload_bytes).await?;
 
         // 2. Parse the package from the temp file. parse_upload is sync; the
         //    temp file is small enough that a blocking read is acceptable here.
         let parsed = {
-            let mut file = std::fs::File::open(&nupkg.temp_path).map_err(|e| {
+            let mut file = std::fs::File::open(&staged_nupkg.temp_path).map_err(|e| {
                 WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
             })?;
             self.format.parse_upload(&mut file)?
         };
+
+        let publish_context =
+            self.publish_policy
+                .as_ref()
+                .map(|(principal, _)| PublishAuthorizationContext {
+                    principal: *principal,
+                    package_id: parsed.id.clone(),
+                    package_version: parsed.version.clone(),
+                });
+        if let (Some((_, policy)), Some(context)) =
+            (self.publish_policy.as_ref(), publish_context.as_ref())
+        {
+            policy.authorize(context).await?;
+        }
+
+        // Authorization succeeded: the staged bytes may now be promoted into
+        // CAS (pending row + ingest lease + S3 object).
+        let nupkg = self.cas.commit(staged_nupkg).await?;
 
         // 3. Store the derived nuspec as its own CAS blob (dedup applies).
         let nuspec_reader = Cursor::new(parsed.nuspec_bytes.clone());
@@ -420,9 +475,11 @@ impl HostedWrite {
                 &mut tx,
                 &comp,
                 &nupkg_sha,
+                nupkg.ingest_token,
                 nupkg_size,
                 &nupkg_hash512,
                 &nuspec_sha,
+                nuspec.ingest_token,
                 nuspec_size,
                 &parsed,
             )
@@ -433,15 +490,23 @@ impl HostedWrite {
                 &mut tx,
                 repo_row.id,
                 &nupkg_sha,
+                nupkg.ingest_token,
                 nupkg_size,
                 &nupkg_hash512,
                 &nuspec_sha,
+                nuspec.ingest_token,
                 nuspec_size,
                 &parsed,
             )
             .await?;
             PublishOutcome::Created
         };
+
+        if let (Some((_, policy)), Some(context)) =
+            (self.publish_policy.as_ref(), publish_context.as_ref())
+        {
+            policy.record_in_transaction(context, &mut tx).await?;
+        }
 
         tx.commit().await.map_err(RepoError::from)?;
 
@@ -459,18 +524,20 @@ impl HostedWrite {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         repo_id: i64,
         nupkg_sha: &str,
+        nupkg_ingest_token: uuid::Uuid,
         nupkg_size: i64,
         nupkg_hash512: &str,
         nuspec_sha: &str,
+        nuspec_ingest_token: uuid::Uuid,
         nuspec_size: i64,
         parsed: &crate::ParsedUpload,
     ) -> Result<(), WriteError> {
-        blob_dao::commit_and_incref(tx, nupkg_sha)
+        blob_dao::commit_ingest_and_incref(tx, nupkg_sha, nupkg_ingest_token)
             .await
             .map_err(RepoError::from)?;
         // The nuspec may dedup onto the nupkg blob only if identical (it never
         // is), but a self-conflict is harmless: incref the (possibly same) row.
-        blob_dao::commit_and_incref(tx, nuspec_sha)
+        blob_dao::commit_ingest_and_incref(tx, nuspec_sha, nuspec_ingest_token)
             .await
             .map_err(RepoError::from)?;
 
@@ -512,9 +579,11 @@ impl HostedWrite {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         comp: &forge_db::model::Component,
         nupkg_sha: &str,
+        nupkg_ingest_token: uuid::Uuid,
         nupkg_size: i64,
         nupkg_hash512: &str,
         nuspec_sha: &str,
+        nuspec_ingest_token: uuid::Uuid,
         nuspec_size: i64,
         parsed: &crate::ParsedUpload,
     ) -> Result<(), WriteError> {
@@ -529,10 +598,10 @@ impl HostedWrite {
         .map_err(RepoError::from)?;
 
         // Incref the new blobs first.
-        blob_dao::commit_and_incref(tx, nupkg_sha)
+        blob_dao::commit_ingest_and_incref(tx, nupkg_sha, nupkg_ingest_token)
             .await
             .map_err(RepoError::from)?;
-        blob_dao::commit_and_incref(tx, nuspec_sha)
+        blob_dao::commit_ingest_and_incref(tx, nuspec_sha, nuspec_ingest_token)
             .await
             .map_err(RepoError::from)?;
 
@@ -646,6 +715,9 @@ impl HostedWrite {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
         let norm_ver = self.format.normalize_version(version)?;
+        if !self.mutation_filter.allows(&lower) {
+            return Ok(DeleteOutcome::NotFound);
+        }
 
         if !hard {
             let updated =
@@ -724,6 +796,9 @@ impl HostedWrite {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
         let norm_ver = self.format.normalize_version(version)?;
+        if !self.mutation_filter.allows(&lower) {
+            return Ok(DeleteOutcome::NotFound);
+        }
         let updated = component_dao::set_listed(&self.pool, repo_row.id, &lower, &norm_ver, true)
             .await
             .map_err(RepoError::from)?;

@@ -12,7 +12,12 @@ pub mod group;
 pub mod hosted;
 pub mod proxy;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+
+use crate::auth::principal::Principal;
+use crate::authz::PackageFilter;
 
 /// Re-export of the repository-kind enum so the protocol crates can branch on
 /// it without depending on `forge-db` directly.
@@ -57,8 +62,9 @@ pub enum RepoError {
 ///
 /// Distinct from [`RepoError`] so the protocol layer can map each variant to the
 /// right HTTP status: [`WriteError::TooLarge`] → 413, [`WriteError::Conflict`]
-/// → 409, [`WriteError::InvalidPackage`] → 400, and the wrapped [`RepoError`]
-/// for not-found / wrong-kind / db / storage.
+/// → 409, [`WriteError::InvalidPackage`] → 400,
+/// [`WriteError::ForbiddenPackage`] → 403, and the wrapped [`RepoError`] for
+/// not-found / wrong-kind / db / storage.
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     /// Repository / database / storage error (also covers not-found and
@@ -82,6 +88,15 @@ pub enum WriteError {
         id: String,
         /// Normalized version.
         version: String,
+    },
+    /// A package's canonical id is outside the selector attached to the
+    /// caller's write grant. This is surfaced as HTTP 403 for uploads; direct
+    /// id/version mutations are converted to `NotFound` before reaching this
+    /// error so they retain non-enumerating 404 semantics.
+    #[error("not authorized to publish package {id}")]
+    ForbiddenPackage {
+        /// Canonical (lowercased for NuGet) package id extracted by the format.
+        id: String,
     },
 }
 
@@ -281,12 +296,190 @@ pub trait RepoReadOps: Send + Sync {
     /// Search packages in `repo` honoring listed/prerelease filtering and
     /// `skip`/`take` paging.
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError>;
+
+    /// Search with an authorization predicate applied **before** paging and
+    /// total-count calculation.
+    ///
+    /// Production backends override this so they can apply the predicate while
+    /// building their in-memory/SQL result once. The default preserves the
+    /// contract for third-party/test implementations by walking pages; it is a
+    /// compatibility fallback, not the preferred implementation for a backend
+    /// whose `search` rescans its complete corpus.
+    async fn search_with_package_filter(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        if matches!(filter, PackageFilter::AllowAll) {
+            return self.search(repo, params).await;
+        }
+        if matches!(filter, PackageFilter::DenyAll) {
+            return Ok(SearchResult {
+                total_hits: 0,
+                hits: Vec::new(),
+            });
+        }
+
+        let mut allowed = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut page_params = params.clone();
+            page_params.skip = offset;
+            page_params.take = SearchParams::MAX_TAKE;
+            let page = self.search(repo, &page_params).await?;
+            let returned = page.hits.len();
+            allowed.extend(
+                page.hits
+                    .into_iter()
+                    .filter(|hit| filter.allows(&hit.original_id)),
+            );
+
+            offset = offset.saturating_add(returned);
+            if returned == 0 || offset >= page.total_hits {
+                break;
+            }
+        }
+
+        let total_hits = allowed.len();
+        let hits = allowed
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        Ok(SearchResult { total_hits, hits })
+    }
+}
+
+/// A package-filtering decorator around any repository read implementation.
+///
+/// This is the enforcement boundary shared by the NuGet protocol, browse API,
+/// hosted/proxy repositories, and group members. Identifier-addressed methods
+/// return the same empty/`None` result as an unknown package, preserving 404
+/// behavior at the route layer. Search is filtered before caller pagination
+/// through [`RepoReadOps::search_with_package_filter`], allowing production
+/// backends to scan their corpus once while preserving an exact `total_hits`.
+pub struct PackageFilteredReadOps {
+    inner: Arc<dyn RepoReadOps>,
+    filter: PackageFilter,
+}
+
+impl PackageFilteredReadOps {
+    /// Wrap `inner` with a precompiled package predicate.
+    pub fn new(inner: Arc<dyn RepoReadOps>, filter: PackageFilter) -> Self {
+        Self { inner, filter }
+    }
+
+    fn allows(&self, id: &str) -> bool {
+        self.filter.allows(id)
+    }
+}
+
+#[async_trait]
+impl RepoReadOps for PackageFilteredReadOps {
+    async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.list_versions(repo, id).await
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.resolve_nupkg(repo, id, version).await
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.resolve_nuspec(repo, id, version).await
+    }
+
+    async fn registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.registration(repo, id).await
+    }
+
+    async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
+        self.inner
+            .search_with_package_filter(repo, params, &self.filter)
+            .await
+    }
+
+    async fn search_with_package_filter(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        let combined = self.filter.clone().intersect(filter.clone());
+        self.inner
+            .search_with_package_filter(repo, params, &combined)
+            .await
+    }
 }
 
 /// A boxed async byte source, used by [`RepoWriteOps::store_upload`] so the
 /// trait stays object-safe (no generic method). The server bridges an axum
 /// multipart field stream into this via `tokio_util::io::StreamReader`.
 pub type UploadReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+
+/// Provenance available after a package has been parsed into canonical identity
+/// but before any CAS, S3, or component mutation occurs.
+///
+/// The same value is retained through the package transaction and passed to
+/// [`PublishPolicy::record_in_transaction`], allowing trusted-publishing audit
+/// records to commit atomically with the package without retaining raw claims.
+#[derive(Debug, Clone)]
+pub struct PublishAuthorizationContext {
+    /// Authenticated request actor (user or workload provenance).
+    pub principal: Principal,
+    /// Canonical package id extracted by the format parser.
+    pub package_id: String,
+    /// Canonical normalized package version extracted by the format parser.
+    pub package_version: String,
+}
+
+/// Request-specific policy and provenance hook for package publication.
+///
+/// `authorize` runs after local staging and format parsing but before the staged
+/// bytes are promoted into CAS. `record_in_transaction` runs after component and
+/// asset changes on their still-open transaction, immediately before commit.
+#[async_trait]
+pub trait PublishPolicy: Send + Sync {
+    /// Authorize this canonical package identity. A denial must be explicit and
+    /// must not cause CAS/DB/S3 mutation.
+    async fn authorize(&self, context: &PublishAuthorizationContext) -> Result<(), WriteError>;
+
+    /// Append request provenance in the package transaction. The default is a
+    /// no-op so non-audited callers keep their existing behavior.
+    async fn record_in_transaction(
+        &self,
+        _context: &PublishAuthorizationContext,
+        _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), WriteError> {
+        Ok(())
+    }
+}
 
 /// Write operations a NuGet **publish** route handler needs, abstracted (like
 /// [`RepoReadOps`]) so handlers can be unit-tested against an in-memory mock.

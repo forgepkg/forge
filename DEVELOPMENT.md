@@ -76,9 +76,10 @@ The UI is a **TanStack Router SPA** in [`web/`](./web), built by Vite into
 `web/dist/`. There is **no Node server in production**: the Rust `forge-server`
 serves `web/dist/` directly (a `ServeDir` with an `index.html` SPA fallback,
 mounted *after* `/admin`, `/browse`, `/v3`), and the browser calls the Rust HTTP
-API on the **same origin** with relative URLs. Auth today is token-paste (slice
-1 has no sessions yet): paste a repository token on the login screen; it is
-verified via `GET /admin/me` and stored in `localStorage`.
+API on the **same origin** with relative URLs. The SPA uses server-side
+password/OIDC sessions and restores its identity through `/auth/me`. Repository
+tokens remain credentials for NuGet clients; the browser does not use a pasted
+token in `localStorage` as its primary login model.
 
 The web project uses **pnpm** (pinned via `packageManager` in `web/package.json`)
 with a 7-day `minimumReleaseAge` cooldown (`web/pnpm-workspace.yaml`): pnpm will
@@ -209,12 +210,18 @@ Key knobs:
 Authentication is driven by ordered, web-managed **auth realms** stored in the
 `auth_realm` table: the built-in `local` password realm, optional `oidc`
 realms (interactive IdP login) and `credential_forwarding` realms (validate a
-login by forwarding it to an upstream like a Nexus over HTTP Basic). Manage
+login by forwarding it to an upstream like a Nexus over HTTP Basic), plus
+`workload_identity` realms for non-interactive, direct-token OIDC trusted
+publishing. Manage
 them under **Admin → Authentication** or via `/admin/realms` (CRUD +
 `PUT /admin/realms/order`); changes apply at runtime — no redeploy. Secrets in
 a realm config (`client_secret`, `key_pepper`) are write-only: responses carry
 `<key>_set` markers, and an update that omits/blanks a secret keeps the stored
 one.
+
+For trust-policy validation, direct-token replay/cache limits, and GitHub
+Actions/GitLab CI examples, see
+[Trusted publishing](./docs/trusted-publishing.md).
 
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
@@ -254,9 +261,11 @@ State-changing cookie endpoints (`logout`, token mint/revoke) require a
 Browser login uses the **OpenID Connect authorization-code flow with PKCE**.
 A successful login creates a server-side **session** (an opaque `forge_session`
 cookie → a `session` row; the DB stores only `sha256(cookie)`, like API tokens)
-and maps the IdP identity to an `app_user`. NuGet protocol endpoints are
-unchanged — clients still authenticate with `X-NuGet-ApiKey`/Basic; humans mint
-those keys after logging in (`POST /auth/tokens`).
+and maps the IdP identity to an `app_user`. Ordinary NuGet clients authenticate
+with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
+keys after logging in (`POST /auth/tokens`). A validated workload JWT may
+instead be supplied as the Basic password, `X-NuGet-ApiKey`, or
+`Authorization: Bearer` for the direct-token publishing flow.
 
 Configure the provider as an `oidc` **auth realm** (Admin → Authentication), or
 seed it via the legacy `[oidc]` TOML section / `FORGE_OIDC__*` env vars (see
@@ -381,6 +390,36 @@ cargo xtask docker-run         # run the image against the compose db + s3 on :8
 `docker-run` composes `docker-compose.yml` (db + versitygw) with
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
 http://localhost:8421.
+
+### Upgrade boundary for migration 0011
+
+Migration `0011_blob_deletion_reservations.sql` changes the CAS coordination
+protocol as well as the database schema: new instances acquire `blob_ingest`
+leases and create incarnation-qualified S3 keys. Instances built before this
+migration do neither. **Do not perform a rolling upgrade across this boundary.**
+
+For the first deployment containing migration 0011:
+
+1. disable old upload traffic **and** old blob-outbox/reconciler workers;
+2. stop every pre-0011 Forge instance, wait for active uploads, and ensure every
+   S3 DELETE issued by the old workers has reached an unambiguous terminal
+   state before continuing;
+3. take a coordinated PostgreSQL and object-store backup;
+4. start only the new version and let one instance apply migrations; and
+5. verify package upload and download before restoring normal replica count.
+
+Stopping the old process is not by itself proof that an S3 DELETE did not reach
+the backend: a timed-out or disconnected request can complete later. Use the
+object store's documented operation bound/active-request observability for the
+quiescence check. If the backend cannot provide that guarantee, copy/restore
+the coordinated backup into a clean object namespace before starting the new
+version. A delayed pre-0011 DELETE must never overlap a post-0011 revival of the
+same legacy object key.
+
+Do not roll back to a pre-0011 binary after new instances have accepted writes.
+A rollback requires restoring the coordinated PostgreSQL/object-store backup.
+Later versions that use the same lease and key protocol may again be deployed
+with the operator's normal rolling strategy.
 
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
 (`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=all`,

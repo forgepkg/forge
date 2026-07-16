@@ -124,6 +124,8 @@ fn ctx(kind: RepoKind, ops: MockOps, bytes: MockBytes) -> RouteContext {
         format: Arc::new(NugetFormat::new()),
         nupkg: Arc::new(bytes),
         write: None,
+        protocol_mutations_allowed: false,
+        package_filter: forge_core::authz::PackageFilter::AllowAll,
         max_upload_bytes: 16 * 1024 * 1024,
     }
 }
@@ -138,6 +140,8 @@ fn ctx_with_write(kind: RepoKind, write: MockWrite) -> RouteContext {
         format: Arc::new(NugetFormat::new()),
         nupkg: Arc::new(MockBytes::default()),
         write: Some(Arc::new(write)),
+        protocol_mutations_allowed: true,
+        package_filter: forge_core::authz::PackageFilter::AllowAll,
         max_upload_bytes: 16 * 1024 * 1024,
     }
 }
@@ -865,6 +869,20 @@ async fn push_requires_api_key() {
 }
 
 #[tokio::test]
+async fn push_rejects_non_protocol_principal_even_with_auth_header() {
+    let mut context = ctx_with_write(RepoKind::Hosted, MockWrite::found());
+    context.protocol_mutations_allowed = false;
+    let router = nuget_router(RepoKind::Hosted, context);
+    let (status, body) =
+        put_multipart(&router, "/package", Some("unrelated-header"), b"PK\x03\x04").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "API token or workload identity required"
+    );
+}
+
+#[tokio::test]
 async fn push_streams_bytes_and_returns_201() {
     let router = nuget_router(
         RepoKind::Hosted,
@@ -903,6 +921,17 @@ async fn push_too_large_maps_to_413() {
     let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
     let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn selector_denied_push_maps_to_403() {
+    let w = MockWrite::found();
+    *w.publish_result.lock().unwrap() = Some(Err(WriteError::ForbiddenPackage {
+        id: "Other.Lib".into(),
+    }));
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -960,4 +989,19 @@ async fn relist_requires_api_key() {
     // No API key → 401 (never anonymous), and the relist must not run.
     let (status, _h, _) = send(&router, "POST", "/package/Sample.Lib/1.0.0").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn selector_excluded_identifier_mutations_are_404() {
+    let mut ctx = ctx_with_write(RepoKind::Hosted, MockWrite::found());
+    ctx.package_filter = forge_core::authz::PackageFilter::DenyAll;
+    let router = nuget_router(RepoKind::Hosted, ctx);
+
+    let (delete_status, _, _) =
+        send_with_key(&router, "DELETE", "/package/Hidden.Lib/1.0.0", "key").await;
+    assert_eq!(delete_status, StatusCode::NOT_FOUND);
+
+    let (relist_status, _, _) =
+        send_with_key(&router, "POST", "/package/Hidden.Lib/1.0.0", "key").await;
+    assert_eq!(relist_status, StatusCode::NOT_FOUND);
 }

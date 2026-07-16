@@ -22,7 +22,12 @@
 //! upstream. The admin surface logs the configured host on save for that
 //! reason.
 
+use std::time::Duration;
+
 use url::Url;
+
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Reasons a URL is rejected by the outbound guard.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -63,6 +68,18 @@ pub fn validate_url(url: &str) -> Result<(), SsrfError> {
 pub fn outbound_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+}
+
+/// Build the stricter client used for OIDC discovery, JWKS, and token-endpoint
+/// metadata traffic. A matching-issuer JWT can trigger these calls on a cold
+/// cache, so both connection establishment and the full response need hard
+/// deadlines rather than occupying an auth request indefinitely.
+pub fn outbound_metadata_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(METADATA_CONNECT_TIMEOUT)
+        .timeout(METADATA_REQUEST_TIMEOUT)
         .build()
 }
 
@@ -108,5 +125,6 @@ mod tests {
     #[test]
     fn outbound_client_builds() {
         assert!(outbound_client().is_ok());
+        assert!(outbound_metadata_client().is_ok());
     }
 }

@@ -7,7 +7,8 @@
 //! invalidation) — and exposes the predicates the whole codebase routes through:
 //!
 //! * [`Authz::can_read`] — download / list / search.
-//! * [`Authz::can_write`] — push / delete / relist.
+//! * [`Authz::can_write`] — push / relist.
+//! * [`Authz::can_delete`] — unlist / delete.
 //! * [`Authz::can_admin`] — repository config + privilege management.
 //! * [`Authz::package_filter`] — the package-level visibility predicate applied
 //!   when listing/serving packages and re-applied on direct download.
@@ -84,13 +85,21 @@ impl Authz {
         self.allows(principal, Action::Read, repo.id).await
     }
 
-    /// May `principal` write (push / delete / relist) to `repo`?
+    /// May `principal` write (push / relist) to `repo`?
     ///
     /// Writing always requires a held `write` grant; anonymous callers can only
     /// write if the `anonymous` role was explicitly granted `write` (it is not,
     /// by default). Fail-closed.
     pub async fn can_write(&self, principal: &Principal, repo: &Repository) -> bool {
         self.allows(principal, Action::Write, repo.id).await
+    }
+
+    /// May `principal` delete / unlist a package from `repo`?
+    ///
+    /// Delete is deliberately distinct from write so a publisher can be
+    /// allowed to add and relist packages without being able to remove them.
+    pub async fn can_delete(&self, principal: &Principal, repo: &Repository) -> bool {
+        self.allows(principal, Action::Delete, repo.id).await
     }
 
     /// May `principal` perform admin operations on `repo`?
@@ -124,15 +133,33 @@ impl Authz {
     /// (the caller returns 404, not 403, to avoid leaking existence). An
     /// evaluation error fails closed to [`PackageFilter::DenyAll`].
     pub async fn package_filter(&self, principal: &Principal, repo: &Repository) -> PackageFilter {
+        self.package_filter_for(principal, repo, Action::Read).await
+    }
+
+    /// The package predicate for a specific action on `repo`.
+    ///
+    /// The repo-level gate and package-level predicate intentionally remain
+    /// separate: a selector-scoped grant reaches the repository, but only a
+    /// matching canonical package id reaches an identifier-addressed read or
+    /// mutation. Evaluation errors return deny-all.
+    pub async fn package_filter_for(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+        action: Action,
+    ) -> PackageFilter {
         // `anonymous_read` grants the anonymous principal full package visibility
         // (mirrors the repo-level fast-path in `can_read`); without this, an
         // anon-readable repo's gate would pass but every package would be
         // filtered out on a default-deny RBAC install.
-        if repo.anonymous_read && matches!(principal, Principal::Anonymous { .. }) {
+        if action == Action::Read
+            && repo.anonymous_read
+            && matches!(principal, Principal::Anonymous { .. })
+        {
             return PackageFilter::AllowAll;
         }
         match self.effective(principal).await {
-            Ok(eff) => eff.package_filter(repo.id),
+            Ok(eff) => eff.package_filter_for(action, repo.id),
             Err(()) => PackageFilter::DenyAll,
         }
     }

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::routing::{delete, get, put, MethodRouter};
 use axum::Router;
+use forge_core::authz::PackageFilter;
 use forge_core::format::Format;
 use forge_core::repo::{RepoError, RepoKind};
 use forge_core::{RepoReadOps, RepoWriteOps};
@@ -61,6 +62,16 @@ pub struct RouteContext {
     /// for **hosted** repositories; `None` for proxy/group, whose publish routes
     /// are never mounted.
     pub write: Option<Arc<dyn RepoWriteOps>>,
+    /// Whether the authenticated principal came from a NuGet wire credential:
+    /// an API token or a verified workload identity. Browser/password sessions
+    /// may administer Forge but must not become package-publish credentials just
+    /// because a request also carries an unrelated auth-looking header.
+    pub protocol_mutations_allowed: bool,
+    /// Package selector for this request's action. Read operations are also
+    /// protected by a filtered [`RepoReadOps`] decorator; identifier-addressed
+    /// mutations consult this value before touching their backend so excluded
+    /// ids have the same 404 response as unknown ids.
+    pub package_filter: PackageFilter,
     /// Maximum accepted upload size in bytes; uploads exceeding it yield 413.
     pub max_upload_bytes: u64,
 }
@@ -163,6 +174,11 @@ pub(crate) fn write_error_response(err: forge_core::WriteError) -> axum::respons
         WriteError::InvalidPackage(e) => {
             (StatusCode::BAD_REQUEST, format!("invalid package: {e}")).into_response()
         }
+        WriteError::ForbiddenPackage { .. } => (
+            StatusCode::FORBIDDEN,
+            "package is outside the authorized scope",
+        )
+            .into_response(),
         WriteError::Repo(re) => repo_error_response(re),
     }
 }

@@ -82,6 +82,9 @@ impl Signer {
 /// Mutable IdP state shared with the axum handlers.
 struct Inner {
     issuer: String,
+    /// Emit only issuer + JWKS metadata, matching non-interactive providers
+    /// such as GitHub Actions that have no browser authorize/token endpoints.
+    workload_only_discovery: bool,
     /// The active signer (latest after any rotation).
     signer: Signer,
     /// Every key the JWKS advertises (current + any explicitly retained).
@@ -117,6 +120,16 @@ impl MockOidc {
     /// Start the mock IdP for the given OAuth `client_id`, bound to an ephemeral
     /// loopback port. The issuer is `http://127.0.0.1:<port>`.
     pub async fn start(client_id: &str) -> Self {
+        Self::start_with_discovery(client_id, false).await
+    }
+
+    /// Start a workload-only issuer whose discovery document contains no
+    /// interactive OAuth endpoints (the GitHub Actions metadata shape).
+    pub async fn start_workload_only(client_id: &str) -> Self {
+        Self::start_with_discovery(client_id, true).await
+    }
+
+    async fn start_with_discovery(client_id: &str, workload_only_discovery: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock idp");
@@ -126,6 +139,7 @@ impl MockOidc {
 
         let inner = Arc::new(Mutex::new(Inner {
             issuer: issuer.clone(),
+            workload_only_discovery,
             published_jwks: vec![signer.jwk.clone()],
             signer,
             next_id_token_claims: None,
@@ -246,7 +260,8 @@ session_absolute_ttl_seconds = 604800
             "aud": aud,
             "exp": now + 3600,
             "nbf": now - 10,
-            "iat": now - 10,
+            "iat": now,
+            "jti": format!("mock-{now}-{:016x}", rand::random::<u64>()),
         });
         if let (Some(obj), Some(extra)) = (claims.as_object_mut(), extra.as_object()) {
             for (k, v) in extra {
@@ -279,15 +294,25 @@ session_absolute_ttl_seconds = 604800
 }
 
 async fn discovery(State(ctx): State<AppCtx>) -> Response {
-    let issuer = ctx.inner.lock().await.issuer.clone();
-    Json(json!({
-        "issuer": issuer,
-        "authorization_endpoint": format!("{issuer}/authorize"),
-        "token_endpoint": format!("{issuer}/token"),
-        "jwks_uri": format!("{issuer}/jwks"),
-        "end_session_endpoint": format!("{issuer}/logout"),
-    }))
-    .into_response()
+    let inner = ctx.inner.lock().await;
+    let issuer = inner.issuer.clone();
+    let body = if inner.workload_only_discovery {
+        json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks"),
+            "subject_types_supported": ["public", "pairwise"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+    } else {
+        json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "end_session_endpoint": format!("{issuer}/logout"),
+        })
+    };
+    Json(body).into_response()
 }
 
 async fn jwks(State(ctx): State<AppCtx>) -> Response {

@@ -94,6 +94,7 @@ async fn matrix_user_with_per_repo_read_grant() {
 
     assert!(az.can_read(&p, &repo_a).await, "read granted on A");
     assert!(!az.can_write(&p, &repo_a).await, "no write grant on A");
+    assert!(!az.can_delete(&p, &repo_a).await, "no delete grant on A");
     assert!(!az.can_admin(&p, &repo_a).await, "not admin");
     assert!(
         !az.can_read(&p, &repo_b).await,
@@ -110,6 +111,7 @@ async fn matrix_user_with_no_roles_is_denied() {
     let p = user(uid, false);
     assert!(!az.can_read(&p, &repo).await);
     assert!(!az.can_write(&p, &repo).await);
+    assert!(!az.can_delete(&p, &repo).await);
     assert!(!az.can_admin(&p, &repo).await);
 }
 
@@ -125,6 +127,7 @@ async fn dual_read_is_admin_grants_admin_without_role() {
     assert!(az.can_admin(&p, &repo).await, "dual-read admin");
     assert!(az.can_read(&p, &repo).await, "admin reads everything");
     assert!(az.can_write(&p, &repo).await, "admin writes everything");
+    assert!(az.can_delete(&p, &repo).await, "admin deletes everything");
 }
 
 #[tokio::test]
@@ -135,6 +138,7 @@ async fn unauthenticated_is_always_denied() {
     let p = Principal::Unauthenticated;
     assert!(!az.can_read(&p, &repo).await);
     assert!(!az.can_write(&p, &repo).await);
+    assert!(!az.can_delete(&p, &repo).await);
     assert!(!az.can_admin(&p, &repo).await);
 }
 

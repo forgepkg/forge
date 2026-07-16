@@ -17,5 +17,5 @@ pub mod outbox_worker;
 pub mod reconciler;
 pub mod s3;
 
-pub use cas::{Cas, CasError, StoredBlob};
+pub use cas::{Cas, CasError, StagedBlob, StoredBlob};
 pub use s3::{BlobStore, ConditionalWrites, S3Config, S3Error};

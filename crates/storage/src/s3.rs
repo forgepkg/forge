@@ -10,9 +10,11 @@
 //!   versitygw rejects or mishandles these, so we set both request and response
 //!   checksum calculation to `WhenRequired`.
 //!
-//! All object keys follow the layout
-//! `blobs/sha256/{aa}/{bb}/{full-hash}` where `aa`/`bb` are the first two hex
-//! byte-pairs of the content's SHA-256 (computed by the CAS layer).
+//! CAS object keys use the layout
+//! `blobs/sha256/{aa}/{bb}/{full-hash}/{incarnation}` where `aa`/`bb` are the
+//! first two hex byte-pairs of the content's SHA-256. The incarnation suffix
+//! fences delayed deletes after a fully garbage-collected blob is revived;
+//! legacy rows without the suffix remain readable.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -47,6 +47,8 @@ impl std::fmt::Display for RepoKind {
 pub enum BlobState {
     Pending,
     Committed,
+    /// An S3 delete has been reserved; the fencing metadata lives on `blob`.
+    Deleting,
 }
 
 impl BlobState {
@@ -54,6 +56,7 @@ impl BlobState {
         match self {
             BlobState::Pending => "pending",
             BlobState::Committed => "committed",
+            BlobState::Deleting => "deleting",
         }
     }
 }
@@ -63,6 +66,7 @@ impl From<&str> for BlobState {
         match s {
             "pending" => BlobState::Pending,
             "committed" => BlobState::Committed,
+            "deleting" => BlobState::Deleting,
             other => panic!("invalid blob.state value in database: {other:?}"),
         }
     }

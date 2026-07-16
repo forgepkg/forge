@@ -1,9 +1,52 @@
 //! Data access for `blob` and the deferred-delete `blob_outbox` enqueue.
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{PgExecutor, PgPool, Postgres, Row, Transaction};
+use uuid::Uuid;
 
 use crate::model::Blob;
+
+/// Result of registering an ingest before its S3 HEAD/PUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginIngestOutcome {
+    /// The caller owns a live ingest lease and may touch the object store.
+    Ready {
+        token: Uuid,
+        inserted: bool,
+        /// Authoritative key for this blob incarnation. On a dedup hit this is
+        /// the existing row's key, not the caller's fresh candidate key.
+        s3_key: String,
+    },
+    /// Another process owns a non-stale deletion reservation. Retry shortly.
+    DeletionInProgress,
+    /// A deleter crashed after reserving the row. The caller now owns that
+    /// reservation and must finish its idempotent S3 delete before retrying.
+    CompleteStaleDeletion(BlobDeletionReservation),
+}
+
+/// A fencing token for the DB -> S3 -> DB deletion protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobDeletionReservation {
+    pub sha256: String,
+    pub s3_key: String,
+    pub token: Uuid,
+}
+
+/// Result of trying to reserve a candidate for deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveDeleteOutcome {
+    Reserved(BlobDeletionReservation),
+    Missing,
+    Referenced,
+    Busy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeleteKind {
+    Outbox,
+    StalePending { created_before: DateTime<Utc> },
+    DanglingCommitted { created_before: DateTime<Utc> },
+}
 
 /// Insert a pending, zero-refcount blob row keyed by `sha256`.
 ///
@@ -30,6 +73,114 @@ pub async fn upsert_pending(
     Ok(res.rows_affected() > 0)
 }
 
+/// Register an ingest lease before checking or uploading the S3 object.
+///
+/// The blob row is locked while its state is inspected and the lease is
+/// inserted, which serializes this operation with [`reserve_outbox_delete`]
+/// and the reconciler reservation paths. Therefore any caller that receives
+/// `Ready` is protected from object deletion until it atomically consumes the
+/// returned token via [`commit_ingest_and_incref`] (or the lease expires).
+///
+/// If a deletion owner crashed, a caller may fence it out and receive
+/// `CompleteStaleDeletion`; finishing that idempotent delete lets the ingest
+/// create a clean pending row on its next attempt.
+#[allow(clippy::too_many_arguments)]
+pub async fn begin_ingest(
+    pool: &PgPool,
+    sha256: &str,
+    size: i64,
+    s3_key: &str,
+    lease_expires_at: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<BeginIngestOutcome> {
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO blob (sha256, size, s3_key, ref_count, state)
+        VALUES ($1, $2, $3, 0, 'pending')
+        ON CONFLICT (sha256) DO NOTHING
+        "#,
+    )
+    .bind(sha256)
+    .bind(size)
+    .bind(s3_key)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+
+    let row = sqlx::query(
+        r#"
+        SELECT state, s3_key, delete_started_at
+        FROM blob
+        WHERE sha256 = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(sha256)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let state: String = row.try_get("state")?;
+    if state == "deleting" {
+        let delete_started_at: DateTime<Utc> = row.try_get("delete_started_at")?;
+        if delete_started_at < stale_deletion_before {
+            let token = Uuid::new_v4();
+            let stored_key: String = row.try_get("s3_key")?;
+            sqlx::query(
+                r#"
+                UPDATE blob
+                SET delete_token = $2, delete_started_at = now()
+                WHERE sha256 = $1 AND state = 'deleting'
+                "#,
+            )
+            .bind(sha256)
+            .bind(token)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(BeginIngestOutcome::CompleteStaleDeletion(
+                BlobDeletionReservation {
+                    sha256: sha256.to_owned(),
+                    s3_key: stored_key,
+                    token,
+                },
+            ));
+        }
+
+        tx.rollback().await?;
+        return Ok(BeginIngestOutcome::DeletionInProgress);
+    }
+
+    // Stale leases are no longer deletion fences. Prune them on this hot path
+    // so frequently deduplicated live blobs do not accumulate lease rows.
+    sqlx::query("DELETE FROM blob_ingest WHERE blob_sha256 = $1 AND expires_at <= now()")
+        .bind(sha256)
+        .execute(&mut *tx)
+        .await?;
+
+    let token = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO blob_ingest (token, blob_sha256, expires_at)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(token)
+    .bind(sha256)
+    .bind(lease_expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let stored_key: String = row.try_get("s3_key")?;
+    Ok(BeginIngestOutcome::Ready {
+        token,
+        inserted,
+        s3_key: stored_key,
+    })
+}
+
 /// Fetch a blob by content hash.
 pub async fn get_blob(pool: &PgPool, sha256: &str) -> sqlx::Result<Option<Blob>> {
     sqlx::query_as!(
@@ -53,17 +204,89 @@ pub async fn commit_and_incref(
     tx: &mut Transaction<'_, Postgres>,
     sha256: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query!(
+    let result = sqlx::query(
         r#"
         UPDATE blob
         SET state = 'committed', ref_count = ref_count + 1
-        WHERE sha256 = $1
+        WHERE sha256 = $1 AND state <> 'deleting'
         "#,
-        sha256,
     )
+    .bind(sha256)
     .execute(&mut **tx)
     .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(())
+}
+
+/// Commit one reference and consume the ingest lease in the same transaction.
+///
+/// Both the token and a non-`deleting` row are required. The row update locks
+/// the blob before the token is consumed, serializing against every deletion
+/// reservation. This is the production counterpart to [`begin_ingest`].
+pub async fn commit_ingest_and_incref(
+    tx: &mut Transaction<'_, Postgres>,
+    sha256: &str,
+    ingest_token: Uuid,
+) -> sqlx::Result<()> {
+    let result = sqlx::query(
+        r#"
+        UPDATE blob b
+        SET state = 'committed', ref_count = ref_count + 1
+        WHERE b.sha256 = $1
+          AND b.state <> 'deleting'
+          AND EXISTS (
+              SELECT 1
+              FROM blob_ingest i
+              WHERE i.token = $2 AND i.blob_sha256 = b.sha256
+          )
+        "#,
+    )
+    .bind(sha256)
+    .bind(ingest_token)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    let consumed = sqlx::query("DELETE FROM blob_ingest WHERE token = $1 AND blob_sha256 = $2")
+        .bind(ingest_token)
+        .bind(sha256)
+        .execute(&mut **tx)
+        .await?;
+    if consumed.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+/// Release an ingest lease after an S3 failure or an explicit caller abort.
+pub async fn abort_ingest<'e, E>(executor: E, ingest_token: Uuid) -> sqlx::Result<()>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query("DELETE FROM blob_ingest WHERE token = $1")
+        .bind(ingest_token)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Extend a live ingest lease. Returns `false` once the token was consumed,
+/// aborted, or fenced out by stale-lease cleanup.
+pub async fn refresh_ingest(
+    pool: &PgPool,
+    ingest_token: Uuid,
+    lease_expires_at: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query("UPDATE blob_ingest SET expires_at = $2 WHERE token = $1")
+        .bind(ingest_token)
+        .bind(lease_expires_at)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Decrement a blob's reference count by one. If it reaches zero, enqueue a
@@ -114,26 +337,207 @@ pub async fn decref_and_maybe_enqueue_delete(
     Ok(true)
 }
 
-/// Delete a blob row **only if** it is still at `ref_count = 0`.
-///
-/// Used by the deferred-delete worker after it has removed the S3 object: a
-/// concurrent re-push may have revived the blob (`ref_count > 0`), in which case
-/// the row must survive. Accepts any executor so it composes with the worker's
-/// short transaction. Returns `true` if a row was deleted.
-pub async fn delete_if_unreferenced<'e, E>(executor: E, sha256: &str) -> sqlx::Result<bool>
+/// Reserve a due outbox blob for deletion.
+pub async fn reserve_outbox_delete(
+    pool: &PgPool,
+    sha256: &str,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<ReserveDeleteOutcome> {
+    reserve_delete(pool, sha256, DeleteKind::Outbox, stale_deletion_before).await
+}
+
+/// Reserve a stale, never-committed pending blob for reconciliation.
+pub async fn reserve_stale_pending_delete(
+    pool: &PgPool,
+    sha256: &str,
+    created_before: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<ReserveDeleteOutcome> {
+    reserve_delete(
+        pool,
+        sha256,
+        DeleteKind::StalePending { created_before },
+        stale_deletion_before,
+    )
+    .await
+}
+
+/// Reserve a stale committed zero-ref blob without a pending outbox row.
+pub async fn reserve_dangling_delete(
+    pool: &PgPool,
+    sha256: &str,
+    created_before: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<ReserveDeleteOutcome> {
+    reserve_delete(
+        pool,
+        sha256,
+        DeleteKind::DanglingCommitted { created_before },
+        stale_deletion_before,
+    )
+    .await
+}
+
+async fn reserve_delete(
+    pool: &PgPool,
+    sha256: &str,
+    kind: DeleteKind,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<ReserveDeleteOutcome> {
+    let mut tx = pool.begin().await?;
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT
+            state, ref_count, s3_key, created_at,
+            delete_previous_state, delete_started_at
+        FROM blob
+        WHERE sha256 = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(ReserveDeleteOutcome::Missing);
+    };
+
+    let ref_count: i64 = row.try_get("ref_count")?;
+    if ref_count > 0 {
+        tx.rollback().await?;
+        return Ok(ReserveDeleteOutcome::Referenced);
+    }
+
+    let state: String = row.try_get("state")?;
+    let original_state = if state == "deleting" {
+        let started: DateTime<Utc> = row.try_get("delete_started_at")?;
+        if started >= stale_deletion_before {
+            tx.rollback().await?;
+            return Ok(ReserveDeleteOutcome::Busy);
+        }
+        row.try_get::<String, _>("delete_previous_state")?
+    } else {
+        state.clone()
+    };
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+
+    let eligible = match kind {
+        DeleteKind::Outbox => true,
+        DeleteKind::StalePending { created_before } => {
+            original_state == "pending" && created_at < created_before
+        }
+        DeleteKind::DanglingCommitted { created_before } => {
+            if original_state != "committed" || created_at >= created_before {
+                false
+            } else {
+                let outstanding: bool = sqlx::query_scalar(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM blob_outbox
+                        WHERE sha256 = $1 AND processed_at IS NULL
+                    )
+                    "#,
+                )
+                .bind(sha256)
+                .fetch_one(&mut *tx)
+                .await?;
+                !outstanding
+            }
+        }
+    };
+    if !eligible {
+        tx.rollback().await?;
+        return Ok(ReserveDeleteOutcome::Busy);
+    }
+
+    // Expired leases no longer represent a caller that may attach a reference.
+    sqlx::query("DELETE FROM blob_ingest WHERE blob_sha256 = $1 AND expires_at <= now()")
+        .bind(sha256)
+        .execute(&mut *tx)
+        .await?;
+    let live_ingest: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM blob_ingest WHERE blob_sha256 = $1)")
+            .bind(sha256)
+            .fetch_one(&mut *tx)
+            .await?;
+    if live_ingest {
+        tx.rollback().await?;
+        return Ok(ReserveDeleteOutcome::Busy);
+    }
+
+    let token = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        UPDATE blob
+        SET state = 'deleting',
+            delete_token = $2,
+            delete_previous_state = CASE
+                WHEN state = 'deleting' THEN delete_previous_state
+                ELSE state
+            END,
+            delete_started_at = now()
+        WHERE sha256 = $1
+        "#,
+    )
+    .bind(sha256)
+    .bind(token)
+    .execute(&mut *tx)
+    .await?;
+    let s3_key: String = row.try_get("s3_key")?;
+    tx.commit().await?;
+
+    Ok(ReserveDeleteOutcome::Reserved(BlobDeletionReservation {
+        sha256: sha256.to_owned(),
+        s3_key,
+        token,
+    }))
+}
+
+/// Remove a blob row only for the exact deletion reservation that performed
+/// the S3 delete. A newer owner fences a stale worker out.
+pub async fn finalize_delete_reservation<'e, E>(
+    executor: E,
+    reservation: &BlobDeletionReservation,
+) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
 {
-    let res = sqlx::query!(
+    let result = sqlx::query(
         r#"
         DELETE FROM blob
-        WHERE sha256 = $1 AND ref_count = 0
+        WHERE sha256 = $1
+          AND state = 'deleting'
+          AND ref_count = 0
+          AND delete_token = $2
         "#,
-        sha256,
     )
+    .bind(&reservation.sha256)
+    .bind(reservation.token)
     .execute(executor)
     .await?;
-    Ok(res.rows_affected() > 0)
+    Ok(result.rows_affected() == 1)
+}
+
+/// Prune expired ingest leases in bounded batches. Blob-local deletion paths
+/// also prune their own expired leases before deciding eligibility.
+pub async fn prune_expired_ingests(pool: &PgPool, limit: i64) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM blob_ingest
+        WHERE token IN (
+            SELECT token
+            FROM blob_ingest
+            WHERE expires_at <= now()
+            ORDER BY expires_at
+            LIMIT $1
+        )
+        "#,
+    )
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// List `pending` blobs created before `cutoff`.
@@ -144,23 +548,32 @@ where
 pub async fn list_stale_pending<'e, E>(
     executor: E,
     cutoff: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
     limit: i64,
 ) -> sqlx::Result<Vec<Blob>>
 where
     E: PgExecutor<'e>,
 {
-    sqlx::query_as!(
-        Blob,
+    sqlx::query_as::<_, Blob>(
         r#"
         SELECT sha256, size, s3_key, ref_count, state, created_at
         FROM blob
-        WHERE state = 'pending' AND created_at < $1
+        WHERE created_at < $1
+          AND (
+              state = 'pending'
+              OR (
+                  state = 'deleting'
+                  AND delete_previous_state = 'pending'
+                  AND delete_started_at < $2
+              )
+          )
         ORDER BY created_at
-        LIMIT $2
+        LIMIT $3
         "#,
-        cutoff,
-        limit,
     )
+    .bind(cutoff)
+    .bind(stale_deletion_before)
+    .bind(limit)
     .fetch_all(executor)
     .await
 }
@@ -174,57 +587,37 @@ where
 pub async fn list_stale_unreferenced<'e, E>(
     executor: E,
     cutoff: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
     limit: i64,
 ) -> sqlx::Result<Vec<Blob>>
 where
     E: PgExecutor<'e>,
 {
-    sqlx::query_as!(
-        Blob,
+    sqlx::query_as::<_, Blob>(
         r#"
         SELECT b.sha256, b.size, b.s3_key, b.ref_count, b.state, b.created_at
         FROM blob b
         WHERE b.ref_count = 0
           AND b.created_at < $1
+          AND (
+              b.state = 'committed'
+              OR (
+                  b.state = 'deleting'
+                  AND b.delete_previous_state = 'committed'
+                  AND b.delete_started_at < $2
+              )
+          )
           AND NOT EXISTS (
               SELECT 1 FROM blob_outbox o
               WHERE o.sha256 = b.sha256 AND o.processed_at IS NULL
           )
         ORDER BY b.created_at
-        LIMIT $2
+        LIMIT $3
         "#,
-        cutoff,
-        limit,
     )
+    .bind(cutoff)
+    .bind(stale_deletion_before)
+    .bind(limit)
     .fetch_all(executor)
     .await
-}
-
-/// Delete a blob row **only if** it is still `pending` and created before
-/// `cutoff`.
-///
-/// Used by the orphan reconciler after removing the S3 object: a slow-but-valid
-/// ingest transaction may have committed the blob (`state = 'committed'`,
-/// `ref_count > 0`) between listing and deletion, in which case the row must
-/// survive. The `created_at < cutoff` guard re-confirms the staleness window
-/// atomically with the delete. Returns `true` if a row was deleted.
-pub async fn delete_if_stale_pending<'e, E>(
-    executor: E,
-    sha256: &str,
-    cutoff: DateTime<Utc>,
-) -> sqlx::Result<bool>
-where
-    E: PgExecutor<'e>,
-{
-    let res = sqlx::query!(
-        r#"
-        DELETE FROM blob
-        WHERE sha256 = $1 AND state = 'pending' AND created_at < $2
-        "#,
-        sha256,
-        cutoff,
-    )
-    .execute(executor)
-    .await?;
-    Ok(res.rows_affected() > 0)
 }

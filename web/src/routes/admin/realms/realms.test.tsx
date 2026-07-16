@@ -389,12 +389,14 @@ describe('admin realms create', () => {
       'https://forge.example.com',
     )
 
-    // Add a rule with one condition.
+    // A newly added rule starts with one mandatory condition.
     await u.click(screen.getByRole('button', { name: 'Add rule' }))
     await u.type(screen.getByLabelText('Role'), 'ci-deployer')
+    await u.type(screen.getByLabelText('Claim'), 'repository_id')
+    await u.type(screen.getByLabelText('Any of'), '987654321')
     await u.click(screen.getByRole('button', { name: 'Add condition' }))
-    await u.type(screen.getByLabelText('Claim'), 'repository')
-    await u.type(screen.getByLabelText('Any of'), 'acme/api, acme/web')
+    await u.type(screen.getAllByLabelText('Claim')[1], 'repository_owner_id')
+    await u.type(screen.getAllByLabelText('Any of')[1], '1234567')
 
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
@@ -411,7 +413,8 @@ describe('admin realms create', () => {
           {
             role: 'ci-deployer',
             conditions: [
-              { claim: 'repository', any_of: ['acme/api', 'acme/web'] },
+              { claim: 'repository_id', any_of: ['987654321'] },
+              { claim: 'repository_owner_id', any_of: ['1234567'] },
             ],
           },
         ],
@@ -443,6 +446,45 @@ describe('admin realms create', () => {
     ).toBeInTheDocument()
     expect(
       screen.getByText('At least one rule is required.'),
+    ).toBeInTheDocument()
+    expect(posted).toBeNull()
+  })
+
+  it('rejects a GitHub workload rule scoped only by execution context', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body
+        return json(realm(body as Partial<RealmView>), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/admin/realms/new')
+    await u.selectOptions(
+      await screen.findByLabelText('Kind'),
+      'workload_identity',
+    )
+    await u.type(screen.getByLabelText('Name'), 'github-actions')
+    await u.type(
+      screen.getByLabelText('Issuer URL'),
+      'https://token.actions.githubusercontent.com',
+    )
+    await u.type(
+      screen.getByLabelText('Allowed audiences'),
+      'https://forge.example.com',
+    )
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    await u.type(screen.getByLabelText('Role'), 'publisher')
+    await u.type(screen.getByLabelText('Claim'), 'ref')
+    await u.type(screen.getByLabelText('Any of'), 'refs/heads/main')
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    expect(
+      await screen.findByText(
+        'GitHub Actions rules must include both repository_id and repository_owner_id.',
+      ),
     ).toBeInTheDocument()
     expect(posted).toBeNull()
   })

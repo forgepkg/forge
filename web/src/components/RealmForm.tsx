@@ -34,7 +34,8 @@ import { Select } from '~/components/catalyst/select'
  *  - **credential_forwarding** → upstream URL / acceptance criteria /
  *    timeouts / groups / caching TTLs / write-only key pepper
  *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
- *    clock skew / ordered claim→role rules (no secrets, no redaction)
+ *    bounded token lifetime / optional authorized parties / ordered
+ *    claim→role rules (no secrets, no redaction)
  *  - **local** → no config; only name + enabled are editable (built-in realm)
  *
  * On **create** the kind is selectable (local is built-in and cannot be
@@ -89,6 +90,12 @@ export interface RealmFormValues {
   // `clock_skew_seconds` above since only one kind is active at a time.
   /** Comma/newline-separated allowed audiences (parsed to string[] on submit). */
   allowed_audiences: string
+  /** Optional exact `azp` values for issuers that emit authorized-party claims. */
+  allowed_authorized_parties: string
+  /** Maximum accepted token age and declared token lifetime. */
+  max_token_age_seconds: string
+  /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
+  positive_cache_seconds: string
   /** Ordered claim→role rules; anyOf is a comma-separated string per condition. */
   wifRules: Array<{
     role: string
@@ -167,6 +174,11 @@ function seed(existing?: RealmView): RealmFormValues {
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
     key_pepper: '',
     allowed_audiences: joinList(wif.allowed_audiences),
+    allowed_authorized_parties: joinList(wif.allowed_authorized_parties),
+    max_token_age_seconds:
+      wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
+    positive_cache_seconds:
+      wif.positive_cache_seconds != null ? String(wif.positive_cache_seconds) : '',
     wifRules: (wif.rules ?? []).map((rule) => ({
       role: rule.role ?? '',
       conditions: (rule.conditions ?? []).map((c) => ({
@@ -244,8 +256,14 @@ export function RealmForm({
       if (parseList(values.allowed_audiences).length === 0) {
         next.allowed_audiences = 'At least one allowed audience is required.'
       }
-      if (!isBlankNumber(values.clock_skew_seconds)) {
-        next.clock_skew_seconds = 'Clock skew must be a non-negative number.'
+      if (!isBlankNumberInRange(values.clock_skew_seconds, 0, 300)) {
+        next.clock_skew_seconds = 'Clock skew must be between 0 and 300 seconds.'
+      }
+      if (!isBlankNumberInRange(values.max_token_age_seconds, 1, 86400)) {
+        next.max_token_age_seconds = 'Maximum token age must be between 1 and 86400 seconds.'
+      }
+      if (!isBlankNumberInRange(values.positive_cache_seconds, 0, 300)) {
+        next.positive_cache_seconds = 'Positive cache TTL must be between 0 and 300 seconds.'
       }
       if (values.wifRules.length === 0) {
         next.wifRules = 'At least one rule is required.'
@@ -253,6 +271,19 @@ export function RealmForm({
       values.wifRules.forEach((rule, ri) => {
         if (rule.role.trim() === '') {
           next[`wifRule.${ri}.role`] = 'A role is required.'
+        } else if (rule.role.trim() === 'admin') {
+          next[`wifRule.${ri}.role`] =
+            'Workload identity cannot grant the built-in global admin role.'
+        }
+        if (rule.conditions.length === 0) {
+          next[`wifRule.${ri}.conditions`] =
+            'At least one claim condition is required; catch-all trust is not allowed.'
+        } else if (!wifRuleHasIdentityScope(values.issuer, rule.conditions)) {
+          next[`wifRule.${ri}.conditions`] = isGitHubActionsIssuer(values.issuer)
+            ? 'GitHub Actions rules must include both repository_id and repository_owner_id.'
+            : isGitLabComIssuer(values.issuer)
+              ? 'GitLab.com rules must include a numeric project ID (job_project_id or project_id) and namespace ID (job_namespace_id or namespace_id).'
+              : 'Include a workload identity claim such as sub, repository_id, job_project_id, project_path, or a provider-specific workload ID; ref/environment alone is unsafe.'
         }
         rule.conditions.forEach((cond, ci) => {
           if (cond.claim.trim() === '') {
@@ -293,7 +324,10 @@ export function RealmForm({
   function addRule() {
     setValues((v) => ({
       ...v,
-      wifRules: [...v.wifRules, { role: '', conditions: [] }],
+      wifRules: [
+        ...v.wifRules,
+        { role: '', conditions: [{ claim: '', anyOf: '' }] },
+      ],
     }))
   }
 
@@ -766,6 +800,7 @@ export function RealmForm({
               <Input
                 type="number"
                 min={0}
+                max={300}
                 value={values.clock_skew_seconds}
                 onChange={(e) => set('clock_skew_seconds', e.target.value)}
                 placeholder="60"
@@ -774,6 +809,65 @@ export function RealmForm({
               {errors.clock_skew_seconds && (
                 <ErrorMessage role="alert">
                   {errors.clock_skew_seconds}
+                </ErrorMessage>
+              )}
+            </Field>
+
+            <Field>
+              <Label>Maximum token age (seconds)</Label>
+              <Input
+                type="number"
+                min={1}
+                max={86400}
+                value={values.max_token_age_seconds}
+                onChange={(e) => set('max_token_age_seconds', e.target.value)}
+                placeholder="3600"
+                invalid={!!errors.max_token_age_seconds}
+              />
+              <Description>
+                Bounds both token age and declared lifetime. GitHub tokens are
+                normally 10 minutes; use the shortest value your CI jobs support.
+              </Description>
+              {errors.max_token_age_seconds && (
+                <ErrorMessage role="alert">
+                  {errors.max_token_age_seconds}
+                </ErrorMessage>
+              )}
+            </Field>
+
+            <Field>
+              <Label>Allowed authorized parties</Label>
+              <Input
+                type="text"
+                value={values.allowed_authorized_parties}
+                onChange={(e) => set('allowed_authorized_parties', e.target.value)}
+                placeholder="Optional azp values"
+              />
+              <Description>
+                Optional exact <code>azp</code> allowlist for issuers that emit
+                it. Leave blank for GitHub Actions and GitLab CI.
+              </Description>
+            </Field>
+
+            <Field>
+              <Label>Positive verification cache (seconds)</Label>
+              <Input
+                type="number"
+                min={0}
+                max={300}
+                value={values.positive_cache_seconds}
+                onChange={(e) => set('positive_cache_seconds', e.target.value)}
+                placeholder="60"
+                invalid={!!errors.positive_cache_seconds}
+              />
+              <Description>
+                Caches signature verification only for tokens with <code>jti</code>,
+                never beyond <code>exp</code>. Claim rules and roles are still
+                evaluated on every request. Use 0 to disable.
+              </Description>
+              {errors.positive_cache_seconds && (
+                <ErrorMessage role="alert">
+                  {errors.positive_cache_seconds}
                 </ErrorMessage>
               )}
             </Field>
@@ -790,7 +884,10 @@ export function RealmForm({
               <Label>Rules</Label>
               <Description>
                 Ordered; the first rule whose conditions all match grants its
-                role. A rule with no conditions is a catch-all.
+                role. Every rule needs a workload identity condition; ref or
+                environment alone is not enough. Public GitHub/GitLab issuers
+                require immutable numeric repository/project and owner/namespace
+                IDs. Global admin is not allowed; grant a repository-scoped role.
               </Description>
               {errors.wifRules && (
                 <ErrorMessage role="alert">{errors.wifRules}</ErrorMessage>
@@ -832,6 +929,13 @@ export function RealmForm({
                   </div>
 
                   <div className="mt-4 space-y-3">
+                    {errors[`wifRule.${ri}.conditions`] && (
+                      <Field>
+                        <ErrorMessage role="alert">
+                          {errors[`wifRule.${ri}.conditions`]}
+                        </ErrorMessage>
+                      </Field>
+                    )}
                     {rule.conditions.map((cond, ci) => (
                       <div
                         key={ci}
@@ -986,9 +1090,72 @@ function isBlankNumber(raw: string): boolean {
   return Number.isFinite(n) && n >= 0
 }
 
+/** "" or a finite number within the inclusive range. */
+function isBlankNumberInRange(raw: string, min: number, max: number): boolean {
+  if (raw.trim() === '') return true
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= min && n <= max
+}
+
 /** "" or a comma-separated list of numbers. */
 function isBlankNumberList(raw: string): boolean {
   return parseList(raw).every((s) => Number.isFinite(Number(s)))
+}
+
+const GITHUB_ACTIONS_ISSUER = 'https://token.actions.githubusercontent.com'
+const GITLAB_COM_ISSUER = 'https://gitlab.com'
+const CONTEXT_ONLY_WIF_CLAIMS = new Set([
+  'iss',
+  'aud',
+  'azp',
+  'exp',
+  'nbf',
+  'iat',
+  'jti',
+  'nonce',
+  'ref',
+  'ref_path',
+  'ref_type',
+  'ref_protected',
+  'environment',
+  'environment_protected',
+])
+
+function normalizedIssuer(raw: string): string {
+  return raw.trim().replace(/\/+$/, '')
+}
+
+function isGitHubActionsIssuer(raw: string): boolean {
+  return normalizedIssuer(raw) === GITHUB_ACTIONS_ISSUER
+}
+
+function isGitLabComIssuer(raw: string): boolean {
+  return normalizedIssuer(raw) === GITLAB_COM_ISSUER
+}
+
+/** Mirror the server's defense against syntactically non-empty catch-all rules. */
+function wifRuleHasIdentityScope(
+  issuer: string,
+  conditions: Array<{ claim: string }>,
+): boolean {
+  const claims = conditions.map((condition) => condition.claim.trim())
+  if (isGitHubActionsIssuer(issuer)) {
+    return (
+      claims.includes('repository_id') &&
+      claims.includes('repository_owner_id')
+    )
+  }
+  if (isGitLabComIssuer(issuer)) {
+    return (
+      claims.some((claim) => ['project_id', 'job_project_id'].includes(claim)) &&
+      claims.some((claim) =>
+        ['namespace_id', 'job_namespace_id'].includes(claim),
+      )
+    )
+  }
+  return claims.some(
+    (claim) => claim !== '' && !CONTEXT_ONLY_WIF_CLAIMS.has(claim),
+  )
 }
 
 /** A parseable absolute URL (http/https or otherwise). */
@@ -1089,13 +1256,19 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
           claim: cond.claim.trim(),
           any_of: parseList(cond.anyOf),
         }))
-        return conditions.length > 0
-          ? { role: rule.role.trim(), conditions }
-          : { role: rule.role.trim() }
+        return { role: rule.role.trim(), conditions }
       }),
     }
     const skew = parseNumber(values.clock_skew_seconds)
     if (skew !== undefined) config.clock_skew_seconds = skew
+    const maxAge = parseNumber(values.max_token_age_seconds)
+    if (maxAge !== undefined) config.max_token_age_seconds = maxAge
+    const authorizedParties = parseList(values.allowed_authorized_parties)
+    if (authorizedParties.length > 0) {
+      config.allowed_authorized_parties = authorizedParties
+    }
+    const positiveCache = parseNumber(values.positive_cache_seconds)
+    if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
     return config
   }
   // local (and reserved kinds): no config.

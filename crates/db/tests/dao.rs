@@ -278,6 +278,41 @@ async fn blob_upsert_pending_returns_true_then_false() {
 }
 
 #[tokio::test]
+async fn refreshed_ingest_lease_still_fences_delete_after_original_expiry() {
+    let pool = pool().await;
+    let pool = &pool;
+    let sha = format!("sha-lease-refresh-{}", unique());
+    let now = Utc::now();
+    let outcome = blob_dao::begin_ingest(
+        pool,
+        &sha,
+        10,
+        "k/lease-refresh",
+        now + Duration::milliseconds(10),
+        now - Duration::minutes(2),
+    )
+    .await
+    .expect("begin ingest");
+    let token = match outcome {
+        blob_dao::BeginIngestOutcome::Ready { token, .. } => token,
+        other => panic!("unexpected begin outcome: {other:?}"),
+    };
+
+    assert!(
+        blob_dao::refresh_ingest(pool, token, Utc::now() + Duration::hours(1))
+            .await
+            .expect("refresh")
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let outcome = blob_dao::reserve_outbox_delete(pool, &sha, Utc::now() - Duration::minutes(2))
+        .await
+        .expect("reserve");
+    assert_eq!(outcome, blob_dao::ReserveDeleteOutcome::Busy);
+    blob_dao::abort_ingest(pool, token).await.expect("abort");
+}
+
+#[tokio::test]
 async fn blob_commit_and_incref_increments_and_commits() {
     let pool = pool().await;
     let pool = &pool;

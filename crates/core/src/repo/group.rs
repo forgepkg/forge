@@ -53,9 +53,10 @@ use sqlx::PgPool;
 
 use crate::auth::authz::Authz;
 use crate::auth::principal::Principal;
+use crate::authz::PackageFilter;
 use crate::repo::{
-    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
-    SearchResult, VersionEntry,
+    NupkgLocation, PackageFilteredReadOps, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
+    SearchParams, SearchResult, VersionEntry,
 };
 
 /// Builds the [`RepoReadOps`] for one member repository of a group.
@@ -148,9 +149,17 @@ impl GroupRepo {
         let mut seen_leaves: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
         visited.insert(group_row.id);
+        let root_filter = self.authz.package_filter(&self.principal, &group_row).await;
 
-        self.flatten_into(group_row.id, 0, &mut visited, &mut seen_leaves, &mut out)
-            .await?;
+        self.flatten_into(
+            group_row.id,
+            0,
+            root_filter,
+            &mut visited,
+            &mut seen_leaves,
+            &mut out,
+        )
+        .await?;
         Ok(out)
     }
 
@@ -166,6 +175,7 @@ impl GroupRepo {
         &'a self,
         group_id: i64,
         depth: u32,
+        path_filter: PackageFilter,
         visited: &'a mut std::collections::HashSet<i64>,
         seen_leaves: &'a mut std::collections::HashSet<i64>,
         out: &'a mut Vec<VisibleMember>,
@@ -189,6 +199,8 @@ impl GroupRepo {
                 if !self.authz.can_read(&self.principal, &member).await {
                     continue;
                 }
+                let member_filter = self.authz.package_filter(&self.principal, &member).await;
+                let member_path_filter = path_filter.clone().intersect(member_filter);
 
                 if member.kind() == forge_db::model::RepoKind::Group {
                     // Cycle guard: a group already on the descent path is a
@@ -200,19 +212,69 @@ impl GroupRepo {
                         );
                         continue;
                     }
-                    self.flatten_into(member.id, depth + 1, visited, seen_leaves, out)
-                        .await?;
+                    self.flatten_into(
+                        member.id,
+                        depth + 1,
+                        member_path_filter,
+                        visited,
+                        seen_leaves,
+                        out,
+                    )
+                    .await?;
                     // Pop off the path so a diamond (two paths to the same group
                     // via distinct parents) is still resolvable, while a true
                     // back-edge on the *current* path stays blocked.
                     visited.remove(&member.id);
                 } else if seen_leaves.insert(member.id) {
                     let ops = self.factory.ops_for(&member)?;
+                    let ops = Arc::new(PackageFilteredReadOps::new(ops, member_path_filter));
                     out.push(VisibleMember { repo: member, ops });
                 }
             }
             Ok(())
         })
+    }
+
+    /// Merge member search results with the caller's package predicate pushed
+    /// through every member wrapper. This keeps selector filtering inside each
+    /// production backend's single corpus scan rather than repeatedly
+    /// re-running the whole group search for successive filtered pages.
+    async fn search_filtered(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        let members = self.visible_members(repo).await?;
+        let mut member_params = params.clone();
+        member_params.skip = 0;
+        member_params.take = SearchParams::MAX_TAKE;
+
+        use std::collections::BTreeMap;
+        let mut by_id: BTreeMap<String, SearchHit> = BTreeMap::new();
+        for m in &members {
+            let result = m
+                .ops
+                .search_with_package_filter(&m.repo.name, &member_params, filter)
+                .await?;
+            for hit in result.hits {
+                by_id.entry(hit.original_id.to_lowercase()).or_insert(hit);
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = by_id.into_values().collect();
+        hits.sort_by(|a, b| {
+            a.original_id
+                .to_lowercase()
+                .cmp(&b.original_id.to_lowercase())
+        });
+        let total_hits = hits.len();
+        let hits = hits
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        Ok(SearchResult { total_hits, hits })
     }
 }
 
@@ -294,41 +356,16 @@ impl RepoReadOps for GroupRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        let members = self.visible_members(repo).await?;
+        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+            .await
+    }
 
-        // Merge hits across members, dedup by lowercased id, highest-priority
-        // wins (first member that yields a hit for that id keeps its versions).
-        // We request the full corpus from each member (skip=0, take=MAX) and
-        // page the merged result ourselves, since paging cannot be pushed down
-        // across independently-paged members.
-        let mut member_params = params.clone();
-        member_params.skip = 0;
-        member_params.take = SearchParams::MAX_TAKE;
-
-        use std::collections::BTreeMap;
-        // BTreeMap keyed by lowercased id for a deterministic merged order.
-        let mut by_id: BTreeMap<String, SearchHit> = BTreeMap::new();
-        for m in &members {
-            let result = m.ops.search(&m.repo.name, &member_params).await?;
-            for hit in result.hits {
-                by_id.entry(hit.original_id.to_lowercase()).or_insert(hit);
-            }
-        }
-
-        let mut hits: Vec<SearchHit> = by_id.into_values().collect();
-        hits.sort_by(|a, b| {
-            a.original_id
-                .to_lowercase()
-                .cmp(&b.original_id.to_lowercase())
-        });
-
-        let total_hits = hits.len();
-        let skip = params.skip.min(total_hits);
-        let take = params.effective_take();
-        let page = hits.into_iter().skip(skip).take(take).collect();
-        Ok(SearchResult {
-            total_hits,
-            hits: page,
-        })
+    async fn search_with_package_filter(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter).await
     }
 }

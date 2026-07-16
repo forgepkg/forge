@@ -7,10 +7,12 @@
 //! what makes the whole module unit-testable with a [`wiremock`] HTTP server and
 //! a self-signed token — no real IdP, no real network.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
+use futures_util::StreamExt;
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyOperations, PublicKeyUse};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,13 +20,22 @@ use url::Url;
 
 /// Cache namespace for the parsed OIDC discovery document, keyed by issuer.
 const NS_DISCOVERY: &str = "oidc_discovery";
+/// Separate namespace for workload-only discovery documents. Keeping it
+/// distinct prevents a minimal GitHub Actions document from being cached under
+/// the interactive OIDC shape (which requires browser-flow endpoints).
+const NS_WORKLOAD_DISCOVERY: &str = "oidc_workload_discovery";
 /// Cache namespace for the issuer's JWKS, keyed by issuer.
 const NS_JWKS: &str = "oidc_jwks";
+/// Issuer-scoped cooldown after a `kid` miss claims the one allowed refresh.
+/// Keying only by issuer (not attacker-controlled `kid`) bounds random-kid
+/// traffic to one JWKS eviction/refetch per cooldown window.
+const NS_JWKS_KID_REFRESH: &str = "oidc_jwks_kid_refresh";
 
 /// Default TTL for the discovery document (stable; refetch daily).
 const DEFAULT_DISCOVERY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Default TTL for the JWKS (moderate; kid-miss handles early rotation).
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Upper bound on a fetched discovery / JWKS document. Generous, but bounds
 /// memory against a hostile or misconfigured IdP. (Mirrors the proxy's
@@ -93,10 +104,24 @@ pub struct DiscoveryDocument {
     pub end_session_endpoint: Option<String>,
 }
 
+/// The metadata a non-interactive workload verifier actually needs.
+///
+/// GitHub Actions deliberately publishes issuer/JWKS metadata without OAuth
+/// authorization or token endpoints. WIF validates a token already obtained by
+/// the CI runtime, so requiring browser-flow endpoints here is both unnecessary
+/// and incompatible with that provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadDiscoveryDocument {
+    /// The issuer identifier. Must equal the configured issuer.
+    pub issuer: String,
+    /// URI publishing the issuer's signing keys.
+    pub jwks_uri: String,
+}
+
 /// The ID-token claims we extract after a successful verification. Format-
 /// specific claim → user mapping happens in a later phase (`claims.rs`); here we
 /// keep the raw values plus the full claim set for that step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verified {
     /// `sub` — the stable, issuer-scoped subject identifier.
     pub subject: String,
@@ -127,6 +152,11 @@ pub struct IdTokenClaims {
     /// Issued-at (seconds since epoch).
     #[serde(default)]
     pub iat: Option<i64>,
+    /// Unique token identifier. WIF uses it only for an expiry-bounded positive
+    /// signature-verification cache and audit correlation; it is never an
+    /// authorization input.
+    #[serde(default)]
+    pub jti: Option<String>,
     /// Nonce binding the token to a single login flow.
     #[serde(default)]
     pub nonce: Option<String>,
@@ -233,6 +263,32 @@ impl OidcMetadataClient {
         Ok(doc)
     }
 
+    /// Fetch (or read from cache) the minimal discovery document used for
+    /// workload-token verification. Unlike [`Self::discovery`], this accepts a
+    /// standards-compatible issuer/JWKS-only document and does not require
+    /// interactive OAuth endpoints.
+    pub async fn workload_discovery(&self) -> Result<WorkloadDiscoveryDocument, OidcError> {
+        let url = discovery_url(&self.issuer);
+        let http = self.http.clone();
+        let expected_issuer = self.issuer.clone();
+
+        let doc: WorkloadDiscoveryDocument = self
+            .cache
+            .get_or_try_insert_with(
+                NS_WORKLOAD_DISCOVERY,
+                &self.issuer,
+                self.discovery_ttl,
+                || async move {
+                    let doc: WorkloadDiscoveryDocument =
+                        fetch_json(&http, &url, "workload discovery").await?;
+                    validate_workload_discovery(&doc, &expected_issuer)?;
+                    Ok(doc)
+                },
+            )
+            .await?;
+        Ok(doc)
+    }
+
     /// Fetch (or read from cache) the issuer's JWKS.
     pub async fn jwks(&self) -> Result<JwkSet, OidcError> {
         let jwks_uri = self.discovery().await?.jwks_uri;
@@ -262,6 +318,25 @@ impl OidcMetadataClient {
         self.fetch_jwks_cached(jwks_uri).await
     }
 
+    /// Claim the issuer's single unknown-`kid` refresh slot for the cooldown
+    /// window. The cache's per-key coalescing means concurrent misses share one
+    /// winner; a Redis-backed cache also bounds normal multi-instance traffic.
+    async fn acquire_unknown_kid_refresh(&self) -> bool {
+        let candidate = uuid::Uuid::new_v4().to_string();
+        let produced = candidate.clone();
+        let cached = self
+            .cache
+            .get_or_try_insert_with(
+                NS_JWKS_KID_REFRESH,
+                &self.issuer,
+                DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN,
+                || async move { Ok::<String, Infallible>(produced) },
+            )
+            .await
+            .expect("infallible refresh-slot cache factory");
+        cached == candidate
+    }
+
     /// Verify an ID token: signature (against the cached JWKS, with a single
     /// kid-miss refetch), then `iss`/`aud`/`exp`/`nbf` (with leeway) and `nonce`.
     ///
@@ -272,11 +347,13 @@ impl OidcMetadataClient {
         token: &str,
         params: &VerifyParams,
     ) -> Result<Verified, OidcError> {
-        self.verify_jwt(
+        self.verify_jwt_inner(
             token,
             &[params.audience.as_str()],
             params.nonce.as_deref(),
             params.leeway_seconds,
+            DiscoveryKind::Interactive,
+            false,
         )
         .await
     }
@@ -297,6 +374,60 @@ impl OidcMetadataClient {
         nonce: Option<&str>,
         leeway_seconds: u64,
     ) -> Result<Verified, OidcError> {
+        self.verify_jwt_inner(
+            token,
+            audiences,
+            nonce,
+            leeway_seconds,
+            DiscoveryKind::Interactive,
+            false,
+        )
+        .await
+    }
+
+    /// Verify a non-interactive workload JWT.
+    ///
+    /// This differs deliberately from browser-login ID-token verification:
+    /// workload-only discovery needs only `issuer` + `jwks_uri`; a non-empty
+    /// `kid` is mandatory; and `iat` plus the total token lifetime are bounded.
+    /// `allowed_authorized_parties` is optional for providers that do not emit
+    /// `azp`; when configured, the token must carry one of those exact values.
+    pub async fn verify_workload_jwt(
+        &self,
+        token: &str,
+        audiences: &[&str],
+        allowed_authorized_parties: &[&str],
+        leeway_seconds: u64,
+        max_token_age_seconds: u64,
+    ) -> Result<Verified, OidcError> {
+        let verified = self
+            .verify_jwt_inner(
+                token,
+                audiences,
+                None,
+                leeway_seconds,
+                DiscoveryKind::Workload,
+                true,
+            )
+            .await?;
+        validate_workload_claims(
+            &verified.claims,
+            allowed_authorized_parties,
+            leeway_seconds,
+            max_token_age_seconds,
+        )?;
+        Ok(verified)
+    }
+
+    async fn verify_jwt_inner(
+        &self,
+        token: &str,
+        audiences: &[&str],
+        nonce: Option<&str>,
+        leeway_seconds: u64,
+        discovery_kind: DiscoveryKind,
+        require_kid: bool,
+    ) -> Result<Verified, OidcError> {
         if audiences.is_empty() {
             return Err(OidcError::InvalidToken(
                 "no allowed audiences configured".into(),
@@ -305,14 +436,23 @@ impl OidcMetadataClient {
         // 1. Read the header to find the signing-key id + declared algorithm.
         let header = decode_header(token).map_err(|e| OidcError::InvalidToken(e.to_string()))?;
         let kid = header.kid.clone();
+        if require_kid && kid.as_deref().is_none_or(str::is_empty) {
+            return Err(OidcError::UnknownKid(None));
+        }
+        if !is_allowed_rsa_algorithm(header.alg) {
+            return Err(OidcError::UnsupportedAlg(format!("{:?}", header.alg)));
+        }
 
         // 2. Locate the key in the cached JWKS; on a kid miss force exactly one
         //    refetch (early IdP rotation) and look again.
-        let discovery = self.discovery().await?;
-        let mut jwks = self.fetch_jwks_cached(&discovery.jwks_uri).await?;
+        let jwks_uri = match discovery_kind {
+            DiscoveryKind::Interactive => self.discovery().await?.jwks_uri,
+            DiscoveryKind::Workload => self.workload_discovery().await?.jwks_uri,
+        };
+        let mut jwks = self.fetch_jwks_cached(&jwks_uri).await?;
         let mut jwk = find_key(&jwks, kid.as_deref());
-        if jwk.is_none() {
-            jwks = self.refetch_jwks(&discovery.jwks_uri).await?;
+        if jwk.is_none() && self.acquire_unknown_kid_refresh().await {
+            jwks = self.refetch_jwks(&jwks_uri).await?;
             jwk = find_key(&jwks, kid.as_deref());
         }
         let jwk = jwk.ok_or_else(|| OidcError::UnknownKid(kid.clone()))?;
@@ -325,20 +465,35 @@ impl OidcMetadataClient {
                 jwk.common.key_algorithm
             )));
         }
+        if let Some(key_use) = &jwk.common.public_key_use {
+            if key_use != &PublicKeyUse::Signature {
+                return Err(OidcError::UnsupportedAlg(format!(
+                    "JWK use is {key_use:?}, not sig"
+                )));
+            }
+        }
+        if let Some(ops) = &jwk.common.key_operations {
+            if !ops.contains(&KeyOperations::Verify) {
+                return Err(OidcError::UnsupportedAlg(
+                    "JWK key_ops does not include verify".into(),
+                ));
+            }
+        }
+        if let Some(key_alg) = jwk.common.key_algorithm {
+            if key_alg.to_string() != format!("{:?}", header.alg) {
+                return Err(OidcError::UnsupportedAlg(format!(
+                    "token alg {:?} does not match JWK alg {key_alg}",
+                    header.alg
+                )));
+            }
+        }
         let decoding_key =
             DecodingKey::from_jwk(jwk).map_err(|e| OidcError::InvalidToken(e.to_string()))?;
 
         // 4. Build a strict validation: RSA family only, issuer = configured
         //    issuer, audience = client_id, exp/nbf with leeway.
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = vec![
-            Algorithm::RS256,
-            Algorithm::RS384,
-            Algorithm::RS512,
-            Algorithm::PS256,
-            Algorithm::PS384,
-            Algorithm::PS512,
-        ];
+        let mut validation = Validation::new(header.alg);
+        validation.algorithms = vec![header.alg];
         validation.set_issuer(&[self.issuer.as_str()]);
         validation.set_audience(audiences);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
@@ -368,6 +523,83 @@ impl OidcMetadataClient {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DiscoveryKind {
+    Interactive,
+    Workload,
+}
+
+fn is_allowed_rsa_algorithm(alg: Algorithm) -> bool {
+    matches!(
+        alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+    )
+}
+
+/// Workload tokens must be fresh even when an issuer gives them an overly-long
+/// `exp`. This closes the gap left by generic JWT libraries, which validate
+/// `exp`/`nbf` but intentionally assign no semantics to `iat`.
+fn validate_workload_claims(
+    claims: &IdTokenClaims,
+    allowed_authorized_parties: &[&str],
+    leeway_seconds: u64,
+    max_token_age_seconds: u64,
+) -> Result<(), OidcError> {
+    if claims.sub.trim().is_empty() {
+        return Err(OidcError::InvalidToken("sub must not be empty".into()));
+    }
+    let iat = claims
+        .iat
+        .ok_or_else(|| OidcError::InvalidToken("iat is required for workload tokens".into()))?;
+    let exp = claims
+        .exp
+        .ok_or_else(|| OidcError::InvalidToken("exp is required for workload tokens".into()))?;
+    let now = chrono::Utc::now().timestamp();
+    let leeway = i64::try_from(leeway_seconds).unwrap_or(i64::MAX);
+    let max_age = i64::try_from(max_token_age_seconds).unwrap_or(i64::MAX);
+    if max_age <= 0 {
+        return Err(OidcError::InvalidToken(
+            "max workload token age must be positive".into(),
+        ));
+    }
+    if iat > now.saturating_add(leeway) {
+        return Err(OidcError::InvalidToken(
+            "workload token iat is in the future".into(),
+        ));
+    }
+    if iat < now.saturating_sub(max_age.saturating_add(leeway)) {
+        return Err(OidcError::InvalidToken(
+            "workload token exceeds maximum age".into(),
+        ));
+    }
+    if exp <= iat {
+        return Err(OidcError::InvalidToken(
+            "workload token exp must be after iat".into(),
+        ));
+    }
+    if exp.saturating_sub(iat) > max_age {
+        return Err(OidcError::InvalidToken(
+            "workload token lifetime exceeds configured maximum".into(),
+        ));
+    }
+    if !allowed_authorized_parties.is_empty() {
+        match claims.azp.as_deref() {
+            Some(azp) if allowed_authorized_parties.contains(&azp) => {}
+            _ => {
+                return Err(OidcError::InvalidToken(
+                    "workload token azp is missing or not allowed".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Find a JWK by `kid`. When the token header carries no `kid` and the set holds
 /// exactly one key, fall back to that key (some minimal IdPs publish a single,
 /// unlabeled key).
@@ -395,10 +627,40 @@ fn discovery_url(issuer: &str) -> String {
 /// issuer, and the advertised token/jwks endpoints must be https and share the
 /// issuer's host (SSRF sanity on top of the guarded client).
 fn validate_discovery(doc: &DiscoveryDocument, expected_issuer: &str) -> Result<(), OidcError> {
-    if normalize_issuer(doc.issuer.clone()) != expected_issuer {
+    validate_discovery_identity_and_endpoints(
+        &doc.issuer,
+        expected_issuer,
+        &[
+            ("jwks_uri", doc.jwks_uri.as_str()),
+            ("token_endpoint", doc.token_endpoint.as_str()),
+            (
+                "authorization_endpoint",
+                doc.authorization_endpoint.as_str(),
+            ),
+        ],
+    )
+}
+
+fn validate_workload_discovery(
+    doc: &WorkloadDiscoveryDocument,
+    expected_issuer: &str,
+) -> Result<(), OidcError> {
+    validate_discovery_identity_and_endpoints(
+        &doc.issuer,
+        expected_issuer,
+        &[("jwks_uri", doc.jwks_uri.as_str())],
+    )
+}
+
+fn validate_discovery_identity_and_endpoints(
+    document_issuer: &str,
+    expected_issuer: &str,
+    endpoints: &[(&'static str, &str)],
+) -> Result<(), OidcError> {
+    if normalize_issuer(document_issuer.to_string()) != expected_issuer {
         return Err(OidcError::DiscoveryMismatch(format!(
             "document issuer {:?} != configured issuer {:?}",
-            doc.issuer, expected_issuer
+            document_issuer, expected_issuer
         )));
     }
     let issuer_url = Url::parse(expected_issuer).map_err(|e| {
@@ -414,11 +676,7 @@ fn validate_discovery(doc: &DiscoveryDocument, expected_issuer: &str) -> Result<
     // the guarded client).
     let issuer_scheme = issuer_url.scheme();
 
-    for (label, endpoint) in [
-        ("jwks_uri", &doc.jwks_uri),
-        ("token_endpoint", &doc.token_endpoint),
-        ("authorization_endpoint", &doc.authorization_endpoint),
-    ] {
+    for (label, endpoint) in endpoints {
         let url = Url::parse(endpoint).map_err(|e| {
             OidcError::DiscoveryMismatch(format!("{label} {endpoint:?} is not a valid url: {e}"))
         })?;
@@ -455,15 +713,30 @@ async fn fetch_json<T: DeserializeOwned>(
             reason: format!("status {}", resp.status()),
         });
     }
-    let bytes = resp.bytes().await.map_err(|e| OidcError::Http {
-        url: url.to_string(),
-        reason: format!("read body: {e}"),
-    })?;
-    if bytes.len() > MAX_DOC_BYTES {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_DOC_BYTES as u64)
+    {
         return Err(OidcError::Parse {
             what: what.to_string(),
             reason: "document too large".into(),
         });
+    }
+    let mut bytes =
+        Vec::with_capacity(resp.content_length().unwrap_or(0).min(MAX_DOC_BYTES as u64) as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| OidcError::Http {
+            url: url.to_string(),
+            reason: format!("read body: {e}"),
+        })?;
+        if chunk.len() > MAX_DOC_BYTES.saturating_sub(bytes.len()) {
+            return Err(OidcError::Parse {
+                what: what.to_string(),
+                reason: "document too large".into(),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|e| OidcError::Parse {
         what: what.to_string(),
@@ -530,6 +803,13 @@ mod tests {
             let key = EncodingKey::from_rsa_pem(self.private_pem.as_bytes()).expect("enc key");
             encode(&header, claims, &key).expect("sign jwt")
         }
+
+        /// Sign with a valid RSA algorithm but deliberately omit `kid`.
+        fn sign_without_kid(&self, claims: &serde_json::Value) -> String {
+            let header = Header::new(Algorithm::RS256);
+            let key = EncodingKey::from_rsa_pem(self.private_pem.as_bytes()).expect("enc key");
+            encode(&header, claims, &key).expect("sign jwt")
+        }
     }
 
     /// A wiremock responder that counts how many times it was hit.
@@ -564,6 +844,22 @@ mod tests {
             "email": "alice@example.com",
             "name": "Alice Example",
             "roles": ["forge-admins"],
+        })
+    }
+
+    /// GitHub/GitLab-shaped workload claims: no nonce or interactive-client
+    /// claims, but a unique token id and a short, bounded lifetime.
+    fn workload_claims(issuer: &str, aud: &str) -> serde_json::Value {
+        json!({
+            "sub": "repo:acme/widgets:ref:refs/heads/main",
+            "iss": issuer,
+            "aud": aud,
+            "exp": now() + 600,
+            "nbf": now() - 10,
+            "iat": now() - 10,
+            "jti": "8c11c3fb-0f5d-4b4c-bdf1-4c8dcad3b091",
+            "repository": "acme/widgets",
+            "ref": "refs/heads/main",
         })
     }
 
@@ -627,6 +923,156 @@ mod tests {
 
         assert_eq!(disco_hits.load(Ordering::SeqCst), 1, "discovery cached");
         assert_eq!(jwks_hits.load(Ordering::SeqCst), 1, "jwks cached");
+    }
+
+    #[tokio::test]
+    async fn workload_verification_accepts_github_style_minimal_discovery() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("github-actions-key");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+                "subject_types_supported": ["public", "pairwise"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [signer.jwk] })))
+            .mount(&server)
+            .await;
+
+        let token = signer.sign(&workload_claims(&issuer, "forge-ci"));
+        let verified = client_for(&issuer, &server)
+            .verify_workload_jwt(&token, &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect("GitHub-style workload discovery must be sufficient");
+        assert_eq!(verified.subject, "repo:acme/widgets:ref:refs/heads/main");
+        assert_eq!(
+            verified.claims.additional.get("repository"),
+            Some(&json!("acme/widgets"))
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_discovery_still_requires_browser_flow_endpoints() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&issuer, &server)
+            .discovery()
+            .await
+            .expect_err("interactive OIDC must still require authorize/token endpoints");
+        assert!(matches!(err, OidcError::Parse { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn workload_discovery_rejects_oversized_document() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_DOC_BYTES + 1]))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&issuer, &server)
+            .workload_discovery()
+            .await
+            .expect_err("metadata over one MiB must be rejected before full buffering");
+        assert!(matches!(err, OidcError::Parse { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn workload_discovery_obeys_request_timeout() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(json!({
+                        "issuer": issuer,
+                        "jwks_uri": format!("{issuer}/jwks"),
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let client = OidcMetadataClient::new(issuer, http, Cache::l1_only(8));
+
+        let err = client
+            .workload_discovery()
+            .await
+            .expect_err("slow metadata response must honor the client deadline");
+        assert!(matches!(err, OidcError::Http { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn workload_verification_requires_kid() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("only-key");
+        mount_discovery_and_jwks(&server, &issuer, &[&signer]).await;
+
+        let token = signer.sign_without_kid(&workload_claims(&issuer, "forge-ci"));
+        let err = client_for(&issuer, &server)
+            .verify_workload_jwt(&token, &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect_err("workload tokens without kid must be rejected");
+        assert_eq!(err, OidcError::UnknownKid(None));
+    }
+
+    #[tokio::test]
+    async fn workload_verification_bounds_issued_at_and_lifetime() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("k1");
+        mount_discovery_and_jwks(&server, &issuer, &[&signer]).await;
+        let client = client_for(&issuer, &server);
+
+        let mut future = workload_claims(&issuer, "forge-ci");
+        future["iat"] = json!(now() + 600);
+        future["nbf"] = json!(now() - 10);
+        let err = client
+            .verify_workload_jwt(&signer.sign(&future), &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect_err("far-future iat must be rejected");
+        assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+
+        let mut stale = workload_claims(&issuer, "forge-ci");
+        stale["iat"] = json!(now() - 7200);
+        stale["nbf"] = json!(now() - 7200);
+        stale["exp"] = json!(now() + 300);
+        let err = client
+            .verify_workload_jwt(&signer.sign(&stale), &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect_err("over-age token must be rejected even when exp is future");
+        assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+
+        let mut overlong = workload_claims(&issuer, "forge-ci");
+        overlong["exp"] = json!(now() + 7200);
+        let err = client
+            .verify_workload_jwt(&signer.sign(&overlong), &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect_err("token lifetime must not exceed the configured maximum");
+        assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -846,6 +1292,21 @@ mod tests {
         assert_eq!(err, OidcError::UnknownKid(Some("absent-kid".into())));
         // Cold load + one refetch, then give up — no infinite refetch loop.
         assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
+
+        // A different attacker-controlled kid during the issuer cooldown must
+        // reuse the now-fresh JWKS and fail without another eviction/refetch.
+        let another_absent = TestSigner::new("another-random-kid");
+        let token = another_absent.sign(&good_claims(&issuer, "client-abc", "n"));
+        let err = client.verify_id_token(&token, &params).await.unwrap_err();
+        assert_eq!(
+            err,
+            OidcError::UnknownKid(Some("another-random-kid".into()))
+        );
+        assert_eq!(
+            jwks_hits.load(Ordering::SeqCst),
+            2,
+            "random kid spray must not refetch once per request"
+        );
     }
 
     #[tokio::test]

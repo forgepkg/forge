@@ -6,6 +6,18 @@ mod common;
 use common::ServerOpts;
 use serde_json::Value;
 
+fn session_cookie(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get("set-cookie")
+        .expect("login sets session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 /// Unknown repository → 404 from the dispatcher.
 #[tokio::test]
 async fn unknown_repo_is_404() {
@@ -48,6 +60,13 @@ async fn read_authz_and_service_index() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "anon read of non-anon repo must be 401");
+    assert_eq!(
+        resp.headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic realm=\"Forge\""),
+        "native NuGet clients need a Basic challenge before sending stored source credentials"
+    );
 
     // Authenticated read → 200, with PackagePublish advertised (hosted).
     let resp = client
@@ -155,6 +174,68 @@ async fn hosted_publish_and_restore() {
     assert_eq!(resp.status(), 200);
     let downloaded = resp.bytes().await.unwrap();
     assert_eq!(downloaded.as_ref(), bytes.as_slice(), "round-trip bytes");
+}
+
+/// A browser/password session is valid for the admin UI but is not a NuGet
+/// publishing credential. An unrelated Authorization scheme must not satisfy
+/// the route's wire-credential check while the cookie supplies the principal.
+#[tokio::test]
+async fn session_plus_junk_authorization_header_cannot_publish() {
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("sessionpub{}", common::unique());
+    let package_id = format!("Session.Bypass{}", common::unique());
+
+    let login = client
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&serde_json::json!({"username": admin, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let cookie = session_cookie(&login);
+
+    let created = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&package_id, "1.0.0"))
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let form = reqwest::multipart::Form::new().part("package", part);
+    let response = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("cookie", cookie)
+        .header("authorization", "Unrelated session-bypass")
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        401,
+        "a junk auth header must not upgrade a session into a publish credential"
+    );
+
+    let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert!(
+        forge_db::component_dao::find_component(&srv.pool, repo_id, &package_id, "1.0.0")
+            .await
+            .unwrap()
+            .is_none(),
+        "rejected session publish must not create a component"
+    );
 }
 
 /// Anonymous read succeeds when the repo is `anonymous_read` and the server is

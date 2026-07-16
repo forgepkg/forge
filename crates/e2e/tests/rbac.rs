@@ -33,6 +33,7 @@ use std::time::Duration;
 use forge_e2e::{make_nupkg, start_stack, AnonMode, StackBuilder};
 use reqwest::StatusCode;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 // ── principal × repo × action matrix ────────────────────────────────────────
 
@@ -105,6 +106,21 @@ async fn matrix_read_write_any_and_fail_closed() {
             .status(),
         201,
         "an (write, ANY) grant covers repo-a"
+    );
+    let delete_without_grant = srv
+        .client()
+        .delete(format!(
+            "{}/v3/repo-a/package/Matrix.Pkg/1.0.0",
+            srv.base_url
+        ))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        delete_without_grant.status(),
+        StatusCode::FORBIDDEN,
+        "write does not imply the distinct delete privilege"
     );
 
     // The bootstrap admin (admin role) is allow-all: it can read repo-b which the
@@ -309,6 +325,166 @@ async fn anonymous_role_grant_enables_anon_read() {
     );
 }
 
+// ── content-selector enforcement ───────────────────────────────────────────
+
+/// Content selectors are enforced at every package-aware HTTP boundary. The
+/// repo-level service index remains reachable, matching packages work, and an
+/// excluded id is absent from listings/details/downloads and cannot be mutated.
+#[tokio::test]
+async fn content_selector_filters_reads_and_package_mutations() {
+    let srv = start_stack().await;
+    assert_eq!(
+        srv.create_repo(serde_json::json!({"name": "selected", "kind": "hosted"}))
+            .await
+            .status(),
+        201
+    );
+    for id in ["Company.Allowed", "Other.Hidden"] {
+        assert_eq!(
+            srv.push_nupkg("selected", make_nupkg(id, "1.0.0"))
+                .await
+                .status(),
+            201
+        );
+    }
+
+    let selector = srv
+        .create_content_selector("company-only", &["company.*"], &[])
+        .await;
+    let user = srv.create_user("selector-user", "pw").await;
+    let role = srv.create_role("selector-role").await;
+    for action in ["read", "write", "delete"] {
+        assert_eq!(
+            srv.add_grant(role, Some("selected"), action, Some(selector))
+                .await
+                .status(),
+            201
+        );
+    }
+    assert_eq!(srv.assign_role(user, role).await.status(), 204);
+    let token = srv.issue_token(user, None).await;
+
+    // A selector-scoped grant still reaches the repository-level index.
+    assert_eq!(
+        srv.read_index_with_token("selected", &token).await,
+        StatusCode::OK
+    );
+
+    let get = |path: &str| {
+        srv.client()
+            .get(format!("{}{path}", srv.base_url))
+            .header("X-NuGet-ApiKey", &token)
+            .send()
+    };
+    assert_eq!(
+        get("/v3/selected/flat/company.allowed/index.json")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "matching flat-container id remains visible"
+    );
+    for path in [
+        "/v3/selected/flat/other.hidden/index.json",
+        "/v3/selected/registration/other.hidden/index.json",
+        "/v3/selected/flat/other.hidden/1.0.0/other.hidden.1.0.0.nupkg",
+        "/browse/packages/selected/other.hidden",
+    ] {
+        assert_eq!(
+            get(path).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "excluded identifier path must look absent: {path}"
+        );
+    }
+
+    let search: Value = get("/v3/selected/query?q=&prerelease=true")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search["totalHits"], 1);
+    assert_eq!(search["data"][0]["id"], "Company.Allowed");
+
+    let browse: Value = get("/browse/packages?repo=selected&take=20")
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(browse["total"], 1);
+    assert_eq!(browse["items"][0]["original_id"], "Company.Allowed");
+
+    // Upload authorization uses the canonical id parsed from the nupkg. The
+    // excluded upload is rejected before it can create a component.
+    assert_eq!(
+        srv.push_nupkg_with_token("selected", &token, make_nupkg("Company.New", "1.0.0"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let denied_package = make_nupkg("Other.New", "1.0.0");
+    let denied_sha = hex::encode(Sha256::digest(&denied_package));
+    assert_eq!(
+        srv.push_nupkg_with_token("selected", &token, denied_package)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let repo = forge_db::repository_dao::find_repository_by_name(&srv.pool, "selected")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        forge_db::component_dao::find_component(&srv.pool, repo.id, "other.new", "1.0.0")
+            .await
+            .unwrap()
+            .is_none(),
+        "denied upload must not create a component"
+    );
+    let denied_blob_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM blob WHERE sha256 = $1)")
+            .bind(denied_sha)
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert!(
+        !denied_blob_exists,
+        "denied upload must not promote its staged bytes into CAS"
+    );
+
+    let mutation = |method: reqwest::Method, id: &str| {
+        srv.client()
+            .request(
+                method,
+                format!("{}/v3/selected/package/{id}/1.0.0", srv.base_url),
+            )
+            .header("X-NuGet-ApiKey", &token)
+            .send()
+    };
+    assert_eq!(
+        mutation(reqwest::Method::DELETE, "Company.Allowed")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        mutation(reqwest::Method::POST, "Company.Allowed")
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    for method in [reqwest::Method::DELETE, reqwest::Method::POST] {
+        assert_eq!(
+            mutation(method, "Other.Hidden").await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "excluded identifier mutation must not reveal package existence"
+        );
+    }
+}
+
 // ── nested-group visibility honoring privileges ─────────────────────────────
 
 /// A nested group `g-outer → g-inner → {leaf-ok, leaf-no}`: a user who can read
@@ -360,16 +536,31 @@ async fn nested_group_visibility_honors_privileges() {
             .status(),
         201
     );
+    assert_eq!(
+        srv.push_nupkg("leaf-ok", make_nupkg("Other.Hidden", "1.0.0"))
+            .await
+            .status(),
+        201
+    );
 
     // A user who can read g-outer, g-inner and leaf-ok — but NOT leaf-no.
     let uid = srv.create_user("nest-user", "pw").await;
     let role = srv.create_role("nest-reader").await;
-    for repo in ["g-outer", "g-inner", "leaf-ok"] {
+    for repo in ["g-outer", "g-inner"] {
         assert_eq!(
             srv.add_grant(role, Some(repo), "read", None).await.status(),
             201
         );
     }
+    let leaf_selector = srv
+        .create_content_selector("nested-leaf-nest-only", &["nest.*"], &[])
+        .await;
+    assert_eq!(
+        srv.add_grant(role, Some("leaf-ok"), "read", Some(leaf_selector))
+            .await
+            .status(),
+        201
+    );
     assert_eq!(srv.assign_role(uid, role).await.status(), 204);
     let token = srv.issue_token(uid, None).await;
 
@@ -416,6 +607,22 @@ async fn nested_group_visibility_honors_privileges() {
         resp.status(),
         404,
         "a package in a forbidden nested leaf is 404 (no existence leak)"
+    );
+
+    let resp = srv
+        .client()
+        .get(format!(
+            "{}/v3/g-outer/flat/other.hidden/index.json",
+            srv.base_url
+        ))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a leaf content selector is preserved through nested-group resolution"
     );
 
     // The admin, who can read every leaf, sees the union of both versions.

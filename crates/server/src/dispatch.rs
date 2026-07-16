@@ -14,7 +14,8 @@
 //!   user is impossible in Slice 1 (any user can read), so a denial means an
 //!   anonymous/unauthenticated caller → **401** (so a NuGet client knows to send
 //!   credentials).
-//! * Write methods (`PUT`/`POST`/`DELETE`) require [`can_write`]; an
+//! * Publish/relist methods (`PUT`/`POST`) require `write`; package deletion
+//!   (`DELETE`) requires the distinct `delete` privilege. An
 //!   unauthenticated caller → **401**, an authenticated-but-disallowed caller →
 //!   **403** (none in Slice 1, but the distinction is wired for §12.4).
 
@@ -23,18 +24,24 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::principal::Principal;
+use forge_core::authz::{Action, PackageFilter};
 use forge_core::repo::RepoKind;
 use forge_db::model::Repository;
 use forge_db::repository_dao;
 use forge_nuget::routes::{nuget_router, RouteContext};
+use sha2::Digest;
 use tower::ServiceExt;
 
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Whether an HTTP method is a write (publish / unlist / relist / delete).
-fn is_write(method: &Method) -> bool {
-    matches!(method, &Method::PUT | &Method::POST | &Method::DELETE)
+/// RBAC action corresponding to one NuGet protocol request.
+fn action_for_method(method: &Method) -> Action {
+    match *method {
+        Method::PUT | Method::POST => Action::Write,
+        Method::DELETE => Action::Delete,
+        _ => Action::Read,
+    }
 }
 
 /// Strip the `/v3/{repo}` prefix from the original request path, returning the
@@ -51,14 +58,16 @@ fn subpath(uri: &Uri, repo: &str) -> String {
 }
 
 /// Build a [`RouteContext`] for a resolved repository + principal.
-fn route_context(
+async fn route_context(
     state: &AppState,
     repo: &Repository,
     principal: Principal,
+    package_filter: PackageFilter,
 ) -> Option<RouteContext> {
     let kind = repo.kind();
     let format = state.formats.for_repository(repo);
-    let ops = state.read_ops_for(repo, principal).ok()?;
+    let ops = state.read_ops_for(repo, principal).await.ok()?;
+    let protocol_mutations_allowed = principal_allows_protocol_mutations(&principal);
 
     // Write ops only for hosted repos; the router mounts publish routes only for
     // hosted, so proxy/group never reach a write handler.
@@ -66,6 +75,10 @@ fn route_context(
         RepoKind::Hosted => Some(std::sync::Arc::new(HostedWriteAdapter::new(
             state,
             format.clone(),
+            repo.id,
+            repo.name.clone(),
+            principal,
+            package_filter.clone(),
         ))),
         _ => None,
     };
@@ -78,8 +91,25 @@ fn route_context(
         format,
         nupkg: state.blob_bytes(),
         write,
+        protocol_mutations_allowed,
+        package_filter,
         max_upload_bytes: forge_nuget::routes::DEFAULT_MAX_UPLOAD_BYTES,
     })
+}
+
+/// NuGet mutation endpoints accept only credentials designed for non-browser
+/// package clients. A session/password principal is intentionally insufficient:
+/// otherwise adding an unrelated `Authorization` header to a cookie-authenticated
+/// request would turn that browser session into a package publishing credential.
+fn principal_allows_protocol_mutations(principal: &Principal) -> bool {
+    matches!(
+        principal,
+        Principal::Workload { .. }
+            | Principal::User {
+                token_id: Some(_),
+                ..
+            }
+    )
 }
 
 /// Axum fallback handler mounted at `/v3/{repo}` (and everything under it).
@@ -102,16 +132,24 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
 
-    // Authorization gate (before any handler runs).
-    if is_write(&method) {
-        if !state.authz.can_write(&principal, &repo).await {
-            return authz_denied(&principal);
-        }
-    } else if !state.authz.can_read(&principal, &repo).await {
+    // Authorization gate (before any handler runs). Delete is a distinct
+    // privilege from publish/relist; selectors are evaluated separately below.
+    let action = action_for_method(&method);
+    let allowed = match action {
+        Action::Read => state.authz.can_read(&principal, &repo).await,
+        Action::Write => state.authz.can_write(&principal, &repo).await,
+        Action::Delete => state.authz.can_delete(&principal, &repo).await,
+        Action::Admin => false,
+    };
+    if !allowed {
         return authz_denied(&principal);
     }
+    let package_filter = state
+        .authz
+        .package_filter_for(&principal, &repo, action)
+        .await;
 
-    let Some(ctx) = route_context(&state, &repo, principal) else {
+    let Some(ctx) = route_context(&state, &repo, principal, package_filter).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     };
 
@@ -152,9 +190,15 @@ fn authz_denied(principal: &Principal) -> Response {
             (StatusCode::FORBIDDEN, "forbidden").into_response()
         }
         // No/insufficient identity → 401 so the client knows to authenticate.
-        Principal::Anonymous { .. } | Principal::Unauthenticated => {
-            (StatusCode::UNAUTHORIZED, "authentication required").into_response()
-        }
+        Principal::Anonymous { .. } | Principal::Unauthenticated => (
+            StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"Forge\"",
+            )],
+            "authentication required",
+        )
+            .into_response(),
     }
 }
 
@@ -172,7 +216,11 @@ fn repo_name_from_path(path: &str) -> Option<String> {
 
 use forge_core::format::Format;
 use forge_core::repo::hosted::HostedWrite;
-use forge_core::repo::{DeleteOutcome, PublishOutcome, RepoWriteOps, UploadReader, WriteError};
+use forge_core::repo::{
+    DeleteOutcome, PublishAuthorizationContext, PublishOutcome, PublishPolicy, RepoError,
+    RepoWriteOps, UploadReader, WriteError,
+};
+use forge_db::trusted_publish_audit_dao::{self, NewTrustedPublishAudit};
 use std::sync::Arc;
 
 /// Bridges the object-safe [`RepoWriteOps`] trait (which takes a boxed
@@ -182,15 +230,133 @@ struct HostedWriteAdapter {
 }
 
 impl HostedWriteAdapter {
-    fn new(state: &AppState, format: Arc<dyn Format>) -> Self {
+    fn new(
+        state: &AppState,
+        format: Arc<dyn Format>,
+        repository_id: i64,
+        repository_name: String,
+        principal: Principal,
+        package_filter: PackageFilter,
+    ) -> Self {
+        let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
+            filter: package_filter.clone(),
+            repository_id,
+            repository_name,
+        });
         let inner = HostedWrite::new(
             state.pool.clone(),
             format,
             state.cas.clone(),
             state.cache_invalidator(),
             state.config.outbox.grace(),
-        );
+        )
+        .with_publish_policy(principal, policy)
+        .with_mutation_filter(package_filter);
         HostedWriteAdapter { inner }
+    }
+}
+
+/// Request-scoped publication policy. The canonical package id is available
+/// only after format parsing, so this hook is the first safe point at which the
+/// selector can be applied without trusting multipart metadata.
+struct SelectorPublishPolicy {
+    filter: PackageFilter,
+    repository_id: i64,
+    repository_name: String,
+}
+
+#[async_trait::async_trait]
+impl PublishPolicy for SelectorPublishPolicy {
+    async fn authorize(&self, context: &PublishAuthorizationContext) -> Result<(), WriteError> {
+        if self.filter.allows(&context.package_id) {
+            Ok(())
+        } else {
+            Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            })
+        }
+    }
+
+    async fn record_in_transaction(
+        &self,
+        context: &PublishAuthorizationContext,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), WriteError> {
+        let Principal::Workload {
+            realm_id,
+            role_id,
+            issuer_sha256,
+            config_sha256,
+            subject_sha256,
+            jti_sha256,
+            issued_at,
+        } = context.principal
+        else {
+            // This ledger is specifically the federated trusted-publishing
+            // provenance record. Existing user/token publication behavior is
+            // unchanged and is not mislabeled as workload identity.
+            return Ok(());
+        };
+        let token_issued_at = chrono::DateTime::<chrono::Utc>::from_timestamp(issued_at, 0)
+            .ok_or_else(|| RepoError::Storage("validated workload iat is out of range".into()))?;
+        let identity = trusted_publish_audit_dao::lock_identity_snapshot(tx, realm_id, role_id)
+            .await
+            .map_err(RepoError::from)?
+            .ok_or_else(|| WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            })?;
+        let current_issuer_hash: [u8; 32] =
+            sha2::Sha256::digest(identity.issuer.trim_end_matches('/').as_bytes()).into();
+        if current_issuer_hash != issuer_sha256 {
+            // A stale in-memory realm snapshot authenticated against an issuer
+            // that has since been replaced. The row locks above make this check
+            // authoritative for the rest of the package transaction.
+            return Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            });
+        }
+        let current_config_hash = crate::auth::workload_identity_config_sha256(
+            &identity.realm_config,
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                realm_id,
+                error = %error,
+                "current WIF realm config is invalid; publish denied"
+            );
+            WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            }
+        })?;
+        if current_config_hash != config_sha256 {
+            // Audience, lifetime, authorized-party, or claim-rule policy changed
+            // after this peer built its realm snapshot. Do not let the stale
+            // principal publish under the new configuration's identity.
+            return Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            });
+        }
+
+        trusted_publish_audit_dao::insert(
+            tx,
+            NewTrustedPublishAudit {
+                repository_id: self.repository_id,
+                repository_name: &self.repository_name,
+                package_name: &context.package_id,
+                package_version: &context.package_version,
+                realm_id,
+                realm_name: &identity.realm_name,
+                issuer: &identity.issuer,
+                role_id,
+                role_name: &identity.role_name,
+                subject_sha256: &subject_sha256,
+                jti_sha256: jti_sha256.as_ref(),
+                token_issued_at,
+            },
+        )
+        .await
+        .map_err(RepoError::from)?;
+        Ok(())
     }
 }
 
@@ -257,11 +423,37 @@ mod tests {
     }
 
     #[test]
-    fn write_methods_classified() {
-        assert!(is_write(&Method::PUT));
-        assert!(is_write(&Method::POST));
-        assert!(is_write(&Method::DELETE));
-        assert!(!is_write(&Method::GET));
-        assert!(!is_write(&Method::HEAD));
+    fn protocol_methods_map_to_distinct_actions() {
+        assert_eq!(action_for_method(&Method::PUT), Action::Write);
+        assert_eq!(action_for_method(&Method::POST), Action::Write);
+        assert_eq!(action_for_method(&Method::DELETE), Action::Delete);
+        assert_eq!(action_for_method(&Method::GET), Action::Read);
+        assert_eq!(action_for_method(&Method::HEAD), Action::Read);
+    }
+
+    #[test]
+    fn only_api_tokens_and_workloads_are_protocol_mutation_credentials() {
+        assert!(principal_allows_protocol_mutations(&Principal::User {
+            user_id: 1,
+            token_id: Some(7),
+            is_admin: false,
+        }));
+        assert!(principal_allows_protocol_mutations(&Principal::Workload {
+            realm_id: 1,
+            role_id: 2,
+            issuer_sha256: [1; 32],
+            config_sha256: [3; 32],
+            subject_sha256: [2; 32],
+            jti_sha256: None,
+            issued_at: 1,
+        }));
+        assert!(!principal_allows_protocol_mutations(&Principal::User {
+            user_id: 1,
+            token_id: None,
+            is_admin: true,
+        }));
+        assert!(!principal_allows_protocol_mutations(
+            &Principal::Unauthenticated
+        ));
     }
 }

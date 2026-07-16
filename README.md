@@ -14,7 +14,10 @@ store; package metadata lives in **PostgreSQL**. Access control is **fine-graine
 RBAC** (users, nested groups, roles, package/content selectors). Authentication
 is organized into ordered, web-managed **auth realms** — local passwords,
 **OIDC / Microsoft Entra** browser login, and credential-forwarding against an
-existing registry — with an identifier-first login flow.
+existing registry — with an identifier-first login flow. CI jobs can publish
+without stored API keys through Forge's **direct-token OIDC trusted-publishing**
+flow for GitHub Actions, GitLab CI, and compatible workload issuers; its bearer
+token, cache, and audit limitations are documented below.
 A **retention** engine reaps cold versions and garbage-collects dereferenced
 blobs. The admin + browse UI is a **TanStack Router SPA** served by the same Rust
 process on a single origin — there is no Node server in production.
@@ -114,6 +117,8 @@ the user password).
 - **[DEVELOPMENT.md](./DEVELOPMENT.md)** — full local-dev guide: every
   `cargo xtask` command, configuration knobs, OIDC/Entra setup, the web UI dev
   server, tests, and Docker packaging details.
+- **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
+  workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers.
 - **Design specs** — `docs/superpowers/specs/` (NuGet registry design;
   auth-realms & workload-identity design) and implementation plans in
   `docs/superpowers/plans/`.

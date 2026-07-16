@@ -75,7 +75,7 @@ export interface WorkloadIdentityCondition {
 
 /**
  * A workload-identity rule: grants `role` when ALL `conditions` match (AND).
- * An empty (or omitted) `conditions` list is a catch-all (any token).
+ * At least one condition is required; catch-all trust is rejected.
  */
 export interface WorkloadIdentityRule {
   role: string
@@ -92,6 +92,9 @@ export interface WorkloadIdentityConfig {
   allowed_audiences: string[]
   allow_http_issuer?: boolean
   clock_skew_seconds?: number
+  max_token_age_seconds?: number
+  allowed_authorized_parties?: string[]
+  positive_cache_seconds?: number
   rules: WorkloadIdentityRule[]
 }
 

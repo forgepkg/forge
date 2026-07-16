@@ -15,8 +15,9 @@
 //!    a manual decref path). After `grace`, we delete the object and row.
 //!
 //! Like the outbox worker, the reconciler never holds a DB transaction across an
-//! S3 call: it lists candidates, deletes objects outside any transaction, then
-//! deletes the rows.
+//! S3 call: it lists candidates, reserves each eligible row with a fencing
+//! token, deletes the object, then token-conditionally deletes the row. Live
+//! ingest leases make a candidate ineligible.
 
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -34,20 +35,46 @@ pub async fn reconcile_orphans(
     grace: Duration,
 ) -> anyhow::Result<usize> {
     let cutoff = Utc::now() - grace;
+    let stale_deletion_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
     let mut removed = 0usize;
 
+    // Expired leases on live/referenced blobs might never pass through a delete
+    // candidate. Keep the coordination table bounded independently.
+    forge_db::blob_dao::prune_expired_ingests(pool, RECONCILE_BATCH).await?;
+
     // Class 1: stale pending uploads whose owning tx never committed.
-    let stale_pending =
-        forge_db::blob_dao::list_stale_pending(pool, cutoff, RECONCILE_BATCH).await?;
+    let stale_pending = forge_db::blob_dao::list_stale_pending(
+        pool,
+        cutoff,
+        stale_deletion_before,
+        RECONCILE_BATCH,
+    )
+    .await?;
     for blob in stale_pending {
-        // Delete the S3 object first (idempotent, no tx held), then drop the row
-        // only if it is *still* a stale pending row — a slow-but-valid ingest
-        // could have committed it in the meantime, in which case we leave it.
         let res = async {
-            store.delete(&blob.s3_key).await?;
-            let removed =
-                forge_db::blob_dao::delete_if_stale_pending(pool, &blob.sha256, cutoff).await?;
-            Ok::<bool, anyhow::Error>(removed)
+            let reservation = match forge_db::blob_dao::reserve_stale_pending_delete(
+                pool,
+                &blob.sha256,
+                cutoff,
+                stale_deletion_before,
+            )
+            .await?
+            {
+                forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
+                _ => return Ok::<bool, anyhow::Error>(false),
+            };
+            if let Err(error) = store.delete(&reservation.s3_key).await {
+                // The failed response may hide a delete that completes later.
+                // Retain the fence until a stale-reservation takeover so this
+                // object incarnation cannot be revived underneath it.
+                return Err(error.into());
+            }
+            let finalized =
+                forge_db::blob_dao::finalize_delete_reservation(pool, &reservation).await?;
+            if !finalized {
+                anyhow::bail!("stale pending deletion reservation was superseded");
+            }
+            Ok(true)
         }
         .await;
         match res {
@@ -62,15 +89,38 @@ pub async fn reconcile_orphans(
     }
 
     // Class 2: committed-then-unreferenced blobs with no pending outbox row.
-    let stale_unref =
-        forge_db::blob_dao::list_stale_unreferenced(pool, cutoff, RECONCILE_BATCH).await?;
+    let stale_unref = forge_db::blob_dao::list_stale_unreferenced(
+        pool,
+        cutoff,
+        stale_deletion_before,
+        RECONCILE_BATCH,
+    )
+    .await?;
     for blob in stale_unref {
         let res = async {
-            store.delete(&blob.s3_key).await?;
-            // Drop the row only if it is still unreferenced (a re-push may have
-            // revived it).
-            let removed = forge_db::blob_dao::delete_if_unreferenced(pool, &blob.sha256).await?;
-            Ok::<bool, anyhow::Error>(removed)
+            let reservation = match forge_db::blob_dao::reserve_dangling_delete(
+                pool,
+                &blob.sha256,
+                cutoff,
+                stale_deletion_before,
+            )
+            .await?
+            {
+                forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
+                _ => return Ok::<bool, anyhow::Error>(false),
+            };
+            if let Err(error) = store.delete(&reservation.s3_key).await {
+                // Preserve the reservation on an ambiguous failure; releasing
+                // it would allow a new reference to reuse a key that a delayed
+                // delete can still remove.
+                return Err(error.into());
+            }
+            let finalized =
+                forge_db::blob_dao::finalize_delete_reservation(pool, &reservation).await?;
+            if !finalized {
+                anyhow::bail!("dangling blob deletion reservation was superseded");
+            }
+            Ok(true)
         }
         .await;
         match res {

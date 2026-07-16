@@ -25,6 +25,7 @@ pub mod retention_dao;
 pub mod secret_dao;
 pub mod session_dao;
 pub mod token_dao;
+pub mod trusted_publish_audit_dao;
 pub mod user_dao;
 pub mod validated_credential_dao;
 

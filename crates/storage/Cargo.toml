@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 forge-db = { path = "../db" }
 
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 sqlx = { workspace = true }
@@ -17,6 +17,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }

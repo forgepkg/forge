@@ -49,7 +49,7 @@ pub enum Action {
     Read,
     /// Push / relist.
     Write,
-    /// Hard delete / unlist beyond owner.
+    /// Unlist / delete.
     Delete,
     /// Repository config + privilege management.
     Admin,
@@ -300,7 +300,7 @@ impl EffectiveSet {
         self.grants.iter().any(|g| g.covers_repo(action, repo_id))
     }
 
-    /// **Package-level filter** for `read` on `repo_id`.
+    /// **Package-level filter** for `action` on `repo_id`.
     ///
     /// Returns the predicate to apply when listing/serving packages from the
     /// repo. Admin and any unscoped `read` grant covering the repo ⇒
@@ -309,14 +309,14 @@ impl EffectiveSet {
     /// ([`PackageFilter::Selectors`]). If no read grant covers the repo at all,
     /// returns [`PackageFilter::DenyAll`] (the repo gate should have already
     /// denied, but this stays fail-closed independently).
-    pub fn package_filter(&self, repo_id: i64) -> PackageFilter {
+    pub fn package_filter_for(&self, action: Action, repo_id: i64) -> PackageFilter {
         if self.is_admin {
             return PackageFilter::AllowAll;
         }
         let mut selectors: Vec<Arc<CompiledSelector>> = Vec::new();
         let mut covers = false;
         for g in &self.grants {
-            if !g.covers_repo(Action::Read, repo_id) {
+            if !g.covers_repo(action, repo_id) {
                 continue;
             }
             covers = true;
@@ -331,6 +331,15 @@ impl EffectiveSet {
         } else {
             PackageFilter::Selectors(selectors)
         }
+    }
+
+    /// **Package-level filter** for `read` on `repo_id`.
+    ///
+    /// Kept as the read-oriented convenience API used by existing callers;
+    /// package-aware mutations use [`Self::package_filter_for`] with their own
+    /// action so a read grant can never authorize a write or delete.
+    pub fn package_filter(&self, repo_id: i64) -> PackageFilter {
+        self.package_filter_for(Action::Read, repo_id)
     }
 
     /// Apply a token scope, returning a **narrowed** set (never widened).
@@ -399,6 +408,10 @@ pub enum PackageFilter {
     DenyAll,
     /// A package is visible iff **any** of these selectors matches it (union).
     Selectors(Vec<Arc<CompiledSelector>>),
+    /// A package is visible iff every nested filter allows it. Used for group
+    /// traversal, where the filters on the outer group, nested groups, and leaf
+    /// repository must all hold.
+    All(Vec<PackageFilter>),
 }
 
 impl PackageFilter {
@@ -408,6 +421,30 @@ impl PackageFilter {
             PackageFilter::AllowAll => true,
             PackageFilter::DenyAll => false,
             PackageFilter::Selectors(sels) => sels.iter().any(|s| s.matches(package_name)),
+            PackageFilter::All(filters) => filters.iter().all(|f| f.allows(package_name)),
+        }
+    }
+
+    /// Intersect two package filters without losing either selector boundary.
+    /// This is primarily used while descending nested repository groups.
+    pub fn intersect(self, other: PackageFilter) -> PackageFilter {
+        match (self, other) {
+            (PackageFilter::DenyAll, _) | (_, PackageFilter::DenyAll) => PackageFilter::DenyAll,
+            (PackageFilter::AllowAll, rhs) => rhs,
+            (lhs, PackageFilter::AllowAll) => lhs,
+            (PackageFilter::All(mut lhs), PackageFilter::All(rhs)) => {
+                lhs.extend(rhs);
+                PackageFilter::All(lhs)
+            }
+            (PackageFilter::All(mut lhs), rhs) => {
+                lhs.push(rhs);
+                PackageFilter::All(lhs)
+            }
+            (lhs, PackageFilter::All(mut rhs)) => {
+                rhs.insert(0, lhs);
+                PackageFilter::All(rhs)
+            }
+            (lhs, rhs) => PackageFilter::All(vec![lhs, rhs]),
         }
     }
 }
@@ -648,6 +685,49 @@ mod tests {
         let f1 = s.package_filter(1);
         assert!(f1.allows("Pub.A"));
         assert!(!f1.allows("Priv.A"));
+    }
+
+    #[test]
+    fn package_filters_are_action_specific() {
+        let s = set(
+            false,
+            &[
+                (Action::Read, Some(1), Some(sel(&["public.*"], &[]))),
+                (Action::Write, Some(1), Some(sel(&["publish.*"], &[]))),
+                (Action::Delete, Some(1), Some(sel(&["retire.*"], &[]))),
+            ],
+        );
+
+        let read = s.package_filter_for(Action::Read, 1);
+        assert!(read.allows("Public.Tools"));
+        assert!(!read.allows("Publish.Tools"));
+
+        let write = s.package_filter_for(Action::Write, 1);
+        assert!(write.allows("Publish.Tools"));
+        assert!(!write.allows("Public.Tools"));
+
+        let delete = s.package_filter_for(Action::Delete, 1);
+        assert!(delete.allows("Retire.Tools"));
+        assert!(!delete.allows("Publish.Tools"));
+    }
+
+    #[test]
+    fn intersect_requires_every_group_path_filter() {
+        let outer = set(
+            false,
+            &[(Action::Read, Some(1), Some(sel(&["company.*"], &[])))],
+        )
+        .package_filter(1);
+        let leaf = set(
+            false,
+            &[(Action::Read, Some(2), Some(sel(&["*.public"], &[])))],
+        )
+        .package_filter(2);
+        let combined = outer.intersect(leaf);
+
+        assert!(combined.allows("Company.Public"));
+        assert!(!combined.allows("Company.Secret"));
+        assert!(!combined.allows("Other.Public"));
     }
 
     // --- token scoping ------------------------------------------------------

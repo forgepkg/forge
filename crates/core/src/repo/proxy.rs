@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::net::ssrf::outbound_client;
 use crate::repo::{
@@ -641,7 +642,7 @@ impl ProxyRepo {
         }
 
         // Commit blob + attach component/asset within this short tx.
-        blob_dao::commit_and_incref(&mut tx, &stored.sha256).await?;
+        blob_dao::commit_ingest_and_incref(&mut tx, &stored.sha256, stored.ingest_token).await?;
 
         // Insert the component if it is not already present (a prior metadata
         // discovery never inserts components, so normally absent here).
@@ -723,6 +724,77 @@ impl ProxyRepo {
             size: asset.size,
             content_type: asset.content_type,
         }))
+    }
+
+    /// Search the locally known proxy corpus once, applying authorization
+    /// before total-count calculation and client paging.
+    async fn search_filtered(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let now = Utc::now();
+        let rows = sqlx::query_as!(
+            forge_db::model::ProxyCachedVersion,
+            r#"
+            SELECT id, repository_id, name, version, listed, first_seen_at,
+                   downloaded, metadata_refreshed_at, not_found, not_found_at
+            FROM proxy_cached_version
+            WHERE repository_id = $1 AND version <> '*' AND not_found = false
+            "#,
+            repo_row.id,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let q = params.q.trim().to_lowercase();
+        use std::collections::BTreeMap;
+        let mut by_id: BTreeMap<String, Vec<forge_db::model::ProxyCachedVersion>> = BTreeMap::new();
+        for r in rows {
+            if !Self::delay_cleared(&repo_row, r.first_seen_at, now)
+                || !filter.allows(&r.name)
+                || (!q.is_empty() && !r.name.contains(&q))
+            {
+                continue;
+            }
+            by_id.entry(r.name.clone()).or_default().push(r);
+        }
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for (_name, rows) in by_id {
+            let mut versions: Vec<VersionEntry> = rows
+                .into_iter()
+                .filter(|r| r.listed)
+                .filter(|r| params.prerelease || !is_prerelease(&r.version))
+                .map(|r| VersionEntry {
+                    original_id: r.name.clone(),
+                    version: r.version.clone(),
+                    version_original: r.version,
+                    listed: r.listed,
+                })
+                .collect();
+            versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+            if versions.is_empty() {
+                continue;
+            }
+            let latest = versions.last().expect("non-empty versions");
+            hits.push(SearchHit {
+                original_id: latest.original_id.clone(),
+                latest_version: latest.version.clone(),
+                versions,
+            });
+        }
+        hits.sort_by(|a, b| a.original_id.cmp(&b.original_id));
+
+        let total_hits = hits.len();
+        let hits = hits
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        Ok(SearchResult { total_hits, hits })
     }
 }
 
@@ -996,70 +1068,16 @@ impl RepoReadOps for ProxyRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        let repo_row = self.proxy_repo(repo).await?;
-        let now = Utc::now();
+        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+            .await
+    }
 
-        // Search over locally-known cached versions (slice 1 does not proxy the
-        // upstream search endpoint; it surfaces what has been discovered).
-        let rows = sqlx::query_as!(
-            forge_db::model::ProxyCachedVersion,
-            r#"
-            SELECT id, repository_id, name, version, listed, first_seen_at,
-                   downloaded, metadata_refreshed_at, not_found, not_found_at
-            FROM proxy_cached_version
-            WHERE repository_id = $1 AND version <> '*' AND not_found = false
-            "#,
-            repo_row.id,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let q = params.q.trim().to_lowercase();
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::ProxyCachedVersion>> = BTreeMap::new();
-        for r in rows {
-            if !Self::delay_cleared(&repo_row, r.first_seen_at, now) {
-                continue;
-            }
-            if !q.is_empty() && !r.name.contains(&q) {
-                continue;
-            }
-            by_id.entry(r.name.clone()).or_default().push(r);
-        }
-
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, rows) in by_id {
-            let mut versions: Vec<VersionEntry> = rows
-                .into_iter()
-                .filter(|r| r.listed)
-                .filter(|r| params.prerelease || !is_prerelease(&r.version))
-                .map(|r| VersionEntry {
-                    original_id: r.name.clone(),
-                    version: r.version.clone(),
-                    version_original: r.version.clone(),
-                    listed: r.listed,
-                })
-                .collect();
-            versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
-            if versions.is_empty() {
-                continue;
-            }
-            let latest = versions.last().unwrap();
-            hits.push(SearchHit {
-                original_id: latest.original_id.clone(),
-                latest_version: latest.version.clone(),
-                versions,
-            });
-        }
-        hits.sort_by(|a, b| a.original_id.cmp(&b.original_id));
-
-        let total_hits = hits.len();
-        let skip = params.skip.min(total_hits);
-        let take = params.effective_take();
-        let page = hits.into_iter().skip(skip).take(take).collect();
-        Ok(SearchResult {
-            total_hits,
-            hits: page,
-        })
+    async fn search_with_package_filter(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter).await
     }
 }

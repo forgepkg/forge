@@ -1,11 +1,11 @@
 //! Content-addressed storage (CAS) ingest.
 //!
-//! [`Cas::store`] streams an arbitrary reader to a temp file while hashing it,
-//! records a `pending` blob row (dedup-safe via `ON CONFLICT DO NOTHING`), and
-//! uploads the object to S3 **only if absent**. It deliberately does NOT incref
-//! the blob or insert any asset row — that is the caller's job, done in its own
-//! transaction together with `commit_and_incref` once the surrounding write
-//! (e.g. an asset/component insert) is known to succeed.
+//! [`Cas::stage`] streams an arbitrary reader to a temp file while hashing it
+//! without mutating the database or S3. [`Cas::commit`] then registers an ingest
+//! lease and uploads the object **only if absent**. The lease fences deferred
+//! deletion until the caller atomically consumes it with
+//! `blob_dao::commit_ingest_and_incref` in the transaction that attaches the
+//! component/asset reference.
 //!
 //! The returned [`StoredBlob`] keeps the temp file alive ([`tempfile::TempPath`])
 //! so the caller can hand it to a format parser before dropping it.
@@ -20,6 +20,24 @@ use tokio::io::{copy, AsyncRead, ReadBuf};
 use crate::hash::HashingWriter;
 use crate::s3::{BlobStore, S3Error};
 
+/// An ingest lease comfortably covers S3 promotion plus package transaction
+/// work. Abandoned leases are ignored after this bound and pruned by the
+/// reconciler; successful commits consume them immediately.
+const INGEST_LEASE: chrono::Duration = chrono::Duration::hours(1);
+
+/// Renew far ahead of expiry. The heartbeat runs independently of an
+/// arbitrarily slow S3 request and remains alive with `StoredBlob` through the
+/// caller's database transaction.
+const INGEST_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A crashed delete owner may be fenced out after this interval. S3 deletion
+/// is idempotent, and the DB token prevents the stale owner from finalizing a
+/// reservation it no longer owns.
+pub(crate) const DELETE_RESERVATION_LEASE: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Poll interval while a healthy peer is completing an S3 delete.
+const DELETION_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Errors raised while ingesting content into the CAS.
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
@@ -33,6 +51,18 @@ pub enum CasError {
     S3(#[from] S3Error),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+}
+
+/// Locally staged bytes and their content hashes.
+///
+/// Staging is intentionally mutation-free so a format parser and authorization
+/// policy can inspect package identity before any database/S3 side effect.
+#[derive(Debug)]
+pub struct StagedBlob {
+    pub sha256: String,
+    pub sha512_base64: String,
+    pub size: u64,
+    pub temp_path: TempPath,
 }
 
 /// Result of ingesting content: its content address, integrity hash, size, and
@@ -52,6 +82,76 @@ pub struct StoredBlob {
     pub s3_key: String,
     /// Whether this ingest performed a fresh S3 upload (`false` = dedup hit).
     pub uploaded: bool,
+    /// Lease consumed atomically with the reference-count increment.
+    pub ingest_token: uuid::Uuid,
+    _lease_guard: IngestLeaseGuard,
+}
+
+#[derive(Debug)]
+struct IngestLeaseGuard {
+    token: uuid::Uuid,
+    pool: PgPool,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl IngestLeaseGuard {
+    fn start(pool: PgPool, token: uuid::Uuid) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let heartbeat_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(INGEST_HEARTBEAT);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = ticker.tick() => {
+                        match forge_db::blob_dao::refresh_ingest(
+                            &heartbeat_pool,
+                            token,
+                            chrono::Utc::now() + INGEST_LEASE,
+                        ).await {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => tracing::warn!(
+                                ingest_token = %token,
+                                error = %error,
+                                "failed to renew blob ingest lease"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            token,
+            pool,
+            stop: Some(stop),
+        }
+    }
+}
+
+impl Drop for IngestLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        // Successful reference transactions already consumed the token. On
+        // every rollback/early-return path this best-effort cleanup removes the
+        // deletion fence immediately instead of waiting for lease expiry.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let pool = self.pool.clone();
+            let token = self.token;
+            runtime.spawn(async move {
+                if let Err(error) = forge_db::blob_dao::abort_ingest(&pool, token).await {
+                    tracing::warn!(
+                        ingest_token = %token,
+                        error = %error,
+                        "failed to release dropped blob ingest lease"
+                    );
+                }
+            });
+        }
+    }
 }
 
 /// Content-addressed store coordinating the S3 object store and the blob table.
@@ -66,7 +166,12 @@ impl Cas {
         Self { store, pool }
     }
 
-    /// Compute the S3 key for a content hash: `blobs/sha256/{aa}/{bb}/{hash}`.
+    /// Compute the stable prefix for a content hash:
+    /// `blobs/sha256/{aa}/{bb}/{hash}`.
+    ///
+    /// New CAS rows append an incarnation UUID to this prefix. Existing rows
+    /// keep their stored key. The suffix prevents a delayed DELETE for a
+    /// garbage-collected incarnation from deleting a newly revived object.
     pub fn blob_key(sha256: &str) -> String {
         // sha256 hex is 64 chars; aa/bb are the first two byte-pairs.
         let aa = &sha256[0..2];
@@ -74,17 +179,14 @@ impl Cas {
         format!("blobs/sha256/{aa}/{bb}/{sha256}")
     }
 
-    /// Stream `reader` into the CAS.
+    /// Stage `reader` into a local temp file without DB or S3 mutation.
     ///
     /// 1. Copy bytes into a temp file via [`HashingWriter`], enforcing
     ///    `max_bytes`.
-    /// 2. `upsert_pending` the blob row (no-op if it already exists).
-    /// 3. `put_if_absent` the object (HEAD-then-PUT dedup — no duplicate upload
-    ///    for content already present).
     ///
-    /// Does not incref or touch assets; see the module docs. The temp file is
-    /// cleaned up automatically on every error path (RAII via [`TempPath`]).
-    pub async fn store<R>(&self, reader: R, max_bytes: u64) -> Result<StoredBlob, CasError>
+    /// The temp file is cleaned up automatically on every error path (RAII via
+    /// [`TempPath`]).
+    pub async fn stage<R>(&self, reader: R, max_bytes: u64) -> Result<StagedBlob, CasError>
     where
         R: AsyncRead + Unpin,
     {
@@ -113,25 +215,99 @@ impl Cas {
             writer.finalize().await?
         };
 
-        let size_i64 = i64::try_from(size).map_err(|_| CasError::SizeOverflow { size })?;
-        let s3_key = Self::blob_key(&sha256);
-
-        // Record the pending row (idempotent across concurrent ingests).
-        forge_db::blob_dao::upsert_pending(&self.pool, &sha256, size_i64, &s3_key).await?;
-
-        // Upload only if absent. Content addressing guarantees an existing
-        // object is byte-identical, so a dedup hit needs no upload.
         let temp_path = temp.into_temp_path();
-        let uploaded = self.store.put_if_absent(&s3_key, &temp_path).await?;
-
-        Ok(StoredBlob {
+        Ok(StagedBlob {
             sha256,
             sha512_base64,
             size,
             temp_path,
+        })
+    }
+
+    /// Promote locally staged bytes into the CAS and register an ingest lease.
+    ///
+    /// Lease registration happens before S3 HEAD/PUT. A delete reservation and
+    /// an ingest lease both lock the same blob row, so a deletion can neither
+    /// start after this method observes the old object nor run before the
+    /// caller consumes `ingest_token` in its reference transaction.
+    pub async fn commit(&self, staged: StagedBlob) -> Result<StoredBlob, CasError> {
+        let size_i64 =
+            i64::try_from(staged.size).map_err(|_| CasError::SizeOverflow { size: staged.size })?;
+        let candidate_s3_key = format!(
+            "{}/{}",
+            Self::blob_key(&staged.sha256),
+            uuid::Uuid::new_v4()
+        );
+
+        let (ingest_token, s3_key) = loop {
+            let now = chrono::Utc::now();
+            match forge_db::blob_dao::begin_ingest(
+                &self.pool,
+                &staged.sha256,
+                size_i64,
+                &candidate_s3_key,
+                now + INGEST_LEASE,
+                now - DELETE_RESERVATION_LEASE,
+            )
+            .await?
+            {
+                forge_db::blob_dao::BeginIngestOutcome::Ready { token, s3_key, .. } => {
+                    break (token, s3_key)
+                }
+                forge_db::blob_dao::BeginIngestOutcome::DeletionInProgress => {
+                    tokio::time::sleep(DELETION_WAIT).await;
+                }
+                forge_db::blob_dao::BeginIngestOutcome::CompleteStaleDeletion(reservation) => {
+                    if let Err(error) = self.store.delete(&reservation.s3_key).await {
+                        // A failed response can be ambiguous: the delete may
+                        // still complete after this call returns. Keep the
+                        // reservation fenced instead of making its key
+                        // reusable. A later owner will take over the stale
+                        // reservation, finish deletion, and only then create a
+                        // fresh blob incarnation.
+                        return Err(error.into());
+                    }
+                    // A newer owner may have fenced us out. Either way, retry
+                    // from the retained temp file and re-observe DB state.
+                    let _ =
+                        forge_db::blob_dao::finalize_delete_reservation(&self.pool, &reservation)
+                            .await?;
+                }
+            }
+        };
+        let lease_guard = IngestLeaseGuard::start(self.pool.clone(), ingest_token);
+
+        // Content addressing guarantees an existing object is byte-identical.
+        // The live ingest lease prevents a deleter from racing this check/put.
+        let uploaded = match self.store.put_if_absent(&s3_key, &staged.temp_path).await {
+            Ok(uploaded) => uploaded,
+            Err(error) => {
+                let _ = forge_db::blob_dao::abort_ingest(&self.pool, ingest_token).await;
+                return Err(error.into());
+            }
+        };
+
+        Ok(StoredBlob {
+            sha256: staged.sha256,
+            sha512_base64: staged.sha512_base64,
+            size: staged.size,
+            temp_path: staged.temp_path,
             s3_key,
             uploaded,
+            ingest_token,
+            _lease_guard: lease_guard,
         })
+    }
+
+    /// Stage and immediately promote bytes. Callers that need to parse and
+    /// authorize package identity before mutation should call [`Self::stage`]
+    /// and [`Self::commit`] separately.
+    pub async fn store<R>(&self, reader: R, max_bytes: u64) -> Result<StoredBlob, CasError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let staged = self.stage(reader, max_bytes).await?;
+        self.commit(staged).await
     }
 }
 

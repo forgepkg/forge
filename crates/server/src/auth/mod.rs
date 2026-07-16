@@ -42,7 +42,7 @@ use forge_core::auth::client_ip::resolve_client_ip;
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
-use forge_core::net::ssrf::outbound_client;
+use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
     begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
     ClientParams, OidcMetadataClient, ResolvePolicy,
@@ -65,6 +65,7 @@ pub use realms::{
     RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
+pub(crate) use wif::workload_identity_config_sha256;
 pub use wif::WorkloadIdentitySource;
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to
@@ -99,7 +100,8 @@ impl OidcRuntime {
         public_base_url: &str,
         cache: Cache,
     ) -> anyhow::Result<Self> {
-        let http = outbound_client().map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
+        let http = outbound_metadata_client()
+            .map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
         let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache);
 
         let client = ClientParams {

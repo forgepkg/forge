@@ -11,7 +11,7 @@ use forge_e2e::{make_nupkg, StackBuilder, S3_ACCESS, S3_BUCKET, S3_SECRET};
 use forge_storage::{BlobStore, Cas, S3Config};
 use sha2::{Digest, Sha256};
 
-/// sha256 hex of `bytes` (the CAS key for the nupkg blob).
+/// SHA-256 identity of `bytes` (the blob-table key; S3 adds an incarnation).
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -57,7 +57,11 @@ async fn dedup_refcount_2_to_1_to_0_with_outbox_delete() {
     );
 
     // The S3 object exists.
-    let s3_key = Cas::blob_key(&sha);
+    let s3_key: String = sqlx::query_scalar("SELECT s3_key FROM blob WHERE sha256 = $1")
+        .bind(&sha)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
     assert!(
         srv.state.blob_store.get(&s3_key).await.is_ok(),
         "blob object present in S3"
@@ -164,8 +168,14 @@ async fn orphan_reconciler_reclaims_pending_blob() {
         .unwrap();
     assert_eq!(state, "pending");
     assert_eq!(ref_count(&srv.pool, &sha).await, Some(0));
-    let s3_key = Cas::blob_key(&sha);
+    let s3_key = stored.s3_key.clone();
     assert!(store.get(&s3_key).await.is_ok(), "pending object in S3");
+
+    // Simulate the abandoned caller releasing its live promotion lease. A
+    // dropped StoredBlob does this best-effort; make it deterministic here.
+    forge_db::blob_dao::abort_ingest(&srv.pool, stored.ingest_token)
+        .await
+        .unwrap();
 
     // Reconcile with grace 0 ⇒ the stale pending blob is reclaimed.
     let reclaimed =

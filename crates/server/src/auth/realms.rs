@@ -239,9 +239,9 @@ fn secret_keys(kind: &str) -> &'static [&'static str] {
 }
 
 /// Parse + validate a realm `config` document for `kind`. Returns a normalized
-/// document (unknown fields dropped, defaults filled) or a human-readable
-/// error. `local` accepts only an empty/no-op config; `workload_identity` is
-/// reserved for 12.8 and rejected for now.
+/// document (kind-specific defaults filled) or a human-readable error. `local`
+/// accepts only an empty/no-op config; workload-identity documents are
+/// validated by the stricter WIF parser, which rejects unknown policy fields.
 pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, String> {
     match kind {
         KIND_LOCAL => Ok(JsonValue::Object(Default::default())),
@@ -371,6 +371,15 @@ pub struct RealmSnapshot {
     /// issuer-scoped JWKS verifier. Multiple issuers are supported (GitLab,
     /// GitHub Actions, …) — unlike OIDC there is no single-realm invariant.
     pub workload: Vec<super::wif::WorkloadIdentityRealm>,
+    /// Normalized issuer strings from every enabled WIF row, including rows
+    /// whose remaining config is malformed. Token routing consults this before
+    /// falling through so a matching JWT is rejected terminally rather than
+    /// reinterpreted as a Basic credential by a later realm.
+    pub workload_configured_issuers: Vec<String>,
+    /// Issuers named by more than one enabled WIF row. Raw DB writes or legacy
+    /// data can bypass the admin/DB uniqueness checks; routing such an issuer is
+    /// ambiguous and must reject rather than depend on realm priority.
+    pub workload_ambiguous_issuers: Vec<String>,
 }
 
 impl RealmSnapshot {
@@ -439,6 +448,7 @@ impl RealmAuth {
         let mut has_cred_forward = false;
         let mut oidc: Option<OidcRealmRuntime> = None;
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
+        let mut workload_configured_issuers: Vec<String> = Vec::new();
 
         for realm in realms.iter().filter(|r| r.enabled) {
             match realm.kind.as_str() {
@@ -471,6 +481,16 @@ impl RealmAuth {
                     }
                 }
                 KIND_WORKLOAD_IDENTITY => {
+                    if let Some(issuer) = realm
+                        .config
+                        .get("issuer")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .map(|issuer| issuer.trim_end_matches('/'))
+                        .filter(|issuer| !issuer.is_empty())
+                    {
+                        workload_configured_issuers.push(issuer.to_string());
+                    }
                     match super::wif::WorkloadIdentityRealm::build(realm, &self.cache) {
                         Ok(w) => workload.push(w),
                         // One malformed WIF realm must not take down the others; its
@@ -492,6 +512,15 @@ impl RealmAuth {
             Some(Arc::new(Chain::new(providers)))
         };
         let wire_password_enabled = self.config.auth.allow_password_basic || has_cred_forward;
+        workload_configured_issuers.sort();
+        let workload_ambiguous_issuers = workload_configured_issuers
+            .windows(2)
+            .filter(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0].clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        workload_configured_issuers.dedup();
 
         Ok(RealmSnapshot {
             built_at: Instant::now(),
@@ -500,6 +529,8 @@ impl RealmAuth {
             wire_password_enabled,
             oidc,
             workload,
+            workload_configured_issuers,
+            workload_ambiguous_issuers,
         })
     }
 

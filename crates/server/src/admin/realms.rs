@@ -20,8 +20,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::db_error;
-use crate::auth::{merge_secrets, redact_config, validate_config, KIND_LOCAL, KIND_OIDC};
+use crate::auth::{
+    merge_secrets, redact_config, validate_config, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+};
 use crate::state::AppState;
+
+const WIF_ISSUER_UNIQUE_INDEX: &str = "auth_realm_enabled_wif_issuer_uq";
 
 /// Secret-free view of a realm (config redacted via
 /// [`crate::auth::redact_config`]).
@@ -92,6 +96,49 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
+fn is_wif_issuer_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some(WIF_ISSUER_UNIQUE_INDEX))
+}
+
+fn normalized_wif_issuer(config: &JsonValue) -> Option<&str> {
+    config
+        .get("issuer")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .map(|issuer| issuer.trim_end_matches('/'))
+        .filter(|issuer| !issuer.is_empty())
+}
+
+/// Friendly pre-check for enabled WIF issuer ownership. Migration 0013's
+/// partial unique index is the authoritative race-safe enforcement.
+async fn assert_unique_enabled_wif_issuer(
+    state: &AppState,
+    issuer: &str,
+    exclude_id: Option<i64>,
+) -> Result<(), Response> {
+    match auth_realm_dao::list_enabled_realms(&state.pool).await {
+        Ok(realms) => {
+            let duplicate = realms.iter().any(|realm| {
+                realm.kind == KIND_WORKLOAD_IDENTITY
+                    && Some(realm.id) != exclude_id
+                    && normalized_wif_issuer(&realm.config) == Some(issuer)
+            });
+            if duplicate {
+                Err((
+                    StatusCode::CONFLICT,
+                    "an enabled workload identity realm already uses this issuer",
+                )
+                    .into_response())
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(db_error(error)),
+    }
+}
+
 /// Refuse a write that would leave more than one **enabled** `oidc` realm
 /// (12.7 ships single-IdP; multi-IdP selection/routing is a later slice).
 async fn assert_single_enabled_oidc(
@@ -151,6 +198,14 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
             return resp;
         }
     }
+    if body.kind == KIND_WORKLOAD_IDENTITY && body.enabled {
+        let Some(issuer) = normalized_wif_issuer(&config) else {
+            return bad_request("workload identity config must contain an issuer");
+        };
+        if let Err(response) = assert_unique_enabled_wif_issuer(&state, issuer, None).await {
+            return response;
+        }
+    }
 
     let priority = match auth_realm_dao::next_priority(&state.pool).await {
         Ok(p) => p,
@@ -169,6 +224,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
             tracing::info!(realm = %r.name, kind = %r.kind, "auth realm created");
             (StatusCode::CREATED, Json(RealmView::from(&r))).into_response()
         }
+        Err(e) if is_wif_issuer_unique_violation(&e) => (
+            StatusCode::CONFLICT,
+            "an enabled workload identity realm already uses this issuer",
+        )
+            .into_response(),
         Err(e) if is_unique_violation(&e) => {
             (StatusCode::CONFLICT, "realm name already exists").into_response()
         }
@@ -209,8 +269,24 @@ pub async fn update(
                 Err(msg) => return bad_request(msg),
             }
         }
+        None if existing.kind == KIND_WORKLOAD_IDENTITY => {
+            match validate_config(&existing.kind, &existing.config) {
+                Ok(config) => config,
+                Err(message) => return bad_request(message),
+            }
+        }
         None => existing.config.clone(),
     };
+    if existing.kind == KIND_WORKLOAD_IDENTITY && enabled {
+        let Some(issuer) = normalized_wif_issuer(&config) else {
+            return bad_request("workload identity config must contain an issuer");
+        };
+        if let Err(response) =
+            assert_unique_enabled_wif_issuer(&state, issuer, Some(existing.id)).await
+        {
+            return response;
+        }
+    }
 
     let upd = AuthRealmUpdate {
         name: body
@@ -231,6 +307,11 @@ pub async fn update(
             Json(RealmView::from(&r)).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
+        Err(e) if is_wif_issuer_unique_violation(&e) => (
+            StatusCode::CONFLICT,
+            "an enabled workload identity realm already uses this issuer",
+        )
+            .into_response(),
         Err(e) if is_unique_violation(&e) => {
             (StatusCode::CONFLICT, "realm name already exists").into_response()
         }

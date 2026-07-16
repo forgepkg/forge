@@ -24,19 +24,27 @@ use crate::routes::{write_error_response, RouteContext};
 /// Header carrying the NuGet API key on publish/delete requests.
 const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 
-/// Enforce presence of the API key on write routes.
+/// Enforce presence of a wire credential on write routes.
 ///
-/// Write operations (push, unlist, relist) require a `User` and are never
-/// anonymous (spec §6, plan Task 7.1). The server's principal middleware
-/// (Phase 10) validates the key against a real user; here we only enforce
-/// presence so each route is self-contained and never accepts an
-/// unauthenticated request.
-fn require_api_key(headers: &HeaderMap) -> Option<Response> {
-    if headers.contains_key(API_KEY_HEADER) {
-        None
-    } else {
-        Some((StatusCode::UNAUTHORIZED, "missing API key").into_response())
+/// The outer server middleware has already authenticated the value. This local
+/// route guard accepts every transport supported by WIF: `X-NuGet-ApiKey`,
+/// `Authorization: Bearer`, or Basic with the workload token as password.
+fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<Response> {
+    if !ctx.protocol_mutations_allowed {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                "API token or workload identity required",
+            )
+                .into_response(),
+        );
     }
+    if !headers.contains_key(API_KEY_HEADER)
+        && !headers.contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Some((StatusCode::UNAUTHORIZED, "missing credentials").into_response());
+    }
+    None
 }
 
 /// Handler: `PUT /package` — publish (or redeploy) a `.nupkg`.
@@ -51,7 +59,7 @@ pub async fn push(
     };
 
     // Push requires authentication: an API key must be present.
-    if let Some(resp) = require_api_key(&headers) {
+    if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
     }
 
@@ -98,8 +106,11 @@ pub async fn unlist(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Response {
-    if let Some(resp) = require_api_key(&headers) {
+    if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
+    }
+    if !ctx.package_filter.allows(&ctx.format.lower_id(&id)) {
+        return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
     delete_version(&ctx, &id, &version, false).await
 }
@@ -110,8 +121,11 @@ pub async fn relist(
     headers: HeaderMap,
     Path((id, version)): Path<(String, String)>,
 ) -> Response {
-    if let Some(resp) = require_api_key(&headers) {
+    if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
+    }
+    if !ctx.package_filter.allows(&ctx.format.lower_id(&id)) {
+        return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
     let Some(write) = ctx.write.clone() else {
         return (StatusCode::NOT_FOUND, "relist not supported").into_response();

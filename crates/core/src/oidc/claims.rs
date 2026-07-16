@@ -145,6 +145,7 @@ mod tests {
             exp: None,
             nbf: None,
             iat: None,
+            jti: None,
             nonce: None,
             azp: None,
             additional,

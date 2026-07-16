@@ -26,7 +26,7 @@ use forge_core::format::Format;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
-use forge_core::repo::{CacheInvalidator, RepoError, RepoReadOps};
+use forge_core::repo::{CacheInvalidator, PackageFilteredReadOps, RepoError, RepoReadOps};
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobStore, Cas};
@@ -170,19 +170,20 @@ impl AppState {
     ///
     /// The `principal` is needed only for **group** repositories, whose member
     /// visibility is identity-aware; hosted/proxy ignore it.
-    pub fn read_ops_for(
+    pub async fn read_ops_for(
         &self,
         repo: &Repository,
         principal: Principal,
     ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         let format = self.formats.for_repository(repo);
-        match repo.kind() {
-            RepoKind::Hosted => Ok(Arc::new(HostedRepo::new(
+        let filter = self.authz.package_filter(&principal, repo).await;
+        let inner: Arc<dyn RepoReadOps> = match repo.kind() {
+            RepoKind::Hosted => Arc::new(HostedRepo::new(
                 self.pool.clone(),
                 format,
                 self.blob_bytes(),
-            ))),
-            RepoKind::Proxy => Ok(Arc::new(
+            )),
+            RepoKind::Proxy => Arc::new(
                 ProxyRepo::new(
                     self.pool.clone(),
                     format,
@@ -191,15 +192,16 @@ impl AppState {
                 )
                 // §12.5: lets the upstream fetch decrypt an encrypted password.
                 .with_envelope(self.envelope.clone()),
-            )),
-            RepoKind::Group => Ok(Arc::new(GroupRepo::new(
+            ),
+            RepoKind::Group => Arc::new(GroupRepo::new(
                 self.pool.clone(),
                 principal,
                 Arc::new(self.member_factory()),
                 self.authz.clone(),
                 self.config.groups.max_nesting_depth.max(0) as u32,
-            ))),
-        }
+            )),
+        };
+        Ok(Arc::new(PackageFilteredReadOps::new(inner, filter)))
     }
 
     /// A member-ops factory for group resolution (hosted/proxy members only).

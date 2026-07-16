@@ -9,8 +9,9 @@
 //! S3 network call. We therefore split each unit of work into short
 //! transactions around the network I/O:
 //!   1. claim a batch (leases the rows) — short tx, committed immediately;
-//!   2. for each row: re-check the blob, do the S3 delete outside any tx, then
-//!      delete the row + mark processed in a second short tx.
+//!   2. for each row: reserve the zero-ref blob in a short transaction (which
+//!      fails while an ingest lease is live), do the S3 delete outside any tx,
+//!      then token-conditionally delete the row + mark processed.
 
 use std::time::Duration as StdDuration;
 
@@ -74,12 +75,12 @@ async fn process_row(
     store: &BlobStore,
     row: &forge_db::model::BlobOutbox,
 ) -> anyhow::Result<bool> {
-    // Re-check the blob: a concurrent re-push may have revived it
-    // (ref_count > 0), or a prior worker run may have already removed the row.
-    let blob = forge_db::blob_dao::get_blob(pool, &row.sha256).await?;
-    match blob {
-        // Revived: keep both the object and the row. Mark the outbox entry done.
-        Some(b) if b.ref_count > 0 => {
+    use forge_db::blob_dao::ReserveDeleteOutcome;
+
+    let stale_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
+    match forge_db::blob_dao::reserve_outbox_delete(pool, &row.sha256, stale_before).await? {
+        // A committed ingest won before deletion could reserve the row.
+        ReserveDeleteOutcome::Referenced => {
             forge_db::outbox_dao::mark_processed(pool, row.id).await?;
             tracing::debug!(
                 outbox_id = row.id,
@@ -88,21 +89,35 @@ async fn process_row(
             );
             Ok(true)
         }
-        // Blob row already gone: nothing to delete, just close the outbox row.
-        None => {
+        ReserveDeleteOutcome::Missing => {
             forge_db::outbox_dao::mark_processed(pool, row.id).await?;
             Ok(true)
         }
-        // Still unreferenced: delete the object, then the row.
-        Some(_) => {
-            // S3 delete is idempotent and runs OUTSIDE any DB transaction.
-            store.delete(&row.s3_key).await?;
+        // An ingest has registered before its S3 check, or another deletion
+        // owner still holds a live fencing token. Keep the outbox row pending.
+        ReserveDeleteOutcome::Busy => {
+            anyhow::bail!("blob is protected by an ingest or deletion reservation")
+        }
+        ReserveDeleteOutcome::Reserved(reservation) => {
+            // S3 delete is idempotent and runs OUTSIDE any DB transaction. If
+            // it fails, the response may be ambiguous and the operation may
+            // still complete later. Keep the reservation fenced so no ingest
+            // can reuse this incarnation; a later worker or ingest may take
+            // over the stale reservation and finish it safely.
+            if let Err(error) = store.delete(&reservation.s3_key).await {
+                return Err(error.into());
+            }
 
-            // Short tx: drop the blob row only if it is still unreferenced AND
-            // mark the outbox row processed — both in the same transaction so a
-            // crash between the two is not possible.
+            // Short tx: finalize only our exact fencing token and mark the
+            // outbox row processed atomically. A stale owner cannot delete a
+            // newer row or close work now owned by another process.
             let mut tx = pool.begin().await?;
-            forge_db::blob_dao::delete_if_unreferenced(&mut *tx, &row.sha256).await?;
+            let finalized =
+                forge_db::blob_dao::finalize_delete_reservation(&mut *tx, &reservation).await?;
+            if !finalized {
+                tx.rollback().await?;
+                anyhow::bail!("blob deletion reservation was superseded before finalization");
+            }
             forge_db::outbox_dao::mark_processed(&mut *tx, row.id).await?;
             tx.commit().await?;
 

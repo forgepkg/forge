@@ -9,13 +9,20 @@ use std::io::Cursor;
 use chrono::Duration;
 use forge_storage::cas::Cas;
 use forge_storage::reconciler;
+use tokio::sync::Mutex;
 
 const MAX: u64 = 100 * 1024 * 1024;
+
+// Every reconciler pass intentionally scans all eligible rows in the shared
+// test database. Serialize this test binary so one test cannot reserve and
+// delete another test's blob between its object and row assertions.
+static RECONCILE_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// A `pending` blob older than the grace window whose S3 object exists (a
 /// never-committed ingest) is reconciled: object + row removed.
 #[tokio::test]
 async fn reconciles_stale_pending() {
+    let _guard = RECONCILE_LOCK.lock().await;
     let pool = common::pool().await;
     let store = common::blob_store().await;
     let cas = Cas::new(store.clone(), pool.clone());
@@ -27,13 +34,17 @@ async fn reconciles_stale_pending() {
         .await
         .unwrap();
     assert!(store.head(&stored.s3_key).await.unwrap(), "object present");
+    // Simulate the caller abandoning the staged promotion. `StoredBlob` would
+    // release this on drop; make it deterministic while retaining its fields.
+    forge_db::blob_dao::abort_ingest(&pool, stored.ingest_token)
+        .await
+        .unwrap();
 
     // Backdate created_at so it falls outside the grace window.
     backdate_blob(&pool, &stored.sha256, Duration::hours(2)).await;
 
-    // Reconcile with a 1h grace. (Tests share a DB and run in parallel, so the
-    // returned count covers all orphans, not just ours — assert on the per-blob
-    // end state instead of the count.)
+    // Reconcile with a 1h grace. Assert on the per-blob end state rather than
+    // the aggregate count so unrelated leftovers cannot affect the result.
     reconciler::reconcile_orphans(&pool, &store, Duration::hours(1))
         .await
         .unwrap();
@@ -53,6 +64,7 @@ async fn reconciles_stale_pending() {
 /// transaction may still be in flight).
 #[tokio::test]
 async fn leaves_fresh_pending_alone() {
+    let _guard = RECONCILE_LOCK.lock().await;
     let pool = common::pool().await;
     let store = common::blob_store().await;
     let cas = Cas::new(store.clone(), pool.clone());
@@ -88,6 +100,7 @@ async fn leaves_fresh_pending_alone() {
 /// pending outbox row is reconciled.
 #[tokio::test]
 async fn reconciles_dangling_unreferenced() {
+    let _guard = RECONCILE_LOCK.lock().await;
     let pool = common::pool().await;
     let store = common::blob_store().await;
     let cas = Cas::new(store.clone(), pool.clone());
@@ -101,7 +114,7 @@ async fn reconciles_dangling_unreferenced() {
     // Commit once then bring ref_count back to zero WITHOUT enqueuing an outbox
     // row (simulate the outbox row already having been processed).
     let mut tx = pool.begin().await.unwrap();
-    forge_db::blob_dao::commit_and_incref(&mut tx, &stored.sha256)
+    forge_db::blob_dao::commit_ingest_and_incref(&mut tx, &stored.sha256, stored.ingest_token)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -118,6 +131,42 @@ async fn reconciles_dangling_unreferenced() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// A stale-looking pending row is not deleted while the CAS promotion's ingest
+/// lease is live. This covers the reconciler side of the same fence used by the
+/// outbox worker.
+#[tokio::test]
+async fn live_ingest_lease_fences_stale_pending_reconcile() {
+    let _guard = RECONCILE_LOCK.lock().await;
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+
+    let n = common::unique();
+    let stored = cas
+        .store(Cursor::new(format!("leased-pending-{n}").into_bytes()), MAX)
+        .await
+        .unwrap();
+    backdate_blob(&pool, &stored.sha256, Duration::hours(2)).await;
+
+    reconciler::reconcile_orphans(&pool, &store, Duration::hours(1))
+        .await
+        .unwrap();
+
+    assert!(store.head(&stored.s3_key).await.unwrap());
+    assert!(forge_db::blob_dao::get_blob(&pool, &stored.sha256)
+        .await
+        .unwrap()
+        .is_some());
+
+    forge_db::blob_dao::abort_ingest(&pool, stored.ingest_token)
+        .await
+        .unwrap();
+    reconciler::reconcile_orphans(&pool, &store, Duration::hours(1))
+        .await
+        .unwrap();
+    assert!(!store.head(&stored.s3_key).await.unwrap());
 }
 
 /// Backdate a blob's `created_at` by `age` so it falls outside a grace window.
