@@ -161,3 +161,62 @@ async fn l2_sharing_and_backplane_invalidation() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
+    let url = redis_url().await;
+    let a = Cache::with_redis(1000, &url).await.unwrap();
+    let b = Cache::with_redis(1000, &url).await.unwrap();
+    // Let both detached subscribers finish subscribing before publishing.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let factory_started = Arc::new(tokio::sync::Notify::new());
+    let release_factory = Arc::new(tokio::sync::Notify::new());
+    let fill = {
+        let b = b.clone();
+        let factory_started = factory_started.clone();
+        let release_factory = release_factory.clone();
+        tokio::spawn(async move {
+            b.get_or_try_insert_with::<String, _, _, TestError>(
+                "race",
+                "credential",
+                Duration::from_secs(300),
+                || async move {
+                    factory_started.notify_one();
+                    release_factory.notified().await;
+                    Ok("STALE-FILL".to_string())
+                },
+            )
+            .await
+            .unwrap()
+        })
+    };
+    factory_started.notified().await;
+
+    // A deletes the shared L2 namespace and publishes while B's older fill is
+    // still blocked. B will write after A's first delete, so its subscriber must
+    // fence that fill and delete the stale L1/L2 value again.
+    a.invalidate_ns("race").await;
+    release_factory.notify_one();
+    assert_eq!(fill.await.unwrap(), "STALE-FILL");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let probe = b
+            .get_or_try_insert_with::<String, _, _, TestError>(
+                "race",
+                "credential",
+                Duration::from_secs(300),
+                || async { Ok("FRESH".to_string()) },
+            )
+            .await
+            .unwrap();
+        if probe == "FRESH" {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("remote invalidation left an in-flight stale L2 fill readable");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

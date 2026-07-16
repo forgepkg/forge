@@ -63,7 +63,9 @@ use sqlx::PgPool;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Cache namespace for validated-credential verdicts, keyed by the credential
-/// HMAC. Combined with the provider id below so two providers can't collide.
+/// HMAC. The HMAC already includes the provider id, so all providers can share
+/// one invalidation domain without key collisions. A user revocation must be
+/// able to evict realm-scoped providers whose names are only known at runtime.
 const NS_CRED: &str = "validated_credential";
 
 /// A server-held secret keying the credential-cache HMAC.
@@ -242,7 +244,6 @@ impl ValidatedCredentialCache {
         // — and re-checked on read — for the authoritative, per-verdict bound.
         // A negative entry that out-lives its DB expiry is re-derived on the next
         // Postgres read (the DAO treats an expired row as a miss).
-        let ns = self.namespaced(provider_id);
         let pool = self.pool.clone();
         let provider = provider_id.to_string();
         let user = username.to_string();
@@ -252,7 +253,7 @@ impl ValidatedCredentialCache {
 
         let verdict: CachedVerdict = self
             .cache
-            .get_or_try_insert_with(&ns, &key, self.positive_ttl, || async move {
+            .get_or_try_insert_with(NS_CRED, &key, self.positive_ttl, || async move {
                 load_or_forward(
                     &pool,
                     &provider,
@@ -275,45 +276,19 @@ impl ValidatedCredentialCache {
     ///
     /// Because the cache key is the (peppered) credential HMAC, we cannot target
     /// the exact L1 keys for a username without the passwords — so we invalidate
-    /// the **whole provider namespace** in the cache layer (a coarse but correct
-    /// drop; the namespace repopulates lazily from the now-purged Postgres
-    /// store). Authoritative correctness comes from the row deletes; the cache
-    /// invalidation just prevents a stale L1 hit.
+    /// the whole validated-credential namespace (a coarse but correct drop; it
+    /// repopulates lazily from the authoritative Postgres store). Provider ids
+    /// are already framed into each HMAC key, so sharing this invalidation domain
+    /// cannot make credentials collide across providers.
     pub async fn revoke_user(
         &self,
         username: &str,
         provider_id: Option<&str>,
     ) -> Result<u64, CredCacheError> {
         let deleted = vc_dao::revoke_by_username(&self.pool, username, provider_id).await?;
-
-        match provider_id {
-            Some(p) => self.cache.invalidate_ns(&self.namespaced(p)).await,
-            None => {
-                // No single provider to scope to: drop every provider namespace
-                // we know how to build. In this slice that's just upstream-basic;
-                // invalidating it (and the bare namespace) is sufficient and
-                // correct (over-invalidation only costs re-reads).
-                self.cache
-                    .invalidate_ns(&self.namespaced("upstream-basic"))
-                    .await;
-            }
-        }
+        self.cache.invalidate_ns(NS_CRED).await;
         Ok(deleted)
     }
-
-    /// Build the per-provider cache namespace so two providers' verdicts for the
-    /// same HMAC (which cannot collide given the framed input, but defense in
-    /// depth) live in separate namespaces and can be invalidated independently.
-    fn namespaced(&self, provider_id: &str) -> String {
-        format!("{NS_CRED}:{provider_id}")
-    }
-}
-
-/// The cache namespace for a provider's verdicts — used by the standalone
-/// [`revoke_credentials_for_user`] (which has no [`ValidatedCredentialCache`]
-/// instance and therefore no pepper, but does not need one to invalidate).
-fn cred_namespace(provider_id: &str) -> String {
-    format!("{NS_CRED}:{provider_id}")
 }
 
 /// Revoke every cached verdict for `username` **without** needing a
@@ -321,13 +296,14 @@ fn cred_namespace(provider_id: &str) -> String {
 ///
 /// This is the admin "force re-auth user X" / deactivate-user path: it deletes
 /// the authoritative `validated_credential` rows for the username (across all
-/// providers) and broadcasts a cache-layer invalidation of the `upstream-basic`
-/// namespace so peer instances drop their L1/L2 entries on the next read. The
-/// pepper is irrelevant here — revocation is keyed by username, not by the
-/// credential HMAC. Returns the number of authoritative rows deleted.
+/// providers) and broadcasts a cache-layer invalidation of the shared
+/// validated-credential namespace so peer instances drop their L1/L2 entries
+/// on the next read. The pepper is irrelevant here — revocation is keyed by
+/// username, not by the credential HMAC. Returns the number of authoritative
+/// rows deleted.
 ///
 /// Correctness without the pepper: the row deletes are authoritative, and the
-/// namespace invalidation is coarse (drops the whole provider namespace), so the
+/// namespace invalidation is coarse (drops every provider's hot entries), so the
 /// next request for any of that user's credentials misses the cache and
 /// re-derives from the now-purged Postgres store.
 pub async fn revoke_credentials_for_user(
@@ -336,7 +312,7 @@ pub async fn revoke_credentials_for_user(
     username: &str,
 ) -> Result<u64, CredCacheError> {
     let deleted = vc_dao::revoke_by_username(pool, username, None).await?;
-    cache.invalidate_ns(&cred_namespace("upstream-basic")).await;
+    cache.invalidate_ns(NS_CRED).await;
     Ok(deleted)
 }
 

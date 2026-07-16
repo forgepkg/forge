@@ -18,10 +18,10 @@
 //!   `id + version` (registration) / `id` (search), **highest-priority wins**.
 //!
 //! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
-//! a group** (nested groups). Resolution flattens the nested graph into the
-//! ordered list of **leaf** (hosted/proxy) members before reading: the
-//! [`MemberOpsFactory`] is only ever asked for a leaf. Two guards keep this
-//! safe even against a cycle injected by a raw DB write:
+//! a group** (nested groups). Resolution first loads each readable group node
+//! and edge once, then evaluates package-specific reachability over that compact
+//! graph: the [`MemberOpsFactory`] is only ever asked for each selected leaf.
+//! Two guards keep this safe even against a cycle injected by a raw DB write:
 //!
 //! * a **visited-set** (group ids already on the current descent) — a re-visit
 //!   is treated as an empty subtree (fail-closed) and logged, never followed;
@@ -33,10 +33,11 @@
 //! ([`Authz::can_read`]). Being able to read an outer group grants **no**
 //! transitive read on an inner member — only a `read` grant on the actual leaf
 //! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
-//! stable pre-order walk. A leaf reachable by several paths is retained once per
-//! path because each path may carry a different package-selector intersection;
-//! result merging still deduplicates package ids and versions with the first,
-//! highest-priority match winning.
+//! stable pre-order walk. For a concrete package id, selectors are evaluated
+//! while walking and a repeated group is expanded only when reached at a
+//! strictly shallower depth. A repeated leaf is queried once at its first
+//! package-visible sighting. Search also queries each unique leaf once and uses
+//! the same package-specific walk to select the highest-priority winner.
 //!
 //! ## Decoupling from concrete member kinds
 //! `forge-core` must not hard-wire how a hosted vs. proxy member is constructed
@@ -46,7 +47,9 @@
 //! implements it by branching on [`Repository::kind`]; tests implement it with
 //! an in-memory map.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use forge_db::model::Repository;
@@ -57,8 +60,8 @@ use crate::auth::authz::Authz;
 use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::repo::{
-    NupkgLocation, PackageFilteredReadOps, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
-    SearchParams, SearchResult, VersionEntry,
+    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    SearchResult, VersionEntry,
 };
 
 /// Builds the [`RepoReadOps`] for one member repository of a group.
@@ -98,6 +101,158 @@ struct VisibleMember {
     ops: Arc<dyn RepoReadOps>,
 }
 
+/// One readable edge in the compact group graph. The filter belongs to the
+/// member repository itself; a package is reachable along a path only when
+/// every edge filter on that path allows it.
+#[derive(Debug, Clone)]
+struct GraphMember {
+    repo: Repository,
+    filter: PackageFilter,
+}
+
+/// Readable group DAG for one request principal.
+///
+/// `groups` stores every reachable group adjacency list once, preserving each
+/// list's priority order. `leaves` stores every readable leaf once. Package-id
+/// walks are memoized because hosted/proxy search may evaluate the same id once
+/// per version row.
+#[derive(Debug)]
+struct GroupGraph {
+    root_id: i64,
+    max_depth: u32,
+    groups: HashMap<i64, Vec<GraphMember>>,
+    leaves: Vec<Repository>,
+    visible_leaf_cache: Mutex<HashMap<String, Arc<VisibleLeaves>>>,
+    cycle_logged: AtomicBool,
+}
+
+#[derive(Debug)]
+struct VisibleLeaves {
+    ordered: Vec<i64>,
+    ranks: HashMap<i64, usize>,
+}
+
+impl GroupGraph {
+    /// Visible leaf ids for `package_id`, in the same package-specific stable
+    /// pre-order as the former path-expanding traversal.
+    fn visible_leaves(&self, package_id: &str) -> Arc<VisibleLeaves> {
+        let key = package_id.to_lowercase();
+        if let Some(cached) = self
+            .visible_leaf_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let mut path = HashSet::new();
+        path.insert(self.root_id);
+        let mut best_group_depth = HashMap::new();
+        best_group_depth.insert(self.root_id, 0);
+        let mut seen_leaves = HashSet::new();
+        let mut out = Vec::new();
+        self.walk_visible(
+            self.root_id,
+            0,
+            &key,
+            &mut path,
+            &mut best_group_depth,
+            &mut seen_leaves,
+            &mut out,
+        );
+
+        let ranks = out
+            .iter()
+            .enumerate()
+            .map(|(rank, leaf_id)| (*leaf_id, rank))
+            .collect();
+        let out = Arc::new(VisibleLeaves {
+            ordered: out,
+            ranks,
+        });
+        self.visible_leaf_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, out.clone());
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_visible(
+        &self,
+        group_id: i64,
+        depth: u32,
+        package_id: &str,
+        path: &mut HashSet<i64>,
+        best_group_depth: &mut HashMap<i64, u32>,
+        seen_leaves: &mut HashSet<i64>,
+        out: &mut Vec<i64>,
+    ) {
+        if depth >= self.max_depth {
+            return;
+        }
+
+        let Some(members) = self.groups.get(&group_id) else {
+            return;
+        };
+        for member in members {
+            if !member.filter.allows(package_id) {
+                continue;
+            }
+
+            if member.repo.kind() == forge_db::model::RepoKind::Group {
+                if path.contains(&member.repo.id) {
+                    if !self.cycle_logged.swap(true, Ordering::Relaxed) {
+                        tracing::error!(
+                            cyclic_group_id = member.repo.id,
+                            "group membership cycle detected at resolve time; treating subtree as empty (fail-closed)"
+                        );
+                    }
+                    continue;
+                }
+
+                let next_depth = depth + 1;
+                if best_group_depth
+                    .get(&member.repo.id)
+                    .is_some_and(|seen_depth| *seen_depth <= next_depth)
+                {
+                    continue;
+                }
+                best_group_depth.insert(member.repo.id, next_depth);
+                path.insert(member.repo.id);
+                self.walk_visible(
+                    member.repo.id,
+                    next_depth,
+                    package_id,
+                    path,
+                    best_group_depth,
+                    seen_leaves,
+                    out,
+                );
+                path.remove(&member.repo.id);
+            } else if seen_leaves.insert(member.repo.id) {
+                out.push(member.repo.id);
+            }
+        }
+    }
+
+    fn leaf_rank(&self, package_id: &str, leaf_id: i64) -> Option<usize> {
+        self.visible_leaves(package_id).ranks.get(&leaf_id).copied()
+    }
+
+    fn filter_for_leaf(self: &Arc<Self>, leaf_id: i64) -> PackageFilter {
+        let graph = self.clone();
+        PackageFilter::Predicate(Arc::new(move |package_id| {
+            graph
+                .visible_leaves(package_id)
+                .ranks
+                .contains_key(&leaf_id)
+        }))
+    }
+}
+
 impl GroupRepo {
     /// Build a group resolver for `principal` over `pool`, using `factory` to
     /// construct each member's read ops and `authz` to filter members the
@@ -134,54 +289,24 @@ impl GroupRepo {
         Ok(row)
     }
 
-    /// The **leaf** (hosted/proxy) members `self.principal` may read, flattened
-    /// across nested groups in **descending priority** pre-order (the DAO orders
-    /// each level `priority DESC`), each paired with its read ops.
+    /// Build the compact readable group graph for this principal.
     ///
-    /// Nested groups are descended into (subject to `can_read` at every level);
-    /// a leaf reachable by several paths is kept once per path so distinct
-    /// package-selector intersections remain visible. The walk is bounded by a
-    /// visited-set (group ids on the current path) and [`Self::max_depth`];
-    /// hitting either treats that subtree as empty (fail-closed) and logs, so a
-    /// cycle injected by a raw DB write terminates rather than looping.
-    async fn visible_members(&self, group: &str) -> Result<Vec<VisibleMember>, RepoError> {
+    /// Breadth-first discovery reaches every group at its minimum depth, so its
+    /// adjacency list is fetched once while still respecting the configured
+    /// depth bound. Edges remain in DAO priority order. A global discovery set
+    /// bounds raw-DB cycles without discarding diamond edges; package-specific
+    /// evaluation applies the current-path cycle guard later.
+    async fn group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
         let group_row = self.group_row(group).await?;
+        let mut groups = HashMap::new();
+        let mut leaves = Vec::new();
+        let mut seen_leaves = HashSet::new();
+        let mut discovered_groups = HashSet::new();
+        let mut queue = VecDeque::new();
+        discovered_groups.insert(group_row.id);
+        queue.push_back((group_row.id, 0_u32));
 
-        let mut out: Vec<VisibleMember> = Vec::new();
-        let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        visited.insert(group_row.id);
-
-        self.flatten_into(
-            group_row.id,
-            0,
-            // The requested root repository is authorized and package-filtered
-            // by the caller's outer `PackageFilteredReadOps`. Only filters from
-            // members encountered during traversal belong in this path.
-            PackageFilter::AllowAll,
-            &mut visited,
-            &mut out,
-        )
-        .await?;
-        Ok(out)
-    }
-
-    /// Recursive worker for [`Self::visible_members`]. Walks `group_id`'s direct
-    /// members (priority DESC); for each member the principal `can_read`:
-    /// * a **group** member is descended into (cycle/depth-guarded);
-    /// * a **leaf** member is appended with its path-specific package filter.
-    ///
-    /// `visited` holds the group ids on the current descent path. Boxed future
-    /// because the async fn is recursive.
-    fn flatten_into<'a>(
-        &'a self,
-        group_id: i64,
-        depth: u32,
-        path_filter: PackageFilter,
-        visited: &'a mut std::collections::HashSet<i64>,
-        out: &'a mut Vec<VisibleMember>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RepoError>> + Send + 'a>>
-    {
-        Box::pin(async move {
+        while let Some((group_id, depth)) = queue.pop_front() {
             if depth >= self.max_depth {
                 tracing::error!(
                     group_id,
@@ -189,43 +314,65 @@ impl GroupRepo {
                     max_depth = self.max_depth,
                     "group nesting depth bound hit; treating subtree as empty (fail-closed)"
                 );
-                return Ok(());
+                groups.entry(group_id).or_insert_with(Vec::new);
+                continue;
             }
 
-            let members = repository_dao::group_members(&self.pool, group_id).await?;
-            for (member, _priority) in members {
-                // Identity filter at every level: skip members this principal
-                // cannot read. Reading an outer group grants no transitive read.
+            let rows = repository_dao::group_members(&self.pool, group_id).await?;
+            let mut members = Vec::with_capacity(rows.len());
+            for (member, _priority) in rows {
+                // Reading an outer group grants no transitive read. An edge is
+                // absent from this principal's graph unless the member itself
+                // passes the repo-level gate.
                 if !self.authz.can_read(&self.principal, &member).await {
                     continue;
                 }
-                let member_filter = self.authz.package_filter(&self.principal, &member).await;
-                let member_path_filter = path_filter.clone().intersect(member_filter);
+                let filter = self.authz.package_filter(&self.principal, &member).await;
 
                 if member.kind() == forge_db::model::RepoKind::Group {
-                    // Cycle guard: a group already on the descent path is a
-                    // back-edge — log and skip (fail-closed), never follow it.
-                    if !visited.insert(member.id) {
-                        tracing::error!(
-                            cyclic_group_id = member.id,
-                            "group membership cycle detected at resolve time; treating subtree as empty (fail-closed)"
-                        );
-                        continue;
+                    if discovered_groups.insert(member.id) {
+                        queue.push_back((member.id, depth + 1));
                     }
-                    self.flatten_into(member.id, depth + 1, member_path_filter, visited, out)
-                        .await?;
-                    // Pop off the path so a diamond (two paths to the same group
-                    // via distinct parents) is still resolvable, while a true
-                    // back-edge on the *current* path stays blocked.
-                    visited.remove(&member.id);
-                } else {
-                    let ops = self.factory.ops_for(&member)?;
-                    let ops = Arc::new(PackageFilteredReadOps::new(ops, member_path_filter));
-                    out.push(VisibleMember { repo: member, ops });
+                } else if seen_leaves.insert(member.id) {
+                    leaves.push(member.clone());
                 }
+                members.push(GraphMember {
+                    repo: member,
+                    filter,
+                });
             }
-            Ok(())
-        })
+            groups.insert(group_id, members);
+        }
+
+        Ok(Arc::new(GroupGraph {
+            root_id: group_row.id,
+            max_depth: self.max_depth,
+            groups,
+            leaves,
+            visible_leaf_cache: Mutex::new(HashMap::new()),
+            cycle_logged: AtomicBool::new(false),
+        }))
+    }
+
+    /// Construct each package-visible leaf once, in package-specific priority
+    /// order. The requested root repository's filter remains the caller's outer
+    /// [`crate::repo::PackageFilteredReadOps`] responsibility.
+    fn visible_members_for_id(
+        &self,
+        graph: &GroupGraph,
+        package_id: &str,
+    ) -> Result<Vec<VisibleMember>, RepoError> {
+        let mut out = Vec::new();
+        for leaf_id in &graph.visible_leaves(package_id).ordered {
+            let Some(repo) = graph.leaves.iter().find(|repo| repo.id == *leaf_id) else {
+                continue;
+            };
+            out.push(VisibleMember {
+                repo: repo.clone(),
+                ops: self.factory.ops_for(repo)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Merge member search results with the caller's package predicate pushed
@@ -238,24 +385,38 @@ impl GroupRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        let members = self.visible_members(repo).await?;
+        let graph = self.group_graph(repo).await?;
         let mut member_params = params.clone();
         member_params.skip = 0;
         member_params.take = SearchParams::MAX_TAKE;
 
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, SearchHit> = BTreeMap::new();
-        for m in &members {
-            let result = m
-                .ops
-                .search_with_package_filter(&m.repo.name, &member_params, filter)
+        let mut by_id: BTreeMap<String, (usize, SearchHit)> = BTreeMap::new();
+        for leaf in &graph.leaves {
+            let ops = self.factory.ops_for(leaf)?;
+            let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
+            let result = ops
+                .search_with_package_filter(&leaf.name, &member_params, &leaf_filter)
                 .await?;
             for hit in result.hits {
-                by_id.entry(hit.original_id.to_lowercase()).or_insert(hit);
+                let Some(rank) = graph.leaf_rank(&hit.original_id, leaf.id) else {
+                    continue;
+                };
+                let key = hit.original_id.to_lowercase();
+                match by_id.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((rank, hit));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry)
+                        if rank < entry.get().0 =>
+                    {
+                        entry.insert((rank, hit));
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
             }
         }
 
-        let mut hits: Vec<SearchHit> = by_id.into_values().collect();
+        let mut hits: Vec<SearchHit> = by_id.into_values().map(|(_, hit)| hit).collect();
         hits.sort_by(|a, b| {
             a.original_id
                 .to_lowercase()
@@ -274,7 +435,8 @@ impl GroupRepo {
 #[async_trait]
 impl RepoReadOps for GroupRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
-        let members = self.visible_members(repo).await?;
+        let graph = self.group_graph(repo).await?;
+        let members = self.visible_members_for_id(&graph, id)?;
 
         // Union across visible members, deduped by normalized version. Members
         // are highest-priority first, so the first sighting of a version wins
@@ -302,7 +464,8 @@ impl RepoReadOps for GroupRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
-        let members = self.visible_members(repo).await?;
+        let graph = self.group_graph(repo).await?;
+        let members = self.visible_members_for_id(&graph, id)?;
         // Highest-priority visible member that has the exact (id, version).
         for m in &members {
             if let Some(loc) = m.ops.resolve_nupkg(&m.repo.name, id, version).await? {
@@ -318,7 +481,8 @@ impl RepoReadOps for GroupRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
-        let members = self.visible_members(repo).await?;
+        let graph = self.group_graph(repo).await?;
+        let members = self.visible_members_for_id(&graph, id)?;
         for m in &members {
             if let Some(bytes) = m.ops.resolve_nuspec(&m.repo.name, id, version).await? {
                 return Ok(Some(bytes));
@@ -332,7 +496,8 @@ impl RepoReadOps for GroupRepo {
         repo: &str,
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
-        let members = self.visible_members(repo).await?;
+        let graph = self.group_graph(repo).await?;
+        let members = self.visible_members_for_id(&graph, id)?;
 
         // Merge, dedup by version (id is fixed here), highest-priority wins.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

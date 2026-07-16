@@ -44,8 +44,9 @@ mod backplane;
 mod l1;
 mod l2_redis;
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -77,6 +78,27 @@ struct Inner {
     l1: L1,
     l2: Option<RedisL2>,
     backplane: Option<Backplane>,
+    namespace_locks: NamespaceLocks,
+}
+
+/// Per-namespace read/write fences. Cache fills take a shared guard while
+/// invalidations take an exclusive guard, so a fill that started before a
+/// revocation cannot publish a stale L1/L2 value after that revocation has
+/// completed. The same locks are used by the Redis backplane subscriber.
+#[derive(Clone, Default)]
+pub(crate) struct NamespaceLocks {
+    inner: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
+}
+
+impl NamespaceLocks {
+    pub(crate) fn get(&self, ns: &str) -> Arc<tokio::sync::RwLock<()>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(ns.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
 }
 
 impl Cache {
@@ -85,11 +107,13 @@ impl Cache {
     ///
     /// `l1_max_capacity` bounds the number of entries held in process.
     pub fn l1_only(l1_max_capacity: u64) -> Self {
+        let namespace_locks = NamespaceLocks::default();
         Cache {
             inner: Arc::new(Inner {
                 l1: L1::new(l1_max_capacity),
                 l2: None,
                 backplane: None,
+                namespace_locks,
             }),
         }
     }
@@ -99,16 +123,19 @@ impl Cache {
     /// entries when another node publishes an invalidation.
     pub async fn with_redis(l1_max_capacity: u64, redis_url: &str) -> Result<Self, CacheError> {
         let l1 = L1::new(l1_max_capacity);
+        let namespace_locks = NamespaceLocks::default();
         let client = redis::Client::open(redis_url)?;
 
         let l2 = RedisL2::connect(client.clone()).await?;
-        let backplane = Backplane::start(client, l1.clone()).await?;
+        let backplane =
+            Backplane::start(client, l1.clone(), l2.clone(), namespace_locks.clone()).await?;
 
         Ok(Cache {
             inner: Arc::new(Inner {
                 l1,
                 l2: Some(l2),
                 backplane: Some(backplane),
+                namespace_locks,
             }),
         })
     }
@@ -137,6 +164,8 @@ impl Cache {
         // we clone the inner error out for each caller (and cache nothing).
         E: Clone + Send + Sync + 'static,
     {
+        let namespace_lock = self.inner.namespace_locks.get(ns);
+        let _fill_guard = namespace_lock.read().await;
         let full_key = make_key(ns, key);
         let l2 = self.inner.l2.clone();
 
@@ -185,9 +214,12 @@ impl Cache {
         Ok(value)
     }
 
-    /// Invalidate a single `(ns, key)`: drop from L1, drop from L2 (if present),
-    /// and publish on the backplane (if present) so other nodes drop their L1.
+    /// Invalidate a single `(ns, key)`: fence older local fills, drop from L1
+    /// and L2, and publish on the backplane so peers fence their own older fills
+    /// before re-dropping both tiers.
     pub async fn invalidate(&self, ns: &str, key: &str) {
+        let namespace_lock = self.inner.namespace_locks.get(ns);
+        let _invalidation_guard = namespace_lock.write().await;
         let full_key = make_key(ns, key);
         self.inner.l1.invalidate(&full_key).await;
 
@@ -201,9 +233,12 @@ impl Cache {
         }
     }
 
-    /// Invalidate an entire namespace: drop all `ns:*` entries from L1, from L2
-    /// (if present), and broadcast the ns-invalidation on the backplane.
+    /// Invalidate an entire namespace: fence older local fills, drop all
+    /// `ns:*` entries from L1 and L2, and broadcast the fenced invalidation on
+    /// the backplane.
     pub async fn invalidate_ns(&self, ns: &str) {
+        let namespace_lock = self.inner.namespace_locks.get(ns);
+        let _invalidation_guard = namespace_lock.write().await;
         let prefix = format!("{ns}:");
         self.inner.l1.invalidate_prefix(&prefix).await;
 

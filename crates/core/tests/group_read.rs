@@ -16,6 +16,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,6 +70,20 @@ impl MemberOpsFactory for HostedFactory {
             Arc::new(NugetFormat::new()),
             Arc::new(self.blobs.clone()),
         )))
+    }
+}
+
+/// Hosted factory that counts constructions. Since each returned hosted ops is
+/// called once by a group method, this also detects path-count backend fan-out.
+struct CountingHostedFactory {
+    inner: HostedFactory,
+    builds: Arc<AtomicUsize>,
+}
+
+impl MemberOpsFactory for CountingHostedFactory {
+    fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        self.inner.ops_for(member)
     }
 }
 
@@ -567,15 +582,19 @@ async fn nested_group_filtering_honors_privileges_per_level() {
 #[tokio::test]
 async fn diamond_paths_preserve_each_paths_package_filter() {
     // outer -> company_path -> leaf
+    //       -> middle
     //       -> other_path   -> leaf
     //
     // The higher-priority path only allows Company.*, while the second path
-    // only allows Other.*. Deduplicating the leaf before applying both paths
-    // would incorrectly hide Other.Public.
+    // only allows Other.*. `middle` must still beat the shared leaf for an
+    // Other.* package because that leaf is only visible through its lower-
+    // priority path. Deduplicating or unioning at the first structural sighting
+    // would respectively hide or incorrectly promote Other.Public.
     let pool = common::pool().await;
     let mut blobs = StubBlobs::default();
 
     let leaf = seed_member(&pool, false).await;
+    let middle = seed_member(&pool, false).await;
     let company_path = seed_group(&pool).await;
     let other_path = seed_group(&pool).await;
     let outer = seed_group(&pool).await;
@@ -589,7 +608,33 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         "company",
     )
     .await;
-    seed_version(&pool, &mut blobs, leaf.id, "Other.Public", "1.0.0", "other").await;
+    seed_version(
+        &pool,
+        &mut blobs,
+        leaf.id,
+        "Other.Public",
+        "1.0.0",
+        "other-low",
+    )
+    .await;
+    seed_version(
+        &pool,
+        &mut blobs,
+        leaf.id,
+        "Other.Public",
+        "2.0.0",
+        "other-low",
+    )
+    .await;
+    seed_version(
+        &pool,
+        &mut blobs,
+        middle.id,
+        "Other.Public",
+        "1.0.0",
+        "middle",
+    )
+    .await;
 
     repository_dao::add_group_member(&pool, company_path.id, leaf.id, 100)
         .await
@@ -598,6 +643,9 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         .await
         .unwrap();
     repository_dao::add_group_member(&pool, outer.id, company_path.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, middle.id, 50)
         .await
         .unwrap();
     repository_dao::add_group_member(&pool, outer.id, other_path.id, 10)
@@ -659,6 +707,9 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     authz_dao::add_grant(&pool, role.id, Some(leaf.id), "read", None)
         .await
         .expect("grant leaf read");
+    authz_dao::add_grant(&pool, role.id, Some(middle.id), "read", None)
+        .await
+        .expect("grant middle read");
     authz_dao::assign_role(&pool, account.id, role.id)
         .await
         .expect("assign role");
@@ -668,7 +719,7 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         token_id: None,
         is_admin: false,
     };
-    let g = group_repo(&pool, blobs, principal);
+    let g = group_repo(&pool, blobs.clone(), principal);
 
     assert_eq!(
         g.list_versions(&outer.name, "company.tools")
@@ -678,13 +729,141 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         1,
         "higher-priority path keeps its matching package"
     );
+    let other_versions = g.list_versions(&outer.name, "other.public").await.unwrap();
     assert_eq!(
-        g.list_versions(&outer.name, "other.public")
+        other_versions
+            .iter()
+            .map(|entry| entry.version.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1.0.0", "2.0.0"],
+        "lower path contributes its additional version without duplicate reads"
+    );
+
+    let loc = g
+        .resolve_nupkg(&outer.name, "other.public", "1.0.0")
+        .await
+        .unwrap()
+        .expect("Other.Public 1.0.0 resolves");
+    assert_eq!(
+        served_tag(&blobs, &loc),
+        "nupkg-middle",
+        "the middle leaf beats the shared leaf's lower-priority visible path"
+    );
+
+    let registration = g.registration(&outer.name, "other.public").await.unwrap();
+    assert_eq!(registration.len(), 2);
+    assert_eq!(
+        registration[0].package_hash_sha512_base64.as_deref(),
+        Some("hash-middle"),
+        "registration overlap uses the package-specific highest-priority leaf"
+    );
+
+    let search = g
+        .search(
+            &outer.name,
+            &SearchParams {
+                q: "other.public".to_string(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(search.total_hits, 1);
+    assert_eq!(
+        search.hits[0].latest_version, "1.0.0",
+        "search winner follows the package-specific path order"
+    );
+}
+
+#[tokio::test]
+async fn layered_diamond_queries_each_leaf_once_per_operation() {
+    // Eight two-wide layers produce 256 root-to-leaf paths but only 17 group
+    // nodes (including the root) and one leaf. Every read operation must
+    // construct/query that leaf once, not once per path.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let leaf = seed_member(&pool, false).await;
+    let outer = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, leaf.id, "Dense.Graph", "1.0.0", "dense").await;
+
+    let mut previous = vec![outer.clone()];
+    for _ in 0..8 {
+        let left = seed_group(&pool).await;
+        let right = seed_group(&pool).await;
+        for parent in &previous {
+            repository_dao::add_group_member(&pool, parent.id, left.id, 100)
+                .await
+                .unwrap();
+            repository_dao::add_group_member(&pool, parent.id, right.id, 90)
+                .await
+                .unwrap();
+        }
+        previous = vec![left, right];
+    }
+    for parent in &previous {
+        repository_dao::add_group_member(&pool, parent.id, leaf.id, 100)
+            .await
+            .unwrap();
+    }
+
+    let builds = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(CountingHostedFactory {
+        inner: HostedFactory {
+            pool: pool.clone(),
+            blobs,
+        },
+        builds: builds.clone(),
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(32));
+    let g = GroupRepo::new(
+        pool.clone(),
+        user(&pool).await,
+        factory,
+        authz,
+        TEST_MAX_DEPTH,
+    );
+
+    assert_eq!(
+        g.list_versions(&outer.name, "dense.graph")
             .await
             .unwrap()
             .len(),
-        1,
-        "second path contributes packages allowed only by its selector"
+        1
+    );
+    assert!(g
+        .resolve_nupkg(&outer.name, "dense.graph", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(g
+        .resolve_nuspec(&outer.name, "dense.graph", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        g.registration(&outer.name, "dense.graph")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        g.search(
+            &outer.name,
+            &SearchParams {
+                q: "dense.graph".to_string(),
+                ..SearchParams::default()
+            }
+        )
+        .await
+        .unwrap()
+        .total_hits,
+        1
+    );
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        5,
+        "five operations construct the unique leaf once each, not 256 times each"
     );
 }
 

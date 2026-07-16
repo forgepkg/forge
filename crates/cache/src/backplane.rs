@@ -2,19 +2,22 @@
 //!
 //! When Redis is present, every [`crate::Cache`] node publishes invalidations on
 //! the shared channel [`CHANNEL`]. A background subscriber task on every node
-//! receives those messages and drops the matching entries from its **local L1**,
-//! so a mutation on node A causes node B to forget its stale copy.
+//! receives those messages and fences concurrent fills before dropping matching
+//! entries from its local L1 and shared L2, so a mutation on node A causes node
+//! B to forget stale copies even when a fill was already in flight.
 //!
 //! ## Message format
 //!
 //! `"{node_id}|{kind}|{payload}"` where `kind` is:
-//! * `k` — `payload` is a flat `"{ns}:{key}"`; drop that single L1 entry.
-//! * `n` — `payload` is a namespace `"{ns}"`; drop every L1 entry under it.
+//! * `k` — `payload` is a flat `"{ns}:{key}"`; fence local fills and drop that
+//!   single L1/L2 entry.
+//! * `n` — `payload` is a namespace `"{ns}"`; fence local fills and drop every
+//!   L1/L2 entry under it.
 //!
 //! ## Self-message suppression
 //!
 //! Each node has a random `node_id`. The publisher already dropped its own L1
-//! entry synchronously (see [`crate::Cache::invalidate`]), so when the
+//! and L2 entries synchronously (see [`crate::Cache::invalidate`]), so when the
 //! subscriber sees its *own* `node_id` it skips the redundant local drop.
 //!
 //! ## Graceful degradation
@@ -30,6 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redis::AsyncCommands;
 
 use crate::l1::L1;
+use crate::l2_redis::RedisL2;
+use crate::NamespaceLocks;
 
 /// The pub/sub channel all nodes share for invalidation broadcasts.
 pub const CHANNEL: &str = "forge:cache:invalidate";
@@ -60,14 +65,20 @@ pub struct Backplane {
 }
 
 impl Backplane {
-    /// Connect a publisher and spawn the subscriber task bound to `l1`.
-    pub async fn start(client: redis::Client, l1: L1) -> Result<Self, redis::RedisError> {
+    /// Connect a publisher and spawn the subscriber task bound to this node's
+    /// cache tiers and namespace fences.
+    pub async fn start(
+        client: redis::Client,
+        l1: L1,
+        l2: RedisL2,
+        namespace_locks: NamespaceLocks,
+    ) -> Result<Self, redis::RedisError> {
         let node_id = fresh_node_id();
         let conn = redis::aio::ConnectionManager::new(client.clone()).await?;
 
         // Spawn the subscriber. It owns its own dedicated connection (pub/sub
         // connections can't multiplex normal commands).
-        tokio::spawn(subscriber_loop(client, l1, node_id));
+        tokio::spawn(subscriber_loop(client, l1, l2, namespace_locks, node_id));
 
         Ok(Backplane { conn, node_id })
     }
@@ -94,7 +105,13 @@ impl Backplane {
 
 /// Background task: subscribe to [`CHANNEL`] and apply remote invalidations to
 /// the local L1, ignoring messages this node published itself.
-async fn subscriber_loop(client: redis::Client, l1: L1, node_id: u64) {
+async fn subscriber_loop(
+    client: redis::Client,
+    l1: L1,
+    l2: RedisL2,
+    namespace_locks: NamespaceLocks,
+    node_id: u64,
+) {
     let mut pubsub = match client.get_async_pubsub().await {
         Ok(p) => p,
         Err(err) => {
@@ -117,14 +134,20 @@ async fn subscriber_loop(client: redis::Client, l1: L1, node_id: u64) {
                 continue;
             }
         };
-        apply_message(&l1, node_id, &payload).await;
+        apply_message(&l1, &l2, &namespace_locks, node_id, &payload).await;
     }
 
     tracing::warn!("backplane subscriber stream ended; cross-node invalidation now relies on TTL");
 }
 
 /// Parse and apply one backplane message to the local L1.
-async fn apply_message(l1: &L1, node_id: u64, payload: &str) {
+async fn apply_message(
+    l1: &L1,
+    l2: &RedisL2,
+    namespace_locks: &NamespaceLocks,
+    node_id: u64,
+    payload: &str,
+) {
     let mut parts = payload.splitn(3, '|');
     let (Some(origin), Some(kind), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
         tracing::warn!(payload, "backplane: malformed message");
@@ -137,8 +160,26 @@ async fn apply_message(l1: &L1, node_id: u64, payload: &str) {
     }
 
     match kind {
-        "k" => l1.invalidate(rest).await,
-        "n" => l1.invalidate_prefix(&format!("{rest}:")).await,
+        "k" => {
+            let Some((ns, _key)) = rest.split_once(':') else {
+                tracing::warn!(full_key = rest, "backplane: malformed cache key");
+                return;
+            };
+            let namespace_lock = namespace_locks.get(ns);
+            let _guard = namespace_lock.write().await;
+            l1.invalidate(rest).await;
+            if let Err(err) = l2.del(rest).await {
+                tracing::warn!(error = %err, key = rest, "backplane L2 key re-delete failed");
+            }
+        }
+        "n" => {
+            let namespace_lock = namespace_locks.get(rest);
+            let _guard = namespace_lock.write().await;
+            l1.invalidate_prefix(&format!("{rest}:")).await;
+            if let Err(err) = l2.del_ns(rest).await {
+                tracing::warn!(error = %err, ns = rest, "backplane L2 namespace re-delete failed");
+            }
+        }
         other => tracing::warn!(kind = other, "backplane: unknown message kind"),
     }
 }

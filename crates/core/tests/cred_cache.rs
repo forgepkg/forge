@@ -25,7 +25,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use forge_core::auth::{CredCacheError, CredKeyPepper, UpstreamVerdict, ValidatedCredentialCache};
+use forge_core::auth::{
+    revoke_credentials_for_user, CredCacheError, CredKeyPepper, UpstreamVerdict,
+    ValidatedCredentialCache,
+};
 
 use common::{pool, unique};
 
@@ -283,6 +286,54 @@ async fn revoke_user_all_providers() {
         .await
         .unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn standalone_revoke_invalidates_realm_scoped_provider() {
+    let pool = pool().await;
+    let hot_cache = Cache::l1_only(256);
+    let cache = ValidatedCredentialCache::new(
+        hot_cache.clone(),
+        pool.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
+    let user = format!("realm-revoke-{}", unique());
+    let provider = format!("realm:corporate-{}", unique());
+    let pw = "good-password";
+    let hits = Arc::new(AtomicU32::new(0));
+
+    cache
+        .check(
+            &provider,
+            &user,
+            pw,
+            counting_forward(hits.clone(), UpstreamVerdict::Valid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let deleted = revoke_credentials_for_user(&hot_cache, &pool, &user)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    cache
+        .check(
+            &provider,
+            &user,
+            pw,
+            counting_forward(hits.clone(), UpstreamVerdict::Valid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "standalone reauth must invalidate dynamically named realm providers"
+    );
 }
 
 /// After caching a credential, dump every text column of `validated_credential`

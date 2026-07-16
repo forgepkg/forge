@@ -293,3 +293,69 @@ async fn invalidate_ns_drops_all_keys_in_namespace() {
         "invalidate_ns must not touch other namespaces"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn namespace_invalidation_fences_an_inflight_fill() {
+    let cache = Cache::l1_only(1000);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_started = Arc::new(tokio::sync::Notify::new());
+    let release_factory = Arc::new(tokio::sync::Notify::new());
+
+    let fill = {
+        let cache = cache.clone();
+        let calls = calls.clone();
+        let factory_started = factory_started.clone();
+        let release_factory = release_factory.clone();
+        tokio::spawn(async move {
+            cache
+                .get_or_try_insert_with::<u64, _, _, TestError>(
+                    "ns",
+                    "racy",
+                    Duration::from_secs(60),
+                    || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        factory_started.notify_one();
+                        release_factory.notified().await;
+                        Ok(1)
+                    },
+                )
+                .await
+                .unwrap()
+        })
+    };
+    factory_started.notified().await;
+
+    let invalidation = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.invalidate_ns("ns").await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !invalidation.is_finished(),
+        "invalidation waits until the older fill can no longer reinsert"
+    );
+
+    release_factory.notify_one();
+    assert_eq!(fill.await.unwrap(), 1);
+    invalidation.await.unwrap();
+
+    let calls_after_race = calls.clone();
+    let value = cache
+        .get_or_try_insert_with::<u64, _, _, TestError>(
+            "ns",
+            "racy",
+            Duration::from_secs(60),
+            || async move {
+                calls_after_race.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(value, 2);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the fill completed before the invalidation fence and was then removed"
+    );
+}

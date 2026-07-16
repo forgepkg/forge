@@ -36,6 +36,7 @@
 //! [`globset::GlobSet`] held behind `Arc` inside a [`CompiledSelector`] so the
 //! cached set is cheap to clone and the hot path does no recompilation.
 
+use std::fmt;
 use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -400,7 +401,7 @@ impl EffectiveSet {
 }
 
 /// The package-visibility predicate returned by [`EffectiveSet::package_filter`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PackageFilter {
     /// Every package in the repo is visible (admin, or an unscoped read grant).
     AllowAll,
@@ -412,6 +413,24 @@ pub enum PackageFilter {
     /// traversal, where the filters on the outer group, nested groups, and leaf
     /// repository must all hold.
     All(Vec<PackageFilter>),
+    /// A runtime-composed package predicate. Group DAG resolution uses this to
+    /// push a compact reachability check into each unique leaf search without
+    /// expanding every root-to-leaf path into a separate backend query.
+    Predicate(Arc<dyn Fn(&str) -> bool + Send + Sync>),
+}
+
+impl fmt::Debug for PackageFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackageFilter::AllowAll => f.write_str("AllowAll"),
+            PackageFilter::DenyAll => f.write_str("DenyAll"),
+            PackageFilter::Selectors(selectors) => {
+                f.debug_tuple("Selectors").field(selectors).finish()
+            }
+            PackageFilter::All(filters) => f.debug_tuple("All").field(filters).finish(),
+            PackageFilter::Predicate(_) => f.write_str("Predicate(..)"),
+        }
+    }
 }
 
 impl PackageFilter {
@@ -422,6 +441,7 @@ impl PackageFilter {
             PackageFilter::DenyAll => false,
             PackageFilter::Selectors(sels) => sels.iter().any(|s| s.matches(package_name)),
             PackageFilter::All(filters) => filters.iter().all(|f| f.allows(package_name)),
+            PackageFilter::Predicate(predicate) => predicate(package_name),
         }
     }
 
