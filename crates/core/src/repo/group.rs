@@ -33,8 +33,10 @@
 //! ([`Authz::can_read`]). Being able to read an outer group grants **no**
 //! transitive read on an inner member — only a `read` grant on the actual leaf
 //! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
-//! stable pre-order walk; a leaf reachable by several paths is kept once, at its
-//! highest-priority (first) sighting.
+//! stable pre-order walk. A leaf reachable by several paths is retained once per
+//! path because each path may carry a different package-selector intersection;
+//! result merging still deduplicates package ids and versions with the first,
+//! highest-priority match winning.
 //!
 //! ## Decoupling from concrete member kinds
 //! `forge-core` must not hard-wire how a hosted vs. proxy member is constructed
@@ -137,26 +139,26 @@ impl GroupRepo {
     /// each level `priority DESC`), each paired with its read ops.
     ///
     /// Nested groups are descended into (subject to `can_read` at every level);
-    /// a leaf reachable by several paths is kept once, at its first (highest
-    /// effective priority) sighting. The walk is bounded by a visited-set (group
-    /// ids on the current path) and [`Self::max_depth`]; hitting either treats
-    /// that subtree as empty (fail-closed) and logs, so a cycle injected by a
-    /// raw DB write terminates rather than looping.
+    /// a leaf reachable by several paths is kept once per path so distinct
+    /// package-selector intersections remain visible. The walk is bounded by a
+    /// visited-set (group ids on the current path) and [`Self::max_depth`];
+    /// hitting either treats that subtree as empty (fail-closed) and logs, so a
+    /// cycle injected by a raw DB write terminates rather than looping.
     async fn visible_members(&self, group: &str) -> Result<Vec<VisibleMember>, RepoError> {
         let group_row = self.group_row(group).await?;
 
         let mut out: Vec<VisibleMember> = Vec::new();
-        let mut seen_leaves: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
         visited.insert(group_row.id);
-        let root_filter = self.authz.package_filter(&self.principal, &group_row).await;
 
         self.flatten_into(
             group_row.id,
             0,
-            root_filter,
+            // The requested root repository is authorized and package-filtered
+            // by the caller's outer `PackageFilteredReadOps`. Only filters from
+            // members encountered during traversal belong in this path.
+            PackageFilter::AllowAll,
             &mut visited,
-            &mut seen_leaves,
             &mut out,
         )
         .await?;
@@ -166,18 +168,16 @@ impl GroupRepo {
     /// Recursive worker for [`Self::visible_members`]. Walks `group_id`'s direct
     /// members (priority DESC); for each member the principal `can_read`:
     /// * a **group** member is descended into (cycle/depth-guarded);
-    /// * a **leaf** member is appended (deduped by repo id).
+    /// * a **leaf** member is appended with its path-specific package filter.
     ///
-    /// `visited` holds the group ids on the current descent path; `seen_leaves`
-    /// dedups leaves across the whole flatten. Boxed future because the async fn
-    /// is recursive.
+    /// `visited` holds the group ids on the current descent path. Boxed future
+    /// because the async fn is recursive.
     fn flatten_into<'a>(
         &'a self,
         group_id: i64,
         depth: u32,
         path_filter: PackageFilter,
         visited: &'a mut std::collections::HashSet<i64>,
-        seen_leaves: &'a mut std::collections::HashSet<i64>,
         out: &'a mut Vec<VisibleMember>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RepoError>> + Send + 'a>>
     {
@@ -212,20 +212,13 @@ impl GroupRepo {
                         );
                         continue;
                     }
-                    self.flatten_into(
-                        member.id,
-                        depth + 1,
-                        member_path_filter,
-                        visited,
-                        seen_leaves,
-                        out,
-                    )
-                    .await?;
+                    self.flatten_into(member.id, depth + 1, member_path_filter, visited, out)
+                        .await?;
                     // Pop off the path so a diamond (two paths to the same group
                     // via distinct parents) is still resolvable, while a true
                     // back-edge on the *current* path stays blocked.
                     visited.remove(&member.id);
-                } else if seen_leaves.insert(member.id) {
+                } else {
                     let ops = self.factory.ops_for(&member)?;
                     let ops = Arc::new(PackageFilteredReadOps::new(ops, member_path_filter));
                     out.push(VisibleMember { repo: member, ops });

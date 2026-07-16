@@ -565,6 +565,130 @@ async fn nested_group_filtering_honors_privileges_per_level() {
 }
 
 #[tokio::test]
+async fn diamond_paths_preserve_each_paths_package_filter() {
+    // outer -> company_path -> leaf
+    //       -> other_path   -> leaf
+    //
+    // The higher-priority path only allows Company.*, while the second path
+    // only allows Other.*. Deduplicating the leaf before applying both paths
+    // would incorrectly hide Other.Public.
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+
+    let leaf = seed_member(&pool, false).await;
+    let company_path = seed_group(&pool).await;
+    let other_path = seed_group(&pool).await;
+    let outer = seed_group(&pool).await;
+
+    seed_version(
+        &pool,
+        &mut blobs,
+        leaf.id,
+        "Company.Tools",
+        "1.0.0",
+        "company",
+    )
+    .await;
+    seed_version(&pool, &mut blobs, leaf.id, "Other.Public", "1.0.0", "other").await;
+
+    repository_dao::add_group_member(&pool, company_path.id, leaf.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, other_path.id, leaf.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, company_path.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, other_path.id, 10)
+        .await
+        .unwrap();
+
+    let suffix = common::unique();
+    let account = user_dao::insert_user(
+        &pool,
+        NewUser::local(format!("diamond-user-{suffix}"), "x".into(), false, true),
+    )
+    .await
+    .expect("insert user");
+    let role = authz_dao::insert_role(
+        &pool,
+        &format!("diamond-reader-{suffix}"),
+        "diamond path selector regression",
+    )
+    .await
+    .expect("insert role");
+    let company_selector = authz_dao::insert_content_selector(
+        &pool,
+        &format!("diamond-company-{suffix}"),
+        &["company.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("insert company selector");
+    let other_selector = authz_dao::insert_content_selector(
+        &pool,
+        &format!("diamond-other-{suffix}"),
+        &["other.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("insert other selector");
+
+    authz_dao::add_grant(&pool, role.id, Some(outer.id), "read", None)
+        .await
+        .expect("grant outer read");
+    authz_dao::add_grant(
+        &pool,
+        role.id,
+        Some(company_path.id),
+        "read",
+        Some(company_selector),
+    )
+    .await
+    .expect("grant company path read");
+    authz_dao::add_grant(
+        &pool,
+        role.id,
+        Some(other_path.id),
+        "read",
+        Some(other_selector),
+    )
+    .await
+    .expect("grant other path read");
+    authz_dao::add_grant(&pool, role.id, Some(leaf.id), "read", None)
+        .await
+        .expect("grant leaf read");
+    authz_dao::assign_role(&pool, account.id, role.id)
+        .await
+        .expect("assign role");
+
+    let principal = Principal::User {
+        user_id: account.id,
+        token_id: None,
+        is_admin: false,
+    };
+    let g = group_repo(&pool, blobs, principal);
+
+    assert_eq!(
+        g.list_versions(&outer.name, "company.tools")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "higher-priority path keeps its matching package"
+    );
+    assert_eq!(
+        g.list_versions(&outer.name, "other.public")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "second path contributes packages allowed only by its selector"
+    );
+}
+
+#[tokio::test]
 async fn nested_group_inner_unreadable_blocks_descent() {
     // outer -> inner (NOT anon-readable) -> pub (anon-readable leaf). An
     // anonymous caller cannot read the inner group, so it must not descend and
