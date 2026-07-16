@@ -1,119 +1,106 @@
-//! Backplane — the optional cross-node invalidation channel (Redis pub/sub).
+//! Redis pub/sub backplane for passive cache-tag invalidation.
 //!
-//! When Redis is present, every [`crate::Cache`] node publishes invalidations on
-//! the shared channel [`CHANNEL`]. A background subscriber task on every node
-//! receives those messages and fences concurrent fills before dropping matching
-//! entries from its local L1 and shared L2, so a mutation on node A causes node
-//! B to forget stale copies even when a fill was already in flight.
+//! Invalidating a tag first advances its authoritative Redis generation, then
+//! publishes `"{node_id}|t|{namespace}|{generation}|{tag}"`. Receivers acquire
+//! the namespace writer fence and advance their local tag barrier. Any L1 entry
+//! stamped with an older generation becomes invisible immediately, without an
+//! L1/L2 scan.
 //!
-//! ## Message format
-//!
-//! `"{node_id}|{kind}|{payload}"` where `kind` is:
-//! * `k` — `payload` is a flat `"{ns}:{key}"`; fence local fills and drop that
-//!   single L1/L2 entry.
-//! * `n` — `payload` is a namespace `"{ns}"`; fence local fills and drop every
-//!   L1/L2 entry under it.
-//!
-//! ## Self-message suppression
-//!
-//! Each node has a random `node_id`. The publisher already dropped its own L1
-//! and L2 entries synchronously (see [`crate::Cache::invalidate`]), so when the
-//! subscriber sees its *own* `node_id` it skips the redundant local drop.
-//!
-//! ## Graceful degradation
-//!
-//! A publish failure is logged and ignored — the local drop already happened and
-//! the backplane is best-effort. If the subscriber connection drops, the task
-//! attempts to re-subscribe; a hard failure is logged and the task exits (the
-//! node then relies on TTL expiry for cross-node staleness, which is still
-//! correct, just slower).
+//! During a rolling upgrade, new publishers also send the former `k`/`n`
+//! message understood by old nodes. New subscribers that hear a legacy-only
+//! publisher promote that event into a Redis tag bump and republish it, closing
+//! the old delete/re-delete race inside mixed-version clusters.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redis::AsyncCommands;
 
-use crate::l1::L1;
 use crate::l2_redis::RedisL2;
-use crate::NamespaceLocks;
+use crate::{key_tag, namespace_tag, NamespaceLocks, TagVersions};
 
-/// The pub/sub channel all nodes share for invalidation broadcasts.
+/// The pub/sub channel shared by every cache node.
 pub const CHANNEL: &str = "forge:cache:invalidate";
 
-/// Process-unique-ish node id source. A monotonically increasing base XORed with
-/// the start instant keeps ids distinct across nodes in the same process (tests)
-/// without needing a UUID dependency.
 static NODE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn fresh_node_id() -> u64 {
     let seq = NODE_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
-    // Mix the sequence into the low bits so two nodes created in the same nanos
-    // (same process) still differ.
     nanos
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(seq.wrapping_add(1))
 }
 
-/// Publishes invalidations; owns this node's id. The subscriber runs as a
-/// detached background task spawned in [`Backplane::start`].
+fn tag_message(node_id: u64, ns: &str, tag: &str, generation: u64) -> String {
+    format!("{node_id}|t|{ns}|{generation}|{tag}")
+}
+
+/// Publishes tag invalidations; the subscriber is a detached task.
 pub struct Backplane {
     conn: redis::aio::ConnectionManager,
     node_id: u64,
 }
 
 impl Backplane {
-    /// Connect a publisher and spawn the subscriber task bound to this node's
-    /// cache tiers and namespace fences.
     pub async fn start(
         client: redis::Client,
-        l1: L1,
         l2: RedisL2,
         namespace_locks: NamespaceLocks,
+        tag_versions: TagVersions,
     ) -> Result<Self, redis::RedisError> {
         let node_id = fresh_node_id();
         let conn = redis::aio::ConnectionManager::new(client.clone()).await?;
 
-        // Spawn the subscriber. It owns its own dedicated connection (pub/sub
-        // connections can't multiplex normal commands).
-        tokio::spawn(subscriber_loop(client, l1, l2, namespace_locks, node_id));
+        tokio::spawn(subscriber_loop(
+            client,
+            l2,
+            conn.clone(),
+            namespace_locks,
+            tag_versions,
+            node_id,
+        ));
 
         Ok(Backplane { conn, node_id })
     }
 
-    /// Broadcast a single-key invalidation.
-    pub async fn publish_key(&self, full_key: &str) {
-        let msg = format!("{}|k|{}", self.node_id, full_key);
-        self.publish(msg).await;
-    }
-
-    /// Broadcast a namespace invalidation.
-    pub async fn publish_ns(&self, ns: &str) {
-        let msg = format!("{}|n|{}", self.node_id, ns);
-        self.publish(msg).await;
-    }
-
-    async fn publish(&self, msg: String) {
+    /// Broadcast one tag-generation barrier plus a legacy companion for nodes
+    /// that have not yet upgraded to tag-aware envelopes.
+    pub async fn publish_tag(&self, ns: &str, tag: &str, generation: u64) {
         let mut conn = self.conn.clone();
-        if let Err(err) = conn.publish::<_, _, ()>(CHANNEL, msg).await {
-            tracing::warn!(error = %err, "backplane publish failed (local drop already applied)");
+        if let Err(err) = conn
+            .publish::<_, _, ()>(CHANNEL, tag_message(self.node_id, ns, tag, generation))
+            .await
+        {
+            tracing::warn!(error = %err, ns, tag, generation, "backplane tag publish failed");
+        }
+
+        let legacy = if let Some(full_key) = tag.strip_prefix("@key:") {
+            format!("{}|k|{}", self.node_id, full_key)
+        } else {
+            // Custom tags have no old wire equivalent, so old nodes receive the
+            // safe coarse namespace invalidation.
+            format!("{}|n|{}", self.node_id, ns)
+        };
+        if let Err(err) = conn.publish::<_, _, ()>(CHANNEL, legacy).await {
+            tracing::warn!(error = %err, ns, tag, "legacy backplane companion publish failed");
         }
     }
 }
 
-/// Background task: subscribe to [`CHANNEL`] and apply remote invalidations to
-/// the local L1, ignoring messages this node published itself.
 async fn subscriber_loop(
     client: redis::Client,
-    l1: L1,
     l2: RedisL2,
+    publisher: redis::aio::ConnectionManager,
     namespace_locks: NamespaceLocks,
+    tag_versions: TagVersions,
     node_id: u64,
 ) {
     let mut pubsub = match client.get_async_pubsub().await {
-        Ok(p) => p,
+        Ok(pubsub) => pubsub,
         Err(err) => {
             tracing::error!(error = %err, "backplane subscriber could not open pubsub connection; exiting");
             return;
@@ -125,26 +112,38 @@ async fn subscriber_loop(
     }
 
     use futures_util::StreamExt;
+    let mut tag_capable_origins = HashSet::new();
     let mut stream = pubsub.on_message();
-    while let Some(msg) = stream.next().await {
-        let payload: String = match msg.get_payload() {
-            Ok(p) => p,
+    while let Some(message) = stream.next().await {
+        let payload: String = match message.get_payload() {
+            Ok(payload) => payload,
             Err(err) => {
                 tracing::warn!(error = %err, "backplane: undecodable message payload");
                 continue;
             }
         };
-        apply_message(&l1, &l2, &namespace_locks, node_id, &payload).await;
+        apply_message(
+            &l2,
+            &publisher,
+            &namespace_locks,
+            &tag_versions,
+            &mut tag_capable_origins,
+            node_id,
+            &payload,
+        )
+        .await;
     }
 
     tracing::warn!("backplane subscriber stream ended; cross-node invalidation now relies on TTL");
 }
 
-/// Parse and apply one backplane message to the local L1.
+#[allow(clippy::too_many_arguments)]
 async fn apply_message(
-    l1: &L1,
     l2: &RedisL2,
+    publisher: &redis::aio::ConnectionManager,
     namespace_locks: &NamespaceLocks,
+    tag_versions: &TagVersions,
+    tag_capable_origins: &mut HashSet<u64>,
     node_id: u64,
     payload: &str,
 ) {
@@ -153,31 +152,67 @@ async fn apply_message(
         tracing::warn!(payload, "backplane: malformed message");
         return;
     };
-
-    // Skip our own broadcasts: the publishing node already dropped locally.
-    if origin.parse::<u64>().ok() == Some(node_id) {
+    let Ok(origin) = origin.parse::<u64>() else {
+        tracing::warn!(payload, "backplane: malformed origin");
+        return;
+    };
+    if origin == node_id {
         return;
     }
 
     match kind {
-        "k" => {
-            let Some((ns, _key)) = rest.split_once(':') else {
-                tracing::warn!(full_key = rest, "backplane: malformed cache key");
+        "t" => {
+            // `splitn` preserves any `|` characters inside the tag.
+            let mut tagged = rest.splitn(3, '|');
+            let (Some(ns), Some(generation), Some(tag)) =
+                (tagged.next(), tagged.next(), tagged.next())
+            else {
+                tracing::warn!(payload, "backplane: malformed tag message");
                 return;
             };
+            let Ok(generation) = generation.parse::<u64>() else {
+                tracing::warn!(generation, tag, "backplane: malformed tag generation");
+                return;
+            };
+            tag_capable_origins.insert(origin);
             let namespace_lock = namespace_locks.get(ns);
             let _guard = namespace_lock.write().await;
-            l1.invalidate(rest).await;
-            if let Err(err) = l2.del(rest).await {
-                tracing::warn!(error = %err, key = rest, "backplane L2 key re-delete failed");
-            }
+            tag_versions.observe_one(tag, generation);
         }
-        "n" => {
-            let namespace_lock = namespace_locks.get(rest);
+        "k" | "n" => {
+            if tag_capable_origins.contains(&origin) {
+                // Companion from a new publisher; the preceding tag message is
+                // already authoritative for this receiver.
+                return;
+            }
+            let (ns, tag) = if kind == "k" {
+                let Some((ns, key)) = rest.split_once(':') else {
+                    tracing::warn!(full_key = rest, "backplane: malformed legacy cache key");
+                    return;
+                };
+                (ns, key_tag(ns, key))
+            } else {
+                (rest, namespace_tag(rest))
+            };
+
+            let namespace_lock = namespace_locks.get(ns);
             let _guard = namespace_lock.write().await;
-            l1.invalidate_prefix(&format!("{rest}:")).await;
-            if let Err(err) = l2.del_ns(rest).await {
-                tracing::warn!(error = %err, ns = rest, "backplane L2 namespace re-delete failed");
+            let current = tag_versions.current(&tag);
+            let generation = match l2.bump_tag(&tag, current).await {
+                Ok(generation) => generation,
+                Err(err) => {
+                    tracing::warn!(error = %err, ns, tag, "legacy invalidation tag promotion failed");
+                    current.saturating_add(1)
+                }
+            };
+            tag_versions.observe_one(&tag, generation);
+
+            let mut publisher = publisher.clone();
+            if let Err(err) = publisher
+                .publish::<_, _, ()>(CHANNEL, tag_message(node_id, ns, &tag, generation))
+                .await
+            {
+                tracing::warn!(error = %err, ns, tag, "promoted tag publish failed");
             }
         }
         other => tracing::warn!(kind = other, "backplane: unknown message kind"),

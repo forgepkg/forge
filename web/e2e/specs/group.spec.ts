@@ -78,13 +78,13 @@ test('a group resolves the highest-priority member for an overlapping id+version
   )
 
   await page.getByLabel(/^repository$/i).selectOption(winner)
-  await page.getByLabel(/^priority$/i).fill('200')
+  await page.getByRole('spinbutton', { name: /^priority$/i }).fill('200')
   await page.getByRole('button', { name: /add member/i }).click()
   // The winner row appears in the priority list.
   await expect(page.getByText(winner, { exact: false })).toBeVisible()
 
   await page.getByLabel(/^repository$/i).selectOption(loser)
-  await page.getByLabel(/^priority$/i).fill('100')
+  await page.getByRole('spinbutton', { name: /^priority$/i }).fill('100')
   await page.getByRole('button', { name: /add member/i }).click()
   await expect(page.getByText(loser, { exact: false })).toBeVisible()
 

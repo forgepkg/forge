@@ -57,7 +57,7 @@ use forge_cache::Cache;
 use forge_db::validated_credential_dao::{self as vc_dao, NewVerdict};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -67,6 +67,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// one invalidation domain without key collisions. A user revocation must be
 /// able to evict realm-scoped providers whose names are only known at runtime.
 const NS_CRED: &str = "validated_credential";
+
+/// Opaque cache tag shared by every credential entry for one username. Hashing
+/// avoids placing usernames directly in Redis metadata or pub/sub payloads;
+/// this tag is an invalidation grouping key, not an authentication secret.
+fn user_cache_tag(username: &str) -> String {
+    format!(
+        "credential-user:{}",
+        hex::encode(Sha256::digest(username.as_bytes()))
+    )
+}
 
 /// A server-held secret keying the credential-cache HMAC.
 ///
@@ -236,6 +246,7 @@ impl ValidatedCredentialCache {
         Fut: std::future::Future<Output = UpstreamVerdict>,
     {
         let key = cred_key(&self.pepper, provider_id, username, password);
+        let user_tag = user_cache_tag(username);
 
         // The cache value's TTL must depend on the verdict (positive vs
         // negative), but `get_or_try_insert_with` takes a single `ttl`. We pass
@@ -253,18 +264,24 @@ impl ValidatedCredentialCache {
 
         let verdict: CachedVerdict = self
             .cache
-            .get_or_try_insert_with(NS_CRED, &key, self.positive_ttl, || async move {
-                load_or_forward(
-                    &pool,
-                    &provider,
-                    &user,
-                    &key_for_factory,
-                    positive_ttl,
-                    negative_ttl,
-                    forward,
-                )
-                .await
-            })
+            .get_or_try_insert_with_tags(
+                NS_CRED,
+                &key,
+                std::slice::from_ref(&user_tag),
+                self.positive_ttl,
+                || async move {
+                    load_or_forward(
+                        &pool,
+                        &provider,
+                        &user,
+                        &key_for_factory,
+                        positive_ttl,
+                        negative_ttl,
+                        forward,
+                    )
+                    .await
+                },
+            )
             .await?;
 
         Ok(verdict.valid)
@@ -276,17 +293,18 @@ impl ValidatedCredentialCache {
     ///
     /// Because the cache key is the (peppered) credential HMAC, we cannot target
     /// the exact L1 keys for a username without the passwords — so we invalidate
-    /// the whole validated-credential namespace (a coarse but correct drop; it
-    /// repopulates lazily from the authoritative Postgres store). Provider ids
-    /// are already framed into each HMAC key, so sharing this invalidation domain
-    /// cannot make credentials collide across providers.
+    /// the user's cache tag. Provider ids are already framed into each HMAC key,
+    /// so a provider-scoped DB revoke may safely evict that user's entries from
+    /// every provider without invalidating unrelated users.
     pub async fn revoke_user(
         &self,
         username: &str,
         provider_id: Option<&str>,
     ) -> Result<u64, CredCacheError> {
         let deleted = vc_dao::revoke_by_username(&self.pool, username, provider_id).await?;
-        self.cache.invalidate_ns(NS_CRED).await;
+        self.cache
+            .invalidate_tag(NS_CRED, &user_cache_tag(username))
+            .await;
         Ok(deleted)
     }
 }
@@ -303,16 +321,17 @@ impl ValidatedCredentialCache {
 /// rows deleted.
 ///
 /// Correctness without the pepper: the row deletes are authoritative, and the
-/// namespace invalidation is coarse (drops every provider's hot entries), so the
-/// next request for any of that user's credentials misses the cache and
-/// re-derives from the now-purged Postgres store.
+/// per-user tag invalidation drops every provider's hot entries for this user,
+/// so the next request re-derives from the now-purged Postgres store.
 pub async fn revoke_credentials_for_user(
     cache: &Cache,
     pool: &PgPool,
     username: &str,
 ) -> Result<u64, CredCacheError> {
     let deleted = vc_dao::revoke_by_username(pool, username, None).await?;
-    cache.invalidate_ns(NS_CRED).await;
+    cache
+        .invalidate_tag(NS_CRED, &user_cache_tag(username))
+        .await;
     Ok(deleted)
 }
 
@@ -344,6 +363,7 @@ where
     // 2. Singleflight: take the ROW lock. If a peer wrote a fresh verdict while
     //    we waited, use it without forwarding.
     let mut tx = pool.begin().await?;
+    vc_dao::lock_user_tag(&mut tx, username).await?;
     if let Some(row) = vc_dao::begin_singleflight(&mut tx, provider_id, username, cred_hmac).await?
     {
         tx.commit().await?;

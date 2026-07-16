@@ -172,6 +172,42 @@ pub async fn begin_singleflight(
     }
 }
 
+/// Materialize and share-lock the durable revocation tag for `username`.
+///
+/// Production credential fills call this before taking the per-credential row
+/// lock and before forwarding upstream. [`revoke_by_username`] advances the same
+/// row under an exclusive lock, so revocation either happens before a fill (the
+/// fill is a fresh post-revocation validation) or waits for it and then deletes
+/// its verdict. There is no absent-row gap in which a stale fill can resurrect a
+/// deleted verdict.
+pub async fn lock_user_tag(
+    tx: &mut Transaction<'_, Postgres>,
+    username: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query(
+        r#"
+        INSERT INTO validated_credential_tag (username)
+        VALUES ($1)
+        ON CONFLICT (username) DO NOTHING
+        "#,
+    )
+    .bind(username)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query_scalar(
+        r#"
+        SELECT generation
+        FROM validated_credential_tag
+        WHERE username = $1
+        FOR SHARE
+        "#,
+    )
+    .bind(username)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// Finalize the singleflight: write the real verdict onto the anchor row that
 /// the caller locked via [`begin_singleflight`], **inside the same
 /// transaction**. The caller commits `tx` afterwards, which releases the row
@@ -215,6 +251,25 @@ pub async fn revoke_by_username(
     username: &str,
     provider_id: Option<&str>,
 ) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+
+    // The upsert is the revocation's linearization point. It takes an exclusive
+    // row lock and therefore waits for every pre-existing fill holding the
+    // shared user-tag lock. New fills observe the advanced generation and run
+    // only after this transaction commits.
+    sqlx::query(
+        r#"
+        INSERT INTO validated_credential_tag (username, generation)
+        VALUES ($1, 1)
+        ON CONFLICT (username)
+        DO UPDATE SET generation = validated_credential_tag.generation + 1,
+                      updated_at = now()
+        "#,
+    )
+    .bind(username)
+    .execute(&mut *tx)
+    .await?;
+
     let res = sqlx::query!(
         r#"
         DELETE FROM validated_credential
@@ -224,9 +279,11 @@ pub async fn revoke_by_username(
         username,
         provider_id,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(res.rows_affected())
+    let deleted = res.rows_affected();
+    tx.commit().await?;
+    Ok(deleted)
 }
 
 /// Delete all expired rows (the background sweeper). Returns the count removed.

@@ -258,10 +258,6 @@ async fn invalidate_ns_drops_all_keys_in_namespace() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     cache.invalidate_ns("ns").await;
-    // moka's predicate-based invalidation is applied in the background; give it
-    // a moment then confirm both ns keys re-run.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     run("a").await;
     run("b").await;
     assert_eq!(
@@ -358,4 +354,79 @@ async fn namespace_invalidation_fences_an_inflight_fill() {
         2,
         "the fill completed before the invalidation fence and was then removed"
     );
+}
+
+#[tokio::test]
+async fn custom_tag_invalidation_expires_only_matching_entries() {
+    let cache = Cache::l1_only(64);
+    let tagged = vec!["user:alice".to_string()];
+    let other = vec!["user:bob".to_string()];
+
+    let _: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "alice-one",
+            &tagged,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("OLD-ALICE-1".to_string()) },
+        )
+        .await
+        .unwrap();
+    let _: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "alice-two",
+            &tagged,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("OLD-ALICE-2".to_string()) },
+        )
+        .await
+        .unwrap();
+    let _: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "bob",
+            &other,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("OLD-BOB".to_string()) },
+        )
+        .await
+        .unwrap();
+
+    cache.invalidate_tag("credential", "user:alice").await;
+
+    let alice_one: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "alice-one",
+            &tagged,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("FRESH-ALICE-1".to_string()) },
+        )
+        .await
+        .unwrap();
+    let alice_two: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "alice-two",
+            &tagged,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("FRESH-ALICE-2".to_string()) },
+        )
+        .await
+        .unwrap();
+    let bob: String = cache
+        .get_or_try_insert_with_tags(
+            "credential",
+            "bob",
+            &other,
+            Duration::from_secs(60),
+            || async { Ok::<_, TestError>("SHOULD-NOT-RUN".to_string()) },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(alice_one, "FRESH-ALICE-1");
+    assert_eq!(alice_two, "FRESH-ALICE-2");
+    assert_eq!(bob, "OLD-BOB");
 }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forge_cache::Cache;
+use redis::AsyncCommands;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
@@ -124,12 +125,11 @@ async fn l2_sharing_and_backplane_invalidation() {
     }
     assert_eq!(b_calls.load(Ordering::SeqCst), 0);
 
-    // 3) invalidate on A → backplane → B drops its L1 entry (and L2 is gone).
-    //    After this, B's next read must MISS both layers and run its factory.
+    // 3) invalidate on A → Redis tag bump + backplane → B rejects its older L1
+    //    and shared L2 envelopes. Its next read must run the factory.
     a.invalidate("pkg", "Newtonsoft.Json").await;
 
-    // Poll until the backplane message has been processed by B (its L1 drop) and
-    // the L2 key is deleted, so B re-runs its factory. Timeout to avoid hangs.
+    // Poll until B has observed the tag barrier and re-runs its factory.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let b_calls_probe = b_calls.clone();
@@ -193,9 +193,8 @@ async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
     };
     factory_started.notified().await;
 
-    // A deletes the shared L2 namespace and publishes while B's older fill is
-    // still blocked. B will write after A's first delete, so its subscriber must
-    // fence that fill and delete the stale L1/L2 value again.
+    // A advances the namespace tag while B's older fill is blocked. B's
+    // conditional Redis write must fail because its captured generation is old.
     a.invalidate_ns("race").await;
     release_factory.notify_one();
     assert_eq!(fill.await.unwrap(), "STALE-FILL");
@@ -218,5 +217,128 @@ async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
             panic!("remote invalidation left an in-flight stale L2 fill readable");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tag_generation_prevents_three_node_stale_l2_relay() {
+    let url = redis_url().await;
+    let a = Cache::with_redis(1000, &url).await.unwrap();
+    let b = Cache::with_redis(1000, &url).await.unwrap();
+    let c = Cache::with_redis(1000, &url).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Keep C's namespace read fence occupied even after the stale relay fill
+    // completes. In the former delete/re-delete design this held C's subscriber
+    // back long enough for B to promote C's stale L2 write into B's L1.
+    let blocker_started = Arc::new(tokio::sync::Notify::new());
+    let release_blocker = Arc::new(tokio::sync::Notify::new());
+    let blocker = {
+        let c = c.clone();
+        let blocker_started = blocker_started.clone();
+        let release_blocker = release_blocker.clone();
+        tokio::spawn(async move {
+            c.get_or_try_insert_with::<String, _, _, TestError>(
+                "relay-race",
+                "blocker",
+                Duration::from_secs(300),
+                || async move {
+                    blocker_started.notify_one();
+                    release_blocker.notified().await;
+                    Ok("BLOCKER".to_string())
+                },
+            )
+            .await
+            .unwrap()
+        })
+    };
+
+    let stale_started = Arc::new(tokio::sync::Notify::new());
+    let release_stale = Arc::new(tokio::sync::Notify::new());
+    let stale_fill = {
+        let c = c.clone();
+        let stale_started = stale_started.clone();
+        let release_stale = release_stale.clone();
+        tokio::spawn(async move {
+            c.get_or_try_insert_with::<String, _, _, TestError>(
+                "relay-race",
+                "credential",
+                Duration::from_secs(300),
+                || async move {
+                    stale_started.notify_one();
+                    release_stale.notified().await;
+                    Ok("STALE-C".to_string())
+                },
+            )
+            .await
+            .unwrap()
+        })
+    };
+
+    blocker_started.notified().await;
+    stale_started.notified().await;
+    a.invalidate_ns("relay-race").await;
+
+    // C captured generation 0 before invalidation. Its Redis CAS must reject the
+    // stale write because A already advanced the namespace tag to generation 1.
+    release_stale.notify_one();
+    assert_eq!(stale_fill.await.unwrap(), "STALE-C");
+
+    let observed_by_b = b
+        .get_or_try_insert_with::<String, _, _, TestError>(
+            "relay-race",
+            "credential",
+            Duration::from_secs(300),
+            || async { Ok("FRESH-B".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observed_by_b, "FRESH-B",
+        "a stale fill on C must never relay through shared L2 into B"
+    );
+
+    release_blocker.notify_one();
+    assert_eq!(blocker.await.unwrap(), "BLOCKER");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
+    let url = redis_url().await;
+    let cache = Cache::with_redis(1000, &url).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let old: String = cache
+        .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+            Ok::<_, TestError>("OLD".to_string())
+        })
+        .await
+        .unwrap();
+    assert_eq!(old, "OLD");
+
+    // Simulate a pre-tag-version node. A new subscriber must turn this legacy
+    // namespace event into a durable Redis tag bump and apply it locally.
+    let client = redis::Client::open(url).unwrap();
+    let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let _: () = publisher
+        .publish("forge:cache:invalidate", "424242|n|legacy")
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = cache
+            .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+                Ok::<_, TestError>("FRESH".to_string())
+            })
+            .await
+            .unwrap();
+        if value == "FRESH" {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("legacy invalidation was not promoted to a tag barrier");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

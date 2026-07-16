@@ -336,6 +336,69 @@ async fn standalone_revoke_invalidates_realm_scoped_provider() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoke_fences_an_inflight_forward_before_deleting_its_verdict() {
+    let cache = make_cache(Duration::from_secs(300), Duration::from_secs(30)).await;
+    let user = format!("revoke-race-{}", unique());
+    let password = "still-valid-upstream";
+    let forward_started = Arc::new(tokio::sync::Notify::new());
+    let release_forward = Arc::new(tokio::sync::Notify::new());
+
+    let fill = {
+        let cache = cache.clone();
+        let user = user.clone();
+        let forward_started = forward_started.clone();
+        let release_forward = release_forward.clone();
+        tokio::spawn(async move {
+            cache
+                .check(PROVIDER, &user, password, || async move {
+                    forward_started.notify_one();
+                    release_forward.notified().await;
+                    UpstreamVerdict::Valid
+                })
+                .await
+                .unwrap()
+        })
+    };
+    forward_started.notified().await;
+
+    let revoke = {
+        let cache = cache.clone();
+        let user = user.clone();
+        tokio::spawn(async move { cache.revoke_user(&user, Some(PROVIDER)).await.unwrap() })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !revoke.is_finished(),
+        "revocation must wait on the durable user-tag lock held by the fill"
+    );
+
+    release_forward.notify_one();
+    assert!(fill.await.unwrap());
+    assert_eq!(
+        revoke.await.unwrap(),
+        1,
+        "revocation deletes the verdict committed by the older fill"
+    );
+
+    let forwards_after_revoke = Arc::new(AtomicU32::new(0));
+    let valid = cache
+        .check(
+            PROVIDER,
+            &user,
+            password,
+            counting_forward(forwards_after_revoke.clone(), UpstreamVerdict::Valid),
+        )
+        .await
+        .unwrap();
+    assert!(valid);
+    assert_eq!(
+        forwards_after_revoke.load(Ordering::SeqCst),
+        1,
+        "the first request after revocation must forward upstream again"
+    );
+}
+
 /// After caching a credential, dump every text column of `validated_credential`
 /// and assert the plaintext password is nowhere to be found — only the HMAC key.
 #[tokio::test]

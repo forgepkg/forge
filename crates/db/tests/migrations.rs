@@ -33,6 +33,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "oidc_flow",
     // 0004_credforward.sql
     "validated_credential",
+    // 0014_validated_credential_tags.sql
+    "validated_credential_tag",
     // 0005_rbac.sql
     "privilege",
     "role",

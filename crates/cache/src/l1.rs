@@ -1,6 +1,6 @@
 //! L1 — the in-process [`moka`] tier.
 //!
-//! Stores [`L1Entry`] values (deadline + shared JSON bytes) in a single moka
+//! Stores [`L1Entry`] values (deadline + tagged entry) in a single moka
 //! cache keyed by the flat `"{ns}:{key}"` string. Coalescing of concurrent
 //! loads is delegated to moka's [`try_get_with`](moka::future::Cache::try_get_with).
 //!
@@ -15,11 +15,13 @@ use moka::future::Cache as MokaCache;
 use moka::Expiry;
 use tokio::time::Instant;
 
+use crate::{StoredEntry, TagVersions};
+
 /// One cached entry: its absolute expiry deadline and the shared JSON bytes.
 #[derive(Clone)]
 pub struct L1Entry {
     expires_at: Instant,
-    bytes: Arc<Vec<u8>>,
+    entry: Arc<StoredEntry>,
 }
 
 impl L1Entry {
@@ -66,8 +68,6 @@ impl L1 {
     pub fn new(max_capacity: u64) -> Self {
         let cache = MokaCache::builder()
             .max_capacity(max_capacity)
-            // Required for `invalidate_entries_if` (namespace invalidation).
-            .support_invalidation_closures()
             .expire_after(PerEntryExpiry)
             .build();
         L1 { cache }
@@ -77,25 +77,30 @@ impl L1 {
     /// callers for `full_key`; on `init` error nothing is cached and the error
     /// propagates. An entry already present but past its deadline is treated as
     /// a miss (it is invalidated and `init` re-runs).
-    pub async fn try_get_bytes_with<F, Fut, E>(
+    pub async fn try_get_entry_with<F, Fut, E>(
         &self,
         full_key: String,
         ttl: Duration,
+        expected_tags: Arc<Vec<String>>,
+        tag_versions: TagVersions,
         init: F,
-    ) -> Result<Arc<Vec<u8>>, E>
+    ) -> Result<Arc<StoredEntry>, E>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Arc<Vec<u8>>, E>>,
+        Fut: std::future::Future<Output = Result<Arc<StoredEntry>, E>>,
         E: Clone + Send + Sync + 'static,
     {
         // Fast path: a live entry already present. (`try_get_with` would also
         // return it, but checking here lets us detect a *stale* entry and force
         // a re-run rather than serving expired bytes.)
         if let Some(entry) = self.cache.get(&full_key).await {
-            if entry.is_expired() {
+            if entry.is_expired()
+                || !entry.entry.has_tags(&expected_tags)
+                || !tag_versions.is_current(&entry.entry.tags)
+            {
                 self.cache.invalidate(&full_key).await;
             } else {
-                return Ok(entry.bytes);
+                return Ok(entry.entry);
             }
         }
 
@@ -103,8 +108,8 @@ impl L1 {
         let entry = self
             .cache
             .try_get_with(full_key, async move {
-                let bytes = init().await?;
-                Ok::<L1Entry, E>(L1Entry { expires_at, bytes })
+                let entry = init().await?;
+                Ok::<L1Entry, E>(L1Entry { expires_at, entry })
             })
             .await
             // moka wraps the init (factory) error in an `Arc<E>` because every
@@ -114,29 +119,11 @@ impl L1 {
             // next call re-runs the factory.
             .map_err(|arc_err| (*arc_err).clone())?;
 
-        Ok(entry.bytes)
+        Ok(entry.entry)
     }
 
     /// Drop a single entry from L1.
     pub async fn invalidate(&self, full_key: &str) {
         self.cache.invalidate(full_key).await;
-    }
-
-    /// Drop every entry whose key begins with `prefix` (i.e. `"{ns}:"`).
-    ///
-    /// moka removes the matched entries during a maintenance pass, but its
-    /// retrieval methods already refuse to return values that match a registered
-    /// predicate — so reads observe the invalidation immediately. We still run
-    /// pending tasks to make the eviction deterministic for callers/tests.
-    pub async fn invalidate_prefix(&self, prefix: &str) {
-        let prefix = prefix.to_string();
-        if let Err(err) = self
-            .cache
-            .invalidate_entries_if(move |k, _v| k.starts_with(&prefix))
-        {
-            tracing::error!(error = %err, "L1 prefix invalidation closure rejected");
-            return;
-        }
-        self.cache.run_pending_tasks().await;
     }
 }
