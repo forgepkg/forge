@@ -122,8 +122,15 @@ impl L1 {
         Ok(entry.entry)
     }
 
-    /// Drop a single entry from L1.
-    pub async fn invalidate(&self, full_key: &str) {
-        self.cache.invalidate(full_key).await;
+    /// Drop the resident entry only when *it* is stamped behind the current tag
+    /// barriers. Used by the post-fill staleness check: the fill that raced an
+    /// invalidation must not evict a fresh entry a concurrent task already
+    /// refilled under the new generation.
+    pub async fn invalidate_if_stale(&self, full_key: &str, tag_versions: &TagVersions) {
+        if let Some(resident) = self.cache.get(full_key).await {
+            if !tag_versions.is_current(&resident.entry.tags) {
+                self.cache.invalidate(full_key).await;
+            }
+        }
     }
 }

@@ -399,6 +399,84 @@ async fn revoke_fences_an_inflight_forward_before_deleting_its_verdict() {
     );
 }
 
+/// A definitive ACCEPT records a `(username, auth method)` row in the
+/// `auth_success` cutoff log; a REJECT records nothing there, and once its
+/// short-lived negative verdict is swept the sprayed username's fence row is
+/// reaped too — an unauthenticated attacker leaves no durable rows behind.
+#[tokio::test]
+async fn only_successful_auth_is_recorded_and_spray_leaves_no_durable_rows() {
+    let p = pool().await;
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(64),
+        p.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        // Negative TTL of zero: the sprayed attempt's verdict expires
+        // immediately, as after a real negative window lapses.
+        Duration::from_secs(0),
+    );
+    let n = unique();
+    let good_user = format!("success-log-{n}");
+    let sprayed_user = format!("sprayed-{n}");
+
+    cache
+        .check(PROVIDER, &good_user, "good-password", || async {
+            UpstreamVerdict::Valid
+        })
+        .await
+        .unwrap();
+    let recorded = forge_db::validated_credential_dao::list_auth_successes(&p, &good_user)
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1, "a successful validation is recorded");
+    assert_eq!(recorded[0].auth_method, PROVIDER);
+
+    let rejected = cache
+        .check(PROVIDER, &sprayed_user, "wrong-password", || async {
+            UpstreamVerdict::Rejected
+        })
+        .await
+        .unwrap();
+    assert!(!rejected);
+    assert!(
+        forge_db::validated_credential_dao::list_auth_successes(&p, &sprayed_user)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rejected attempt must never be recorded as an auth success"
+    );
+
+    // The reaper pass: expired verdicts first, then orphaned fence rows.
+    forge_db::validated_credential_dao::sweep_expired(&p)
+        .await
+        .unwrap();
+    forge_db::validated_credential_dao::sweep_orphaned_tags(&p)
+        .await
+        .unwrap();
+
+    let sprayed_tag_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential_tag WHERE username = $1")
+            .bind(&sprayed_user)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    assert_eq!(
+        sprayed_tag_rows, 0,
+        "after the sweep a sprayed username leaves no fence row behind"
+    );
+
+    let good_tag_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential_tag WHERE username = $1")
+            .bind(&good_user)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    assert_eq!(
+        good_tag_rows, 1,
+        "a user with a live positive verdict keeps their fence row"
+    );
+}
+
 /// After caching a credential, dump every text column of `validated_credential`
 /// and assert the plaintext password is nowhere to be found — only the HMAC key.
 #[tokio::test]

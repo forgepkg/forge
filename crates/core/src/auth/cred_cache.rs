@@ -16,6 +16,12 @@
 //!   the credential HMAC, with the Postgres read as its factory. Invalidation
 //!   broadcasts on the cache backplane so a revoke on one node drops the L1 entry
 //!   on every node.
+//! * **Success log:** every definitive upstream ACCEPT also records
+//!   `(username, provider_id)` in `auth_success`
+//!   ([`forge_db::validated_credential_dao::record_auth_success`]) — rejected
+//!   attempts never do — bounded to the 5 most recently used methods per user.
+//!   This answers "who still authenticates through which upstream?" when
+//!   deciding to cut an upstream off.
 //!
 //! ## The cache key — never the password
 //!
@@ -384,6 +390,14 @@ where
             return Err(CredCacheError::Unavailable);
         }
     };
+
+    // Record the successful validation for the "who still authenticates
+    // through which upstream?" cutoff log — accepts only; a rejected attempt
+    // leaves no durable trace anywhere (its tag row and negative verdict are
+    // both swept once the negative TTL lapses).
+    if valid {
+        vc_dao::record_auth_success(&mut tx, username, provider_id).await?;
+    }
 
     let expires_at = Utc::now()
         + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));

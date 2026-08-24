@@ -27,6 +27,19 @@
 //! transaction. The first caller holds the lock, forwards upstream, writes the
 //! verdict, and commits; concurrent callers block on the lock and, once it is
 //! released, read the freshly-written verdict. See [`upsert_verdict`].
+//!
+//! ## Side tables
+//!
+//! * `validated_credential_tag` — the per-username revocation **fence**
+//!   ([`lock_user_tag`] / [`revoke_by_username`]). Rows are transient lock
+//!   anchors, not an audit trail: [`sweep_orphaned_tags`] reaps any row whose
+//!   username has no verdicts left, so rejected/sprayed usernames never
+//!   accumulate.
+//! * `auth_success` — the durable successful-authentication log
+//!   ([`record_auth_success`]), written only on a definitive upstream ACCEPT,
+//!   unique per (username, auth method) and capped at the
+//!   [`AUTH_SUCCESS_METHODS_KEPT`] most recently used methods per user. Used to
+//!   decide when an upstream (e.g. Nexus) can be cut off.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -180,31 +193,128 @@ pub async fn begin_singleflight(
 /// fill is a fresh post-revocation validation) or waits for it and then deletes
 /// its verdict. There is no absent-row gap in which a stale fill can resurrect a
 /// deleted verdict.
+///
+/// The row this creates is **transient**, not a durable record of the attempt:
+/// once no verdict rows remain for the username (rejected/sprayed usernames
+/// after their negative TTL, revoked users after the revocation's delete),
+/// [`sweep_orphaned_tags`] reaps it, so unauthenticated spray cannot grow the
+/// table without bound.
 pub async fn lock_user_tag(
     tx: &mut Transaction<'_, Postgres>,
     username: &str,
 ) -> sqlx::Result<i64> {
+    // The sweeper may delete the row between our INSERT … DO NOTHING (which
+    // takes no lock when the row already exists) and the SELECT … FOR SHARE,
+    // so re-materialize and retry on a vanished row instead of failing the
+    // fill. Two rounds suffice: our second INSERT's uncommitted row cannot be
+    // swept (the sweeper's FOR UPDATE SKIP LOCKED never sees/needs it).
+    for _ in 0..2 {
+        sqlx::query(
+            r#"
+            INSERT INTO validated_credential_tag (username)
+            VALUES ($1)
+            ON CONFLICT (username) DO NOTHING
+            "#,
+        )
+        .bind(username)
+        .execute(&mut **tx)
+        .await?;
+
+        let generation: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT generation
+            FROM validated_credential_tag
+            WHERE username = $1
+            FOR SHARE
+            "#,
+        )
+        .bind(username)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(generation) = generation {
+            return Ok(generation);
+        }
+    }
+    Err(sqlx::Error::RowNotFound)
+}
+
+/// How many auth methods (provider ids) [`record_auth_success`] retains per
+/// username: only the most recently used ones survive the prune.
+pub const AUTH_SUCCESS_METHODS_KEPT: i64 = 5;
+
+/// One successful-authentication record: the latest (and first) time
+/// `username` was definitively accepted through `auth_method` (a provider id).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuthSuccess {
+    pub username: String,
+    pub auth_method: String,
+    pub first_success_at: DateTime<Utc>,
+    pub last_success_at: DateTime<Utc>,
+}
+
+/// Record that `username` was successfully validated through `auth_method`
+/// (the provider id), inside the fill transaction, and prune the username down
+/// to its [`AUTH_SUCCESS_METHODS_KEPT`] most recently used methods.
+///
+/// Called **only** on a definitive upstream ACCEPT — rejected attempts leave no
+/// row here — and at most once per positive-TTL window per credential (the
+/// fill is the only writer), so the hot cache path stays write-free. Two
+/// concurrent winning fills for the same (username, method) serialize briefly
+/// on the row at the end of their transactions, which is harmless.
+pub async fn record_auth_success(
+    tx: &mut Transaction<'_, Postgres>,
+    username: &str,
+    auth_method: &str,
+) -> sqlx::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO validated_credential_tag (username)
-        VALUES ($1)
-        ON CONFLICT (username) DO NOTHING
+        INSERT INTO auth_success (username, auth_method)
+        VALUES ($1, $2)
+        ON CONFLICT (username, auth_method)
+        DO UPDATE SET last_success_at = now()
         "#,
     )
     .bind(username)
+    .bind(auth_method)
     .execute(&mut **tx)
     .await?;
 
-    sqlx::query_scalar(
+    // Keep only the most recently used methods for this username (the
+    // `auth_method` tiebreak makes the survivor set deterministic when
+    // timestamps collide).
+    sqlx::query(
         r#"
-        SELECT generation
-        FROM validated_credential_tag
+        DELETE FROM auth_success
         WHERE username = $1
-        FOR SHARE
+          AND auth_method NOT IN (
+            SELECT auth_method FROM auth_success
+            WHERE username = $1
+            ORDER BY last_success_at DESC, auth_method
+            LIMIT $2
+          )
         "#,
     )
     .bind(username)
-    .fetch_one(&mut **tx)
+    .bind(AUTH_SUCCESS_METHODS_KEPT)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The retained successful-auth records for `username`, most recent first.
+/// This is the "who still authenticates through which upstream?" read used to
+/// decide when an upstream can be cut off.
+pub async fn list_auth_successes(pool: &PgPool, username: &str) -> sqlx::Result<Vec<AuthSuccess>> {
+    sqlx::query_as::<_, AuthSuccess>(
+        r#"
+        SELECT username, auth_method, first_success_at, last_success_at
+        FROM auth_success
+        WHERE username = $1
+        ORDER BY last_success_at DESC, auth_method
+        "#,
+    )
+    .bind(username)
+    .fetch_all(pool)
     .await
 }
 
@@ -291,5 +401,36 @@ pub async fn sweep_expired(pool: &PgPool) -> sqlx::Result<u64> {
     let res = sqlx::query!(r#"DELETE FROM validated_credential WHERE expires_at <= now()"#,)
         .execute(pool)
         .await?;
+    Ok(res.rows_affected())
+}
+
+/// Reap `validated_credential_tag` rows that no longer fence anything: no
+/// verdict rows remain for the username (all expired-and-swept or revoked).
+/// Returns the count removed.
+///
+/// This is what keeps the tag table bounded — rejected/sprayed usernames leave
+/// a tag row plus a short-TTL negative verdict; once [`sweep_expired`] removes
+/// the verdict, this removes the tag. Correctness of the fence never depends
+/// on the row surviving: an absent row simply re-materializes as generation 0
+/// on the next fill, and any fill currently share-locking its row is skipped
+/// (`FOR UPDATE SKIP LOCKED`), so an in-flight fill's fence is never pulled
+/// out from under it. `lock_user_tag` tolerates the between-statement window
+/// by retrying.
+pub async fn sweep_orphaned_tags(pool: &PgPool) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        r#"
+        DELETE FROM validated_credential_tag
+        WHERE ctid IN (
+            SELECT t.ctid
+            FROM validated_credential_tag t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM validated_credential v WHERE v.username = t.username
+            )
+            FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected())
 }

@@ -63,10 +63,17 @@ async fn endpoint() -> &'static str {
     ENDPOINT.get().unwrap()
 }
 
-/// A fresh, migrated pool for the calling test, backed by the shared container.
+/// A fresh, migrated pool for the calling test, backed by the shared container
+/// — or by an external Postgres when `FORGE_TEST_DATABASE_URL` is set (for
+/// environments without Docker).
 pub async fn pool() -> PgPool {
-    let endpoint = endpoint().await;
-    let url = format!("postgres://forge:forge@{endpoint}/forge");
+    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)

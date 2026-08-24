@@ -27,7 +27,15 @@
 //!    growth; correctness never depends on it (callback/validate already reject
 //!    expired rows in SQL).
 //!
-//! [`spawn_all`] launches all four and returns their join handles (so a caller
+//! 5. **Credential reaper** (slice 12.3) — periodically deletes expired
+//!    `validated_credential` verdicts and then the orphaned
+//!    `validated_credential_tag` fence rows left behind (rejected/sprayed
+//!    usernames, completed revocations). Pure `DELETE`s safe on every instance;
+//!    in-flight fills are skipped via `FOR UPDATE SKIP LOCKED`. Like the auth
+//!    reaper it only bounds growth — reads already treat expired rows as
+//!    misses.
+//!
+//! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process.
 
@@ -58,6 +66,9 @@ pub struct WorkerHandles {
     /// Expired-`oidc_flow` / `session` reaper loop (slice 12.2). Present only
     /// when OIDC login is enabled (the only path that writes those tables).
     pub auth_reaper: Option<JoinHandle<()>>,
+    /// Expired-`validated_credential` / orphaned-tag reaper loop (slice 12.3).
+    /// Always present: any credential-forwarding provider writes those tables.
+    pub cred_reaper: JoinHandle<()>,
     /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
     /// when `[crypto]` is enabled and its rotation worker is not turned off.
     /// Cluster-coordinated via a Postgres advisory lock (see
@@ -76,6 +87,7 @@ impl WorkerHandles {
         if let Some(h) = &self.auth_reaper {
             h.abort();
         }
+        self.cred_reaper.abort();
         if let Some(h) = &self.crypto_rotation {
             h.abort();
         }
@@ -149,6 +161,15 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         )
     });
 
+    // Credential reaper (slice 12.3): bounds `validated_credential` (expired
+    // verdicts) and `validated_credential_tag` (fence rows whose usernames have
+    // no verdicts left — including every rejected/sprayed attempt). Runs
+    // unconditionally: any credential-forwarding provider writes these tables.
+    let cred_reaper = spawn_cred_reaper(
+        state.pool.clone(),
+        poll.saturating_mul(6).max(Duration::from_secs(60)),
+    );
+
     // Crypto rotation/backfill worker (slice 12.5): only when secret
     // encryption is enabled. One instance at a time performs a pass (advisory
     // lock); every step is idempotent/resumable so crashes are harmless.
@@ -165,8 +186,42 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         proxy_refresh,
         retention,
         auth_reaper,
+        cred_reaper,
         crypto_rotation,
     }
+}
+
+/// Spawn the credential reaper loop: each tick deletes expired
+/// `validated_credential` verdicts, then the `validated_credential_tag` fence
+/// rows orphaned by that (no verdicts left for the username). Pure `DELETE`s —
+/// no advisory locks; safe to run concurrently on every instance.
+fn spawn_cred_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            match forge_db::validated_credential_dao::sweep_expired(&pool).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::debug!(
+                        reaped = n,
+                        "cred reaper deleted expired credential verdicts"
+                    )
+                }
+                Err(e) => tracing::error!(error = %e, "validated_credential sweep failed"),
+            }
+            match forge_db::validated_credential_dao::sweep_orphaned_tags(&pool).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::debug!(
+                        reaped = n,
+                        "cred reaper deleted orphaned user-tag fence rows"
+                    )
+                }
+                Err(e) => tracing::error!(error = %e, "validated_credential_tag sweep failed"),
+            }
+        }
+    })
 }
 
 /// Spawn the auth reaper loop: each tick deletes expired/used `oidc_flow` rows

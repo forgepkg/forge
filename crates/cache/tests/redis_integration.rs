@@ -30,8 +30,14 @@ const REDIS_PORT: u16 = 6379;
 
 /// Start a fresh `redis:7` container and return its `redis://host:port` URL,
 /// keeping the container alive by leaking it (its async `Drop` would otherwise
-/// run on a torn-down runtime).
+/// run on a torn-down runtime). Set `FORGE_TEST_REDIS_URL` to use an external
+/// Redis instead (for environments without Docker); it must be a dedicated,
+/// **empty** server — tests use disjoint namespaces within a run but assume no
+/// state from previous runs, so `FLUSHALL` between runs.
 async fn redis_url() -> String {
+    if let Ok(url) = std::env::var("FORGE_TEST_REDIS_URL") {
+        return url;
+    }
     let container = GenericImage::new("redis", "7")
         .with_exposed_port(REDIS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
@@ -300,6 +306,67 @@ async fn tag_generation_prevents_three_node_stale_l2_relay() {
 
     release_blocker.notify_one();
     assert_eq!(blocker.await.unwrap(), "BLOCKER");
+}
+
+/// Every tag generation key must carry a TTL: an invalidated tag would
+/// otherwise live in Redis forever (one key per ever-invalidated tag), and a
+/// pre-TTL key from an older deployment gets its clock started by the next
+/// conditional value write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tag_generation_keys_carry_a_ttl() {
+    let url = redis_url().await;
+    let cache = Cache::with_redis(1000, &url).await.unwrap();
+
+    cache
+        .get_or_try_insert_with("ttl-ns", "item", Duration::from_secs(300), || async {
+            Ok::<_, TestError>("VALUE".to_string())
+        })
+        .await
+        .unwrap();
+    cache.invalidate("ttl-ns", "item").await;
+
+    let client = redis::Client::open(url).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    for tag_key in [
+        "forge:cache:tag:@key:ttl-ns:item",
+        "forge:cache:tag:@ns:ttl-ns",
+    ] {
+        // The bump created @key (and invalidate_ns would create @ns); only the
+        // bumped @key tag must exist here — and with an expiry.
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(tag_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_ne!(ttl, -1, "tag key {tag_key} must never be persistent");
+        if tag_key.contains("@key") {
+            assert!(ttl > 0, "bumped tag key {tag_key} must exist with a TTL");
+        }
+    }
+
+    // A pre-TTL (persistent) tag key from an older deployment gets an expiry
+    // from the next conditional value write that touches it.
+    let _: () = redis::cmd("SET")
+        .arg("forge:cache:tag:@ns:ttl-ns")
+        .arg(0u64)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    cache
+        .get_or_try_insert_with("ttl-ns", "item", Duration::from_secs(300), || async {
+            Ok::<_, TestError>("REFILLED".to_string())
+        })
+        .await
+        .unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg("forge:cache:tag:@ns:ttl-ns")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ttl > 0,
+        "a legacy persistent tag key must be given a TTL by the next value write (got {ttl})"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

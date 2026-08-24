@@ -225,6 +225,130 @@ async fn stored_bytes_never_contain_plaintext() {
     assert_eq!(row.cred_hmac, hmac, "only the hmac is stored as the key");
 }
 
+/// `record_auth_success` keeps one row per (username, auth method) — a repeat
+/// success refreshes `last_success_at` in place — and prunes each username to
+/// its 5 most recently used methods.
+#[tokio::test]
+async fn auth_success_is_unique_per_method_and_caps_at_five() {
+    let pool = pool().await;
+    let n = unique();
+    let user = format!("as-user-{n}");
+
+    // Record a success through the same method twice: one row, refreshed.
+    let mut tx = pool.begin().await.unwrap();
+    vc::record_auth_success(&mut tx, &user, "upstream-basic")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let first = vc::list_auth_successes(&pool, &user).await.unwrap();
+    assert_eq!(first.len(), 1);
+
+    let mut tx = pool.begin().await.unwrap();
+    vc::record_auth_success(&mut tx, &user, "upstream-basic")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let refreshed = vc::list_auth_successes(&pool, &user).await.unwrap();
+    assert_eq!(refreshed.len(), 1, "same method must not duplicate");
+    assert_eq!(refreshed[0].auth_method, "upstream-basic");
+    assert!(
+        refreshed[0].last_success_at >= first[0].last_success_at,
+        "a repeat success refreshes last_success_at"
+    );
+    assert_eq!(
+        refreshed[0].first_success_at, first[0].first_success_at,
+        "first_success_at is preserved on refresh"
+    );
+
+    // Push six more distinct methods through; only the 5 most recent survive.
+    for i in 0..6 {
+        let mut tx = pool.begin().await.unwrap();
+        vc::record_auth_success(&mut tx, &user, &format!("realm:m{i}"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let kept = vc::list_auth_successes(&pool, &user).await.unwrap();
+    assert_eq!(
+        kept.len() as i64,
+        vc::AUTH_SUCCESS_METHODS_KEPT,
+        "a username keeps only its most recently used methods"
+    );
+    assert!(
+        !kept.iter().any(|s| s.auth_method == "upstream-basic"),
+        "the oldest method is pruned once the cap is exceeded"
+    );
+}
+
+/// Orphaned user-tag fence rows (no verdicts left for the username) are reaped
+/// by `sweep_orphaned_tags`; a username that still has a verdict keeps its row.
+#[tokio::test]
+async fn sweep_orphaned_tags_reaps_only_tagless_usernames() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let orphan = format!("tag-orphan-{n}");
+    let live = format!("tag-live-{n}");
+
+    // Materialize both fence rows the way a fill does (insert + share lock).
+    let mut tx = pool.begin().await.unwrap();
+    vc::lock_user_tag(&mut tx, &orphan).await.unwrap();
+    vc::lock_user_tag(&mut tx, &live).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // `live` keeps a fresh verdict; `orphan` has none (its rejected attempt's
+    // negative verdict has expired and been swept, say).
+    vc::upsert_verdict(pool, new_verdict(&live, &format!("tl-{n}"), true, 300))
+        .await
+        .unwrap();
+
+    vc::sweep_orphaned_tags(pool).await.unwrap();
+
+    let orphan_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential_tag WHERE username = $1")
+            .bind(&orphan)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        orphan_rows, 0,
+        "a tag row with no verdicts left must be reaped (no durable trace of rejected attempts)"
+    );
+
+    let live_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential_tag WHERE username = $1")
+            .bind(&live)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        live_rows, 1,
+        "a username with a live verdict keeps its fence row"
+    );
+
+    // A fence row currently share-locked by an in-flight fill is skipped, even
+    // when its username has no verdicts.
+    let inflight = format!("tag-inflight-{n}");
+    let mut setup = pool.begin().await.unwrap();
+    vc::lock_user_tag(&mut setup, &inflight).await.unwrap();
+    setup.commit().await.unwrap();
+
+    let mut fill = pool.begin().await.unwrap();
+    vc::lock_user_tag(&mut fill, &inflight).await.unwrap();
+    vc::sweep_orphaned_tags(pool).await.unwrap();
+    let still_there: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential_tag WHERE username = $1")
+            .bind(&inflight)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        still_there, 1,
+        "the sweeper must skip (not wait on) a fence row an in-flight fill holds"
+    );
+    fill.rollback().await.unwrap();
+}
+
 /// The singleflight ROW lock (no advisory locks) serializes concurrent identical
 /// checks: a winner holds the lock, "forwards" (simulated), writes the verdict,
 /// and commits; a peer that called `begin_singleflight` concurrently blocks on
