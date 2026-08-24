@@ -249,13 +249,7 @@ impl Cache {
         let client = redis::Client::open(redis_url)?;
 
         let l2 = RedisL2::connect(client.clone()).await?;
-        let backplane = Backplane::start(
-            client,
-            l2.clone(),
-            namespace_locks.clone(),
-            tag_versions.clone(),
-        )
-        .await?;
+        let backplane = Backplane::start(client, l2.clone(), tag_versions.clone()).await?;
 
         Ok(Cache {
             inner: Arc::new(Inner {
@@ -359,6 +353,19 @@ impl Cache {
                                         }
                                     }
                                 }
+                                Ok(candidate)
+                                    if candidate.format_version == ENTRY_FORMAT_VERSION =>
+                                {
+                                    // A current-format envelope stamped with a
+                                    // *different* tag set: another code version
+                                    // (or call site) owns this (ns, key) with
+                                    // its own tags. Treat it as a miss but
+                                    // leave it in place — deleting here would
+                                    // make both versions perpetually destroy
+                                    // each other's valid entries during a
+                                    // rolling deploy. Our conditional write
+                                    // below simply replaces it.
+                                }
                                 Ok(_) | Err(_) => {
                                     // Rolling upgrades can encounter the former raw-value
                                     // format. Treat it as a miss; the next successful fill
@@ -378,11 +385,24 @@ impl Cache {
 
                 let (stamps, redis_generations_available) = if let Some(l2) = &l2 {
                     match l2.tag_versions(&entry_tags).await {
-                        Ok(stamps) => {
-                            (
-                                tag_versions.merge_snapshot(&entry_tags, &stamps),
-                                true,
-                            )
+                        Ok(remote) => {
+                            let merged = tag_versions.merge_snapshot(&entry_tags, &remote);
+                            // Heal a Redis that fell behind locally observed
+                            // barriers (a bump that failed after pub/sub already
+                            // advanced them): raise each lagging tag so the
+                            // conditional write below — and every peer's — can
+                            // succeed again instead of being rejected until the
+                            // next invalidation.
+                            for (stamp, seen) in merged.iter().zip(&remote) {
+                                if stamp.generation > seen.generation {
+                                    if let Err(err) =
+                                        l2.raise_tag(&stamp.tag, stamp.generation).await
+                                    {
+                                        tracing::warn!(error = %err, tag = %stamp.tag, "raising lagging Redis tag generation failed");
+                                    }
+                                }
+                            }
+                            (merged, true)
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, key = %key_for_l2, "tag generation read failed; filling L1 only");
@@ -434,9 +454,15 @@ impl Cache {
 
         // A remote tag bump may have raced the completed factory. Never leave
         // such a result resident in L1; the in-progress caller may still use the
-        // value it started computing before the invalidation linearized.
+        // value it started computing before the invalidation linearized. Only
+        // the *resident* entry is checked before evicting: a concurrent task may
+        // already have refilled the key with a fresh post-bump entry, which must
+        // survive.
         if !self.inner.tag_versions.is_current(&entry.tags) {
-            self.inner.l1.invalidate(&full_key).await;
+            self.inner
+                .l1
+                .invalidate_if_stale(&full_key, &self.inner.tag_versions)
+                .await;
         }
 
         let value: T = serde_json::from_slice(&entry.value)
@@ -470,6 +496,9 @@ impl Cache {
             match l2.bump_tag(tag, current).await {
                 Ok(generation) => generation,
                 Err(err) => {
+                    // The locally advanced generation is still published below;
+                    // the next fill that sees Redis lagging raises it to catch
+                    // up (see `raise_tag`), so this stays a transient gap.
                     tracing::warn!(error = %err, ns, tag, "Redis tag bump failed; invalidation is local/backplane-only until Redis recovers");
                     current.saturating_add(1)
                 }

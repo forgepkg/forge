@@ -35,6 +35,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "validated_credential",
     // 0014_validated_credential_tags.sql
     "validated_credential_tag",
+    // 0015_auth_success.sql
+    "auth_success",
     // 0005_rbac.sql
     "privilege",
     "role",

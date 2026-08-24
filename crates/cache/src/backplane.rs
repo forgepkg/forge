@@ -1,15 +1,23 @@
 //! Redis pub/sub backplane for passive cache-tag invalidation.
 //!
 //! Invalidating a tag first advances its authoritative Redis generation, then
-//! publishes `"{node_id}|t|{namespace}|{generation}|{tag}"`. Receivers acquire
-//! the namespace writer fence and advance their local tag barrier. Any L1 entry
-//! stamped with an older generation becomes invisible immediately, without an
-//! L1/L2 scan.
+//! publishes `"{node_id}|t|{namespace}|{generation}|{tag}"`. Receivers advance
+//! their local tag barrier. Any L1 entry stamped with an older generation
+//! becomes invisible immediately, without an L1/L2 scan.
+//!
+//! Applying a barrier takes **no namespace lock**: barriers are monotonic
+//! (`observe_one` is a max-merge), stale L1 entries are rejected on read, and
+//! every fill re-checks its stamps after completion — so the subscriber never
+//! parks behind a slow in-flight fill holding the namespace read guard, which
+//! would stall invalidation delivery for every namespace queued behind it.
 //!
 //! During a rolling upgrade, new publishers also send the former `k`/`n`
 //! message understood by old nodes. New subscribers that hear a legacy-only
 //! publisher promote that event into a Redis tag bump and republish it, closing
-//! the old delete/re-delete race inside mixed-version clusters.
+//! the old delete/re-delete race inside mixed-version clusters. The companion
+//! `k`/`n` sent by an already tag-capable publisher doubles as a recovery
+//! channel: receivers re-sync that tag's generation from Redis, so an
+//! invalidation whose tag publish was lost is not silently dropped.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redis::AsyncCommands;
 
 use crate::l2_redis::RedisL2;
-use crate::{key_tag, namespace_tag, NamespaceLocks, TagVersions};
+use crate::{key_tag, namespace_tag, TagVersions};
 
 /// The pub/sub channel shared by every cache node.
 pub const CHANNEL: &str = "forge:cache:invalidate";
@@ -49,7 +57,6 @@ impl Backplane {
     pub async fn start(
         client: redis::Client,
         l2: RedisL2,
-        namespace_locks: NamespaceLocks,
         tag_versions: TagVersions,
     ) -> Result<Self, redis::RedisError> {
         let node_id = fresh_node_id();
@@ -59,7 +66,6 @@ impl Backplane {
             client,
             l2,
             conn.clone(),
-            namespace_locks,
             tag_versions,
             node_id,
         ));
@@ -95,7 +101,6 @@ async fn subscriber_loop(
     client: redis::Client,
     l2: RedisL2,
     publisher: redis::aio::ConnectionManager,
-    namespace_locks: NamespaceLocks,
     tag_versions: TagVersions,
     node_id: u64,
 ) {
@@ -125,7 +130,6 @@ async fn subscriber_loop(
         apply_message(
             &l2,
             &publisher,
-            &namespace_locks,
             &tag_versions,
             &mut tag_capable_origins,
             node_id,
@@ -137,11 +141,9 @@ async fn subscriber_loop(
     tracing::warn!("backplane subscriber stream ended; cross-node invalidation now relies on TTL");
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_message(
     l2: &RedisL2,
     publisher: &redis::aio::ConnectionManager,
-    namespace_locks: &NamespaceLocks,
     tag_versions: &TagVersions,
     tag_capable_origins: &mut HashSet<u64>,
     node_id: u64,
@@ -164,7 +166,7 @@ async fn apply_message(
         "t" => {
             // `splitn` preserves any `|` characters inside the tag.
             let mut tagged = rest.splitn(3, '|');
-            let (Some(ns), Some(generation), Some(tag)) =
+            let (Some(_ns), Some(generation), Some(tag)) =
                 (tagged.next(), tagged.next(), tagged.next())
             else {
                 tracing::warn!(payload, "backplane: malformed tag message");
@@ -175,16 +177,11 @@ async fn apply_message(
                 return;
             };
             tag_capable_origins.insert(origin);
-            let namespace_lock = namespace_locks.get(ns);
-            let _guard = namespace_lock.write().await;
+            // No namespace fence here (see module docs): barriers are
+            // monotonic and every read/fill path re-validates against them.
             tag_versions.observe_one(tag, generation);
         }
         "k" | "n" => {
-            if tag_capable_origins.contains(&origin) {
-                // Companion from a new publisher; the preceding tag message is
-                // already authoritative for this receiver.
-                return;
-            }
             let (ns, tag) = if kind == "k" {
                 let Some((ns, key)) = rest.split_once(':') else {
                     tracing::warn!(full_key = rest, "backplane: malformed legacy cache key");
@@ -195,25 +192,49 @@ async fn apply_message(
                 (rest, namespace_tag(rest))
             };
 
-            let namespace_lock = namespace_locks.get(ns);
-            let _guard = namespace_lock.write().await;
+            if tag_capable_origins.contains(&origin) {
+                // Companion of a tag-capable publisher. Usually the preceding
+                // tag message already advanced our barrier — but when that
+                // publish failed while the Redis bump succeeded, re-syncing the
+                // generation from Redis recovers the invalidation instead of
+                // silently dropping it (observe is a max-merge, so a plain
+                // duplicate is a no-op).
+                match l2.tag_versions(std::slice::from_ref(&tag)).await {
+                    Ok(stamps) => tag_versions.observe(&stamps),
+                    Err(err) => {
+                        tracing::warn!(error = %err, ns, tag, "companion tag re-sync failed")
+                    }
+                }
+                return;
+            }
+
+            // Legacy-only publisher: promote the event into a tag bump. The
+            // conditional bump means one receiver bumps and republishes while
+            // the rest adopt its generation, instead of every node in the
+            // cluster bumping once per legacy event.
             let current = tag_versions.current(&tag);
-            let generation = match l2.bump_tag(&tag, current).await {
-                Ok(generation) => generation,
+            let generation = match l2.promote_tag(&tag, current).await {
+                Ok((generation, bumped)) => {
+                    if bumped {
+                        let mut publisher = publisher.clone();
+                        if let Err(err) = publisher
+                            .publish::<_, _, ()>(
+                                CHANNEL,
+                                tag_message(node_id, ns, &tag, generation),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %err, ns, tag, "promoted tag publish failed");
+                        }
+                    }
+                    generation
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, ns, tag, "legacy invalidation tag promotion failed");
                     current.saturating_add(1)
                 }
             };
             tag_versions.observe_one(&tag, generation);
-
-            let mut publisher = publisher.clone();
-            if let Err(err) = publisher
-                .publish::<_, _, ()>(CHANNEL, tag_message(node_id, ns, &tag, generation))
-                .await
-            {
-                tracing::warn!(error = %err, ns, tag, "promoted tag publish failed");
-            }
         }
         other => tracing::warn!(kind = other, "backplane: unknown message kind"),
     }
