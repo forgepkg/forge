@@ -1,7 +1,7 @@
 //! Redis L2 + backplane integration test (gated on a Docker/Redis container).
 //!
-//! Starts a `redis:7` testcontainer and exercises the spec's cross-instance
-//! requirements:
+//! Shares one `redis:7` testcontainer across the binary (tests use disjoint
+//! namespaces) and exercises the spec's cross-instance requirements:
 //!   * miss → factory → BOTH layers (L1 + L2) populated,
 //!   * a second independent `Cache` sharing the same Redis sees an L2 hit
 //!     WITHOUT running its own factory,
@@ -14,7 +14,7 @@
 //! cover all non-Redis behaviour and run without Docker).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use forge_cache::Cache;
@@ -22,22 +22,39 @@ use redis::AsyncCommands;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq)]
 struct TestError(&'static str);
 
 const REDIS_PORT: u16 = 6379;
 
-/// Start a fresh `redis:7` container and return its `redis://host:port` URL,
-/// keeping the container alive by leaking it (its async `Drop` would otherwise
-/// run on a torn-down runtime). Set `FORGE_TEST_REDIS_URL` to use an external
-/// Redis instead (for environments without Docker); it must be a dedicated,
-/// **empty** server — tests use disjoint namespaces within a run but assume no
-/// state from previous runs, so `FLUSHALL` between runs.
+// `redis://host:port` of the shared container, computed once per test binary.
+static REDIS_URL: OnceLock<String> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// The shared `redis:7` container's `redis://host:port` URL (mirroring the
+/// Postgres harness in `forge-db`): one container per test binary — every test
+/// starting its own container meant as many concurrent image pulls as tests,
+/// which flaked in CI — started once behind a lock and intentionally leaked so
+/// its async `Drop` never runs on a torn-down per-test runtime. Tests isolate
+/// themselves with disjoint namespaces. Set `FORGE_TEST_REDIS_URL` to use an
+/// external Redis instead (for environments without Docker); it must be a
+/// dedicated server that is **empty** at the start of each run, so `FLUSHALL`
+/// between runs.
 async fn redis_url() -> String {
     if let Ok(url) = std::env::var("FORGE_TEST_REDIS_URL") {
         return url;
     }
+    if let Some(url) = REDIS_URL.get() {
+        return url.clone();
+    }
+    // Serialize first-time startup across concurrent tests.
+    let _guard = INIT_LOCK.lock().await;
+    if let Some(url) = REDIS_URL.get() {
+        return url.clone();
+    }
+
     let container = GenericImage::new("redis", "7")
         .with_exposed_port(REDIS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
@@ -55,7 +72,9 @@ async fn redis_url() -> String {
     // removes it when the process exits.
     let _: &'static testcontainers::ContainerAsync<GenericImage> = Box::leak(Box::new(container));
 
-    format!("redis://{host}:{port}")
+    let url = format!("redis://{host}:{port}");
+    REDIS_URL.set(url).ok();
+    REDIS_URL.get().unwrap().clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
