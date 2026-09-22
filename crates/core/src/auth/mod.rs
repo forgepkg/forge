@@ -46,7 +46,8 @@ pub use principal::{Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
 pub use token::{
-    generate_token_secret, hash_token, resolve_principal, verify_password, verify_token, AuthError,
-    BasicAuthSource, PrincipalSource, SourceOutcome, TokenHeaderSource,
+    generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
+    verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,
+    SourceOutcome, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};

@@ -11,6 +11,8 @@
 //!   (otherwise revoking one would not cut off access). Every route here
 //!   therefore requires a principal authenticated by **password or realm
 //!   session** (`token_id == None`); token-authenticated callers get 403.
+//! * Cookie-authenticated mutations are CSRF-checked by the principal
+//!   middleware (`X-CSRF-Token`); `POST` also requires a JSON content type.
 //! * Reuses the admin token DTOs: the plaintext secret is returned exactly once
 //!   from `POST`, listing returns metadata only, and an optional scope can only
 //!   narrow the owner's privileges.
@@ -79,7 +81,15 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
 
     // Manual body extraction: the principal check above needs the full request,
     // and axum's `Json` extractor cannot run after `Request` is consumed by
-    // value in the signature, so deserialize here.
+    // value in the signature, so deserialize here — enforcing the same
+    // `Content-Type: application/json` the extractor would (no form posts).
+    if !is_json_request(req.headers()) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "expected Content-Type: application/json",
+        )
+            .into_response();
+    }
     let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid body").into_response(),
@@ -125,6 +135,16 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
     (StatusCode::CREATED, Json(resp)).into_response()
 }
 
+/// Whether the request declares a JSON body (`application/json`, optionally
+/// with parameters such as `charset`).
+fn is_json_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+}
+
 /// `DELETE /admin/me/tokens/{id}` — revoke one of the caller's own tokens.
 /// Another user's token id answers 404 (not 403) to avoid confirming it exists.
 pub async fn revoke(
@@ -154,4 +174,33 @@ pub fn me_tokens_router() -> Router<AppState> {
     Router::new()
         .route("/admin/me/tokens", get(list).post(create))
         .route("/admin/me/tokens/{id}", axum::routing::delete(revoke))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn json_content_type_is_required() {
+        let mut h = HeaderMap::new();
+        assert!(!is_json_request(&h), "missing");
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        assert!(!is_json_request(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        assert!(!is_json_request(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(is_json_request(&h));
+        h.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Application/JSON; charset=utf-8"),
+        );
+        assert!(is_json_request(&h));
+    }
 }

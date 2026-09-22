@@ -38,7 +38,9 @@ use crate::web_ui::spa_service;
 /// the chain on every attempt, so admin realm edits apply without a restart
 /// (and the wire path stays disabled unless `auth.allow_password_basic` or an
 /// enabled credential-forwarding realm allows it). The session source is
-/// always mounted — local password logins mint sessions too.
+/// always mounted — local password logins mint sessions too — and every
+/// state-changing request it authenticates must carry the session's CSRF
+/// token (enforced by [`attach_principal`]).
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -71,6 +73,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         sources: Arc::new(sources),
         trusted_proxies: Arc::new(trusted),
         anon: Arc::new(anon),
+        // Cookie-authenticated mutations must carry the session's CSRF token.
+        sessions: Some(state.sessions.clone()),
     })
 }
 

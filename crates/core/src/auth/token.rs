@@ -180,6 +180,15 @@ pub enum AuthError {
 pub trait PrincipalSource: Send + Sync {
     /// Attempt to resolve a principal from the given headers / peer IP.
     async fn resolve(&self, headers: &HeaderMap, peer_ip: IpAddr) -> SourceOutcome;
+
+    /// Whether this source authenticates from an **ambient** credential — one
+    /// the browser attaches to every request on its own (the session cookie).
+    /// A state-changing request authenticated by an ambient source must also
+    /// prove same-origin intent (the CSRF token); explicit credentials (API
+    /// key, Basic, bearer JWT) cannot be forged cross-site and are exempt.
+    fn is_ambient(&self) -> bool {
+        false
+    }
 }
 
 /// Resolves the `X-NuGet-ApiKey` header as an API token.
@@ -421,10 +430,38 @@ pub async fn resolve_principal(
     client_ip: IpAddr,
     anon: &AnonPolicy,
 ) -> Result<Principal, AuthError> {
+    resolve_principal_with_origin(sources, headers, client_ip, anon)
+        .await
+        .map(|r| r.principal)
+}
+
+/// A resolved principal plus how it was authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPrincipal {
+    /// The resolved principal.
+    pub principal: Principal,
+    /// Whether the winning source was ambient ([`PrincipalSource::is_ambient`],
+    /// i.e. the session cookie). `false` for anonymous / unauthenticated.
+    pub ambient: bool,
+}
+
+/// [`resolve_principal`], also reporting whether the principal came from an
+/// ambient (cookie) credential so the caller can enforce CSRF on it.
+pub async fn resolve_principal_with_origin(
+    sources: &[Box<dyn PrincipalSource>],
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+    anon: &AnonPolicy,
+) -> Result<ResolvedPrincipal, AuthError> {
     let mut saw_invalid = false;
     for source in sources {
         match source.resolve(headers, client_ip).await {
-            SourceOutcome::Authenticated(p) => return Ok(p),
+            SourceOutcome::Authenticated(principal) => {
+                return Ok(ResolvedPrincipal {
+                    principal,
+                    ambient: source.is_ambient(),
+                })
+            }
             // Terminal: the source owns this credential and rejected it.
             SourceOutcome::Reject => return Err(AuthError::Unauthorized),
             SourceOutcome::Invalid => saw_invalid = true,
@@ -436,11 +473,15 @@ pub async fn resolve_principal(
         return Err(AuthError::Unauthorized);
     }
 
-    if anon.allows(client_ip) {
-        Ok(Principal::Anonymous { ip: client_ip })
+    let principal = if anon.allows(client_ip) {
+        Principal::Anonymous { ip: client_ip }
     } else {
-        Ok(Principal::Unauthenticated)
-    }
+        Principal::Unauthenticated
+    };
+    Ok(ResolvedPrincipal {
+        principal,
+        ambient: false,
+    })
 }
 
 #[cfg(test)]
@@ -559,6 +600,59 @@ mod tests {
             vec![Box::new(StubSource(SourceOutcome::NoCredentials))];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
         assert_eq!(res, Ok(Principal::Anonymous { ip: ip() }));
+    }
+
+    /// A stub that reports itself as an ambient (cookie) source.
+    struct AmbientStub(SourceOutcome);
+
+    #[async_trait::async_trait]
+    impl PrincipalSource for AmbientStub {
+        async fn resolve(&self, _h: &HeaderMap, _ip: IpAddr) -> SourceOutcome {
+            self.0
+        }
+        fn is_ambient(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_reports_whether_the_winner_was_ambient() {
+        let authed = Principal::User {
+            user_id: 1,
+            token_id: None,
+            is_admin: false,
+        };
+        // An explicit credential wins before the cookie source: not ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+        ];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
+                .await
+                .unwrap();
+        assert!(!res.ambient);
+
+        // Only the cookie authenticated: ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::NoCredentials)),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+        ];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
+                .await
+                .unwrap();
+        assert_eq!(res.principal, authed);
+        assert!(res.ambient);
+
+        // Anonymous is never ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> =
+            vec![Box::new(AmbientStub(SourceOutcome::NoCredentials))];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All)
+                .await
+                .unwrap();
+        assert!(!res.ambient);
     }
 
     #[tokio::test]
