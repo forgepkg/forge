@@ -4,9 +4,12 @@
 //! `{ totalHits, data: [ { id, version, description, versions: [...] } ] }`.
 //!
 //! `prerelease` defaults to `false`; `skip`/`take` are clamped by the core op.
-//! `semVerLevel` is accepted for client compatibility — slice 1 always returns
-//! SemVer2 versions when `prerelease` is set, so no additional filtering is
-//! applied here.
+//! `q` understands `packageid:`, `id:` and multi-term queries (see
+//! [`forge_core::repo::SearchQuery`]). SemVer 2.0.0 versions (dotted
+//! prerelease labels, build metadata) are only returned to clients that send
+//! `semVerLevel=2.0.0`, as the protocol requires. Hits carry description,
+//! authors, tags, icon/project/license URLs, package types and total
+//! downloads from the latest version's manifest.
 
 use std::collections::HashMap;
 
@@ -16,6 +19,7 @@ use forge_core::repo::SearchParams;
 use serde_json::{json, Value};
 
 use crate::routes::RouteContext;
+use crate::{nuspec, version};
 
 /// Parse the raw query map into [`SearchParams`].
 fn parse_params(raw: &HashMap<String, String>) -> SearchParams {
@@ -40,36 +44,113 @@ fn parse_params(raw: &HashMap<String, String>) -> SearchParams {
     }
 }
 
+/// Whether the client asked for SemVer 2.0.0 packages (`semVerLevel=2.0.0`
+/// or higher). Without it, SemVer2 versions must not be returned.
+fn wants_semver2(raw: &HashMap<String, String>) -> bool {
+    raw.get("semVerLevel")
+        .and_then(|v| v.split('.').next())
+        .and_then(|major| major.trim().parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
 /// Build the search-response JSON from core search results.
-pub fn search_json(ctx: &RouteContext, result: &forge_core::repo::SearchResult) -> Value {
+pub fn search_json(
+    ctx: &RouteContext,
+    result: &forge_core::repo::SearchResult,
+    include_semver2: bool,
+) -> Value {
     let base = ctx.base();
+    let mut dropped = 0usize;
     let data: Vec<Value> = result
         .hits
         .iter()
-        .map(|hit| {
+        .filter_map(|hit| {
             let lower_id = ctx.format.lower_id(&hit.original_id);
-            let versions: Vec<Value> = hit
+            let visible: Vec<&forge_core::repo::VersionEntry> = hit
                 .versions
+                .iter()
+                .filter(|v| include_semver2 || !version::is_semver2(&v.version_original))
+                .collect();
+            let Some(latest) = visible.last() else {
+                dropped += 1;
+                return None;
+            };
+            let versions: Vec<Value> = visible
                 .iter()
                 .map(|v| {
                     json!({
                         "version": v.version,
                         "downloads": 0,
-                        "@id": format!("{base}/registration/{lower_id}/{}.json", v.version),
+                        "@id": format!(
+                            "{base}/registration/{lower_id}/{}.json",
+                            v.version.to_ascii_lowercase()
+                        ),
                     })
                 })
                 .collect();
-            json!({
+            // The manifest describes the backend's latest version; only use
+            // it when that version survived the SemVer filter.
+            let meta = hit
+                .nuspec_bytes
+                .as_deref()
+                .filter(|_| latest.version == hit.latest_version)
+                .and_then(|b| nuspec::metadata_from_nuspec(b).ok())
+                .unwrap_or_default();
+            let authors: Vec<Value> = meta
+                .authors
+                .as_deref()
+                .map(|a| {
+                    a.split(',')
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(|a| Value::String(a.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let package_types: Vec<Value> = if meta.package_types.is_empty() {
+                vec![json!({ "name": "Dependency" })]
+            } else {
+                meta.package_types
+                    .iter()
+                    .map(|name| json!({ "name": name }))
+                    .collect()
+            };
+            let license_url = meta.license_url.clone().or_else(|| {
+                meta.license_expression
+                    .as_ref()
+                    .map(|expr| format!("https://licenses.nuget.org/{expr}"))
+            });
+            let mut obj = json!({
+                "@id": format!("{base}/registration/{lower_id}/index.json"),
+                "@type": "Package",
+                "registration": format!("{base}/registration/{lower_id}/index.json"),
                 "id": hit.original_id,
-                "version": hit.latest_version,
-                "description": "",
+                "version": latest.version,
+                "description": meta.description.clone().unwrap_or_default(),
+                "summary": meta.summary.clone().unwrap_or_default(),
+                "title": meta.title.clone().unwrap_or_else(|| hit.original_id.clone()),
+                "authors": authors,
+                "tags": meta.tags,
+                "totalDownloads": hit.total_downloads.unwrap_or(0),
+                "verified": false,
+                "packageTypes": package_types,
                 "versions": versions,
-            })
+            });
+            for (key, value) in [
+                ("iconUrl", meta.icon_url),
+                ("projectUrl", meta.project_url),
+                ("licenseUrl", license_url),
+            ] {
+                if let Some(value) = value {
+                    obj[key] = Value::String(value);
+                }
+            }
+            Some(obj)
         })
         .collect();
 
     json!({
-        "totalHits": result.total_hits,
+        "totalHits": result.total_hits.saturating_sub(dropped),
         "data": data,
     })
 }
@@ -82,7 +163,7 @@ pub async fn query(
     use axum::response::IntoResponse;
     let params = parse_params(&raw);
     match ctx.ops.search(&ctx.repo, &params).await {
-        Ok(result) => Json(search_json(&ctx, &result)).into_response(),
+        Ok(result) => Json(search_json(&ctx, &result, wants_semver2(&raw))).into_response(),
         Err(e) => crate::routes::repo_error_response(e),
     }
 }

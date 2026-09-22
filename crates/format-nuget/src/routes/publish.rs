@@ -30,10 +30,17 @@ const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 /// route guard accepts every transport supported by WIF: `X-NuGet-ApiKey`,
 /// `Authorization: Bearer`, or Basic with the workload token as password.
 fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<Response> {
+    // Same Basic challenge as the dispatcher's 401, so clients know to send
+    // the stored source credentials (token as password).
+    let challenge = [(
+        axum::http::header::WWW_AUTHENTICATE,
+        "Basic realm=\"Forge\"",
+    )];
     if !ctx.protocol_mutations_allowed {
         return Some(
             (
                 StatusCode::UNAUTHORIZED,
+                challenge,
                 "API token or workload identity required",
             )
                 .into_response(),
@@ -42,7 +49,7 @@ fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<
     if !headers.contains_key(API_KEY_HEADER)
         && !headers.contains_key(axum::http::header::AUTHORIZATION)
     {
-        return Some((StatusCode::UNAUTHORIZED, "missing credentials").into_response());
+        return Some((StatusCode::UNAUTHORIZED, challenge, "missing credentials").into_response());
     }
     None
 }

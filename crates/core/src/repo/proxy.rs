@@ -65,7 +65,7 @@ use crate::format::Format;
 use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
 use crate::repo::hosted::BlobFetch;
 use crate::repo::{
-    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
     SearchResult, VersionEntry, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH,
     NUSPEC_CONTENT_TYPE,
 };
@@ -989,7 +989,8 @@ impl ProxyRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let now = Utc::now();
-        let q = params.q.trim().to_lowercase();
+        let query = SearchQuery::parse(&params.q);
+        let q = query.prefilter().unwrap_or("").to_string();
         let rows = sqlx::query_as!(
             forge_db::model::ProxyCachedVersion,
             r#"
@@ -1009,7 +1010,10 @@ impl ProxyRepo {
         use std::collections::BTreeMap;
         let mut by_id: BTreeMap<String, Vec<forge_db::model::ProxyCachedVersion>> = BTreeMap::new();
         for r in rows {
-            if !Self::delay_cleared(&repo_row, r.first_seen_at, now) || !filter.allows(&r.name) {
+            if !Self::delay_cleared(&repo_row, r.first_seen_at, now)
+                || !filter.allows(&r.name)
+                || !query.matches(&r.name)
+            {
                 continue;
             }
             by_id.entry(r.name.clone()).or_default().push(r);
@@ -1036,16 +1040,25 @@ impl ProxyRepo {
                 original_id: latest.original_id.clone(),
                 latest_version: latest.version.clone(),
                 versions,
+                ..Default::default()
             });
         }
         hits.sort_by(|a, b| a.original_id.cmp(&b.original_id));
 
         let total_hits = hits.len();
-        let hits = hits
+        let mut hits: Vec<SearchHit> = hits
             .into_iter()
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
+        // Manifests are known for cached packages only (no upstream fan-out
+        // per search hit).
+        for hit in &mut hits {
+            hit.nuspec_bytes = self
+                .local_nuspec(repo_row.id, &hit.original_id, &hit.latest_version)
+                .await
+                .unwrap_or(None);
+        }
         Ok(SearchResult { total_hits, hits })
     }
 }
@@ -1244,6 +1257,9 @@ impl RepoReadOps for ProxyRepo {
                 listed: r.listed,
                 package_hash_sha512_base64: hash,
                 nuspec_bytes: nuspec,
+                // The upstream publish time is not known from the flat
+                // container (the cache time would be misleading).
+                published: None,
             });
         }
         Ok(out)

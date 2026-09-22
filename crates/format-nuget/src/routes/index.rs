@@ -19,6 +19,13 @@ pub fn service_index_json(ctx: &RouteContext) -> Value {
         json!({ "@id": format!("{base}/query"), "@type": "SearchQueryService/3.5.0" }),
         // Common alias many clients still probe for.
         json!({ "@id": format!("{base}/query"), "@type": "SearchQueryService/3.0.0-rc" }),
+        // Every registration variant points at the same hive: older clients
+        // (VS2015, nuget.exe 3.x/4.x, packages.config resolvers) look up the
+        // unversioned / 3.0.0 / 3.4.0 types and find no registration otherwise.
+        json!({ "@id": format!("{base}/registration/"), "@type": "RegistrationsBaseUrl" }),
+        json!({ "@id": format!("{base}/registration/"), "@type": "RegistrationsBaseUrl/3.0.0-beta" }),
+        json!({ "@id": format!("{base}/registration/"), "@type": "RegistrationsBaseUrl/3.0.0-rc" }),
+        json!({ "@id": format!("{base}/registration/"), "@type": "RegistrationsBaseUrl/3.4.0" }),
         json!({ "@id": format!("{base}/registration/"), "@type": "RegistrationsBaseUrl/3.6.0" }),
         json!({ "@id": format!("{base}/flat/"), "@type": "PackageBaseAddress/3.0.0" }),
     ];

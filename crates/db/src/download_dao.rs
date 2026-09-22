@@ -181,3 +181,26 @@ where
     .await?;
     Ok(())
 }
+
+/// Total `.nupkg` downloads per package id (lowercased `component.name`) in a
+/// repository, for the ids in `names`. Ids without downloads are omitted.
+pub async fn total_downloads_by_name(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+    names: &[String],
+) -> sqlx::Result<Vec<(String, i64)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT c.name AS "name!", COALESCE(SUM(a.download_count), 0)::bigint AS "total!"
+        FROM component c
+        JOIN asset a ON a.component_id = c.id AND a.path = 'package.nupkg'
+        WHERE c.repository_id = $1 AND c.name = ANY($2)
+        GROUP BY c.name
+        "#,
+        repository_id,
+        names,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.total)).collect())
+}

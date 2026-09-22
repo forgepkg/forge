@@ -115,6 +115,8 @@ where
 /// * `/flat/{id}/index.json` — flat-container versions
 /// * `/flat/{id}/{version}/{filename}` — `.nupkg` bytes or `.nuspec` XML
 /// * `/registration/{id}/index.json` — inlined registration page
+/// * `/registration/{id}/{version}.json` — registration leaf
+/// * `/catalog/{id}/{version}.json` — catalog entry
 /// * `/query` — search
 pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
     // The `kind` argument is authoritative for resource advertisement.
@@ -126,6 +128,14 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
         .route(
             "/registration/{id}/index.json",
             get_head(registration::index),
+        )
+        .route(
+            "/registration/{id}/{leaf}",
+            get_head(registration::leaf_document),
+        )
+        .route(
+            "/catalog/{id}/{leaf}",
+            get_head(registration::catalog_document),
         )
         .route("/query", get_head(search::query));
 

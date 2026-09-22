@@ -62,6 +62,7 @@ impl RepoReadOps for FixtureReads {
             listed: true,
             package_hash_sha512_base64: None,
             nuspec_bytes: None,
+            published: None,
         }])
     }
 
@@ -73,6 +74,7 @@ impl RepoReadOps for FixtureReads {
                 original_id: (*id).to_string(),
                 latest_version: "1.0.0".to_string(),
                 versions: Self::versions(id),
+                ..Default::default()
             })
             .collect();
         let total_hits = all.len();

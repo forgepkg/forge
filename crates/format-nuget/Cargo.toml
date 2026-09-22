@@ -13,6 +13,7 @@ base64 = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 async-trait = { workspace = true }
 bytes = "1"
 # Bridge the multipart upload field stream into the CAS's AsyncRead.

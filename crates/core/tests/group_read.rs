@@ -1098,6 +1098,7 @@ impl RepoReadOps for FakeProxy {
                 listed: true,
                 package_hash_sha512_base64: None,
                 nuspec_bytes: None,
+                published: None,
             })
             .collect())
     }
@@ -1120,6 +1121,7 @@ impl RepoReadOps for FakeProxy {
                     .map(|v| v.version.clone())
                     .unwrap_or_default(),
                 versions,
+                ..Default::default()
             }],
         })
     }
