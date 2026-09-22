@@ -184,9 +184,23 @@ password supplied to NuGet should be a **token**.
 
 - **hosted** — `{"name":"nuget","kind":"hosted"}`; push/restore your own packages.
 - **proxy** — `{"name":"nuget-proxy","kind":"proxy","remote_url":"https://api.nuget.org/v3/index.json","package_delay_seconds":0}`; caches on demand, with an optional package delay.
+  Private / custom **NuGet V3** feeds (Azure Artifacts, GitHub Packages,
+  Artifactory, Nexus, ProGet, MyGet, …) work too: set `upstream_username` and
+  `upstream_password` (typically a PAT). The credentials are sent with every
+  request to the `remote_url` host — never to a resource the service index
+  points at on a different host — and must not be embedded in `remote_url`.
+  NuGet V2-only feeds cannot be proxied. Version listings are refreshed at
+  most once per `metadata_ttl_seconds`; a failing upstream degrades to what
+  is already cached.
 - **group** — `{"name":"all","kind":"group"}`, then
   `POST /admin/repositories/all/members` with `{"member":"nuget","priority":100}`
-  (higher priority wins ties).
+  (higher priority wins ties). A member that errors (e.g. an unreachable
+  proxy) is skipped while the others answer. With `prefer_hosted` (default
+  **on**, settable on create/update and in the UI), once a hosted member has a
+  package id, proxy members are not consulted for it — so a same-named,
+  higher-versioned package on a public feed cannot shadow an internal one
+  (dependency confusion). Set `"prefer_hosted": false` for plain union
+  semantics.
 
 ## Configuration
 
@@ -203,7 +217,18 @@ Key knobs:
 | `auth.bootstrap_admin` | First-run admin username/password. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme`/empty or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
-| `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. |
+| `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
+| `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
+| `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
+| `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
+
+### Health probes
+
+`GET /healthz` is a dependency-free liveness probe; `GET /readyz` returns 200
+only when PostgreSQL and the object store answer within 3 s (503 with
+`{"checks":{"database":…,"object_store":…}}` otherwise). The server handles
+SIGTERM (as sent by `docker stop` / Kubernetes): it stops accepting
+connections, drains in-flight requests, then stops the background workers.
 
 > **Anonymous reads need both** `anonymous_mode` *and* the repo's `anonymous_read=true`
 > (authz = authenticated user **or** anonymous-and-repo-allows). For zero-auth
@@ -351,6 +376,16 @@ cargo xtask check   # cargo fmt --check + clippy -D warnings
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
+
+**Without Docker**, point the db / storage / core / server suites at running
+services instead (use a fresh database per crate run — suites share it):
+
+```bash
+export FORGE_TEST_DATABASE_URL=postgres://forge:forge@localhost:5432/forge_test
+export FORGE_TEST_S3_ENDPOINT=http://127.0.0.1:7070   # versitygw --access test --secret test posix <dir>
+export FORGE_TEST_REDIS_URL=redis://127.0.0.1:6379    # an empty, dedicated Redis
+cargo test -p forge-server
+```
 
 ## Resetting & troubleshooting
 

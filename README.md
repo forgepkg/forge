@@ -5,9 +5,13 @@ A self-hosted **NuGet package registry** written in Rust. It speaks the NuGet
 enterprise registry:
 
 - **hosted** — push and restore your own `.nupkg` packages.
-- **proxy** — cache packages on demand from an upstream feed (e.g.
-  `api.nuget.org`), with an optional publication delay.
-- **group** — fan a single feed URL out across several member repos by priority.
+- **proxy** — cache packages on demand from an upstream NuGet V3 feed —
+  `api.nuget.org` or a private/custom feed (Azure Artifacts, GitHub Packages,
+  Artifactory, Nexus, …) with Basic/PAT credentials — with an optional
+  publication delay.
+- **group** — fan a single feed URL out across several member repos by
+  priority; tolerates a failing member and, by default, keeps public feeds
+  from shadowing internal package ids (dependency-confusion guard).
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained

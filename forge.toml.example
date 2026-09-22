@@ -16,9 +16,14 @@ public_base_url = "http://localhost:8421"
 # admin/changeme) are refused at startup unless this is true. Keep it for a
 # local dev copy only; in production replace the placeholders and drop it.
 allow_insecure_defaults = true  # (default: false)
+# Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
+# (never buffered in memory); larger pushes get HTTP 413.
+max_upload_bytes = 536870912    # (default: 512 MiB)
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
+max_connections = 20            # (default: 20) connection-pool size
+acquire_timeout_seconds = 10    # (default: 10) wait for a free connection before failing
 
 [s3]
 endpoint = "http://localhost:8422"
@@ -65,6 +70,25 @@ password = "changeme"
 [redis]
 # Optional shared L2 cache + invalidation backplane. Omit for L1-only caching.
 # url = "redis://localhost:6379"
+# A slower/partitioned Redis is treated as a cache miss instead of hanging reads.
+# connect_timeout_ms  = 2000    # (default: 2000)
+# response_timeout_ms = 2000    # (default: 2000)
+
+[proxy]
+# Outbound HTTP to proxy upstreams (nuget.org, Azure Artifacts, GitHub
+# Packages, Artifactory, Nexus, ProGet, …). Upstream credentials configured on
+# a proxy repository are sent with every request to the remote_url host
+# (service index, version listing, .nuspec and .nupkg).
+connect_timeout_seconds  = 15          # (default: 15)
+read_timeout_seconds     = 60          # (default: 60) max silence between two reads
+metadata_timeout_seconds = 60          # (default: 60) total, per metadata request
+download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg download
+max_metadata_bytes       = 33554432    # (default: 32 MiB)
+max_package_bytes        = 1073741824  # (default: 1 GiB)
+# Metadata bodies up to this size stay in memory; larger ones spill to a
+# temp file that is removed when the request ends. Packages always stream
+# to a temp file.
+spool_memory_bytes       = 2097152     # (default: 2 MiB)
 
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
