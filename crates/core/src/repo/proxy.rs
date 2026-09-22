@@ -8,21 +8,29 @@
 //!
 //! ## Hard invariants enforced here
 //! * **Outbound scheme guard** — upstream URLs are validated to be http/https
-//!   at config time ([`crate::net::ssrf::validate_url`]) and every upstream
-//!   request uses the redirect-capped [`crate::net::ssrf::outbound_client`].
-//!   Private/loopback upstreams are permitted (12.7 §3.6 — admin-only config).
-//! * **NO advisory locks** — first-time fetch singleflight is a plain row lock:
+//!   at config time ([`crate::net::ssrf::validate_url`]). Private/loopback
+//!   upstreams are permitted (12.7 §3.6 — admin-only config).
+//! * **Bounded upstream I/O** — every request goes through the shared
+//!   [`UpstreamHttp`] client: connect / idle-read / total deadlines, size caps
+//!   enforced while streaming, metadata spooled (memory → temp file) and
+//!   `.nupkg` bodies streamed straight into a CAS temp file. Nothing is ever
+//!   buffered whole in memory.
+//! * **Credentials on every upstream request** — the configured Basic
+//!   credentials are sent with the service index, version listing, `.nuspec`
+//!   and `.nupkg` requests, but only to the `remote_url` host
+//!   ([`crate::net::upstream`] credential scoping).
+//! * **NO advisory locks, no DB transaction across network I/O** — first-time
+//!   fetch singleflight is a plain row lock:
 //!   [`proxy_dao::upsert_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
 //!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
 //!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
 //!   and finalize transactions; it is **released before** the upstream HTTP
-//!   fetch and the CAS/S3 PUT (Addendum A7 — never hold a DB tx across a
-//!   network/S3 call). The singleflight is therefore best-effort: under
-//!   contention more than one caller may fetch from upstream, but the CAS is
-//!   content-addressed and the finalize tx re-checks `downloaded`, so
-//!   concurrent fetches converge on identical state.
-//!   Upstream-index refresh serializes on a `SELECT … FOR UPDATE` of the proxy
-//!   `repository` row (spec A11).
+//!   fetch and the CAS/S3 PUT (Addendum A7). The singleflight is therefore
+//!   best-effort: under contention more than one caller may fetch from
+//!   upstream, but the CAS is content-addressed and the finalize tx re-checks
+//!   `downloaded`, so concurrent fetches converge on identical state. The
+//!   upstream-index refresh likewise never holds a lock over the fetch; the
+//!   per-instance cache coalesces concurrent refreshes.
 //! * **Package delay** — a version discovered from upstream is recorded with
 //!   `first_seen_at = now()` but is **not** served until
 //!   `now − first_seen_at ≥ package_delay_seconds`. Inside the window it is
@@ -30,6 +38,8 @@
 //!   delay-gated 404 is **never** written to the not-found negative cache.
 //! * **Negative cache** — a genuine upstream 404 sets `not_found = true` +
 //!   `not_found_at = now()`, honored for `not_found_ttl_seconds`.
+//! * **Metadata TTL** — the upstream service index *and* each package's
+//!   version listing are re-fetched at most once per `metadata_ttl_seconds`.
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made.
 
@@ -39,39 +49,43 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use forge_cache::Cache;
+use forge_crypto::ExposeSecret;
 use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::proxy_dao::{self, NewProxyCachedVersion};
 use forge_db::{blob_dao, repository_dao};
-use forge_storage::Cas;
+use forge_storage::{Cas, CasError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
 use crate::authz::PackageFilter;
 use crate::format::Format;
-use crate::net::ssrf::outbound_client;
+use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
+use crate::repo::hosted::BlobFetch;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
-    SearchResult, VersionEntry, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE,
+    SearchResult, VersionEntry, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH,
+    NUSPEC_CONTENT_TYPE,
 };
 
 /// Cache namespace for resolved upstream service indexes, keyed by repo name.
-const NS_UPSTREAM_INDEX: &str = "proxy_index";
+pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
+/// Cache namespace marking a package's upstream version listing as fresh,
+/// keyed by `"{repo}/{lower_id}"`.
+pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
+/// Cache namespace for upstream `.nuspec` documents of not-yet-downloaded
+/// versions, keyed by `"{repo}/{lower_id}/{version}"`.
+pub const NS_UPSTREAM_NUSPEC: &str = "proxy_nuspec";
 
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
 const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
-
-/// Upper bound on a fetched upstream metadata document (service index, flat
-/// container listing). Generous, but bounds memory against a hostile upstream.
-const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Upper bound on a proxied `.nupkg` artifact fetched from upstream. Bounds
-/// memory/disk against a hostile or misconfigured upstream.
-const MAX_NUPKG_BYTES: u64 = 512 * 1024 * 1024;
+/// A published `(id, version)`'s manifest is immutable, so an upstream
+/// `.nuspec` can be cached far longer than the version listing.
+const NUSPEC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// The upstream resource `@id`s resolved from a V3 service index, persisted as
 /// the `proxy_upstream_index.resources` JSON and cached.
@@ -143,6 +157,28 @@ fn with_trailing_slash(s: &str) -> String {
     }
 }
 
+/// Map an upstream transport/size/parse failure onto the read-path error.
+fn upstream_err(e: UpstreamError) -> RepoError {
+    RepoError::Storage(e.to_string())
+}
+
+/// Decrypted upstream Basic credentials, held only for one request.
+struct Credentials {
+    origin: Option<Origin>,
+    username: String,
+    password: forge_crypto::PlaintextSecret,
+}
+
+impl Credentials {
+    fn auth(&self) -> UpstreamAuth<'_> {
+        UpstreamAuth {
+            origin: self.origin.clone(),
+            username: &self.username,
+            password: self.password.expose_secret(),
+        }
+    }
+}
+
 /// Storage-backed proxy read implementation.
 ///
 /// Constructed per request (cheap: clones of shared handles) with the resolved
@@ -153,10 +189,11 @@ pub struct ProxyRepo {
     format: Arc<dyn Format>,
     cas: Cas,
     cache: Cache,
-    /// Grace period passed to blob deref (unused on the read path today, kept for
-    /// symmetry with the hosted facade should proxy eviction land later).
-    #[allow(dead_code)]
-    delete_grace: Duration,
+    /// Pooled, timeout- and size-bounded upstream client.
+    http: UpstreamHttp,
+    /// Byte access to locally stored blobs (the cached `.nuspec`). `None` ⇒
+    /// manifests are only served from upstream.
+    blobs: Option<Arc<dyn BlobFetch>>,
     /// Envelope service decrypting the encrypted `upstream_password_enc`
     /// (slice 12.5). `None` ⇒ secret encryption is not configured; only the
     /// legacy plaintext column can be used and a row that holds an encrypted
@@ -166,16 +203,30 @@ pub struct ProxyRepo {
 }
 
 impl ProxyRepo {
-    /// Build a proxy read facade.
+    /// Build a proxy read facade over the process-wide default upstream client.
     pub fn new(pool: PgPool, format: Arc<dyn Format>, cas: Cas, cache: Cache) -> Self {
         ProxyRepo {
             pool,
             format,
             cas,
             cache,
-            delete_grace: Duration::seconds(0),
+            http: UpstreamHttp::shared_default(),
+            blobs: None,
             envelope: None,
         }
+    }
+
+    /// Use `http` (built from the server's `[proxy]` config) for upstream
+    /// traffic.
+    pub fn with_http(mut self, http: UpstreamHttp) -> Self {
+        self.http = http;
+        self
+    }
+
+    /// Attach blob byte access so cached manifests can be served locally.
+    pub fn with_blob_fetch(mut self, blobs: Arc<dyn BlobFetch>) -> Self {
+        self.blobs = Some(blobs);
+        self
     }
 
     /// Attach the envelope service so this proxy can decrypt an encrypted
@@ -217,6 +268,37 @@ impl ProxyRepo {
         }
     }
 
+    /// The Basic credentials for `repo`'s upstream, if both a username and a
+    /// password are configured.
+    async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RepoError> {
+        let Some(username) = repo.upstream_username.clone() else {
+            return Ok(None);
+        };
+        let Some(password) = self.upstream_password(repo).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Credentials {
+            origin: repo.remote_url.as_deref().and_then(Origin::of),
+            username,
+            password,
+        }))
+    }
+
+    /// GET an upstream JSON document with the proxy's credentials. `None` on
+    /// a genuine 404.
+    async fn fetch_json(
+        &self,
+        repo: &Repository,
+        url: &str,
+    ) -> Result<Option<JsonValue>, RepoError> {
+        let creds = self.credentials(repo).await?;
+        let auth = creds.as_ref().map(Credentials::auth);
+        self.http
+            .get_json(url, auth.as_ref())
+            .await
+            .map_err(upstream_err)
+    }
+
     /// Resolve the repository row by name, erroring if missing or not a proxy.
     async fn proxy_repo(&self, repo: &str) -> Result<Repository, RepoError> {
         let row = repository_dao::find_repository_by_name(&self.pool, repo)
@@ -235,7 +317,8 @@ impl ProxyRepo {
         Duration::seconds(
             repo.metadata_ttl_seconds
                 .map(i64::from)
-                .unwrap_or(DEFAULT_METADATA_TTL_SECONDS),
+                .unwrap_or(DEFAULT_METADATA_TTL_SECONDS)
+                .max(0),
         )
     }
 
@@ -254,12 +337,6 @@ impl ProxyRepo {
         now - first_seen_at >= delay
     }
 
-    /// Build the outbound client for upstream fetches (scheme-only guard,
-    /// redirect-capped — 12.7 §3.6).
-    fn client(&self, _repo: &Repository) -> Result<reqwest::Client, RepoError> {
-        outbound_client().map_err(|e| RepoError::Storage(format!("build upstream client: {e}")))
-    }
-
     // ── Upstream service-index discovery (Task 8.1) ──────────────────────────
 
     /// Resolve the upstream resource `@id`s for `repo`, reading through the
@@ -271,22 +348,24 @@ impl ProxyRepo {
     ///    upstream.
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`
     ///    is within metadata_ttl, reuse it without a network call.
-    /// 3. **Cross-instance singleflight (A11)** — otherwise take a `FOR UPDATE`
-    ///    row lock on the proxy `repository` row, re-check freshness, then fetch
-    ///    the upstream index, resolve the `@id`s, and persist — all in that tx.
+    /// 3. **Refresh** — otherwise fetch the upstream index (no DB transaction
+    ///    or row lock held across the request), resolve the `@id`s, and
+    ///    upsert them. Concurrent instances may both refresh; the result is
+    ///    idempotent.
+    ///
+    /// The cache key includes the repository id and `remote_url` so a changed
+    /// upstream (or a deleted-and-recreated repository) never serves the old
+    /// upstream's resources.
     pub async fn resolve_upstream_index(
         &self,
         repo: &Repository,
     ) -> Result<UpstreamResources, RepoError> {
         let ttl = Self::metadata_ttl(repo);
-        let pool = self.pool.clone();
-        let repo_id = repo.id;
         let remote_url = repo
             .remote_url
             .clone()
             .ok_or_else(|| RepoError::Storage("proxy repository has no remote_url".into()))?;
-        let client = self.client(repo)?;
-        let online = repo.online;
+        let key = format!("{}/{}/{}", repo.name, repo.id, remote_url);
 
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,
@@ -294,10 +373,10 @@ impl ProxyRepo {
         self.cache
             .get_or_try_insert_with(
                 NS_UPSTREAM_INDEX,
-                &repo.name,
+                &key,
                 ttl.to_std().unwrap_or_default(),
-                || async move {
-                    resolve_index_uncached(&pool, repo_id, ttl, online, &remote_url, &client)
+                || async {
+                    self.resolve_index_uncached(repo, ttl, &remote_url)
                         .await
                         .map_err(|e| e.to_string())
                 },
@@ -306,14 +385,79 @@ impl ProxyRepo {
             .map_err(RepoError::Storage)
     }
 
+    /// The uncached body of [`Self::resolve_upstream_index`]: DB-freshness
+    /// short-circuit, offline handling, and refetch.
+    async fn resolve_index_uncached(
+        &self,
+        repo: &Repository,
+        ttl: Duration,
+        remote_url: &str,
+    ) -> Result<UpstreamResources, RepoError> {
+        let persisted = proxy_dao::get_upstream_index(&self.pool, repo.id).await?;
+        if let Some(idx) = &persisted {
+            if Utc::now() - idx.fetched_at < ttl {
+                return Ok(parse_resources(idx.resources.clone()));
+            }
+        }
+
+        // Offline: never fetch. Serve a persisted (possibly stale) index if present.
+        if !repo.online {
+            return match persisted {
+                Some(idx) => Ok(parse_resources(idx.resources)),
+                None => Err(RepoError::Storage(
+                    "proxy is offline and has no cached upstream index".into(),
+                )),
+            };
+        }
+
+        let doc = match self.fetch_json(repo, remote_url).await {
+            Ok(Some(doc)) => doc,
+            Ok(None) => {
+                return Err(RepoError::Storage(format!(
+                    "upstream service index {remote_url} returned 404"
+                )))
+            }
+            Err(e) => {
+                // A stale persisted index is better than failing every read
+                // while the upstream is briefly unreachable.
+                if let Some(idx) = persisted {
+                    tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
+                    return Ok(parse_resources(idx.resources));
+                }
+                return Err(e);
+            }
+        };
+        let resources = UpstreamResources::from_service_index(&doc);
+        let resources_json = serde_json::to_value(&resources)
+            .map_err(|e| RepoError::Storage(format!("serialize resources: {e}")))?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO proxy_upstream_index (repository_id, resources, fetched_at, etag)
+            VALUES ($1, $2, now(), NULL)
+            ON CONFLICT (repository_id)
+            DO UPDATE SET resources = EXCLUDED.resources, fetched_at = EXCLUDED.fetched_at, etag = EXCLUDED.etag
+            "#,
+            repo.id,
+            resources_json,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(resources)
+    }
+
     // ── Metadata discovery: enumerate upstream versions (Task 8.2) ───────────
 
     /// Discover the upstream versions of `lower_id`, recording each as a
     /// `proxy_cached_version` (first sighting stamps `first_seen_at`). Returns
     /// the recorded rows (post-upsert) for the caller to delay-gate.
     ///
-    /// Offline ⇒ serves only existing cached rows; a genuine upstream 404 sets
-    /// the negative cache on a synthetic row and returns empty.
+    /// The upstream listing is fetched at most once per metadata TTL (the
+    /// fresh marker lives in the shared cache, so it also coalesces concurrent
+    /// requests). Offline ⇒ serves only existing cached rows; a genuine
+    /// upstream 404 sets the negative cache on a synthetic row and returns
+    /// empty.
     async fn discover_versions(
         &self,
         repo: &Repository,
@@ -324,14 +468,41 @@ impl ProxyRepo {
             return self.cached_rows(repo.id, lower_id).await;
         }
 
-        let resources = self.resolve_upstream_index(repo).await?;
-        let Some(base) = resources.package_base_address else {
-            return self.cached_rows(repo.id, lower_id).await;
-        };
+        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
+        let key = format!("{}/{}/{lower_id}", repo.name, repo.id);
+        let refreshed = self
+            .cache
+            .get_or_try_insert_with(NS_UPSTREAM_VERSIONS, &key, ttl, || async {
+                Box::pin(self.refresh_versions(repo, lower_id))
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        match refreshed {
+            Ok(true) => self.cached_rows(repo.id, lower_id).await,
+            Ok(false) => Ok(Vec::new()),
+            Err(e) => {
+                // Upstream unreachable: degrade to what is already cached
+                // locally rather than failing a restore that could be served.
+                let rows = self.cached_rows(repo.id, lower_id).await?;
+                if rows.is_empty() {
+                    return Err(RepoError::Storage(e));
+                }
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions");
+                Ok(rows)
+            }
+        }
+    }
 
-        let client = self.client(repo)?;
+    /// Fetch the upstream flat-container listing for `lower_id` and record
+    /// every version. Returns `false` when the upstream does not know the id.
+    async fn refresh_versions(&self, repo: &Repository, lower_id: &str) -> Result<bool, RepoError> {
+        let resources = Box::pin(self.resolve_upstream_index(repo)).await?;
+        let Some(base) = resources.package_base_address else {
+            return Ok(true);
+        };
         let url = format!("{base}{lower_id}/index.json");
-        match fetch_json_opt(&client, &url).await? {
+        match self.fetch_json(repo, &url).await? {
             Some(doc) => {
                 let versions: Vec<String> = doc
                     .get("versions")
@@ -344,29 +515,16 @@ impl ProxyRepo {
                     })
                     .unwrap_or_default();
 
-                // Record each version's first sighting (idempotent).
-                for v in &versions {
-                    proxy_dao::upsert_cached_version(
-                        &self.pool,
-                        NewProxyCachedVersion {
-                            repository_id: repo.id,
-                            name: lower_id.to_string(),
-                            version: v.clone(),
-                            listed: true,
-                            downloaded: false,
-                            not_found: false,
-                        },
-                    )
-                    .await?;
-                }
-                self.cached_rows(repo.id, lower_id).await
+                // Record each version's first sighting (idempotent, one round-trip).
+                proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
+                Ok(true)
             }
             None => {
                 // Genuine upstream 404 for the whole package id → negative cache.
                 // We model it on a synthetic `*` version row so a later request
                 // can short-circuit without re-hitting upstream within the TTL.
                 self.mark_not_found(repo.id, lower_id, "*").await?;
-                Ok(Vec::new())
+                Ok(false)
             }
         }
     }
@@ -496,17 +654,10 @@ impl ProxyRepo {
         //   1. a short tx that locks the row, re-checks state, and decides
         //      whether this caller must perform the upstream fetch — then
         //      *commits immediately*, releasing the row lock;
-        //   2. the unbounded network I/O (upstream HTTP fetch) and the S3 PUT
-        //      (CAS store), with NO transaction held;
+        //   2. the bounded network I/O (upstream HTTP fetch streamed into a
+        //      CAS temp file) and the S3 PUT, with NO transaction held;
         //   3. a second short tx that re-locks the row, re-checks (a racing
         //      caller may have finished in the meantime), and finalizes.
-        //
-        // The row lock no longer spans the network round-trip, so a slow or
-        // misbehaving upstream can no longer pin a Postgres connection. The
-        // cost is that the singleflight window is best-effort: under contention
-        // more than one caller may fetch from upstream. That is safe — the CAS
-        // is content-addressed (dedup by sha) and the finalize tx re-checks
-        // `downloaded`, so concurrent fetches converge on identical state.
         let first_seen_at = {
             let mut tx = self.pool.begin().await?;
             let locked =
@@ -540,7 +691,6 @@ impl ProxyRepo {
         };
 
         // ── Network I/O — performed with NO transaction held (A7). ───────────
-        // Resolve the flat-container base.
         let resources = self.resolve_upstream_index(repo).await?;
         let Some(base) = resources.package_base_address else {
             return Err(RepoError::Storage(
@@ -548,21 +698,18 @@ impl ProxyRepo {
             ));
         };
 
-        let client = self.client(repo)?;
         // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let mut req = client.get(&url);
         // §12.5: decrypt-on-use; the plaintext lives only inside this request
-        // builder (and the zeroizing secret wrapper) — never in a log or model.
-        let upstream_password = self.upstream_password(repo).await?;
-        if let (Some(u), Some(p)) = (&repo.upstream_username, &upstream_password) {
-            use forge_crypto::ExposeSecret;
-            req = req.basic_auth(u, Some(p.expose_secret()));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| RepoError::Storage(format!("upstream nupkg fetch: {e}")))?;
+        // (and the zeroizing secret wrapper) — never in a log or model.
+        let resp = {
+            let creds = self.credentials(repo).await?;
+            let auth = creds.as_ref().map(Credentials::auth);
+            self.http
+                .get(&url, RequestClass::Download, auth.as_ref())
+                .await
+                .map_err(upstream_err)?
+        };
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             // Genuine upstream 404 → negative cache on this exact version row.
@@ -587,43 +734,73 @@ impl ProxyRepo {
         }
         if !resp.status().is_success() {
             return Err(RepoError::Storage(format!(
-                "upstream nupkg fetch returned {}",
+                "upstream nupkg fetch {url} returned {}",
                 resp.status()
             )));
         }
 
-        // Reject an over-large advertised body before reading it.
-        if let Some(len) = resp.content_length() {
-            if len > MAX_NUPKG_BYTES {
-                return Err(RepoError::Storage("upstream nupkg too large".into()));
-            }
+        // Stream the body straight into a CAS temp file (size-capped while
+        // copying; never buffered in memory).
+        let max_bytes = self.http.config().max_package_bytes;
+        if resp.content_length().is_some_and(|len| len > max_bytes) {
+            return Err(RepoError::Storage(format!(
+                "upstream nupkg {url} exceeds {max_bytes} bytes"
+            )));
         }
-        let bytes = resp
-            .bytes()
+        let body = futures_util::TryStreamExt::map_err(resp.bytes_stream(), std::io::Error::other);
+        let reader = tokio_util::io::StreamReader::new(body);
+        let staged = self
+            .cas
+            .stage(reader, max_bytes)
             .await
-            .map_err(|e| RepoError::Storage(format!("read upstream nupkg body: {e}")))?;
-        if bytes.len() as u64 > MAX_NUPKG_BYTES {
-            return Err(RepoError::Storage("upstream nupkg too large".into()));
+            .map_err(|e| match e {
+                CasError::TooLarge { limit } => {
+                    RepoError::Storage(format!("upstream nupkg {url} exceeds {limit} bytes"))
+                }
+                other => RepoError::Storage(format!("read upstream nupkg {url}: {other}")),
+            })?;
+
+        // Parse from the temp file on the blocking pool to obtain the canonical
+        // identity and the manifest.
+        let parsed = {
+            let format = self.format.clone();
+            let path = staged.temp_path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut file = std::fs::File::open(&path)?;
+                format
+                    .parse_upload(&mut file)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+            .await
+            .map_err(|e| RepoError::Storage(format!("parse upstream nupkg: {e}")))?
+            .map_err(|e| RepoError::Storage(format!("parse upstream nupkg: {e}")))?
+        };
+        // Never cache a package under an identity it does not carry: a
+        // misbehaving upstream must not be able to plant `evil 1.0.0` bytes at
+        // `good/1.0.0`.
+        if parsed.id != lower_id || parsed.version != version {
+            return Err(RepoError::Storage(format!(
+                "upstream nupkg at {url} identifies as {} {}",
+                parsed.id, parsed.version
+            )));
         }
 
-        // Parse to obtain canonical id/version (and the .nuspec for later).
-        let parsed = {
-            let mut cur = Cursor::new(bytes.as_ref());
-            self.format
-                .parse_upload(&mut cur)
-                .map_err(|e| RepoError::Storage(format!("parse upstream nupkg: {e}")))?
-        };
-
-        // CAS-store the bytes (dedup applies across repos); the CAS re-enforces
-        // the cap while streaming to disk. This is an S3 PUT — still NO tx held.
+        // Promote into CAS (dedup applies across repos). S3 PUT — still NO tx.
         let stored = self
             .cas
-            .store(Cursor::new(bytes.to_vec()), MAX_NUPKG_BYTES)
+            .commit(staged)
             .await
             .map_err(|e| RepoError::Storage(format!("cas store upstream nupkg: {e}")))?;
+        let nuspec = self
+            .cas
+            .store(Cursor::new(parsed.nuspec_bytes.clone()), max_bytes)
+            .await
+            .map_err(|e| RepoError::Storage(format!("cas store upstream nuspec: {e}")))?;
 
         let size = i64::try_from(stored.size)
             .map_err(|_| RepoError::Storage("nupkg size overflow".into()))?;
+        let nuspec_size = i64::try_from(nuspec.size)
+            .map_err(|_| RepoError::Storage("nuspec size overflow".into()))?;
 
         // ── Finalize (short tx) — re-lock, re-check, attach, mark downloaded. ─
         let mut tx = self.pool.begin().await?;
@@ -640,9 +817,6 @@ impl ProxyRepo {
             }
             return self.local_nupkg(repo.id, lower_id, version).await;
         }
-
-        // Commit blob + attach component/asset within this short tx.
-        blob_dao::commit_ingest_and_incref(&mut tx, &stored.sha256, stored.ingest_token).await?;
 
         // Insert the component if it is not already present (a prior metadata
         // discovery never inserts components, so normally absent here).
@@ -665,11 +839,15 @@ impl ProxyRepo {
             }
         };
 
-        // Attach the .nupkg asset if absent.
+        // Attach the .nupkg / .nuspec assets if absent. Each blob reference is
+        // taken only when its asset row is actually inserted; an unused ingest
+        // lease simply expires.
         if asset_dao::find_asset(&mut *tx, comp.id, NUPKG_ASSET_PATH)
             .await?
             .is_none()
         {
+            blob_dao::commit_ingest_and_incref(&mut tx, &stored.sha256, stored.ingest_token)
+                .await?;
             asset_dao::insert_asset(
                 &mut *tx,
                 NewAsset {
@@ -679,6 +857,25 @@ impl ProxyRepo {
                     blob_sha256: stored.sha256.clone(),
                     size,
                     sha512_base64: Some(stored.sha512_base64.clone()),
+                },
+            )
+            .await?;
+        }
+        if asset_dao::find_asset(&mut *tx, comp.id, NUSPEC_ASSET_PATH)
+            .await?
+            .is_none()
+        {
+            blob_dao::commit_ingest_and_incref(&mut tx, &nuspec.sha256, nuspec.ingest_token)
+                .await?;
+            asset_dao::insert_asset(
+                &mut *tx,
+                NewAsset {
+                    component_id: comp.id,
+                    path: NUSPEC_ASSET_PATH.to_string(),
+                    content_type: NUSPEC_CONTENT_TYPE.to_string(),
+                    blob_sha256: nuspec.sha256.clone(),
+                    size: nuspec_size,
+                    sha512_base64: None,
                 },
             )
             .await?;
@@ -726,8 +923,64 @@ impl ProxyRepo {
         }))
     }
 
+    /// The locally cached `.nuspec` of a downloaded version, if stored.
+    async fn local_nuspec(
+        &self,
+        repo_id: i64,
+        lower_id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        let Some(blobs) = &self.blobs else {
+            return Ok(None);
+        };
+        let Some(comp) =
+            component_dao::find_component(&self.pool, repo_id, lower_id, version).await?
+        else {
+            return Ok(None);
+        };
+        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUSPEC_ASSET_PATH).await?
+        else {
+            return Ok(None);
+        };
+        let Some(blob) = blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
+            return Ok(None);
+        };
+        Ok(Some(blobs.fetch_all(&blob.s3_key).await?))
+    }
+
+    /// Fetch the upstream `.nuspec` for a known, not-yet-downloaded version.
+    /// Cached (L1/L2) — a published manifest never changes.
+    async fn upstream_nuspec(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        let key = format!("{}/{}/{lower_id}/{version}", repo.name, repo.id);
+        let fetched: Result<Option<Vec<u8>>, String> = self
+            .cache
+            .get_or_try_insert_with(NS_UPSTREAM_NUSPEC, &key, NUSPEC_CACHE_TTL, || async {
+                let resources = Box::pin(self.resolve_upstream_index(repo))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let Some(base) = resources.package_base_address else {
+                    return Ok(None);
+                };
+                let url = format!("{base}{lower_id}/{version}/{lower_id}.nuspec");
+                let creds = self.credentials(repo).await.map_err(|e| e.to_string())?;
+                let auth = creds.as_ref().map(Credentials::auth);
+                self.http
+                    .get_bytes(&url, auth.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        fetched.map_err(RepoError::Storage)
+    }
+
     /// Search the locally known proxy corpus once, applying authorization
-    /// before total-count calculation and client paging.
+    /// before total-count calculation and client paging. The id substring
+    /// filter runs in PostgreSQL so a large proxy cache is not loaded whole.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -736,6 +989,7 @@ impl ProxyRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let now = Utc::now();
+        let q = params.q.trim().to_lowercase();
         let rows = sqlx::query_as!(
             forge_db::model::ProxyCachedVersion,
             r#"
@@ -743,20 +997,19 @@ impl ProxyRepo {
                    downloaded, metadata_refreshed_at, not_found, not_found_at
             FROM proxy_cached_version
             WHERE repository_id = $1 AND version <> '*' AND not_found = false
+              AND listed AND ($2 = '' OR strpos(name, $2) > 0)
+            ORDER BY name
             "#,
             repo_row.id,
+            q,
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let q = params.q.trim().to_lowercase();
         use std::collections::BTreeMap;
         let mut by_id: BTreeMap<String, Vec<forge_db::model::ProxyCachedVersion>> = BTreeMap::new();
         for r in rows {
-            if !Self::delay_cleared(&repo_row, r.first_seen_at, now)
-                || !filter.allows(&r.name)
-                || (!q.is_empty() && !r.name.contains(&q))
-            {
+            if !Self::delay_cleared(&repo_row, r.first_seen_at, now) || !filter.allows(&r.name) {
                 continue;
             }
             by_id.entry(r.name.clone()).or_default().push(r);
@@ -766,7 +1019,6 @@ impl ProxyRepo {
         for (_name, rows) in by_id {
             let mut versions: Vec<VersionEntry> = rows
                 .into_iter()
-                .filter(|r| r.listed)
                 .filter(|r| params.prerelease || !is_prerelease(&r.version))
                 .map(|r| VersionEntry {
                     original_id: r.name.clone(),
@@ -822,135 +1074,6 @@ fn parse_resources(value: JsonValue) -> UpstreamResources {
     })
 }
 
-/// The uncached body of [`ProxyRepo::resolve_upstream_index`]: DB-freshness
-/// short-circuit, offline handling, and cross-instance row-locked refetch.
-async fn resolve_index_uncached(
-    pool: &PgPool,
-    repo_id: i64,
-    ttl: Duration,
-    online: bool,
-    remote_url: &str,
-    client: &reqwest::Client,
-) -> Result<UpstreamResources, RepoError> {
-    // 2. DB freshness short-circuit (no lock needed for a read).
-    if let Some(idx) = proxy_dao::get_upstream_index(pool, repo_id).await? {
-        if Utc::now() - idx.fetched_at < ttl {
-            return Ok(parse_resources(idx.resources));
-        }
-    }
-
-    // Offline: never fetch. Serve a persisted (possibly stale) index if present.
-    if !online {
-        return match proxy_dao::get_upstream_index(pool, repo_id).await? {
-            Some(idx) => Ok(parse_resources(idx.resources)),
-            None => Err(RepoError::Storage(
-                "proxy is offline and has no cached upstream index".into(),
-            )),
-        };
-    }
-
-    // 3. Cross-instance singleflight: row-lock the proxy `repository` row (A11).
-    let mut tx = pool.begin().await?;
-    sqlx::query!(
-        r#"SELECT id FROM repository WHERE id = $1 FOR UPDATE"#,
-        repo_id
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // Re-check freshness inside the lock — another instance may have refreshed it.
-    let recheck = sqlx::query!(
-        r#"SELECT resources, fetched_at FROM proxy_upstream_index WHERE repository_id = $1"#,
-        repo_id
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(row) = recheck {
-        if Utc::now() - row.fetched_at < ttl {
-            let resources = parse_resources(row.resources);
-            tx.commit().await?;
-            return Ok(resources);
-        }
-    }
-
-    // Fetch the upstream service index (SSRF-guarded by `client`).
-    let doc = fetch_json(client, remote_url).await?;
-    let resources = UpstreamResources::from_service_index(&doc);
-    let resources_json = serde_json::to_value(&resources)
-        .map_err(|e| RepoError::Storage(format!("serialize resources: {e}")))?;
-
-    sqlx::query!(
-        r#"
-        INSERT INTO proxy_upstream_index (repository_id, resources, fetched_at, etag)
-        VALUES ($1, $2, now(), NULL)
-        ON CONFLICT (repository_id)
-        DO UPDATE SET resources = EXCLUDED.resources, fetched_at = EXCLUDED.fetched_at, etag = EXCLUDED.etag
-        "#,
-        repo_id,
-        resources_json,
-    )
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    Ok(resources)
-}
-
-/// Fetch a URL expecting JSON, mapping a non-success status to an error.
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<JsonValue, RepoError> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| RepoError::Storage(format!("upstream GET {url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(RepoError::Storage(format!(
-            "upstream GET {url} returned {}",
-            resp.status()
-        )));
-    }
-    let bytes = bounded_body(resp).await?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| RepoError::Storage(format!("parse upstream JSON: {e}")))
-}
-
-/// Like [`fetch_json`] but returns `Ok(None)` on a genuine 404.
-async fn fetch_json_opt(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<Option<JsonValue>, RepoError> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| RepoError::Storage(format!("upstream GET {url}: {e}")))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !resp.status().is_success() {
-        return Err(RepoError::Storage(format!(
-            "upstream GET {url} returned {}",
-            resp.status()
-        )));
-    }
-    let bytes = bounded_body(resp).await?;
-    let doc = serde_json::from_slice(&bytes)
-        .map_err(|e| RepoError::Storage(format!("parse upstream JSON: {e}")))?;
-    Ok(Some(doc))
-}
-
-/// Read a response body, capping it at [`MAX_METADATA_BYTES`].
-async fn bounded_body(resp: reqwest::Response) -> Result<Vec<u8>, RepoError> {
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| RepoError::Storage(format!("read upstream body: {e}")))?;
-    if bytes.len() as u64 > MAX_METADATA_BYTES {
-        return Err(RepoError::Storage("upstream metadata too large".into()));
-    }
-    Ok(bytes.to_vec())
-}
-
 /// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
 fn is_prerelease(version: &str) -> bool {
     version.contains('-')
@@ -996,7 +1119,7 @@ impl RepoReadOps for ProxyRepo {
             .format
             .normalize_version(version)
             .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
-        let loc = self.ensure_downloaded(&repo_row, &lower, &norm).await?;
+        let loc = Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await?;
         if loc.is_some() {
             // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
             // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
@@ -1008,15 +1131,63 @@ impl RepoReadOps for ProxyRepo {
         Ok(loc)
     }
 
+    /// Serve the manifest of a proxied version: the locally stored `.nuspec`
+    /// once the package is cached, otherwise the upstream's flat-container
+    /// `.nuspec` (without downloading the whole package). Delay-gated and
+    /// negative-cached exactly like the version listing.
     async fn resolve_nuspec(
         &self,
         repo: &str,
         id: &str,
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
-        // Proxy nuspec serving is derived from the cached nupkg in a later slice;
-        // for now return None (the route falls back to extracting on demand).
-        let _ = (repo, id, version);
+        let repo_row = self.proxy_repo(repo).await?;
+        let lower = self.format.lower_id(id);
+        let Ok(norm) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+
+        if let Some(row) =
+            proxy_dao::get_cached_version(&self.pool, repo_row.id, &lower, &norm).await?
+        {
+            if !row.not_found && !Self::delay_cleared(&repo_row, row.first_seen_at, Utc::now()) {
+                return Ok(None);
+            }
+            if row.downloaded {
+                if let Some(bytes) = self.local_nuspec(repo_row.id, &lower, &norm).await? {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(None);
+        }
+        // The version must be known upstream (and past its delay window).
+        let known = Box::pin(self.discover_versions(&repo_row, &lower))
+            .await?
+            .into_iter()
+            .any(|r| {
+                r.version == norm
+                    && !r.not_found
+                    && Self::delay_cleared(&repo_row, r.first_seen_at, Utc::now())
+            });
+        if !known {
+            return Ok(None);
+        }
+        if repo_row.online {
+            if let Some(bytes) = Box::pin(self.upstream_nuspec(&repo_row, &lower, &norm)).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        // Upstream serves no manifest (or we are offline): fall back to the
+        // package itself, which also caches the manifest locally.
+        if Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm))
+            .await?
+            .is_some()
+        {
+            return self.local_nuspec(repo_row.id, &lower, &norm).await;
+        }
         Ok(None)
     }
 
@@ -1043,19 +1214,30 @@ impl RepoReadOps for ProxyRepo {
 
         let mut out = Vec::with_capacity(visible.len());
         for r in visible {
-            // Pull the packageHash + nuspec only for already-downloaded versions;
-            // otherwise serve metadata without a hash (avoids a fetch per entry).
-            let (hash, nuspec) =
+            // packageHash + dependency groups are known only for downloaded
+            // versions; others are served without them (avoids a fetch per
+            // entry).
+            let (hash, nuspec) = if r.downloaded {
                 match component_dao::find_component(&self.pool, repo_row.id, &r.name, &r.version)
                     .await?
                 {
                     Some(comp) => {
                         let asset =
                             asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?;
-                        (asset.and_then(|a| a.sha512_base64), None)
+                        let nuspec = self
+                            .local_nuspec(repo_row.id, &r.name, &r.version)
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, id = %r.name, version = %r.version, "cached nuspec read failed");
+                                None
+                            });
+                        (asset.and_then(|a| a.sha512_base64), nuspec)
                     }
                     None => (None, None),
-                };
+                }
+            } else {
+                (None, None)
+            };
             out.push(RegistrationEntry {
                 original_id: r.name.clone(),
                 version: r.version.clone(),

@@ -398,13 +398,19 @@ impl HostedWrite {
         // needs the canonical identity extracted by the format parser first.
         let staged_nupkg = self.cas.stage(reader, max_upload_bytes).await?;
 
-        // 2. Parse the package from the temp file. parse_upload is sync; the
-        //    temp file is small enough that a blocking read is acceptable here.
+        // 2. Parse the package from the temp file. parse_upload is sync and a
+        //    package may be hundreds of MiB, so it runs on the blocking pool.
         let parsed = {
-            let mut file = std::fs::File::open(&staged_nupkg.temp_path).map_err(|e| {
-                WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
-            })?;
-            self.format.parse_upload(&mut file)?
+            let format = self.format.clone();
+            let path = staged_nupkg.temp_path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut file = std::fs::File::open(&path).map_err(|e| {
+                    WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
+                })?;
+                format.parse_upload(&mut file).map_err(WriteError::from)
+            })
+            .await
+            .map_err(|e| WriteError::Repo(RepoError::Storage(format!("parse upload: {e}"))))??
         };
 
         let publish_context =

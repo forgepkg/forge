@@ -39,15 +39,12 @@
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use forge_core::format::Format;
-use forge_core::repo::proxy::ProxyRepo;
 use forge_core::retention::worker::{RetentionConfig, RetentionWorker};
 use forge_db::model::RepoKind;
 use forge_db::repository_dao;
-use forge_storage::{outbox_worker, reconciler, BlobStore, Cas};
+use forge_storage::{outbox_worker, reconciler, BlobStore};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
@@ -113,12 +110,9 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     );
 
     let proxy_refresh = spawn_proxy_refresh(
-        state.pool.clone(),
-        state.cas.clone(),
-        state.cache.clone(),
-        state.formats.nuget(),
+        state.clone(),
         // Refresh upstream metadata on a modest cadence; the per-proxy TTL +
-        // row-lock singleflight bound actual upstream traffic.
+        // the shared cache bound actual upstream traffic.
         poll.saturating_mul(6).max(Duration::from_secs(60)),
     );
 
@@ -267,20 +261,15 @@ fn spawn_reconciler(
 }
 
 /// Spawn the proxy metadata-refresh loop. Each tick lists proxy repositories and
-/// refreshes their upstream service index; the proxy layer's row-lock
-/// singleflight ensures only one instance refetches per repo per TTL window.
-fn spawn_proxy_refresh(
-    pool: PgPool,
-    cas: Cas,
-    cache: forge_cache::Cache,
-    format: Arc<dyn Format>,
-    interval: Duration,
-) -> JoinHandle<()> {
+/// refreshes their upstream service index. Each repository's pass runs under
+/// the proxy client's own deadlines, so one unreachable upstream delays the
+/// pass by at most one metadata timeout instead of stalling it.
+fn spawn_proxy_refresh(state: AppState, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = refresh_proxies_once(&pool, &cas, &cache, &format).await {
+            if let Err(e) = refresh_proxies_once(&state).await {
                 tracing::error!(error = %e, "proxy metadata refresh pass failed");
             }
         }
@@ -289,18 +278,15 @@ fn spawn_proxy_refresh(
 
 /// One proxy-refresh pass: re-resolve every online proxy repository's upstream
 /// index (best-effort; a single proxy's failure does not abort the pass).
-async fn refresh_proxies_once(
-    pool: &PgPool,
-    cas: &Cas,
-    cache: &forge_cache::Cache,
-    format: &Arc<dyn Format>,
-) -> anyhow::Result<()> {
-    let repos = repository_dao::list_repositories(pool).await?;
+async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
+    let repos = repository_dao::list_repositories(&state.pool).await?;
     for repo in repos {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        let proxy = ProxyRepo::new(pool.clone(), format.clone(), cas.clone(), cache.clone());
+        // Same wiring as request-time reads: shared upstream client and the
+        // envelope service, so credentialed upstreams refresh too.
+        let proxy = state.proxy_repo(state.formats.for_repository(&repo));
         if let Err(e) = proxy.resolve_upstream_index(&repo).await {
             tracing::warn!(error = %e, repo = %repo.name, "proxy upstream refresh failed");
         }

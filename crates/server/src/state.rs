@@ -23,6 +23,7 @@ use forge_cache::Cache;
 use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
 use forge_core::format::Format;
+use forge_core::net::upstream::UpstreamHttp;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
@@ -73,6 +74,9 @@ pub struct AppState {
     /// [`AppState::new`] (a configured-but-broken root key must abort startup)
     /// and attached via [`AppState::with_envelope`].
     pub envelope: Option<std::sync::Arc<forge_crypto::service::EnvelopeService>>,
+    /// Pooled, timeout- and size-bounded client for proxy upstream traffic,
+    /// built once from `[proxy]` and shared by every proxy repository.
+    pub upstream: UpstreamHttp,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -125,6 +129,10 @@ impl AppState {
         );
         let cookie_secure = config.public_base_url().starts_with("https://");
         let realms = Arc::new(RealmAuth::new(pool.clone(), cache.clone(), config.clone()));
+        let upstream = UpstreamHttp::new(config.proxy.upstream_http()).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
+            UpstreamHttp::shared_default()
+        });
 
         AppState {
             pool,
@@ -138,6 +146,7 @@ impl AppState {
             sessions,
             cookie_secure,
             envelope: None,
+            upstream,
         }
     }
 
@@ -183,16 +192,7 @@ impl AppState {
                 format,
                 self.blob_bytes(),
             )),
-            RepoKind::Proxy => Arc::new(
-                ProxyRepo::new(
-                    self.pool.clone(),
-                    format,
-                    self.cas.clone(),
-                    self.cache.clone(),
-                )
-                // §12.5: lets the upstream fetch decrypt an encrypted password.
-                .with_envelope(self.envelope.clone()),
-            ),
+            RepoKind::Proxy => Arc::new(self.proxy_repo(format)),
             RepoKind::Group => Arc::new(GroupRepo::new(
                 self.pool.clone(),
                 principal,
@@ -204,6 +204,21 @@ impl AppState {
         Ok(Arc::new(PackageFilteredReadOps::new(inner, filter)))
     }
 
+    /// A fully wired proxy read facade: shared upstream client, local blob
+    /// access, and (§12.5) the envelope service for encrypted upstream
+    /// passwords.
+    pub fn proxy_repo(&self, format: Arc<dyn Format>) -> ProxyRepo {
+        ProxyRepo::new(
+            self.pool.clone(),
+            format,
+            self.cas.clone(),
+            self.cache.clone(),
+        )
+        .with_envelope(self.envelope.clone())
+        .with_http(self.upstream.clone())
+        .with_blob_fetch(self.blob_bytes())
+    }
+
     /// A member-ops factory for group resolution (hosted/proxy members only).
     pub fn member_factory(&self) -> MemberFactory {
         MemberFactory {
@@ -213,11 +228,13 @@ impl AppState {
             cache: self.cache.clone(),
             formats: self.formats.clone(),
             envelope: self.envelope.clone(),
+            upstream: self.upstream.clone(),
         }
     }
 }
 
-/// Reads whole blobs from the S3 store. Implements the two byte-fetch seams.
+/// Reads blobs from the S3 store: whole small metadata blobs (`BlobFetch`,
+/// the `.nuspec`) and streamed packages (`NupkgBytes`).
 pub struct BlobBytes {
     store: BlobStore,
 }
@@ -249,8 +266,14 @@ impl BlobFetch for BlobBytes {
 
 #[async_trait]
 impl forge_nuget::routes::NupkgBytes for BlobBytes {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        self.read_all(s3_key).await
+    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+        let stream = self.store.get(s3_key).await.map_err(|e| {
+            tracing::error!(error = %e, %s3_key, "s3 get failed");
+            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
+        })?;
+        Ok(Box::pin(tokio_util::io::ReaderStream::new(
+            stream.into_async_read(),
+        )))
     }
 }
 
@@ -280,6 +303,8 @@ pub struct MemberFactory {
     formats: Arc<FormatRegistry>,
     /// §12.5: proxy members decrypt their upstream password through this.
     envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    /// Shared proxy upstream client.
+    upstream: UpstreamHttp,
 }
 
 impl MemberOpsFactory for MemberFactory {
@@ -300,7 +325,11 @@ impl MemberOpsFactory for MemberFactory {
                     self.cas.clone(),
                     self.cache.clone(),
                 )
-                .with_envelope(self.envelope.clone()),
+                .with_envelope(self.envelope.clone())
+                .with_http(self.upstream.clone())
+                .with_blob_fetch(Arc::new(BlobBytes {
+                    store: self.blob_store.clone(),
+                })),
             )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),

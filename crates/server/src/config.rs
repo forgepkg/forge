@@ -45,6 +45,9 @@ pub struct Config {
     /// Group-repository nesting limits (slice 12.4).
     #[serde(default)]
     pub groups: GroupsConfig,
+    /// Proxy-repository upstream HTTP tuning (timeouts, size caps, spooling).
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -70,6 +73,15 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
+    /// Largest accepted package upload (`dotnet nuget push`) in bytes. Uploads
+    /// are streamed to a temp file, never buffered in memory; exceeding the
+    /// limit yields HTTP 413. Default 512 MiB.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+}
+
+fn default_max_upload_bytes() -> u64 {
+    512 * 1024 * 1024
 }
 
 impl ServerConfig {
@@ -539,6 +551,122 @@ fn default_max_nesting_depth() -> i32 {
     20
 }
 
+/// `proxy.*` — outbound HTTP tuning shared by every proxy repository.
+///
+/// Timeouts are split by what they protect against: `connect_timeout_seconds`
+/// and `read_timeout_seconds` (no bytes received for that long) bound a dead
+/// or stalled peer for every request, while the total deadlines differ by
+/// request class — metadata documents are small, but `.nupkg` downloads may be
+/// hundreds of MiB over a slow link, so `download_timeout_seconds` is
+/// deliberately generous. Response bodies are size-capped while streaming;
+/// metadata up to `spool_memory_bytes` stays in memory and larger bodies spill
+/// to a self-deleting temp file, and packages always stream to a temp file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyConfig {
+    /// TCP + TLS connect deadline. Default 15 s.
+    #[serde(default = "default_proxy_connect_timeout")]
+    pub connect_timeout_seconds: u64,
+    /// Maximum idle time between two reads of a response. Default 60 s.
+    #[serde(default = "default_proxy_read_timeout")]
+    pub read_timeout_seconds: u64,
+    /// Total deadline for metadata requests (service index, version listing,
+    /// `.nuspec`). Default 60 s.
+    #[serde(default = "default_proxy_metadata_timeout")]
+    pub metadata_timeout_seconds: u64,
+    /// Total deadline for a `.nupkg` download. Default 30 min.
+    #[serde(default = "default_proxy_download_timeout")]
+    pub download_timeout_seconds: u64,
+    /// Largest accepted upstream metadata document. Default 32 MiB.
+    #[serde(default = "default_proxy_max_metadata_bytes")]
+    pub max_metadata_bytes: u64,
+    /// Largest accepted upstream `.nupkg`. Default 1 GiB.
+    #[serde(default = "default_proxy_max_package_bytes")]
+    pub max_package_bytes: u64,
+    /// Bodies up to this size are kept in memory; larger ones spill to a temp
+    /// file that is removed when the request finishes. Default 2 MiB.
+    #[serde(default = "default_proxy_spool_memory_bytes")]
+    pub spool_memory_bytes: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            connect_timeout_seconds: default_proxy_connect_timeout(),
+            read_timeout_seconds: default_proxy_read_timeout(),
+            metadata_timeout_seconds: default_proxy_metadata_timeout(),
+            download_timeout_seconds: default_proxy_download_timeout(),
+            max_metadata_bytes: default_proxy_max_metadata_bytes(),
+            max_package_bytes: default_proxy_max_package_bytes(),
+            spool_memory_bytes: default_proxy_spool_memory_bytes(),
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// The runtime tuning handed to [`forge_core::net::upstream::UpstreamHttp`].
+    pub fn upstream_http(&self) -> forge_core::net::upstream::UpstreamHttpConfig {
+        forge_core::net::upstream::UpstreamHttpConfig {
+            connect_timeout: Duration::from_secs(self.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.read_timeout_seconds),
+            metadata_timeout: Duration::from_secs(self.metadata_timeout_seconds),
+            download_timeout: Duration::from_secs(self.download_timeout_seconds),
+            max_metadata_bytes: self.max_metadata_bytes,
+            max_package_bytes: self.max_package_bytes,
+            spool_memory_bytes: usize::try_from(self.spool_memory_bytes).unwrap_or(usize::MAX),
+            ..Default::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "proxy.connect_timeout_seconds",
+                self.connect_timeout_seconds,
+            ),
+            ("proxy.read_timeout_seconds", self.read_timeout_seconds),
+            (
+                "proxy.metadata_timeout_seconds",
+                self.metadata_timeout_seconds,
+            ),
+            (
+                "proxy.download_timeout_seconds",
+                self.download_timeout_seconds,
+            ),
+            ("proxy.max_metadata_bytes", self.max_metadata_bytes),
+            ("proxy.max_package_bytes", self.max_package_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} must be greater than 0"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_proxy_connect_timeout() -> u64 {
+    15
+}
+fn default_proxy_read_timeout() -> u64 {
+    60
+}
+fn default_proxy_metadata_timeout() -> u64 {
+    60
+}
+fn default_proxy_download_timeout() -> u64 {
+    30 * 60
+}
+fn default_proxy_max_metadata_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+fn default_proxy_max_package_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_proxy_spool_memory_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -971,6 +1099,12 @@ impl Config {
             }
         }
         self.validate_crypto()?;
+        self.proxy.validate()?;
+        if self.server.max_upload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "server.max_upload_bytes must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 

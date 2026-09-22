@@ -19,6 +19,7 @@ pub mod search;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, put, MethodRouter};
 use axum::Router;
 use forge_core::authz::PackageFilter;
@@ -28,18 +29,26 @@ use forge_core::{RepoReadOps, RepoWriteOps};
 
 /// Default maximum accepted upload size (bytes) when the server does not
 /// override it. Mirrors a generous NuGet package size ceiling; the real limit
-/// comes from server config (Phase 10).
-pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
+/// comes from server config (`server.max_upload_bytes`).
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Allowance for multipart framing (boundaries, part headers) on top of the
+/// package-size limit when bounding the raw request body.
+const MULTIPART_OVERHEAD_BYTES: u64 = 1024 * 1024;
+
+/// A package body streamed from the blob store chunk by chunk.
+pub type BlobByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
 
 /// Stream the bytes of a stored `.nupkg` blob by its S3 object key.
 ///
 /// Abstracted (like [`forge_core::repo::hosted::BlobFetch`]) so the route layer
 /// is independent of the S3 client and so handler tests can stub blob bytes.
-/// Slice 1 buffers the whole blob; chunked streaming is a later optimization.
+/// Packages are streamed to the client — never buffered whole in memory.
 #[async_trait]
 pub trait NupkgBytes: Send + Sync {
-    /// Read the entire blob at `s3_key` into memory.
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError>;
+    /// Open the blob at `s3_key` as a byte stream.
+    async fn open(&self, s3_key: &str) -> Result<BlobByteStream, RepoError>;
 }
 
 /// Everything a NuGet route handler needs for one repository.
@@ -122,11 +131,21 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
 
     // PackagePublish surface — hosted only.
     if kind == RepoKind::Hosted {
+        // axum's extractors default to a 2 MiB request-body limit, which would
+        // reject every real-sized package. The upload is streamed to a temp
+        // file (never buffered), and the CAS enforces `max_upload_bytes` on
+        // the package bytes; the raw body bound only adds framing slack.
+        let body_limit = usize::try_from(
+            ctx.max_upload_bytes
+                .saturating_add(MULTIPART_OVERHEAD_BYTES),
+        )
+        .unwrap_or(usize::MAX);
+        let push = put(publish::push).layer(DefaultBodyLimit::max(body_limit));
         router = router
-            .route("/package", put(publish::push))
+            .route("/package", push.clone())
             // The official NuGet client appends a trailing slash to the
             // PackagePublish `@id` before the PUT (`.../package/`); accept both.
-            .route("/package/", put(publish::push))
+            .route("/package/", push)
             .route(
                 "/package/{id}/{version}",
                 delete(publish::unlist).post(publish::relist),

@@ -93,7 +93,7 @@ async fn route_context(
         write,
         protocol_mutations_allowed,
         package_filter,
-        max_upload_bytes: forge_nuget::routes::DEFAULT_MAX_UPLOAD_BYTES,
+        max_upload_bytes: state.config.server.max_upload_bytes,
     })
 }
 

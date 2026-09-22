@@ -107,11 +107,15 @@ struct MockBytes {
 
 #[async_trait]
 impl NupkgBytes for MockBytes {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        self.map
+    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+        let bytes = self
+            .map
             .get(s3_key)
             .cloned()
-            .ok_or_else(|| RepoError::RepoNotFound(s3_key.to_string()))
+            .ok_or_else(|| RepoError::RepoNotFound(s3_key.to_string()))?;
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(bytes::Bytes::from(bytes))
+        })))
     }
 }
 
@@ -740,7 +744,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct MockWrite {
     /// Bytes received by the most recent `store_upload`, for assertions.
-    last_upload: Mutex<Option<Vec<u8>>>,
+    last_upload: Arc<Mutex<Option<Vec<u8>>>>,
     /// Outcome to return from `store_upload` (default: Created).
     publish_result: Mutex<Option<Result<PublishOutcome, WriteError>>>,
     /// Whether delete/relist should report the version as found.
@@ -766,7 +770,9 @@ impl RepoWriteOps for MockWrite {
     ) -> Result<PublishOutcome, WriteError> {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
+        if let Err(e) = reader.read_to_end(&mut buf).await {
+            return Err(WriteError::Repo(RepoError::Storage(e.to_string())));
+        }
         if buf.len() as u64 > max_upload_bytes {
             return Err(WriteError::TooLarge {
                 limit: max_upload_bytes,
@@ -920,6 +926,35 @@ async fn push_too_large_maps_to_413() {
     *w.publish_result.lock().unwrap() = Some(Err(WriteError::TooLarge { limit: 4 }));
     let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
     let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Regression: axum's extractor default (2 MiB) used to reject every
+/// real-sized push with a 500. A multi-MiB package must stream through.
+#[tokio::test]
+async fn push_larger_than_axum_default_limit_succeeds() {
+    let w = MockWrite::found();
+    let last = w.last_upload.clone();
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let payload = vec![0x5a_u8; 3 * 1024 * 1024 + 17];
+    let (status, _) = put_multipart(&router, "/package", Some("key"), &payload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        last.lock().unwrap().as_ref().map(Vec::len),
+        Some(payload.len())
+    );
+}
+
+/// A body beyond `max_upload_bytes` + framing slack trips the request-body
+/// limit mid-stream; that must surface as 413, not as a storage error.
+#[tokio::test]
+async fn push_over_body_limit_maps_to_413() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let payload = vec![0x5a_u8; 18 * 1024 * 1024];
+    let (status, _) = put_multipart(&router, "/package", Some("key"), &payload).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 

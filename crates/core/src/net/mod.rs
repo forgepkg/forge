@@ -1,6 +1,8 @@
 //! Outbound-networking helpers.
 //!
-//! Currently just [`ssrf`], the guard the proxy repository (and §12.3) use to
-//! safely fetch admin-configured upstream URLs.
+//! * [`ssrf`] — the scheme guard for admin-configured upstream URLs.
+//! * [`upstream`] — the pooled, timeout- and size-bounded client the proxy
+//!   repository uses for all upstream traffic.
 
 pub mod ssrf;
+pub mod upstream;
