@@ -193,13 +193,16 @@ impl AppState {
                 self.blob_bytes(),
             )),
             RepoKind::Proxy => Arc::new(self.proxy_repo(format)),
-            RepoKind::Group => Arc::new(GroupRepo::new(
-                self.pool.clone(),
-                principal,
-                Arc::new(self.member_factory()),
-                self.authz.clone(),
-                self.config.groups.max_nesting_depth.max(0) as u32,
-            )),
+            RepoKind::Group => Arc::new(
+                GroupRepo::new(
+                    self.pool.clone(),
+                    principal,
+                    Arc::new(self.member_factory()),
+                    self.authz.clone(),
+                    self.config.groups.max_nesting_depth.max(0) as u32,
+                )
+                .with_format(format),
+            ),
         };
         Ok(Arc::new(PackageFilteredReadOps::new(inner, filter)))
     }

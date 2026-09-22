@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
-use forge_db::model::{RepoKind, Repository};
+use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{asset_dao, blob_dao, component_dao};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,8 @@ pub struct RepoView {
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
+    /// Group dependency-confusion guard (see [`Repository::prefer_hosted`]).
+    pub prefer_hosted: bool,
 }
 
 impl From<&Repository> for RepoView {
@@ -60,6 +62,7 @@ impl From<&Repository> for RepoView {
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
+            prefer_hosted: r.prefer_hosted(),
         }
     }
 }
@@ -91,6 +94,9 @@ pub struct CreateRepo {
     pub not_found_ttl_seconds: Option<i32>,
     #[serde(default)]
     pub allow_redeploy: bool,
+    /// Group only: hide proxy versions of ids a hosted member has (default on).
+    #[serde(default)]
+    pub prefer_hosted: Option<bool>,
 }
 
 /// Update-repository request body. Identity columns (`kind`, `format`) are not
@@ -108,6 +114,8 @@ pub struct UpdateRepo {
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: Option<bool>,
+    /// Group only.
+    pub prefer_hosted: Option<bool>,
 }
 
 fn default_format() -> String {
@@ -129,7 +137,18 @@ fn bad_request(msg: impl Into<String>) -> Response {
 fn validate_remote_url(url: &str) -> Result<(), Response> {
     validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
     if let Ok(parsed) = url::Url::parse(url) {
-        tracing::info!(host = parsed.host_str().unwrap_or(""), %url, "proxy remote_url configured");
+        // Credentials embedded in the URL would be stored, logged and returned
+        // in plaintext; they belong in the write-only upstream_username /
+        // upstream_password fields.
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(bad_request(
+                "remote_url must not embed credentials; use upstream_username / upstream_password",
+            ));
+        }
+        tracing::info!(
+            host = parsed.host_str().unwrap_or(""),
+            "proxy remote_url configured"
+        );
     }
     Ok(())
 }
@@ -173,6 +192,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     } else if body.remote_url.is_some() {
         return bad_request("remote_url is only valid for proxy repositories");
     }
+    if body.prefer_hosted.is_some() && parsed_kind != RepoKind::Group {
+        return bad_request("prefer_hosted is only valid for group repositories");
+    }
+    let mut config = json!({});
+    if parsed_kind == RepoKind::Group {
+        config[PREFER_HOSTED_KEY] = json!(body.prefer_hosted.unwrap_or(true));
+    }
 
     // §12.5: with encryption enabled the password is NOT inserted as plaintext;
     // the row is created first (the AAD binds the ciphertext to the row id,
@@ -184,7 +210,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         kind: kind.clone(),
         anonymous_read: body.anonymous_read,
         online: body.online,
-        config: json!({}),
+        config,
         remote_url: body.remote_url.clone(),
         package_delay_seconds: body.package_delay_seconds,
         upstream_username: body.upstream_username.clone(),
@@ -275,11 +301,22 @@ pub async fn update(
         }
     }
 
+    let mut config = existing.config.clone();
+    if let Some(prefer_hosted) = body.prefer_hosted {
+        if existing.kind() != RepoKind::Group {
+            return bad_request("prefer_hosted is only valid for group repositories");
+        }
+        if !config.is_object() {
+            config = json!({});
+        }
+        config[PREFER_HOSTED_KEY] = json!(prefer_hosted);
+    }
+
     let upd = RepositoryUpdate {
         name: body.name.clone().unwrap_or(existing.name.clone()),
         anonymous_read: body.anonymous_read.unwrap_or(existing.anonymous_read),
         online: body.online.unwrap_or(existing.online),
-        config: existing.config.clone(),
+        config,
         remote_url,
         package_delay_seconds: body
             .package_delay_seconds

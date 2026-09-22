@@ -111,6 +111,9 @@ function toUpdateBody(values: RepoFormValues): UpdateRepo {
   if (values.kind === 'hosted') {
     body.allow_redeploy = values.allow_redeploy
   }
+  if (values.kind === 'group') {
+    body.prefer_hosted = values.prefer_hosted
+  }
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()
     body.package_delay_seconds = Number(values.package_delay_seconds) || 0

@@ -78,6 +78,11 @@ async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
     }
+    // Docker-less environments point at an already-running gateway.
+    if let Ok(endpoint) = std::env::var("FORGE_TEST_S3_ENDPOINT") {
+        S3_ENDPOINT.set(endpoint).ok();
+        return S3_ENDPOINT.get().unwrap();
+    }
     let container = GenericImage::new("versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
@@ -97,10 +102,16 @@ async fn s3_endpoint() -> &'static str {
     S3_ENDPOINT.get().unwrap()
 }
 
-/// A fresh migrated pool over the shared Postgres container.
+/// A fresh migrated pool over the shared Postgres container — or over an
+/// external Postgres when `FORGE_TEST_DATABASE_URL` is set (no Docker).
 pub async fn pool() -> PgPool {
-    let endpoint = pg_endpoint().await;
-    let url = format!("postgres://forge:forge@{endpoint}/forge");
+    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = pg_endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)

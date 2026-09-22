@@ -1012,3 +1012,319 @@ async fn wrong_kind_errors() {
     let err = g.list_versions(&hosted.name, "x").await.unwrap_err();
     assert!(matches!(err, RepoError::WrongKind { .. }));
 }
+
+// ── Proxy-kind members: failure tolerance, precedence, prefer-hosted ────────
+
+/// A scripted stand-in for a proxy member: fixed versions, or a hard failure
+/// (an unreachable upstream).
+struct FakeProxy {
+    versions: Vec<&'static str>,
+    fail: bool,
+}
+
+impl FakeProxy {
+    fn err() -> RepoError {
+        RepoError::Storage("upstream unreachable".into())
+    }
+
+    fn entries(&self) -> Vec<forge_core::repo::VersionEntry> {
+        self.versions
+            .iter()
+            .map(|v| forge_core::repo::VersionEntry {
+                original_id: "Sample".into(),
+                version: (*v).into(),
+                version_original: (*v).into(),
+                listed: true,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl RepoReadOps for FakeProxy {
+    async fn list_versions(
+        &self,
+        _repo: &str,
+        _id: &str,
+    ) -> Result<Vec<forge_core::repo::VersionEntry>, RepoError> {
+        if self.fail {
+            return Err(Self::err());
+        }
+        Ok(self.entries())
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        _repo: &str,
+        _id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        if self.fail {
+            return Err(Self::err());
+        }
+        Ok(self.versions.contains(&version).then(|| NupkgLocation {
+            blob_s3_key: format!("proxy/{version}"),
+            size: 1,
+            content_type: "application/octet-stream".into(),
+        }))
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        if self.fail {
+            return Err(Self::err());
+        }
+        Ok(None)
+    }
+
+    async fn registration(
+        &self,
+        _repo: &str,
+        _id: &str,
+    ) -> Result<Vec<forge_core::repo::RegistrationEntry>, RepoError> {
+        if self.fail {
+            return Err(Self::err());
+        }
+        Ok(self
+            .versions
+            .iter()
+            .map(|v| forge_core::repo::RegistrationEntry {
+                original_id: "Sample".into(),
+                version: (*v).into(),
+                listed: true,
+                package_hash_sha512_base64: None,
+                nuspec_bytes: None,
+            })
+            .collect())
+    }
+
+    async fn search(
+        &self,
+        _repo: &str,
+        _params: &SearchParams,
+    ) -> Result<forge_core::repo::SearchResult, RepoError> {
+        if self.fail {
+            return Err(Self::err());
+        }
+        let versions = self.entries();
+        Ok(forge_core::repo::SearchResult {
+            total_hits: 1,
+            hits: vec![forge_core::repo::SearchHit {
+                original_id: "Sample".into(),
+                latest_version: versions
+                    .last()
+                    .map(|v| v.version.clone())
+                    .unwrap_or_default(),
+                versions,
+            }],
+        })
+    }
+}
+
+/// Hosted members are real; proxy-kind members are [`FakeProxy`] by id.
+struct MixedFactory {
+    hosted: HostedFactory,
+    proxies: HashMap<i64, Arc<FakeProxy>>,
+}
+
+impl MemberOpsFactory for MixedFactory {
+    fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        match self.proxies.get(&member.id) {
+            Some(fake) => Ok(fake.clone()),
+            None => self.hosted.ops_for(member),
+        }
+    }
+}
+
+async fn seed_proxy_member(pool: &PgPool) -> Repository {
+    let mut new = NewRepository::proxy(format!("proxy-{}", common::unique()));
+    new.remote_url = Some("https://upstream.invalid/v3/index.json".into());
+    repository_dao::insert_repository(pool, new)
+        .await
+        .expect("insert proxy member")
+}
+
+async fn set_prefer_hosted(pool: &PgPool, group: &Repository, on: bool) {
+    sqlx::query("UPDATE repository SET config = jsonb_build_object('prefer_hosted', $2::boolean) WHERE id = $1")
+        .bind(group.id)
+        .bind(on)
+        .execute(pool)
+        .await
+        .expect("set prefer_hosted");
+}
+
+fn mixed_group_repo(
+    pool: &PgPool,
+    blobs: StubBlobs,
+    principal: Principal,
+    proxies: HashMap<i64, Arc<FakeProxy>>,
+) -> GroupRepo {
+    let factory = Arc::new(MixedFactory {
+        hosted: HostedFactory {
+            pool: pool.clone(),
+            blobs,
+        },
+        proxies,
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
+        .with_format(Arc::new(NugetFormat::new()))
+}
+
+/// An unreachable proxy member must not break restores of packages another
+/// member can serve; only an all-members failure is an error.
+#[tokio::test]
+async fn failing_member_is_skipped_while_others_answer() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    // The broken proxy has the higher priority.
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+
+    // Plain union semantics, so the proxy is consulted for this id at all.
+    set_prefer_hosted(&pool, &group, false).await;
+    let mut proxies = HashMap::new();
+    proxies.insert(
+        proxy.id,
+        Arc::new(FakeProxy {
+            versions: vec![],
+            fail: true,
+        }),
+    );
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, proxies);
+
+    let versions = g.list_versions(&group.name, "sample").await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert!(g
+        .resolve_nupkg(&group.name, "sample", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        g.registration(&group.name, "sample").await.unwrap().len(),
+        1
+    );
+    let params = SearchParams {
+        q: "sample".into(),
+        ..SearchParams::default()
+    };
+    assert_eq!(g.search(&group.name, &params).await.unwrap().total_hits, 1);
+
+    // A version only the broken member could have is "unknown", not "absent".
+    assert!(g
+        .resolve_nupkg(&group.name, "sample", "9.9.9")
+        .await
+        .is_err());
+}
+
+/// Merged versions follow NuGet precedence, not string order.
+#[tokio::test]
+async fn merged_versions_are_in_precedence_order() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let a = seed_member(&pool, false).await;
+    let b = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, a.id, "Sample", "1.10.0", "a").await;
+    seed_version(&pool, &mut blobs, b.id, "Sample", "1.9.0", "b").await;
+    seed_version(&pool, &mut blobs, b.id, "Sample", "1.9.0-beta", "b").await;
+    repository_dao::add_group_member(&pool, group.id, a.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, b.id, 10)
+        .await
+        .unwrap();
+
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, HashMap::new());
+    let listed: Vec<String> = g
+        .list_versions(&group.name, "sample")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(listed, ["1.9.0-beta", "1.9.0", "1.10.0"]);
+    let reg: Vec<String> = g
+        .registration(&group.name, "sample")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.version)
+        .collect();
+    assert_eq!(reg, ["1.9.0-beta", "1.9.0", "1.10.0"]);
+}
+
+/// Dependency confusion: once a hosted member owns an id, a public proxy's
+/// higher version of the same id is not served (prefer_hosted, default on).
+#[tokio::test]
+async fn prefer_hosted_hides_proxy_versions_of_internal_ids() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+    let mut proxies = HashMap::new();
+    proxies.insert(
+        proxy.id,
+        Arc::new(FakeProxy {
+            versions: vec!["99.0.0"],
+            fail: false,
+        }),
+    );
+
+    // Default (no config key): on.
+    let g = mixed_group_repo(&pool, blobs.clone(), user(&pool).await, proxies.clone());
+    let versions: Vec<String> = g
+        .list_versions(&group.name, "sample")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(versions, ["1.0.0"]);
+    assert!(g
+        .resolve_nupkg(&group.name, "sample", "99.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    let params = SearchParams {
+        q: "sample".into(),
+        ..SearchParams::default()
+    };
+    let hits = g.search(&group.name, &params).await.unwrap().hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].latest_version, "1.0.0");
+
+    // Ids the hosted members do not have still come from the proxy.
+    assert_eq!(
+        g.list_versions(&group.name, "other").await.unwrap().len(),
+        1
+    );
+
+    // Opting out restores plain union semantics.
+    set_prefer_hosted(&pool, &group, false).await;
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, proxies);
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        2
+    );
+}

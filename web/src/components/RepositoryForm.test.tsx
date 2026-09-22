@@ -53,6 +53,27 @@ describe('RepositoryForm', () => {
     expect(body).not.toHaveProperty('upstream_password')
   })
 
+  it('sends prefer_hosted for groups (on by default)', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    await user.type(screen.getByLabelText('Name'), 'my-group')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.getByLabelText(/Prefer hosted packages/)).toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      kind: 'group',
+      prefer_hosted: true,
+    })
+  })
+
   it('blocks submit when the name is empty', async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -106,6 +127,7 @@ describe('RepositoryForm', () => {
       metadata_ttl_seconds: null,
       not_found_ttl_seconds: null,
       allow_redeploy: false,
+      prefer_hosted: false,
     }
     const user = userEvent.setup()
     const onSubmit = vi.fn()

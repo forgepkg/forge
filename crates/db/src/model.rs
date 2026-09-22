@@ -159,7 +159,23 @@ impl Repository {
     pub fn has_upstream_password(&self) -> bool {
         self.upstream_password_enc.is_some() || self.upstream_password.is_some()
     }
+
+    /// Group option (stored in `config.prefer_hosted`, default **on**): when a
+    /// package id exists in a hosted member, versions of that id from proxy
+    /// members are hidden — the dependency-confusion guard. Always `false` for
+    /// non-group repositories.
+    pub fn prefer_hosted(&self) -> bool {
+        self.kind() == RepoKind::Group
+            && self
+                .config
+                .get(PREFER_HOSTED_KEY)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+    }
 }
+
+/// `repository.config` key of [`Repository::prefer_hosted`].
+pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
 
 /// A row of `group_member`.
 #[derive(Debug, Clone, sqlx::FromRow)]
