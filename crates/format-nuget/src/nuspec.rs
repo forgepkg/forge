@@ -348,7 +348,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
         {
             Event::Start(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 match local.as_slice() {
                     b"metadata" => {
                         metadata.min_client_version = attr_local(&e, b"minClientVersion")?;
@@ -383,7 +383,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 path.push(local);
             }
             Event::Empty(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 match local.as_slice() {
                     b"dependency" if in_dependencies => {
                         let dep = parse_dependency(&e)?;
@@ -408,10 +408,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 // Empty elements do not change nesting depth.
             }
             Event::Text(t) => {
-                let text = t
-                    .decode()
-                    .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
-                    .into_owned();
+                let text = t.xml10_content().into_owned();
                 append_text(
                     &path,
                     &text,
@@ -422,10 +419,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 );
             }
             Event::CData(t) => {
-                let text = t
-                    .decode()
-                    .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
-                    .into_owned();
+                let text = t.xml10_content().into_owned();
                 append_text(
                     &path,
                     &text,
@@ -441,10 +435,8 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                         .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
                         .map(String::from)
                 } else {
-                    let name = r
-                        .decode()
-                        .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?;
-                    quick_xml::escape::resolve_predefined_entity(&name).map(str::to_string)
+                    let name: &str = &r;
+                    quick_xml::escape::resolve_predefined_entity(name).map(str::to_string)
                 };
                 if let Some(text) = resolved {
                     append_text(
@@ -458,7 +450,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 if local.as_slice() == b"group" && in_dependencies {
                     if let Some(g) = current_group.take() {
                         groups.push(g);
@@ -584,7 +576,7 @@ fn attr_local(
         let attr = attr.map_err(|err| NupkgError::MalformedNuspec(err.to_string()))?;
         let key = attr.key;
         let key_local = key.local_name();
-        if key_local.as_ref() == local {
+        if key_local.as_ref().as_bytes() == local {
             // Equivalent to the (deprecated) `unescape_value`: decode UTF-8 and
             // resolve the predefined XML entities (`&amp;`, `&lt;`, …).
             let val = attr

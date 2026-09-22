@@ -50,7 +50,7 @@ struct Signer {
 
 impl Signer {
     fn new(kid: &str) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
         let public_key = RsaPublicKey::from(&private_key);
         let n =

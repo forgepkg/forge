@@ -185,13 +185,12 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
 
 /// Hash a plaintext password with argon2id (PHC string), on a blocking thread.
 pub(crate) async fn hash_password(password: String) -> Result<String, Response> {
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::PasswordHasher;
     use argon2::Argon2;
 
     let joined = tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .map(|h| h.to_string())
             .map_err(|e| e.to_string())
     })

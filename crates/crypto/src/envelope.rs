@@ -24,8 +24,8 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::XChaCha20Poly1305;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use zeroize::Zeroizing;
 
 use crate::error::CryptoError;
@@ -216,19 +216,33 @@ pub fn seal_with_key(
 ) -> Result<Vec<u8>, CryptoError> {
     let nonce_len = algorithm.nonce_len();
     let mut nonce = vec![0u8; nonce_len];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .expect("OS random number generator failed");
 
     let payload = Payload {
         msg: plaintext,
         aad,
     };
     let ciphertext = match algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
-            .encrypt(nonce.as_slice().into(), payload)
+        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+            .encrypt(
+                nonce
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CryptoError::MalformedEnvelope("bad nonce length"))?,
+                payload,
+            )
             // RustCrypto's encrypt only fails on absurd input sizes.
             .map_err(|_| CryptoError::MalformedEnvelope("AEAD encryption failed"))?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
-            .encrypt(nonce.as_slice().into(), payload)
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+            .encrypt(
+                nonce
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CryptoError::MalformedEnvelope("bad nonce length"))?,
+                payload,
+            )
             .map_err(|_| CryptoError::MalformedEnvelope("AEAD encryption failed"))?,
     };
 
@@ -263,11 +277,21 @@ pub fn open_with_key(
         aad,
     };
     let plaintext = match header.algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
-            .decrypt(nonce.into(), payload)
+        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+            .decrypt(
+                nonce
+                    .try_into()
+                    .map_err(|_| CryptoError::MalformedEnvelope("bad nonce length"))?,
+                payload,
+            )
             .map_err(|_| CryptoError::DecryptFailed)?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
-            .decrypt(nonce.into(), payload)
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+            .decrypt(
+                nonce
+                    .try_into()
+                    .map_err(|_| CryptoError::MalformedEnvelope("bad nonce length"))?,
+                payload,
+            )
             .map_err(|_| CryptoError::DecryptFailed)?,
     };
     Ok(Zeroizing::new(plaintext))

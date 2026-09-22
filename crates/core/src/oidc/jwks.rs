@@ -770,7 +770,7 @@ mod tests {
     impl TestSigner {
         fn new(kid: &str) -> Self {
             // 2048-bit is the smallest size Entra/AAD uses; fine for a unit test.
-            let mut rng = rand::thread_rng();
+            let mut rng = rsa::rand_core::OsRng;
             let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
             let public_key = RsaPublicKey::from(&private_key);
             let n = base64::engine::general_purpose::URL_SAFE_NO_PAD

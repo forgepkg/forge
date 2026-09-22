@@ -68,5 +68,5 @@ wiremock = "0.6"
 # Generate a throwaway RSA keypair in-test: sign a self-signed ID token and
 # publish its public n/e in a static JWKS. Verifier is exercised end-to-end
 # without touching the network.
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 rand = { workspace = true }

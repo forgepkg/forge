@@ -43,7 +43,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis"], o
 # throwaway RSA key. Mirrors the forge-server route-test harness, but in-process
 # (reachable from the real server's SSRF-guarded client at a loopback address).
 jsonwebtoken = { workspace = true }
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 rand = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }

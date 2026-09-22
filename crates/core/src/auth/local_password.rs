@@ -41,7 +41,7 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+use argon2::PasswordHasher;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use sqlx::PgPool;
 
@@ -67,9 +67,8 @@ impl LocalPasswordProvider {
 fn dummy_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
-            .hash_password(b"forge-timing-equalizer", &salt)
+            .hash_password(b"forge-timing-equalizer")
             .map(|h| h.to_string())
             .unwrap_or_default()
     })
@@ -155,8 +154,7 @@ mod tests {
         let parsed = PasswordHash::new(dummy_hash()).expect("valid PHC string");
         assert_eq!(parsed.algorithm.as_str(), "argon2id");
         // Same parameters as a freshly created user's hash, so the timing matches.
-        let salt = SaltString::generate(&mut OsRng);
-        let real = Argon2::default().hash_password(b"x", &salt).unwrap();
+        let real = Argon2::default().hash_password(b"x").unwrap();
         assert_eq!(parsed.params, real.params);
     }
 

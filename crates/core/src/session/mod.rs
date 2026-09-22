@@ -16,7 +16,7 @@ use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use forge_db::model::Session;
 use forge_db::session_dao::{self, NewSession};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -213,7 +213,7 @@ pub fn csrf_token_matches(presented: &str, session_csrf_secret: &str) -> bool {
 /// cookie value and the per-session CSRF secret.
 fn random_secret() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

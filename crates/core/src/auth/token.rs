@@ -19,7 +19,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
 use chrono::Utc;
 use http::HeaderMap;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -41,7 +41,7 @@ pub fn hash_token(secret: &str) -> String {
 /// is persisted.
 pub fn generate_token_secret() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

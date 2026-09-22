@@ -144,8 +144,8 @@ impl Default for RedisTimeouts {
 impl RedisTimeouts {
     pub(crate) fn manager_config(&self) -> redis::aio::ConnectionManagerConfig {
         redis::aio::ConnectionManagerConfig::new()
-            .set_connection_timeout(self.connect)
-            .set_response_timeout(self.response)
+            .set_connection_timeout(Some(self.connect))
+            .set_response_timeout(Some(self.response))
     }
 }
 

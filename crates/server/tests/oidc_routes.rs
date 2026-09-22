@@ -19,6 +19,11 @@
 
 mod common;
 
+/// Every test seeds the same `[oidc]`-imported auth realm row (one per
+/// database) with its own mock IdP; run them one at a time so a parallel test
+/// cannot swap the issuer under another's login flow.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -39,7 +44,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new(kid: &str) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
         let public_key = RsaPublicKey::from(&private_key);
         let n =
@@ -218,6 +223,7 @@ fn session_cookie_from(set_cookie: &str) -> String {
 
 #[tokio::test]
 async fn login_redirects_to_idp_and_writes_flow_row() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -275,6 +281,7 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
 
 #[tokio::test]
 async fn login_rejects_open_redirect_target() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -309,6 +316,7 @@ async fn login_rejects_open_redirect_target() {
 
 #[tokio::test]
 async fn callback_sets_session_cookie_and_me_recognises_it() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let pool = common::pool().await;
     let srv = start_with(
@@ -390,6 +398,7 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
 
 #[tokio::test]
 async fn callback_rejects_unknown_state() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -415,6 +424,7 @@ async fn callback_rejects_unknown_state() {
 
 #[tokio::test]
 async fn callback_from_another_browser_is_rejected() {
+    let _serial = SERIAL.lock().await;
     // Login CSRF / session swap: the attacker starts a flow in their browser and
     // lures the victim to the callback. The victim has no flow cookie → 400, no
     // session, and the flow row survives for the real initiator.
@@ -466,6 +476,7 @@ async fn callback_from_another_browser_is_rejected() {
 
 #[tokio::test]
 async fn logout_revokes_session_and_clears_cookie() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -617,6 +628,7 @@ async fn login_and_get_cookie(
 
 #[tokio::test]
 async fn auth_me_returns_identity_and_csrf_token() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -658,6 +670,7 @@ async fn auth_me_returns_identity_and_csrf_token() {
 
 #[tokio::test]
 async fn session_can_mint_and_revoke_repository_token() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -738,7 +751,16 @@ async fn session_can_mint_and_revoke_repository_token() {
 
 #[tokio::test]
 async fn auth_routes_absent_when_oidc_disabled() {
+    let _serial = SERIAL.lock().await;
     // No oidc_block ⇒ no OIDC runtime ⇒ /auth/oidc/login is not mounted.
+    // Realms seeded by earlier tests persist in the shared database; remove
+    // them so this test sees an install without OIDC (a later test's boot
+    // re-imports its `[oidc]` block into a fresh row).
+    let pool = common::pool().await;
+    sqlx::query("DELETE FROM auth_realm WHERE kind = 'oidc'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let srv = common::start().await;
     let resp = no_redirect_client()
         .get(format!("{}/auth/oidc/login", srv.base_url))

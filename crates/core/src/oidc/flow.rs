@@ -39,7 +39,7 @@
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use forge_db::oidc_flow_dao::{self, NewOidcFlow};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -400,7 +400,7 @@ fn build_authorize_url(
 /// valid PKCE verifier per RFC 7636.)
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

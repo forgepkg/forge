@@ -31,7 +31,13 @@ use testcontainers_modules::{
 /// Start a dedicated, throwaway Postgres and return a connected (un-migrated)
 /// pool. Each test in this file needs full control over *when* migrations run
 /// relative to seeding, so it cannot share the common migrated container.
-async fn fresh_pool() -> (PgPool, ContainerAsync<Postgres>) {
+///
+/// With `FORGE_TEST_DATABASE_URL` set (no Docker), a fresh empty database is
+/// created on that server instead.
+async fn fresh_pool() -> (PgPool, Option<ContainerAsync<Postgres>>) {
+    if let Ok(admin_url) = std::env::var("FORGE_TEST_DATABASE_URL") {
+        return (fresh_external_database(&admin_url).await, None);
+    }
     let container = Postgres::default()
         .with_db_name("forge")
         .with_user("forge")
@@ -52,7 +58,34 @@ async fn fresh_pool() -> (PgPool, ContainerAsync<Postgres>) {
         .connect(&url)
         .await
         .expect("connect");
-    (pool, container)
+    (pool, Some(container))
+}
+
+/// Create an empty, uniquely named database next to `admin_url` and connect.
+async fn fresh_external_database(admin_url: &str) -> PgPool {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "rbac_migrate_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .expect("connect admin");
+    // The name is generated here, never user input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .execute(&admin)
+        .await
+        .expect("create database");
+    admin.close().await;
+    let (base, _) = admin_url.rsplit_once('/').expect("database url has a path");
+    PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&format!("{base}/{name}"))
+        .await
+        .expect("connect fresh database")
 }
 
 /// Build a [`Migrator`] over the workspace `migrations/` dir.

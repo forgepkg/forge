@@ -1,7 +1,7 @@
 //! Zeroizing newtypes for plaintext secrets and raw key bytes.
 
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use zeroize::Zeroizing;
 
 use crate::error::CryptoError;
@@ -30,7 +30,9 @@ impl KeyBytes {
     /// Generate a fresh random key from the OS CSPRNG.
     pub fn generate() -> Self {
         let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
-        OsRng.fill_bytes(bytes.as_mut());
+        SysRng
+            .try_fill_bytes(bytes.as_mut())
+            .expect("OS random number generator failed");
         KeyBytes(bytes)
     }
 

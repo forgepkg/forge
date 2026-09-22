@@ -16,7 +16,7 @@ mod common;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+use argon2::PasswordHasher;
 use argon2::Argon2;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -38,9 +38,8 @@ fn ip() -> IpAddr {
 
 /// argon2id PHC hash of `password` (mirrors the bootstrap-admin hashing).
 fn hash(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .expect("hash")
         .to_string()
 }
