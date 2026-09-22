@@ -8,13 +8,14 @@
 //! matching the plan's "401 if no/invalid principal" contract.
 //!
 //! ## Capabilities
-//! Slice 1's authorization is binary (`is_admin`), so the capability list is
-//! derived from `is_admin`:
+//! `is_admin` and the capability list come from the **effective RBAC** verdict
+//! ([`forge_core::auth::authz::Authz::is_global_admin`]: the built-in `admin`
+//! role, or the legacy `app_user.is_admin` dual-read fallback) for the calling
+//! principal — the same check the admin API's `require_admin` gate uses, so the
+//! SPA never hides screens from an RBAC admin nor shows them to a demoted one.
+//! A token-scoped principal reports what that token may do.
 //! * every authenticated user can read (`repo.read`);
 //! * an admin additionally gets `repo.admin` / `user.admin` / `token.admin`.
-//!
-//! When §12.4 RBAC lands it refines this list without changing the route shape
-//! or the SPA's consumption of it.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -46,7 +47,7 @@ pub struct MeView {
     pub capabilities: Vec<&'static str>,
 }
 
-/// Derive the capability list for a principal from its admin flag (Slice 1).
+/// Derive the capability list for a principal from its effective admin verdict.
 fn capabilities_for(is_admin: bool) -> Vec<&'static str> {
     if is_admin {
         vec!["repo.read", "repo.admin", "user.admin", "token.admin"]
@@ -73,16 +74,18 @@ pub async fn me(State(state): State<AppState>, req: axum::extract::Request) -> R
     };
 
     // Resolve the live user row so the response reflects the current
-    // username/admin/active state (a token's cached `is_admin` could be stale).
+    // username/active state, and the effective RBAC verdict (not the legacy
+    // column) for admin.
     match user_dao::find_user_by_id(&state.pool, user_id).await {
         Ok(Some(u)) => {
+            let is_admin = state.authz.is_global_admin(&principal).await;
             let view = MeView {
-                is_admin: u.is_admin,
-                capabilities: capabilities_for(u.is_admin),
+                is_admin,
+                capabilities: capabilities_for(is_admin),
                 user: MeUser {
                     id: u.id,
                     username: u.username,
-                    is_admin: u.is_admin,
+                    is_admin,
                     active: u.active,
                 },
             };

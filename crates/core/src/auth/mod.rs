@@ -15,12 +15,15 @@
 //! * [`cred_cache`] — the validated-credential cache (slice 12.3): an HMAC-keyed
 //!   L1/L2 + Postgres cache of upstream verdicts so NuGet's per-request Basic
 //!   auth does not hammer the upstream. Plaintext is never stored; fail-closed.
+//! * [`login_throttle`] — per `(client IP, username)` password-failure lockout
+//!   shared by the browser login and the wire Basic password path.
 
 pub mod authz;
 pub mod chain;
 pub mod client_ip;
 pub mod cred_cache;
 pub mod local_password;
+pub mod login_throttle;
 pub mod principal;
 pub mod provider;
 pub mod session_source;
@@ -38,11 +41,13 @@ pub use cred_cache::{
     ValidatedCredentialCache,
 };
 pub use local_password::LocalPasswordProvider;
+pub use login_throttle::LoginThrottle;
 pub use principal::{Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
 pub use token::{
-    generate_token_secret, hash_token, resolve_principal, verify_password, verify_token, AuthError,
-    BasicAuthSource, PrincipalSource, SourceOutcome, TokenHeaderSource,
+    generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
+    verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,
+    SourceOutcome, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};

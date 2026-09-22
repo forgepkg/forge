@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, kind, name, enabled, priority, config, created_at, updated_at\n        FROM auth_realm\n        WHERE enabled\n        ORDER BY priority\n        ",
+  "query": "\n        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at\n        FROM auth_realm\n        WHERE enabled\n        ORDER BY priority\n        ",
   "describe": {
     "columns": [
       {
@@ -35,11 +35,16 @@
       },
       {
         "ordinal": 6,
+        "name": "secrets_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -54,9 +59,10 @@
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "9fb76cd222eb1b1442c35a324ec7d6cd2edb0bc1095ddee904de7cb08c36a4a7"
+  "hash": "c770ac32f77e48f8588fcfc775f28f373b04c3108f3c22652890262aa9e79f7d"
 }

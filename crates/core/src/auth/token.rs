@@ -26,6 +26,7 @@ use subtle::ConstantTimeEq;
 
 use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
 use super::local_password::LocalPasswordProvider;
+use super::login_throttle::LoginThrottle;
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
 
@@ -179,6 +180,15 @@ pub enum AuthError {
 pub trait PrincipalSource: Send + Sync {
     /// Attempt to resolve a principal from the given headers / peer IP.
     async fn resolve(&self, headers: &HeaderMap, peer_ip: IpAddr) -> SourceOutcome;
+
+    /// Whether this source authenticates from an **ambient** credential — one
+    /// the browser attaches to every request on its own (the session cookie).
+    /// A state-changing request authenticated by an ambient source must also
+    /// prove same-origin intent (the CSRF token); explicit credentials (API
+    /// key, Basic, bearer JWT) cannot be forged cross-site and are exempt.
+    fn is_ambient(&self) -> bool {
+        false
+    }
 }
 
 /// Resolves the `X-NuGet-ApiKey` header as an API token.
@@ -242,6 +252,10 @@ pub struct BasicAuthSource {
     /// `auth_realm` table. `password_chain() == None` reproduces slice-1
     /// `allow_password_basic = false` (password path disabled).
     chain: Arc<dyn ChainSource>,
+    /// Password-failure lockout per `(client IP, username)`, shared with the
+    /// browser login endpoint. Disabled unless wired via
+    /// [`BasicAuthSource::with_throttle`].
+    throttle: Arc<LoginThrottle>,
 }
 
 impl BasicAuthSource {
@@ -275,7 +289,18 @@ impl BasicAuthSource {
     /// Build a source whose chain is re-resolved per attempt (12.7: the
     /// realm-driven server wiring hands in its snapshot-cached source).
     pub fn with_source(pool: PgPool, chain: Arc<dyn ChainSource>) -> Self {
-        Self { pool, chain }
+        Self {
+            pool,
+            chain,
+            throttle: Arc::new(LoginThrottle::disabled()),
+        }
+    }
+
+    /// Enforce a password-failure lockout on the password path (the token
+    /// path is never throttled: token secrets are high-entropy).
+    pub fn with_throttle(mut self, throttle: Arc<LoginThrottle>) -> Self {
+        self.throttle = throttle;
+        self
     }
 }
 
@@ -323,6 +348,12 @@ impl PrincipalSource for BasicAuthSource {
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
         if let Some(chain) = self.chain.password_chain().await {
+            // Too many recent failures for this (IP, username): refuse without
+            // running the chain (no argon2 work, nothing forwarded upstream).
+            if self.throttle.is_locked(peer_ip, &username) {
+                tracing::warn!(%username, ip = %peer_ip, "basic password auth throttled");
+                return SourceOutcome::Invalid;
+            }
             let cred = PasswordCredential {
                 username: &username,
                 password: &secret,
@@ -335,32 +366,42 @@ impl PrincipalSource for BasicAuthSource {
                     // when configured (phase 5).
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
-                            return SourceOutcome::Authenticated(Principal::from_user(up))
+                            self.throttle.record_success(peer_ip, &username);
+                            return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
                         // Vouched-for but no (active) app_user row, or a DB
                         // error during mapping: fail closed. Basic creds were
                         // presented, so this is an attempted-but-failed login
                         // (Invalid → 401), never a downgrade to anonymous.
-                        Ok(None) => return SourceOutcome::Invalid,
+                        Ok(None) => {
+                            self.throttle.record_failure(peer_ip, &username);
+                            return SourceOutcome::Invalid;
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
                             return SourceOutcome::Invalid;
                         }
                     }
                 }
-                // A definitive rejection (wrong local password) or a fail-closed
-                // outage both mean: credentials were presented and not accepted.
-                // Slice 1 mapped a failed password verify to Invalid (→ 401);
-                // we preserve that for Rejected and Unavailable.
-                ChainOutcome::Rejected | ChainOutcome::Unavailable => {
-                    return SourceOutcome::Invalid
+                // A definitive rejection (wrong local password) means:
+                // credentials were presented and not accepted. Slice 1 mapped a
+                // failed password verify to Invalid (→ 401); we preserve that.
+                ChainOutcome::Rejected => {
+                    self.throttle.record_failure(peer_ip, &username);
+                    return SourceOutcome::Invalid;
                 }
+                // A fail-closed outage also denies, but is not the caller's
+                // fault, so it does not count towards the lockout.
+                ChainOutcome::Unavailable => return SourceOutcome::Invalid,
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still
                 // an attempted-but-invalid login — exactly slice 1, where an
                 // unknown username made `verify_password` return `None` and the
                 // basic source fell through to `Invalid`.
-                ChainOutcome::NoCredentials => return SourceOutcome::Invalid,
+                ChainOutcome::NoCredentials => {
+                    self.throttle.record_failure(peer_ip, &username);
+                    return SourceOutcome::Invalid;
+                }
             }
         }
         SourceOutcome::Invalid
@@ -389,10 +430,38 @@ pub async fn resolve_principal(
     client_ip: IpAddr,
     anon: &AnonPolicy,
 ) -> Result<Principal, AuthError> {
+    resolve_principal_with_origin(sources, headers, client_ip, anon)
+        .await
+        .map(|r| r.principal)
+}
+
+/// A resolved principal plus how it was authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPrincipal {
+    /// The resolved principal.
+    pub principal: Principal,
+    /// Whether the winning source was ambient ([`PrincipalSource::is_ambient`],
+    /// i.e. the session cookie). `false` for anonymous / unauthenticated.
+    pub ambient: bool,
+}
+
+/// [`resolve_principal`], also reporting whether the principal came from an
+/// ambient (cookie) credential so the caller can enforce CSRF on it.
+pub async fn resolve_principal_with_origin(
+    sources: &[Box<dyn PrincipalSource>],
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+    anon: &AnonPolicy,
+) -> Result<ResolvedPrincipal, AuthError> {
     let mut saw_invalid = false;
     for source in sources {
         match source.resolve(headers, client_ip).await {
-            SourceOutcome::Authenticated(p) => return Ok(p),
+            SourceOutcome::Authenticated(principal) => {
+                return Ok(ResolvedPrincipal {
+                    principal,
+                    ambient: source.is_ambient(),
+                })
+            }
             // Terminal: the source owns this credential and rejected it.
             SourceOutcome::Reject => return Err(AuthError::Unauthorized),
             SourceOutcome::Invalid => saw_invalid = true,
@@ -404,11 +473,15 @@ pub async fn resolve_principal(
         return Err(AuthError::Unauthorized);
     }
 
-    if anon.allows(client_ip) {
-        Ok(Principal::Anonymous { ip: client_ip })
+    let principal = if anon.allows(client_ip) {
+        Principal::Anonymous { ip: client_ip }
     } else {
-        Ok(Principal::Unauthenticated)
-    }
+        Principal::Unauthenticated
+    };
+    Ok(ResolvedPrincipal {
+        principal,
+        ambient: false,
+    })
 }
 
 #[cfg(test)]
@@ -527,6 +600,59 @@ mod tests {
             vec![Box::new(StubSource(SourceOutcome::NoCredentials))];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
         assert_eq!(res, Ok(Principal::Anonymous { ip: ip() }));
+    }
+
+    /// A stub that reports itself as an ambient (cookie) source.
+    struct AmbientStub(SourceOutcome);
+
+    #[async_trait::async_trait]
+    impl PrincipalSource for AmbientStub {
+        async fn resolve(&self, _h: &HeaderMap, _ip: IpAddr) -> SourceOutcome {
+            self.0
+        }
+        fn is_ambient(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_reports_whether_the_winner_was_ambient() {
+        let authed = Principal::User {
+            user_id: 1,
+            token_id: None,
+            is_admin: false,
+        };
+        // An explicit credential wins before the cookie source: not ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+        ];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
+                .await
+                .unwrap();
+        assert!(!res.ambient);
+
+        // Only the cookie authenticated: ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::NoCredentials)),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+        ];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
+                .await
+                .unwrap();
+        assert_eq!(res.principal, authed);
+        assert!(res.ambient);
+
+        // Anonymous is never ambient.
+        let sources: Vec<Box<dyn PrincipalSource>> =
+            vec![Box::new(AmbientStub(SourceOutcome::NoCredentials))];
+        let res =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All)
+                .await
+                .unwrap();
+        assert!(!res.ambient);
     }
 
     #[tokio::test]

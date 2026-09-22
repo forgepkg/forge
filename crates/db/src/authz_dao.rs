@@ -370,6 +370,43 @@ where
     Ok(())
 }
 
+/// Make the built-in `admin` role membership of `user_id` match `is_admin`
+/// (assign when true, remove when false) — used where an external identity
+/// source is authoritative for admin (an OIDC realm with `admin_groups`, a
+/// credential-forwarding realm with an `admin_group`), so a demotion revokes
+/// the role too and not only the legacy `app_user.is_admin` column. Returns
+/// whether the membership changed (the caller invalidates the user's cached
+/// effective set). A missing built-in role is a no-op.
+pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sqlx::Result<bool> {
+    let Some(role_id) = role_id_by_name(pool, ADMIN_ROLE).await? else {
+        return Ok(false);
+    };
+    let changed = if is_admin {
+        sqlx::query!(
+            r#"
+            INSERT INTO user_role (user_id, role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, role_id) DO NOTHING
+            "#,
+            user_id,
+            role_id,
+        )
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        sqlx::query!(
+            r#"DELETE FROM user_role WHERE user_id = $1 AND role_id = $2"#,
+            user_id,
+            role_id,
+        )
+        .execute(pool)
+        .await?
+        .rows_affected()
+    };
+    Ok(changed > 0)
+}
+
 /// Insert a repository-privilege grant for a role. `repository_id = None` ⇒ ANY
 /// repo; `selector_id = None` ⇒ unscoped. Idempotent via the unique index
 /// (COALESCE-folded NULLs). Accepts any executor.
@@ -794,18 +831,40 @@ pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
 }
 
 /// Re-apply the idempotent behavior-preserving legacy mapping (the same
-/// PL/pgSQL routine migration 0007 installs and runs once). Safe to call on
-/// every boot: it maps is_admin→admin role, anonymous_read→anonymous read
-/// grants, and — only when `legacy_open_access` is set — assigns the
-/// `authenticated` role to every user. All writes are upserts, so a no-op once
-/// applied. The boot path calls this so rows that arrive after the one-shot
-/// migration (a late anonymous_read flip, a manually-added user on a legacy
-/// install) are folded in without a new migration.
+/// PL/pgSQL routine migration 0007 installs and runs once): is_admin→admin
+/// role, anonymous_read→anonymous read grants, and — only when
+/// `legacy_open_access` is set — the `authenticated` role for every user. All
+/// writes are upserts.
+///
+/// **Not for the boot path**: re-running it would re-grant anything an
+/// operator revoked through RBAC since (the routine only ever adds). Boot uses
+/// [`apply_legacy_migration_once`].
 pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
     sqlx::query!(r#"SELECT forge_rbac_apply_legacy_migration()"#)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// The `forge_setting` key marking the legacy RBAC synthesis as done.
+pub const LEGACY_RBAC_SYNCED_KEY: &str = "legacy_rbac_synced";
+
+/// Run [`apply_legacy_migration`] exactly once per install, then record
+/// [`LEGACY_RBAC_SYNCED_KEY`] so later boots never re-synthesize grants an
+/// operator has since revoked. Returns whether the mapping ran now.
+///
+/// Rows that arrive later need no re-sync: `anonymous_read` is honored
+/// directly by the authz seam, the `is_admin` column is a dual-read fallback,
+/// and new users on a legacy-open install get `authenticated` at creation
+/// ([`assign_authenticated_if_legacy_open`]). Two instances booting together
+/// may both apply it — harmless, every write is an idempotent upsert.
+pub async fn apply_legacy_migration_once(pool: &PgPool) -> sqlx::Result<bool> {
+    if get_setting(pool, LEGACY_RBAC_SYNCED_KEY).await?.as_deref() == Some("true") {
+        return Ok(false);
+    }
+    apply_legacy_migration(pool).await?;
+    set_setting(pool, LEGACY_RBAC_SYNCED_KEY, "true").await?;
+    Ok(true)
 }
 
 /// Per-creation half of the `legacy_open_access` rule: when this install opted

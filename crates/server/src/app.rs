@@ -38,7 +38,9 @@ use crate::web_ui::spa_service;
 /// the chain on every attempt, so admin realm edits apply without a restart
 /// (and the wire path stays disabled unless `auth.allow_password_basic` or an
 /// enabled credential-forwarding realm allows it). The session source is
-/// always mounted — local password logins mint sessions too.
+/// always mounted — local password logins mint sessions too — and every
+/// state-changing request it authenticates must carry the session's CSRF
+/// token (enforced by [`attach_principal`]).
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -52,10 +54,10 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
             pool.clone(),
         )),
         Box::new(TokenHeaderSource::new(pool.clone())),
-        Box::new(BasicAuthSource::with_source(
-            pool.clone(),
-            state.realms.clone(),
-        )),
+        Box::new(
+            BasicAuthSource::with_source(pool.clone(), state.realms.clone())
+                .with_throttle(state.login_throttle.clone()),
+        ),
         Box::new(SessionCookieSource::new(
             state.sessions.clone(),
             pool.clone(),
@@ -71,6 +73,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         sources: Arc::new(sources),
         trusted_proxies: Arc::new(trusted),
         anon: Arc::new(anon),
+        // Cookie-authenticated mutations must carry the session's CSRF token.
+        sessions: Some(state.sessions.clone()),
     })
 }
 
@@ -192,30 +196,35 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
 /// One-shot import of the legacy `[oidc]` / `[auth.upstream_basic]` config
 /// blocks into `auth_realm` rows (12.7). Delegates to
 /// [`crate::auth::seed_auth_realms`]; call on every boot — a `forge_setting`
-/// marker makes it a no-op after the first import.
-pub async fn ensure_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
-    crate::auth::seed_auth_realms(config, pool)
+/// marker makes it a no-op after the first import. Pass the (bootstrapped)
+/// envelope service when secret encryption is enabled so seeded realm secrets
+/// are encrypted at rest.
+pub async fn ensure_auth_realms(
+    config: &Config,
+    pool: &PgPool,
+    envelope: Option<&forge_crypto::service::EnvelopeService>,
+) -> anyhow::Result<()> {
+    crate::auth::seed_auth_realms(config, pool, envelope)
         .await
         .context("seed auth realms")
 }
 
-/// Re-apply the idempotent behavior-preserving RBAC legacy mapping on boot
+/// Apply the behavior-preserving RBAC legacy mapping **once** per install
 /// (§12.4 Phase 5).
 ///
-/// Migration `0007` already ran this once and recorded the install-wide
-/// `legacy_open_access` default (open on upgrade, closed on a fresh install).
-/// Calling it again here folds in rows that arrived *after* that migration —
-/// e.g. a repository whose `anonymous_read` was flipped on, an `is_admin` user
-/// created out-of-band, or (on a legacy-open install) any newly-created user
-/// that should inherit the `authenticated` role. Every write is an idempotent
-/// upsert, so on a fresh / already-converged install this is a cheap no-op.
-///
-/// It never *opens* a fresh install: the `authenticated` auto-assignment inside
-/// the routine is gated on the `legacy_open_access` setting, which is `false`
-/// for fresh installs.
+/// Migration `0007` ran it and recorded the install-wide `legacy_open_access`
+/// default (open on upgrade, closed on a fresh install). This boot hook runs it
+/// one more time for installs that upgraded before the one-shot marker existed,
+/// then records the `legacy_rbac_synced` marker: re-running it on every boot
+/// would re-grant admin roles / anonymous grants an operator has since revoked
+/// through RBAC (the routine only ever adds). It never *opens* a fresh install:
+/// the `authenticated` auto-assignment is gated on `legacy_open_access`.
 pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
-    authz_dao::apply_legacy_migration(pool)
+    if authz_dao::apply_legacy_migration_once(pool)
         .await
-        .context("apply legacy RBAC migration")?;
+        .context("apply legacy RBAC migration")?
+    {
+        tracing::info!("applied the one-shot legacy RBAC mapping");
+    }
     Ok(())
 }

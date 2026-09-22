@@ -328,6 +328,55 @@ async fn apply_legacy_migration_is_idempotent() {
         .is_some());
 }
 
+/// P1.2: the boot hook applies the legacy mapping only ONCE per install, so an
+/// admin role an operator revokes through RBAC is not silently re-synthesized
+/// from the legacy `is_admin` column on the next restart.
+#[tokio::test]
+async fn boot_sync_runs_once_so_revocations_stick() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0006");
+    let admin_user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('a', 'x', true) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed admin");
+    migrator().await.run(&pool).await.expect("migrate all");
+
+    // First boot: runs (the marker is absent) and records the marker.
+    assert!(authz_dao::apply_legacy_migration_once(&pool)
+        .await
+        .expect("first boot"));
+    assert_eq!(
+        authz_dao::get_setting(&pool, authz_dao::LEGACY_RBAC_SYNCED_KEY)
+            .await
+            .expect("setting")
+            .as_deref(),
+        Some("true")
+    );
+
+    // The operator revokes the synthesized admin role.
+    let admin_role = authz_dao::role_id_by_name(&pool, ADMIN_ROLE)
+        .await
+        .expect("query")
+        .expect("admin role");
+    authz_dao::unassign_role(&pool, admin_user, admin_role)
+        .await
+        .expect("revoke");
+
+    // Later boots are no-ops: the revocation sticks.
+    assert!(!authz_dao::apply_legacy_migration_once(&pool)
+        .await
+        .expect("second boot"));
+    assert!(!authz_dao::user_has_role(&pool, admin_user, ADMIN_ROLE)
+        .await
+        .expect("query"));
+}
+
 /// §12.4 Phase 5 per-creation semantics: on an UPGRADED (legacy_open_access)
 /// install a user created *after* boot — by the admin API, OIDC/upstream
 /// auto-provision — must inherit the `authenticated` role *immediately* via

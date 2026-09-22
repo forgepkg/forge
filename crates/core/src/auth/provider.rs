@@ -20,7 +20,9 @@
 //!   caller denies access. An unreachable upstream must not open a hole.
 //! * [`AuthOutcome::Rejected`] (a definitive "no", e.g. upstream 401) does not
 //!   stop the chain — a user may be local *or* upstream — but on its own never
-//!   grants access.
+//!   grants access. The exception is a **local** rejection (a local account with
+//!   a password owns the username): it is terminal, so the password is never
+//!   forwarded upstream.
 //! * [`AuthOutcome::Skip`] ("not my user") simply advances to the next provider.
 
 use std::fmt;
@@ -103,9 +105,15 @@ pub struct ProvenIdentity {
     pub external_subject: Option<String>,
     /// Raw upstream groups/roles (coarse). Empty for local.
     pub groups: Vec<String>,
-    /// Whether an admin-group mapping suggests this identity is an admin. Only
-    /// ever used to *grant* admin on provision, never to revoke (see §12.3).
+    /// Whether an admin-group mapping suggests this identity is an admin.
     pub suggested_is_admin: bool,
+    /// Whether [`Self::suggested_is_admin`] is an **authoritative** reading of
+    /// the upstream's admin state: the realm configures an admin mapping AND the
+    /// groups were freshly fetched for this login (not a cache hit, which
+    /// carries no groups). Only then may provisioning *revoke* admin; otherwise
+    /// the suggestion is ignored for existing users (see
+    /// [`super::chain::provision_and_map`]). Always `false` for local.
+    pub admin_authoritative: bool,
     /// Whether the vouching provider is configured to auto-provision an
     /// `app_user` for this identity on first success (12.7: per-realm — each
     /// credential-forwarding realm carries its own flag, so the chain caller no
@@ -126,6 +134,7 @@ impl ProvenIdentity {
             external_subject: None,
             groups: Vec::new(),
             suggested_is_admin: false,
+            admin_authoritative: false,
             auto_provision: false,
             realm_id: None,
         }
@@ -139,7 +148,8 @@ pub enum AuthOutcome {
     /// First `Authenticated` in the chain wins.
     Authenticated(ProvenIdentity),
     /// The provider definitively rejected the credential (e.g. upstream 401,
-    /// wrong local password). Does **not** stop the chain, but never grants.
+    /// wrong local password). Never grants; terminal when the provider's source
+    /// is [`AuthSource::Local`], otherwise the chain continues.
     Rejected,
     /// The provider can't decide — typically "this username isn't mine".
     /// The chain advances to the next provider.
@@ -189,6 +199,7 @@ mod tests {
         assert!(id.external_subject.is_none());
         assert!(id.groups.is_empty());
         assert!(!id.suggested_is_admin);
+        assert!(!id.admin_authoritative);
         assert!(!id.auto_provision);
         assert!(id.realm_id.is_none());
     }

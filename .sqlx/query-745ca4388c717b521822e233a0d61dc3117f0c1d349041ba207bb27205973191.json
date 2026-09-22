@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO auth_realm (kind, name, enabled, priority, config)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING id, kind, name, enabled, priority, config, created_at, updated_at\n        ",
+  "query": "\n        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at\n        FROM auth_realm\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -35,22 +35,23 @@
       },
       {
         "ordinal": 6,
+        "name": "secrets_enc",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
-        "Bool",
-        "Int4",
-        "Jsonb"
+        "Int8"
       ]
     },
     "nullable": [
@@ -60,9 +61,10 @@
       false,
       false,
       false,
+      true,
       false,
       false
     ]
   },
-  "hash": "0808ddc47361d85d2d5740d3c86d386132cc5527d78ade99360c34486d66f8d8"
+  "hash": "745ca4388c717b521822e233a0d61dc3117f0c1d349041ba207bb27205973191"
 }

@@ -1,3 +1,6 @@
+import { queryOptions } from '@tanstack/react-query'
+
+import { getCsrfToken, setSession } from '~/lib/auth'
 import { httpClient } from '~/lib/httpClient'
 
 /**
@@ -61,6 +64,7 @@ export interface AuthSession {
 /** Query-key factory for the public auth resources. */
 export const authKeys = {
   loginOptions: () => ['auth', 'login-options'] as const,
+  session: () => ['auth', 'session'] as const,
 }
 
 /** `GET /auth/login-options` — public; how the login screen should render. */
@@ -85,6 +89,40 @@ export function login(body: {
 export function fetchAuthSession(signal?: AbortSignal): Promise<AuthSession> {
   return httpClient.get<AuthSession>('/auth/me', { signal })
 }
+
+/**
+ * Refresh the stored CSRF token from the live cookie session (`GET /auth/me`).
+ *
+ * An OIDC sign-in ends with a server redirect that only sets the httpOnly
+ * cookie, and a token stored by an earlier session can be stale, so the app
+ * shell calls this once per load: without the current token every mutating
+ * request (and logout) would be refused. Best-effort — any failure resolves
+ * to `null` and leaves the stored token alone (a 401 already clears it in
+ * `httpClient`).
+ */
+export async function syncAuthSession(
+  signal?: AbortSignal,
+): Promise<AuthSession | null> {
+  try {
+    const session = await fetchAuthSession(signal)
+    if (getCsrfToken() !== session.csrf_token) setSession(session.csrf_token)
+    return session
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Query options wrapping {@link syncAuthSession}: fetched once per app load
+ * (never stale), shared by the app-shell guard. Removed on sign-out so the
+ * next session syncs again.
+ */
+export const authSessionQueryOptions = queryOptions<AuthSession | null>({
+  queryKey: authKeys.session(),
+  queryFn: ({ signal }) => syncAuthSession(signal),
+  staleTime: Infinity,
+  retry: false,
+})
 
 /** `POST /auth/logout` — invalidate the cookie session (CSRF-guarded). */
 export function logout(): Promise<void> {

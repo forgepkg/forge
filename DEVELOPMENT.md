@@ -55,7 +55,10 @@ the full command list.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
 > automatically. A bootstrap admin **`admin` / `changeme`** is created (the server
-> logs a warning while that seeded password is in use).
+> logs a warning while that seeded password is in use). These placeholder
+> credentials (and the `minioadmin` S3 keys) are only accepted because the dev
+> `forge.toml` sets `server.allow_insecure_defaults = true`; without it the
+> server refuses to start with them.
 
 ### Add demo data (optional)
 
@@ -198,6 +201,8 @@ Key knobs:
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
 | `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
 | `auth.bootstrap_admin` | First-run admin username/password. |
+| `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme`/empty or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
+| `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. |
 
 > **Anonymous reads need both** `anonymous_mode` *and* the repo's `anonymous_read=true`
@@ -301,12 +306,16 @@ admin_groups  = ["forge-admins"]
 admin_claim   = "roles"
 ```
 
-`is_admin` is **recomputed on every login** from the current claims (a user
+When `admin_groups` is set, admin is **recomputed on every login** from the
+current claims — both the legacy flag and the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
-downgraded mid-session). With `auto_provision = true` (default) a first-time
-login creates an `app_user`; `link_existing_by_username = true` lets the matching
-Entra identity claim an existing local user (the **bootstrap admin** interplay) —
-set it `false` if the username claim is not trustworthy.
+downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
+OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
+true` (default) a first-time login creates an `app_user`;
+`link_existing_by_username` is **off by default** — when enabled it links a new
+identity to an existing user of the same name, but never to an account that has
+a local password or is an admin, and an email claim is only used as the
+username when `email_verified` is true.
 
 ### Multi-instance / scale-out
 
@@ -422,10 +431,13 @@ Later versions that use the same lease and key protocol may again be deployed
 with the operator's normal rolling strategy.
 
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=all`,
-`allow_password_basic`, bootstrap admin `admin/changeme`). Override anything via
-`FORGE_*` env vars (double-underscore nesting). Required at runtime (no safe
-default):
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
+anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
+`allow_password_basic`, bootstrap admin `admin` with a placeholder password).
+The placeholder credentials (`minioadmin` S3 keys, `changeme`) are **refused at
+startup** unless overridden; only the dev compose stack sets
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true`. Override anything via `FORGE_*`
+env vars (double-underscore nesting). Required at runtime (no safe default):
 
 | Env var | Example |
 | --- | --- |
@@ -435,5 +447,7 @@ default):
 | `FORGE_S3__ACCESS_KEY` | `…` |
 | `FORGE_S3__SECRET_KEY` | `…` |
 
+| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | a real password (the placeholder is refused) |
+
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
-URLs) and `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` (change the seeded password).
+URLs).

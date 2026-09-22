@@ -399,8 +399,14 @@ pub struct AuthRealm {
     /// Total order (unique): lower tries first.
     pub priority: i32,
     /// Kind-specific configuration. May contain secrets — never serialize this
-    /// field into an API response as-is.
+    /// field into an API response as-is. With secret encryption enabled the
+    /// secret keys are stripped from here and live in [`Self::secrets_enc`].
     pub config: JsonValue,
+    /// Envelope-encrypted JSON object of the realm's secret config keys (P1.5),
+    /// AAD-bound to this row. `None` ⇒ secrets (if any) are the legacy
+    /// plaintext keys in [`Self::config`]. Read via
+    /// [`crate::secret_dao::realm_config`].
+    pub secrets_enc: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

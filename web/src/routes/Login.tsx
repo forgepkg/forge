@@ -26,6 +26,8 @@ interface LoginSearch {
   redirect?: string
   /** Set when the session expired mid-use (the guard / a 401 redirected here). */
   expired?: boolean
+  /** Set when sign-out could not be confirmed by the server. */
+  logout_failed?: boolean
 }
 
 const passwordFallbackOptions: LoginOptions = {
@@ -39,6 +41,8 @@ export const Route = createFileRoute('/login')({
   validateSearch: (search: Record<string, unknown>): LoginSearch => ({
     redirect: typeof search.redirect === 'string' ? search.redirect : undefined,
     expired: search.expired === true || search.expired === 'true',
+    logout_failed:
+      search.logout_failed === true || search.logout_failed === 'true',
   }),
 })
 
@@ -60,7 +64,7 @@ export const Route = createFileRoute('/login')({
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired } = useSearch({ from: '/login' })
+  const { redirect, expired, logout_failed } = useSearch({ from: '/login' })
   const options = useQuery<LoginOptions, ApiError>({
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
@@ -91,6 +95,16 @@ function Login() {
             className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
           >
             Your session expired. Sign in again to continue.
+          </p>
+        )}
+
+        {logout_failed && (
+          <p
+            role="alert"
+            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
+          >
+            Sign-out could not be confirmed by the server, so your session may
+            still be active. Sign in and sign out again, or close the browser.
           </p>
         )}
 

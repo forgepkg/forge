@@ -38,8 +38,8 @@ use sqlx::PgPool;
 
 pub use claims::{map_claims, ClaimMapping, MappedClaims};
 pub use flow::{
-    begin_login, complete_login, BeginLogin, CallbackParams, ClientParams, FlowError,
-    ValidatedLogin,
+    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientParams,
+    FlowError, ValidatedLogin,
 };
 pub use jwks::{
     DiscoveryDocument, IdTokenClaims, OidcError, OidcMetadataClient, Verified, VerifyParams,
@@ -75,10 +75,11 @@ pub enum ResolveError {
 pub struct ResolvePolicy {
     /// Create a fresh `app_user` on first login when no link/match exists.
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local `app_user` whose `username`
-    /// equals the resolved username claim (bootstrap-admin interplay). Risky if
-    /// the username claim is attacker-influenced — operators set this `false` in
-    /// hardened deployments.
+    /// Link a *new* OIDC identity to an existing `app_user` whose `username`
+    /// equals the resolved username claim. **Off by default**: the username
+    /// claim is IdP-controlled and often user-editable. Even when enabled, a
+    /// user with a local password or with admin rights is never linked this
+    /// way (see [`resolve_user`]).
     pub link_existing_by_username: bool,
 }
 
@@ -86,7 +87,7 @@ impl Default for ResolvePolicy {
     fn default() -> Self {
         Self {
             auto_provision: true,
-            link_existing_by_username: true,
+            link_existing_by_username: false,
         }
     }
 }
@@ -96,10 +97,16 @@ impl Default for ResolvePolicy {
 ///
 /// Order:
 /// 1. **Existing link** `(issuer, subject)` → load that user, recompute admin,
-///    refresh the denormalized identity claims.
-/// 2. **No link, matching local username** + `link_existing_by_username` → link
-///    the existing user (bootstrap-admin interplay), recompute admin.
-/// 3. **No link, no match** + `auto_provision` → create a no-password user, link.
+///    refresh the denormalized identity claims. This stable, issuer-scoped key
+///    is the identity of an OIDC user — never the username or email.
+/// 2. **No link, matching username** + `link_existing_by_username` (off by
+///    default) → link the existing user, but **only** if it has no local
+///    password and is not an admin (column or `admin` role): a colliding
+///    `preferred_username` must never take over a password account or an
+///    administrator. Otherwise fall through (a fresh, suffixed user is
+///    provisioned instead).
+/// 3. **No link, no linkable match** + `auto_provision` → create a no-password
+///    user, link.
 /// 4. **Else** → [`ResolveError::NotProvisioned`].
 ///
 /// In every path the resolved user's `active` flag is enforced
@@ -123,16 +130,26 @@ pub async fn resolve_user(
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?
     {
-        return finalize(pool, user, login, &identity_claims, mapped.is_admin).await;
+        return finalize(pool, user, login, &identity_claims, mapped).await;
     }
 
-    // 2. No link, but a local user already owns this username → link it.
+    // 2. No link, but an existing user owns this username → link it, unless
+    //    it is a password account or an admin (never linkable by name).
     if policy.link_existing_by_username {
         if let Some(user) = user_dao::find_user_by_username(pool, &mapped.username)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?
         {
-            return finalize(pool, user, login, &identity_claims, mapped.is_admin).await;
+            let is_admin_role = authz_dao::user_has_role(pool, user.id, authz_dao::ADMIN_ROLE)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?;
+            if user.password_hash.is_none() && !user.is_admin && !is_admin_role {
+                return finalize(pool, user, login, &identity_claims, mapped).await;
+            }
+            tracing::warn!(
+                username = %mapped.username,
+                "oidc login not linked by username: target has a password or is an admin"
+            );
         }
     }
 
@@ -160,13 +177,13 @@ pub async fn resolve_user(
         // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
         // freshly auto-provisioned OIDC user must inherit the `authenticated` role
         // immediately so it has the slice-1 "read/write everywhere" reach —
-        // `ensure_legacy_rbac` only folds in new users at the next boot. The
+        // `ensure_legacy_rbac` runs only once per install. The
         // assignment is idempotent and gated on the install-wide flag, so a fresh
         // (fail-closed) install leaves the user with no automatic grants.
         authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?;
-        return finalize(pool, user, login, &identity_claims, mapped.is_admin).await;
+        return finalize(pool, user, login, &identity_claims, mapped).await;
     }
 
     // 4. No link, no match, no provisioning → reject.
@@ -174,24 +191,38 @@ pub async fn resolve_user(
 }
 
 /// Common tail for every resolution branch: enforce `active`, recompute
-/// `is_admin` from the current claims, refresh the `external_identity` link
-/// (insert or update denormalized claims + `last_login_at`).
+/// admin from the current claims (when the IdP is authoritative for it),
+/// refresh the `external_identity` link (insert or update denormalized claims +
+/// `last_login_at`).
 async fn finalize(
     pool: &PgPool,
     user: AppUser,
     login: &ValidatedLogin,
     identity_claims: &IdentityClaims,
-    is_admin: bool,
+    mapped: &MappedClaims,
 ) -> Result<AppUser, ResolveError> {
     if !user.active {
         return Err(ResolveError::Inactive);
     }
 
-    // Recompute admin on every login so IdP grant/revoke takes effect.
-    let user = if user.is_admin != is_admin {
-        user_dao::update_is_admin(pool, user.id, is_admin)
+    // Recompute admin on every login so IdP grant/revoke takes effect — but
+    // only when the realm maps admin groups; otherwise admins are managed
+    // locally and a login must not touch them. Both the legacy column and the
+    // built-in `admin` role follow the claim, so a demotion also removes the
+    // role (the column alone is only a dual-read fallback). The caller
+    // invalidates the user's cached effective set.
+    let user = if mapped.admin_managed {
+        let user = if user.is_admin != mapped.is_admin {
+            user_dao::update_is_admin(pool, user.id, mapped.is_admin)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?
+        } else {
+            user
+        };
+        authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
             .await
-            .map_err(|e| ResolveError::Db(e.to_string()))?
+            .map_err(|e| ResolveError::Db(e.to_string()))?;
+        user
     } else {
         user
     };
@@ -214,8 +245,8 @@ async fn finalize(
 
 /// Find a free username, suffixing `-2`, `-3`, … on collision so auto-provision
 /// never fails the unique constraint. (Only reached when there is no existing
-/// `(issuer, subject)` link, so a collision means a *different* local account
-/// already owns the base name and linking was disabled.)
+/// `(issuer, subject)` link, so a collision means a *different* account
+/// already owns the base name and was not linked.)
 async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveError> {
     if user_dao::find_user_by_username(pool, base)
         .await

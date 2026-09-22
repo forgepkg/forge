@@ -78,6 +78,13 @@ pub struct ServerConfig {
     /// limit yields HTTP 413. Default 512 MiB.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
+    /// Permit starting with **known-insecure placeholder credentials** (the
+    /// `changeme` / empty bootstrap-admin password, `minioadmin` S3 keys).
+    /// Default `false`: such a config refuses to start, so a copied dev config
+    /// or the image's baked defaults never reach production unnoticed. Set
+    /// `true` only for local development / compose stacks.
+    #[serde(default)]
+    pub allow_insecure_defaults: bool,
 }
 
 fn default_max_upload_bytes() -> u64 {
@@ -237,6 +244,23 @@ pub struct AuthConfig {
     /// window. Keep small — the rebuild is two cheap queries.
     #[serde(default = "default_realm_cache_ttl")]
     pub realm_cache_ttl_seconds: u64,
+    /// Failed password attempts allowed per `(client IP, username)` within
+    /// [`Self::login_failure_window_seconds`] before further attempts are
+    /// refused until the window lapses (browser login and Basic password auth;
+    /// per instance, in memory). `0` disables the lockout.
+    #[serde(default = "default_login_max_failures")]
+    pub login_max_failures: u32,
+    /// Length (seconds) of the password-failure window / lockout.
+    #[serde(default = "default_login_failure_window")]
+    pub login_failure_window_seconds: u64,
+}
+
+fn default_login_max_failures() -> u32 {
+    10
+}
+
+fn default_login_failure_window() -> u64 {
+    300
 }
 
 fn default_login_mode() -> String {
@@ -803,11 +827,11 @@ pub struct OidcConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local `app_user` whose `username`
-    /// matches the resolved username claim (bootstrap-admin interplay). Risky if
-    /// the username claim is attacker-influenced — set `false` in hardened
-    /// deployments.
-    #[serde(default = "default_true")]
+    /// Link a new OIDC identity to an existing `app_user` whose `username`
+    /// matches the resolved username claim. Off by default (the claim is
+    /// IdP-controlled); even when on, accounts with a local password or admin
+    /// rights are never linked by name.
+    #[serde(default)]
     pub link_existing_by_username: bool,
 
     // ---- admin assignment ----
@@ -1140,6 +1164,7 @@ impl Config {
         self.validate_crypto()?;
         self.proxy.validate()?;
         self.validate_workers()?;
+        self.validate_insecure_defaults()?;
         if self.server.max_upload_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "server.max_upload_bytes must be greater than 0".into(),
@@ -1200,6 +1225,38 @@ impl Config {
             )?;
         }
         Ok(())
+    }
+
+    /// Refuse known-insecure placeholder credentials unless
+    /// `server.allow_insecure_defaults` opts in (dev/compose only): a
+    /// `changeme` or empty bootstrap-admin password, or `minioadmin` S3 keys.
+    fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
+        let mut found = Vec::new();
+        if let Some(ba) = &self.auth.bootstrap_admin {
+            let pw = ba.password.trim();
+            if pw.is_empty() || pw.eq_ignore_ascii_case("changeme") {
+                found.push("auth.bootstrap_admin.password is a placeholder (\"changeme\"/empty)");
+            }
+        }
+        if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
+            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults");
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        if self.server.allow_insecure_defaults {
+            for issue in &found {
+                tracing::warn!(%issue, "starting with insecure default credentials (server.allow_insecure_defaults = true)");
+            }
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "refusing to start with insecure default credentials: {}; set real secrets \
+             (e.g. FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD, FORGE_S3__ACCESS_KEY / \
+             FORGE_S3__SECRET_KEY) or, for local development only, \
+             server.allow_insecure_defaults = true (FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true)",
+            found.join("; ")
+        )))
     }
 
     /// Validate the optional `[crypto]` section when present and enabled
@@ -1834,7 +1891,10 @@ mod tests {
         assert_eq!(oidc.email_claim, "email");
         assert_eq!(oidc.display_name_claim, "name");
         assert!(oidc.auto_provision);
-        assert!(oidc.link_existing_by_username);
+        assert!(
+            !oidc.link_existing_by_username,
+            "linking by username is opt-in"
+        );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
         assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);
@@ -2115,12 +2175,41 @@ mod tests {
     fn bootstrap_admin_parsed() {
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"s3cret-Pw!\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         let ba = cfg.auth.bootstrap_admin.expect("present");
         assert_eq!(ba.username, "admin");
-        assert_eq!(ba.password, "changeme");
+        assert_eq!(ba.password, "s3cret-Pw!");
+        assert!(!cfg.server.allow_insecure_defaults, "off by default");
+    }
+
+    #[test]
+    fn insecure_default_credentials_refused_unless_allowed() {
+        for (from, to) in [
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            ),
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
+            ),
+            ("access_key = \"test\"", "access_key = \"minioadmin\""),
+            ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
+        ] {
+            let toml = MINIMAL.replace(from, to);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains("insecure default"), "{err}");
+
+            // The explicit dev opt-in lets it start.
+            let allowed = toml.replace(
+                "public_base_url = \"https://forge.example.com/\"",
+                "public_base_url = \"https://forge.example.com/\"\nallow_insecure_defaults = true",
+            );
+            let cfg = Config::from_figment(fig_from_toml(&allowed)).expect("dev opt-in");
+            assert!(cfg.server.allow_insecure_defaults);
+        }
     }
 
     // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────

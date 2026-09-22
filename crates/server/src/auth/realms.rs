@@ -12,6 +12,12 @@
 //!   writes invalidate the local snapshot immediately; other instances
 //!   converge within `auth.realm_cache_ttl_seconds` (the table is the shared
 //!   authority — no in-memory-only state, no advisory locks);
+//! * **secrets at rest** (review P1.5): with `[crypto]` enabled the secret
+//!   keys of a realm config are stripped from the stored jsonb and sealed into
+//!   `auth_realm.secrets_enc` via [`forge_db::secret_dao`]; every reader goes
+//!   through the *logical* config ([`forge_db::secret_dao::realm_config`]),
+//!   legacy plaintext rows keep working and are re-encrypted on write / by the
+//!   crypto backfill;
 //! * the **legacy-config import** ([`seed_auth_realms`]): the 12.2 `[oidc]`
 //!   and 12.3 `[auth.upstream_basic]` TOML blocks become realm rows, with
 //!   drift detection — a changed block keeps re-applying only while the row is
@@ -33,8 +39,9 @@ use forge_core::auth::{
     ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
+use forge_crypto::service::EnvelopeService;
 use forge_db::model::AuthRealm;
-use forge_db::{auth_realm_dao, authz_dao};
+use forge_db::{auth_realm_dao, authz_dao, secret_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
@@ -153,8 +160,9 @@ pub struct OidcRealmConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local user by username.
-    #[serde(default = "default_true")]
+    /// Link a new OIDC identity to an existing user by username. Off by
+    /// default; password accounts and admins are never linked by name.
+    #[serde(default)]
     pub link_existing_by_username: bool,
     /// Group/role values that grant `is_admin` (empty ⇒ never).
     #[serde(default)]
@@ -229,8 +237,9 @@ fn default_admin_claim() -> String {
 
 // ─── validation / redaction / secret merge ──────────────────────────────────
 
-/// Which json keys of a realm `config` are secrets (write-only, redacted).
-fn secret_keys(kind: &str) -> &'static [&'static str] {
+/// Which json keys of a realm `config` are secrets (write-only, redacted,
+/// encrypted at rest when `[crypto]` is enabled).
+pub fn secret_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         KIND_OIDC => &["client_secret"],
         KIND_CRED_FORWARD => &["key_pepper"],
@@ -401,6 +410,8 @@ pub struct RealmAuth {
     config: Arc<Config>,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
+    /// Decrypts `auth_realm.secrets_enc` when secret encryption is enabled.
+    envelope: Option<Arc<EnvelopeService>>,
 }
 
 impl RealmAuth {
@@ -413,7 +424,15 @@ impl RealmAuth {
             config,
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
+            envelope: None,
         }
+    }
+
+    /// Attach the secret-encryption service so encrypted realm secrets can be
+    /// read (`None` ⇒ only plaintext realm configs are usable).
+    pub fn with_envelope(mut self, envelope: Option<Arc<EnvelopeService>>) -> Self {
+        self.envelope = envelope;
+        self
     }
 
     /// The current snapshot (cached within TTL; rebuilt from the DB after).
@@ -451,11 +470,20 @@ impl RealmAuth {
         let mut workload_configured_issuers: Vec<String> = Vec::new();
 
         for realm in realms.iter().filter(|r| r.enabled) {
+            // The logical config (encrypted secrets merged in). A realm whose
+            // secrets cannot be decrypted is skipped: fail closed.
+            let config = match secret_dao::realm_config(self.envelope.as_deref(), realm).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(realm = %realm.name, error = %e, "realm secrets unreadable; realm skipped");
+                    continue;
+                }
+            };
             match realm.kind.as_str() {
                 KIND_LOCAL => {
                     providers.push(Box::new(LocalPasswordProvider::new(self.pool.clone())));
                 }
-                KIND_CRED_FORWARD => match self.build_cred_forward(realm) {
+                KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
                     Ok(p) => {
                         has_cred_forward = true;
                         providers.push(p);
@@ -473,7 +501,7 @@ impl RealmAuth {
                         tracing::error!(realm = %realm.name, "second enabled oidc realm ignored (multi-IdP is a later slice)");
                         continue;
                     }
-                    match self.build_oidc(realm) {
+                    match self.build_oidc(realm, &config) {
                         Ok(rt) => oidc = Some(rt),
                         Err(e) => {
                             tracing::error!(realm = %realm.name, error = %e, "oidc realm skipped");
@@ -535,9 +563,13 @@ impl RealmAuth {
     }
 
     /// Build the per-realm credential-forwarding provider.
-    fn build_cred_forward(&self, realm: &AuthRealm) -> anyhow::Result<Box<dyn AuthProvider>> {
-        let cfg: CredForwardRealmConfig = serde_json::from_value(realm.config.clone())
-            .map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    fn build_cred_forward(
+        &self,
+        realm: &AuthRealm,
+        config: &JsonValue,
+    ) -> anyhow::Result<Box<dyn AuthProvider>> {
+        let cfg: CredForwardRealmConfig =
+            serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         let client =
             ssrf::outbound_client().map_err(|e| anyhow::anyhow!("build outbound client: {e}"))?;
         let cred_cache = ValidatedCredentialCache::new(
@@ -568,9 +600,13 @@ impl RealmAuth {
     }
 
     /// Build the OIDC login runtime from a realm row.
-    fn build_oidc(&self, realm: &AuthRealm) -> anyhow::Result<OidcRealmRuntime> {
-        let cfg: OidcRealmConfig = serde_json::from_value(realm.config.clone())
-            .map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    fn build_oidc(
+        &self,
+        realm: &AuthRealm,
+        config: &JsonValue,
+    ) -> anyhow::Result<OidcRealmRuntime> {
+        let cfg: OidcRealmConfig =
+            serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         let base = self.config.public_base_url();
         let (idle, absolute) = self.config.session_ttls();
         // Synthesize the legacy-shaped OidcConfig the runtime builder takes;
@@ -663,7 +699,14 @@ fn seed_fingerprint_key(kind: &str) -> String {
 /// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
 /// initial `local`-realm priority adjustment (which must not fight later
 /// manual reorders).
-pub async fn seed_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
+///
+/// Seeded secrets go through the envelope (`envelope = Some`) like admin
+/// writes, and the drift fingerprint is taken over the *logical* config.
+pub async fn seed_auth_realms(
+    config: &Config,
+    pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
+) -> anyhow::Result<()> {
     let first_import =
         authz_dao::get_setting(pool, REALMS_SEEDED_KEY).await? != Some("true".to_string());
 
@@ -711,6 +754,7 @@ pub async fn seed_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<
         let priority = provider_idx("upstream-basic").map(slot).unwrap_or(20);
         apply_seed(
             pool,
+            envelope,
             KIND_CRED_FORWARD,
             "upstream-basic",
             priority,
@@ -740,6 +784,7 @@ pub async fn seed_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<
         let priority = auth_realm_dao::next_priority(pool).await?;
         apply_seed(
             pool,
+            envelope,
             KIND_OIDC,
             "oidc",
             priority,
@@ -758,6 +803,7 @@ pub async fn seed_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<
 /// [`seed_auth_realms`] for the drift-detection contract).
 async fn apply_seed(
     pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
     kind: &str,
     name: &str,
     priority: i32,
@@ -773,8 +819,9 @@ async fn apply_seed(
             // renamed the row or created their own realm of this kind has
             // taken over and the TOML block is ignored.
             if !auth_realm_dao::kind_exists(pool, kind).await? {
-                auth_realm_dao::insert_realm(
+                secret_dao::insert_realm_with_secrets(
                     pool,
+                    envelope,
                     forge_db::auth_realm_dao::NewAuthRealm {
                         kind: kind.to_string(),
                         name: name.to_string(),
@@ -782,6 +829,7 @@ async fn apply_seed(
                         priority,
                         config,
                     },
+                    secret_keys(kind),
                 )
                 .await?;
                 authz_dao::set_setting(pool, &key, &fingerprint).await?;
@@ -789,12 +837,19 @@ async fn apply_seed(
             }
         }
         Some(existing) if existing.kind == kind => {
+            // Compare the logical config (encrypted secrets merged in). If the
+            // secrets cannot be read here, leave the row alone.
+            let Ok(existing_config) = secret_dao::realm_config(envelope, &existing).await else {
+                tracing::warn!(realm = %name, "seeded realm secrets unreadable; skipping re-apply");
+                return Ok(());
+            };
             let last_seed = authz_dao::get_setting(pool, &key).await?;
             let unmodified =
-                last_seed.as_deref() == Some(&config_fingerprint(&existing.config) as &str);
-            if unmodified && existing.config != config {
-                auth_realm_dao::update_realm(
+                last_seed.as_deref() == Some(&config_fingerprint(&existing_config) as &str);
+            if unmodified && existing_config != config {
+                secret_dao::update_realm_with_secrets(
                     pool,
+                    envelope,
                     existing.id,
                     forge_db::auth_realm_dao::AuthRealmUpdate {
                         name: existing.name.clone(),
@@ -802,6 +857,7 @@ async fn apply_seed(
                         priority: existing.priority,
                         config,
                     },
+                    secret_keys(kind),
                 )
                 .await?;
                 authz_dao::set_setting(pool, &key, &fingerprint).await?;

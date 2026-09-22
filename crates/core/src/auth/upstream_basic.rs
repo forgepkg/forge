@@ -107,9 +107,11 @@ pub struct UpstreamBasicConfig {
     /// `.`-separated path into the JSON body locating the user's groups (see
     /// [`extract_groups`]). Empty ⇒ no group data parsed.
     pub groups_path: String,
-    /// Optional upstream group that maps to forge admin on provision (grant
-    /// only, never revoke — see chain provisioning). Empty ⇒ never suggests
-    /// admin.
+    /// Optional upstream group that maps to forge admin. When set (with a
+    /// `groups_path`), every login that freshly fetched the groups is
+    /// authoritative: membership grants admin and its absence revokes it for
+    /// `upstream-basic` users (see chain provisioning). Empty ⇒ never suggests
+    /// admin and never touches an existing user's admin state.
     pub admin_group: String,
     /// Stable provider id keying the validated-credential cache and logged as
     /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
@@ -296,30 +298,41 @@ impl AuthProvider for UpstreamBasicProvider {
         // we hand the captured groups out through an `Arc<Mutex<_>>` rather than a
         // `RefCell`. It stays empty when a peer wins the singleflight (the factory
         // never runs locally) — see the note above.
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // `None` until the factory runs locally: distinguishes "fetched, no
+        // groups" from "cache hit, groups unknown" for the admin mapping.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<String>>));
         let captured_factory = captured.clone();
 
         let result = self
             .cache
             .check(self.id(), cred.username, cred.password, || async move {
                 let r = self.forward(&username, &password).await;
-                *captured_factory.lock().expect("groups mutex not poisoned") = r.groups;
+                *captured_factory.lock().expect("groups mutex not poisoned") = Some(r.groups);
                 r.verdict
             })
             .await;
 
         match result {
             Ok(true) => {
-                let groups =
-                    std::mem::take(&mut *captured.lock().expect("groups mutex not poisoned"));
-                let suggested_is_admin = !self.config.admin_group.is_empty()
-                    && groups.iter().any(|g| g == &self.config.admin_group);
+                let fetched = captured.lock().expect("groups mutex not poisoned").take();
+                // An admin group without a groups path can never match; treat
+                // it as "no admin mapping" rather than as a standing demotion.
+                let admin_mapped =
+                    !self.config.admin_group.is_empty() && !self.config.groups_path.is_empty();
+                // Admin state is authoritative only when the realm maps an admin
+                // group AND this login actually saw the upstream's groups; a
+                // cache hit must never demote an upstream admin.
+                let admin_authoritative = admin_mapped && fetched.is_some();
+                let groups = fetched.unwrap_or_default();
+                let suggested_is_admin =
+                    admin_mapped && groups.iter().any(|g| g == &self.config.admin_group);
                 AuthOutcome::Authenticated(ProvenIdentity {
                     username: cred.username.to_string(),
                     source: AuthSource::UpstreamBasic,
                     external_subject: Some(cred.username.to_string()),
                     groups,
                     suggested_is_admin,
+                    admin_authoritative,
                     auto_provision: self.config.auto_provision,
                     realm_id: self.config.realm_id,
                 })

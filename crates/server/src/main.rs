@@ -65,20 +65,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // §12.4 Phase 5: re-apply the idempotent behavior-preserving RBAC legacy
-    // mapping (is_admin→admin role, anonymous_read→anonymous grants, and — only
-    // on legacy-open-access installs — authenticated for every user). A no-op
-    // once converged; never opens a fresh install. Runs after bootstrap so a
-    // freshly-created legacy-open user inherits the `authenticated` role too.
+    // §12.4 Phase 5: apply the behavior-preserving RBAC legacy mapping
+    // (is_admin→admin role, anonymous_read→anonymous grants, and — only on
+    // legacy-open-access installs — authenticated for every user) ONCE per
+    // install (a forge_setting marker), so later RBAC revocations stick. Never
+    // opens a fresh install. Runs after bootstrap so a freshly-created
+    // legacy-open user inherits the `authenticated` role too.
     ensure_legacy_rbac(&pool)
         .await
         .context("ensure legacy RBAC mapping")?;
-
-    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
-    // auth_realm rows (drift-detected); the DB is the authority.
-    ensure_auth_realms(&config, &pool)
-        .await
-        .context("ensure auth realms")?;
 
     // §12.5: secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
@@ -92,6 +87,13 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("bootstrap secret encryption")?;
     }
+
+    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // auth_realm rows (drift-detected); the DB is the authority. After the
+    // crypto bootstrap so seeded realm secrets are encrypted at rest.
+    ensure_auth_realms(&config, &pool, envelope.as_deref())
+        .await
+        .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());

@@ -255,12 +255,16 @@ pub enum AddMemberOutcome {
 ///
 /// Nested-group members are allowed (a member may itself be a group), but the
 /// resulting graph must stay a DAG within a bounded depth. The whole check +
-/// insert runs in **one transaction** that first takes a row-level lock
-/// (`SELECT ... FOR UPDATE`) on the **group's** `repository` row. That lock
-/// serializes concurrent edge mutations *touching this group* across instances
-/// without any `pg_advisory_*` lock, closing the check-then-insert race: two
-/// concurrent inserts that would each individually be acyclic but jointly form a
-/// cycle cannot both pass, because they contend on the same locked row.
+/// insert runs in **one transaction** that first takes a `SHARE ROW EXCLUSIVE`
+/// lock on the `group_member` table. That mode conflicts with itself and with
+/// the row-exclusive lock every INSERT/UPDATE/DELETE takes, so **all** group
+/// graph mutations are serialized cluster-wide (reads are unaffected) without
+/// any `pg_advisory_*` lock. A per-group row lock is not enough: concurrent
+/// `A -> B` and `B -> A` lock *different* group rows, both walks run before
+/// either insert commits, and both pass under `READ COMMITTED`, leaving a
+/// cycle. With the table lock the second transaction's walk starts only after
+/// the first committed, so it sees the new edge and rejects the cycle. Group
+/// edits are rare admin operations, so the coarse lock is cheap.
 ///
 /// The guard is a recursive CTE over `group_member`: starting from `member_id`
 /// it walks `member -> member` edges (i.e. descends into nested groups). Adding
@@ -281,9 +285,12 @@ pub async fn add_group_member_checked(
     let mut tx = pool.begin().await?;
     let conn = tx.acquire().await?;
 
-    // Serialize group-graph edits touching this group across instances. Group
-    // edits are rare, so a per-group row lock is cheap and race-free — no
-    // pg_advisory lock. The selected value is unused; the lock is the point.
+    // Serialize every group-graph mutation across instances (see above): the
+    // cycle walk below must see all edges committed by concurrent editors.
+    sqlx::query!(r#"LOCK TABLE group_member IN SHARE ROW EXCLUSIVE MODE"#)
+        .execute(&mut *conn)
+        .await?;
+    // Keep the group row locked too, so it cannot be deleted mid-check.
     let _locked: i64 = sqlx::query_scalar!(
         r#"SELECT id FROM repository WHERE id = $1 FOR UPDATE"#,
         group_id,

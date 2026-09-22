@@ -57,7 +57,9 @@ That one command uses your **local Postgres on :5432** (creating the `forge`
 role + database if missing), brings up an S3 gateway (**:8422**) via
 `docker-compose.yml`, runs migrations, and starts the Rust API on **:8421** plus
 Vite HMR on **:8420**. A bootstrap admin **`admin` / `changeme`** is created on
-first run. (Requires a running local PostgreSQL with permission to create the
+first run (dev only: the bundled `forge.toml` sets
+`server.allow_insecure_defaults = true`; any other config refuses to start with
+the `changeme` password or `minioadmin` S3 keys). (Requires a running local PostgreSQL with permission to create the
 role/db; use `--db docker` if you don't have one — see below.)
 
 - **UI:** http://localhost:8420
@@ -97,8 +99,13 @@ docker run --rm -p 8421:8421 \
   -e FORGE_DATABASE__URL=postgres://forge:forge@db:5432/forge \
   -e FORGE_S3__ENDPOINT=http://s3:8422 -e FORGE_S3__BUCKET=forge \
   -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
+  -e FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=… \
   envisia-forge:latest
 ```
+
+The image refuses to start while its placeholder credentials (`minioadmin` S3
+keys, bootstrap password `changeme`) are in effect, and defaults to
+`anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads).
 
 ### Point a `dotnet` client at it
 

@@ -195,6 +195,19 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
         .unwrap();
     assert_eq!(login.status(), 200);
     let cookie = session_cookie(&login);
+    let me: Value = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let csrf = me["csrf_token"]
+        .as_str()
+        .expect("/auth/me returns the csrf token")
+        .to_string();
 
     let created = client
         .post(format!("{}/admin/repositories", srv.base_url))
@@ -205,19 +218,27 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
         .unwrap();
     assert_eq!(created.status(), 201);
 
-    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&package_id, "1.0.0"))
-        .file_name("package.nupkg")
-        .mime_str("application/octet-stream")
-        .unwrap();
-    let form = reqwest::multipart::Form::new().part("package", part);
-    let response = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
-        .header("cookie", cookie)
-        .header("authorization", "Unrelated session-bypass")
-        .multipart(form)
-        .send()
-        .await
-        .unwrap();
+    let push = |csrf: Option<&str>| {
+        let part = reqwest::multipart::Part::bytes(common::make_nupkg(&package_id, "1.0.0"))
+            .file_name("package.nupkg")
+            .mime_str("application/octet-stream")
+            .unwrap();
+        let mut req = client
+            .put(format!("{}/v3/{repo}/package", srv.base_url))
+            .header("cookie", &cookie)
+            .header("authorization", "Unrelated session-bypass")
+            .multipart(reqwest::multipart::Form::new().part("package", part));
+        if let Some(token) = csrf {
+            req = req.header("x-csrf-token", token);
+        }
+        req.send()
+    };
+    // Without the CSRF token the cookie-authenticated mutation is refused
+    // outright by the CSRF gate …
+    let response = push(None).await.unwrap();
+    assert_eq!(response.status(), 403, "cookie mutation without csrf token");
+    // … and even with it, a session is not a publish credential.
+    let response = push(Some(&csrf)).await.unwrap();
     assert_eq!(
         response.status(),
         401,

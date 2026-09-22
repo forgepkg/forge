@@ -68,6 +68,9 @@ pub struct AppState {
     pub sessions: SessionService,
     /// Whether session cookies carry `Secure` (https `public_base_url`).
     pub cookie_secure: bool,
+    /// Password-failure lockout per `(client IP, username)`, shared by
+    /// `POST /auth/login` and the wire Basic password path.
+    pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
     /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
@@ -133,6 +136,10 @@ impl AppState {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
         });
+        let login_throttle = Arc::new(forge_core::auth::LoginThrottle::new(
+            config.auth.login_max_failures,
+            std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
+        ));
 
         AppState {
             pool,
@@ -145,6 +152,7 @@ impl AppState {
             realms,
             sessions,
             cookie_secure,
+            login_throttle,
             envelope: None,
             upstream,
         }
@@ -157,6 +165,12 @@ impl AppState {
         mut self,
         envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     ) -> Self {
+        // Realm secrets may be encrypted too (P1.5): rebuild the (still
+        // unshared, empty) realm snapshot cache with the envelope attached.
+        self.realms = Arc::new(
+            RealmAuth::new(self.pool.clone(), self.cache.clone(), self.config.clone())
+                .with_envelope(envelope.clone()),
+        );
         self.envelope = envelope;
         self
     }
