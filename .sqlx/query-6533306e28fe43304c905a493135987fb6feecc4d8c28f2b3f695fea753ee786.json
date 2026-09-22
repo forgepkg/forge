@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE retention_run\n        SET locked_until = $3\n        WHERE repository_id = $1 AND current_run_id = $2 AND state = 'running'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6533306e28fe43304c905a493135987fb6feecc4d8c28f2b3f695fea753ee786"
+}

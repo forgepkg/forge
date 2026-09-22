@@ -242,7 +242,7 @@ pub async fn load_role_effective(pool: &PgPool, role_id: i64) -> sqlx::Result<Ef
     let rows = sqlx::query!(
         r#"
         SELECT
-            rp.action            AS action,
+            rp.action            AS "action!",
             rp.repository_id     AS repository_id,
             cs.id                AS "selector_id?",
             cs.includes          AS "includes?",

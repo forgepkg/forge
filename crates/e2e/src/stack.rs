@@ -15,7 +15,7 @@ use forge_server::state::AppState;
 use forge_server::workers::{self, WorkerHandles};
 use forge_storage::{BlobStore, S3Config};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool};
+use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -132,8 +132,9 @@ async fn fresh_database() -> String {
         .await
         .expect("connect admin db");
     let db = format!("e2e_{}", unique());
-    admin
-        .execute(format!(r#"CREATE DATABASE "{db}""#).as_str())
+    // The name is generated here (never user input), so the dynamic SQL is safe.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{db}""#)))
+        .execute(&admin)
         .await
         .expect("create database");
     admin.close().await;

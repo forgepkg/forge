@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "secrets_enc!",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "auth_realm",
+            "name": "secrets_enc"
+          }
+        }
       }
     ],
     "parameters": {

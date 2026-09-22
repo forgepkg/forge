@@ -16,8 +16,8 @@ mod common;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use argon2::PasswordHasher;
 use argon2::Argon2;
+use argon2::PasswordHasher;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use forge_core::auth::chain::{Chain, ChainOutcome};

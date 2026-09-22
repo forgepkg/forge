@@ -156,8 +156,8 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
 
     let password = ba.password.clone();
     let password_hash = tokio::task::spawn_blocking(move || {
-        use argon2::PasswordHasher;
         use argon2::Argon2;
+        use argon2::PasswordHasher;
         Argon2::default()
             .hash_password(password.as_bytes())
             .map(|h| h.to_string())

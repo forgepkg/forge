@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "provider_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "provider_id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "username",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "username"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "cred_hmac",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "cred_hmac"
+          }
+        }
       }
     ],
     "parameters": {

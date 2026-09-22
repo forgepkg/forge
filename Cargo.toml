@@ -26,7 +26,7 @@ axum = { version = "0.8" }
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # Database
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "postgres",
     "macros",

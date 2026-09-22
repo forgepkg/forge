@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            rp.action            AS \"action!\",\n            rp.repository_id     AS repository_id,\n            cs.id                AS \"selector_id?\",\n            cs.includes          AS \"includes?\",\n            cs.excludes          AS \"excludes?\"\n        FROM repository_privilege rp\n        LEFT JOIN content_selector cs ON cs.id = rp.selector_id\n        WHERE rp.role_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "action!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_privilege",
+            "name": "action"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_privilege",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "selector_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_selector",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "includes?",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "content_selector",
+            "name": "includes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "excludes?",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "content_selector",
+            "name": "excludes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "40f21413a411fee206c8eecb6f9a0d11af2d4907317bab1c7916cf74a1831958"
+}

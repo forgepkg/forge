@@ -6,47 +6,101 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "op",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "op"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "sha256",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "sha256"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "s3_key",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "s3_key"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "available_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "available_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "attempts",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "attempts"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "locked_until",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "locked_until"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "processed_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "processed_at"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

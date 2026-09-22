@@ -6,62 +6,134 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "layer",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "layer"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "algorithm",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "algorithm"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "wrapped_key",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "wrapped_key"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "root_key_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "root_key_id"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "root_key_version",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "root_key_version"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "wrapping_kek_version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "wrapping_kek_version"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "state",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "state"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "scope",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "scope"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "rotated_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "encryption_key",
+            "name": "rotated_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -341,7 +341,7 @@ impl SpooledBody {
                     Ok(inner)
                 })
                 .await
-                .map_err(|e| std::io::Error::other(e))??;
+                .map_err(std::io::Error::other)??;
             } else if inner.is_rolled() {
                 inner = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
                     let mut inner = inner;
@@ -349,7 +349,7 @@ impl SpooledBody {
                     Ok(inner)
                 })
                 .await
-                .map_err(|e| std::io::Error::other(e))??;
+                .map_err(std::io::Error::other)??;
             } else {
                 inner.write_all(&chunk)?;
             }

@@ -185,8 +185,8 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
 
 /// Hash a plaintext password with argon2id (PHC string), on a blocking thread.
 pub(crate) async fn hash_password(password: String) -> Result<String, Response> {
-    use argon2::PasswordHasher;
     use argon2::Argon2;
+    use argon2::PasswordHasher;
 
     let joined = tokio::task::spawn_blocking(move || {
         Argon2::default()
