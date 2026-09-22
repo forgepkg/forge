@@ -29,4 +29,4 @@ pub mod trusted_publish_audit_dao;
 pub mod user_dao;
 pub mod validated_credential_dao;
 
-pub use pool::{connect, migrate};
+pub use pool::{connect, connect_with, migrate};

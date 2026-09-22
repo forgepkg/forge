@@ -26,7 +26,7 @@ use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
     CacheInvalidator, DeleteOutcome, NupkgLocation, PublishAuthorizationContext, PublishOutcome,
-    PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
     SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE,
     NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
@@ -89,13 +89,18 @@ impl HostedRepo {
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
-        let comps = component_dao::list_components_for_repo(&self.pool, repo_id).await?;
-        let q = params.q.trim().to_lowercase();
+        let query = SearchQuery::parse(&params.q);
+        let comps = match query.prefilter() {
+            Some(sub) => {
+                component_dao::list_components_for_repo_matching(&self.pool, repo_id, sub).await?
+            }
+            None => component_dao::list_components_for_repo(&self.pool, repo_id).await?,
+        };
 
         use std::collections::BTreeMap;
         let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
         for c in comps {
-            if !filter.allows(&c.name) || (!q.is_empty() && !c.name.contains(&q)) {
+            if !filter.allows(&c.name) || !query.matches(&c.name) {
                 continue;
             }
             by_id.entry(c.name.clone()).or_default().push(c);
@@ -123,6 +128,7 @@ impl HostedRepo {
                 original_id: latest.original_id.clone(),
                 latest_version: latest.version.clone(),
                 versions,
+                ..Default::default()
             });
         }
 
@@ -132,12 +138,78 @@ impl HostedRepo {
                 .cmp(&b.original_id.to_lowercase())
         });
         let total_hits = hits.len();
-        let hits = hits
+        let mut hits: Vec<SearchHit> = hits
             .into_iter()
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
+        self.enrich_hits(repo_id, &mut hits).await?;
         Ok(SearchResult { total_hits, hits })
+    }
+
+    /// Attach the latest version's manifest and the download total to each
+    /// hit of the (already paged) result.
+    async fn enrich_hits(&self, repo_id: i64, hits: &mut [SearchHit]) -> Result<(), RepoError> {
+        use futures_util::StreamExt;
+        let names: Vec<String> = hits
+            .iter()
+            .map(|h| self.format.lower_id(&h.original_id))
+            .collect();
+        let totals: std::collections::HashMap<String, i64> =
+            forge_db::download_dao::total_downloads_by_name(&self.pool, repo_id, &names)
+                .await?
+                .into_iter()
+                .collect();
+        let wanted: Vec<(String, String)> = names
+            .iter()
+            .cloned()
+            .zip(hits.iter().map(|h| h.latest_version.clone()))
+            .collect();
+        let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
+            .map(|(name, version)| async move { self.nuspec_of(repo_id, &name, &version).await })
+            .buffered(8)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "search: manifest fetch failed");
+                    None
+                })
+            })
+            .collect();
+        for ((hit, name), manifest) in hits.iter_mut().zip(&names).zip(manifests) {
+            hit.total_downloads = Some(totals.get(name).copied().unwrap_or(0));
+            hit.nuspec_bytes = manifest;
+        }
+        Ok(())
+    }
+
+    /// The stored `.nuspec` of `(id, version)`, if any.
+    async fn nuspec_of(
+        &self,
+        repo_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
+        else {
+            return Ok(None);
+        };
+        self.nuspec_of_component(comp.id).await
+    }
+
+    /// The stored `.nuspec` of a component, if any.
+    async fn nuspec_of_component(&self, component_id: i64) -> Result<Option<Vec<u8>>, RepoError> {
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, component_id, NUSPEC_ASSET_PATH).await?
+        else {
+            return Ok(None);
+        };
+        match forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? {
+            Some(blob) => Ok(Some(self.blobs.fetch_all(&blob.s3_key).await?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -244,34 +316,30 @@ impl RepoReadOps for HostedRepo {
         let comps = component_dao::list_versions(&self.pool, repo_id, id).await?;
         let comps = self.sort_versions(comps);
 
-        let mut out = Vec::with_capacity(comps.len());
-        for c in comps {
+        // Per-version lookups (packageHash + stored nuspec for dependency
+        // extraction by the format layer) run with bounded concurrency so a
+        // package with hundreds of versions does not serialize hundreds of
+        // S3 round-trips.
+        use futures_util::StreamExt;
+        futures_util::stream::iter(comps.into_iter().map(|c| async move {
             // The nupkg asset carries the SHA-512 used as packageHash.
             let nupkg = asset_dao::find_asset(&self.pool, c.id, NUPKG_ASSET_PATH).await?;
             let package_hash_sha512_base64 = nupkg.and_then(|a| a.sha512_base64);
-
-            // Fetch the stored nuspec bytes (if present) for dependency
-            // extraction by the format layer.
-            let nuspec_bytes =
-                match asset_dao::find_asset(&self.pool, c.id, NUSPEC_ASSET_PATH).await? {
-                    Some(asset) => {
-                        match forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? {
-                            Some(blob) => Some(self.blobs.fetch_all(&blob.s3_key).await?),
-                            None => None,
-                        }
-                    }
-                    None => None,
-                };
-
-            out.push(RegistrationEntry {
+            let nuspec_bytes = self.nuspec_of_component(c.id).await?;
+            Ok::<_, RepoError>(RegistrationEntry {
                 original_id: c.original_id,
                 version: c.version,
                 listed: c.listed,
                 package_hash_sha512_base64,
                 nuspec_bytes,
-            });
-        }
-        Ok(out)
+                published: Some(c.created_at),
+            })
+        }))
+        .buffered(16)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
@@ -398,13 +466,19 @@ impl HostedWrite {
         // needs the canonical identity extracted by the format parser first.
         let staged_nupkg = self.cas.stage(reader, max_upload_bytes).await?;
 
-        // 2. Parse the package from the temp file. parse_upload is sync; the
-        //    temp file is small enough that a blocking read is acceptable here.
+        // 2. Parse the package from the temp file. parse_upload is sync and a
+        //    package may be hundreds of MiB, so it runs on the blocking pool.
         let parsed = {
-            let mut file = std::fs::File::open(&staged_nupkg.temp_path).map_err(|e| {
-                WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
-            })?;
-            self.format.parse_upload(&mut file)?
+            let format = self.format.clone();
+            let path = staged_nupkg.temp_path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut file = std::fs::File::open(&path).map_err(|e| {
+                    WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
+                })?;
+                format.parse_upload(&mut file).map_err(WriteError::from)
+            })
+            .await
+            .map_err(|e| WriteError::Repo(RepoError::Storage(format!("parse upload: {e}"))))??
         };
 
         let publish_context =

@@ -1,0 +1,127 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, is_admin, active, auth_source,\n             external_subject, last_auth_source_at, realm_id)\n        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now(), $4)\n        ON CONFLICT (username) DO UPDATE SET\n            is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,\n            last_auth_source_at = now(),\n            realm_id = COALESCE(app_user.realm_id, EXCLUDED.realm_id),\n            -- Touch updated_at only when the admin flag actually changes.\n            updated_at = CASE\n                WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()\n                ELSE app_user.updated_at\n            END\n        WHERE app_user.auth_source = 'upstream-basic'\n          AND (EXCLUDED.realm_id IS NULL\n               OR app_user.realm_id IS NULL\n               OR app_user.realm_id = EXCLUDED.realm_id)\n        RETURNING\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "password_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "password_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "is_admin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "is_admin"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "active",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "active"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "auth_source"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "external_subject",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "external_subject"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "6f0ccab5536b47d115a839305b4349d4d6b36102ff592af3fbef2e5cbf85cd0f"
+}

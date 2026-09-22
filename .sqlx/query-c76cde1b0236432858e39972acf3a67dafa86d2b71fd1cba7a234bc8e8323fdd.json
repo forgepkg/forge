@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT c.name AS \"name!\", COALESCE(SUM(a.download_count), 0)::bigint AS \"total!\"\n        FROM component c\n        JOIN asset a ON a.component_id = c.id AND a.path = 'package.nupkg'\n        WHERE c.repository_id = $1 AND c.name = ANY($2)\n        GROUP BY c.name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "total!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "c76cde1b0236432858e39972acf3a67dafa86d2b71fd1cba7a234bc8e8323fdd"
+}

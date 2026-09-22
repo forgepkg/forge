@@ -6,37 +6,74 @@
       {
         "ordinal": 0,
         "name": "component_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "name",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "version",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "listed",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "listed"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "last_downloaded_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "last_downloaded_at"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "blob_sha256?: String",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": "Expression"
       }
     ],
     "parameters": {

@@ -14,6 +14,10 @@
 bind = "0.0.0.0:8421"
 # Used to build absolute NuGet V3 @id URLs in the service index. No trailing slash.
 public_base_url = "http://localhost:8421"
+# DEV ONLY: this file ships the known-insecure placeholder credentials below
+# (bootstrap admin/changeme, minioadmin S3 keys). Without this opt-in the
+# server refuses to start with them. Never set it in production.
+allow_insecure_defaults = true
 
 [database]
 # docker-compose maps the dev Postgres to host port 5433 (see docker-compose.yml).

@@ -27,6 +27,28 @@ pub fn parse_nupkg(
     let nuspec_bytes = extract_nuspec(file, limits)?;
     let raw = parse_nuspec(&nuspec_bytes)?;
 
+    validate_package_id(&raw.id)?;
+    // NuGet clients reject a `v` prefix; accepting it would store a package
+    // whose own manifest the client later refuses to read.
+    if raw.version.starts_with(['v', 'V']) {
+        return Err(FormatError::InvalidVersion {
+            value: raw.version.clone(),
+            reason: "a leading 'v' is not a valid NuGet version".into(),
+        });
+    }
+    // A `.snupkg` is a symbols package: pushing it to the package endpoint
+    // must not replace (or pose as) the real package of the same identity.
+    if raw
+        .metadata
+        .package_types
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("SymbolsPackage"))
+    {
+        return Err(FormatError::InvalidPackage(
+            "symbol packages (.snupkg) are not accepted by the package publish endpoint".into(),
+        ));
+    }
+
     let version_normalized = version::normalize(&raw.version)?;
     let id_lower = lower_id(&raw.id);
 
@@ -41,10 +63,113 @@ pub fn parse_nupkg(
     })
 }
 
+/// Maximum package id length accepted by NuGet.
+pub const MAX_PACKAGE_ID_LENGTH: usize = 100;
+
+/// Validate a package id against NuGet's rules: at most 100 characters,
+/// matching `^\w+([.-]\w+)*$` (word characters separated by single dots or
+/// dashes). Ids outside this grammar are rejected by NuGet clients, so a
+/// package carrying one could never be restored.
+pub fn validate_package_id(id: &str) -> Result<(), FormatError> {
+    let invalid = |reason: &str| {
+        Err(FormatError::InvalidPackage(format!(
+            "invalid package id {id:?}: {reason}"
+        )))
+    };
+    if id.chars().count() > MAX_PACKAGE_ID_LENGTH {
+        return invalid("longer than 100 characters");
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut prev_sep = true; // disallow a leading separator
+    for c in id.chars() {
+        if c == '.' || c == '-' {
+            if prev_sep {
+                return invalid("separators must sit between word characters");
+            }
+            prev_sep = true;
+        } else if is_word(c) {
+            prev_sep = false;
+        } else {
+            return invalid("only letters, digits, '_', '.' and '-' are allowed");
+        }
+    }
+    if prev_sep {
+        return invalid("must not be empty or end with a separator");
+    }
+    Ok(())
+}
+
 /// Lowercase a package id using ASCII (invariant) lowering, matching
 /// `ToLowerInvariant()`.
 pub fn lower_id(id: &str) -> String {
     id.trim().to_ascii_lowercase()
+}
+
+/// Display metadata of a `.nuspec`, for registration catalog entries and
+/// search results. Absent elements are `None` / empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NuspecMetadata {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub summary: Option<String>,
+    pub authors: Option<String>,
+    pub owners: Option<String>,
+    pub tags: Vec<String>,
+    pub project_url: Option<String>,
+    pub license_url: Option<String>,
+    /// SPDX expression from `<license type="expression">`.
+    pub license_expression: Option<String>,
+    pub icon_url: Option<String>,
+    pub release_notes: Option<String>,
+    pub copyright: Option<String>,
+    pub language: Option<String>,
+    pub require_license_acceptance: bool,
+    /// `<packageTypes><packageType name=…/>` names (empty ⇒ `Dependency`).
+    pub package_types: Vec<String>,
+    /// `<minClientVersion>` from the `metadata` element attribute.
+    pub min_client_version: Option<String>,
+    raw_tags: Option<String>,
+    raw_require_license_acceptance: Option<String>,
+}
+
+impl NuspecMetadata {
+    /// Trim collected text, split tags, and drop empty values.
+    fn trim(&mut self) {
+        for slot in [
+            &mut self.title,
+            &mut self.description,
+            &mut self.summary,
+            &mut self.authors,
+            &mut self.owners,
+            &mut self.project_url,
+            &mut self.license_url,
+            &mut self.license_expression,
+            &mut self.icon_url,
+            &mut self.release_notes,
+            &mut self.copyright,
+            &mut self.language,
+        ] {
+            *slot = slot
+                .take()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+        }
+        if let Some(tags) = self.raw_tags.take() {
+            self.tags = tags
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(flag) = self.raw_require_license_acceptance.take() {
+            self.require_license_acceptance = flag.trim().eq_ignore_ascii_case("true");
+        }
+    }
+}
+
+/// Extract the display metadata from raw `.nuspec` bytes.
+pub fn metadata_from_nuspec(bytes: &[u8]) -> Result<NuspecMetadata, FormatError> {
+    Ok(parse_nuspec(bytes).map_err(FormatError::from)?.metadata)
 }
 
 /// Extract just the dependency groups from raw `.nuspec` bytes.
@@ -190,13 +315,16 @@ struct RawNuspec {
     id: String,
     version: String,
     deps: Vec<DependencyGroup>,
+    metadata: NuspecMetadata,
 }
 
 /// Parse the `.nuspec` XML namespace-insensitively (by local name).
 fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
     let mut reader = Reader::from_reader(bytes);
-    let config = reader.config_mut();
-    config.trim_text(true);
+    // Text is kept verbatim (entity references split it into several
+    // events, so trimming per event would eat inner spaces); values are
+    // trimmed once parsing is complete.
+    reader.config_mut().trim_text(false);
 
     // Path of local element names, so we know our context (e.g. metadata/id).
     let mut path: Vec<Vec<u8>> = Vec::new();
@@ -209,6 +337,9 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
     let mut in_dependencies = false;
     // Flat (groupless) dependencies collected directly under <dependencies>.
     let mut flat_group: Option<DependencyGroup> = None;
+    let mut metadata = NuspecMetadata::default();
+    // `type` attribute of the currently open <license>, if any.
+    let mut license_type: Option<String> = None;
 
     let mut buf = Vec::new();
     loop {
@@ -217,8 +348,25 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
         {
             Event::Start(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 match local.as_slice() {
+                    b"metadata" => {
+                        metadata.min_client_version = attr_local(&e, b"minClientVersion")?;
+                    }
+                    b"license" if path.last().map(Vec::as_slice) == Some(b"metadata") => {
+                        license_type = attr_local(&e, b"type")?;
+                    }
+                    // `<dependency ...></dependency>` (explicit end tag) is as
+                    // valid as the self-closing form.
+                    b"dependency" if in_dependencies => {
+                        let dep = parse_dependency(&e)?;
+                        push_dependency(&mut current_group, &mut flat_group, dep);
+                    }
+                    b"packageType" if path.last().map(Vec::as_slice) == Some(b"packageTypes") => {
+                        if let Some(name) = attr_local(&e, b"name")? {
+                            metadata.package_types.push(name);
+                        }
+                    }
                     b"dependencies" if under_metadata(&path) => {
                         in_dependencies = true;
                         flat_group = None;
@@ -235,24 +383,15 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 path.push(local);
             }
             Event::Empty(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 match local.as_slice() {
                     b"dependency" if in_dependencies => {
-                        let dep_id = attr_local(&e, b"id")?.ok_or_else(|| {
-                            NupkgError::MalformedNuspec("<dependency> missing id".into())
-                        })?;
-                        let range = attr_local(&e, b"version")?;
-                        let dep = Dependency { id: dep_id, range };
-                        if let Some(g) = current_group.as_mut() {
-                            g.dependencies.push(dep);
-                        } else {
-                            flat_group
-                                .get_or_insert_with(|| DependencyGroup {
-                                    target_framework: None,
-                                    dependencies: Vec::new(),
-                                })
-                                .dependencies
-                                .push(dep);
+                        let dep = parse_dependency(&e)?;
+                        push_dependency(&mut current_group, &mut flat_group, dep);
+                    }
+                    b"packageType" if path.last().map(Vec::as_slice) == Some(b"packageTypes") => {
+                        if let Some(name) = attr_local(&e, b"name")? {
+                            metadata.package_types.push(name);
                         }
                     }
                     // A self-closing <group/> with no dependencies still
@@ -269,22 +408,49 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 // Empty elements do not change nesting depth.
             }
             Event::Text(t) => {
-                let text = t
-                    .decode()
-                    .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
-                    .into_owned();
-                match path.last().map(Vec::as_slice) {
-                    Some(b"id") if under_metadata_parent(&path) => {
-                        id.get_or_insert(text);
-                    }
-                    Some(b"version") if under_metadata_parent(&path) => {
-                        ver.get_or_insert(text);
-                    }
-                    _ => {}
+                let text = t.xml10_content().into_owned();
+                append_text(
+                    &path,
+                    &text,
+                    &mut id,
+                    &mut ver,
+                    &mut metadata,
+                    &license_type,
+                );
+            }
+            Event::CData(t) => {
+                let text = t.xml10_content().into_owned();
+                append_text(
+                    &path,
+                    &text,
+                    &mut id,
+                    &mut ver,
+                    &mut metadata,
+                    &license_type,
+                );
+            }
+            Event::GeneralRef(r) => {
+                let resolved = if r.is_char_ref() {
+                    r.resolve_char_ref()
+                        .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
+                        .map(String::from)
+                } else {
+                    let name: &str = &r;
+                    quick_xml::escape::resolve_predefined_entity(name).map(str::to_string)
+                };
+                if let Some(text) = resolved {
+                    append_text(
+                        &path,
+                        &text,
+                        &mut id,
+                        &mut ver,
+                        &mut metadata,
+                        &license_type,
+                    );
                 }
             }
             Event::End(e) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().as_bytes().to_vec();
                 if local.as_slice() == b"group" && in_dependencies {
                     if let Some(g) = current_group.take() {
                         groups.push(g);
@@ -303,6 +469,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
         buf.clear();
     }
 
+    metadata.trim();
     let id = id.ok_or_else(|| NupkgError::MalformedNuspec("missing <id>".into()))?;
     let version = ver.ok_or_else(|| NupkgError::MalformedNuspec("missing <version>".into()))?;
     if id.trim().is_empty() {
@@ -316,7 +483,76 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
         id: id.trim().to_string(),
         version: version.trim().to_string(),
         deps: groups,
+        metadata,
     })
+}
+
+/// Route a piece of element text to its field. Text of one element may
+/// arrive in several pieces (entity references, CDATA), so values append.
+fn append_text(
+    path: &[Vec<u8>],
+    text: &str,
+    id: &mut Option<String>,
+    ver: &mut Option<String>,
+    metadata: &mut NuspecMetadata,
+    license_type: &Option<String>,
+) {
+    if !under_metadata_parent(path) {
+        return;
+    }
+    let slot = match path.last().map(Vec::as_slice) {
+        Some(b"id") => id,
+        Some(b"version") => ver,
+        Some(b"title") => &mut metadata.title,
+        Some(b"description") => &mut metadata.description,
+        Some(b"summary") => &mut metadata.summary,
+        Some(b"authors") => &mut metadata.authors,
+        Some(b"owners") => &mut metadata.owners,
+        Some(b"projectUrl") => &mut metadata.project_url,
+        Some(b"licenseUrl") => &mut metadata.license_url,
+        Some(b"iconUrl") => &mut metadata.icon_url,
+        Some(b"releaseNotes") => &mut metadata.release_notes,
+        Some(b"copyright") => &mut metadata.copyright,
+        Some(b"language") => &mut metadata.language,
+        Some(b"tags") => &mut metadata.raw_tags,
+        Some(b"requireLicenseAcceptance") => &mut metadata.raw_require_license_acceptance,
+        Some(b"license")
+            if license_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("expression")) =>
+        {
+            &mut metadata.license_expression
+        }
+        _ => return,
+    };
+    slot.get_or_insert_with(String::new).push_str(text);
+}
+
+/// Build a [`Dependency`] from a `<dependency>` element's attributes.
+fn parse_dependency(e: &quick_xml::events::BytesStart) -> Result<Dependency, NupkgError> {
+    let dep_id = attr_local(e, b"id")?
+        .ok_or_else(|| NupkgError::MalformedNuspec("<dependency> missing id".into()))?;
+    let range = attr_local(e, b"version")?;
+    Ok(Dependency { id: dep_id, range })
+}
+
+/// Add `dep` to the open `<group>`, or to the flat (groupless) group.
+fn push_dependency(
+    current_group: &mut Option<DependencyGroup>,
+    flat_group: &mut Option<DependencyGroup>,
+    dep: Dependency,
+) {
+    if let Some(g) = current_group.as_mut() {
+        g.dependencies.push(dep);
+    } else {
+        flat_group
+            .get_or_insert_with(|| DependencyGroup {
+                target_framework: None,
+                dependencies: Vec::new(),
+            })
+            .dependencies
+            .push(dep);
+    }
 }
 
 /// True if the element path is currently inside `<metadata>` (any ancestor).
@@ -340,7 +576,7 @@ fn attr_local(
         let attr = attr.map_err(|err| NupkgError::MalformedNuspec(err.to_string()))?;
         let key = attr.key;
         let key_local = key.local_name();
-        if key_local.as_ref() == local {
+        if key_local.as_ref().as_bytes() == local {
             // Equivalent to the (deprecated) `unescape_value`: decode UTF-8 and
             // resolve the predefined XML entities (`&amp;`, `&lt;`, …).
             let val = attr
@@ -443,5 +679,95 @@ mod tests {
     fn lower_id_is_ascii_invariant() {
         assert_eq!(lower_id("Newtonsoft.JSON"), "newtonsoft.json");
         assert_eq!(lower_id("  Foo.Bar  "), "foo.bar");
+    }
+
+    #[test]
+    fn extracts_display_metadata_with_entities_and_cdata() {
+        let xml = br#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/10/nuspec.xsd">
+  <metadata minClientVersion="4.1">
+    <id>Contoso.Tools</id>
+    <version>2.1.0</version>
+    <title>Contoso Tools</title>
+    <authors>Alice &amp; Bob</authors>
+    <description><![CDATA[Fast <b>and</b> safe]]> tooling</description>
+    <tags>cli  tools,build</tags>
+    <license type="expression">MIT OR Apache-2.0</license>
+    <projectUrl>https://example.com/tools</projectUrl>
+    <requireLicenseAcceptance>true</requireLicenseAcceptance>
+    <packageTypes><packageType name="DotnetTool" /></packageTypes>
+    <dependencies>
+      <group targetFramework="net8.0">
+        <dependency id="Explicit.End" version="1.0.0"></dependency>
+        <dependency id="Self.Closing" version="2.0.0" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>"#;
+        let raw = parse_nuspec(xml).unwrap();
+        let m = &raw.metadata;
+        assert_eq!(m.authors.as_deref(), Some("Alice & Bob"));
+        assert_eq!(
+            m.description.as_deref(),
+            Some("Fast <b>and</b> safe tooling")
+        );
+        assert_eq!(m.tags, ["cli", "tools", "build"]);
+        assert_eq!(m.license_expression.as_deref(), Some("MIT OR Apache-2.0"));
+        assert_eq!(m.project_url.as_deref(), Some("https://example.com/tools"));
+        assert!(m.require_license_acceptance);
+        assert_eq!(m.package_types, ["DotnetTool"]);
+        assert_eq!(m.min_client_version.as_deref(), Some("4.1"));
+        let ids: Vec<&str> = raw.deps[0]
+            .dependencies
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, ["Explicit.End", "Self.Closing"]);
+    }
+
+    #[test]
+    fn package_id_grammar() {
+        for ok in ["A", "Newtonsoft.Json", "my_pkg-2.x", "Ünicode.Lib"] {
+            assert!(validate_package_id(ok).is_ok(), "{ok}");
+        }
+        let long = "a".repeat(101);
+        for bad in [
+            "",
+            ".lead",
+            "trail.",
+            "two..dots",
+            "sp ace",
+            "slash/x",
+            long.as_str(),
+        ] {
+            assert!(validate_package_id(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn nupkg_with(nuspec: &str) -> std::io::Cursor<Vec<u8>> {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zw.start_file("p.nuspec", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(nuspec.as_bytes()).unwrap();
+        std::io::Cursor::new(zw.finish().unwrap().into_inner())
+    }
+
+    #[test]
+    fn rejects_symbols_packages_v_versions_and_bad_ids() {
+        let limits = NupkgLimits::default();
+        let symbols = r#"<package><metadata><id>A.B</id><version>1.0.0</version>
+            <packageTypes><packageType name="SymbolsPackage"/></packageTypes></metadata></package>"#;
+        let err = parse_nupkg(&mut nupkg_with(symbols), &limits).unwrap_err();
+        assert!(err.to_string().contains("symbol packages"), "{err}");
+
+        let v = r#"<package><metadata><id>A.B</id><version>v1.0.0</version></metadata></package>"#;
+        assert!(parse_nupkg(&mut nupkg_with(v), &limits).is_err());
+
+        let id = r#"<package><metadata><id>a/b</id><version>1.0.0</version></metadata></package>"#;
+        assert!(parse_nupkg(&mut nupkg_with(id), &limits).is_err());
+
+        let ok = r#"<package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
+        assert_eq!(parse_nupkg(&mut nupkg_with(ok), &limits).unwrap().id, "a.b");
     }
 }

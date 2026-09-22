@@ -9,8 +9,14 @@
 # be supplied at runtime via env:
 #   FORGE_DATABASE__URL   FORGE_S3__ENDPOINT   FORGE_S3__BUCKET
 #   FORGE_S3__ACCESS_KEY  FORGE_S3__SECRET_KEY
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 # and you should set:
-#   FORGE_SERVER__PUBLIC_BASE_URL   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
+#   FORGE_SERVER__PUBLIC_BASE_URL
+#
+# FAIL-CLOSED: the placeholder S3 keys (minioadmin) and bootstrap password
+# (changeme) below are refused at startup unless they are overridden or the
+# deployment explicitly opts in with FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true
+# (local compose/dev only — see docker-compose.app.yml).
 
 [server]
 # Listen on all interfaces inside the container; EXPOSE 8421 in the Dockerfile.
@@ -18,6 +24,9 @@ bind = "0.0.0.0:8421"
 # Override per-deployment with FORGE_SERVER__PUBLIC_BASE_URL so the NuGet V3
 # service index emits correct absolute @id URLs behind your real hostname.
 public_base_url = "http://localhost:8421"
+# Keep false in the image: the placeholders below must be replaced at runtime.
+# Only a local dev stack sets FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true.
+allow_insecure_defaults = false
 
 [database]
 # Placeholder — MUST be overridden via FORGE_DATABASE__URL at runtime.
@@ -33,15 +42,15 @@ secret_key = "minioadmin"
 force_path_style = true
 
 [auth]
-# "all" makes unauthenticated requests an Anonymous principal; a repo must ALSO
-# be created with anonymous_read=true to actually grant anonymous reads. Set to
-# "off" via FORGE_AUTH__ANONYMOUS_MODE=off for a fully authenticated deployment.
-anonymous_mode = "all"
+# Secure default: no anonymous principal — every request must authenticate.
+# For public/anonymous reads set FORGE_AUTH__ANONYMOUS_MODE=all (or allowlist)
+# AND create the repo with anonymous_read=true.
+anonymous_mode = "off"
 # Allow HTTP Basic password auth so the bootstrap admin can reach the admin API.
 allow_password_basic = true
 
-# First-run admin, created only if no admin exists yet. CHANGE THE PASSWORD via
-# FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD before exposing the server.
+# First-run admin, created only if no admin exists yet. The placeholder password
+# is refused at startup: set FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD.
 [auth.bootstrap_admin]
 username = "admin"
 password = "changeme"

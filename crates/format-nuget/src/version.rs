@@ -222,6 +222,18 @@ fn cmp_identifier(a: &str, b: &str) -> Ordering {
 }
 
 /// Normalize a raw version string to its canonical NuGet form.
+/// Whether `raw` (a version as published) is a SemVer 2.0.0 version in
+/// NuGet's sense: it carries build metadata or a dotted prerelease label.
+/// Clients that do not send `semVerLevel=2.0.0` must not be shown these.
+pub fn is_semver2(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.contains('+') {
+        return true;
+    }
+    raw.split_once('-')
+        .is_some_and(|(_, prerelease)| prerelease.contains('.'))
+}
+
 pub fn normalize(raw: &str) -> Result<String, FormatError> {
     Ok(NugetVersion::parse(raw)?.to_normalized_string())
 }
@@ -238,6 +250,14 @@ pub fn compare(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semver2_detection() {
+        assert!(is_semver2("1.0.0-beta.1"));
+        assert!(is_semver2("1.0.0+sha.abc"));
+        assert!(!is_semver2("1.0.0-beta1"));
+        assert!(!is_semver2("1.0.0"));
+    }
 
     fn norm(s: &str) -> String {
         normalize(s).unwrap()

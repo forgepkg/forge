@@ -43,9 +43,18 @@ pub enum ReserveDeleteOutcome {
 
 #[derive(Debug, Clone, Copy)]
 enum DeleteKind {
-    Outbox,
-    StalePending { created_before: DateTime<Utc> },
-    DanglingCommitted { created_before: DateTime<Utc> },
+    /// A due outbox row. `row_id` (when known) identifies the row being
+    /// processed so a *later* deferred delete for the same content can
+    /// supersede it.
+    Outbox {
+        row_id: Option<i64>,
+    },
+    StalePending {
+        created_before: DateTime<Utc>,
+    },
+    DanglingCommitted {
+        created_before: DateTime<Utc>,
+    },
 }
 
 /// Insert a pending, zero-refcount blob row keyed by `sha256`.
@@ -343,7 +352,34 @@ pub async fn reserve_outbox_delete(
     sha256: &str,
     stale_deletion_before: DateTime<Utc>,
 ) -> sqlx::Result<ReserveDeleteOutcome> {
-    reserve_delete(pool, sha256, DeleteKind::Outbox, stale_deletion_before).await
+    reserve_delete(
+        pool,
+        sha256,
+        DeleteKind::Outbox { row_id: None },
+        stale_deletion_before,
+    )
+    .await
+}
+
+/// Reserve the blob of outbox row `row_id` for deletion, unless a later
+/// deferred delete for the same content exists (the blob was revived and
+/// dereferenced again after this row was written): that row's later grace
+/// window governs, and this one retires as [`ReserveDeleteOutcome::Referenced`].
+pub async fn reserve_outbox_row_delete(
+    pool: &PgPool,
+    row_id: i64,
+    sha256: &str,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<ReserveDeleteOutcome> {
+    reserve_delete(
+        pool,
+        sha256,
+        DeleteKind::Outbox {
+            row_id: Some(row_id),
+        },
+        stale_deletion_before,
+    )
+    .await
 }
 
 /// Reserve a stale, never-committed pending blob for reconciliation.
@@ -423,7 +459,39 @@ async fn reserve_delete(
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
 
     let eligible = match kind {
-        DeleteKind::Outbox => true,
+        // A later deferred delete for the same content means the blob was
+        // revived and dereferenced again after this row was written; that
+        // row's (later) grace window governs. Treat this row like a revived
+        // blob so it retires without deleting anything. A takeover of an
+        // abandoned in-flight deletion (`state = 'deleting'`) must always
+        // complete, so it is exempt.
+        DeleteKind::Outbox {
+            row_id: Some(row_id),
+        } if state != "deleting" => {
+            let superseded: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM blob_outbox later, blob_outbox this
+                    WHERE this.id = $2
+                      AND later.sha256 = $1
+                      AND later.id <> this.id
+                      AND later.processed_at IS NULL
+                      AND later.available_at > this.available_at
+                )
+                "#,
+            )
+            .bind(sha256)
+            .bind(row_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if superseded {
+                tx.rollback().await?;
+                return Ok(ReserveDeleteOutcome::Referenced);
+            }
+            true
+        }
+        DeleteKind::Outbox { .. } => true,
         DeleteKind::StalePending { created_before } => {
             original_state == "pending" && created_at < created_before
         }

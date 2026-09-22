@@ -85,6 +85,52 @@ async fn me_reachable_by_non_admin() {
     assert_eq!(resp.status(), 403);
 }
 
+/// `/admin/me` reports the **effective** RBAC verdict: a user whose legacy
+/// `is_admin` column is false but who holds the built-in `admin` role is an
+/// admin to the SPA too (the admin API already treats it as one).
+#[tokio::test]
+async fn me_reflects_admin_role_not_legacy_column() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("rbacadmin{}", common::unique());
+
+    let created: Value = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_i64().expect("user id");
+    let resp = client
+        .put(format!("{}/admin/users/{id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "assign admin role");
+
+    let body: Value = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_admin"], json!(true), "admin role ⇒ admin");
+    assert!(body["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("user.admin")));
+}
+
 /// An unauthenticated caller (no credentials, anon mode off) gets 401.
 #[tokio::test]
 async fn me_unauthenticated_is_401() {

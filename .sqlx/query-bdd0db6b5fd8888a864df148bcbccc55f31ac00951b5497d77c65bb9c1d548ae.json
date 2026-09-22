@@ -6,37 +6,79 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "provider_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "provider_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "username",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "username"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "cred_hmac",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "cred_hmac"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "verdict",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "verdict"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "expires_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "expires_at"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

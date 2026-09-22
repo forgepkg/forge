@@ -43,6 +43,36 @@ pub async fn upsert_cached_version(
     Ok(res.rows_affected() > 0)
 }
 
+/// Record every upstream-listed `versions` of `name` in one round-trip
+/// (first sighting stamps `first_seen_at`; existing rows are untouched).
+/// Duplicates in `versions` are ignored. Returns the number of new rows.
+pub async fn upsert_cached_versions(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+) -> sqlx::Result<u64> {
+    if versions.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query!(
+        r#"
+        INSERT INTO proxy_cached_version (
+            repository_id, name, version, listed, downloaded, not_found, metadata_refreshed_at
+        )
+        SELECT $1, $2, v, true, false, false, now()
+        FROM (SELECT DISTINCT v FROM unnest($3::text[]) AS t(v)) AS d
+        ON CONFLICT (repository_id, name, version) DO NOTHING
+        "#,
+        repository_id,
+        name,
+        versions,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Fetch a cached-version row by its unique key.
 pub async fn get_cached_version(
     pool: &PgPool,

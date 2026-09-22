@@ -104,6 +104,12 @@ async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
     }
+    // Docker-less environments point at an already-running gateway (e.g. a
+    // local `versitygw --access test --secret test posix <dir>`).
+    if let Ok(endpoint) = std::env::var("FORGE_TEST_S3_ENDPOINT") {
+        S3_ENDPOINT.set(endpoint).ok();
+        return S3_ENDPOINT.get().unwrap();
+    }
 
     // versitygw posix backend (see storage harness): root must already exist,
     // so we point it at `/tmp` and use a named bucket subdir we create below.

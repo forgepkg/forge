@@ -87,10 +87,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
     };
 
     // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a brand
-    // new authenticated user must inherit the `authenticated` role *now*, not
-    // only at the next boot when `ensure_legacy_rbac` re-runs — otherwise a freshly
+    // new authenticated user must inherit the `authenticated` role *now* —
+    // `ensure_legacy_rbac` runs only once per install, so otherwise a freshly
     // created user would silently lose the slice-1 "read/write everywhere"
-    // behavior until a restart. Fail-closed installs leave the flag false and skip
+    // behavior. Fail-closed installs leave the flag false and skip
     // this. Idempotent.
     match authz_dao::assign_authenticated_if_legacy_open(&state.pool, u.id).await {
         Ok(true) => {

@@ -13,7 +13,7 @@
 //! 2. [`bootstrap`] idempotently creates the active KEK + DEK (atomic
 //!    create-if-absent in the key store — two instances starting together
 //!    create exactly one) and runs a first backfill pass so existing plaintext
-//!    `upstream_password` rows are wrapped immediately;
+//!    `upstream_password` rows and auth-realm secrets are wrapped immediately;
 //! 3. the [`spawn_worker`] loop keeps the system converged: plaintext
 //!    backfill, the DEK re-encrypt sweep, retire/revoke bookkeeping, age-based
 //!    DEK/KEK rotation, and the root re-wrap sweep (after an operator swaps
@@ -150,6 +150,12 @@ pub async fn bootstrap(
             "backfilled plaintext upstream passwords into envelopes"
         );
     }
+    let realms = secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
+        .await
+        .context("backfill plaintext realm secrets")?;
+    if realms > 0 {
+        tracing::info!(realms, "encrypted plaintext auth-realm secrets at rest");
+    }
     Ok(())
 }
 
@@ -269,6 +275,9 @@ async fn rotation_pass(
             break;
         }
     }
+    secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
+        .await
+        .context("realm secrets backfill")?;
 
     // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     let mut after_id = 0i64;
@@ -281,6 +290,9 @@ async fn rotation_pass(
             None => break,
         }
     }
+    secret_dao::reseal_realm_secrets(pool, envelope)
+        .await
+        .context("realm secrets re-encrypt sweep")?;
 
     // 6. Revoke keys nothing references anymore.
     secret_dao::revoke_unreferenced_deks(pool, envelope)

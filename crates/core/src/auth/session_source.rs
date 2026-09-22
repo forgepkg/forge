@@ -58,6 +58,11 @@ impl SessionCookieSource {
 
 #[async_trait::async_trait]
 impl PrincipalSource for SessionCookieSource {
+    /// The browser sends the cookie on its own: mutations need CSRF proof.
+    fn is_ambient(&self) -> bool {
+        true
+    }
+
     async fn resolve(&self, headers: &HeaderMap, _peer_ip: IpAddr) -> SourceOutcome {
         // No `Cookie` header, or no `forge_session` within it → not our turn.
         let Some(secret) = cookie_value(headers, SESSION_COOKIE) else {

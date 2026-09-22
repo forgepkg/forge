@@ -19,6 +19,11 @@
 
 mod common;
 
+/// Every test seeds the same `[oidc]`-imported auth realm row (one per
+/// database) with its own mock IdP; run them one at a time so a parallel test
+/// cannot swap the issuer under another's login flow.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -39,7 +44,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new(kid: &str) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rsa::rand_core::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
         let public_key = RsaPublicKey::from(&private_key);
         let n =
@@ -188,6 +193,22 @@ fn state_from_url(url: &str) -> String {
         .expect("state param")
 }
 
+/// The `Cookie` header value replaying the pre-auth `forge_oidc_flow` cookie
+/// the login leg set (the callback requires it: login-CSRF binding).
+fn flow_cookie_header(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| {
+            v.split(';')
+                .next()
+                .filter(|kv| kv.starts_with("forge_oidc_flow="))
+        })
+        .map(str::to_string)
+        .expect("forge_oidc_flow cookie set on the login leg")
+}
+
 /// Extract the `forge_session` cookie value from a Set-Cookie header.
 fn session_cookie_from(set_cookie: &str) -> String {
     set_cookie
@@ -202,6 +223,7 @@ fn session_cookie_from(set_cookie: &str) -> String {
 
 #[tokio::test]
 async fn login_redirects_to_idp_and_writes_flow_row() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -235,8 +257,18 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
         "redirects to IdP authorize: {location}"
     );
     assert!(location.contains("code_challenge_method=S256"));
-    // No session cookie is set on the login leg (state lives in the DB).
-    assert!(resp.headers().get("set-cookie").is_none());
+    // No session cookie is set on the login leg (state lives in the DB); only
+    // the short-lived HttpOnly pre-auth cookie binding the flow to this browser.
+    let set_cookies: Vec<&str> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert_eq!(set_cookies.len(), 1, "{set_cookies:?}");
+    assert!(set_cookies[0].starts_with("forge_oidc_flow="));
+    assert!(set_cookies[0].contains("HttpOnly"));
+    assert!(set_cookies[0].contains("SameSite=Lax"));
 
     // The oidc_flow row exists with the sanitized redirect target.
     let state = state_from_url(&location);
@@ -249,6 +281,7 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
 
 #[tokio::test]
 async fn login_rejects_open_redirect_target() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -283,6 +316,7 @@ async fn login_rejects_open_redirect_target() {
 
 #[tokio::test]
 async fn callback_sets_session_cookie_and_me_recognises_it() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let pool = common::pool().await;
     let srv = start_with(
@@ -310,6 +344,7 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
         .unwrap();
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
 
     // 2. The IdP echoes the flow's nonce so the token verifies; user is admin.
     let nonce = peek_nonce(&srv.pool, &state).await;
@@ -328,6 +363,7 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
             "{}/auth/oidc/callback?code=the-code&state={state}",
             srv.base_url
         ))
+        .header("cookie", &flow)
         .send()
         .await
         .unwrap();
@@ -362,6 +398,7 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
 
 #[tokio::test]
 async fn callback_rejects_unknown_state() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -385,10 +422,61 @@ async fn callback_rejects_unknown_state() {
     assert!(resp.headers().get("set-cookie").is_none());
 }
 
+#[tokio::test]
+async fn callback_from_another_browser_is_rejected() {
+    let _serial = SERIAL.lock().await;
+    // Login CSRF / session swap: the attacker starts a flow in their browser and
+    // lures the victim to the callback. The victim has no flow cookie → 400, no
+    // session, and the flow row survives for the real initiator.
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+
+    for cookie in [None, Some("forge_oidc_flow=forged")] {
+        let mut req = no_redirect_client().get(format!(
+            "{}/auth/oidc/callback?code=c&state={state}",
+            srv.base_url
+        ));
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), 400, "unbound callback rejected");
+        assert!(resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .all(|v| !v.to_str().unwrap().starts_with("forge_session=")));
+    }
+    let still = sqlx::query!("SELECT state FROM oidc_flow WHERE state = $1", state)
+        .fetch_optional(&srv.pool)
+        .await
+        .unwrap();
+    assert!(
+        still.is_some(),
+        "flow row not consumed by a forged callback"
+    );
+}
+
 // ── logout ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn logout_revokes_session_and_clears_cookie() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -409,6 +497,7 @@ async fn logout_revokes_session_and_clears_cookie() {
         .unwrap();
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
     let nonce = peek_nonce(&srv.pool, &state).await;
     idp.mount_token_with_claims(id_claims(
         &idp.issuer,
@@ -423,6 +512,7 @@ async fn logout_revokes_session_and_clears_cookie() {
             "{}/auth/oidc/callback?code=c&state={state}",
             srv.base_url
         ))
+        .header("cookie", &flow)
         .send()
         .await
         .unwrap();
@@ -500,6 +590,7 @@ async fn login_and_get_cookie(
         .unwrap();
     let location = resp.headers().get("location").unwrap().to_str().unwrap();
     let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
     let nonce = peek_nonce(&srv.pool, &state).await;
     idp.mount_token_with_claims(id_claims(&idp.issuer, sub, username, &nonce, roles))
         .await;
@@ -508,6 +599,7 @@ async fn login_and_get_cookie(
             "{}/auth/oidc/callback?code=c&state={state}",
             srv.base_url
         ))
+        .header("cookie", &flow)
         .send()
         .await
         .unwrap();
@@ -536,6 +628,7 @@ async fn login_and_get_cookie(
 
 #[tokio::test]
 async fn auth_me_returns_identity_and_csrf_token() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -577,6 +670,7 @@ async fn auth_me_returns_identity_and_csrf_token() {
 
 #[tokio::test]
 async fn session_can_mint_and_revoke_repository_token() {
+    let _serial = SERIAL.lock().await;
     let idp = MockIdp::start().await;
     let srv = start_with(
         common::pool().await,
@@ -657,7 +751,16 @@ async fn session_can_mint_and_revoke_repository_token() {
 
 #[tokio::test]
 async fn auth_routes_absent_when_oidc_disabled() {
+    let _serial = SERIAL.lock().await;
     // No oidc_block ⇒ no OIDC runtime ⇒ /auth/oidc/login is not mounted.
+    // Realms seeded by earlier tests persist in the shared database; remove
+    // them so this test sees an install without OIDC (a later test's boot
+    // re-imports its `[oidc]` block into a fresh row).
+    let pool = common::pool().await;
+    sqlx::query("DELETE FROM auth_realm WHERE kind = 'oidc'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let srv = common::start().await;
     let resp = no_redirect_client()
         .get(format!("{}/auth/oidc/login", srv.base_url))

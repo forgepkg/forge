@@ -31,7 +31,13 @@ use testcontainers_modules::{
 /// Start a dedicated, throwaway Postgres and return a connected (un-migrated)
 /// pool. Each test in this file needs full control over *when* migrations run
 /// relative to seeding, so it cannot share the common migrated container.
-async fn fresh_pool() -> (PgPool, ContainerAsync<Postgres>) {
+///
+/// With `FORGE_TEST_DATABASE_URL` set (no Docker), a fresh empty database is
+/// created on that server instead.
+async fn fresh_pool() -> (PgPool, Option<ContainerAsync<Postgres>>) {
+    if let Ok(admin_url) = std::env::var("FORGE_TEST_DATABASE_URL") {
+        return (fresh_external_database(&admin_url).await, None);
+    }
     let container = Postgres::default()
         .with_db_name("forge")
         .with_user("forge")
@@ -52,7 +58,34 @@ async fn fresh_pool() -> (PgPool, ContainerAsync<Postgres>) {
         .connect(&url)
         .await
         .expect("connect");
-    (pool, container)
+    (pool, Some(container))
+}
+
+/// Create an empty, uniquely named database next to `admin_url` and connect.
+async fn fresh_external_database(admin_url: &str) -> PgPool {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "rbac_migrate_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .expect("connect admin");
+    // The name is generated here, never user input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .execute(&admin)
+        .await
+        .expect("create database");
+    admin.close().await;
+    let (base, _) = admin_url.rsplit_once('/').expect("database url has a path");
+    PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&format!("{base}/{name}"))
+        .await
+        .expect("connect fresh database")
 }
 
 /// Build a [`Migrator`] over the workspace `migrations/` dir.
@@ -326,6 +359,55 @@ async fn apply_legacy_migration_is_idempotent() {
         .await
         .expect("query")
         .is_some());
+}
+
+/// P1.2: the boot hook applies the legacy mapping only ONCE per install, so an
+/// admin role an operator revokes through RBAC is not silently re-synthesized
+/// from the legacy `is_admin` column on the next restart.
+#[tokio::test]
+async fn boot_sync_runs_once_so_revocations_stick() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0006");
+    let admin_user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('a', 'x', true) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed admin");
+    migrator().await.run(&pool).await.expect("migrate all");
+
+    // First boot: runs (the marker is absent) and records the marker.
+    assert!(authz_dao::apply_legacy_migration_once(&pool)
+        .await
+        .expect("first boot"));
+    assert_eq!(
+        authz_dao::get_setting(&pool, authz_dao::LEGACY_RBAC_SYNCED_KEY)
+            .await
+            .expect("setting")
+            .as_deref(),
+        Some("true")
+    );
+
+    // The operator revokes the synthesized admin role.
+    let admin_role = authz_dao::role_id_by_name(&pool, ADMIN_ROLE)
+        .await
+        .expect("query")
+        .expect("admin role");
+    authz_dao::unassign_role(&pool, admin_user, admin_role)
+        .await
+        .expect("revoke");
+
+    // Later boots are no-ops: the revocation sticks.
+    assert!(!authz_dao::apply_legacy_migration_once(&pool)
+        .await
+        .expect("second boot"));
+    assert!(!authz_dao::user_has_role(&pool, admin_user, ADMIN_ROLE)
+        .await
+        .expect("query"));
 }
 
 /// §12.4 Phase 5 per-creation semantics: on an UPGRADED (legacy_open_access)

@@ -195,6 +195,19 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
         .unwrap();
     assert_eq!(login.status(), 200);
     let cookie = session_cookie(&login);
+    let me: Value = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let csrf = me["csrf_token"]
+        .as_str()
+        .expect("/auth/me returns the csrf token")
+        .to_string();
 
     let created = client
         .post(format!("{}/admin/repositories", srv.base_url))
@@ -205,19 +218,27 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
         .unwrap();
     assert_eq!(created.status(), 201);
 
-    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&package_id, "1.0.0"))
-        .file_name("package.nupkg")
-        .mime_str("application/octet-stream")
-        .unwrap();
-    let form = reqwest::multipart::Form::new().part("package", part);
-    let response = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
-        .header("cookie", cookie)
-        .header("authorization", "Unrelated session-bypass")
-        .multipart(form)
-        .send()
-        .await
-        .unwrap();
+    let push = |csrf: Option<&str>| {
+        let part = reqwest::multipart::Part::bytes(common::make_nupkg(&package_id, "1.0.0"))
+            .file_name("package.nupkg")
+            .mime_str("application/octet-stream")
+            .unwrap();
+        let mut req = client
+            .put(format!("{}/v3/{repo}/package", srv.base_url))
+            .header("cookie", &cookie)
+            .header("authorization", "Unrelated session-bypass")
+            .multipart(reqwest::multipart::Form::new().part("package", part));
+        if let Some(token) = csrf {
+            req = req.header("x-csrf-token", token);
+        }
+        req.send()
+    };
+    // Without the CSRF token the cookie-authenticated mutation is refused
+    // outright by the CSRF gate …
+    let response = push(None).await.unwrap();
+    assert_eq!(response.status(), 403, "cookie mutation without csrf token");
+    // … and even with it, a session is not a publish credential.
+    let response = push(Some(&csrf)).await.unwrap();
     assert_eq!(
         response.status(),
         401,
@@ -287,4 +308,88 @@ async fn anonymous_read_when_allowed() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "anonymous read should be allowed");
+}
+
+/// Regression: pushes above axum's 2 MiB extractor default used to fail with
+/// a 500. A 9 MiB package must publish (201) and restore byte-identically
+/// (streamed from S3).
+#[tokio::test]
+async fn large_package_push_and_restore_round_trip() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("big{}", common::unique());
+    let id = format!("Big.Pkg{}", common::unique());
+    let lower = id.to_lowercase();
+    client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+
+    let bytes = common::make_nupkg_with_payload(&id, "1.0.0", 9 * 1024 * 1024);
+    assert!(bytes.len() > 9 * 1024 * 1024);
+    let api_key = srv.admin_token().await;
+    let part = reqwest::multipart::Part::bytes(bytes.clone())
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", &api_key)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "a 9 MiB push must be accepted");
+
+    let url = format!(
+        "{}/v3/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+        srv.base_url
+    );
+    let head = client
+        .head(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some(bytes.len().to_string().as_str())
+    );
+    let resp = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), bytes.as_slice());
+}
+
+/// Liveness and readiness probes answer without authentication.
+#[tokio::test]
+async fn health_endpoints() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let live = client
+        .get(format!("{}/healthz", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    let ready = client
+        .get(format!("{}/readyz", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
+    let body: Value = ready.json().await.unwrap();
+    assert_eq!(body["checks"]["database"], true);
+    assert_eq!(body["checks"]["object_store"], true);
 }

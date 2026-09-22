@@ -107,11 +107,15 @@ struct MockBytes {
 
 #[async_trait]
 impl NupkgBytes for MockBytes {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        self.map
+    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+        let bytes = self
+            .map
             .get(s3_key)
             .cloned()
-            .ok_or_else(|| RepoError::RepoNotFound(s3_key.to_string()))
+            .ok_or_else(|| RepoError::RepoNotFound(s3_key.to_string()))?;
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(bytes::Bytes::from(bytes))
+        })))
     }
 }
 
@@ -445,6 +449,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH512".into()),
                 nuspec_bytes: Some(nuspec_with_dep()),
+                published: None,
             },
             RegistrationEntry {
                 original_id: "Sample.Lib".into(),
@@ -452,6 +457,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH2".into()),
                 nuspec_bytes: None,
+                published: None,
             },
         ],
     );
@@ -534,6 +540,7 @@ fn ops_with_search() -> MockOps {
                 listed: true,
             },
         ],
+        ..Default::default()
     }];
     ops
 }
@@ -601,6 +608,7 @@ fn ops_with_n_hits(n: usize) -> MockOps {
                 version_original: "1.0.0".into(),
                 listed: true,
             }],
+            ..Default::default()
         })
         .collect();
     ops
@@ -682,40 +690,188 @@ async fn search_skip_take_page_window_at_route_layer() {
 }
 
 #[tokio::test]
-async fn search_semver_level_param_does_not_filter_results() {
-    // A14: `semVerLevel=2.0.0` is accepted for client compatibility and must
-    // not break the request or unexpectedly drop results. With prerelease on,
-    // a SemVer2 prerelease hit is still returned unchanged.
+async fn search_hides_semver2_versions_unless_semver_level_2() {
+    // Protocol rule: SemVer 2.0.0 versions (dotted prerelease labels, build
+    // metadata) are only returned to clients sending `semVerLevel=2.0.0`.
     let mut ops = MockOps::default();
     ops.search_hits = vec![SearchHit {
         original_id: "Sample.Lib".into(),
         latest_version: "2.0.0-beta.1".into(),
-        versions: vec![VersionEntry {
-            original_id: "Sample.Lib".into(),
-            version: "2.0.0-beta.1".into(),
-            version_original: "2.0.0-beta.1".into(),
-            listed: true,
-        }],
+        versions: vec![
+            VersionEntry {
+                original_id: "Sample.Lib".into(),
+                version: "1.0.0".into(),
+                version_original: "1.0.0".into(),
+                listed: true,
+            },
+            VersionEntry {
+                original_id: "Sample.Lib".into(),
+                version: "2.0.0-beta.1".into(),
+                version_original: "2.0.0-beta.1".into(),
+                listed: true,
+            },
+        ],
+        ..Default::default()
     }];
     let router = nuget_router(
         RepoKind::Hosted,
         ctx(RepoKind::Hosted, ops, MockBytes::default()),
     );
 
-    // Without semVerLevel.
     let (status, _h, body) = get(&router, "/query?q=sample&prerelease=true").await;
     assert_eq!(status, StatusCode::OK);
-    let baseline = json(&body);
+    let legacy = json(&body);
+    assert_eq!(legacy["data"][0]["version"], "1.0.0");
+    assert_eq!(legacy["data"][0]["versions"].as_array().unwrap().len(), 1);
 
-    // With semVerLevel=2.0.0 — identical result, nothing filtered out.
     let (status, _h, body) =
         get(&router, "/query?q=sample&prerelease=true&semVerLevel=2.0.0").await;
     assert_eq!(status, StatusCode::OK);
-    let with_level = json(&body);
+    let modern = json(&body);
+    assert_eq!(modern["totalHits"], 1);
+    assert_eq!(modern["data"][0]["version"], "2.0.0-beta.1");
+    assert_eq!(modern["data"][0]["versions"].as_array().unwrap().len(), 2);
+}
 
-    assert_eq!(with_level, baseline);
-    assert_eq!(with_level["totalHits"], 1);
-    assert_eq!(with_level["data"][0]["version"], "2.0.0-beta.1");
+fn nuspec_with_metadata() -> Vec<u8> {
+    br#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Sample.Lib</id>
+    <version>1.0.0</version>
+    <authors>Alice, Bob</authors>
+    <description>A sample &amp; more</description>
+    <tags>json serializer</tags>
+    <license type="expression">MIT</license>
+    <projectUrl>https://example.com/p</projectUrl>
+  </metadata>
+</package>"#
+        .to_vec()
+}
+
+#[tokio::test]
+async fn search_hits_carry_manifest_metadata_and_downloads() {
+    let mut ops = MockOps::default();
+    ops.search_hits = vec![SearchHit {
+        original_id: "Sample.Lib".into(),
+        latest_version: "1.0.0".into(),
+        versions: vec![VersionEntry {
+            original_id: "Sample.Lib".into(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+        }],
+        nuspec_bytes: Some(nuspec_with_metadata()),
+        total_downloads: Some(42),
+    }];
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+    let (_s, _h, body) = get(&router, "/query?q=sample").await;
+    let hit = &json(&body)["data"][0];
+    assert_eq!(hit["description"], "A sample & more");
+    assert_eq!(hit["authors"], serde_json::json!(["Alice", "Bob"]));
+    assert_eq!(hit["tags"], serde_json::json!(["json", "serializer"]));
+    assert_eq!(hit["licenseUrl"], "https://licenses.nuget.org/MIT");
+    assert_eq!(hit["projectUrl"], "https://example.com/p");
+    assert_eq!(hit["totalDownloads"], 42);
+    assert_eq!(
+        hit["registration"],
+        "https://forge.example.com/v3/main/registration/sample.lib/index.json"
+    );
+}
+
+#[tokio::test]
+async fn registration_leaf_and_catalog_documents_resolve() {
+    let published = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut ops = MockOps::default();
+    ops.registration.insert(
+        "sample.lib".to_string(),
+        vec![
+            RegistrationEntry {
+                original_id: "Sample.Lib".into(),
+                version: "1.0.0".into(),
+                listed: true,
+                package_hash_sha512_base64: Some("HASH".into()),
+                nuspec_bytes: Some(nuspec_with_metadata()),
+                published: Some(published),
+            },
+            RegistrationEntry {
+                original_id: "Sample.Lib".into(),
+                version: "0.9.0".into(),
+                listed: false,
+                package_hash_sha512_base64: None,
+                nuspec_bytes: None,
+                published: Some(published),
+            },
+        ],
+    );
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+
+    let (status, _h, body) = get(&router, "/registration/sample.lib/index.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let index = json(&body);
+    let leaf = &index["items"][0]["items"][0];
+    let ce = &leaf["catalogEntry"];
+    assert_eq!(ce["published"], "2026-01-02T03:04:05.000+00:00");
+    assert_eq!(ce["description"], "A sample & more");
+    assert_eq!(ce["licenseExpression"], "MIT");
+    assert_eq!(
+        index["items"][0]["items"][1]["catalogEntry"]["published"], "1900-01-01T00:00:00+00:00",
+        "unlisted versions use nuget.org's 1900 marker"
+    );
+
+    // The leaf @id resolves to the leaf document …
+    let leaf_url = leaf["@id"].as_str().unwrap();
+    let path = leaf_url
+        .strip_prefix("https://forge.example.com/v3/main")
+        .unwrap();
+    let (status, _h, body) = get(&router, path).await;
+    assert_eq!(status, StatusCode::OK);
+    let doc = json(&body);
+    assert_eq!(doc["listed"], true);
+    assert_eq!(doc["catalogEntry"], ce["@id"]);
+
+    // … and its catalogEntry URL to the catalog entry.
+    let catalog_url = doc["catalogEntry"].as_str().unwrap();
+    let path = catalog_url
+        .strip_prefix("https://forge.example.com/v3/main")
+        .unwrap();
+    let (status, _h, body) = get(&router, path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["authors"], "Alice, Bob");
+
+    let (status, _h, _b) = get(&router, "/registration/sample.lib/9.9.9.json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn service_index_advertises_every_registration_variant() {
+    let router = nuget_router(
+        RepoKind::Proxy,
+        ctx(RepoKind::Proxy, MockOps::default(), MockBytes::default()),
+    );
+    let (_s, _h, body) = get(&router, "/index.json").await;
+    let types: Vec<String> = json(&body)["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["@type"].as_str().unwrap().to_string())
+        .collect();
+    for ty in [
+        "RegistrationsBaseUrl",
+        "RegistrationsBaseUrl/3.0.0-rc",
+        "RegistrationsBaseUrl/3.4.0",
+        "RegistrationsBaseUrl/3.6.0",
+    ] {
+        assert!(types.iter().any(|t| t == ty), "missing {ty}");
+    }
 }
 
 #[tokio::test]
@@ -740,7 +896,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct MockWrite {
     /// Bytes received by the most recent `store_upload`, for assertions.
-    last_upload: Mutex<Option<Vec<u8>>>,
+    last_upload: Arc<Mutex<Option<Vec<u8>>>>,
     /// Outcome to return from `store_upload` (default: Created).
     publish_result: Mutex<Option<Result<PublishOutcome, WriteError>>>,
     /// Whether delete/relist should report the version as found.
@@ -766,7 +922,9 @@ impl RepoWriteOps for MockWrite {
     ) -> Result<PublishOutcome, WriteError> {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.unwrap();
+        if let Err(e) = reader.read_to_end(&mut buf).await {
+            return Err(WriteError::Repo(RepoError::Storage(e.to_string())));
+        }
         if buf.len() as u64 > max_upload_bytes {
             return Err(WriteError::TooLarge {
                 limit: max_upload_bytes,
@@ -920,6 +1078,35 @@ async fn push_too_large_maps_to_413() {
     *w.publish_result.lock().unwrap() = Some(Err(WriteError::TooLarge { limit: 4 }));
     let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
     let (status, _) = put_multipart(&router, "/package", Some("key"), b"bytes").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Regression: axum's extractor default (2 MiB) used to reject every
+/// real-sized push with a 500. A multi-MiB package must stream through.
+#[tokio::test]
+async fn push_larger_than_axum_default_limit_succeeds() {
+    let w = MockWrite::found();
+    let last = w.last_upload.clone();
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let payload = vec![0x5a_u8; 3 * 1024 * 1024 + 17];
+    let (status, _) = put_multipart(&router, "/package", Some("key"), &payload).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        last.lock().unwrap().as_ref().map(Vec::len),
+        Some(payload.len())
+    );
+}
+
+/// A body beyond `max_upload_bytes` + framing slack trips the request-body
+/// limit mid-stream; that must surface as 413, not as a storage error.
+#[tokio::test]
+async fn push_over_body_limit_maps_to_413() {
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx_with_write(RepoKind::Hosted, MockWrite::found()),
+    );
+    let payload = vec![0x5a_u8; 18 * 1024 * 1024];
+    let (status, _) = put_multipart(&router, "/package", Some("key"), &payload).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 

@@ -23,10 +23,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.8" }
 
 # Static file serving (SPA assets + index.html fallback)
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # Database
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "postgres",
     "macros",
@@ -42,7 +42,7 @@ aws-sdk-s3 = { version = "1.85" }
 aws-config = { version = "1.8" }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form", "system-proxy"] }
 
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
@@ -52,7 +52,7 @@ moka = { version = "0.12", features = ["future"] }
 globset = { version = "0.4" }
 
 # Redis (optional)
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 
 # Futures combinators (Stream adapters for redis pub/sub)
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -70,16 +70,16 @@ tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Hashing
-sha2 = { version = "0.10" }
+sha2 = { version = "0.11" }
 
 # Keyed hashing (validated-credential cache key: HMAC-SHA256 with a server pepper)
-hmac = { version = "0.12" }
+hmac = { version = "0.13" }
 
 # Hex encoding (token hashes)
 hex = { version = "0.4" }
 
 # Password hashing (PHC argon2 verification)
-argon2 = { version = "0.5" }
+argon2 = { version = "0.6" }
 
 # Constant-time comparison
 subtle = { version = "2.6" }
@@ -88,8 +88,8 @@ subtle = { version = "2.6" }
 # default (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the
 # opt-in alternative whose 192-bit extended nonce makes pure-random nonces
 # collision-safe without any per-key counter state.
-aes-gcm = { version = "0.10" }
-chacha20poly1305 = { version = "0.10" }
+aes-gcm = { version = "0.11" }
+chacha20poly1305 = { version = "0.11" }
 
 # Scrub unwrapped key bytes / transient plaintext from memory on drop (12.5).
 zeroize = { version = "1.8" }
@@ -99,7 +99,7 @@ zeroize = { version = "1.8" }
 secrecy = { version = "0.10" }
 
 # CSPRNG for token secrets
-rand = { version = "0.8" }
+rand = { version = "0.10" }
 
 # CIDR / IP network parsing (anon allowlist, SSRF guard)
 ipnet = { version = "2.10" }
@@ -114,7 +114,7 @@ http = { version = "1" }
 async-trait = { version = "0.1" }
 
 # Base64 (RFC 4648 standard alphabet)
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 
 # JWT decode/verify (OIDC ID-token signature + claim validation, slice 12.2).
 # We use `jsonwebtoken` (not the heavier `openidconnect`) for Phase 2: it gives
@@ -122,7 +122,7 @@ base64 = { version = "0.22" }
 # allowlist (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots
 # cleanly behind the existing SSRF `guarded_client` + `forge-cache` rather than
 # bringing its own HTTP-client abstraction.
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 # Temp files
 tempfile = { version = "3" }

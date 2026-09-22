@@ -34,9 +34,13 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(config_path.as_deref()).context("load configuration")?;
 
     // Database.
-    let pool = forge_db::connect(&config.database.url)
-        .await
-        .context("connect database")?;
+    let pool = forge_db::connect_with(
+        &config.database.url,
+        config.database.max_connections,
+        std::time::Duration::from_secs(config.database.acquire_timeout_seconds),
+    )
+    .await
+    .context("connect database")?;
     forge_db::migrate(&pool).await.context("run migrations")?;
 
     // Object store (ensure the bucket exists).
@@ -48,9 +52,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Cache: L2 Redis when configured, else L1-only.
     let cache = match &config.redis.url {
-        Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
-            .await
-            .context("connect redis cache")?,
+        Some(url) => {
+            Cache::with_redis_timeouts(config.cache.l1_max_capacity, url, config.redis.timeouts())
+                .await
+                .context("connect redis cache")?
+        }
         None => Cache::l1_only(config.cache.l1_max_capacity),
     };
 
@@ -59,20 +65,15 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // §12.4 Phase 5: re-apply the idempotent behavior-preserving RBAC legacy
-    // mapping (is_admin→admin role, anonymous_read→anonymous grants, and — only
-    // on legacy-open-access installs — authenticated for every user). A no-op
-    // once converged; never opens a fresh install. Runs after bootstrap so a
-    // freshly-created legacy-open user inherits the `authenticated` role too.
+    // §12.4 Phase 5: apply the behavior-preserving RBAC legacy mapping
+    // (is_admin→admin role, anonymous_read→anonymous grants, and — only on
+    // legacy-open-access installs — authenticated for every user) ONCE per
+    // install (a forge_setting marker), so later RBAC revocations stick. Never
+    // opens a fresh install. Runs after bootstrap so a freshly-created
+    // legacy-open user inherits the `authenticated` role too.
     ensure_legacy_rbac(&pool)
         .await
         .context("ensure legacy RBAC mapping")?;
-
-    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
-    // auth_realm rows (drift-detected); the DB is the authority.
-    ensure_auth_realms(&config, &pool)
-        .await
-        .context("ensure auth realms")?;
 
     // §12.5: secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
@@ -87,13 +88,21 @@ async fn main() -> anyhow::Result<()> {
             .context("bootstrap secret encryption")?;
     }
 
+    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // auth_realm rows (drift-detected); the DB is the authority. After the
+    // crypto bootstrap so seeded realm secrets are encrypted at rest.
+    ensure_auth_realms(&config, &pool, envelope.as_deref())
+        .await
+        .context("ensure auth realms")?;
+
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
     let layer = principal_layer(&state)?;
 
-    // Background workers (outbox / reconciler / proxy refresh).
-    let _workers = workers::spawn_all(&state);
+    // Background workers (outbox / reconciler / proxy refresh / …), each
+    // supervised: a panicking loop is logged and restarted.
+    let workers = workers::spawn_all(&state);
 
     let app = build_router(state, layer);
 
@@ -110,11 +119,39 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("server error")?;
 
+    // In-flight requests have drained; stop the background loops. Every worker
+    // step is idempotent / lease-fenced, so an interrupted pass is resumed by
+    // the next instance.
+    workers.abort();
+    tracing::info!("forge-server stopped");
     Ok(())
 }
 
-/// Resolve on Ctrl-C for graceful shutdown.
+/// Resolve on Ctrl-C or SIGTERM for graceful shutdown. In a container the
+/// server is PID 1 and `docker stop` / Kubernetes send SIGTERM; without
+/// handling it every stop would end in SIGKILL mid-request.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }

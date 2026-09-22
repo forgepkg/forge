@@ -86,6 +86,11 @@ pub struct S3Config {
     pub conditional_writes: ConditionalWrites,
 }
 
+/// S3 connect deadline.
+const S3_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Maximum wait for response data from S3 (first byte / between reads).
+const S3_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A content-addressed object store over an S3-compatible backend.
 #[derive(Debug, Clone)]
 pub struct BlobStore {
@@ -118,6 +123,15 @@ impl BlobStore {
             // emit/verify them when the operation actually demands it.
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+            // Bound a stalled object store: connect, and the wait for response
+            // data. No total-operation deadline — multi-hundred-MiB package
+            // transfers must be allowed to take as long as they keep moving.
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(S3_CONNECT_TIMEOUT)
+                    .read_timeout(S3_READ_TIMEOUT)
+                    .build(),
+            )
             .build();
 
         Self {
@@ -127,6 +141,18 @@ impl BlobStore {
             conditional_writes: cfg.conditional_writes,
             conditional_unsupported: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Readiness probe: the bucket is reachable with the configured
+    /// credentials.
+    pub async fn ping(&self) -> Result<(), S3Error> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| S3Error::S3(format!("{e:?}")))
     }
 
     /// Create the bucket if it does not already exist.

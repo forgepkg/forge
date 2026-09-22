@@ -45,6 +45,9 @@ pub struct Config {
     /// Group-repository nesting limits (slice 12.4).
     #[serde(default)]
     pub groups: GroupsConfig,
+    /// Proxy-repository upstream HTTP tuning (timeouts, size caps, spooling).
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -70,6 +73,22 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
+    /// Largest accepted package upload (`dotnet nuget push`) in bytes. Uploads
+    /// are streamed to a temp file, never buffered in memory; exceeding the
+    /// limit yields HTTP 413. Default 512 MiB.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+    /// Permit starting with **known-insecure placeholder credentials** (the
+    /// `changeme` / empty bootstrap-admin password, `minioadmin` S3 keys).
+    /// Default `false`: such a config refuses to start, so a copied dev config
+    /// or the image's baked defaults never reach production unnoticed. Set
+    /// `true` only for local development / compose stacks.
+    #[serde(default)]
+    pub allow_insecure_defaults: bool,
+}
+
+fn default_max_upload_bytes() -> u64 {
+    512 * 1024 * 1024
 }
 
 impl ServerConfig {
@@ -86,6 +105,21 @@ impl ServerConfig {
 pub struct DatabaseConfig {
     /// `postgres://…` connection URL.
     pub url: String,
+    /// Connection-pool size. Default 20.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: u32,
+    /// How long a request waits for a free pooled connection before failing
+    /// (seconds). Default 10.
+    #[serde(default = "default_db_acquire_timeout")]
+    pub acquire_timeout_seconds: u64,
+}
+
+fn default_db_max_connections() -> u32 {
+    20
+}
+
+fn default_db_acquire_timeout() -> u64 {
+    10
 }
 
 /// `s3.*`
@@ -210,6 +244,23 @@ pub struct AuthConfig {
     /// window. Keep small — the rebuild is two cheap queries.
     #[serde(default = "default_realm_cache_ttl")]
     pub realm_cache_ttl_seconds: u64,
+    /// Failed password attempts allowed per `(client IP, username)` within
+    /// [`Self::login_failure_window_seconds`] before further attempts are
+    /// refused until the window lapses (browser login and Basic password auth;
+    /// per instance, in memory). `0` disables the lockout.
+    #[serde(default = "default_login_max_failures")]
+    pub login_max_failures: u32,
+    /// Length (seconds) of the password-failure window / lockout.
+    #[serde(default = "default_login_failure_window")]
+    pub login_failure_window_seconds: u64,
+}
+
+fn default_login_max_failures() -> u32 {
+    10
+}
+
+fn default_login_failure_window() -> u64 {
+    300
 }
 
 fn default_login_mode() -> String {
@@ -392,6 +443,30 @@ pub struct RedisConfig {
     /// `redis://…` URL. Absent ⇒ L1-only caching.
     #[serde(default)]
     pub url: Option<String>,
+    /// Connect / reconnect deadline in milliseconds. Default 2000.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Per-command response deadline in milliseconds. A slower Redis is
+    /// treated as unavailable (reads fall through to the source). Default 2000.
+    #[serde(default)]
+    pub response_timeout_ms: Option<u64>,
+}
+
+impl RedisConfig {
+    /// The runtime timeouts handed to the cache.
+    pub fn timeouts(&self) -> forge_cache::RedisTimeouts {
+        let defaults = forge_cache::RedisTimeouts::default();
+        forge_cache::RedisTimeouts {
+            connect: self
+                .connect_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.connect),
+            response: self
+                .response_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.response),
+        }
+    }
 }
 
 /// `cache.*`
@@ -539,6 +614,122 @@ fn default_max_nesting_depth() -> i32 {
     20
 }
 
+/// `proxy.*` — outbound HTTP tuning shared by every proxy repository.
+///
+/// Timeouts are split by what they protect against: `connect_timeout_seconds`
+/// and `read_timeout_seconds` (no bytes received for that long) bound a dead
+/// or stalled peer for every request, while the total deadlines differ by
+/// request class — metadata documents are small, but `.nupkg` downloads may be
+/// hundreds of MiB over a slow link, so `download_timeout_seconds` is
+/// deliberately generous. Response bodies are size-capped while streaming;
+/// metadata up to `spool_memory_bytes` stays in memory and larger bodies spill
+/// to a self-deleting temp file, and packages always stream to a temp file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyConfig {
+    /// TCP + TLS connect deadline. Default 15 s.
+    #[serde(default = "default_proxy_connect_timeout")]
+    pub connect_timeout_seconds: u64,
+    /// Maximum idle time between two reads of a response. Default 60 s.
+    #[serde(default = "default_proxy_read_timeout")]
+    pub read_timeout_seconds: u64,
+    /// Total deadline for metadata requests (service index, version listing,
+    /// `.nuspec`). Default 60 s.
+    #[serde(default = "default_proxy_metadata_timeout")]
+    pub metadata_timeout_seconds: u64,
+    /// Total deadline for a `.nupkg` download. Default 30 min.
+    #[serde(default = "default_proxy_download_timeout")]
+    pub download_timeout_seconds: u64,
+    /// Largest accepted upstream metadata document. Default 32 MiB.
+    #[serde(default = "default_proxy_max_metadata_bytes")]
+    pub max_metadata_bytes: u64,
+    /// Largest accepted upstream `.nupkg`. Default 1 GiB.
+    #[serde(default = "default_proxy_max_package_bytes")]
+    pub max_package_bytes: u64,
+    /// Bodies up to this size are kept in memory; larger ones spill to a temp
+    /// file that is removed when the request finishes. Default 2 MiB.
+    #[serde(default = "default_proxy_spool_memory_bytes")]
+    pub spool_memory_bytes: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            connect_timeout_seconds: default_proxy_connect_timeout(),
+            read_timeout_seconds: default_proxy_read_timeout(),
+            metadata_timeout_seconds: default_proxy_metadata_timeout(),
+            download_timeout_seconds: default_proxy_download_timeout(),
+            max_metadata_bytes: default_proxy_max_metadata_bytes(),
+            max_package_bytes: default_proxy_max_package_bytes(),
+            spool_memory_bytes: default_proxy_spool_memory_bytes(),
+        }
+    }
+}
+
+impl ProxyConfig {
+    /// The runtime tuning handed to [`forge_core::net::upstream::UpstreamHttp`].
+    pub fn upstream_http(&self) -> forge_core::net::upstream::UpstreamHttpConfig {
+        forge_core::net::upstream::UpstreamHttpConfig {
+            connect_timeout: Duration::from_secs(self.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.read_timeout_seconds),
+            metadata_timeout: Duration::from_secs(self.metadata_timeout_seconds),
+            download_timeout: Duration::from_secs(self.download_timeout_seconds),
+            max_metadata_bytes: self.max_metadata_bytes,
+            max_package_bytes: self.max_package_bytes,
+            spool_memory_bytes: usize::try_from(self.spool_memory_bytes).unwrap_or(usize::MAX),
+            ..Default::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "proxy.connect_timeout_seconds",
+                self.connect_timeout_seconds,
+            ),
+            ("proxy.read_timeout_seconds", self.read_timeout_seconds),
+            (
+                "proxy.metadata_timeout_seconds",
+                self.metadata_timeout_seconds,
+            ),
+            (
+                "proxy.download_timeout_seconds",
+                self.download_timeout_seconds,
+            ),
+            ("proxy.max_metadata_bytes", self.max_metadata_bytes),
+            ("proxy.max_package_bytes", self.max_package_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} must be greater than 0"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_proxy_connect_timeout() -> u64 {
+    15
+}
+fn default_proxy_read_timeout() -> u64 {
+    60
+}
+fn default_proxy_metadata_timeout() -> u64 {
+    60
+}
+fn default_proxy_download_timeout() -> u64 {
+    30 * 60
+}
+fn default_proxy_max_metadata_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+fn default_proxy_max_package_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_proxy_spool_memory_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -636,11 +827,11 @@ pub struct OidcConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local `app_user` whose `username`
-    /// matches the resolved username claim (bootstrap-admin interplay). Risky if
-    /// the username claim is attacker-influenced — set `false` in hardened
-    /// deployments.
-    #[serde(default = "default_true")]
+    /// Link a new OIDC identity to an existing `app_user` whose `username`
+    /// matches the resolved username claim. Off by default (the claim is
+    /// IdP-controlled); even when on, accounts with a local password or admin
+    /// rights are never linked by name.
+    #[serde(default)]
     pub link_existing_by_username: bool,
 
     // ---- admin assignment ----
@@ -971,7 +1162,101 @@ impl Config {
             }
         }
         self.validate_crypto()?;
+        self.proxy.validate()?;
+        self.validate_workers()?;
+        self.validate_insecure_defaults()?;
+        if self.server.max_upload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "server.max_upload_bytes must be greater than 0".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Background-worker tuning must be usable: a zero interval makes
+    /// `tokio::time::interval` panic inside the spawned loop, and a negative
+    /// grace would make blob deletes immediate.
+    fn validate_workers(&self) -> Result<(), ConfigError> {
+        let positive = |key: &str, ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{key} must be greater than 0"
+                )))
+            }
+        };
+        positive(
+            "outbox.poll_interval_seconds",
+            self.outbox.poll_interval_seconds > 0,
+        )?;
+        positive("outbox.batch_size", self.outbox.batch_size > 0)?;
+        if self.outbox.grace_seconds < 0 {
+            return Err(ConfigError::Invalid(
+                "outbox.grace_seconds must not be negative".into(),
+            ));
+        }
+        positive(
+            "retention.poll_interval_seconds",
+            self.retention.poll_interval_seconds > 0,
+        )?;
+        positive("retention.lease_seconds", self.retention.lease_seconds > 0)?;
+        if self.retention.default_run_interval_seconds < 0 {
+            return Err(ConfigError::Invalid(
+                "retention.default_run_interval_seconds must not be negative".into(),
+            ));
+        }
+        positive(
+            "groups.max_nesting_depth",
+            self.groups.max_nesting_depth > 0,
+        )?;
+        positive(
+            "database.max_connections",
+            self.database.max_connections > 0,
+        )?;
+        positive(
+            "database.acquire_timeout_seconds",
+            self.database.acquire_timeout_seconds > 0,
+        )?;
+        if let Some(crypto) = self.crypto.as_ref().filter(|c| c.enabled) {
+            positive(
+                "crypto.rotation.poll_interval_seconds",
+                !crypto.rotation.enabled || crypto.rotation.poll_interval_seconds > 0,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Refuse known-insecure placeholder credentials unless
+    /// `server.allow_insecure_defaults` opts in (dev/compose only): a
+    /// `changeme` or empty bootstrap-admin password, or `minioadmin` S3 keys.
+    fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
+        let mut found = Vec::new();
+        if let Some(ba) = &self.auth.bootstrap_admin {
+            let pw = ba.password.trim();
+            if pw.is_empty() || pw.eq_ignore_ascii_case("changeme") {
+                found.push("auth.bootstrap_admin.password is a placeholder (\"changeme\"/empty)");
+            }
+        }
+        if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
+            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults");
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        if self.server.allow_insecure_defaults {
+            for issue in &found {
+                tracing::warn!(%issue, "starting with insecure default credentials (server.allow_insecure_defaults = true)");
+            }
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "refusing to start with insecure default credentials: {}; set real secrets \
+             (e.g. FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD, FORGE_S3__ACCESS_KEY / \
+             FORGE_S3__SECRET_KEY) or, for local development only, \
+             server.allow_insecure_defaults = true (FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true)",
+            found.join("; ")
+        )))
     }
 
     /// Validate the optional `[crypto]` section when present and enabled
@@ -1606,7 +1891,10 @@ mod tests {
         assert_eq!(oidc.email_claim, "email");
         assert_eq!(oidc.display_name_claim, "name");
         assert!(oidc.auto_provision);
-        assert!(oidc.link_existing_by_username);
+        assert!(
+            !oidc.link_existing_by_username,
+            "linking by username is opt-in"
+        );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
         assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);
@@ -1887,12 +2175,41 @@ mod tests {
     fn bootstrap_admin_parsed() {
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"s3cret-Pw!\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         let ba = cfg.auth.bootstrap_admin.expect("present");
         assert_eq!(ba.username, "admin");
-        assert_eq!(ba.password, "changeme");
+        assert_eq!(ba.password, "s3cret-Pw!");
+        assert!(!cfg.server.allow_insecure_defaults, "off by default");
+    }
+
+    #[test]
+    fn insecure_default_credentials_refused_unless_allowed() {
+        for (from, to) in [
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            ),
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
+            ),
+            ("access_key = \"test\"", "access_key = \"minioadmin\""),
+            ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
+        ] {
+            let toml = MINIMAL.replace(from, to);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains("insecure default"), "{err}");
+
+            // The explicit dev opt-in lets it start.
+            let allowed = toml.replace(
+                "public_base_url = \"https://forge.example.com/\"",
+                "public_base_url = \"https://forge.example.com/\"\nallow_insecure_defaults = true",
+            );
+            let cfg = Config::from_figment(fig_from_toml(&allowed)).expect("dev opt-in");
+            assert!(cfg.server.allow_insecure_defaults);
+        }
     }
 
     // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────

@@ -9,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { meKeys, meQueryOptions } from '~/api/me'
-import { logout } from '~/api/auth'
+import { authKeys, authSessionQueryOptions, logout } from '~/api/auth'
 import { ApiError } from '~/lib/httpClient'
 import { clearSession, onAuthChange } from '~/lib/auth'
 import { useMe } from '~/queries/useMe'
@@ -43,6 +43,9 @@ export const Route = createFileRoute('/_app')({
   beforeLoad: async ({ context, location }) => {
     try {
       await context.queryClient.ensureQueryData(meQueryOptions)
+      // Bootstrap the CSRF token from the live session (an OIDC redirect
+      // only sets the cookie); once per load, best-effort.
+      await context.queryClient.ensureQueryData(authSessionQueryOptions)
     } catch (error) {
       if (error instanceof ApiError && error.isAuthError) {
         throw redirect({
@@ -91,20 +94,32 @@ function AppLayout() {
     })
   }, [queryClient])
 
+  // `is_admin` is the server's effective RBAC verdict (admin role or legacy
+  // flag), not the raw column.
   const isAdmin = me.data?.is_admin === true
   const username = me.data?.user.username ?? null
   const items = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin)
 
   async function signOut() {
     // Only the server can invalidate the httpOnly cookie, so POST /auth/logout
-    // (CSRF-guarded) before clearing local state.
+    // (CSRF-guarded) before clearing local state. A failure is surfaced on the
+    // login screen: the server session may still be alive, and silently
+    // pretending otherwise would leave it usable. Local state is cleared and
+    // the user is sent to login either way.
+    let logoutFailed = false
     try {
       await logout()
-    } catch {
-      /* clear local state regardless; the cookie may already be dead */
+    } catch (error) {
+      // A 401 means the session is already gone — that is a successful logout.
+      logoutFailed = !(error instanceof ApiError && error.status === 401)
     }
     clearSession()
-    void router.navigate({ to: '/login' })
+    queryClient.removeQueries({ queryKey: authKeys.session() })
+    queryClient.removeQueries({ queryKey: meKeys.self() })
+    void router.navigate({
+      to: '/login',
+      search: logoutFailed ? { logout_failed: true } : {},
+    })
   }
 
   return (

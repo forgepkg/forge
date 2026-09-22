@@ -118,6 +118,54 @@ async fn password_login_session_round_trip() {
         .unwrap();
     assert_eq!(resp.status(), 200, "session cookie reaches the admin API");
 
+    // Every cookie-authenticated mutation needs the CSRF token, whichever
+    // router family serves it (admin API, self-service tokens, /v3 dispatch).
+    for (method, path) in [
+        (reqwest::Method::POST, "/admin/roles"),
+        (reqwest::Method::POST, "/admin/me/tokens"),
+        (reqwest::Method::DELETE, "/admin/tokens/999999"),
+        (reqwest::Method::PUT, "/v3/no-such-repo/package"),
+    ] {
+        let resp = client
+            .request(method.clone(), format!("{}{path}", srv.base_url))
+            .header("cookie", &cookie)
+            .json(&json!({ "name": format!("csrf{}", common::unique()) }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{method} {path} without csrf");
+    }
+    // With the token the same self-service mutation goes through.
+    let resp = client
+        .post(format!("{}/admin/me/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "with-csrf" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "csrf-bearing mutation accepted");
+    // …but not as a form post (JSON content type required).
+    let resp = client
+        .post(format!("{}/admin/me/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("name=form")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 415);
+    // Basic-authenticated mutations are exempt (not an ambient credential).
+    let resp = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "name": format!("basic{}", common::unique()), "description": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 403, "basic auth needs no csrf token");
+
     // Logout requires the CSRF token; after it the session is dead.
     let resp = client
         .post(format!("{}/auth/logout", srv.base_url))

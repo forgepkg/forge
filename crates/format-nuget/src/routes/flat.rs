@@ -9,7 +9,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::{json, Value};
 
@@ -38,6 +38,7 @@ pub async fn versions(State(ctx): State<RouteContext>, Path(id): Path<String>) -
 /// filename are not trusted; the `{id}`/`{version}` path segments drive lookup.
 pub async fn content(
     State(ctx): State<RouteContext>,
+    method: Method,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Response {
     let lower = ctx.format.lower_id(&id);
@@ -48,7 +49,7 @@ pub async fn content(
 
     let lower_file = filename.to_ascii_lowercase();
     if lower_file.ends_with(".nupkg") {
-        serve_nupkg(&ctx, &lower, &norm_ver).await
+        serve_nupkg(&ctx, &lower, &norm_ver, method == Method::HEAD).await
     } else if lower_file.ends_with(".nuspec") {
         serve_nuspec(&ctx, &lower, &norm_ver).await
     } else {
@@ -56,25 +57,25 @@ pub async fn content(
     }
 }
 
-async fn serve_nupkg(ctx: &RouteContext, id: &str, version: &str) -> Response {
+async fn serve_nupkg(ctx: &RouteContext, id: &str, version: &str, head: bool) -> Response {
     let loc = match ctx.ops.resolve_nupkg(&ctx.repo, id, version).await {
         Ok(Some(l)) => l,
         Ok(None) => return (StatusCode::NOT_FOUND, "package not found").into_response(),
         Err(e) => return repo_error_response(e),
     };
-    let bytes = match ctx.nupkg.fetch_all(&loc.blob_s3_key).await {
-        Ok(b) => b,
+    let headers = [
+        (header::CONTENT_TYPE, loc.content_type.clone()),
+        (header::CONTENT_LENGTH, loc.size.to_string()),
+    ];
+    // A HEAD only needs the headers; don't open (or bill) an S3 GET for it.
+    if head {
+        return (StatusCode::OK, headers).into_response();
+    }
+    let stream = match ctx.nupkg.open(&loc.blob_s3_key).await {
+        Ok(s) => s,
         Err(e) => return repo_error_response(e),
     };
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, loc.content_type.clone()),
-            (header::CONTENT_LENGTH, bytes.len().to_string()),
-        ],
-        Body::from(bytes),
-    )
-        .into_response()
+    (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
 }
 
 async fn serve_nuspec(ctx: &RouteContext, id: &str, version: &str) -> Response {

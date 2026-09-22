@@ -8,11 +8,13 @@
 //!
 //! `config` may contain secrets (OIDC `client_secret`, credential-forwarding
 //! `key_pepper`). This module moves the jsonb around opaquely; redaction is the
-//! API layer's job, encryption at rest is slice 12.5.
+//! API layer's job. Encryption at rest (`secrets_enc`, migration 0016) goes
+//! through [`crate::secret_dao`]'s realm helpers, which call
+//! [`update_realm_and_secrets`] here.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use crate::model::AuthRealm;
 
@@ -45,7 +47,7 @@ pub async fn list_realms(pool: &PgPool) -> sqlx::Result<Vec<AuthRealm>> {
     sqlx::query_as!(
         AuthRealm,
         r#"
-        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         FROM auth_realm
         ORDER BY priority
         "#,
@@ -59,7 +61,7 @@ pub async fn list_enabled_realms(pool: &PgPool) -> sqlx::Result<Vec<AuthRealm>> 
     sqlx::query_as!(
         AuthRealm,
         r#"
-        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         FROM auth_realm
         WHERE enabled
         ORDER BY priority
@@ -74,7 +76,7 @@ pub async fn find_realm_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<Aut
     sqlx::query_as!(
         AuthRealm,
         r#"
-        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         FROM auth_realm
         WHERE id = $1
         "#,
@@ -89,7 +91,7 @@ pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
     sqlx::query_as!(
         AuthRealm,
         r#"
-        SELECT id, kind, name, enabled, priority, config, created_at, updated_at
+        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         FROM auth_realm
         WHERE name = $1
         "#,
@@ -123,13 +125,18 @@ pub async fn next_priority(pool: &PgPool) -> sqlx::Result<i32> {
 
 /// Insert a realm, returning the persisted row. A duplicate `name` or
 /// `priority` surfaces as a unique violation for the caller to map to 409.
-pub async fn insert_realm(pool: &PgPool, new: NewAuthRealm) -> sqlx::Result<AuthRealm> {
+/// Accepts any executor so the encrypted-secrets insert composes in one
+/// transaction.
+pub async fn insert_realm<'e, E>(executor: E, new: NewAuthRealm) -> sqlx::Result<AuthRealm>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         AuthRealm,
         r#"
         INSERT INTO auth_realm (kind, name, enabled, priority, config)
         VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, kind, name, enabled, priority, config, created_at, updated_at
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         "#,
         new.kind,
         new.name,
@@ -137,7 +144,7 @@ pub async fn insert_realm(pool: &PgPool, new: NewAuthRealm) -> sqlx::Result<Auth
         new.priority,
         new.config,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -158,7 +165,7 @@ pub async fn update_realm(
             config = $5,
             updated_at = now()
         WHERE id = $1
-        RETURNING id, kind, name, enabled, priority, config, created_at, updated_at
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
         "#,
         id,
         upd.name,
@@ -167,6 +174,42 @@ pub async fn update_realm(
         upd.config,
     )
     .fetch_optional(pool)
+    .await
+}
+
+/// Update a realm's mutable fields **and** its encrypted-secrets column in one
+/// statement (`secrets_enc = NULL` ⇒ secrets live as plaintext in `config`).
+/// Used by the [`crate::secret_dao`] realm helpers; bumps `updated_at`.
+pub async fn update_realm_and_secrets<'e, E>(
+    executor: E,
+    id: i64,
+    upd: AuthRealmUpdate,
+    secrets_enc: Option<&[u8]>,
+) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        UPDATE auth_realm SET
+            name = $2,
+            enabled = $3,
+            priority = $4,
+            config = $5,
+            secrets_enc = $6,
+            updated_at = now()
+        WHERE id = $1
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
+        "#,
+        id,
+        upd.name,
+        upd.enabled,
+        upd.priority,
+        upd.config,
+        secrets_enc,
+    )
+    .fetch_optional(executor)
     .await
 }
 

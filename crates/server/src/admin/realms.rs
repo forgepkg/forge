@@ -4,7 +4,9 @@
 //! Secrets inside a realm `config` (OIDC `client_secret`, credential-forwarding
 //! `key_pepper`) are **write-only**: every response carries a redacted config
 //! (`<key>_set` markers instead of values) and an update that omits/blanks a
-//! secret keeps the stored one.
+//! secret keeps the stored one. With `[crypto]` enabled they are encrypted at
+//! rest in `auth_realm.secrets_enc` (every write re-encrypts; legacy plaintext
+//! rows are still read).
 //!
 //! Every successful write invalidates the local realm snapshot so this
 //! instance converges immediately; peers converge within
@@ -16,12 +18,14 @@ use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
 use forge_db::model::AuthRealm;
+use forge_db::secret_dao::{self, SecretDbError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::db_error;
 use crate::auth::{
-    merge_secrets, redact_config, validate_config, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+    merge_secrets, redact_config, secret_keys, validate_config, KIND_LOCAL, KIND_OIDC,
+    KIND_WORKLOAD_IDENTITY,
 };
 use crate::state::AppState;
 
@@ -43,15 +47,41 @@ pub struct RealmView {
 
 impl From<&AuthRealm> for RealmView {
     fn from(r: &AuthRealm) -> Self {
+        let mut config = redact_config(&r.kind, &r.config);
+        // Encrypted secrets are stripped from `config`; validation requires every
+        // secret key, so a sealed secrets document means all of them are set.
+        if r.secrets_enc.is_some() {
+            if let JsonValue::Object(map) = &mut config {
+                for key in secret_keys(&r.kind) {
+                    map.insert(format!("{key}_set"), JsonValue::Bool(true));
+                }
+            }
+        }
         RealmView {
             id: r.id,
             kind: r.kind.clone(),
             name: r.name.clone(),
             enabled: r.enabled,
             priority: r.priority,
-            config: redact_config(&r.kind, &r.config),
+            config,
             created_at: r.created_at,
             updated_at: r.updated_at,
+        }
+    }
+}
+
+/// Map a realm-secret write error: database errors go through the caller's
+/// constraint mapping, envelope failures are a 500.
+fn secret_db_error(e: SecretDbError) -> Result<sqlx::Error, Response> {
+    match e {
+        SecretDbError::Db(e) => Ok(e),
+        other => {
+            tracing::error!(error = %other, "realm secret encryption failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "realm secret encryption failed",
+            )
+                .into_response())
         }
     }
 }
@@ -218,7 +248,21 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
         priority,
         config,
     };
-    match auth_realm_dao::insert_realm(&state.pool, new).await {
+    let inserted = match secret_dao::insert_realm_with_secrets(
+        &state.pool,
+        state.envelope.as_deref(),
+        new,
+        secret_keys(&body.kind),
+    )
+    .await
+    {
+        Ok(r) => Ok(r),
+        Err(e) => match secret_db_error(e) {
+            Ok(db) => Err(db),
+            Err(resp) => return resp,
+        },
+    };
+    match inserted {
         Ok(r) => {
             state.realms.invalidate().await;
             tracing::info!(realm = %r.name, kind = %r.kind, "auth realm created");
@@ -259,23 +303,39 @@ pub async fn update(
         }
     }
 
+    // The stored *logical* config (encrypted secrets merged in) — secrets are
+    // write-only, so an omitted one must be kept from here.
+    let existing_config = match secret_dao::realm_config(state.envelope.as_deref(), &existing).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(realm = %existing.name, error = %e, "realm secrets unreadable");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "realm secrets unreadable",
+            )
+                .into_response();
+        }
+    };
+
     // Merge write-only secrets from the stored config, then re-validate the
     // full document (an update may not leave a realm in an invalid state).
     let config = match &body.config {
         Some(incoming) => {
-            let merged = merge_secrets(&existing.kind, &existing.config, incoming);
+            let merged = merge_secrets(&existing.kind, &existing_config, incoming);
             match validate_config(&existing.kind, &merged) {
                 Ok(c) => c,
                 Err(msg) => return bad_request(msg),
             }
         }
         None if existing.kind == KIND_WORKLOAD_IDENTITY => {
-            match validate_config(&existing.kind, &existing.config) {
+            match validate_config(&existing.kind, &existing_config) {
                 Ok(config) => config,
                 Err(message) => return bad_request(message),
             }
         }
-        None => existing.config.clone(),
+        // Re-stored below, which also (re-)encrypts legacy plaintext secrets.
+        None => existing_config,
     };
     if existing.kind == KIND_WORKLOAD_IDENTITY && enabled {
         let Some(issuer) = normalized_wif_issuer(&config) else {
@@ -300,7 +360,22 @@ pub async fn update(
         priority: existing.priority,
         config,
     };
-    match auth_realm_dao::update_realm(&state.pool, id, upd).await {
+    let updated = match secret_dao::update_realm_with_secrets(
+        &state.pool,
+        state.envelope.as_deref(),
+        id,
+        upd,
+        secret_keys(&existing.kind),
+    )
+    .await
+    {
+        Ok(r) => Ok(r),
+        Err(e) => match secret_db_error(e) {
+            Ok(db) => Err(db),
+            Err(resp) => return resp,
+        },
+    };
+    match updated {
         Ok(Some(r)) => {
             state.realms.invalidate().await;
             tracing::info!(realm = %r.name, kind = %r.kind, enabled = r.enabled, "auth realm updated");

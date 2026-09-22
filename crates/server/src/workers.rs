@@ -37,17 +37,16 @@
 //!
 //! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
-//! than terminating the process.
+//! than terminating the process, and runs under [`supervise`]: a loop that
+//! panics (or exits) is logged at `error` and restarted after a short pause
+//! instead of silently disappearing while the server keeps serving.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use forge_core::format::Format;
-use forge_core::repo::proxy::ProxyRepo;
 use forge_core::retention::worker::{RetentionConfig, RetentionWorker};
 use forge_db::model::RepoKind;
 use forge_db::repository_dao;
-use forge_storage::{outbox_worker, reconciler, BlobStore, Cas};
+use forge_storage::{outbox_worker, reconciler, BlobStore};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
@@ -101,26 +100,31 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     let batch = state.config.outbox.batch_size;
     let grace = state.config.outbox.grace();
 
-    let outbox =
-        outbox_worker::spawn_loop(state.pool.clone(), state.blob_store.clone(), batch, poll);
+    let outbox = {
+        let (pool, store) = (state.pool.clone(), state.blob_store.clone());
+        supervise("outbox", move || {
+            outbox_worker::spawn_loop(pool.clone(), store.clone(), batch, poll)
+        })
+    };
 
-    let reconciler = spawn_reconciler(
-        state.pool.clone(),
-        state.blob_store.clone(),
-        grace,
+    let reconciler = {
+        let (pool, store) = (state.pool.clone(), state.blob_store.clone());
         // Reconcile less often than the outbox polls; it is only a safety net.
-        poll.saturating_mul(6).max(Duration::from_secs(60)),
-    );
+        let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        supervise("reconciler", move || {
+            spawn_reconciler(pool.clone(), store.clone(), grace, interval)
+        })
+    };
 
-    let proxy_refresh = spawn_proxy_refresh(
-        state.pool.clone(),
-        state.cas.clone(),
-        state.cache.clone(),
-        state.formats.nuget(),
+    let proxy_refresh = {
+        let state = state.clone();
         // Refresh upstream metadata on a modest cadence; the per-proxy TTL +
-        // row-lock singleflight bound actual upstream traffic.
-        poll.saturating_mul(6).max(Duration::from_secs(60)),
-    );
+        // the shared cache bound actual upstream traffic.
+        let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        supervise("proxy-refresh", move || {
+            spawn_proxy_refresh(state.clone(), interval)
+        })
+    };
 
     // Retention worker (slice 12.1): runs on every instance, claims one due
     // repository per tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its
@@ -130,52 +134,71 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     // (`FORGE_RETENTION__ENABLED=false`) leaves the admin REST surface intact;
     // due repositories simply wait for an instance that runs the worker.
     let retention = if state.config.retention.enabled {
-        RetentionWorker::new(
-            state.pool.clone(),
-            state.formats.nuget(),
-            state.cache_invalidator(),
-            RetentionConfig {
-                poll_interval: state.config.retention.poll_interval(),
-                default_run_interval: state.config.retention.default_run_interval(),
-                lease: state.config.retention.lease(),
-                // Reuse the outbox grace so a retention-dereferenced blob and a
-                // redeploy-dereferenced one share the same S3-delete deferral.
-                delete_grace: grace,
-            },
-        )
-        .spawn_loop()
+        let state = state.clone();
+        supervise("retention", move || {
+            RetentionWorker::new(
+                state.pool.clone(),
+                state.formats.nuget(),
+                state.cache_invalidator(),
+                RetentionConfig {
+                    poll_interval: state.config.retention.poll_interval(),
+                    default_run_interval: state.config.retention.default_run_interval(),
+                    lease: state.config.retention.lease(),
+                    // Reuse the outbox grace so a retention-dereferenced blob and a
+                    // redeploy-dereferenced one share the same S3-delete deferral.
+                    delete_grace: grace,
+                },
+            )
+            .spawn_loop()
+        })
     } else {
         tracing::info!("retention worker disabled (FORGE_RETENTION__ENABLED=false)");
         tokio::spawn(async {})
     };
 
-    // Auth reaper (slice 12.2): only when OIDC login is enabled — it is the only
-    // path that writes `oidc_flow` / `session`. Both reaps are pure `DELETE`s
-    // safe on every instance (no advisory locks, no leases). Cadence reuses the
-    // outbox poll scaled up — flow rows live ~10min and sessions hours/days, so
-    // a per-minute sweep is plenty to bound growth.
-    let auth_reaper = state.config.oidc.as_ref().filter(|o| o.enabled).map(|_| {
-        spawn_auth_reaper(
-            state.pool.clone(),
-            poll.saturating_mul(6).max(Duration::from_secs(60)),
-        )
-    });
+    // Auth reaper (slice 12.2): always on — local-password logins create
+    // `session` rows and DB-managed OIDC realms create `oidc_flow` rows even
+    // without the legacy `[oidc]` block. Both reaps are pure `DELETE`s safe on
+    // every instance (no advisory locks, no leases). Cadence reuses the outbox
+    // poll scaled up — flow rows live ~10min and sessions hours/days, so a
+    // per-minute sweep is plenty to bound growth.
+    let auth_reaper = {
+        let pool = state.pool.clone();
+        let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        Some(supervise("auth-reaper", move || {
+            spawn_auth_reaper(pool.clone(), interval)
+        }))
+    };
 
     // Credential reaper (slice 12.3): bounds `validated_credential` (expired
     // verdicts) and `validated_credential_tag` (fence rows whose usernames have
     // no verdicts left — including every rejected/sprayed attempt). Runs
     // unconditionally: any credential-forwarding provider writes these tables.
-    let cred_reaper = spawn_cred_reaper(
-        state.pool.clone(),
-        poll.saturating_mul(6).max(Duration::from_secs(60)),
-    );
+    let cred_reaper = {
+        let pool = state.pool.clone();
+        let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        supervise("cred-reaper", move || {
+            spawn_cred_reaper(pool.clone(), interval)
+        })
+    };
 
     // Crypto rotation/backfill worker (slice 12.5): only when secret
     // encryption is enabled. One instance at a time performs a pass (advisory
     // lock); every step is idempotent/resumable so crashes are harmless.
     let crypto_rotation = match (&state.envelope, state.config.crypto.as_ref()) {
-        (Some(envelope), Some(crypto_cfg)) => {
-            crate::crypto::spawn_worker(state.pool.clone(), envelope.clone(), crypto_cfg)
+        (Some(envelope), Some(crypto_cfg)) if crypto_cfg.rotation.enabled => {
+            let (pool, envelope, crypto_cfg) =
+                (state.pool.clone(), envelope.clone(), crypto_cfg.clone());
+            Some(supervise("crypto-rotation", move || {
+                crate::crypto::spawn_worker(pool.clone(), envelope.clone(), &crypto_cfg)
+                    .unwrap_or_else(|| tokio::spawn(std::future::pending()))
+            }))
+        }
+        (Some(_), Some(_)) => {
+            tracing::info!(
+                "crypto rotation worker disabled (FORGE_CRYPTO__ROTATION__ENABLED=false)"
+            );
+            None
         }
         _ => None,
     };
@@ -189,6 +212,38 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         cred_reaper,
         crypto_rotation,
     }
+}
+
+/// Run a worker loop under supervision: `spawn` starts one instance; if it
+/// panics or returns, the failure is logged and a fresh instance is started
+/// after a pause. Aborting the returned handle stops the current instance too.
+fn supervise<F>(name: &'static str, spawn: F) -> JoinHandle<()>
+where
+    F: Fn() -> JoinHandle<()> + Send + 'static,
+{
+    /// Aborts the wrapped task when dropped (i.e. when the supervisor itself
+    /// is aborted mid-`await`).
+    struct AbortOnDrop(JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    const RESTART_DELAY: Duration = Duration::from_secs(5);
+    tokio::spawn(async move {
+        loop {
+            let mut worker = AbortOnDrop(spawn());
+            match (&mut worker.0).await {
+                Ok(()) => tracing::error!(worker = name, "worker loop exited; restarting"),
+                Err(e) if e.is_cancelled() => return,
+                Err(e) => {
+                    tracing::error!(worker = name, error = %e, "worker loop panicked; restarting")
+                }
+            }
+            tokio::time::sleep(RESTART_DELAY).await;
+        }
+    })
 }
 
 /// Spawn the credential reaper loop: each tick deletes expired
@@ -267,20 +322,15 @@ fn spawn_reconciler(
 }
 
 /// Spawn the proxy metadata-refresh loop. Each tick lists proxy repositories and
-/// refreshes their upstream service index; the proxy layer's row-lock
-/// singleflight ensures only one instance refetches per repo per TTL window.
-fn spawn_proxy_refresh(
-    pool: PgPool,
-    cas: Cas,
-    cache: forge_cache::Cache,
-    format: Arc<dyn Format>,
-    interval: Duration,
-) -> JoinHandle<()> {
+/// refreshes their upstream service index. Each repository's pass runs under
+/// the proxy client's own deadlines, so one unreachable upstream delays the
+/// pass by at most one metadata timeout instead of stalling it.
+fn spawn_proxy_refresh(state: AppState, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = refresh_proxies_once(&pool, &cas, &cache, &format).await {
+            if let Err(e) = refresh_proxies_once(&state).await {
                 tracing::error!(error = %e, "proxy metadata refresh pass failed");
             }
         }
@@ -289,21 +339,53 @@ fn spawn_proxy_refresh(
 
 /// One proxy-refresh pass: re-resolve every online proxy repository's upstream
 /// index (best-effort; a single proxy's failure does not abort the pass).
-async fn refresh_proxies_once(
-    pool: &PgPool,
-    cas: &Cas,
-    cache: &forge_cache::Cache,
-    format: &Arc<dyn Format>,
-) -> anyhow::Result<()> {
-    let repos = repository_dao::list_repositories(pool).await?;
+async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
+    let repos = repository_dao::list_repositories(&state.pool).await?;
     for repo in repos {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        let proxy = ProxyRepo::new(pool.clone(), format.clone(), cas.clone(), cache.clone());
+        // Same wiring as request-time reads: shared upstream client and the
+        // envelope service, so credentialed upstreams refresh too.
+        let proxy = state.proxy_repo(state.formats.for_repository(&repo));
         if let Err(e) = proxy.resolve_upstream_index(&repo).await {
             tracing::warn!(error = %e, repo = %repo.name, "proxy upstream refresh failed");
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_restarts_a_panicking_loop_and_abort_stops_it() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let counter = starts.clone();
+        let handle = supervise("test", move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if n == 0 {
+                    panic!("first instance dies");
+                }
+                std::future::pending::<()>().await;
+            })
+        });
+        // Let the first instance panic and the restart delay elapse.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "restarted once after the panic"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "no restarts after abort");
+    }
 }

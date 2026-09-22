@@ -6,72 +6,156 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "run_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "run_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "rule_id",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "rule_id"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "action",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "action"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "target_kind",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "target_kind"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "package_name",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "package_name"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "version",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "component_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "component_id"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "blob_sha256",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "blob_sha256"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "ref_count_after",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "ref_count_after"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "blob_delete_enqueued",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "blob_delete_enqueued"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "dry_run",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "dry_run"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "reason",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "reason"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "retention_audit",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -135,6 +135,52 @@ async fn add_group_member_checked_allows_valid_nesting() {
 }
 
 #[tokio::test]
+async fn concurrent_opposite_edges_never_form_a_cycle() {
+    // P1.4: `A -> B` and `B -> A` added concurrently each look acyclic on their
+    // own; the graph lock must make exactly one of them win in the FINAL state.
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    for round in 0..10 {
+        let n = unique();
+        let a =
+            repository_dao::insert_repository(&pool, NewRepository::group(format!("race-a-{n}")))
+                .await
+                .expect("a");
+        let b =
+            repository_dao::insert_repository(&pool, NewRepository::group(format!("race-b-{n}")))
+                .await
+                .expect("b");
+        let (p1, p2) = (pool.clone(), pool.clone());
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move {
+                repository_dao::add_group_member_checked(&p1, a.id, b.id, 10, 20).await
+            }),
+            tokio::spawn(async move {
+                repository_dao::add_group_member_checked(&p2, b.id, a.id, 10, 20).await
+            }),
+        );
+        let outcomes = [r1.unwrap().expect("a->b"), r2.unwrap().expect("b->a")];
+        let added = outcomes
+            .iter()
+            .filter(|o| **o == AddMemberOutcome::Added)
+            .count();
+        assert_eq!(
+            added, 1,
+            "round {round}: exactly one edge wins: {outcomes:?}"
+        );
+        let edges = repository_dao::group_members(&pool, a.id)
+            .await
+            .unwrap()
+            .len()
+            + repository_dao::group_members(&pool, b.id)
+                .await
+                .unwrap()
+                .len();
+        assert_eq!(edges, 1, "round {round}: no cycle persisted");
+    }
+}
+
+#[tokio::test]
 async fn add_group_member_checked_rejects_cycle() {
     use forge_db::repository_dao::AddMemberOutcome;
     let pool = pool().await;
@@ -762,35 +808,45 @@ async fn upstream_basic_user_has_no_local_password() {
 }
 
 #[tokio::test]
-async fn provision_upstream_user_inserts_then_is_idempotent_and_grant_only() {
+async fn provision_upstream_user_inserts_then_tracks_authoritative_admin() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
     let username = format!("up-prov-{n}");
 
     // First call inserts a passwordless upstream-basic user (non-admin).
-    let u1 = user_dao::provision_upstream_user(pool, &username, false)
+    let u1 = user_dao::provision_upstream_user(pool, &username, false, true, None)
         .await
-        .expect("provision");
+        .expect("provision")
+        .expect("row");
     assert_eq!(u1.auth_source, "upstream-basic");
     assert!(u1.password_hash.is_none());
     assert!(u1.active);
     assert!(!u1.is_admin);
     assert_eq!(u1.external_subject.as_deref(), Some(username.as_str()));
 
-    // Second call (admin suggested) reuses the row AND grants admin.
-    let u2 = user_dao::provision_upstream_user(pool, &username, true)
+    // Authoritative admin suggestion reuses the row AND grants admin.
+    let u2 = user_dao::provision_upstream_user(pool, &username, true, true, None)
         .await
-        .expect("re-provision grants admin");
+        .expect("re-provision grants admin")
+        .expect("row");
     assert_eq!(u2.id, u1.id, "same row");
     assert!(u2.is_admin, "admin granted on refresh");
 
-    // Third call (non-admin) must NOT downgrade the granted admin (grant-only).
-    let u3 = user_dao::provision_upstream_user(pool, &username, false)
+    // A non-authoritative reading never changes the stored admin flag.
+    let u3 = user_dao::provision_upstream_user(pool, &username, false, false, None)
         .await
-        .expect("re-provision");
+        .expect("re-provision")
+        .expect("row");
     assert_eq!(u3.id, u1.id);
-    assert!(u3.is_admin, "grant-only: admin never revoked here");
+    assert!(u3.is_admin, "non-authoritative: admin untouched");
+
+    // An authoritative non-admin reading revokes it.
+    let u4 = user_dao::provision_upstream_user(pool, &username, false, true, None)
+        .await
+        .expect("re-provision")
+        .expect("row");
+    assert!(!u4.is_admin, "authoritative: admin revoked");
 }
 
 #[tokio::test]
@@ -808,13 +864,23 @@ async fn provision_upstream_user_does_not_clobber_local_user() {
     .await
     .expect("insert local");
 
-    // An upstream provision for the same username must NOT null the password or
-    // flip auth_source.
-    let u = user_dao::provision_upstream_user(pool, &username, false)
+    // An upstream provision for the same username returns no row (deny) and
+    // must NOT null the password, flip auth_source or grant admin.
+    let u = user_dao::provision_upstream_user(pool, &username, true, true, None)
         .await
         .expect("provision over local");
-    assert_eq!(u.auth_source, "local", "local provenance preserved");
-    assert!(u.password_hash.is_some(), "local password preserved");
+    assert!(u.is_none(), "local user is never taken over");
+    assert!(user_dao::find_upstream_user(pool, &username, None)
+        .await
+        .unwrap()
+        .is_none());
+    let local = user_dao::find_user_by_username(pool, &username)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(local.auth_source, "local", "local provenance preserved");
+    assert!(local.password_hash.is_some(), "local password preserved");
+    assert!(!local.is_admin, "no admin grant through upstream");
 }
 
 // ── proxy_dao ─────────────────────────────────────────────────────────────────

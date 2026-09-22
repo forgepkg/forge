@@ -6,17 +6,35 @@
       {
         "ordinal": 0,
         "name": "attempts",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "attempts"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "locked_until",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "locked_until"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "processed_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blob_outbox",
+            "name": "processed_at"
+          }
+        }
       }
     ],
     "parameters": {

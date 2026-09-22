@@ -48,6 +48,23 @@ struct MockState {
     index_hits: AtomicUsize,
     flat_index_hits: AtomicUsize,
     nupkg_hits: AtomicUsize,
+    nuspec_hits: AtomicUsize,
+    /// When set, every route requires this `Authorization` header value.
+    required_auth: Option<String>,
+}
+
+impl MockState {
+    fn authorized(&self, headers: &axum::http::HeaderMap) -> bool {
+        match &self.required_auth {
+            None => true,
+            Some(expected) => {
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    == Some(expected.as_str())
+            }
+        }
+    }
 }
 
 /// A running mock upstream feed; holds the server task and exposes its base URL.
@@ -64,9 +81,21 @@ impl MockUpstream {
     fn nupkg_hits(&self) -> usize {
         self.state.nupkg_hits.load(Ordering::SeqCst)
     }
+    fn flat_index_hits(&self) -> usize {
+        self.state.flat_index_hits.load(Ordering::SeqCst)
+    }
+    fn nuspec_hits(&self) -> usize {
+        self.state.nuspec_hits.load(Ordering::SeqCst)
+    }
 }
 
-async fn serve_index(State(st): State<Arc<MockState>>) -> impl IntoResponse {
+async fn serve_index(
+    State(st): State<Arc<MockState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !st.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     st.index_hits.fetch_add(1, Ordering::SeqCst);
     let body = serde_json::json!({
         "version": "3.0.0",
@@ -81,8 +110,12 @@ async fn serve_index(State(st): State<Arc<MockState>>) -> impl IntoResponse {
 
 async fn serve_flat_index(
     State(st): State<Arc<MockState>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if !st.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     st.flat_index_hits.fetch_add(1, Ordering::SeqCst);
     match st.packages.get(&id) {
         Some(vers) => {
@@ -100,8 +133,19 @@ async fn serve_flat_index(
 
 async fn serve_nupkg(
     State(st): State<Arc<MockState>>,
-    Path((id, version, _file)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    Path((id, version, file)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    if !st.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if file.ends_with(".nuspec") {
+        st.nuspec_hits.fetch_add(1, Ordering::SeqCst);
+        return match st.packages.get(&id).and_then(|v| v.get(&version)) {
+            Some(bytes) => (StatusCode::OK, nuspec_of(bytes)).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     st.nupkg_hits.fetch_add(1, Ordering::SeqCst);
     match st.packages.get(&id).and_then(|v| v.get(&version)) {
         Some(bytes) => (
@@ -114,8 +158,32 @@ async fn serve_nupkg(
     }
 }
 
+/// Extract the `.nuspec` entry from a `.nupkg` (zip) archive.
+fn nuspec_of(nupkg: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(nupkg)).expect("nupkg zip");
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).unwrap();
+        if entry.name().ends_with(".nuspec") && !entry.name().contains('/') {
+            let mut out = Vec::new();
+            entry.read_to_end(&mut out).unwrap();
+            return out;
+        }
+    }
+    panic!("fixture has no nuspec");
+}
+
 /// Boot the mock upstream feed on an ephemeral loopback port.
 async fn start_mock(packages: HashMap<String, HashMap<String, Vec<u8>>>) -> MockUpstream {
+    start_mock_with_auth(packages, None).await
+}
+
+/// Like [`start_mock`], but every route answers 401 unless the request carries
+/// `Authorization: <required_auth>`.
+async fn start_mock_with_auth(
+    packages: HashMap<String, HashMap<String, Vec<u8>>>,
+    required_auth: Option<String>,
+) -> MockUpstream {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind mock upstream");
@@ -128,6 +196,8 @@ async fn start_mock(packages: HashMap<String, HashMap<String, Vec<u8>>>) -> Mock
         index_hits: AtomicUsize::new(0),
         flat_index_hits: AtomicUsize::new(0),
         nupkg_hits: AtomicUsize::new(0),
+        nuspec_hits: AtomicUsize::new(0),
+        required_auth,
     });
 
     let app = Router::new()
@@ -197,7 +267,7 @@ async fn cache_on_demand_fetches_upstream_once() {
 
     let mut corpus = HashMap::new();
     let mut vers = HashMap::new();
-    vers.insert("1.0.0".to_string(), sample_nupkg());
+    vers.insert("1.2.3".to_string(), sample_nupkg());
     corpus.insert("sample.lib".to_string(), vers);
     let mock = start_mock(corpus).await;
 
@@ -206,7 +276,7 @@ async fn cache_on_demand_fetches_upstream_once() {
 
     // First download: fetches upstream.
     let loc = px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap();
     assert!(loc.is_some(), "first download should resolve a local nupkg");
@@ -218,7 +288,7 @@ async fn cache_on_demand_fetches_upstream_once() {
 
     // Second download: served locally, no upstream nupkg fetch.
     let loc2 = px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap();
     assert!(loc2.is_some());
@@ -254,7 +324,7 @@ async fn singleflight_concurrent_first_downloads_converge() {
 
     let mut corpus = HashMap::new();
     let mut vers = HashMap::new();
-    vers.insert("1.0.0".to_string(), sample_nupkg());
+    vers.insert("1.2.3".to_string(), sample_nupkg());
     corpus.insert("sample.lib".to_string(), vers);
     let mock = start_mock(corpus).await;
 
@@ -266,8 +336,8 @@ async fn singleflight_concurrent_first_downloads_converge() {
     let r2 = repo.clone();
     let p1 = px.clone();
     let p2 = px.clone();
-    let h1 = tokio::spawn(async move { p1.resolve_nupkg(&r1, "Sample.Lib", "1.0.0").await });
-    let h2 = tokio::spawn(async move { p2.resolve_nupkg(&r2, "Sample.Lib", "1.0.0").await });
+    let h1 = tokio::spawn(async move { p1.resolve_nupkg(&r1, "Sample.Lib", "1.2.3").await });
+    let h2 = tokio::spawn(async move { p2.resolve_nupkg(&r2, "Sample.Lib", "1.2.3").await });
 
     let (a, b) = (h1.await.unwrap().unwrap(), h2.await.unwrap().unwrap());
     assert!(
@@ -289,7 +359,7 @@ async fn singleflight_concurrent_first_downloads_converge() {
     // The version is now cached; a subsequent read is served locally and makes
     // NO further upstream calls.
     let again = px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap()
         .expect("cached version is served locally");
@@ -309,7 +379,7 @@ async fn package_delay_hides_then_reveals() {
 
     let mut corpus = HashMap::new();
     let mut vers = HashMap::new();
-    vers.insert("1.0.0".to_string(), sample_nupkg());
+    vers.insert("1.2.3".to_string(), sample_nupkg());
     corpus.insert("sample.lib".to_string(), vers);
     let mock = start_mock(corpus).await;
 
@@ -324,7 +394,7 @@ async fn package_delay_hides_then_reveals() {
         "version must be hidden inside the delay window, got {versions:?}"
     );
     let dl = px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap();
     assert!(
@@ -338,7 +408,7 @@ async fn package_delay_hides_then_reveals() {
         &pool,
         repo_id(&pool, &repo).await,
         "sample.lib",
-        "1.0.0",
+        "1.2.3",
     )
     .await
     .unwrap()
@@ -357,7 +427,7 @@ async fn package_delay_hides_then_reveals() {
         "version must surface after the delay window"
     );
     let dl = px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap();
     assert!(dl.is_some(), "download must succeed after the delay window");
@@ -400,7 +470,7 @@ async fn offline_serves_only_cached() {
 
     let mut corpus = HashMap::new();
     let mut vers = HashMap::new();
-    vers.insert("1.0.0".to_string(), sample_nupkg());
+    vers.insert("1.2.3".to_string(), sample_nupkg());
     corpus.insert("sample.lib".to_string(), vers);
     let mock = start_mock(corpus).await;
 
@@ -408,7 +478,7 @@ async fn offline_serves_only_cached() {
     let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
     let px = proxy_repo(&pool, cas.clone(), cache.clone());
     assert!(px
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap()
         .is_some());
@@ -425,7 +495,7 @@ async fn offline_serves_only_cached() {
     let px_offline = proxy_repo(&pool, cas, Cache::l1_only(128));
     // Cached version still served.
     assert!(px_offline
-        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
         .await
         .unwrap()
         .is_some());
@@ -444,4 +514,169 @@ async fn repo_id(pool: &PgPool, name: &str) -> i64 {
         .unwrap()
         .unwrap()
         .id
+}
+
+fn sample_corpus(version: &str) -> HashMap<String, HashMap<String, Vec<u8>>> {
+    let mut corpus = HashMap::new();
+    let mut vers = HashMap::new();
+    vers.insert(version.to_string(), sample_nupkg());
+    corpus.insert("sample.lib".to_string(), vers);
+    corpus
+}
+
+/// A private upstream (Azure Artifacts, GitHub Packages, Nexus, …) demands
+/// credentials on *every* resource, including the service index and the
+/// version listing — not only on the package download.
+#[tokio::test]
+async fn credentialed_upstream_gets_basic_auth_on_every_request() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let expected = format!(
+        "Basic {}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "svc:s3cret")
+    );
+    let mock = start_mock_with_auth(sample_corpus("1.2.3"), Some(expected)).await;
+
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    sqlx::query!(
+        r#"UPDATE repository SET upstream_username = 'svc', upstream_password = 's3cret' WHERE name = $1"#,
+        repo
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let versions = px.list_versions(&repo, "Sample.Lib").await.unwrap();
+    assert_eq!(versions.len(), 1, "listing must authenticate");
+    assert!(px
+        .resolve_nuspec(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.index_hits(), 1);
+    assert_eq!(mock.nupkg_hits(), 1);
+}
+
+/// Without credentials the same upstream is a hard error, never a silent
+/// empty listing that clients would treat as "package does not exist".
+#[tokio::test]
+async fn unauthorized_upstream_is_an_error_not_an_empty_listing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock_with_auth(sample_corpus("1.2.3"), Some("Basic x".into())).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(px.list_versions(&repo, "Sample.Lib").await.is_err());
+}
+
+/// An upstream serving package bytes whose manifest names a different
+/// identity than the requested path must not be cached under that path.
+#[tokio::test]
+async fn upstream_identity_mismatch_is_rejected() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    // The fixture's manifest says 1.2.3; serve it as 1.0.0.
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    let err = px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.0.0")
+        .await
+        .expect_err("mismatched identity must fail");
+    assert!(err.to_string().contains("identifies as"), "{err}");
+}
+
+/// The per-package version listing is fetched at most once per metadata TTL.
+#[tokio::test]
+async fn version_listing_is_cached_for_the_metadata_ttl() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    for _ in 0..3 {
+        assert_eq!(
+            px.list_versions(&repo, "Sample.Lib").await.unwrap().len(),
+            1
+        );
+        assert_eq!(px.registration(&repo, "Sample.Lib").await.unwrap().len(), 1);
+    }
+    assert_eq!(mock.flat_index_hits(), 1);
+}
+
+/// `.nuspec` is served from upstream before the package is cached (no full
+/// download) and from the local copy afterwards.
+#[tokio::test]
+async fn nuspec_served_before_and_after_download() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let blobs: Arc<dyn forge_core::repo::hosted::BlobFetch> =
+        Arc::new(StoreBlobs(common::blob_store().await));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128)).with_blob_fetch(blobs);
+
+    let upstream = px
+        .resolve_nuspec(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .expect("upstream nuspec");
+    assert!(String::from_utf8_lossy(&upstream).contains("<id>Sample.Lib</id>"));
+    assert_eq!(mock.nupkg_hits(), 0, "no package download for a manifest");
+    assert_eq!(mock.nuspec_hits(), 1);
+
+    px.resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .expect("download");
+    let local = px
+        .resolve_nuspec(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .expect("local nuspec");
+    assert_eq!(local, upstream);
+    assert_eq!(
+        mock.nuspec_hits(),
+        1,
+        "downloaded manifest is served locally"
+    );
+
+    // Registration now carries the manifest (dependency groups).
+    let reg = px.registration(&repo, "Sample.Lib").await.unwrap();
+    assert!(reg[0].nuspec_bytes.is_some());
+    assert!(reg[0].package_hash_sha512_base64.is_some());
+
+    // Unknown versions stay 404 without touching the manifest endpoint.
+    assert!(px
+        .resolve_nuspec(&repo, "Sample.Lib", "9.9.9")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(mock.nuspec_hits(), 1);
+}
+
+/// `BlobFetch` over the shared test bucket.
+struct StoreBlobs(forge_storage::BlobStore);
+
+#[async_trait::async_trait]
+impl forge_core::repo::hosted::BlobFetch for StoreBlobs {
+    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, forge_core::repo::RepoError> {
+        let body = self
+            .0
+            .get(s3_key)
+            .await
+            .map_err(|e| forge_core::repo::RepoError::Storage(e.to_string()))?;
+        Ok(body
+            .collect()
+            .await
+            .map_err(|e| forge_core::repo::RepoError::Storage(e.to_string()))?
+            .into_bytes()
+            .to_vec())
+    }
 }

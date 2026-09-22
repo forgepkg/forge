@@ -6,7 +6,8 @@
       {
         "ordinal": 0,
         "name": "forge_rbac_apply_legacy_migration",
-        "type_info": "Void"
+        "type_info": "Void",
+        "origin": "Expression"
       }
     ],
     "parameters": {

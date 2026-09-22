@@ -123,10 +123,9 @@ async fn repo_id(pool: &PgPool, name: &str) -> i64 {
 /// fire (the validator rejects `older_than_days = 0`, so age tests must age the
 /// rows rather than use a zero threshold).
 async fn age_all_components(pool: &PgPool, repo_id: i64, days: i64) {
-    sqlx::query(&format!(
-        "UPDATE component SET created_at = now() - interval '{days} days' WHERE repository_id = $1"
-    ))
+    sqlx::query("UPDATE component SET created_at = now() - make_interval(days => $2) WHERE repository_id = $1")
     .bind(repo_id)
+    .bind(days as i32)
     .execute(pool)
     .await
     .unwrap();
@@ -137,14 +136,16 @@ async fn wait_until<F>(pool: &PgPool, sql: &str, done: F, what: &str) -> i64
 where
     F: Fn(i64) -> bool,
 {
+    // Test-authored SQL (ids interpolated from fixtures), safe to run dynamically.
+    let query = || sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()));
     for _ in 0..80 {
-        let v: i64 = sqlx::query_scalar(sql).fetch_one(pool).await.unwrap();
+        let v: i64 = query().fetch_one(pool).await.unwrap();
         if done(v) {
             return v;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let v: i64 = sqlx::query_scalar(sql).fetch_one(pool).await.unwrap();
+    let v: i64 = query().fetch_one(pool).await.unwrap();
     panic!("timed out waiting for {what}; last value = {v}");
 }
 

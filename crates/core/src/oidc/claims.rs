@@ -20,7 +20,7 @@ use super::jwks::IdTokenClaims;
 #[derive(Debug, Clone)]
 pub struct ClaimMapping {
     /// Claim used as the `app_user.username` (fallback chain: this → `email`
-    /// claim → `sub`).
+    /// claim, only when `email_verified` is true → `sub`).
     pub username_claim: String,
     /// Claim carrying the user's email.
     pub email_claim: String,
@@ -53,7 +53,8 @@ impl Default for ClaimMapping {
 /// denormalized on `external_identity` for display only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedClaims {
-    /// The resolved username (username claim → email claim → `sub`).
+    /// The resolved username (username claim → email claim when verified →
+    /// `sub`).
     pub username: String,
     /// Email, if the configured email claim was a non-empty string.
     pub email: Option<String>,
@@ -61,15 +62,22 @@ pub struct MappedClaims {
     pub display_name: Option<String>,
     /// Whether the claims grant admin (admin-claim values ∩ `admin_groups` ≠ ∅).
     pub is_admin: bool,
+    /// Whether the IdP is **authoritative** for admin (`admin_groups` is
+    /// configured). Only then does a login grant *or revoke* admin; with an
+    /// empty `admin_groups` admins stay locally managed and a login never
+    /// touches the user's admin state.
+    pub admin_managed: bool,
 }
 
 /// Extract the username/email/display-name and compute `is_admin` from a
 /// verified ID token.
 pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaims {
-    let username = string_claim(claims, &mapping.username_claim)
-        .or_else(|| string_claim(claims, &mapping.email_claim))
-        .unwrap_or_else(|| claims.sub.clone());
     let email = string_claim(claims, &mapping.email_claim);
+    // An unverified email is attacker-chosen at many IdPs: never let it become
+    // the username (which can drive account linking); fall back to `sub`.
+    let username = string_claim(claims, &mapping.username_claim)
+        .or_else(|| email.clone().filter(|_| email_verified(claims)))
+        .unwrap_or_else(|| claims.sub.clone());
     let display_name = string_claim(claims, &mapping.display_name_claim);
     let is_admin = derive_is_admin(claims, mapping);
     MappedClaims {
@@ -77,6 +85,17 @@ pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaim
         email,
         display_name,
         is_admin,
+        admin_managed: !mapping.admin_groups.is_empty(),
+    }
+}
+
+/// Whether the token asserts `email_verified` (a JSON `true`, or the string
+/// `"true"` some IdPs emit). Absent ⇒ unverified.
+fn email_verified(claims: &IdTokenClaims) -> bool {
+    match claims.additional.get("email_verified") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
     }
 }
 
@@ -175,9 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn username_falls_back_to_email_then_sub() {
-        // No preferred_username → email.
-        let c = claims_with("sub-1", json!({ "email": "bob@corp" }));
+    fn username_falls_back_to_verified_email_then_sub() {
+        // No preferred_username → verified email.
+        let c = claims_with(
+            "sub-1",
+            json!({ "email": "bob@corp", "email_verified": true }),
+        );
         assert_eq!(map_claims(&c, &mapping()).username, "bob@corp");
 
         // Neither username nor email → sub.
@@ -187,9 +209,32 @@ mod tests {
         // Empty-string username is treated as absent and falls through.
         let c = claims_with(
             "sub-1",
-            json!({ "preferred_username": "  ", "email": "c@corp" }),
+            json!({ "preferred_username": "  ", "email": "c@corp", "email_verified": "true" }),
         );
         assert_eq!(map_claims(&c, &mapping()).username, "c@corp");
+    }
+
+    #[test]
+    fn unverified_email_never_becomes_the_username() {
+        for extra in [
+            json!({ "email": "admin@corp" }),
+            json!({ "email": "admin@corp", "email_verified": false }),
+            json!({ "email": "admin@corp", "email_verified": "no" }),
+        ] {
+            let m = map_claims(&claims_with("sub-9", extra), &mapping());
+            assert_eq!(m.username, "sub-9", "falls back to the stable sub");
+            // Still surfaced for display.
+            assert_eq!(m.email.as_deref(), Some("admin@corp"));
+        }
+    }
+
+    #[test]
+    fn admin_managed_follows_admin_groups() {
+        let c = claims_with("sub-1", json!({ "preferred_username": "a" }));
+        assert!(map_claims(&c, &mapping()).admin_managed);
+        let mut m = mapping();
+        m.admin_groups.clear();
+        assert!(!map_claims(&c, &m).admin_managed);
     }
 
     #[test]

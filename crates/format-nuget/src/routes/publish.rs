@@ -30,10 +30,17 @@ const API_KEY_HEADER: &str = "X-NuGet-ApiKey";
 /// route guard accepts every transport supported by WIF: `X-NuGet-ApiKey`,
 /// `Authorization: Bearer`, or Basic with the workload token as password.
 fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<Response> {
+    // Same Basic challenge as the dispatcher's 401, so clients know to send
+    // the stored source credentials (token as password).
+    let challenge = [(
+        axum::http::header::WWW_AUTHENTICATE,
+        "Basic realm=\"Forge\"",
+    )];
     if !ctx.protocol_mutations_allowed {
         return Some(
             (
                 StatusCode::UNAUTHORIZED,
+                challenge,
                 "API token or workload identity required",
             )
                 .into_response(),
@@ -42,7 +49,7 @@ fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<
     if !headers.contains_key(API_KEY_HEADER)
         && !headers.contains_key(axum::http::header::AUTHORIZATION)
     {
-        return Some((StatusCode::UNAUTHORIZED, "missing credentials").into_response());
+        return Some((StatusCode::UNAUTHORIZED, challenge, "missing credentials").into_response());
     }
     None
 }
@@ -67,6 +74,18 @@ pub async fn push(
     // handed to the CAS as a `'static` reader. The stream owns `multipart`,
     // yielding the package bytes chunk-by-chunk (true streaming — never buffered
     // whole in memory; the CAS enforces the size cap as it copies to disk).
+    //
+    // The request body limit (set on the publish routes, see
+    // `routes::nuget_router`) surfaces here as a multipart error with status
+    // 413; remember it so the response is a 413, not a generic storage error.
+    let body_limit_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let limit_flag = body_limit_hit.clone();
+    let multipart_err = move |e: axum::extract::multipart::MultipartError| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            limit_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        std::io::Error::other(e)
+    };
     let byte_stream = async_stream::try_stream! {
         let mut multipart = multipart;
         match multipart.next_field().await {
@@ -75,12 +94,12 @@ pub async fn push(
                     match field.chunk().await {
                         Ok(Some(chunk)) => yield chunk,
                         Ok(None) => break,
-                        Err(e) => Err(std::io::Error::other(e))?,
+                        Err(e) => Err(multipart_err(e))?,
                     }
                 }
             }
             Ok(None) => Err(std::io::Error::other("missing package part"))?,
-            Err(e) => Err(std::io::Error::other(e))?,
+            Err(e) => Err(multipart_err(e))?,
         }
     };
     let byte_stream: std::pin::Pin<
@@ -95,6 +114,11 @@ pub async fn push(
         // Both create and redeploy return 201 Created per the NuGet protocol.
         Ok(PublishOutcome::Created) | Ok(PublishOutcome::Replaced) => {
             StatusCode::CREATED.into_response()
+        }
+        Err(_) if body_limit_hit.load(std::sync::atomic::Ordering::Relaxed) => {
+            write_error_response(forge_core::WriteError::TooLarge {
+                limit: ctx.max_upload_bytes,
+            })
         }
         Err(e) => write_error_response(e),
     }

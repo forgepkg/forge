@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
   RouterProvider,
@@ -8,7 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
-import { clearSession, setSession } from '~/lib/auth'
+import { clearSession, getCsrfToken, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
 
@@ -37,10 +38,17 @@ const readerMe: Me = {
 
 const fetchMock = vi.fn()
 
-/** Mock `GET /admin/me` to return the given identity, or 401 when null. */
-function mockMe(me: Me | null) {
+/**
+ * Mock `GET /admin/me` to return the given identity, or 401 when null. Extra
+ * `routes` (URL suffix → response factory) answer other endpoints such as
+ * `/auth/me` / `/auth/logout`; everything else is a 404.
+ */
+function mockMe(me: Me | null, routes: Record<string, () => Response> = {}) {
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString()
+    for (const [suffix, respond] of Object.entries(routes)) {
+      if (url.endsWith(suffix)) return Promise.resolve(respond())
+    }
     if (url.endsWith('/admin/me')) {
       if (me === null) {
         return Promise.resolve(new Response('unauthorized', { status: 401 }))
@@ -140,6 +148,70 @@ describe('app routing + admin gating', () => {
 
     expect(router.state.location.pathname).toBe('/admin')
     expect(await screen.findByText('Administration')).toBeInTheDocument()
+  })
+
+  it('refreshes the stored CSRF token from the live session on load', async () => {
+    // e.g. after an OIDC redirect: the cookie is fresh, the stored token stale.
+    setSession('stale-csrf')
+    mockMe(readerMe, {
+      '/auth/me': () =>
+        new Response(
+          JSON.stringify({
+            user_id: 2,
+            username: 'alice',
+            is_admin: false,
+            csrf_token: 'fresh-csrf',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    })
+
+    await renderApp('/')
+
+    await waitFor(() => expect(getCsrfToken()).toBe('fresh-csrf'))
+  })
+
+  it('surfaces a failed sign-out and still clears local state', async () => {
+    setSession('reader-csrf')
+    mockMe(readerMe, {
+      '/auth/logout': () => new Response('session error', { status: 500 }),
+    })
+    const router = await renderApp('/')
+
+    const header = await screen.findByRole('banner')
+    await within(header).findByText('alice')
+    await userEvent.click(within(header).getByRole('button', { name: 'Sign out' }))
+
+    await waitFor(() => expect(router.state.location.pathname).toBe('/login'))
+    expect(
+      await screen.findByText(/sign-out could not be confirmed/i),
+    ).toBeInTheDocument()
+    expect(getCsrfToken()).toBeNull()
+    // The logout request carried the CSRF header.
+    const logoutCall = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/auth/logout'),
+    )
+    expect(logoutCall?.[1]?.headers).toMatchObject({ 'X-CSRF-Token': 'reader-csrf' })
+  })
+
+  it('signs out cleanly without a warning when the server confirms', async () => {
+    setSession('reader-csrf')
+    mockMe(readerMe, {
+      '/auth/logout': () =>
+        new Response(JSON.stringify({ revoked: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    })
+    const router = await renderApp('/')
+
+    const header = await screen.findByRole('banner')
+    await within(header).findByText('alice')
+    await userEvent.click(within(header).getByRole('button', { name: 'Sign out' }))
+
+    await waitFor(() => expect(router.state.location.pathname).toBe('/login'))
+    expect(screen.queryByText(/sign-out could not be confirmed/i)).toBeNull()
+    expect(getCsrfToken()).toBeNull()
   })
 
   it('redirects an unauthenticated visitor from /admin to /login', async () => {

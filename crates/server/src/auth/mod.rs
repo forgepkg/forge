@@ -44,8 +44,8 @@ use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
-    begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
-    ClientParams, OidcMetadataClient, ResolvePolicy,
+    begin_login, browser_binding, complete_login, map_claims, resolve_user, CallbackParams,
+    ClaimMapping, ClientParams, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::Session;
@@ -61,8 +61,8 @@ mod redirect;
 mod wif;
 
 pub use realms::{
-    merge_secrets, redact_config, seed_auth_realms, validate_config, OidcRealmRuntime, RealmAuth,
-    RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+    merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config, OidcRealmRuntime,
+    RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
 pub(crate) use wif::workload_identity_config_sha256;
@@ -194,7 +194,18 @@ async fn oidc_login(State(state): State<AppState>, Query(q): Query<LoginQuery>) 
     let redirect_to = sanitize_redirect_to(q.redirect_to.as_deref());
 
     match begin_login(&state.pool, &rt.meta, &rt.client, &redirect_to).await {
-        Ok(begun) => (StatusCode::FOUND, [(header::LOCATION, begun.authorize_url)]).into_response(),
+        // Bind the flow to this browser: the callback must present the cookie.
+        Ok(begun) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, begun.authorize_url),
+                (
+                    header::SET_COOKIE,
+                    set_flow_cookie_value(&browser_binding(&begun.state), rt.cookie_secure),
+                ),
+            ],
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!(error = %e, "oidc begin_login failed");
             (StatusCode::BAD_GATEWAY, "oidc login could not be started").into_response()
@@ -217,8 +228,32 @@ pub struct CallbackQuery {
 }
 
 /// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target.
-async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQuery>) -> Response {
-    let snap = match snapshot_or_resp(&state).await {
+///
+/// The browser must present the pre-auth flow cookie set by
+/// `GET /auth/oidc/login` (login-CSRF defense); it is cleared on every outcome.
+async fn oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let flow_cookie = cookie_value(&headers, OIDC_FLOW_COOKIE).filter(|v| !v.is_empty());
+    let mut resp = oidc_callback_inner(&state, q, flow_cookie.clone()).await;
+    if flow_cookie.is_some() {
+        // Single-use: drop the pre-auth cookie whatever the outcome.
+        if let Ok(v) = clear_flow_cookie_value(state.cookie_secure).parse() {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// The callback proper; [`oidc_callback`] wraps it to clear the flow cookie.
+async fn oidc_callback_inner(
+    state: &AppState,
+    q: CallbackQuery,
+    flow_cookie: Option<String>,
+) -> Response {
+    let snap = match snapshot_or_resp(state).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -232,6 +267,7 @@ async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQu
         state: q.state,
         error: q.error,
         error_description: q.error_description,
+        browser_binding: flow_cookie,
     };
 
     let validated = match complete_login(&state.pool, &rt.meta, &rt.client, &params).await {
@@ -251,6 +287,11 @@ async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQu
             return (StatusCode::FORBIDDEN, "login not permitted").into_response();
         }
     };
+    if mapped.admin_managed {
+        // The login may have granted/revoked the admin role: drop the cached
+        // effective set so the new session sees it immediately.
+        forge_core::authz::invalidate_user(&state.cache, user.id).await;
+    }
 
     // Create a fresh session (login always mints a new row — fixation-proof).
     let issued = match rt.sessions.create_for_user(user.id, None, None).await {
@@ -456,15 +497,26 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    // Reflect the live user row (admin grant/revoke, deactivation).
+    // Reflect the live user row (deactivation) and the effective RBAC admin
+    // verdict (admin role or legacy flag), not the raw column.
     match user_dao::find_user_by_id(&state.pool, session.user_id).await {
-        Ok(Some(u)) if u.active => Json(AuthMe {
-            user_id: u.id,
-            username: u.username,
-            is_admin: u.is_admin,
-            csrf_token: session.csrf_secret,
-        })
-        .into_response(),
+        Ok(Some(u)) if u.active => {
+            let is_admin = state
+                .authz
+                .is_global_admin(&forge_core::auth::Principal::User {
+                    user_id: u.id,
+                    token_id: None,
+                    is_admin: u.is_admin,
+                })
+                .await;
+            Json(AuthMe {
+                user_id: u.id,
+                username: u.username,
+                is_admin,
+                csrf_token: session.csrf_secret,
+            })
+            .into_response()
+        }
         Ok(_) => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth/me user lookup failed");
@@ -643,6 +695,16 @@ async fn password_login(
     }
 
     let client_ip = login_client_ip(&state, connect, &headers);
+    // Too many recent failures for this (IP, username): refuse before running
+    // the chain (no argon2 work, nothing forwarded upstream).
+    if state.login_throttle.is_locked(client_ip, &body.username) {
+        tracing::warn!(username = %body.username, ip = %client_ip, "password login throttled");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-in attempts; try again later",
+        )
+            .into_response();
+    }
     let cred = PasswordCredential {
         username: &body.username,
         password: &body.password,
@@ -651,20 +713,40 @@ async fn password_login(
     let identity = match chain.authenticate(&cred).await {
         ChainOutcome::Authenticated { identity, .. } => identity,
         // Uniform wire response for rejected / outage / unknown (fail-closed;
-        // upstream health goes to logs, not to the caller).
-        ChainOutcome::Rejected | ChainOutcome::Unavailable | ChainOutcome::NoCredentials => {
+        // upstream health goes to logs, not to the caller). An outage is not
+        // the caller's fault and does not count towards the lockout.
+        ChainOutcome::Unavailable => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
+            state
+                .login_throttle
+                .record_failure(client_ip, &body.username);
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
     };
 
     let principal = match provision_and_map(&state.pool, &identity).await {
         Ok(Some(p)) => p,
-        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
+        Ok(None) => {
+            state
+                .login_throttle
+                .record_failure(client_ip, &body.username);
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    state
+        .login_throttle
+        .record_success(client_ip, &body.username);
+    if identity.admin_authoritative {
+        // The upstream may just have granted/revoked admin: drop the cached
+        // effective set so the new session sees it immediately.
+        forge_core::authz::invalidate_user(&state.cache, principal.user_id).await;
+    }
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
     let issued = match state
@@ -688,7 +770,10 @@ async fn password_login(
         Json(AuthMe {
             user_id: principal.user_id,
             username: body.username.clone(),
-            is_admin: principal.is_admin,
+            is_admin: state
+                .authz
+                .is_global_admin(&forge_core::auth::Principal::from_user(principal))
+                .await,
             csrf_token: issued.session.csrf_secret.clone(),
         }),
     )
@@ -853,6 +938,29 @@ fn clear_cookie_value(secure: bool) -> String {
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
 }
 
+/// Pre-auth cookie binding an OIDC flow to the browser that started it.
+const OIDC_FLOW_COOKIE: &str = "forge_oidc_flow";
+
+/// `Max-Age` of the pre-auth flow cookie (matches the flow row's 10 min TTL).
+const OIDC_FLOW_COOKIE_MAX_AGE: i64 = 600;
+
+/// Build the `Set-Cookie` value for the pre-auth flow cookie: `HttpOnly`,
+/// `SameSite=Lax` (sent on the IdP's top-level redirect back), scoped to the
+/// `/auth/oidc` paths, short-lived, and `Secure` on HTTPS deployments.
+fn set_flow_cookie_value(binding: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{OIDC_FLOW_COOKIE}={binding}; Path=/auth/oidc; HttpOnly; SameSite=Lax; \
+         Max-Age={OIDC_FLOW_COOKIE_MAX_AGE}{secure_attr}"
+    )
+}
+
+/// Build the `Set-Cookie` value that clears the pre-auth flow cookie.
+fn clear_flow_cookie_value(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{OIDC_FLOW_COOKIE}=; Path=/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +997,21 @@ mod tests {
         // Plain-HTTP deployment omits Secure (so dev over http works).
         let insecure = set_cookie_value(&issued, false);
         assert!(!insecure.contains("Secure"));
+    }
+
+    #[test]
+    fn flow_cookie_is_short_lived_http_only_and_scoped() {
+        let v = set_flow_cookie_value("bind", true);
+        assert!(v.starts_with("forge_oidc_flow=bind;"));
+        assert!(v.contains("HttpOnly"));
+        assert!(v.contains("SameSite=Lax"));
+        assert!(v.contains("Path=/auth/oidc"));
+        assert!(v.contains("Max-Age=600"));
+        assert!(v.contains("Secure"));
+        assert!(!set_flow_cookie_value("bind", false).contains("Secure"));
+        let clear = clear_flow_cookie_value(false);
+        assert!(clear.contains("forge_oidc_flow=;"));
+        assert!(clear.contains("Max-Age=0"));
     }
 
     #[test]

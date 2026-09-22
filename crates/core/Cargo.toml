@@ -44,9 +44,13 @@ jsonwebtoken = { workspace = true }
 ipnet = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+# Proxy upstream bodies: spooled (memory → temp file) metadata and streamed
+# `.nupkg` downloads into the CAS.
+tempfile = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
 forge-db = { path = "../db" }
 # dev-only cycle (forge-nuget depends on forge-core); Cargo permits this for the
 # version-ordering Format impl used by the hosted-read integration tests.
@@ -64,5 +68,5 @@ wiremock = "0.6"
 # Generate a throwaway RSA keypair in-test: sign a self-signed ID token and
 # publish its public n/e in a static JWKS. Verifier is exercised end-to-end
 # without touching the network.
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 rand = { workspace = true }

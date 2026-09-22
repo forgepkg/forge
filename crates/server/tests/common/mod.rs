@@ -78,6 +78,11 @@ async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
     }
+    // Docker-less environments point at an already-running gateway.
+    if let Ok(endpoint) = std::env::var("FORGE_TEST_S3_ENDPOINT") {
+        S3_ENDPOINT.set(endpoint).ok();
+        return S3_ENDPOINT.get().unwrap();
+    }
     let container = GenericImage::new("versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
@@ -97,10 +102,16 @@ async fn s3_endpoint() -> &'static str {
     S3_ENDPOINT.get().unwrap()
 }
 
-/// A fresh migrated pool over the shared Postgres container.
+/// A fresh migrated pool over the shared Postgres container — or over an
+/// external Postgres when `FORGE_TEST_DATABASE_URL` is set (no Docker).
 pub async fn pool() -> PgPool {
-    let endpoint = pg_endpoint().await;
-    let url = format!("postgres://forge:forge@{endpoint}/forge");
+    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = pg_endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
@@ -258,8 +269,13 @@ impl Default for ServerOpts {
 /// Start a server with the given options against the shared containers, sharing
 /// `pool` (so a caller can run two instances against one DB for scale-out).
 pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
-    let endpoint = pg_endpoint().await;
-    let db_url = format!("postgres://forge:forge@{endpoint}/forge");
+    let db_url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = pg_endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let store = blob_store().await;
     let s3 = s3_endpoint().await;
 
@@ -286,12 +302,6 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .await
         .expect("bootstrap admin");
 
-    // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
-    // (drift-detected) so the realm-driven runtime sees them.
-    forge_server::app::ensure_auth_realms(&config, &pool)
-        .await
-        .expect("seed auth realms");
-
     // §12.5: build + bootstrap the envelope service when the test enabled the
     // [crypto] block (no-op otherwise).
     let envelope =
@@ -301,6 +311,12 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
             .await
             .expect("bootstrap secret encryption");
     }
+
+    // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
+    // (drift-detected) so the realm-driven runtime sees them.
+    forge_server::app::ensure_auth_realms(&config, &pool, envelope.as_deref())
+        .await
+        .expect("seed auth realms");
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
@@ -406,6 +422,12 @@ impl TestServer {
 /// Build a minimal valid `.nupkg` (a zip with `[Content_Types].xml` + a
 /// `{id}.nuspec`) that parses to `id@version`.
 pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
+    make_nupkg_with_payload(id, version, 0)
+}
+
+/// Like [`make_nupkg`], plus an incompressible `lib/net8.0/payload.bin` of
+/// `payload_len` bytes stored uncompressed — for size-limit tests.
+pub fn make_nupkg_with_payload(id: &str, version: &str, payload_len: usize) -> Vec<u8> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -433,5 +455,22 @@ pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
     zw.write_all(content_types.as_bytes()).unwrap();
     zw.start_file(format!("{id}.nuspec"), opts).unwrap();
     zw.write_all(nuspec.as_bytes()).unwrap();
+    if payload_len > 0 {
+        let stored = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(payload_len as u64 >= u32::MAX as u64);
+        zw.start_file("lib/net8.0/payload.bin", stored).unwrap();
+        // xorshift: cheap, deterministic, incompressible enough.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut buf = Vec::with_capacity(payload_len);
+        while buf.len() < payload_len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        buf.truncate(payload_len);
+        zw.write_all(&buf).unwrap();
+    }
     zw.finish().unwrap().into_inner()
 }

@@ -28,7 +28,8 @@ import { Select } from '~/components/catalyst/select'
  *                 (the password is never populated from a GET — slice-1
  *                 redaction; the form offers a "set new password" affordance and
  *                 only sends it when the admin types one)
- *  - **group**  → members are managed on a separate screen (`GroupMembers`)
+ *  - **group**  → `prefer_hosted`; members are managed on a separate screen
+ *                 (`GroupMembers`)
  *
  * On **create** `kind` is selectable; on **edit** it is fixed (identity column,
  * not updatable server-side) and shown read-only. The form computes a
@@ -46,6 +47,7 @@ export interface RepoFormValues {
   anonymous_read: boolean
   online: boolean
   allow_redeploy: boolean
+  prefer_hosted: boolean
   remote_url: string
   package_delay_seconds: string
   upstream_username: string
@@ -77,6 +79,7 @@ function seed(existing?: RepoView): RepoFormValues {
     anonymous_read: existing?.anonymous_read ?? false,
     online: existing?.online ?? true,
     allow_redeploy: existing?.allow_redeploy ?? false,
+    prefer_hosted: existing?.prefer_hosted ?? true,
     remote_url: existing?.remote_url ?? '',
     package_delay_seconds: String(existing?.package_delay_seconds ?? 0),
     upstream_username: existing?.upstream_username ?? '',
@@ -299,6 +302,26 @@ export function RepositoryForm({
         </Fieldset>
       )}
 
+      {isGroup && (
+        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
+          <Legend>Group options</Legend>
+          <CheckboxGroup>
+            <CheckboxField>
+              <Checkbox
+                checked={values.prefer_hosted}
+                onChange={(c) => set('prefer_hosted', c)}
+              />
+              <Label>Prefer hosted packages</Label>
+              <Description>
+                When a package exists in a hosted member, versions of it from
+                proxy members are hidden. Protects internal package names
+                against dependency confusion from public feeds.
+              </Description>
+            </CheckboxField>
+          </CheckboxGroup>
+        </Fieldset>
+      )}
+
       {isGroup && mode === 'edit' && (
         <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
           Group members and their priorities are managed on the{' '}
@@ -347,6 +370,9 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   }
   if (values.kind === 'hosted') {
     body.allow_redeploy = values.allow_redeploy
+  }
+  if (values.kind === 'group') {
+    body.prefer_hosted = values.prefer_hosted
   }
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()

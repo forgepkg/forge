@@ -26,6 +26,8 @@ use std::time::Duration;
 
 use url::Url;
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -68,6 +70,11 @@ pub fn validate_url(url: &str) -> Result<(), SsrfError> {
 pub fn outbound_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
+        // Never let a blackholed peer pin a request forever. Callers add a
+        // per-request total deadline where they know one (the credential
+        // forwarder does); these bounds only cap connect + idle time.
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .read_timeout(DEFAULT_READ_TIMEOUT)
         .build()
 }
 

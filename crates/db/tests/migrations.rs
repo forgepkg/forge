@@ -73,26 +73,34 @@ const EXPECTED_RETENTION_COLUMNS: &[(&str, &str)] = &[
 
 #[tokio::test]
 async fn migrations_create_all_expected_tables() {
-    // Start a throwaway Postgres 17 container matching docker-compose (db/user/pw = forge).
-    let container = Postgres::default()
-        .with_db_name("forge")
-        .with_user("forge")
-        .with_password("forge")
-        .with_tag("17")
-        .start()
-        .await
-        .expect("failed to start postgres testcontainer (is Docker running?)");
-
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get mapped port");
-
-    let url = format!("postgres://forge:forge@{host}:{port}/forge");
+    // Start a throwaway Postgres 17 container matching docker-compose (db/user/pw = forge)
+    // — or, with FORGE_TEST_DATABASE_URL (no Docker), a fresh empty database
+    // on that server.
+    let (url, _container) = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(admin_url) => (fresh_external_database(&admin_url).await, None),
+        Err(_) => {
+            let container = Postgres::default()
+                .with_db_name("forge")
+                .with_user("forge")
+                .with_password("forge")
+                .with_tag("17")
+                .start()
+                .await
+                .expect("failed to start postgres testcontainer (is Docker running?)");
+            let host = container
+                .get_host()
+                .await
+                .expect("failed to get container host");
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("failed to get mapped port");
+            (
+                format!("postgres://forge:forge@{host}:{port}/forge"),
+                Some(container),
+            )
+        }
+    };
 
     let pool = forge_db::connect(&url).await.expect("failed to connect");
     forge_db::migrate(&pool).await.expect("migrations failed");
@@ -565,4 +573,18 @@ async fn migrations_create_all_expected_tables() {
         }
         other => panic!("expected unique-constraint error, got {other:?}"),
     }
+}
+
+/// Create an empty, uniquely named database next to `admin_url`; return its URL.
+async fn fresh_external_database(admin_url: &str) -> String {
+    let name = format!("migrations_{}", std::process::id());
+    let admin = forge_db::connect(admin_url).await.expect("connect admin");
+    // The name is generated here, never user input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .execute(&admin)
+        .await
+        .expect("create database");
+    admin.close().await;
+    let (base, _) = admin_url.rsplit_once('/').expect("database url has a path");
+    format!("{base}/{name}")
 }

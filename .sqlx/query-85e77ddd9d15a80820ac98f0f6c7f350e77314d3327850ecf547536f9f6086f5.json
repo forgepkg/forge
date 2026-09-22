@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository SET upstream_username = 'svc', upstream_password = 's3cret' WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "85e77ddd9d15a80820ac98f0f6c7f350e77314d3327850ecf547536f9f6086f5"
+}

@@ -6,32 +6,68 @@
       {
         "ordinal": 0,
         "name": "state",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "state"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "nonce",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "nonce"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "pkce_verifier",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "pkce_verifier"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "redirect_to",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "redirect_to"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "expires_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oidc_flow",
+            "name": "expires_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -12,9 +12,18 @@
 bind = "0.0.0.0:8421"
 # Public base URL for absolute NuGet V3 service-index @id values. No trailing slash.
 public_base_url = "http://localhost:8421"
+# The placeholder credentials in this example (minioadmin S3 keys, bootstrap
+# admin/changeme) are refused at startup unless this is true. Keep it for a
+# local dev copy only; in production replace the placeholders and drop it.
+allow_insecure_defaults = true  # (default: false)
+# Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
+# (never buffered in memory); larger pushes get HTTP 413.
+max_upload_bytes = 536870912    # (default: 512 MiB)
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
+max_connections = 20            # (default: 20) connection-pool size
+acquire_timeout_seconds = 10    # (default: 10) wait for a free connection before failing
 
 [s3]
 endpoint = "http://localhost:8422"
@@ -37,6 +46,10 @@ anonymous_ip_allowlist = ["loopback"]   # (default: [])
 # CIDRs of reverse proxies whose X-Forwarded-For is trusted.
 trusted_proxy_cidrs = []        # (default: [])
 allow_password_basic = false    # (default: false)
+# Password-failure lockout per (client IP, username) for /auth/login and Basic
+# password auth; 0 disables.
+login_max_failures = 10             # (default: 10)
+login_failure_window_seconds = 300  # (default: 300)
 # 12.7 login UX: "identifier_first" (ask username, then route to a password
 # prompt or an OIDC redirect) or "combined" (always show username+password +
 # a button per enabled OIDC realm).
@@ -57,6 +70,25 @@ password = "changeme"
 [redis]
 # Optional shared L2 cache + invalidation backplane. Omit for L1-only caching.
 # url = "redis://localhost:6379"
+# A slower/partitioned Redis is treated as a cache miss instead of hanging reads.
+# connect_timeout_ms  = 2000    # (default: 2000)
+# response_timeout_ms = 2000    # (default: 2000)
+
+[proxy]
+# Outbound HTTP to proxy upstreams (nuget.org, Azure Artifacts, GitHub
+# Packages, Artifactory, Nexus, ProGet, …). Upstream credentials configured on
+# a proxy repository are sent with every request to the remote_url host
+# (service index, version listing, .nuspec and .nupkg).
+connect_timeout_seconds  = 15          # (default: 15)
+read_timeout_seconds     = 60          # (default: 60) max silence between two reads
+metadata_timeout_seconds = 60          # (default: 60) total, per metadata request
+download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg download
+max_metadata_bytes       = 33554432    # (default: 32 MiB)
+max_package_bytes        = 1073741824  # (default: 1 GiB)
+# Metadata bodies up to this size stay in memory; larger ones spill to a
+# temp file that is removed when the request ends. Packages always stream
+# to a temp file.
+spool_memory_bytes       = 2097152     # (default: 2 MiB)
 
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
@@ -88,7 +120,7 @@ poll_interval_seconds = 10      # (default: 10)
 # display_name_claim = "name"                # (default)
 # # provisioning
 # auto_provision             = true          # (default) create app_user on first login
-# link_existing_by_username  = true          # (default) link matching local user (bootstrap-admin interplay)
+# link_existing_by_username  = false         # (default) opt-in; never links password accounts or admins
 # # admin assignment — empty admin_groups means OIDC never grants admin (safe default)
 # admin_groups = ["forge-admins"]            # group/role values that grant is_admin
 # admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")

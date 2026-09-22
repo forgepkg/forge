@@ -55,7 +55,10 @@ the full command list.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
 > automatically. A bootstrap admin **`admin` / `changeme`** is created (the server
-> logs a warning while that seeded password is in use).
+> logs a warning while that seeded password is in use). These placeholder
+> credentials (and the `minioadmin` S3 keys) are only accepted because the dev
+> `forge.toml` sets `server.allow_insecure_defaults = true`; without it the
+> server refuses to start with them.
 
 ### Add demo data (optional)
 
@@ -181,9 +184,23 @@ password supplied to NuGet should be a **token**.
 
 - **hosted** — `{"name":"nuget","kind":"hosted"}`; push/restore your own packages.
 - **proxy** — `{"name":"nuget-proxy","kind":"proxy","remote_url":"https://api.nuget.org/v3/index.json","package_delay_seconds":0}`; caches on demand, with an optional package delay.
+  Private / custom **NuGet V3** feeds (Azure Artifacts, GitHub Packages,
+  Artifactory, Nexus, ProGet, MyGet, …) work too: set `upstream_username` and
+  `upstream_password` (typically a PAT). The credentials are sent with every
+  request to the `remote_url` host — never to a resource the service index
+  points at on a different host — and must not be embedded in `remote_url`.
+  NuGet V2-only feeds cannot be proxied. Version listings are refreshed at
+  most once per `metadata_ttl_seconds`; a failing upstream degrades to what
+  is already cached.
 - **group** — `{"name":"all","kind":"group"}`, then
   `POST /admin/repositories/all/members` with `{"member":"nuget","priority":100}`
-  (higher priority wins ties).
+  (higher priority wins ties). A member that errors (e.g. an unreachable
+  proxy) is skipped while the others answer. With `prefer_hosted` (default
+  **on**, settable on create/update and in the UI), once a hosted member has a
+  package id, proxy members are not consulted for it — so a same-named,
+  higher-versioned package on a public feed cannot shadow an internal one
+  (dependency confusion). Set `"prefer_hosted": false` for plain union
+  semantics.
 
 ## Configuration
 
@@ -198,7 +215,20 @@ Key knobs:
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
 | `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
 | `auth.bootstrap_admin` | First-run admin username/password. |
-| `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. |
+| `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme`/empty or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
+| `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
+| `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
+| `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
+| `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
+| `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
+
+### Health probes
+
+`GET /healthz` is a dependency-free liveness probe; `GET /readyz` returns 200
+only when PostgreSQL and the object store answer within 3 s (503 with
+`{"checks":{"database":…,"object_store":…}}` otherwise). The server handles
+SIGTERM (as sent by `docker stop` / Kubernetes): it stops accepting
+connections, drains in-flight requests, then stops the background workers.
 
 > **Anonymous reads need both** `anonymous_mode` *and* the repo's `anonymous_read=true`
 > (authz = authenticated user **or** anonymous-and-repo-allows). For zero-auth
@@ -301,12 +331,16 @@ admin_groups  = ["forge-admins"]
 admin_claim   = "roles"
 ```
 
-`is_admin` is **recomputed on every login** from the current claims (a user
+When `admin_groups` is set, admin is **recomputed on every login** from the
+current claims — both the legacy flag and the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
-downgraded mid-session). With `auto_provision = true` (default) a first-time
-login creates an `app_user`; `link_existing_by_username = true` lets the matching
-Entra identity claim an existing local user (the **bootstrap admin** interplay) —
-set it `false` if the username claim is not trustworthy.
+downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
+OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
+true` (default) a first-time login creates an `app_user`;
+`link_existing_by_username` is **off by default** — when enabled it links a new
+identity to an existing user of the same name, but never to an account that has
+a local password or is an admin, and an email claim is only used as the
+username when `email_verified` is true.
 
 ### Multi-instance / scale-out
 
@@ -342,6 +376,16 @@ cargo xtask check   # cargo fmt --check + clippy -D warnings
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
+
+**Without Docker**, point the db / storage / core / server suites at running
+services instead (use a fresh database per crate run — suites share it):
+
+```bash
+export FORGE_TEST_DATABASE_URL=postgres://forge:forge@localhost:5432/forge_test
+export FORGE_TEST_S3_ENDPOINT=http://127.0.0.1:7070   # versitygw --access test --secret test posix <dir>
+export FORGE_TEST_REDIS_URL=redis://127.0.0.1:6379    # an empty, dedicated Redis
+cargo test -p forge-server
+```
 
 ## Resetting & troubleshooting
 
@@ -422,10 +466,13 @@ Later versions that use the same lease and key protocol may again be deployed
 with the operator's normal rolling strategy.
 
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=all`,
-`allow_password_basic`, bootstrap admin `admin/changeme`). Override anything via
-`FORGE_*` env vars (double-underscore nesting). Required at runtime (no safe
-default):
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
+anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
+`allow_password_basic`, bootstrap admin `admin` with a placeholder password).
+The placeholder credentials (`minioadmin` S3 keys, `changeme`) are **refused at
+startup** unless overridden; only the dev compose stack sets
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true`. Override anything via `FORGE_*`
+env vars (double-underscore nesting). Required at runtime (no safe default):
 
 | Env var | Example |
 | --- | --- |
@@ -435,5 +482,7 @@ default):
 | `FORGE_S3__ACCESS_KEY` | `…` |
 | `FORGE_S3__SECRET_KEY` | `…` |
 
+| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | a real password (the placeholder is refused) |
+
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
-URLs) and `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` (change the seeded password).
+URLs).

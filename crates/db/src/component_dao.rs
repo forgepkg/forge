@@ -121,6 +121,31 @@ pub async fn list_components_for_repo(
     .await
 }
 
+/// Like [`list_components_for_repo`], restricted in SQL to ids containing
+/// `name_substring` (lowercased) — a prefilter for search so a large
+/// repository is not loaded whole.
+pub async fn list_components_for_repo_matching(
+    pool: &PgPool,
+    repository_id: i64,
+    name_substring: &str,
+) -> sqlx::Result<Vec<Component>> {
+    sqlx::query_as!(
+        Component,
+        r#"
+        SELECT
+            id, repository_id, name, original_id, version, version_original,
+            listed, created_at, updated_at
+        FROM component
+        WHERE repository_id = $1 AND strpos(name, $2) > 0
+        ORDER BY name, id
+        "#,
+        repository_id,
+        name_substring,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Set the `listed` flag on a specific component version. Returns whether a row
 /// was updated.
 pub async fn set_listed(

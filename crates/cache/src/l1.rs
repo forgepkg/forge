@@ -65,6 +65,12 @@ pub struct L1 {
 }
 
 impl L1 {
+    /// Drop every entry (used after the invalidation backplane was
+    /// disconnected: invalidations published meanwhile were missed).
+    pub fn invalidate_all(&self) {
+        self.cache.invalidate_all();
+    }
+
     pub fn new(max_capacity: u64) -> Self {
         let cache = MokaCache::builder()
             .max_capacity(max_capacity)

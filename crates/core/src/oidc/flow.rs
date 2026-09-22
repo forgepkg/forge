@@ -14,6 +14,19 @@
 //!   the cached JWKS. A callback can therefore be completed by a **different**
 //!   instance than the one that began the login.
 //!
+//! ## Browser binding (login CSRF)
+//!
+//! The `oidc_flow` row alone proves only that *some* browser started the flow.
+//! Without more, an attacker could start a login with their own IdP account and
+//! lure a victim's browser to the callback URL, logging the victim into the
+//! attacker's account (session swap / login CSRF). The server therefore sets a
+//! short-lived, `HttpOnly`, `SameSite=Lax` pre-auth cookie holding
+//! [`browser_binding`]`(state)` when the login starts, and [`complete_login`]
+//! refuses a callback whose presented cookie does not match the echoed `state`
+//! (constant time) — **before** the row is consumed, so a forged callback cannot
+//! burn a legitimate flow. The binding is derived from `state` itself, so no
+//! extra column is needed and any instance can verify it.
+//!
 //! ## PKCE without an extra crate
 //!
 //! The `code_verifier` is a 256-bit URL-safe base64 (no-pad) CSPRNG string and
@@ -26,9 +39,10 @@
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use forge_db::oidc_flow_dao::{self, NewOidcFlow};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use url::Url;
 
 use super::jwks::{IdTokenClaims, OidcError, OidcMetadataClient, VerifyParams};
@@ -55,6 +69,11 @@ pub enum FlowError {
     /// callback.
     #[error("oidc flow state is unknown, expired, or already used")]
     UnknownState,
+    /// The callback's browser did not present the pre-auth binding cookie for
+    /// this `state` (missing or mismatched): the flow was started in a
+    /// different browser (login CSRF / session swap).
+    #[error("oidc flow was not started by this browser")]
+    BrowserMismatch,
     /// The token endpoint call failed at the transport / status level.
     #[error("oidc token exchange http error: {0}")]
     TokenHttp(String),
@@ -179,6 +198,25 @@ pub async fn begin_login(
     })
 }
 
+/// The pre-auth cookie value that binds a flow to the browser that began it:
+/// `base64url(sha256("forge-oidc-flow\0" || state))`. Set by the server at
+/// login start; [`complete_login`] requires it back (see module docs).
+pub fn browser_binding(state: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-oidc-flow\0");
+    hasher.update(state.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// Constant-time check that `presented` is the binding for `state`.
+fn browser_binding_matches(state: &str, presented: &str) -> bool {
+    browser_binding(state)
+        .as_bytes()
+        .ct_eq(presented.as_bytes())
+        .unwrap_u8()
+        == 1
+}
+
 /// Parameters echoed by the IdP on the callback.
 #[derive(Debug, Clone, Default)]
 pub struct CallbackParams {
@@ -190,15 +228,20 @@ pub struct CallbackParams {
     pub error: Option<String>,
     /// An optional human-readable error description.
     pub error_description: Option<String>,
+    /// The pre-auth binding cookie the callback's browser presented (see
+    /// [`browser_binding`]). Required: a missing/mismatched value is rejected.
+    pub browser_binding: Option<String>,
 }
 
 /// Complete a login from the callback parameters.
 ///
 /// 1. If the IdP signalled an `error`, surface it.
-/// 2. Atomically **consume** the `oidc_flow` row by `state` (single-use; an
+/// 2. Require the browser's pre-auth binding cookie to match `state`
+///    ([`FlowError::BrowserMismatch`] otherwise) — before anything is consumed.
+/// 3. Atomically **consume** the `oidc_flow` row by `state` (single-use; an
 ///    unknown/expired/replayed state yields [`FlowError::UnknownState`]).
-/// 3. Exchange `code` + the row's PKCE verifier at the token endpoint.
-/// 4. Verify the returned `id_token` (signature + claims + the row's `nonce`).
+/// 4. Exchange `code` + the row's PKCE verifier at the token endpoint.
+/// 5. Verify the returned `id_token` (signature + claims + the row's `nonce`).
 ///
 /// Returns the validated claims + the persisted redirect target. Pure given the
 /// injected `pool` / `meta` / `client` — so it is testable with a mock token
@@ -219,7 +262,14 @@ pub async fn complete_login(
 
     let state = params.state.as_deref().ok_or(FlowError::UnknownState)?;
 
-    // 2. Single-use consume. A replayed state finds nothing here.
+    // 2. The flow must have been started by this browser (login CSRF defense).
+    //    Checked before the consume so a forged callback can't burn the row.
+    match params.browser_binding.as_deref() {
+        Some(presented) if browser_binding_matches(state, presented) => {}
+        _ => return Err(FlowError::BrowserMismatch),
+    }
+
+    // 3. Single-use consume. A replayed state finds nothing here.
     let flow = oidc_flow_dao::consume(pool, state)
         .await
         .map_err(|e| FlowError::Db(e.to_string()))?
@@ -230,7 +280,7 @@ pub async fn complete_login(
         .as_deref()
         .ok_or_else(|| FlowError::TokenResponse("callback had no code and no error".into()))?;
 
-    // 3. Exchange the code (PKCE verifier sent verbatim).
+    // 4. Exchange the code (PKCE verifier sent verbatim).
     let discovery = meta.discovery().await?;
     let id_token = exchange_code(
         meta,
@@ -241,7 +291,7 @@ pub async fn complete_login(
     )
     .await?;
 
-    // 4. Verify signature + registered claims + this flow's nonce.
+    // 5. Verify signature + registered claims + this flow's nonce.
     let verified = meta
         .verify_id_token(
             &id_token,
@@ -350,7 +400,7 @@ fn build_authorize_url(
 /// valid PKCE verifier per RFC 7636.)
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -363,6 +413,23 @@ fn s256_challenge(verifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_binding_is_state_specific_and_checked_in_constant_time() {
+        let b = browser_binding("state-a");
+        assert!(browser_binding_matches("state-a", &b));
+        assert!(!browser_binding_matches("state-b", &b));
+        assert!(!browser_binding_matches("state-a", ""));
+        assert!(
+            !browser_binding_matches("state-a", "state-a"),
+            "not the raw state"
+        );
+        assert_eq!(
+            b,
+            browser_binding("state-a"),
+            "deterministic across instances"
+        );
+    }
 
     #[test]
     fn s256_challenge_matches_rfc7636_example() {

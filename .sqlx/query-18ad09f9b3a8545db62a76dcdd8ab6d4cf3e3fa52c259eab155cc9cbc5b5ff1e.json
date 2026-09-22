@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "b!",
-        "type_info": "Bytea"
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password_enc"
+          }
+        }
       }
     ],
     "parameters": {

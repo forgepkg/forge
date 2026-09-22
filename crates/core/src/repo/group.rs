@@ -16,6 +16,18 @@
 //!   visible member that has the exact `(id, version)`.
 //! * **Registration / search** merge across visible members, dedup by
 //!   `id + version` (registration) / `id` (search), **highest-priority wins**.
+//!   Merged versions are ordered by the format's version precedence (so
+//!   `1.10.0` sorts after `1.9.0`).
+//! * **Prefer hosted** (group `config.prefer_hosted`, default on): once a
+//!   package id exists in a visible hosted member, proxy members are not
+//!   consulted for that id at all. An attacker publishing a same-named,
+//!   higher-versioned package on a public feed therefore cannot shadow an
+//!   internal package (dependency confusion).
+//! * **Degraded members** — a member that errors (e.g. an unreachable proxy
+//!   upstream) is logged and skipped; the group still answers from the
+//!   remaining members. Only when *every* consulted member fails does the
+//!   group return an error, so a public-feed outage never breaks restores of
+//!   internal packages.
 //!
 //! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
 //! a group** (nested groups). Resolution first loads each readable group node
@@ -59,6 +71,7 @@ use sqlx::PgPool;
 use crate::auth::authz::Authz;
 use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
+use crate::format::Format;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
     SearchResult, VersionEntry,
@@ -92,6 +105,8 @@ pub struct GroupRepo {
     /// Maximum nesting depth followed when flattening nested groups
     /// (`groups.max_nesting_depth`). Descent past this bound stops, fail-closed.
     max_depth: u32,
+    /// Version precedence for merged results. `None` ⇒ string order (tests).
+    format: Option<Arc<dyn Format>>,
 }
 
 /// A visible member: its repository row (carrying its own `name`) and the ops to
@@ -119,6 +134,8 @@ struct GraphMember {
 #[derive(Debug)]
 struct GroupGraph {
     root_id: i64,
+    /// The requested group's `prefer_hosted` option.
+    prefer_hosted: bool,
     max_depth: u32,
     groups: HashMap<i64, Vec<GraphMember>>,
     leaves: Vec<Repository>,
@@ -271,6 +288,20 @@ impl GroupRepo {
             factory,
             authz,
             max_depth,
+            format: None,
+        }
+    }
+
+    /// Order merged versions by `format`'s precedence instead of by string.
+    pub fn with_format(mut self, format: Arc<dyn Format>) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    fn compare_versions(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        match &self.format {
+            Some(format) => format.compare_versions(a, b),
+            None => a.cmp(b),
         }
     }
 
@@ -346,6 +377,7 @@ impl GroupRepo {
 
         Ok(Arc::new(GroupGraph {
             root_id: group_row.id,
+            prefer_hosted: group_row.prefer_hosted(),
             max_depth: self.max_depth,
             groups,
             leaves,
@@ -375,6 +407,33 @@ impl GroupRepo {
         Ok(out)
     }
 
+    /// The members allowed to serve `package_id`: the visible members, minus
+    /// every proxy member when the group prefers hosted packages and a visible
+    /// hosted member already has the id (listed or not). A hosted lookup
+    /// failure propagates — deciding without it could expose the id to a
+    /// public-feed shadow (fail closed).
+    async fn serving_members_for_id(
+        &self,
+        graph: &GroupGraph,
+        package_id: &str,
+    ) -> Result<Vec<VisibleMember>, RepoError> {
+        let members = self.visible_members_for_id(graph, package_id)?;
+        if !graph.prefer_hosted || !members.iter().any(|m| is_proxy(&m.repo)) {
+            return Ok(members);
+        }
+        for m in members.iter().filter(|m| is_hosted(&m.repo)) {
+            if !m
+                .ops
+                .list_versions(&m.repo.name, package_id)
+                .await?
+                .is_empty()
+            {
+                return Ok(members.into_iter().filter(|m| !is_proxy(&m.repo)).collect());
+            }
+        }
+        Ok(members)
+    }
+
     /// Merge member search results with the caller's package predicate pushed
     /// through every member wrapper. This keeps selector filtering inside each
     /// production backend's single corpus scan rather than repeatedly
@@ -391,28 +450,45 @@ impl GroupRepo {
         member_params.take = SearchParams::MAX_TAKE;
 
         let mut by_id: BTreeMap<String, (usize, SearchHit)> = BTreeMap::new();
+        let mut hosted_ids: HashSet<String> = HashSet::new();
+        let mut proxy_hits: Vec<(usize, SearchHit)> = Vec::new();
+        let mut failures = MemberFailures::default();
         for leaf in &graph.leaves {
             let ops = self.factory.ops_for(leaf)?;
             let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
-            let result = ops
+            let result = match ops
                 .search_with_package_filter(&leaf.name, &member_params, &leaf_filter)
-                .await?;
+                .await
+            {
+                Ok(result) => {
+                    failures.ok();
+                    result
+                }
+                Err(e) => {
+                    failures.failed(&leaf.name, e);
+                    continue;
+                }
+            };
             for hit in result.hits {
                 let Some(rank) = graph.leaf_rank(&hit.original_id, leaf.id) else {
                     continue;
                 };
-                let key = hit.original_id.to_lowercase();
-                match by_id.entry(key) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert((rank, hit));
+                if graph.prefer_hosted {
+                    if is_hosted(leaf) {
+                        hosted_ids.insert(hit.original_id.to_lowercase());
+                    } else if is_proxy(leaf) {
+                        // Decided once every hosted leaf has answered.
+                        proxy_hits.push((rank, hit));
+                        continue;
                     }
-                    std::collections::btree_map::Entry::Occupied(mut entry)
-                        if rank < entry.get().0 =>
-                    {
-                        entry.insert((rank, hit));
-                    }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
                 }
+                insert_ranked(&mut by_id, rank, hit);
+            }
+        }
+        failures.into_result()?;
+        for (rank, hit) in proxy_hits {
+            if !hosted_ids.contains(&hit.original_id.to_lowercase()) {
+                insert_ranked(&mut by_id, rank, hit);
             }
         }
 
@@ -436,25 +512,29 @@ impl GroupRepo {
 impl RepoReadOps for GroupRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
         let graph = self.group_graph(repo).await?;
-        let members = self.visible_members_for_id(&graph, id)?;
+        let members = self.serving_members_for_id(&graph, id).await?;
 
-        // Union across visible members, deduped by normalized version. Members
+        // Union across serving members, deduped by normalized version. Members
         // are highest-priority first, so the first sighting of a version wins
         // (its `original_id`/casing comes from the highest-priority member).
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut merged: Vec<VersionEntry> = Vec::new();
+        let mut failures = MemberFailures::default();
         for m in &members {
-            for entry in m.ops.list_versions(&m.repo.name, id).await? {
-                if seen.insert(entry.version.clone()) {
-                    merged.push(entry);
+            match m.ops.list_versions(&m.repo.name, id).await {
+                Ok(entries) => {
+                    failures.ok();
+                    for entry in entries {
+                        if seen.insert(entry.version.clone()) {
+                            merged.push(entry);
+                        }
+                    }
                 }
+                Err(e) => failures.failed(&m.repo.name, e),
             }
         }
-        // No `Format` here; sort by the version string. Callers that need
-        // precedence ordering re-sort with the format (route layer); a stable
-        // lexicographic order is enough for a deduped union and keeps this layer
-        // format-agnostic.
-        merged.sort_by(|a, b| a.version.cmp(&b.version));
+        failures.into_result()?;
+        merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
         Ok(merged)
     }
 
@@ -465,13 +545,19 @@ impl RepoReadOps for GroupRepo {
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
         let graph = self.group_graph(repo).await?;
-        let members = self.visible_members_for_id(&graph, id)?;
-        // Highest-priority visible member that has the exact (id, version).
+        let members = self.serving_members_for_id(&graph, id).await?;
+        // Highest-priority serving member that has the exact (id, version).
+        let mut failures = MemberFailures::default();
         for m in &members {
-            if let Some(loc) = m.ops.resolve_nupkg(&m.repo.name, id, version).await? {
-                return Ok(Some(loc));
+            match m.ops.resolve_nupkg(&m.repo.name, id, version).await {
+                Ok(Some(loc)) => return Ok(Some(loc)),
+                Ok(None) => failures.ok(),
+                Err(e) => failures.failed(&m.repo.name, e),
             }
         }
+        // Not found anywhere reachable: a member failure means "unknown", not
+        // "absent" — report it so clients retry instead of caching a miss.
+        failures.into_strict_result()?;
         Ok(None)
     }
 
@@ -482,12 +568,16 @@ impl RepoReadOps for GroupRepo {
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
         let graph = self.group_graph(repo).await?;
-        let members = self.visible_members_for_id(&graph, id)?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+        let mut failures = MemberFailures::default();
         for m in &members {
-            if let Some(bytes) = m.ops.resolve_nuspec(&m.repo.name, id, version).await? {
-                return Ok(Some(bytes));
+            match m.ops.resolve_nuspec(&m.repo.name, id, version).await {
+                Ok(Some(bytes)) => return Ok(Some(bytes)),
+                Ok(None) => failures.ok(),
+                Err(e) => failures.failed(&m.repo.name, e),
             }
         }
+        failures.into_strict_result()?;
         Ok(None)
     }
 
@@ -497,19 +587,27 @@ impl RepoReadOps for GroupRepo {
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
         let graph = self.group_graph(repo).await?;
-        let members = self.visible_members_for_id(&graph, id)?;
+        let members = self.serving_members_for_id(&graph, id).await?;
 
         // Merge, dedup by version (id is fixed here), highest-priority wins.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut merged: Vec<RegistrationEntry> = Vec::new();
+        let mut failures = MemberFailures::default();
         for m in &members {
-            for entry in m.ops.registration(&m.repo.name, id).await? {
-                if seen.insert(entry.version.clone()) {
-                    merged.push(entry);
+            match m.ops.registration(&m.repo.name, id).await {
+                Ok(entries) => {
+                    failures.ok();
+                    for entry in entries {
+                        if seen.insert(entry.version.clone()) {
+                            merged.push(entry);
+                        }
+                    }
                 }
+                Err(e) => failures.failed(&m.repo.name, e),
             }
         }
-        merged.sort_by(|a, b| a.version.cmp(&b.version));
+        failures.into_result()?;
+        merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
         Ok(merged)
     }
 
@@ -525,5 +623,62 @@ impl RepoReadOps for GroupRepo {
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
         self.search_filtered(repo, params, filter).await
+    }
+}
+
+fn is_hosted(repo: &Repository) -> bool {
+    repo.kind() == forge_db::model::RepoKind::Hosted
+}
+
+fn is_proxy(repo: &Repository) -> bool {
+    repo.kind() == forge_db::model::RepoKind::Proxy
+}
+
+/// Keep the highest-priority (lowest rank) hit per package id.
+fn insert_ranked(by_id: &mut BTreeMap<String, (usize, SearchHit)>, rank: usize, hit: SearchHit) {
+    match by_id.entry(hit.original_id.to_lowercase()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert((rank, hit));
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) if rank < entry.get().0 => {
+            entry.insert((rank, hit));
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
+}
+
+/// Tracks member outcomes for one group operation: failing members are
+/// logged and skipped while at least one member answered.
+#[derive(Default)]
+struct MemberFailures {
+    succeeded: usize,
+    last_error: Option<RepoError>,
+}
+
+impl MemberFailures {
+    fn ok(&mut self) {
+        self.succeeded += 1;
+    }
+
+    fn failed(&mut self, member: &str, error: RepoError) {
+        tracing::warn!(member, error = %error, "group member failed; continuing with the remaining members");
+        self.last_error = Some(error);
+    }
+
+    /// Error only when members were consulted and **none** answered.
+    fn into_result(self) -> Result<(), RepoError> {
+        match (self.succeeded, self.last_error) {
+            (0, Some(error)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    /// Error when **any** member failed — for lookups whose miss is only
+    /// authoritative if every member answered.
+    fn into_strict_result(self) -> Result<(), RepoError> {
+        match self.last_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }

@@ -80,7 +80,7 @@ test:
     - cargo test --workspace
     # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
     # the committed .sqlx/ cache matches the current queries + schema.
-    - cargo install sqlx-cli --version ^0.8 --no-default-features --features rustls,postgres --locked
+    - cargo install sqlx-cli --version ^0.9 --no-default-features --features rustls,postgres --locked
     - SQLX_OFFLINE= sqlx migrate run --source migrations
     - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
@@ -162,7 +162,7 @@ e2e:
 web-e2e:
   stage: e2e
   needs: ["web"]
-  image: mcr.microsoft.com/playwright:v1.50.1-jammy
+  image: mcr.microsoft.com/playwright:v1.63.0-noble
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:

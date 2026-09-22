@@ -184,7 +184,7 @@ pub struct NupkgLocation {
 /// Dependency groups are intentionally **not** included: the format layer
 /// re-parses [`Self::nuspec_bytes`] to produce them, keeping NuGet manifest
 /// parsing out of `forge-core`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistrationEntry {
     /// Package id exactly as published.
     pub original_id: String,
@@ -196,10 +196,13 @@ pub struct RegistrationEntry {
     pub package_hash_sha512_base64: Option<String>,
     /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored.
     pub nuspec_bytes: Option<Vec<u8>>,
+    /// When this version was published into the repository (`None` when
+    /// unknown, e.g. a proxied version not cached yet).
+    pub published: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A search hit: one package id with all of its (filtered) versions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchHit {
     /// Package id exactly as published (casing from the latest version).
     pub original_id: String,
@@ -207,6 +210,70 @@ pub struct SearchHit {
     pub latest_version: String,
     /// All matching versions, ascending by precedence.
     pub versions: Vec<VersionEntry>,
+    /// Manifest of [`Self::latest_version`], when available, so the format
+    /// layer can render description / authors / tags / icon.
+    pub nuspec_bytes: Option<Vec<u8>>,
+    /// Download count across all versions, when tracked.
+    pub total_downloads: Option<i64>,
+}
+
+/// A parsed NuGet search query.
+///
+/// Supports the syntax clients actually send: `packageid:Foo` (exact id,
+/// used by Visual Studio / NuGet.exe / Dependabot), `id:foo` (id substring),
+/// and free-text terms (every term must occur in the id; terms are split on
+/// whitespace, so `newtonsoft json` finds `Newtonsoft.Json`). Unknown
+/// `field:value` filters (e.g. `tags:x`, `owner:x`) match their value against
+/// the id as a best effort. Matching is ASCII case-insensitive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchQuery {
+    /// Lowercased exact package ids (`packageid:`); any one must match.
+    pub exact_ids: Vec<String>,
+    /// Lowercased substrings that must all occur in the id.
+    pub terms: Vec<String>,
+}
+
+impl SearchQuery {
+    /// Parse a raw `q` value.
+    pub fn parse(q: &str) -> Self {
+        let mut out = SearchQuery::default();
+        for token in q.split_whitespace() {
+            let token = token.trim_matches('"').to_ascii_lowercase();
+            if token.is_empty() {
+                continue;
+            }
+            match token.split_once(':') {
+                Some(("packageid", value)) if !value.is_empty() => {
+                    out.exact_ids.push(value.to_string())
+                }
+                Some((_, value)) if !value.is_empty() => out.terms.push(value.to_string()),
+                Some(_) => {}
+                None => out.terms.push(token),
+            }
+        }
+        out
+    }
+
+    /// Whether the query matches everything.
+    pub fn is_empty(&self) -> bool {
+        self.exact_ids.is_empty() && self.terms.is_empty()
+    }
+
+    /// Whether `lower_id` (already lowercased) matches.
+    pub fn matches(&self, lower_id: &str) -> bool {
+        (self.exact_ids.is_empty() || self.exact_ids.iter().any(|id| id == lower_id))
+            && self.terms.iter().all(|t| lower_id.contains(t.as_str()))
+    }
+
+    /// A single substring usable as a SQL prefilter (every match contains
+    /// it), if one exists.
+    pub fn prefilter(&self) -> Option<&str> {
+        self.exact_ids
+            .first()
+            .filter(|_| self.exact_ids.len() == 1)
+            .or_else(|| self.terms.iter().max_by_key(|t| t.len()))
+            .map(String::as_str)
+    }
 }
 
 /// The result of a search query: a clamped page plus the total hit count.
@@ -515,4 +582,29 @@ pub trait RepoWriteOps: Send + Sync {
         id: &str,
         version: &str,
     ) -> Result<DeleteOutcome, WriteError>;
+}
+
+#[cfg(test)]
+mod search_query_tests {
+    use super::SearchQuery;
+
+    #[test]
+    fn parses_client_syntax() {
+        let q = SearchQuery::parse("PackageId:Newtonsoft.Json");
+        assert!(q.matches("newtonsoft.json"));
+        assert!(!q.matches("newtonsoft.json.bson"));
+
+        let q = SearchQuery::parse("newtonsoft  JSON");
+        assert!(q.matches("newtonsoft.json"));
+        assert!(q.matches("newtonsoft.json.bson"));
+        assert!(!q.matches("system.text.json"));
+
+        let q = SearchQuery::parse("id:json tags:serializer");
+        assert_eq!(q.terms, ["json", "serializer"]);
+
+        assert!(SearchQuery::parse("   ").is_empty());
+        assert!(SearchQuery::parse("").matches("anything"));
+        assert_eq!(SearchQuery::parse("a bcd").prefilter(), Some("bcd"));
+        assert_eq!(SearchQuery::parse("packageid:x.y").prefilter(), Some("x.y"));
+    }
 }
