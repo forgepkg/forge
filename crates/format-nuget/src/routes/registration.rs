@@ -221,6 +221,7 @@ pub async fn index(State(ctx): State<RouteContext>, Path(id): Path<String>) -> R
 }
 
 /// Resolve `(id, "{version}.json")` to its registration entry.
+#[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
 async fn find_entry(
     ctx: &RouteContext,
     id: &str,
