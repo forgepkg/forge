@@ -831,18 +831,40 @@ pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
 }
 
 /// Re-apply the idempotent behavior-preserving legacy mapping (the same
-/// PL/pgSQL routine migration 0007 installs and runs once). Safe to call on
-/// every boot: it maps is_admin→admin role, anonymous_read→anonymous read
-/// grants, and — only when `legacy_open_access` is set — assigns the
-/// `authenticated` role to every user. All writes are upserts, so a no-op once
-/// applied. The boot path calls this so rows that arrive after the one-shot
-/// migration (a late anonymous_read flip, a manually-added user on a legacy
-/// install) are folded in without a new migration.
+/// PL/pgSQL routine migration 0007 installs and runs once): is_admin→admin
+/// role, anonymous_read→anonymous read grants, and — only when
+/// `legacy_open_access` is set — the `authenticated` role for every user. All
+/// writes are upserts.
+///
+/// **Not for the boot path**: re-running it would re-grant anything an
+/// operator revoked through RBAC since (the routine only ever adds). Boot uses
+/// [`apply_legacy_migration_once`].
 pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
     sqlx::query!(r#"SELECT forge_rbac_apply_legacy_migration()"#)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// The `forge_setting` key marking the legacy RBAC synthesis as done.
+pub const LEGACY_RBAC_SYNCED_KEY: &str = "legacy_rbac_synced";
+
+/// Run [`apply_legacy_migration`] exactly once per install, then record
+/// [`LEGACY_RBAC_SYNCED_KEY`] so later boots never re-synthesize grants an
+/// operator has since revoked. Returns whether the mapping ran now.
+///
+/// Rows that arrive later need no re-sync: `anonymous_read` is honored
+/// directly by the authz seam, the `is_admin` column is a dual-read fallback,
+/// and new users on a legacy-open install get `authenticated` at creation
+/// ([`assign_authenticated_if_legacy_open`]). Two instances booting together
+/// may both apply it — harmless, every write is an idempotent upsert.
+pub async fn apply_legacy_migration_once(pool: &PgPool) -> sqlx::Result<bool> {
+    if get_setting(pool, LEGACY_RBAC_SYNCED_KEY).await?.as_deref() == Some("true") {
+        return Ok(false);
+    }
+    apply_legacy_migration(pool).await?;
+    set_setting(pool, LEGACY_RBAC_SYNCED_KEY, "true").await?;
+    Ok(true)
 }
 
 /// Per-creation half of the `legacy_open_access` rule: when this install opted

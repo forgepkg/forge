@@ -177,7 +177,7 @@ pub async fn resolve_user(
         // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
         // freshly auto-provisioned OIDC user must inherit the `authenticated` role
         // immediately so it has the slice-1 "read/write everywhere" reach —
-        // `ensure_legacy_rbac` only folds in new users at the next boot. The
+        // `ensure_legacy_rbac` runs only once per install. The
         // assignment is idempotent and gated on the install-wide flag, so a fresh
         // (fail-closed) install leaves the user with no automatic grants.
         authz_dao::assign_authenticated_if_legacy_open(pool, user.id)

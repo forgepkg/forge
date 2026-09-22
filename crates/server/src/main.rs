@@ -59,11 +59,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // §12.4 Phase 5: re-apply the idempotent behavior-preserving RBAC legacy
-    // mapping (is_admin→admin role, anonymous_read→anonymous grants, and — only
-    // on legacy-open-access installs — authenticated for every user). A no-op
-    // once converged; never opens a fresh install. Runs after bootstrap so a
-    // freshly-created legacy-open user inherits the `authenticated` role too.
+    // §12.4 Phase 5: apply the behavior-preserving RBAC legacy mapping
+    // (is_admin→admin role, anonymous_read→anonymous grants, and — only on
+    // legacy-open-access installs — authenticated for every user) ONCE per
+    // install (a forge_setting marker), so later RBAC revocations stick. Never
+    // opens a fresh install. Runs after bootstrap so a freshly-created
+    // legacy-open user inherits the `authenticated` role too.
     ensure_legacy_rbac(&pool)
         .await
         .context("ensure legacy RBAC mapping")?;

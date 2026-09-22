@@ -198,23 +198,22 @@ pub async fn ensure_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Resul
         .context("seed auth realms")
 }
 
-/// Re-apply the idempotent behavior-preserving RBAC legacy mapping on boot
+/// Apply the behavior-preserving RBAC legacy mapping **once** per install
 /// (§12.4 Phase 5).
 ///
-/// Migration `0007` already ran this once and recorded the install-wide
-/// `legacy_open_access` default (open on upgrade, closed on a fresh install).
-/// Calling it again here folds in rows that arrived *after* that migration —
-/// e.g. a repository whose `anonymous_read` was flipped on, an `is_admin` user
-/// created out-of-band, or (on a legacy-open install) any newly-created user
-/// that should inherit the `authenticated` role. Every write is an idempotent
-/// upsert, so on a fresh / already-converged install this is a cheap no-op.
-///
-/// It never *opens* a fresh install: the `authenticated` auto-assignment inside
-/// the routine is gated on the `legacy_open_access` setting, which is `false`
-/// for fresh installs.
+/// Migration `0007` ran it and recorded the install-wide `legacy_open_access`
+/// default (open on upgrade, closed on a fresh install). This boot hook runs it
+/// one more time for installs that upgraded before the one-shot marker existed,
+/// then records the `legacy_rbac_synced` marker: re-running it on every boot
+/// would re-grant admin roles / anonymous grants an operator has since revoked
+/// through RBAC (the routine only ever adds). It never *opens* a fresh install:
+/// the `authenticated` auto-assignment is gated on `legacy_open_access`.
 pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
-    authz_dao::apply_legacy_migration(pool)
+    if authz_dao::apply_legacy_migration_once(pool)
         .await
-        .context("apply legacy RBAC migration")?;
+        .context("apply legacy RBAC migration")?
+    {
+        tracing::info!("applied the one-shot legacy RBAC mapping");
+    }
     Ok(())
 }
