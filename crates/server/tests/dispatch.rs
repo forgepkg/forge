@@ -288,3 +288,87 @@ async fn anonymous_read_when_allowed() {
         .unwrap();
     assert_eq!(resp.status(), 200, "anonymous read should be allowed");
 }
+
+/// Regression: pushes above axum's 2 MiB extractor default used to fail with
+/// a 500. A 9 MiB package must publish (201) and restore byte-identically
+/// (streamed from S3).
+#[tokio::test]
+async fn large_package_push_and_restore_round_trip() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("big{}", common::unique());
+    let id = format!("Big.Pkg{}", common::unique());
+    let lower = id.to_lowercase();
+    client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+
+    let bytes = common::make_nupkg_with_payload(&id, "1.0.0", 9 * 1024 * 1024);
+    assert!(bytes.len() > 9 * 1024 * 1024);
+    let api_key = srv.admin_token().await;
+    let part = reqwest::multipart::Part::bytes(bytes.clone())
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", &api_key)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "a 9 MiB push must be accepted");
+
+    let url = format!(
+        "{}/v3/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+        srv.base_url
+    );
+    let head = client
+        .head(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some(bytes.len().to_string().as_str())
+    );
+    let resp = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), bytes.as_slice());
+}
+
+/// Liveness and readiness probes answer without authentication.
+#[tokio::test]
+async fn health_endpoints() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let live = client
+        .get(format!("{}/healthz", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    let ready = client
+        .get(format!("{}/readyz", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
+    let body: Value = ready.json().await.unwrap();
+    assert_eq!(body["checks"]["database"], true);
+    assert_eq!(body["checks"]["object_store"], true);
+}

@@ -78,7 +78,9 @@ async fn process_row(
     use forge_db::blob_dao::ReserveDeleteOutcome;
 
     let stale_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
-    match forge_db::blob_dao::reserve_outbox_delete(pool, &row.sha256, stale_before).await? {
+    match forge_db::blob_dao::reserve_outbox_row_delete(pool, row.id, &row.sha256, stale_before)
+        .await?
+    {
         // A committed ingest won before deletion could reserve the row.
         ReserveDeleteOutcome::Referenced => {
             forge_db::outbox_dao::mark_processed(pool, row.id).await?;

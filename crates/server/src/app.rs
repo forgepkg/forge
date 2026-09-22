@@ -96,6 +96,8 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
     let mut app = Router::new()
+        // Liveness / readiness probes (unauthenticated, dependency-light).
+        .merge(crate::health::health_router())
         .merge(me_router())
         // Self-service tokens: any signed-in (session) user manages their own
         // tokens here; mounted like `/admin/me`, outside the admin gate.
@@ -123,6 +125,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         layer.clone(),
         attach_principal,
     ))
+    // Request spans (method, path, status, latency) for every route; emitted
+    // at DEBUG, so `RUST_LOG=tower_http=debug` turns on an access log.
+    .layer(tower_http::trace::TraceLayer::new_for_http())
     .with_state(state)
 }
 

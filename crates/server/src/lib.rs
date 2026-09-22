@@ -15,6 +15,7 @@ pub mod browse;
 pub mod config;
 pub mod crypto;
 pub mod dispatch;
+pub mod health;
 pub mod me;
 pub mod me_tokens;
 pub mod middleware;

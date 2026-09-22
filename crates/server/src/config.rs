@@ -98,6 +98,21 @@ impl ServerConfig {
 pub struct DatabaseConfig {
     /// `postgres://…` connection URL.
     pub url: String,
+    /// Connection-pool size. Default 20.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: u32,
+    /// How long a request waits for a free pooled connection before failing
+    /// (seconds). Default 10.
+    #[serde(default = "default_db_acquire_timeout")]
+    pub acquire_timeout_seconds: u64,
+}
+
+fn default_db_max_connections() -> u32 {
+    20
+}
+
+fn default_db_acquire_timeout() -> u64 {
+    10
 }
 
 /// `s3.*`
@@ -404,6 +419,30 @@ pub struct RedisConfig {
     /// `redis://…` URL. Absent ⇒ L1-only caching.
     #[serde(default)]
     pub url: Option<String>,
+    /// Connect / reconnect deadline in milliseconds. Default 2000.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Per-command response deadline in milliseconds. A slower Redis is
+    /// treated as unavailable (reads fall through to the source). Default 2000.
+    #[serde(default)]
+    pub response_timeout_ms: Option<u64>,
+}
+
+impl RedisConfig {
+    /// The runtime timeouts handed to the cache.
+    pub fn timeouts(&self) -> forge_cache::RedisTimeouts {
+        let defaults = forge_cache::RedisTimeouts::default();
+        forge_cache::RedisTimeouts {
+            connect: self
+                .connect_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.connect),
+            response: self
+                .response_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.response),
+        }
+    }
 }
 
 /// `cache.*`
@@ -1100,10 +1139,65 @@ impl Config {
         }
         self.validate_crypto()?;
         self.proxy.validate()?;
+        self.validate_workers()?;
         if self.server.max_upload_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "server.max_upload_bytes must be greater than 0".into(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Background-worker tuning must be usable: a zero interval makes
+    /// `tokio::time::interval` panic inside the spawned loop, and a negative
+    /// grace would make blob deletes immediate.
+    fn validate_workers(&self) -> Result<(), ConfigError> {
+        let positive = |key: &str, ok: bool| {
+            if ok {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{key} must be greater than 0"
+                )))
+            }
+        };
+        positive(
+            "outbox.poll_interval_seconds",
+            self.outbox.poll_interval_seconds > 0,
+        )?;
+        positive("outbox.batch_size", self.outbox.batch_size > 0)?;
+        if self.outbox.grace_seconds < 0 {
+            return Err(ConfigError::Invalid(
+                "outbox.grace_seconds must not be negative".into(),
+            ));
+        }
+        positive(
+            "retention.poll_interval_seconds",
+            self.retention.poll_interval_seconds > 0,
+        )?;
+        positive("retention.lease_seconds", self.retention.lease_seconds > 0)?;
+        if self.retention.default_run_interval_seconds < 0 {
+            return Err(ConfigError::Invalid(
+                "retention.default_run_interval_seconds must not be negative".into(),
+            ));
+        }
+        positive(
+            "groups.max_nesting_depth",
+            self.groups.max_nesting_depth > 0,
+        )?;
+        positive(
+            "database.max_connections",
+            self.database.max_connections > 0,
+        )?;
+        positive(
+            "database.acquire_timeout_seconds",
+            self.database.acquire_timeout_seconds > 0,
+        )?;
+        if let Some(crypto) = self.crypto.as_ref().filter(|c| c.enabled) {
+            positive(
+                "crypto.rotation.poll_interval_seconds",
+                !crypto.rotation.enabled || crypto.rotation.poll_interval_seconds > 0,
+            )?;
         }
         Ok(())
     }

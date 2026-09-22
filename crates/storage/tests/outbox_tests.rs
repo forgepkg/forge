@@ -400,3 +400,71 @@ async fn pending_outbox_count(pool: &sqlx::PgPool, sha256: &str) -> i64 {
     .await
     .unwrap()
 }
+
+/// A blob dereferenced (row A, due), revived, and dereferenced again with a
+/// fresh grace window (row B, not yet due) must not be deleted by row A: row
+/// B's later window governs, so A retires without touching S3.
+#[tokio::test]
+async fn superseded_outbox_row_does_not_cut_the_newer_grace_short() {
+    let _test_guard = OUTBOX_TEST_LOCK.lock().await;
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+
+    let content = format!("superseded-grace-{}", common::unique()).into_bytes();
+    let stored = cas.store(Cursor::new(content), MAX).await.unwrap();
+    let sha = stored.sha256.clone();
+    let mut tx = pool.begin().await.unwrap();
+    forge_db::blob_dao::commit_ingest_and_incref(&mut tx, &sha, stored.ingest_token)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Row A: immediately due.
+    let mut tx = pool.begin().await.unwrap();
+    forge_db::blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &sha, Duration::seconds(0))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let row_a: i64 = sqlx::query_scalar(
+        "SELECT id FROM blob_outbox WHERE sha256 = $1 AND processed_at IS NULL ORDER BY id",
+    )
+    .bind(&sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Revive, then dereference again with a long grace (row B).
+    sqlx::query("UPDATE blob SET ref_count = ref_count + 1 WHERE sha256 = $1")
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    forge_db::blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &sha, Duration::hours(1))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let outcome = forge_db::blob_dao::reserve_outbox_row_delete(
+        &pool,
+        row_a,
+        &sha,
+        Utc::now() - Duration::minutes(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        forge_db::blob_dao::ReserveDeleteOutcome::Referenced
+    );
+    assert!(store.head(&stored.s3_key).await.unwrap(), "object kept");
+
+    // Clean up the test's rows/object.
+    sqlx::query("UPDATE blob_outbox SET processed_at = now() WHERE sha256 = $1")
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.delete(&stored.s3_key).await.unwrap();
+}

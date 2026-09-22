@@ -47,8 +47,15 @@ pub struct RedisL2 {
 
 impl RedisL2 {
     /// Establish the connection manager from an already-opened client.
-    pub async fn connect(client: redis::Client) -> Result<Self, redis::RedisError> {
-        let conn = ConnectionManager::new(client).await?;
+    ///
+    /// Every command is bounded by `timeouts`: a partitioned (blackholed)
+    /// Redis then fails fast into the cache's degrade-to-factory path instead
+    /// of hanging every cached read.
+    pub async fn connect(
+        client: redis::Client,
+        timeouts: crate::RedisTimeouts,
+    ) -> Result<Self, redis::RedisError> {
+        let conn = ConnectionManager::new_with_config(client, timeouts.manager_config()).await?;
         Ok(RedisL2 { conn })
     }
 

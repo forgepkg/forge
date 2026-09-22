@@ -137,14 +137,30 @@ impl RetentionWorker {
             return Ok(None);
         };
 
-        match self.process(&repo, run_id).await {
+        // Keep the lease alive while this (possibly long) run works, so a
+        // large repository is never re-claimed by another instance mid-run.
+        let heartbeat = spawn_lease_heartbeat(
+            self.pool.clone(),
+            repo.repository_id,
+            run_id,
+            self.config.lease,
+        );
+        let result = self.process(&repo, run_id).await;
+        heartbeat.abort();
+
+        match result {
             Ok(summary) => Ok(Some(summary)),
             Err(e) => {
                 // Release the lease, record the error, reschedule.
                 let next = Utc::now() + self.config.default_run_interval;
-                if let Err(e2) =
-                    retention_dao::fail_run(&self.pool, repo.repository_id, &e.to_string(), next)
-                        .await
+                if let Err(e2) = retention_dao::fail_run(
+                    &self.pool,
+                    repo.repository_id,
+                    Some(run_id),
+                    &e.to_string(),
+                    next,
+                )
+                .await
                 {
                     tracing::error!(error = %e2, repo = %repo.name, "failed to record retention run failure");
                 }
@@ -178,6 +194,7 @@ impl RetentionWorker {
             retention_dao::finish_run(
                 &self.pool,
                 repo.repository_id,
+                Some(run_id),
                 &RunSummary::default(),
                 next_run_at,
             )
@@ -237,11 +254,22 @@ impl RetentionWorker {
             run_id,
             delete_grace: self.config.delete_grace,
             dry_run: policy.dry_run_only,
+            evaluated_at: Some(now),
         };
         let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
 
         // ── Finish: record summary, advance schedule, clear lease. ──
-        retention_dao::finish_run(&self.pool, repo.repository_id, &summary, next_run_at).await?;
+        if !retention_dao::finish_run(
+            &self.pool,
+            repo.repository_id,
+            Some(run_id),
+            &summary,
+            next_run_at,
+        )
+        .await?
+        {
+            tracing::warn!(repo = %repo.name, %run_id, "retention lease lost before the run finished; another instance owns the schedule");
+        }
         // Advisory marker on the repository row (the ledger is authoritative).
         if let Err(e) = retention_dao::mark_repo_last_run(&self.pool, repo.repository_id, now).await
         {
@@ -261,7 +289,12 @@ impl RetentionWorker {
     /// The next-run interval for a policy: the larger of the repo's
     /// `min_run_interval_seconds` and the global default.
     fn next_interval(&self, policy: &RetentionPolicy) -> Duration {
-        let per_repo = Duration::seconds(policy.min_run_interval_seconds as i64);
+        // Clamped defensively: validation already bounds the policy value, and
+        // an out-of-range interval must never panic the worker loop.
+        let secs = policy
+            .min_run_interval_seconds
+            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
+        let per_repo = Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
         per_repo.max(self.config.default_run_interval)
     }
 
@@ -294,6 +327,39 @@ impl RetentionWorker {
             }
         })
     }
+}
+
+/// Renew the run's lease every third of its length until aborted; stops on
+/// its own once the lease is lost.
+fn spawn_lease_heartbeat(
+    pool: PgPool,
+    repository_id: i64,
+    run_id: uuid::Uuid,
+    lease: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let every = (lease / 3)
+        .to_std()
+        .unwrap_or_default()
+        .max(std::time::Duration::from_secs(1));
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(every);
+        ticker.tick().await; // the first tick completes immediately
+        loop {
+            ticker.tick().await;
+            match retention_dao::renew_run_lease(&pool, repository_id, run_id, Utc::now() + lease)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(repository_id, %run_id, "retention lease lost; heartbeat stopped");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, repository_id, "retention lease renewal failed")
+                }
+            }
+        }
+    })
 }
 
 /// Errors a retention tick can surface (logged; the loop continues).

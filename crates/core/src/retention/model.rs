@@ -218,7 +218,17 @@ pub enum PolicyError {
     /// Retention was configured on a group repository (groups own no content).
     #[error("retention policies are not supported on group repositories")]
     GroupRepoUnsupported,
+    /// `min_run_interval_seconds` exceeded [`MAX_MIN_RUN_INTERVAL_SECONDS`].
+    #[error("min_run_interval_seconds must be at most {max} (one year)")]
+    RunIntervalTooLarge {
+        /// The upper bound.
+        max: u64,
+    },
 }
+
+/// Upper bound on a policy's `min_run_interval_seconds` (one year). Larger
+/// values are meaningless and would overflow the scheduler's date arithmetic.
+pub const MAX_MIN_RUN_INTERVAL_SECONDS: u64 = 366 * 24 * 60 * 60;
 
 /// Validate a policy against the repository kind it will attach to.
 ///
@@ -238,6 +248,11 @@ pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<
     }
     if policy.rules.is_empty() {
         return Err(PolicyError::EmptyRules);
+    }
+    if policy.min_run_interval_seconds > MAX_MIN_RUN_INTERVAL_SECONDS {
+        return Err(PolicyError::RunIntervalTooLarge {
+            max: MAX_MIN_RUN_INTERVAL_SECONDS,
+        });
     }
 
     let mut seen_ids: Vec<&str> = Vec::with_capacity(policy.rules.len());

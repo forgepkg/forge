@@ -243,17 +243,22 @@ where
 
 /// Finish a run: record its summary, clear the lease, set `state = 'idle'` and
 /// the next scheduled run. Accepts any executor.
+///
+/// With `run_id`, the update is **fenced** to the run that still owns the
+/// lease: a worker whose lease expired and was re-claimed by another instance
+/// cannot clear the newer owner's lease. Returns whether the row was updated.
 pub async fn finish_run<'e, E>(
     executor: E,
     repository_id: i64,
+    run_id: Option<uuid::Uuid>,
     summary: &RunSummary,
     next_run_at: DateTime<Utc>,
-) -> sqlx::Result<()>
+) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
 {
     let summary_json = serde_json::to_value(summary).unwrap_or(JsonValue::Null);
-    sqlx::query!(
+    let res = sqlx::query!(
         r#"
         UPDATE retention_run
         SET state = 'idle',
@@ -263,28 +268,31 @@ where
             next_run_at = $2,
             last_run_summary = $3
         WHERE repository_id = $1
+          AND ($4::uuid IS NULL OR current_run_id = $4)
         "#,
         repository_id,
         next_run_at,
         summary_json,
+        run_id,
     )
     .execute(executor)
     .await?;
-    // Advisory marker on the repository row (the ledger remains authoritative).
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 /// Record a run-level error and release the lease so the repo is retried.
+/// Fenced to `run_id` like [`finish_run`].
 pub async fn fail_run<'e, E>(
     executor: E,
     repository_id: i64,
+    run_id: Option<uuid::Uuid>,
     error: &str,
     next_run_at: DateTime<Utc>,
-) -> sqlx::Result<()>
+) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
 {
-    sqlx::query!(
+    let res = sqlx::query!(
         r#"
         UPDATE retention_run
         SET state = 'idle',
@@ -294,14 +302,42 @@ where
             next_run_at = $2,
             last_error = $3
         WHERE repository_id = $1
+          AND ($4::uuid IS NULL OR current_run_id = $4)
         "#,
         repository_id,
         next_run_at,
         error,
+        run_id,
     )
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
+}
+
+/// Extend the lease of the run `run_id` to `locked_until`. Returns `false`
+/// when that run no longer owns the lease (expired and re-claimed).
+pub async fn renew_run_lease<'e, E>(
+    executor: E,
+    repository_id: i64,
+    run_id: uuid::Uuid,
+    locked_until: DateTime<Utc>,
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        UPDATE retention_run
+        SET locked_until = $3
+        WHERE repository_id = $1 AND current_run_id = $2 AND state = 'running'
+        "#,
+        repository_id,
+        run_id,
+        locked_until,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Bump `repository.retention_last_run_at` (advisory only). Best-effort.

@@ -52,6 +52,24 @@ pub struct ApplyContext<'a> {
     pub delete_grace: Duration,
     /// When true, evaluate + audit only; never mutate (preview / `dry_run_only`).
     pub dry_run: bool,
+    /// When the decisions were evaluated. A decision driven by a
+    /// "not downloaded / pulled for N days" trigger is skipped if the target was
+    /// downloaded after this instant (it is no longer cold). `None` disables
+    /// the re-check.
+    pub evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Whether a download-driven decision became stale: the target was fetched
+/// after the evaluation snapshot.
+fn downloaded_since(
+    ctx: &ApplyContext<'_>,
+    download_trigger: bool,
+    last_downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (ctx.evaluated_at, last_downloaded_at) {
+        (Some(evaluated), Some(downloaded)) => download_trigger && downloaded > evaluated,
+        _ => false,
+    }
 }
 
 /// Serialize a decision's reason to the audit `reason` jsonb. Falls back to an
@@ -130,7 +148,7 @@ async fn apply_hosted(
     // of the asset set is consistent with the decref.
     let locked = sqlx::query!(
         r#"
-        SELECT id, name, version
+        SELECT id, name, version, last_downloaded_at
         FROM component
         WHERE id = $1 AND repository_id = $2
         FOR UPDATE
@@ -148,6 +166,17 @@ async fn apply_hosted(
         summary.skipped += 1;
         return Ok(());
     };
+    // Downloaded while this run was working: no longer cold — skip.
+    if downloaded_since(
+        ctx,
+        d.reason.not_downloaded_for_days.is_some(),
+        row.last_downloaded_at,
+    ) {
+        audit_skipped(&mut tx, ctx, d, "component").await?;
+        tx.commit().await?;
+        summary.skipped += 1;
+        return Ok(());
+    }
 
     match d.action {
         Action::Unlist => {
@@ -295,7 +324,7 @@ async fn apply_proxy(
     // Lock the cached-version row by id; skip if it's gone.
     let cached = sqlx::query!(
         r#"
-        SELECT id, name, version
+        SELECT id, name, version, last_downloaded_at
         FROM proxy_cached_version
         WHERE id = $1 AND repository_id = $2
         FOR UPDATE
@@ -312,6 +341,17 @@ async fn apply_proxy(
         summary.skipped += 1;
         return Ok(());
     };
+    // Pulled while this run was working: no longer cold — skip.
+    if downloaded_since(
+        ctx,
+        d.reason.not_pulled_for_days.is_some(),
+        cached.last_downloaded_at,
+    ) {
+        audit_skipped_proxy(&mut tx, ctx, d).await?;
+        tx.commit().await?;
+        summary.skipped += 1;
+        return Ok(());
+    }
 
     // Delete the parallel component + its assets (decref their blobs), if any.
     let mut audit_blob: Option<String> = None;

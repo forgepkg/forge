@@ -65,10 +65,16 @@ async fn pg_endpoint() -> &'static str {
     PG_ENDPOINT.get().unwrap()
 }
 
-/// A fresh, migrated pool for the calling test, backed by the shared container.
+/// A fresh, migrated pool for the calling test, backed by the shared container
+/// — or by an external Postgres when `FORGE_TEST_DATABASE_URL` is set.
 pub async fn pool() -> PgPool {
-    let endpoint = pg_endpoint().await;
-    let url = format!("postgres://forge:forge@{endpoint}/forge");
+    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = pg_endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
@@ -94,6 +100,11 @@ async fn s3_endpoint() -> &'static str {
     let _guard = INIT_LOCK.lock().await;
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
+    }
+    // Docker-less environments point at an already-running gateway.
+    if let Ok(endpoint) = std::env::var("FORGE_TEST_S3_ENDPOINT") {
+        S3_ENDPOINT.set(endpoint).ok();
+        return S3_ENDPOINT.get().unwrap();
     }
 
     // versitygw posix backend: each subdir of the root dir is a bucket. The

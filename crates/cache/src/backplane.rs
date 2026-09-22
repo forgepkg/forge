@@ -24,8 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use redis::AsyncCommands;
 
+use crate::l1::L1;
 use crate::l2_redis::RedisL2;
-use crate::{key_tag, namespace_tag, TagVersions};
+use crate::{key_tag, namespace_tag, RedisTimeouts, TagVersions};
 
 /// The pub/sub channel shared by every cache node.
 pub const CHANNEL: &str = "forge:cache:invalidate";
@@ -57,17 +58,25 @@ impl Backplane {
     pub async fn start(
         client: redis::Client,
         l2: RedisL2,
+        l1: L1,
         tag_versions: TagVersions,
+        timeouts: RedisTimeouts,
     ) -> Result<Self, redis::RedisError> {
         let node_id = fresh_node_id();
-        let conn = redis::aio::ConnectionManager::new(client.clone()).await?;
+        let conn = redis::aio::ConnectionManager::new_with_config(
+            client.clone(),
+            timeouts.manager_config(),
+        )
+        .await?;
 
-        tokio::spawn(subscriber_loop(
+        tokio::spawn(subscriber_supervisor(
             client,
             l2,
+            l1,
             conn.clone(),
             tag_versions,
             node_id,
+            timeouts,
         ));
 
         Ok(Backplane { conn, node_id })
@@ -97,25 +106,74 @@ impl Backplane {
     }
 }
 
-async fn subscriber_loop(
+/// Keep the subscriber alive for the life of the process. Whenever the
+/// subscription drops (Redis restart, network partition) it is re-established
+/// with capped exponential backoff, and — because invalidations published in
+/// the gap were missed — the local L1 is flushed once the new subscription is
+/// live, so no stale entry outlives the outage.
+async fn subscriber_supervisor(
     client: redis::Client,
     l2: RedisL2,
+    l1: L1,
     publisher: redis::aio::ConnectionManager,
     tag_versions: TagVersions,
     node_id: u64,
+    timeouts: RedisTimeouts,
 ) {
-    let mut pubsub = match client.get_async_pubsub().await {
-        Ok(pubsub) => pubsub,
-        Err(err) => {
-            tracing::error!(error = %err, "backplane subscriber could not open pubsub connection; exiting");
-            return;
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(250);
+    let mut first = true;
+    loop {
+        match subscribe(&client, timeouts).await {
+            Ok(pubsub) => {
+                if !first {
+                    l1.invalidate_all();
+                    tracing::info!("backplane resubscribed; flushed L1 to drop entries whose invalidations were missed");
+                }
+                first = false;
+                backoff = std::time::Duration::from_millis(250);
+                subscriber_loop(pubsub, &l2, &publisher, &tag_versions, node_id).await;
+                // The stream ended: from here until resubscribed, peers'
+                // invalidations are not seen — flush eagerly too.
+                l1.invalidate_all();
+                tracing::warn!("backplane subscriber stream ended; reconnecting");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, retry_in = ?backoff, "backplane subscribe failed; retrying");
+            }
         }
-    };
-    if let Err(err) = pubsub.subscribe(CHANNEL).await {
-        tracing::error!(error = %err, channel = CHANNEL, "backplane subscribe failed; exiting");
-        return;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+}
 
+async fn subscribe(
+    client: &redis::Client,
+    timeouts: RedisTimeouts,
+) -> Result<redis::aio::PubSub, redis::RedisError> {
+    let timed_out = || {
+        redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "backplane subscribe timed out",
+        ))
+    };
+    let deadline = timeouts.connect + timeouts.response;
+    let mut pubsub = tokio::time::timeout(deadline, client.get_async_pubsub())
+        .await
+        .map_err(|_| timed_out())??;
+    tokio::time::timeout(deadline, pubsub.subscribe(CHANNEL))
+        .await
+        .map_err(|_| timed_out())??;
+    Ok(pubsub)
+}
+
+async fn subscriber_loop(
+    mut pubsub: redis::aio::PubSub,
+    l2: &RedisL2,
+    publisher: &redis::aio::ConnectionManager,
+    tag_versions: &TagVersions,
+    node_id: u64,
+) {
     use futures_util::StreamExt;
     let mut tag_capable_origins = HashSet::new();
     let mut stream = pubsub.on_message();
@@ -128,17 +186,15 @@ async fn subscriber_loop(
             }
         };
         apply_message(
-            &l2,
-            &publisher,
-            &tag_versions,
+            l2,
+            publisher,
+            tag_versions,
             &mut tag_capable_origins,
             node_id,
             &payload,
         )
         .await;
     }
-
-    tracing::warn!("backplane subscriber stream ended; cross-node invalidation now relies on TTL");
 }
 
 async fn apply_message(

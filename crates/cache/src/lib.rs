@@ -122,6 +122,33 @@ impl StoredEntry {
     }
 }
 
+/// Bounds on every Redis interaction. The defaults suit a cache: a
+/// round-trip that takes longer than this is treated as a miss / failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedisTimeouts {
+    /// TCP connect (and reconnect) deadline.
+    pub connect: Duration,
+    /// Per-command response deadline.
+    pub response: Duration,
+}
+
+impl Default for RedisTimeouts {
+    fn default() -> Self {
+        RedisTimeouts {
+            connect: Duration::from_secs(2),
+            response: Duration::from_secs(2),
+        }
+    }
+}
+
+impl RedisTimeouts {
+    pub(crate) fn manager_config(&self) -> redis::aio::ConnectionManagerConfig {
+        redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(self.connect)
+            .set_response_timeout(self.response)
+    }
+}
+
 /// Locally observed tag generations. Redis is authoritative when configured;
 /// pub/sub eagerly advances this map so L1 lookups need no Redis round-trip.
 #[derive(Clone, Default)]
@@ -240,16 +267,33 @@ impl Cache {
     }
 
     /// Build a cache backed by Redis L2 **and** a pub/sub invalidation
-    /// backplane. Spawns a subscriber that advances local tag barriers when
-    /// another node publishes an invalidation.
+    /// backplane, with the default [`RedisTimeouts`]. Spawns a subscriber that
+    /// advances local tag barriers when another node publishes an
+    /// invalidation.
     pub async fn with_redis(l1_max_capacity: u64, redis_url: &str) -> Result<Self, CacheError> {
+        Self::with_redis_timeouts(l1_max_capacity, redis_url, RedisTimeouts::default()).await
+    }
+
+    /// Like [`Cache::with_redis`] with explicit Redis timeouts.
+    pub async fn with_redis_timeouts(
+        l1_max_capacity: u64,
+        redis_url: &str,
+        timeouts: RedisTimeouts,
+    ) -> Result<Self, CacheError> {
         let l1 = L1::new(l1_max_capacity);
         let namespace_locks = NamespaceLocks::default();
         let tag_versions = TagVersions::default();
         let client = redis::Client::open(redis_url)?;
 
-        let l2 = RedisL2::connect(client.clone()).await?;
-        let backplane = Backplane::start(client, l2.clone(), tag_versions.clone()).await?;
+        let l2 = RedisL2::connect(client.clone(), timeouts).await?;
+        let backplane = Backplane::start(
+            client,
+            l2.clone(),
+            l1.clone(),
+            tag_versions.clone(),
+            timeouts,
+        )
+        .await?;
 
         Ok(Cache {
             inner: Arc::new(Inner {

@@ -269,8 +269,13 @@ impl Default for ServerOpts {
 /// Start a server with the given options against the shared containers, sharing
 /// `pool` (so a caller can run two instances against one DB for scale-out).
 pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
-    let endpoint = pg_endpoint().await;
-    let db_url = format!("postgres://forge:forge@{endpoint}/forge");
+    let db_url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            let endpoint = pg_endpoint().await;
+            format!("postgres://forge:forge@{endpoint}/forge")
+        }
+    };
     let store = blob_store().await;
     let s3 = s3_endpoint().await;
 
@@ -417,6 +422,12 @@ impl TestServer {
 /// Build a minimal valid `.nupkg` (a zip with `[Content_Types].xml` + a
 /// `{id}.nuspec`) that parses to `id@version`.
 pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
+    make_nupkg_with_payload(id, version, 0)
+}
+
+/// Like [`make_nupkg`], plus an incompressible `lib/net8.0/payload.bin` of
+/// `payload_len` bytes stored uncompressed — for size-limit tests.
+pub fn make_nupkg_with_payload(id: &str, version: &str, payload_len: usize) -> Vec<u8> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -444,5 +455,22 @@ pub fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
     zw.write_all(content_types.as_bytes()).unwrap();
     zw.start_file(format!("{id}.nuspec"), opts).unwrap();
     zw.write_all(nuspec.as_bytes()).unwrap();
+    if payload_len > 0 {
+        let stored = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(payload_len as u64 >= u32::MAX as u64);
+        zw.start_file("lib/net8.0/payload.bin", stored).unwrap();
+        // xorshift: cheap, deterministic, incompressible enough.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut buf = Vec::with_capacity(payload_len);
+        while buf.len() < payload_len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        buf.truncate(payload_len);
+        zw.write_all(&buf).unwrap();
+    }
     zw.finish().unwrap().into_inner()
 }

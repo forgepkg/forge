@@ -192,7 +192,7 @@ async fn finished_run_advances_next_run_and_goes_idle() {
         blobs_enqueued: 2,
         ..Default::default()
     };
-    retention_dao::finish_run(&pool, repo_id, &summary, next)
+    retention_dao::finish_run(&pool, repo_id, None, &summary, next)
         .await
         .expect("finish");
 
@@ -223,6 +223,7 @@ async fn running_repo_is_not_claimed_until_due_and_idle() {
     retention_dao::finish_run(
         &pool,
         repo_id,
+        None,
         &RunSummary::default(),
         now + Duration::seconds(3600),
     )
@@ -416,6 +417,7 @@ async fn schedule_now_makes_repo_immediately_due() {
     retention_dao::finish_run(
         &pool,
         repo_id,
+        None,
         &RunSummary::default(),
         now + Duration::seconds(99999),
     )
@@ -435,4 +437,70 @@ async fn schedule_now_makes_repo_immediately_due() {
     .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(claimed.unwrap().0.repository_id, repo_id);
+}
+
+/// finish/fail are fenced to the run that owns the lease; the heartbeat can
+/// only renew its own run.
+#[tokio::test]
+async fn run_completion_and_renewal_are_fenced_to_the_lease_owner() {
+    let pool = common::pool().await;
+    let repo_id = armed_hosted_repo(&pool, common::unique()).await;
+    let now = Utc::now();
+
+    let mut tx = pool.begin().await.unwrap();
+    let (_, run_id) =
+        retention_dao::claim_next_due_repo(&mut tx, now, Duration::seconds(60), Some(repo_id))
+            .await
+            .unwrap()
+            .unwrap();
+    tx.commit().await.unwrap();
+
+    let stranger = uuid::Uuid::new_v4();
+    assert!(!retention_dao::renew_run_lease(
+        &pool,
+        repo_id,
+        stranger,
+        now + Duration::seconds(120)
+    )
+    .await
+    .unwrap());
+    assert!(
+        retention_dao::renew_run_lease(&pool, repo_id, run_id, now + Duration::seconds(120))
+            .await
+            .unwrap()
+    );
+    assert!(!retention_dao::finish_run(
+        &pool,
+        repo_id,
+        Some(stranger),
+        &RunSummary::default(),
+        now + Duration::seconds(3600),
+    )
+    .await
+    .unwrap());
+    assert!(
+        !retention_dao::fail_run(&pool, repo_id, Some(stranger), "x", now)
+            .await
+            .unwrap()
+    );
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, "running", "a stale owner cannot clear the lease");
+
+    assert!(retention_dao::finish_run(
+        &pool,
+        repo_id,
+        Some(run_id),
+        &RunSummary::default(),
+        now + Duration::seconds(3600),
+    )
+    .await
+    .unwrap());
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, "idle");
 }
