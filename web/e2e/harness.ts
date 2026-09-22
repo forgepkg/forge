@@ -132,6 +132,8 @@ function startServer() {
     // server
     FORGE_SERVER__BIND: `127.0.0.1:${SERVER_PORT}`,
     FORGE_SERVER__PUBLIC_BASE_URL: BASE_URL,
+    // The e2e bootstrap admin uses the placeholder password (dev stack only).
+    FORGE_SERVER__ALLOW_INSECURE_DEFAULTS: 'true',
     // auth: anonymous reads on so the Browse screen works without a token, and
     // password basic on so the bootstrap admin can mint a token.
     FORGE_AUTH__ANONYMOUS_MODE: 'all',

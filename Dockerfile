@@ -91,15 +91,17 @@ COPY --from=web /web/dist /app/web/dist
 # can inspect/run them out-of-band, and to keep the layout self-documenting.
 COPY migrations /app/migrations
 # A baked, secret-free base config. Real secrets come from FORGE_* env at runtime
-# and override these values (FORGE_DATABASE__URL, FORGE_S3__*). The bootstrap
-# admin password MUST be changed via FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD.
+# and override these values (FORGE_DATABASE__URL, FORGE_S3__*). Its placeholder
+# credentials (minioadmin, bootstrap admin/changeme) are REFUSED at startup
+# unless overridden (or FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true for local dev).
 COPY docker/forge.docker.toml /app/forge.toml
 
 USER forge
 
 # ── Runtime configuration (FORGE_* override the baked forge.toml) ─────────────
 # Baked defaults (see docker/forge.docker.toml): bind 0.0.0.0:8421, SPA at
-# /app/web/dist, anonymous_mode=all, allow_password_basic, bootstrap admin.
+# /app/web/dist, anonymous_mode=off, allow_password_basic, bootstrap admin
+# (placeholder password — must be overridden).
 ENV FORGE_CONFIG=/app/forge.toml \
     FORGE_WEB__ASSETS_DIR=/app/web/dist \
     RUST_LOG=info
@@ -110,9 +112,11 @@ ENV FORGE_CONFIG=/app/forge.toml \
 #   FORGE_S3__BUCKET             forge
 #   FORGE_S3__ACCESS_KEY         <s3 access key>
 #   FORGE_S3__SECRET_KEY         <s3 secret key>
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   <a real password>
 # Strongly recommended:
 #   FORGE_SERVER__PUBLIC_BASE_URL   https://forge.example.com (for absolute @id URLs)
-#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   <change me>
+# Local dev only (accept the placeholder credentials):
+#   FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true
 EXPOSE 8421
 
 ENTRYPOINT ["/usr/local/bin/forge-server"]

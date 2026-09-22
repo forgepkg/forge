@@ -70,6 +70,13 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
+    /// Permit starting with **known-insecure placeholder credentials** (the
+    /// `changeme` / empty bootstrap-admin password, `minioadmin` S3 keys).
+    /// Default `false`: such a config refuses to start, so a copied dev config
+    /// or the image's baked defaults never reach production unnoticed. Set
+    /// `true` only for local development / compose stacks.
+    #[serde(default)]
+    pub allow_insecure_defaults: bool,
 }
 
 impl ServerConfig {
@@ -988,7 +995,40 @@ impl Config {
             }
         }
         self.validate_crypto()?;
+        self.validate_insecure_defaults()?;
         Ok(())
+    }
+
+    /// Refuse known-insecure placeholder credentials unless
+    /// `server.allow_insecure_defaults` opts in (dev/compose only): a
+    /// `changeme` or empty bootstrap-admin password, or `minioadmin` S3 keys.
+    fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
+        let mut found = Vec::new();
+        if let Some(ba) = &self.auth.bootstrap_admin {
+            let pw = ba.password.trim();
+            if pw.is_empty() || pw.eq_ignore_ascii_case("changeme") {
+                found.push("auth.bootstrap_admin.password is a placeholder (\"changeme\"/empty)");
+            }
+        }
+        if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
+            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults");
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        if self.server.allow_insecure_defaults {
+            for issue in &found {
+                tracing::warn!(%issue, "starting with insecure default credentials (server.allow_insecure_defaults = true)");
+            }
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "refusing to start with insecure default credentials: {}; set real secrets \
+             (e.g. FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD, FORGE_S3__ACCESS_KEY / \
+             FORGE_S3__SECRET_KEY) or, for local development only, \
+             server.allow_insecure_defaults = true (FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true)",
+            found.join("; ")
+        )))
     }
 
     /// Validate the optional `[crypto]` section when present and enabled
@@ -1907,12 +1947,41 @@ mod tests {
     fn bootstrap_admin_parsed() {
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"s3cret-Pw!\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         let ba = cfg.auth.bootstrap_admin.expect("present");
         assert_eq!(ba.username, "admin");
-        assert_eq!(ba.password, "changeme");
+        assert_eq!(ba.password, "s3cret-Pw!");
+        assert!(!cfg.server.allow_insecure_defaults, "off by default");
+    }
+
+    #[test]
+    fn insecure_default_credentials_refused_unless_allowed() {
+        for (from, to) in [
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+            ),
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
+            ),
+            ("access_key = \"test\"", "access_key = \"minioadmin\""),
+            ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
+        ] {
+            let toml = MINIMAL.replace(from, to);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains("insecure default"), "{err}");
+
+            // The explicit dev opt-in lets it start.
+            let allowed = toml.replace(
+                "public_base_url = \"https://forge.example.com/\"",
+                "public_base_url = \"https://forge.example.com/\"\nallow_insecure_defaults = true",
+            );
+            let cfg = Config::from_figment(fig_from_toml(&allowed)).expect("dev opt-in");
+            assert!(cfg.server.allow_insecure_defaults);
+        }
     }
 
     // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────
