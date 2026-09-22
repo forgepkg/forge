@@ -394,7 +394,7 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
 }
 
 #[tokio::test]
-async fn resolve_user_links_existing_local_user_by_username() {
+async fn resolve_user_never_links_password_or_admin_account_by_username() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
@@ -417,11 +417,105 @@ async fn resolve_user_links_existing_local_user_by_username() {
     )
     .await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
+    // Default policy (no linking) and even explicit linking: never linked to a
+    // password account / admin — a fresh, suffixed user is provisioned.
+    for link in [false, true] {
+        let policy = ResolvePolicy {
+            auto_provision: true,
+            link_existing_by_username: link,
+        };
+        let user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
+            .await
+            .expect("provisioned separately");
+        assert_ne!(user.id, local.id, "never linked to the local admin");
+        assert_ne!(user.username, username);
+    }
+    let still_local = user_dao::find_user_by_id(&pool, local.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(still_local.password_hash.is_some());
+}
+
+#[tokio::test]
+async fn resolve_user_links_passwordless_non_admin_when_enabled() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let username = format!("linkable-{n}");
+
+    // A passwordless, non-admin account (e.g. provisioned by another realm).
+    let existing = user_dao::insert_user(
+        &pool,
+        NewUser {
+            username: username.clone(),
+            password_hash: None,
+            is_admin: false,
+            active: true,
+            auth_source: "upstream-basic".into(),
+            external_subject: Some(username.clone()),
+        },
+    )
+    .await
+    .expect("user");
+
+    let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+
+    // Default policy: not linked.
+    let default = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect("provision");
+    assert_ne!(default.id, existing.id, "linking by username is opt-in");
+
+    let validated2 = run_login(&pool, &idp, &format!("sub2-{n}"), &username, json!([])).await;
+    let mapped2 = map_claims(&validated2.claims, &admin_mapping());
+    let linked = oidc::resolve_user(
+        &pool,
+        &validated2,
+        &mapped2,
+        &ResolvePolicy {
+            auto_provision: true,
+            link_existing_by_username: true,
+        },
+    )
+    .await
+    .expect("link");
+    assert_eq!(
+        linked.id, existing.id,
+        "explicit opt-in links the safe target"
+    );
+}
+
+#[tokio::test]
+async fn resolve_user_demotion_removes_admin_role() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let sub = format!("sub-demote-{n}");
+    let username = format!("demote-{n}");
+
+    let validated = run_login(&pool, &idp, &sub, &username, json!(["forge-admins"])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
     let user = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
         .await
-        .expect("link");
-    assert_eq!(user.id, local.id, "linked to the existing local user");
-    assert!(user.is_admin);
+        .expect("provision");
+    assert!(forge_db::authz_dao::user_has_role(&pool, user.id, "admin")
+        .await
+        .unwrap());
+
+    let validated2 = run_login(&pool, &idp, &sub, &username, json!(["user"])).await;
+    let mapped2 = map_claims(&validated2.claims, &admin_mapping());
+    let user2 = oidc::resolve_user(&pool, &validated2, &mapped2, &ResolvePolicy::default())
+        .await
+        .expect("relogin");
+    assert!(!user2.is_admin);
+    assert!(
+        !forge_db::authz_dao::user_has_role(&pool, user2.id, "admin")
+            .await
+            .unwrap(),
+        "demotion removes the admin role, not just the column"
+    );
 }
 
 #[tokio::test]
@@ -460,20 +554,24 @@ async fn resolve_user_rejects_inactive_linked_user() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
+    let sub = format!("sub-{n}");
     let username = format!("disabled-{n}");
 
-    // A local user that is deactivated; linking-by-username finds it, then the
-    // active check rejects the login.
-    user_dao::insert_user(
-        &pool,
-        NewUser::local(username.clone(), "x".into(), false, false),
-    )
-    .await
-    .expect("inactive user");
-
-    let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
+    // Provision via a first login, then deactivate the account locally; the
+    // (issuer, subject) link finds it and the active check rejects the login.
+    let validated = run_login(&pool, &idp, &sub, &username, json!([])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
-    let res = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default()).await;
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect("provision");
+    sqlx::query("UPDATE app_user SET active = false WHERE id = $1")
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .expect("deactivate");
+
+    let validated2 = run_login(&pool, &idp, &sub, &username, json!([])).await;
+    let res = oidc::resolve_user(&pool, &validated2, &mapped, &ResolvePolicy::default()).await;
     assert!(
         matches!(res, Err(oidc::ResolveError::Inactive)),
         "got {res:?}"

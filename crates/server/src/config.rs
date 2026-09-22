@@ -653,11 +653,11 @@ pub struct OidcConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local `app_user` whose `username`
-    /// matches the resolved username claim (bootstrap-admin interplay). Risky if
-    /// the username claim is attacker-influenced — set `false` in hardened
-    /// deployments.
-    #[serde(default = "default_true")]
+    /// Link a new OIDC identity to an existing `app_user` whose `username`
+    /// matches the resolved username claim. Off by default (the claim is
+    /// IdP-controlled); even when on, accounts with a local password or admin
+    /// rights are never linked by name.
+    #[serde(default)]
     pub link_existing_by_username: bool,
 
     // ---- admin assignment ----
@@ -1623,7 +1623,10 @@ mod tests {
         assert_eq!(oidc.email_claim, "email");
         assert_eq!(oidc.display_name_claim, "name");
         assert!(oidc.auto_provision);
-        assert!(oidc.link_existing_by_username);
+        assert!(
+            !oidc.link_existing_by_username,
+            "linking by username is opt-in"
+        );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
         assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);

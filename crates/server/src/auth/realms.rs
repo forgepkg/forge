@@ -153,8 +153,9 @@ pub struct OidcRealmConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
-    /// Link an OIDC identity to an existing local user by username.
-    #[serde(default = "default_true")]
+    /// Link a new OIDC identity to an existing user by username. Off by
+    /// default; password accounts and admins are never linked by name.
+    #[serde(default)]
     pub link_existing_by_username: bool,
     /// Group/role values that grant `is_admin` (empty ⇒ never).
     #[serde(default)]

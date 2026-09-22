@@ -251,6 +251,11 @@ async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQu
             return (StatusCode::FORBIDDEN, "login not permitted").into_response();
         }
     };
+    if mapped.admin_managed {
+        // The login may have granted/revoked the admin role: drop the cached
+        // effective set so the new session sees it immediately.
+        forge_core::authz::invalidate_user(&state.cache, user.id).await;
+    }
 
     // Create a fresh session (login always mints a new row — fixation-proof).
     let issued = match rt.sessions.create_for_user(user.id, None, None).await {
