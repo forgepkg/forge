@@ -52,10 +52,10 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
             pool.clone(),
         )),
         Box::new(TokenHeaderSource::new(pool.clone())),
-        Box::new(BasicAuthSource::with_source(
-            pool.clone(),
-            state.realms.clone(),
-        )),
+        Box::new(
+            BasicAuthSource::with_source(pool.clone(), state.realms.clone())
+                .with_throttle(state.login_throttle.clone()),
+        ),
         Box::new(SessionCookieSource::new(
             state.sessions.clone(),
             pool.clone(),

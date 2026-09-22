@@ -210,6 +210,23 @@ pub struct AuthConfig {
     /// window. Keep small — the rebuild is two cheap queries.
     #[serde(default = "default_realm_cache_ttl")]
     pub realm_cache_ttl_seconds: u64,
+    /// Failed password attempts allowed per `(client IP, username)` within
+    /// [`Self::login_failure_window_seconds`] before further attempts are
+    /// refused until the window lapses (browser login and Basic password auth;
+    /// per instance, in memory). `0` disables the lockout.
+    #[serde(default = "default_login_max_failures")]
+    pub login_max_failures: u32,
+    /// Length (seconds) of the password-failure window / lockout.
+    #[serde(default = "default_login_failure_window")]
+    pub login_failure_window_seconds: u64,
+}
+
+fn default_login_max_failures() -> u32 {
+    10
+}
+
+fn default_login_failure_window() -> u64 {
+    300
 }
 
 fn default_login_mode() -> String {

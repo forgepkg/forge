@@ -643,6 +643,16 @@ async fn password_login(
     }
 
     let client_ip = login_client_ip(&state, connect, &headers);
+    // Too many recent failures for this (IP, username): refuse before running
+    // the chain (no argon2 work, nothing forwarded upstream).
+    if state.login_throttle.is_locked(client_ip, &body.username) {
+        tracing::warn!(username = %body.username, ip = %client_ip, "password login throttled");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-in attempts; try again later",
+        )
+            .into_response();
+    }
     let cred = PasswordCredential {
         username: &body.username,
         password: &body.password,
@@ -651,20 +661,40 @@ async fn password_login(
     let identity = match chain.authenticate(&cred).await {
         ChainOutcome::Authenticated { identity, .. } => identity,
         // Uniform wire response for rejected / outage / unknown (fail-closed;
-        // upstream health goes to logs, not to the caller).
-        ChainOutcome::Rejected | ChainOutcome::Unavailable | ChainOutcome::NoCredentials => {
+        // upstream health goes to logs, not to the caller). An outage is not
+        // the caller's fault and does not count towards the lockout.
+        ChainOutcome::Unavailable => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
+            state
+                .login_throttle
+                .record_failure(client_ip, &body.username);
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
     };
 
     let principal = match provision_and_map(&state.pool, &identity).await {
         Ok(Some(p)) => p,
-        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
+        Ok(None) => {
+            state
+                .login_throttle
+                .record_failure(client_ip, &body.username);
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    state
+        .login_throttle
+        .record_success(client_ip, &body.username);
+    if identity.admin_authoritative {
+        // The upstream may just have granted/revoked admin: drop the cached
+        // effective set so the new session sees it immediately.
+        forge_core::authz::invalidate_user(&state.cache, principal.user_id).await;
+    }
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
     let issued = match state

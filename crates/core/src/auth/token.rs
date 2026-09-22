@@ -26,6 +26,7 @@ use subtle::ConstantTimeEq;
 
 use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
 use super::local_password::LocalPasswordProvider;
+use super::login_throttle::LoginThrottle;
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
 
@@ -242,6 +243,10 @@ pub struct BasicAuthSource {
     /// `auth_realm` table. `password_chain() == None` reproduces slice-1
     /// `allow_password_basic = false` (password path disabled).
     chain: Arc<dyn ChainSource>,
+    /// Password-failure lockout per `(client IP, username)`, shared with the
+    /// browser login endpoint. Disabled unless wired via
+    /// [`BasicAuthSource::with_throttle`].
+    throttle: Arc<LoginThrottle>,
 }
 
 impl BasicAuthSource {
@@ -275,7 +280,18 @@ impl BasicAuthSource {
     /// Build a source whose chain is re-resolved per attempt (12.7: the
     /// realm-driven server wiring hands in its snapshot-cached source).
     pub fn with_source(pool: PgPool, chain: Arc<dyn ChainSource>) -> Self {
-        Self { pool, chain }
+        Self {
+            pool,
+            chain,
+            throttle: Arc::new(LoginThrottle::disabled()),
+        }
+    }
+
+    /// Enforce a password-failure lockout on the password path (the token
+    /// path is never throttled: token secrets are high-entropy).
+    pub fn with_throttle(mut self, throttle: Arc<LoginThrottle>) -> Self {
+        self.throttle = throttle;
+        self
     }
 }
 
@@ -323,6 +339,12 @@ impl PrincipalSource for BasicAuthSource {
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
         if let Some(chain) = self.chain.password_chain().await {
+            // Too many recent failures for this (IP, username): refuse without
+            // running the chain (no argon2 work, nothing forwarded upstream).
+            if self.throttle.is_locked(peer_ip, &username) {
+                tracing::warn!(%username, ip = %peer_ip, "basic password auth throttled");
+                return SourceOutcome::Invalid;
+            }
             let cred = PasswordCredential {
                 username: &username,
                 password: &secret,
@@ -335,32 +357,42 @@ impl PrincipalSource for BasicAuthSource {
                     // when configured (phase 5).
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
-                            return SourceOutcome::Authenticated(Principal::from_user(up))
+                            self.throttle.record_success(peer_ip, &username);
+                            return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
                         // Vouched-for but no (active) app_user row, or a DB
                         // error during mapping: fail closed. Basic creds were
                         // presented, so this is an attempted-but-failed login
                         // (Invalid → 401), never a downgrade to anonymous.
-                        Ok(None) => return SourceOutcome::Invalid,
+                        Ok(None) => {
+                            self.throttle.record_failure(peer_ip, &username);
+                            return SourceOutcome::Invalid;
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
                             return SourceOutcome::Invalid;
                         }
                     }
                 }
-                // A definitive rejection (wrong local password) or a fail-closed
-                // outage both mean: credentials were presented and not accepted.
-                // Slice 1 mapped a failed password verify to Invalid (→ 401);
-                // we preserve that for Rejected and Unavailable.
-                ChainOutcome::Rejected | ChainOutcome::Unavailable => {
-                    return SourceOutcome::Invalid
+                // A definitive rejection (wrong local password) means:
+                // credentials were presented and not accepted. Slice 1 mapped a
+                // failed password verify to Invalid (→ 401); we preserve that.
+                ChainOutcome::Rejected => {
+                    self.throttle.record_failure(peer_ip, &username);
+                    return SourceOutcome::Invalid;
                 }
+                // A fail-closed outage also denies, but is not the caller's
+                // fault, so it does not count towards the lockout.
+                ChainOutcome::Unavailable => return SourceOutcome::Invalid,
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still
                 // an attempted-but-invalid login — exactly slice 1, where an
                 // unknown username made `verify_password` return `None` and the
                 // basic source fell through to `Invalid`.
-                ChainOutcome::NoCredentials => return SourceOutcome::Invalid,
+                ChainOutcome::NoCredentials => {
+                    self.throttle.record_failure(peer_ip, &username);
+                    return SourceOutcome::Invalid;
+                }
             }
         }
         SourceOutcome::Invalid
