@@ -497,15 +497,26 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    // Reflect the live user row (admin grant/revoke, deactivation).
+    // Reflect the live user row (deactivation) and the effective RBAC admin
+    // verdict (admin role or legacy flag), not the raw column.
     match user_dao::find_user_by_id(&state.pool, session.user_id).await {
-        Ok(Some(u)) if u.active => Json(AuthMe {
-            user_id: u.id,
-            username: u.username,
-            is_admin: u.is_admin,
-            csrf_token: session.csrf_secret,
-        })
-        .into_response(),
+        Ok(Some(u)) if u.active => {
+            let is_admin = state
+                .authz
+                .is_global_admin(&forge_core::auth::Principal::User {
+                    user_id: u.id,
+                    token_id: None,
+                    is_admin: u.is_admin,
+                })
+                .await;
+            Json(AuthMe {
+                user_id: u.id,
+                username: u.username,
+                is_admin,
+                csrf_token: session.csrf_secret,
+            })
+            .into_response()
+        }
         Ok(_) => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth/me user lookup failed");
@@ -759,7 +770,10 @@ async fn password_login(
         Json(AuthMe {
             user_id: principal.user_id,
             username: body.username.clone(),
-            is_admin: principal.is_admin,
+            is_admin: state
+                .authz
+                .is_global_admin(&forge_core::auth::Principal::from_user(principal))
+                .await,
             csrf_token: issued.session.csrf_secret.clone(),
         }),
     )
