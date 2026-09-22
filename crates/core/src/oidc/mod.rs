@@ -38,8 +38,8 @@ use sqlx::PgPool;
 
 pub use claims::{map_claims, ClaimMapping, MappedClaims};
 pub use flow::{
-    begin_login, complete_login, BeginLogin, CallbackParams, ClientParams, FlowError,
-    ValidatedLogin,
+    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientParams,
+    FlowError, ValidatedLogin,
 };
 pub use jwks::{
     DiscoveryDocument, IdTokenClaims, OidcError, OidcMetadataClient, Verified, VerifyParams,

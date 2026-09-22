@@ -124,16 +124,34 @@ async fn begin_login(srv: &TestServer) -> (String, String) {
 }
 
 /// Hit `GET /auth/oidc/callback` on `srv` with the given `state`, returning the
-/// response (caller asserts status / reads the Set-Cookie).
+/// response (caller asserts status / reads the Set-Cookie). Presents the
+/// pre-auth `forge_oidc_flow` cookie the login leg sets (the same browser), so
+/// any instance can verify it without shared memory.
 async fn callback(srv: &TestServer, state: &str) -> reqwest::Response {
     no_redirect_client()
         .get(format!(
             "{}/auth/oidc/callback?code=mock-code&state={state}",
             srv.base_url
         ))
+        .header(
+            "cookie",
+            format!(
+                "forge_oidc_flow={}",
+                forge_core::oidc::browser_binding(state)
+            ),
+        )
         .send()
         .await
         .unwrap()
+}
+
+/// Whether a response set a `forge_session` cookie (the flow cookie is always
+/// cleared on the callback, so "no Set-Cookie at all" is not the signal).
+fn sets_session_cookie(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|v| v.to_str().is_ok_and(|v| v.starts_with("forge_session=")))
 }
 
 // ── 1. happy path: login → callback → session → /auth/me ─────────────────────
@@ -188,7 +206,7 @@ async fn unknown_and_replayed_state_rejected() {
     // Never-issued state → 400 (no oidc_flow row).
     let resp = callback(&srv, "never-issued-state").await;
     assert_eq!(resp.status(), 400, "unknown state rejected");
-    assert!(resp.headers().get("set-cookie").is_none());
+    assert!(!sets_session_cookie(&resp));
 
     // A once-used state cannot be replayed (the row is consumed single-use).
     let (state, nonce) = begin_login(&srv).await;
@@ -214,7 +232,7 @@ async fn nonce_mismatch_rejected() {
         .await;
     let resp = callback(&srv, &state).await;
     assert_eq!(resp.status(), 400, "nonce mismatch rejected");
-    assert!(resp.headers().get("set-cookie").is_none());
+    assert!(!sets_session_cookie(&resp));
 }
 
 // ── 3. cross-instance callback (the headline scale-out scenario) ─────────────

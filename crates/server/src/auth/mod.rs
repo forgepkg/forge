@@ -44,8 +44,8 @@ use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
-    begin_login, complete_login, map_claims, resolve_user, CallbackParams, ClaimMapping,
-    ClientParams, OidcMetadataClient, ResolvePolicy,
+    begin_login, browser_binding, complete_login, map_claims, resolve_user, CallbackParams,
+    ClaimMapping, ClientParams, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::Session;
@@ -194,7 +194,18 @@ async fn oidc_login(State(state): State<AppState>, Query(q): Query<LoginQuery>) 
     let redirect_to = sanitize_redirect_to(q.redirect_to.as_deref());
 
     match begin_login(&state.pool, &rt.meta, &rt.client, &redirect_to).await {
-        Ok(begun) => (StatusCode::FOUND, [(header::LOCATION, begun.authorize_url)]).into_response(),
+        // Bind the flow to this browser: the callback must present the cookie.
+        Ok(begun) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, begun.authorize_url),
+                (
+                    header::SET_COOKIE,
+                    set_flow_cookie_value(&browser_binding(&begun.state), rt.cookie_secure),
+                ),
+            ],
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!(error = %e, "oidc begin_login failed");
             (StatusCode::BAD_GATEWAY, "oidc login could not be started").into_response()
@@ -217,8 +228,32 @@ pub struct CallbackQuery {
 }
 
 /// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target.
-async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQuery>) -> Response {
-    let snap = match snapshot_or_resp(&state).await {
+///
+/// The browser must present the pre-auth flow cookie set by
+/// `GET /auth/oidc/login` (login-CSRF defense); it is cleared on every outcome.
+async fn oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    let flow_cookie = cookie_value(&headers, OIDC_FLOW_COOKIE).filter(|v| !v.is_empty());
+    let mut resp = oidc_callback_inner(&state, q, flow_cookie.clone()).await;
+    if flow_cookie.is_some() {
+        // Single-use: drop the pre-auth cookie whatever the outcome.
+        if let Ok(v) = clear_flow_cookie_value(state.cookie_secure).parse() {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// The callback proper; [`oidc_callback`] wraps it to clear the flow cookie.
+async fn oidc_callback_inner(
+    state: &AppState,
+    q: CallbackQuery,
+    flow_cookie: Option<String>,
+) -> Response {
+    let snap = match snapshot_or_resp(state).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -232,6 +267,7 @@ async fn oidc_callback(State(state): State<AppState>, Query(q): Query<CallbackQu
         state: q.state,
         error: q.error,
         error_description: q.error_description,
+        browser_binding: flow_cookie,
     };
 
     let validated = match complete_login(&state.pool, &rt.meta, &rt.client, &params).await {
@@ -888,6 +924,29 @@ fn clear_cookie_value(secure: bool) -> String {
     format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
 }
 
+/// Pre-auth cookie binding an OIDC flow to the browser that started it.
+const OIDC_FLOW_COOKIE: &str = "forge_oidc_flow";
+
+/// `Max-Age` of the pre-auth flow cookie (matches the flow row's 10 min TTL).
+const OIDC_FLOW_COOKIE_MAX_AGE: i64 = 600;
+
+/// Build the `Set-Cookie` value for the pre-auth flow cookie: `HttpOnly`,
+/// `SameSite=Lax` (sent on the IdP's top-level redirect back), scoped to the
+/// `/auth/oidc` paths, short-lived, and `Secure` on HTTPS deployments.
+fn set_flow_cookie_value(binding: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{OIDC_FLOW_COOKIE}={binding}; Path=/auth/oidc; HttpOnly; SameSite=Lax; \
+         Max-Age={OIDC_FLOW_COOKIE_MAX_AGE}{secure_attr}"
+    )
+}
+
+/// Build the `Set-Cookie` value that clears the pre-auth flow cookie.
+fn clear_flow_cookie_value(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{OIDC_FLOW_COOKIE}=; Path=/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +983,21 @@ mod tests {
         // Plain-HTTP deployment omits Secure (so dev over http works).
         let insecure = set_cookie_value(&issued, false);
         assert!(!insecure.contains("Secure"));
+    }
+
+    #[test]
+    fn flow_cookie_is_short_lived_http_only_and_scoped() {
+        let v = set_flow_cookie_value("bind", true);
+        assert!(v.starts_with("forge_oidc_flow=bind;"));
+        assert!(v.contains("HttpOnly"));
+        assert!(v.contains("SameSite=Lax"));
+        assert!(v.contains("Path=/auth/oidc"));
+        assert!(v.contains("Max-Age=600"));
+        assert!(v.contains("Secure"));
+        assert!(!set_flow_cookie_value("bind", false).contains("Secure"));
+        let clear = clear_flow_cookie_value(false);
+        assert!(clear.contains("forge_oidc_flow=;"));
+        assert!(clear.contains("Max-Age=0"));
     }
 
     #[test]

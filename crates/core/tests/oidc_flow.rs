@@ -255,6 +255,7 @@ async fn complete_login_happy_path_then_replay_fails() {
         &CallbackParams {
             code: Some("the-code".into()),
             state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
             ..Default::default()
         },
     )
@@ -273,6 +274,7 @@ async fn complete_login_happy_path_then_replay_fails() {
         &CallbackParams {
             code: Some("the-code".into()),
             state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
             ..Default::default()
         },
     )
@@ -310,6 +312,7 @@ async fn complete_login_rejects_nonce_mismatch() {
         &CallbackParams {
             code: Some("c".into()),
             state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
             ..Default::default()
         },
     )
@@ -331,11 +334,67 @@ async fn complete_login_unknown_state_rejected() {
         &CallbackParams {
             code: Some("c".into()),
             state: Some("never-issued-state".into()),
+            browser_binding: Some(oidc::browser_binding("never-issued-state")),
             ..Default::default()
         },
     )
     .await;
     assert!(matches!(res, Err(FlowError::UnknownState)), "got {res:?}");
+}
+
+#[tokio::test]
+async fn complete_login_rejects_other_browser_without_consuming_flow() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/")
+        .await
+        .expect("begin");
+
+    // A victim's browser lured to the attacker's callback URL carries no (or a
+    // different flow's) binding cookie: rejected before anything is consumed.
+    for binding in [None, Some(oidc::browser_binding("some-other-state"))] {
+        let res = complete_login(
+            &pool,
+            &idp.meta(),
+            &idp.client(),
+            &CallbackParams {
+                code: Some("c".into()),
+                state: Some(begun.state.clone()),
+                browser_binding: binding,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(res, Err(FlowError::BrowserMismatch)),
+            "got {res:?}"
+        );
+    }
+
+    // The legitimate browser can still complete its own flow.
+    let nonce = peek_nonce(&pool, &begun.state).await;
+    idp.mount_token_with_claims(id_claims(
+        &idp.issuer,
+        &format!("sub-{n}"),
+        &format!("bound-{n}"),
+        &nonce,
+        json!([]),
+    ))
+    .await;
+    complete_login(
+        &pool,
+        &idp.meta(),
+        &idp.client(),
+        &CallbackParams {
+            code: Some("c".into()),
+            state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("bound browser completes");
 }
 
 #[tokio::test]
@@ -703,6 +762,7 @@ async fn run_login(
         &CallbackParams {
             code: Some("code".into()),
             state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
             ..Default::default()
         },
     )
