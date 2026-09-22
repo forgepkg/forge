@@ -501,7 +501,7 @@ impl StackBuilder {
             .expect("bootstrap admin");
 
         // 12.7: one-shot import of [oidc]/[auth.upstream_basic] into realms.
-        forge_server::app::ensure_auth_realms(&config, &pool)
+        forge_server::app::ensure_auth_realms(&config, &pool, None)
             .await
             .expect("seed auth realms");
 

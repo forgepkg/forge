@@ -69,12 +69,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure legacy RBAC mapping")?;
 
-    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
-    // auth_realm rows (drift-detected); the DB is the authority.
-    ensure_auth_realms(&config, &pool)
-        .await
-        .context("ensure auth realms")?;
-
     // §12.5: secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
     // operator who configured encryption never gets a silently-plaintext
@@ -87,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("bootstrap secret encryption")?;
     }
+
+    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // auth_realm rows (drift-detected); the DB is the authority. After the
+    // crypto bootstrap so seeded realm secrets are encrypted at rest.
+    ensure_auth_realms(&config, &pool, envelope.as_deref())
+        .await
+        .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());

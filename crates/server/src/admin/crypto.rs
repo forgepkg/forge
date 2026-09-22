@@ -149,6 +149,10 @@ pub async fn rotate(State(state): State<AppState>, Path(layer): Path<String>) ->
                     Err(e) => return crypto_error(e),
                 }
             }
+            match secret_dao::reseal_realm_secrets(&state.pool, envelope).await {
+                Ok(n) => resealed += n,
+                Err(e) => return crypto_error(e),
+            }
             let revoked = match secret_dao::revoke_unreferenced_deks(&state.pool, envelope).await {
                 Ok(n) => n,
                 Err(e) => return crypto_error(e),

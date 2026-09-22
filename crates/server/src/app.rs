@@ -191,9 +191,15 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
 /// One-shot import of the legacy `[oidc]` / `[auth.upstream_basic]` config
 /// blocks into `auth_realm` rows (12.7). Delegates to
 /// [`crate::auth::seed_auth_realms`]; call on every boot — a `forge_setting`
-/// marker makes it a no-op after the first import.
-pub async fn ensure_auth_realms(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
-    crate::auth::seed_auth_realms(config, pool)
+/// marker makes it a no-op after the first import. Pass the (bootstrapped)
+/// envelope service when secret encryption is enabled so seeded realm secrets
+/// are encrypted at rest.
+pub async fn ensure_auth_realms(
+    config: &Config,
+    pool: &PgPool,
+    envelope: Option<&forge_crypto::service::EnvelopeService>,
+) -> anyhow::Result<()> {
+    crate::auth::seed_auth_realms(config, pool, envelope)
         .await
         .context("seed auth realms")
 }

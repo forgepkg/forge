@@ -156,6 +156,12 @@ impl AppState {
         mut self,
         envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     ) -> Self {
+        // Realm secrets may be encrypted too (P1.5): rebuild the (still
+        // unshared, empty) realm snapshot cache with the envelope attached.
+        self.realms = Arc::new(
+            RealmAuth::new(self.pool.clone(), self.cache.clone(), self.config.clone())
+                .with_envelope(envelope.clone()),
+        );
         self.envelope = envelope;
         self
     }
