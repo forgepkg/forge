@@ -135,6 +135,52 @@ async fn add_group_member_checked_allows_valid_nesting() {
 }
 
 #[tokio::test]
+async fn concurrent_opposite_edges_never_form_a_cycle() {
+    // P1.4: `A -> B` and `B -> A` added concurrently each look acyclic on their
+    // own; the graph lock must make exactly one of them win in the FINAL state.
+    use forge_db::repository_dao::AddMemberOutcome;
+    let pool = pool().await;
+    for round in 0..10 {
+        let n = unique();
+        let a =
+            repository_dao::insert_repository(&pool, NewRepository::group(format!("race-a-{n}")))
+                .await
+                .expect("a");
+        let b =
+            repository_dao::insert_repository(&pool, NewRepository::group(format!("race-b-{n}")))
+                .await
+                .expect("b");
+        let (p1, p2) = (pool.clone(), pool.clone());
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move {
+                repository_dao::add_group_member_checked(&p1, a.id, b.id, 10, 20).await
+            }),
+            tokio::spawn(async move {
+                repository_dao::add_group_member_checked(&p2, b.id, a.id, 10, 20).await
+            }),
+        );
+        let outcomes = [r1.unwrap().expect("a->b"), r2.unwrap().expect("b->a")];
+        let added = outcomes
+            .iter()
+            .filter(|o| **o == AddMemberOutcome::Added)
+            .count();
+        assert_eq!(
+            added, 1,
+            "round {round}: exactly one edge wins: {outcomes:?}"
+        );
+        let edges = repository_dao::group_members(&pool, a.id)
+            .await
+            .unwrap()
+            .len()
+            + repository_dao::group_members(&pool, b.id)
+                .await
+                .unwrap()
+                .len();
+        assert_eq!(edges, 1, "round {round}: no cycle persisted");
+    }
+}
+
+#[tokio::test]
 async fn add_group_member_checked_rejects_cycle() {
     use forge_db::repository_dao::AddMemberOutcome;
     let pool = pool().await;
