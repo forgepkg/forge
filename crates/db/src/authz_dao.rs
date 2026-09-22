@@ -370,6 +370,43 @@ where
     Ok(())
 }
 
+/// Make the built-in `admin` role membership of `user_id` match `is_admin`
+/// (assign when true, remove when false) — used where an external identity
+/// source is authoritative for admin (an OIDC realm with `admin_groups`, a
+/// credential-forwarding realm with an `admin_group`), so a demotion revokes
+/// the role too and not only the legacy `app_user.is_admin` column. Returns
+/// whether the membership changed (the caller invalidates the user's cached
+/// effective set). A missing built-in role is a no-op.
+pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sqlx::Result<bool> {
+    let Some(role_id) = role_id_by_name(pool, ADMIN_ROLE).await? else {
+        return Ok(false);
+    };
+    let changed = if is_admin {
+        sqlx::query!(
+            r#"
+            INSERT INTO user_role (user_id, role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, role_id) DO NOTHING
+            "#,
+            user_id,
+            role_id,
+        )
+        .execute(pool)
+        .await?
+        .rows_affected()
+    } else {
+        sqlx::query!(
+            r#"DELETE FROM user_role WHERE user_id = $1 AND role_id = $2"#,
+            user_id,
+            role_id,
+        )
+        .execute(pool)
+        .await?
+        .rows_affected()
+    };
+    Ok(changed > 0)
+}
+
 /// Insert a repository-privilege grant for a role. `repository_id = None` ⇒ ANY
 /// repo; `selector_id = None` ⇒ unscoped. Idempotent via the unique index
 /// (COALESCE-folded NULLs). Accepts any executor.

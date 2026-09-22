@@ -61,51 +61,89 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 /// (slice 12.3, phase 5).
 ///
 /// Called by the auth chain after the upstream **definitively accepts** a
-/// credential. Idempotent and **never destructive to a local account**:
+/// credential. Idempotent and **never touches a non-upstream account**:
 ///
 /// * **New username** → insert a fresh user with `auth_source = 'upstream-basic'`,
 ///   `password_hash = NULL` (no local password — the DB CHECK only requires one
-///   for `'local'` users), `external_subject = username`, `active = true`, and
-///   `is_admin = suggested_is_admin` (the upstream's admin-group mapping; grant
-///   only on first provision).
-/// * **Existing username** → only stamp `last_auth_source_at = now()` and, when
-///   `suggested_is_admin` is true, **grant** `is_admin` (never revoke it here —
-///   admin downgrade is operator-managed / §12.4). The row's `auth_source`,
-///   `password_hash`, and `external_subject` are left untouched, so an existing
-///   `'local'` admin is never downgraded to a passwordless upstream account by an
-///   upstream login (plan §2.4 / §6 username-collision note).
+///   for `'local'` users), `external_subject = username`, `active = true`,
+///   `realm_id` = the vouching realm, and `is_admin = suggested_is_admin`.
+/// * **Existing `'upstream-basic'` username** (same realm, or no realm recorded
+///   on either side) → stamp `last_auth_source_at = now()`, record the realm if
+///   none was recorded yet, and — only when `admin_authoritative` (the realm
+///   maps an admin group and the groups were freshly fetched) — set `is_admin`
+///   to the upstream's current verdict, so revocation upstream demotes here too.
+///   Without an authoritative reading the stored admin flag is left alone.
+/// * **Existing username owned by anything else** (a `'local'` or `'oidc'`
+///   account, or an upstream user of a different realm) → **no row** is
+///   returned: an upstream login must never be mapped onto (or take over) an
+///   account it did not create. The caller denies.
 ///
-/// Returns the resulting (post-provision) row. The unique constraint on
-/// `username` makes the `ON CONFLICT` path race-safe across instances.
+/// The unique constraint on `username` makes the `ON CONFLICT` path race-safe
+/// across instances.
 pub async fn provision_upstream_user(
     pool: &PgPool,
     username: &str,
     suggested_is_admin: bool,
-) -> sqlx::Result<AppUser> {
+    admin_authoritative: bool,
+    realm_id: Option<i64>,
+) -> sqlx::Result<Option<AppUser>> {
     sqlx::query_as!(
         AppUser,
         r#"
         INSERT INTO app_user
             (username, password_hash, is_admin, active, auth_source,
-             external_subject, last_auth_source_at)
-        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now())
+             external_subject, last_auth_source_at, realm_id)
+        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now(), $4)
         ON CONFLICT (username) DO UPDATE SET
-            -- Grant-only admin: never flip an existing admin off here.
-            is_admin = app_user.is_admin OR EXCLUDED.is_admin,
+            is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,
             last_auth_source_at = now(),
-            -- Touch updated_at only when the admin grant actually changes the row.
+            realm_id = COALESCE(app_user.realm_id, EXCLUDED.realm_id),
+            -- Touch updated_at only when the admin flag actually changes.
             updated_at = CASE
-                WHEN EXCLUDED.is_admin AND NOT app_user.is_admin THEN now()
+                WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()
                 ELSE app_user.updated_at
             END
+        WHERE app_user.auth_source = 'upstream-basic'
+          AND (EXCLUDED.realm_id IS NULL
+               OR app_user.realm_id IS NULL
+               OR app_user.realm_id = EXCLUDED.realm_id)
         RETURNING
             id, username, password_hash, is_admin, active,
             auth_source, external_subject, created_at, updated_at
         "#,
         username,
         suggested_is_admin,
+        admin_authoritative,
+        realm_id,
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Find the `'upstream-basic'` user an upstream realm vouched for: the username
+/// must belong to an upstream-provisioned account, and when both the vouching
+/// realm and the user's recorded realm are known they must match. Local and
+/// OIDC accounts of the same name are never returned (`None` ⇒ deny).
+pub async fn find_upstream_user(
+    pool: &PgPool,
+    username: &str,
+    realm_id: Option<i64>,
+) -> sqlx::Result<Option<AppUser>> {
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        SELECT
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
+        FROM app_user
+        WHERE username = $1
+          AND auth_source = 'upstream-basic'
+          AND ($2::bigint IS NULL OR realm_id IS NULL OR realm_id = $2)
+        "#,
+        username,
+        realm_id,
+    )
+    .fetch_optional(pool)
     .await
 }
 
