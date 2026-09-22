@@ -346,9 +346,16 @@ impl EffectiveSet {
     /// Apply a token scope, returning a **narrowed** set (never widened).
     ///
     /// Each grant is kept only if the scope permits its action AND its repo.
-    /// `admin` is preserved only if the scope permits the `admin` action (a
-    /// scoped token cannot exercise admin unless explicitly scoped to it). A
-    /// `None` scope (no scoping) returns the set unchanged.
+    /// A `None` scope (no scoping) returns the set unchanged.
+    ///
+    /// **Admin** (the allow-all short-circuit) survives only when the scope
+    /// neither restricts repositories nor excludes the `admin` action: a token
+    /// scoped to some repositories must never keep server-wide admin (it would
+    /// reach every repo and the privilege-management API). When admin is dropped,
+    /// the owner's allow-all is replaced by explicit `read` / `write` / `delete`
+    /// grants — filtered by the scope's allowed actions — on the scoped repos
+    /// (or on ANY repo for an action-only scope), so an admin's repo-scoped CI
+    /// token can still push to exactly those repos.
     ///
     /// Note: a grant for `repo == ANY` (None) is narrowed to the scope's repo
     /// allowlist when the scope restricts repos — the ANY grant is expanded into
@@ -362,6 +369,8 @@ impl EffectiveSet {
             None => true,
             Some(allowed) => allowed.contains(&a),
         };
+        // Allow-all survives only an unrestricted-repo scope that allows admin.
+        let keep_admin = self.is_admin && scope.repositories.is_none() && action_ok(Action::Admin);
 
         let mut grants = Vec::new();
         for g in &self.grants {
@@ -391,10 +400,30 @@ impl EffectiveSet {
             }
         }
 
+        if self.is_admin && !keep_admin {
+            // The owner could do anything; the token keeps the package-level
+            // verbs (never `admin`) within its scope.
+            for action in [Action::Read, Action::Write, Action::Delete] {
+                if !action_ok(action) {
+                    continue;
+                }
+                match &scope.repositories {
+                    None => grants.push(Grant {
+                        action,
+                        repo: None,
+                        selector: None,
+                    }),
+                    Some(allowed) => grants.extend(allowed.iter().map(|&repo_id| Grant {
+                        action,
+                        repo: Some(repo_id),
+                        selector: None,
+                    })),
+                }
+            }
+        }
+
         EffectiveSet {
-            // admin short-circuit survives only if the scope allows the admin
-            // action (a read-scoped token must not retain allow-all).
-            is_admin: self.is_admin && action_ok(Action::Admin),
+            is_admin: keep_admin,
             grants,
         }
     }
@@ -836,12 +865,46 @@ mod tests {
         });
         assert!(!read_only.is_admin(), "read-scoped token loses admin");
         assert!(!read_only.allows_repo(Action::Admin, 1));
+        // …but keeps the owner's (admin-implied) read everywhere.
+        assert!(read_only.allows_repo(Action::Read, 1));
+        assert!(!read_only.allows_repo(Action::Write, 1));
 
         let admin_scoped = s.intersect_scope(&TokenScope {
             actions: Some(vec![Action::Admin]),
             repositories: None,
         });
         assert!(admin_scoped.is_admin(), "admin-scoped token keeps admin");
+    }
+
+    #[test]
+    fn repo_scoped_token_never_keeps_admin() {
+        let s = set(true, &[]);
+        // Repo restriction only (actions unrestricted): admin must NOT survive.
+        let scoped = s.intersect_scope(&TokenScope {
+            actions: None,
+            repositories: Some(vec![1]),
+        });
+        assert!(!scoped.is_admin(), "repo-scoped token loses global admin");
+        assert!(!scoped.allows_repo(Action::Admin, 1));
+        // The admin's package-level reach is kept on the scoped repo only.
+        for a in [Action::Read, Action::Write, Action::Delete] {
+            assert!(scoped.allows_repo(a, 1), "{a:?} on scoped repo");
+            assert!(!scoped.allows_repo(a, 2), "{a:?} outside scope denied");
+        }
+        assert!(matches!(
+            scoped.package_filter_for(Action::Write, 1),
+            PackageFilter::AllowAll
+        ));
+
+        // Even explicitly allowing `admin` does not restore it for a repo scope.
+        let with_admin = s.intersect_scope(&TokenScope {
+            actions: Some(vec![Action::Admin, Action::Write]),
+            repositories: Some(vec![1, 3]),
+        });
+        assert!(!with_admin.is_admin());
+        assert!(with_admin.allows_repo(Action::Write, 3));
+        assert!(!with_admin.allows_repo(Action::Read, 1), "read not allowed");
+        assert!(!with_admin.allows_repo(Action::Admin, 1));
     }
 
     #[test]
