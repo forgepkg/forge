@@ -180,19 +180,30 @@ async fn second_identical_request_served_from_cache() {
 
 #[tokio::test]
 async fn ttl_expiry_triggers_a_recheck() {
-    // 1s positive TTL: the cached verdict lapses within a second.
+    // Short positive TTL, but with headroom: two debug-build round-trips take
+    // ~1s on a busy CI runner (the suite runs its stacks in parallel), so a 1s
+    // TTL could lapse before the "still cached" request lands.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(5);
     let mock = MockBasicUpstream::start(vec![(UP_USER, UP_PASS, vec![])]).await;
-    let srv = start_credforward_stack(&mock, 1, 30, &[], "").await;
+    let srv = start_credforward_stack(&mock, TTL.as_secs(), 30, &[], "").await;
 
+    // The verdict is written during this request, so it expires somewhere in
+    // (sent + TTL, answered + TTL].
+    let sent = tokio::time::Instant::now();
     assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    let answered = tokio::time::Instant::now();
     assert_eq!(mock.hits(), 1, "first request forwards");
 
     // A back-to-back request is still cached.
     assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    assert!(
+        sent.elapsed() < TTL,
+        "second request must land before the TTL could have lapsed"
+    );
     assert_eq!(mock.hits(), 1, "still cached pre-expiry");
 
     // After the TTL lapses the cached verdict is stale → re-forward.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    tokio::time::sleep_until(answered + TTL + std::time::Duration::from_millis(500)).await;
     assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
     assert_eq!(
         mock.hits(),
