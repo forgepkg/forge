@@ -12,6 +12,14 @@ members = [
     "xtask",
 ]
 
+# One version for the whole product: every crate inherits it, so a release
+# bumps it here once (and `web/package.json` to match).
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "fs", "io-util"] }

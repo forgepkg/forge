@@ -481,8 +481,8 @@ env vars (double-underscore nesting). Required at runtime (no safe default):
 | `FORGE_S3__BUCKET` | `forge` |
 | `FORGE_S3__ACCESS_KEY` | `…` |
 | `FORGE_S3__SECRET_KEY` | `…` |
-
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | a real password (the placeholder is refused) |
 
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
-URLs).
+URLs). For a production deployment (TLS, secret encryption, trusted proxies,
+backups, upgrades) follow [docs/deployment.md](docs/deployment.md).

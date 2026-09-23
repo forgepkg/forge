@@ -36,9 +36,12 @@ RUN pnpm run build
 
 
 # ── Stage 2a: cargo-chef base ─────────────────────────────────────────────────
-# Pin the Rust toolchain to match rust-toolchain.toml (stable). cargo-chef lets
+# Pin the Rust toolchain to match rust-toolchain.toml (1.95.0). cargo-chef lets
 # us cache the dependency compile separately from the workspace sources.
-FROM rust:1.95-bookworm AS chef
+FROM rust:1.95.0-bookworm AS chef
+# Use the image's preinstalled 1.95.0 as-is; the copied rust-toolchain.toml
+# would otherwise make rustup download its dev components (rustfmt, clippy).
+ENV RUSTUP_TOOLCHAIN=1.95.0
 # aws-lc-sys (transitive via aws-sdk-s3 / rustls) compiles C + asm, so the build
 # needs cmake, clang and perl in addition to the default gcc toolchain.
 RUN apt-get update \
@@ -61,13 +64,18 @@ ENV SQLX_OFFLINE=true
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo chef cook --release --recipe-path recipe.json -p forge-server
+    cargo chef cook --release --locked --recipe-path recipe.json -p forge-server
 # Now build the actual server binary. .sqlx/ and migrations/ come in with the
 # source copy (migrations/ is embedded into the binary via sqlx::migrate!).
+# `--locked`: the committed Cargo.lock is the release's dependency set.
+# FORGE_GIT_SHA is compiled in and reported by `GET /version` and the startup
+# log (`docker build --build-arg FORGE_GIT_SHA=$(git rev-parse HEAD) .`).
+ARG FORGE_GIT_SHA=unknown
+ENV FORGE_GIT_SHA=${FORGE_GIT_SHA}
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p forge-server \
+    cargo build --release --locked -p forge-server \
     && cp target/release/forge-server /usr/local/bin/forge-server
 
 
@@ -75,6 +83,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
 FROM debian:bookworm-slim AS runtime
+ARG FORGE_VERSION=0.1.0
+ARG FORGE_GIT_SHA=unknown
+LABEL org.opencontainers.image.title="envisia-forge" \
+      org.opencontainers.image.description="Self-hosted NuGet V3 registry (hosted, proxy, group)" \
+      org.opencontainers.image.version="${FORGE_VERSION}" \
+      org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -118,5 +132,7 @@ ENV FORGE_CONFIG=/app/forge.toml \
 # Local dev only (accept the placeholder credentials):
 #   FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true
 EXPOSE 8421
+# Probes (no curl in the image; point the orchestrator at them):
+#   liveness  GET /healthz   readiness  GET /readyz   build  GET /version
 
 ENTRYPOINT ["/usr/local/bin/forge-server"]

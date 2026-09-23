@@ -26,7 +26,8 @@ stages:
   - e2e
 
 default:
-  image: rust:latest
+  # Keep in lock-step with rust-toolchain.toml.
+  image: rust:1.95.0
   # A newer commit on the same MR/branch cancels a still-running pipeline.
   interruptible: true
 
@@ -193,7 +194,7 @@ web-e2e:
     - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
     - docker pull postgres:17
     - docker pull versity/versitygw:v1.4.1
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
     - . "$HOME/.cargo/env"
     - corepack enable && corepack prepare pnpm@11.5.0 --activate
   script:

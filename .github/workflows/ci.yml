@@ -17,6 +17,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Read-only token for every job; nothing in CI writes to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Used by sqlx for compile-time query verification from the cached .sqlx/ dir.
@@ -30,8 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain (with rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml) (with rustfmt)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
       - name: cargo fmt --all --check
@@ -44,8 +48,8 @@ jobs:
     needs: [fmt]
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain (with clippy)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy)
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
       - name: Cache cargo registry + build artefacts
@@ -96,8 +100,8 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
           df -h /
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.95.0
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v4
         with:
@@ -130,7 +134,27 @@ jobs:
           SQLX_OFFLINE: ""
         run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
-  # ── Frontend (TanStack Start SPA in web/) ──────────────────────────────────
+  # ── Container image (build only; releases push from release.yml) ─────────
+  # Builds the production Dockerfile on every change so a broken image is
+  # caught before a release tag, not by it.
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            FORGE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Frontend (TanStack Router SPA in web/) ─────────────────────────────────
   # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
   # output (web/dist/) is what the Rust server serves via ServeDir; building here
   # guards against TS/Vite breakage and is a prerequisite for the e2e job.
@@ -189,8 +213,8 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
           df -h /
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.95.0
       - name: Install .NET SDK (for the optional dotnet smoke test)
         uses: actions/setup-dotnet@v4
         with:
@@ -231,8 +255,8 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
           df -h /
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.95.0
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
