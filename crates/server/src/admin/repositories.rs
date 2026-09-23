@@ -179,6 +179,14 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
+    // Only NuGet is implemented; any other value would silently behave as
+    // NuGet (the format registry has a single module).
+    if body.format != "nuget" {
+        return bad_request(format!(
+            "unsupported format {:?}: only \"nuget\" is available",
+            body.format
+        ));
+    }
     let parsed_kind = RepoKind::from(kind.as_str());
 
     // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
@@ -224,28 +232,41 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         allow_redeploy: body.allow_redeploy,
     };
 
-    let repo = match repository_dao::insert_repository(&state.pool, new).await {
+    // The row and its sealed secret commit together: a failed seal must not
+    // leave a half-created repository whose retry then answers 409.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return db_error(e),
+    };
+    let repo = match repository_dao::insert_repository(&mut *tx, new).await {
         Ok(r) => r,
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
         Err(e) => return db_error(e),
     };
-
-    match (&state.envelope, &body.upstream_password) {
+    let sealed = match (&state.envelope, &body.upstream_password) {
         (Some(envelope), Some(pw)) => {
-            if let Err(resp) = store_encrypted_password(&state, envelope, repo.id, pw.clone()).await
+            if let Err(resp) =
+                store_encrypted_password(&mut tx, envelope, repo.id, pw.clone()).await
             {
                 return resp;
             }
-            // Re-fetch so the view reflects the sealed secret.
-            match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
-                Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
-                Ok(None) => db_error(sqlx::Error::RowNotFound),
-                Err(e) => db_error(e),
-            }
+            true
         }
-        _ => (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response(),
+        _ => false,
+    };
+    if let Err(e) = tx.commit().await {
+        return db_error(e);
+    }
+    if !sealed {
+        return (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response();
+    }
+    // Re-fetch so the view reflects the sealed secret.
+    match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
+        Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
+        Ok(None) => db_error(sqlx::Error::RowNotFound),
+        Err(e) => db_error(e),
     }
 }
 
@@ -253,13 +274,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
 /// (`secret_dao::set_upstream_password`); map failures to a 500 response. The
 /// error string carries no key material or plaintext by construction.
 async fn store_encrypted_password(
-    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     envelope: &forge_crypto::service::EnvelopeService,
     repo_id: i64,
     password: String,
 ) -> Result<(), Response> {
     let secret = forge_crypto::PlaintextSecret::from(password);
-    forge_db::secret_dao::set_upstream_password(&state.pool, envelope, repo_id, Some(&secret))
+    forge_db::secret_dao::set_upstream_password(&mut **tx, envelope, repo_id, Some(&secret))
         .await
         .map_err(|e| {
             tracing::error!(error = %e, repo_id, "failed to store encrypted upstream password");
@@ -343,7 +364,14 @@ pub async fn update(
         allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
     };
 
-    let updated = match repository_dao::update_repository(&state.pool, existing.id, upd).await {
+    // The metadata and a replacement secret commit together: otherwise a
+    // failed seal after a committed `remote_url` change would leave the new
+    // host paired with the previous host's credentials.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return db_error(e),
+    };
+    let updated = match repository_dao::update_repository(&mut *tx, existing.id, upd).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) if is_unique_violation(&e) => {
@@ -354,20 +382,27 @@ pub async fn update(
 
     // §12.5: a present password replaces the stored secret through the
     // envelope (clearing any legacy plaintext for this row); absent keeps it.
-    match (&state.envelope, &body.upstream_password) {
+    let sealed = match (&state.envelope, &body.upstream_password) {
         (Some(envelope), Some(pw)) => {
             if let Err(resp) =
-                store_encrypted_password(&state, envelope, updated.id, pw.clone()).await
+                store_encrypted_password(&mut tx, envelope, updated.id, pw.clone()).await
             {
                 return resp;
             }
-            match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
-                Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
-                Ok(None) => db_error(sqlx::Error::RowNotFound),
-                Err(e) => db_error(e),
-            }
+            true
         }
-        _ => Json(RepoView::from(&updated)).into_response(),
+        _ => false,
+    };
+    if let Err(e) = tx.commit().await {
+        return db_error(e);
+    }
+    if !sealed {
+        return Json(RepoView::from(&updated)).into_response();
+    }
+    match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
+        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(None) => db_error(sqlx::Error::RowNotFound),
+        Err(e) => db_error(e),
     }
 }
 

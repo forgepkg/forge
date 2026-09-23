@@ -1227,6 +1227,45 @@ impl Config {
         Ok(())
     }
 
+    /// Settings that are legal but unsafe or wrong for a production
+    /// deployment, reported as startup warnings (not refusals: a lab or an
+    /// internal-only plain-HTTP install may choose them deliberately). Empty
+    /// while `server.allow_insecure_defaults` is on (local development).
+    pub fn deployment_warnings(&self) -> Vec<String> {
+        if self.server.allow_insecure_defaults {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        let base = self.public_base_url();
+        let host = url::Url::parse(&base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+        let loopback = matches!(
+            host.as_deref(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        );
+        if loopback {
+            warnings.push(format!(
+                "server.public_base_url is {base}: NuGet clients are handed URLs on this \
+                 host, so set it to the address clients use (FORGE_SERVER__PUBLIC_BASE_URL)"
+            ));
+        }
+        if !base.starts_with("https://") {
+            warnings.push(format!(
+                "server.public_base_url ({base}) is not https: session cookies are issued \
+                 without Secure; terminate TLS in front of Forge and use an https:// URL"
+            ));
+        }
+        if !self.crypto.as_ref().is_some_and(|c| c.enabled) {
+            warnings.push(
+                "secret encryption at rest is disabled (no [crypto] section): upstream \
+                 passwords and auth-realm secrets are stored in plaintext in PostgreSQL"
+                    .to_string(),
+            );
+        }
+        warnings
+    }
+
     /// Refuse known-insecure placeholder credentials unless
     /// `server.allow_insecure_defaults` opts in (dev/compose only): a
     /// `changeme` or empty bootstrap-admin password, or `minioadmin` S3 keys.
@@ -1560,6 +1599,29 @@ mod tests {
 
     fn fig_from_toml(toml: &str) -> Figment {
         Figment::new().merge(Toml::string(toml))
+    }
+
+    #[test]
+    fn deployment_warnings_flag_http_loopback_and_plaintext_secrets() {
+        let https = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        let w = https.deployment_warnings();
+        assert_eq!(w.len(), 1, "only the missing [crypto] section: {w:?}");
+        assert!(w[0].contains("plaintext"));
+
+        let local = MINIMAL.replace("https://forge.example.com/", "http://localhost:8421");
+        let cfg = Config::from_figment(fig_from_toml(&local)).expect("valid");
+        let w = cfg.deployment_warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w.iter().any(|m| m.contains("not https")));
+        assert!(w.iter().any(|m| m.contains("NuGet clients")));
+
+        let dev = local.replacen(
+            "public_base_url = \"http://localhost:8421\"",
+            "public_base_url = \"http://localhost:8421\"\n        allow_insecure_defaults = true",
+            1,
+        );
+        let cfg = Config::from_figment(fig_from_toml(&dev)).expect("valid");
+        assert!(cfg.deployment_warnings().is_empty(), "dev mode stays quiet");
     }
 
     #[test]

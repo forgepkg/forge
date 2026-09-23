@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::auth::WorkloadIdentitySource;
 use anyhow::Context;
+use axum::http::{header, HeaderValue};
 use axum::routing::any;
 use axum::Router;
 use forge_core::auth::session_source::SessionCookieSource;
@@ -12,6 +13,7 @@ use forge_core::auth::token::{BasicAuthSource, PrincipalSource, TokenHeaderSourc
 use forge_db::authz_dao;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::admin::admin_router;
 use crate::auth::auth_router;
@@ -131,6 +133,25 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     app.layer(axum::middleware::from_fn_with_state(
         layer.clone(),
         attach_principal,
+    ))
+    // Baseline browser hardening for the SPA and every API response (added only
+    // when a handler did not set its own): no MIME sniffing, no framing
+    // (clickjacking on the admin UI), no cross-origin referrer leakage.
+    .layer(SetResponseHeaderLayer::if_not_present(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    ))
+    .layer(SetResponseHeaderLayer::if_not_present(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
+    ))
+    .layer(SetResponseHeaderLayer::if_not_present(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    ))
+    .layer(SetResponseHeaderLayer::if_not_present(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
     ))
     // Request spans (method, path, status, latency) for every route; emitted
     // at DEBUG, so `RUST_LOG=tower_http=debug` turns on an access log.

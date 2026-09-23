@@ -32,6 +32,14 @@ async fn main() -> anyhow::Result<()> {
             default.exists().then_some(default)
         });
     let config = Config::load(config_path.as_deref()).context("load configuration")?;
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        revision = option_env!("FORGE_GIT_SHA").unwrap_or("unknown"),
+        "starting forge-server"
+    );
+    for warning in config.deployment_warnings() {
+        tracing::warn!("{warning}");
+    }
 
     // Database.
     let pool = forge_db::connect_with(

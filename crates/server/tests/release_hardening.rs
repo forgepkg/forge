@@ -258,3 +258,44 @@ async fn deleted_bootstrap_admin_is_not_recreated_on_restart() {
         "a deleted bootstrap admin stays deleted"
     );
 }
+
+#[tokio::test]
+async fn responses_carry_browser_hardening_headers_and_version_is_exposed() {
+    let srv = common::start().await;
+    let resp = srv
+        .client()
+        .get(format!("{}/version", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("content-security-policy", "frame-ancestors 'none'"),
+        ("referrer-policy", "same-origin"),
+    ] {
+        assert_eq!(
+            resp.headers().get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "{name}"
+        );
+    }
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+}
+
+#[tokio::test]
+async fn repository_formats_other_than_nuget_are_rejected() {
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "name": format!("npm{}", common::unique()), "kind": "hosted", "format": "npm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
