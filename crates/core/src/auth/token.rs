@@ -165,6 +165,15 @@ pub enum SourceOutcome {
     /// never be re-interpreted as an opaque token or forwarded upstream as a
     /// password.
     Reject,
+    /// An **ambient** credential (the session cookie) was presented but no
+    /// longer names a live session (expired, revoked, or its user is gone or
+    /// deactivated). The browser attaches it on its own, so it proves nothing
+    /// and is treated like [`Self::NoCredentials`] — the request continues as
+    /// anonymous/unauthenticated rather than failing with 401 — and the caller
+    /// is told to clear the dead cookie ([`ResolvedPrincipal::stale_ambient`]).
+    /// Otherwise a stale cookie would lock the user out of every route,
+    /// including the login endpoint and the SPA itself.
+    Stale,
 }
 
 /// Errors from principal resolution.
@@ -443,6 +452,9 @@ pub struct ResolvedPrincipal {
     /// Whether the winning source was ambient ([`PrincipalSource::is_ambient`],
     /// i.e. the session cookie). `false` for anonymous / unauthenticated.
     pub ambient: bool,
+    /// An ambient credential was presented but is dead
+    /// ([`SourceOutcome::Stale`]); the caller should clear it on the response.
+    pub stale_ambient: bool,
 }
 
 /// [`resolve_principal`], also reporting whether the principal came from an
@@ -454,17 +466,20 @@ pub async fn resolve_principal_with_origin(
     anon: &AnonPolicy,
 ) -> Result<ResolvedPrincipal, AuthError> {
     let mut saw_invalid = false;
+    let mut saw_stale = false;
     for source in sources {
         match source.resolve(headers, client_ip).await {
             SourceOutcome::Authenticated(principal) => {
                 return Ok(ResolvedPrincipal {
                     principal,
                     ambient: source.is_ambient(),
+                    stale_ambient: false,
                 })
             }
             // Terminal: the source owns this credential and rejected it.
             SourceOutcome::Reject => return Err(AuthError::Unauthorized),
             SourceOutcome::Invalid => saw_invalid = true,
+            SourceOutcome::Stale => saw_stale = true,
             SourceOutcome::NoCredentials => {}
         }
     }
@@ -481,6 +496,7 @@ pub async fn resolve_principal_with_origin(
     Ok(ResolvedPrincipal {
         principal,
         ambient: false,
+        stale_ambient: saw_stale,
     })
 }
 
@@ -555,6 +571,39 @@ mod tests {
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::NoCredentials)),
             Box::new(StubSource(SourceOutcome::Invalid)),
+        ];
+        let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
+        assert_eq!(res, Err(AuthError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn stale_ambient_falls_back_to_anonymous_policy_and_flags_it() {
+        // A dead session cookie is not a presented credential: it must not 401
+        // (that would lock the browser out of login and the SPA), and the caller
+        // is told to clear it.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::NoCredentials)),
+            Box::new(StubSource(SourceOutcome::Stale)),
+        ];
+        let open =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All)
+                .await
+                .unwrap();
+        assert_eq!(open.principal, Principal::Anonymous { ip: ip() });
+        assert!(open.stale_ambient && !open.ambient);
+        let closed =
+            resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
+                .await
+                .unwrap();
+        assert_eq!(closed.principal, Principal::Unauthenticated);
+        assert!(closed.stale_ambient);
+    }
+
+    #[tokio::test]
+    async fn stale_does_not_mask_an_invalid_credential() {
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource(SourceOutcome::Invalid)),
+            Box::new(StubSource(SourceOutcome::Stale)),
         ];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
         assert_eq!(res, Err(AuthError::Unauthorized));

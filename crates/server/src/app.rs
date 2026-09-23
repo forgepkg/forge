@@ -31,8 +31,9 @@ use crate::web_ui::spa_service;
 /// `forge_session` cookie. The cookie source is **last** so that API
 /// credentials (tokens) always win for NuGet clients, and the browser session
 /// only resolves a principal when no API credential was presented. A session
-/// cookie that fails validation reports `Invalid`, which the resolver turns
-/// into a 401 (never downgraded to anonymous).
+/// cookie that no longer names a live session reports `Stale`: it is treated
+/// as no credentials and cleared on the response (a 401 there would lock the
+/// browser out of the login page itself).
 ///
 /// 12.7: the Basic source's password path asks [`crate::auth::RealmAuth`] for
 /// the chain on every attempt, so admin realm edits apply without a restart
@@ -75,6 +76,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         anon: Arc::new(anon),
         // Cookie-authenticated mutations must carry the session's CSRF token.
         sessions: Some(state.sessions.clone()),
+        cookie_secure: state.cookie_secure,
+        public_origin: crate::middleware::principal::origin_of(&state.config.public_base_url()),
     })
 }
 
@@ -135,7 +138,12 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     .with_state(state)
 }
 
-/// Create the bootstrap admin user if it does not already exist.
+/// `forge_setting` key prefix (`<prefix>:<username>`) recording that the
+/// bootstrap admin was created, so a later deletion sticks across restarts.
+pub const BOOTSTRAP_ADMIN_CREATED_KEY: &str = "bootstrap_admin_created";
+
+/// Create the bootstrap admin user if it does not already exist and was never
+/// created before (see [`BOOTSTRAP_ADMIN_CREATED_KEY`]).
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it). A no-op when `auth.bootstrap_admin` is unset or the username
@@ -151,6 +159,23 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         .is_some()
     {
         tracing::debug!(username = %ba.username, "bootstrap admin already exists; skipping");
+        return Ok(());
+    }
+
+    // Create it only once: an operator who deleted the bootstrap account (e.g.
+    // after setting up a real admin or an IdP) must not get it back — with
+    // full admin rights and the password still in the environment — on the
+    // next restart.
+    let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{}", ba.username);
+    if authz_dao::get_setting(pool, &marker)
+        .await
+        .context("bootstrap admin marker")?
+        .is_some()
+    {
+        tracing::info!(
+            username = %ba.username,
+            "bootstrap admin was created before and has since been removed; not re-creating it"
+        );
         return Ok(());
     }
 
@@ -184,6 +209,9 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
             .await
             .context("grant admin role to bootstrap admin")?;
     }
+    authz_dao::set_setting(pool, &marker, &user.id.to_string())
+        .await
+        .context("record bootstrap admin marker")?;
 
     tracing::warn!(
         username = %ba.username,

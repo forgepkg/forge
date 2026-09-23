@@ -75,9 +75,12 @@ impl PrincipalSource for SessionCookieSource {
         // Validate against the authoritative session row.
         let session = match self.sessions.validate(&secret).await {
             Ok(Some(s)) => s,
-            // Unknown / expired / revoked cookie: credentials were presented but
-            // rejected — Invalid, never downgraded to anonymous.
-            Ok(None) => return SourceOutcome::Invalid,
+            // Unknown / expired / revoked cookie: the browser sent it on its
+            // own, so it proves nothing — Stale (treated as no credentials and
+            // cleared by the middleware), not a 401 that would lock the user out
+            // of the login page itself.
+            Ok(None) => return SourceOutcome::Stale,
+            // Infrastructure failure: fail closed.
             Err(e) => {
                 tracing::warn!(error = %e, "session validation failed");
                 return SourceOutcome::Invalid;
@@ -92,8 +95,9 @@ impl PrincipalSource for SessionCookieSource {
                 token_id: None,
                 is_admin: user.is_admin,
             }),
-            // The session points at a vanished or deactivated user: reject.
-            Ok(_) => SourceOutcome::Invalid,
+            // The session points at a vanished or deactivated user: it grants
+            // nothing, so clear it like an expired one.
+            Ok(_) => SourceOutcome::Stale,
             Err(e) => {
                 tracing::warn!(error = %e, "session user lookup failed");
                 SourceOutcome::Invalid

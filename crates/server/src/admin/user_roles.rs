@@ -82,11 +82,13 @@ pub async fn assign(
         Err(resp) => return resp,
     };
 
-    match authz_dao::assign_role(&state.pool, user_id, role_id).await {
-        Ok(()) => {
-            invalidate_user(&state.cache, user_id).await;
-            StatusCode::NO_CONTENT.into_response()
-        }
+    if let Err(e) = authz_dao::assign_role(&state.pool, user_id, role_id).await {
+        return db_error(e);
+    }
+    let result = sync_legacy_admin_flag(&state, user_id, role_id, true).await;
+    invalidate_user(&state.cache, user_id).await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -96,12 +98,37 @@ pub async fn unassign(
     State(state): State<AppState>,
     Path((user_id, role_id)): Path<(i64, i64)>,
 ) -> Response {
-    match authz_dao::unassign_role(&state.pool, user_id, role_id).await {
-        Ok(()) => {
-            invalidate_user(&state.cache, user_id).await;
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // Clear the legacy flag first: while `app_user.is_admin` is set the user
+    // stays a global admin through the dual-read fallback, so removing only the
+    // role would silently leave the admin rights in place.
+    if let Err(e) = sync_legacy_admin_flag(&state, user_id, role_id, false).await {
+        return db_error(e);
+    }
+    let result = authz_dao::unassign_role(&state.pool, user_id, role_id).await;
+    invalidate_user(&state.cache, user_id).await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => db_error(e),
+    }
+}
+
+/// Keep the slice-1 `app_user.is_admin` column in step with membership of the
+/// built-in `admin` role. The authz seam still honors the column as a
+/// dual-read fallback, so the role alone cannot revoke admin: an unassign that
+/// left the flag set would be a no-op. A no-op for any other role, or for a
+/// user that no longer exists.
+async fn sync_legacy_admin_flag(
+    state: &AppState,
+    user_id: i64,
+    role_id: i64,
+    is_admin: bool,
+) -> sqlx::Result<()> {
+    if authz_dao::role_id_by_name(&state.pool, authz_dao::ADMIN_ROLE).await? != Some(role_id) {
+        return Ok(());
+    }
+    match user_dao::update_is_admin(&state.pool, user_id, is_admin).await {
+        Ok(_) | Err(sqlx::Error::RowNotFound) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
