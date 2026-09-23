@@ -92,6 +92,14 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
     // created user would silently lose the slice-1 "read/write everywhere"
     // behavior. Fail-closed installs leave the flag false and skip
     // this. Idempotent.
+    // An admin created here holds the built-in `admin` role as well as the
+    // legacy flag, so the role-assignment API sees (and can revoke) it.
+    if u.is_admin {
+        if let Err(e) = authz_dao::sync_admin_role(&state.pool, u.id, true).await {
+            return db_error(e);
+        }
+    }
+
     match authz_dao::assign_authenticated_if_legacy_open(&state.pool, u.id).await {
         Ok(true) => {
             // No cached effective set should exist for a just-created id, but

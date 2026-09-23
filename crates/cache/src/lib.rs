@@ -385,8 +385,19 @@ impl Cache {
                                         Ok(stamps) => {
                                             let current =
                                                 tag_versions.merge_snapshot(&entry_tags, &stamps);
-                                            if candidate.tags == current {
+                                            // Only an entry whose payload decodes
+                                            // as `T` is a hit: a shared Redis, a
+                                            // changed type after an upgrade, or a
+                                            // tampered value must degrade to a
+                                            // miss, not panic the decode below.
+                                            if candidate.tags == current
+                                                && serde_json::from_slice::<T>(&candidate.value)
+                                                    .is_ok()
+                                            {
                                                 return Ok(Arc::new(candidate));
+                                            }
+                                            if candidate.tags == current {
+                                                tracing::warn!(key = %key_for_l2, "L2 entry does not decode as the expected type; refilling");
                                             }
                                             if let Err(err) = l2.del(&key_for_l2).await {
                                                 tracing::warn!(error = %err, key = %key_for_l2, "stale tagged L2 entry cleanup failed");

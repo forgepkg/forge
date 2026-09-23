@@ -25,12 +25,22 @@
 //! place. Requests authenticated by an explicit credential (API key, Basic,
 //! workload JWT) cannot be forged cross-site and are exempt, as are the
 //! pre-session login endpoints ([`CSRF_EXEMPT_PATHS`]).
+//!
+//! Independently of the credential, a state-changing request that a browser
+//! labels as cross-site (`Sec-Fetch-Site`, or a foreign `Origin`) is refused
+//! with **403** before authentication — this covers Basic credentials a
+//! browser cached from the `/v3` login prompt, which the token cannot.
+//!
+//! ## Stale session cookies
+//! A session cookie that no longer names a live session is treated as absent
+//! (anonymous policy applies) and cleared on the response, so an expired
+//! session never locks the browser out of the login page or the SPA.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::client_ip::{resolve_client_ip, AnonPolicy};
@@ -63,6 +73,72 @@ pub struct PrincipalLayer {
     /// Session service used to check the CSRF token of cookie-authenticated
     /// mutations. `None` ⇒ such requests are refused (fail closed).
     pub sessions: Option<SessionService>,
+    /// Whether cookies are issued with `Secure` (HTTPS deployment); used when
+    /// clearing a stale session cookie.
+    pub cookie_secure: bool,
+    /// The deployment's own origin (`scheme://host[:port]` of
+    /// `server.public_base_url`), accepted as a same-origin `Origin` header.
+    pub public_origin: Option<String>,
+}
+
+/// Refuse a state-changing request a **browser** marked as cross-site.
+///
+/// The session-cookie CSRF token does not cover credentials a browser caches
+/// and replays on its own — HTTP Basic typed into the native prompt `/v3`
+/// raises, in particular — so a cross-site `<form>` could otherwise drive a
+/// body-less admin POST with them. Browsers label every request with
+/// `Sec-Fetch-Site` (and send `Origin` on non-GET requests); NuGet clients and
+/// other non-browser callers send neither and are unaffected.
+///
+/// * `Sec-Fetch-Site` present: only `same-origin` and `none` (user-initiated)
+///   pass — `same-site` is refused too, since a sibling subdomain is not
+///   necessarily trusted.
+/// * Otherwise (older browsers): an `Origin` header must match the configured
+///   public origin or the request's own `Host`; `Origin: null` is refused.
+fn cross_site_browser_request(headers: &HeaderMap, public_origin: Option<&str>) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return !matches!(site.trim(), "same-origin" | "none");
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return true;
+    };
+    let origin = origin.trim().trim_end_matches('/');
+    if public_origin.is_some_and(|p| p.eq_ignore_ascii_case(origin)) {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return true; // includes the opaque `null` origin
+    };
+    let Some(host) = parsed.host_str() else {
+        return true;
+    };
+    let authority = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let request_host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    !request_host.eq_ignore_ascii_case(&authority)
+}
+
+/// The `scheme://host[:port]` origin of a base URL, if it parses.
+pub fn origin_of(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    match url.origin() {
+        o @ url::Origin::Tuple(..) => Some(o.ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
+/// `Set-Cookie` value that clears the session cookie.
+fn clear_session_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
 }
 
 /// Resolve the socket peer for a request.
@@ -85,6 +161,12 @@ pub async fn attach_principal(
     next: Next,
 ) -> Response {
     let peer = peer_ip(&req);
+
+    if !req.method().is_safe()
+        && cross_site_browser_request(req.headers(), layer.public_origin.as_deref())
+    {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
 
     let xff = req
         .headers()
@@ -112,7 +194,16 @@ pub async fn attach_principal(
     }
 
     req.extensions_mut().insert(resolved.principal);
-    next.run(req).await
+    let mut resp = next.run(req).await;
+    // A dead session cookie continues as anonymous/unauthenticated; drop it
+    // from the browser so it stops riding along — unless the handler set the
+    // cookie itself (a fresh login on this very request).
+    if resolved.stale_ambient && !resp.headers().contains_key(header::SET_COOKIE) {
+        if let Ok(v) = HeaderValue::from_str(&clear_session_cookie(layer.cookie_secure)) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
 /// Enforce the double-submit CSRF token for a cookie-authenticated mutation:
@@ -206,6 +297,8 @@ mod tests {
             trusted_proxies: Arc::new(vec![]),
             anon: Arc::new(anon),
             sessions: None,
+            cookie_secure: false,
+            public_origin: Some("https://forge.example".into()),
         }
     }
 
@@ -326,6 +419,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A cookie source whose session has expired.
+    struct StaleCookieStub;
+
+    #[async_trait::async_trait]
+    impl PrincipalSource for StaleCookieStub {
+        async fn resolve(&self, headers: &http::HeaderMap, _ip: IpAddr) -> SourceOutcome {
+            if cookie_value(headers, SESSION_COOKIE).is_some() {
+                SourceOutcome::Stale
+            } else {
+                SourceOutcome::NoCredentials
+            }
+        }
+        fn is_ambient(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_session_cookie_does_not_block_login_or_pages_and_is_cleared() {
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StaleCookieStub)];
+        let app = post_app(layer(sources, AnonPolicy::Off));
+        for (method, uri, want) in [
+            ("POST", "/auth/login", "login"),
+            ("GET", "/admin/thing", "read"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("cookie", "forge_session=expired")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{method} {uri}");
+            let cleared = resp
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                cleared.starts_with("forge_session=;") && cleared.contains("Max-Age=0"),
+                "stale cookie cleared on {uri}: {cleared}"
+            );
+            assert_eq!(body_string(resp).await, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_session_cookie_mutation_is_not_authenticated() {
+        // A dead cookie downgrades to Unauthenticated; the (admin) handler's own
+        // authz then refuses it. Here the handler is unguarded, so just check the
+        // principal the handler would see.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StaleCookieStub)];
+        let resp = app(layer(sources, AnonPolicy::Off))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("cookie", "forge_session=expired")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "unauthenticated");
+    }
+
+    #[tokio::test]
+    async fn cross_site_browser_mutations_are_refused_before_auth() {
+        // Basic credentials a browser cached from the `/v3` prompt are replayed
+        // on a cross-site form POST; the fetch-metadata / Origin check stops it
+        // even though Basic is CSRF-token exempt.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
+            outcome: SourceOutcome::Authenticated(Principal::User {
+                user_id: 1,
+                token_id: None,
+                is_admin: true,
+            }),
+            require_header: true,
+        })];
+        let app = post_app(layer(sources, AnonPolicy::Off));
+        let send = |headers: Vec<(&'static str, &'static str)>| {
+            let app = app.clone();
+            async move {
+                let mut b = Request::builder()
+                    .method("POST")
+                    .uri("/admin/thing")
+                    .header(AUTHORIZATION, "Basic x")
+                    .header(header::HOST, "forge.internal:8421");
+                for (k, v) in headers {
+                    b = b.header(k, v);
+                }
+                app.oneshot(b.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        // Refused.
+        for h in [
+            vec![("sec-fetch-site", "cross-site")],
+            vec![("sec-fetch-site", "same-site")],
+            vec![("origin", "https://evil.example")],
+            vec![("origin", "null")],
+        ] {
+            assert_eq!(send(h.clone()).await, StatusCode::FORBIDDEN, "{h:?}");
+        }
+        // Allowed: non-browser client, same-origin fetch metadata, the public
+        // origin, and an Origin matching the request's own Host.
+        for h in [
+            vec![],
+            vec![("sec-fetch-site", "same-origin")],
+            vec![("origin", "https://forge.example")],
+            vec![("origin", "http://forge.internal:8421")],
+        ] {
+            assert_eq!(send(h.clone()).await, StatusCode::OK, "{h:?}");
+        }
+    }
+
+    #[test]
+    fn origin_of_strips_path_and_default_port() {
+        assert_eq!(
+            origin_of("https://forge.example/some/path").as_deref(),
+            Some("https://forge.example")
+        );
+        assert_eq!(
+            origin_of("http://localhost:8421").as_deref(),
+            Some("http://localhost:8421")
+        );
+        assert_eq!(origin_of("not a url"), None);
     }
 
     async fn body_string(resp: Response) -> String {

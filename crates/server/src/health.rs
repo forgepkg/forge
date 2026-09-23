@@ -7,7 +7,11 @@
 //!   check names otherwise, so traffic is routed away from an instance that
 //!   cannot serve.
 //!
-//! Both are unauthenticated and reveal nothing beyond check names.
+//! * `GET /version` — the running build: crate version and, when the image was
+//!   built with `FORGE_GIT_SHA`, the source revision.
+//!
+//! All are unauthenticated and reveal nothing beyond check names and the
+//! build identity.
 
 use std::time::Duration;
 
@@ -22,11 +26,20 @@ use crate::state::AppState;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Router with the two probe endpoints.
+/// Router with the probe and version endpoints.
 pub fn health_router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/version", get(version))
+}
+
+async fn version() -> Response {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "revision": option_env!("FORGE_GIT_SHA").unwrap_or("unknown"),
+    }))
+    .into_response()
 }
 
 async fn healthz() -> Response {

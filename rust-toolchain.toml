@@ -1,2 +1,7 @@
+# Pinned so local builds, both CIs and the Docker image compile with the same
+# compiler. Bump deliberately (together with the Dockerfile's rust:<ver> base
+# and .gitlab-ci.yml's RUST_IMAGE).
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

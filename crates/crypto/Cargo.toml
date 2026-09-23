@@ -1,7 +1,9 @@
 [package]
 name = "forge-crypto"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 # Secret encryption at rest (spec §12.5): the double-envelope key hierarchy
 # (root → KEK → DEK), the versioned AEAD envelope format, the `KmsProvider`

@@ -6,6 +6,13 @@
 secret handling, workers, frontend, tests, CI/CD, operations, documentation, the
 published roadmap, and trusted-publishing readiness.
 
+## Status as of 0.1.0 (2026-09-23)
+
+The remaining release blockers from this review and the 2026-09-23 readiness
+pass are closed for 0.1.0. The items still open are listed as **Known
+limitations** in the [0.1.0 changelog](../CHANGELOG.md#010); operator guidance
+is in [deployment.md](deployment.md).
+
 ## Remediation addendum — 2026-07-16 working tree
 
 The review below is intentionally preserved as the point-in-time assessment of

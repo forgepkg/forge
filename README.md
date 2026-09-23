@@ -45,7 +45,9 @@ A Cargo workspace of small crates plus the web SPA:
 **Single-origin serving.** `forge-server` mounts the NuGet feed (`/v3`), the
 admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
-the same origin with relative URLs; no reverse proxy is required.
+the same origin with relative URLs; no routing proxy is required (production
+still puts a TLS-terminating proxy in front — see
+[docs/deployment.md](docs/deployment.md)).
 
 ## Quickstart
 
@@ -125,6 +127,12 @@ the user password).
 
 ## Documentation
 
+- **[Production deployment](./docs/deployment.md)** — required settings, TLS
+  and reverse proxy, secret encryption, health probes, backup/restore and
+  upgrades.
+- **[CHANGELOG.md](./CHANGELOG.md)** — release notes, upgrade notes and known
+  limitations; **[SECURITY.md](./SECURITY.md)** — how to report a
+  vulnerability.
 - **[DEVELOPMENT.md](./DEVELOPMENT.md)** — full local-dev guide: every
   `cargo xtask` command, configuration knobs, OIDC/Entra setup, the web UI dev
   server, tests, and Docker packaging details.

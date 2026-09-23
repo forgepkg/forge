@@ -25,10 +25,14 @@
 //!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
 //!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
 //!   and finalize transactions; it is **released before** the upstream HTTP
-//!   fetch and the CAS/S3 PUT (Addendum A7). The singleflight is therefore
-//!   best-effort: under contention more than one caller may fetch from
-//!   upstream, but the CAS is content-addressed and the finalize tx re-checks
-//!   `downloaded`, so concurrent fetches converge on identical state. The
+//!   fetch and the CAS/S3 PUT (Addendum A7). Within one instance, concurrent
+//!   first-time fetches of the same version are serialized by an in-process
+//!   gate ([`inflight_gate`]): the first caller fetches, the others wait and
+//!   then find `downloaded` set, so N simultaneous restores cost one upstream
+//!   download and one temp file. Across instances the singleflight is
+//!   best-effort (at most one fetch per instance): the CAS is
+//!   content-addressed and the finalize tx re-checks `downloaded`, so
+//!   concurrent fetches converge on identical state. The
 //!   upstream-index refresh likewise never holds a lock over the fetch; the
 //!   per-instance cache coalesces concurrent refreshes.
 //! * **Package delay** — a version discovered from upstream is recorded with
@@ -177,6 +181,35 @@ impl Credentials {
             password: self.password.expose_secret(),
         }
     }
+}
+
+/// Key of an in-flight first-time `.nupkg` fetch: `(repository id, lowercase
+/// id, version)`.
+type InflightKey = (i64, String, String);
+
+/// Process-wide registry of in-flight first-time fetches. Entries are weak so a
+/// finished fetch frees its slot as soon as the last waiter drops the gate.
+static INFLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<InflightKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The per-version gate serializing first-time fetches within this process.
+/// [`ProxyRepo`] is built per request, so the gate cannot live on it.
+fn inflight_gate(repository_id: i64, lower_id: &str, version: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (repository_id, lower_id.to_string(), version.to_string());
+    if let Some(gate) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    // Prune finished entries before growing the map.
+    if map.len() >= 1024 {
+        map.retain(|_, gate| gate.strong_count() > 0);
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, Arc::downgrade(&gate));
+    gate
 }
 
 /// Storage-backed proxy read implementation.
@@ -646,6 +679,13 @@ impl ProxyRepo {
             },
         )
         .await?;
+
+        // In-process singleflight: wait for any fetch of this version already
+        // running on this instance; the gate tx below then sees `downloaded`
+        // and serves the local copy instead of fetching again. Held (it is an
+        // async mutex, not a DB lock) until this call returns.
+        let gate = inflight_gate(repo.id, lower_id, version);
+        let _inflight = gate.lock().await;
 
         // ── Singleflight gate (short tx, NO network/S3 held under the lock) ──
         //

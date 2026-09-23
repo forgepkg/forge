@@ -560,19 +560,34 @@ impl HostedWrite {
             .await?;
             PublishOutcome::Replaced
         } else {
-            self.insert_new_in_tx(
-                &mut tx,
-                repo_row.id,
-                &nupkg_sha,
-                nupkg.ingest_token,
-                nupkg_size,
-                &nupkg_hash512,
-                &nuspec_sha,
-                nuspec.ingest_token,
-                nuspec_size,
-                &parsed,
-            )
-            .await?;
+            let inserted = self
+                .insert_new_in_tx(
+                    &mut tx,
+                    repo_row.id,
+                    &nupkg_sha,
+                    nupkg.ingest_token,
+                    nupkg_size,
+                    &nupkg_hash512,
+                    &nuspec_sha,
+                    nuspec.ingest_token,
+                    nuspec_size,
+                    &parsed,
+                )
+                .await;
+            match inserted {
+                Ok(()) => {}
+                // A concurrent first push of the same (id, version) won the
+                // race: the duplicate check above could not lock a row that
+                // did not exist yet, so the unique index decides. Report it as
+                // the documented conflict, not an internal error.
+                Err(WriteError::Repo(RepoError::Db(e))) if is_unique_violation(&e) => {
+                    return Err(WriteError::Conflict {
+                        id: parsed.original_id.clone(),
+                        version: parsed.version.clone(),
+                    });
+                }
+                Err(e) => return Err(e),
+            }
             PublishOutcome::Created
         };
 
@@ -914,4 +929,9 @@ impl crate::repo::RepoWriteOps for HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         HostedWrite::relist(self, repo, id, version).await
     }
+}
+
+/// Whether a `sqlx::Error` is a Postgres unique violation (SQLSTATE 23505).
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }

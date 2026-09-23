@@ -65,12 +65,19 @@ pub enum SecretDbError {
 /// is cleared in the same statement: once a secret is written through the
 /// envelope, plaintext never reappears for that row (the column itself is
 /// dropped by a later migration once every deployment has backfilled).
-pub async fn set_upstream_password(
-    pool: &PgPool,
+///
+/// Accepts any executor so the admin API can commit it atomically with the
+/// repository metadata it belongs to (a new `remote_url` must never become
+/// visible with the previous host's credentials).
+pub async fn set_upstream_password<'e, E>(
+    executor: E,
     envelope: &EnvelopeService,
     repo_id: i64,
     secret: Option<&PlaintextSecret>,
-) -> Result<(), SecretDbError> {
+) -> Result<(), SecretDbError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let blob = match secret {
         Some(pt) => Some(envelope.seal(pt, binding(repo_id)).await?),
         None => None,
@@ -84,7 +91,7 @@ pub async fn set_upstream_password(
         repo_id,
         blob.as_deref(),
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     if res.rows_affected() == 0 {
         return Err(SecretDbError::RepoNotFound(repo_id));

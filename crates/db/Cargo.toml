@@ -1,7 +1,9 @@
 [package]
 name = "forge-db"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
 # Secret encryption at rest (slice 12.5): the Postgres KeyStore over

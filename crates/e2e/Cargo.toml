@@ -1,8 +1,9 @@
 [package]
 name = "forge-e2e"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [features]
 # All e2e harness code + tests are gated behind this feature so a plain

@@ -68,7 +68,11 @@ impl NewRepository {
 }
 
 /// Insert a repository, returning the full persisted row.
-pub async fn insert_repository(pool: &PgPool, new: NewRepository) -> sqlx::Result<Repository> {
+/// Accepts any executor so it composes with other writes in one transaction.
+pub async fn insert_repository<'e, E>(executor: E, new: NewRepository) -> sqlx::Result<Repository>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         Repository,
         r#"
@@ -98,7 +102,7 @@ pub async fn insert_repository(pool: &PgPool, new: NewRepository) -> sqlx::Resul
         new.not_found_ttl_seconds,
         new.allow_redeploy,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -408,11 +412,15 @@ pub struct RepositoryUpdate {
 
 /// Update the mutable settings of a repository by id. Returns the updated row,
 /// or `None` if no repository has that id. `updated_at` is bumped to `now()`.
-pub async fn update_repository(
-    pool: &PgPool,
+/// Accepts any executor so it composes with other writes in one transaction.
+pub async fn update_repository<'e, E>(
+    executor: E,
     id: i64,
     upd: RepositoryUpdate,
-) -> sqlx::Result<Option<Repository>> {
+) -> sqlx::Result<Option<Repository>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         Repository,
         r#"
@@ -449,7 +457,7 @@ pub async fn update_repository(
         upd.not_found_ttl_seconds,
         upd.allow_redeploy,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

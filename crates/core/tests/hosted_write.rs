@@ -239,6 +239,35 @@ async fn duplicate_without_redeploy_is_conflict() {
     assert!(matches!(err, WriteError::Conflict { .. }));
 }
 
+/// Simultaneous *first* pushes of one (id, version): the duplicate check cannot
+/// lock a row that does not exist yet, so the unique index decides — and the
+/// losers must see the documented 409 conflict, never an internal error.
+#[tokio::test]
+async fn concurrent_first_pushes_yield_one_create_and_conflicts() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, false).await;
+    let w = Arc::new(writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await);
+    let bytes = fixture_bytes("sample.lib.1.0.0.nupkg");
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let (w, repo, bytes) = (w.clone(), repo.clone(), bytes.clone());
+            tokio::spawn(async move { w.store_upload(&repo, &bytes[..], MAX_UPLOAD).await })
+        })
+        .collect();
+    let (mut created, mut conflicts) = (0, 0);
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(PublishOutcome::Created) => created += 1,
+            Err(WriteError::Conflict { .. }) => conflicts += 1,
+            other => panic!("unexpected publish result: {other:?}"),
+        }
+    }
+    assert_eq!((created, conflicts), (1, 7));
+}
+
 #[tokio::test]
 async fn too_large_upload_is_rejected() {
     let pool = common::pool().await;
