@@ -428,3 +428,50 @@ async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// A Redis entry whose envelope is current but whose payload does not decode as
+/// the caller's type (a changed type after an upgrade, two deployments sharing
+/// one Redis) is a miss that refills — never a panic in the request path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l2_payload_of_another_type_is_a_miss_not_a_panic() {
+    let url = redis_url().await;
+    let writer = Cache::with_redis(1000, &url)
+        .await
+        .expect("writer connects");
+    let reader = Cache::with_redis(1000, &url)
+        .await
+        .expect("reader connects");
+
+    let stored = writer
+        .get_or_try_insert_with::<String, _, _, TestError>(
+            "typeshift",
+            "k",
+            Duration::from_secs(300),
+            || async { Ok("not a number".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored, "not a number");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let got = {
+        let calls = calls.clone();
+        reader
+            .get_or_try_insert_with::<u64, _, _, TestError>(
+                "typeshift",
+                "k",
+                Duration::from_secs(300),
+                || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                },
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        got, 42,
+        "undecodable L2 payload falls through to the factory"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

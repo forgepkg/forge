@@ -346,9 +346,9 @@ async fn singleflight_concurrent_first_downloads_converge() {
     );
 
     let after_race = mock.nupkg_hits();
-    assert!(
-        after_race >= 1,
-        "concurrent first downloads must hit upstream at least once"
+    assert_eq!(
+        after_race, 1,
+        "concurrent first downloads in one process collapse to one upstream fetch"
     );
 
     // Both racers converge on the same cached blob (CAS dedup by sha).
