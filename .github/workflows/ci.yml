@@ -23,6 +23,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep target/ small enough for a hosted runner's disk: a full-debuginfo
+  # workspace test build is ~20 GB. Line tables keep file:line in panics and
+  # backtraces; incremental artefacts are useless in a one-shot CI build.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # Used by sqlx for compile-time query verification from the cached .sqlx/ dir.
   # The `prepare` job overrides this when it needs a live database.
   SQLX_OFFLINE: "true"
@@ -60,8 +66,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -110,8 +116,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-
       - name: cargo build --workspace
         run: cargo build --workspace
       - name: cargo test --workspace
@@ -227,8 +233,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-
 
       # Pre-pull the images the testcontainers harness uses (deterministic).
       - name: Pre-pull container images
@@ -276,8 +282,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-web-e2e-
+          key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Pre-pull container images
         run: |
           docker pull postgres:17
