@@ -27,6 +27,79 @@ reverse proxy. The Medium and Low items can follow in 0.1.x.
 `v0.1.0` has not been tagged yet, so the release workflow (signing, SBOM,
 provenance) has never actually run.
 
+## Remediation status (2026-10-02)
+
+Every finding below has been fixed on this branch with a regression test,
+except where the table says otherwise. An independent review of the fixes
+then found 15 follow-up issues (one regression in the new ZIP pre-check, the
+rest low or medium); all of them are fixed as well. Operator-visible changes
+and upgrade notes are in the [0.1.0 changelog](../CHANGELOG.md#010).
+
+| Finding | Status | Commits |
+|---|---|---|
+| B1 hard-delete double decrement | Fixed; reproduced first, deterministic race tests; migration 0017 adds `CHECK (ref_count >= 0)` and repairs pre-existing drift; GC never deletes a blob an asset names | `e5dc1c9` `567d7d7` `076d896` `79b9ef8` `4d53dec` |
+| B2 `prefer_hosted` guard bypass | Fixed: ownership decided over every hosted leaf, caller-independent; e2e for anonymous and selector-scoped callers | `d10576f` |
+| B3 login-lockout memory exhaustion | Fixed: 256-byte username cap, fixed-size keys, swept entries | `ef1c95d` |
+| B4 admin tokens as admin credentials | Fixed: admin only with an explicit `admin` token scope | `6aec710` |
+| H1 DB connection held across credential forwards | Fixed: lease-based singleflight, per-realm concurrency bound, realm timeouts applied | `52188da` |
+| H2 hosted-scope retention on proxies | Fixed: rejected at validation and in the worker; proxy self-heals a missing local copy | `70dd66d` `1b6ef2b` |
+| H3 proxy not-found marker | Fixed: TTL-bound, cleared by listings, unconfirmed rows never listed and pruned | `1b6ef2b` `b275e04` |
+| H4 SPA 401 loop | Fixed | `431cc1a` |
+| M1 selector PATCH | Fixed | `b2dda5b` |
+| M2 upstream credentials after `remote_url` change | Fixed (server and UI) | `b2dda5b` `e31f2de` |
+| M3 credential forwarding follows redirects | Fixed | `52188da` |
+| M4 argon2 cost and concurrency | Fixed; timing of unknown vs. federated names equalized | `ef1c95d` `dbcfa31` |
+| M5 federated users cannot be cut off | Fixed: `PATCH /admin/users/{id}` deactivation | `f4adc41` |
+| M6 `keep_last_n` semantics | Fixed | `e0a09c3` |
+| M7 proxy eviction resets `first_seen_at` | Fixed | `72b5701` |
+| M8 group search amplification | Fixed | `383fcfc` `d10576f` |
+| M9 ZIP limits on every entry | Fixed; pre-check vets only the EOCD the reader uses | `f33977f` `7ddd59f` |
+| M10 upstream `.nuspec` passthrough | Fixed: identity check, metadata-address refusal | `c7449e6` `1b6ef2b` |
+| M11 proxy registration metadata | Fixed | `1b6ef2b` |
+| M12 `X-Forwarded-For` lines, mapped IPv6 | Fixed; mapped CIDR entries canonicalized | `ef1c95d` `8b05bd5` |
+| M13 key-rotation races | Fixed; lock guard owns the connection before locking | `24d09c6` `cebb9de` |
+| M14 plaintext left after enabling encryption | Fixed; ciphertext verified before a plaintext copy is dropped | `24d09c6` `bca4045` |
+| M15 bootstrap password removal breaks the image | Fixed: env-only bootstrap | `a9ec8f4` |
+| M16 release-pipeline trust | Fixed: sign by digest, exact identity, SHA-pinned actions, digest-pinned bases | `f332b1d` |
+| M17 admin deep links | Fixed: UI under `/manage/*`, legacy redirect | `45ead2b` `91c6a7a` |
+| M18 repository names | Fixed (server and UI) | `b2dda5b` `e31f2de` |
+| M19 GC indexes, outbox pruning | Fixed | `567d7d7` |
+| M20 legacy RBAC switches | Fixed for switches made from now on; earlier ones are an upgrade note | `b2dda5b` |
+| L1 cache first subscription | Fixed | `db7dbac` |
+| L2 multipart abort | Fixed | `8559741` |
+| L3 repository-delete gap | Fixed | `e5dc1c9` |
+| L4 publish vs. GC finalize | Fixed | `567d7d7` |
+| L5 backup wording | Fixed | `189f730` |
+| L6 token scope, nesting depth, signed-in reads | Fixed; signed-in public reach only under `anonymous_mode = "all"` | `6aec710` `b2dda5b` `fdeef48` |
+| L7 auth edge cases | Fixed (bootstrap marker, trailing-slash issuers, concurrent first OIDC logins, Host check) | `e113bfd` `4034f5b` `ef1c95d` `3ee50d6` |
+| L8 parsing edge cases | Fixed: ids lowered like .NET, ZIP directory pre-check, 1 MiB nuspec cap | `f33977f` `7c17f1c` `26e1398` |
+| L9 image and config | Fixed (numeric UID, secret env handling, exact `FORGE_CONFIG`, Basic default) | `a9ec8f4` `f332b1d` `6d960d0` |
+| L10 retention panic | Fixed | `70dd66d` |
+| L11 SPA polish | Fixed (`Retry-After` added server-side) | `45ead2b` `431cc1a` `6fd8204` |
+| L12 dependencies | Fixed: advisories removed, `cargo audit` and `pnpm audit --prod` in CI, Dependabot. **Not done:** container image OS scan (see the changelog) | `f332b1d` `9b5b6c3` |
+| L13 docs drift | Fixed | `189f730` |
+
+Additional defects found while fixing: unlist rules re-touched unlisted
+versions (`61c0bfc`); NuGet `DELETE` and redeploy race losers returned 500
+(`076d896`, `1828dc0`); lock-order deadlocks between deleters (`4d53dec`).
+
+The product gaps listed above (RBAC, retention and user-lifecycle consoles,
+anonymous web browse) are unchanged and recorded as known limitations.
+
+### Verification of the fixes
+
+All checks were run on the final tree with a fresh, private build directory.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -D warnings` (offline) | Passed |
+| `cargo test --workspace --features forge-e2e --locked` (Docker, Postgres 17, versitygw, Redis) | **948 passed, 0 failed** (75 test binaries; 778 before the fixes). The .NET smoke test skipped itself (no SDK here); CI's e2e job installs one |
+| `cargo sqlx prepare --check` against a database migrated 0001–0020 | Passed |
+| Web: `tsc`, e2e `tsc`, Vitest, `vite build` | Passed: 15 files and 110 tests |
+| `cargo audit`, `pnpm audit --prod` | No vulnerabilities (`rsa`, used only by the e2e mock issuer, is ignored with a rationale) |
+| Fail-without-fix checks | The new tests for B1, the drift guard and the redeploy race were run against the old code and failed there |
+| Not run here | Playwright browser specs (the preinstalled Chromium is older than Playwright 1.63 needs; the `web-e2e` CI job on `main` runs them) and the image build (the `docker` CI job builds it) |
+
 ## Verification performed
 
 | Check | Result |
