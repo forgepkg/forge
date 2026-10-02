@@ -10,6 +10,7 @@ use forge_db::{
     asset_dao::{self, NewAsset},
     blob_dao,
     component_dao::{self, NewComponent},
+    proxy_dao::{self, NewProxyCachedVersion},
     repository_dao::{self, NewRepository},
     retention_dao::{self, AuditRow, RunSummary},
 };
@@ -364,6 +365,44 @@ async fn load_candidate_components_returns_components_with_nupkg_blob() {
     assert_eq!(cands[0].0.component_id, with.id);
     assert_eq!(cands[0].0.version, "1.0.0");
     assert_eq!(cands[0].1, sha);
+}
+
+#[tokio::test]
+async fn load_proxy_candidates_returns_only_versions_with_cached_bytes() {
+    // Regression (M7): metadata-only rows (`downloaded = false`: listed
+    // upstream but never pulled, or already evicted) hold nothing to evict and
+    // must not be candidates, or every run "evicts" them again. Negative-cache
+    // tombstones are excluded as before.
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("pc-{n}")))
+        .await
+        .unwrap();
+    for (version, downloaded, not_found) in [
+        ("1.0.0", true, false),
+        ("2.0.0", false, false),
+        ("3.0.0", false, true),
+    ] {
+        proxy_dao::upsert_cached_version(
+            &pool,
+            NewProxyCachedVersion {
+                repository_id: repo.id,
+                name: "lib".into(),
+                version: version.into(),
+                listed: true,
+                downloaded,
+                not_found,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let cands = retention_dao::load_proxy_candidates(&pool, repo.id)
+        .await
+        .expect("load");
+    let versions: Vec<&str> = cands.iter().map(|c| c.version.as_str()).collect();
+    assert_eq!(versions, vec!["1.0.0"]);
 }
 
 #[tokio::test]

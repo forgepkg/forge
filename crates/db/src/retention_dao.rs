@@ -49,6 +49,8 @@ pub struct CandidateRow {
 }
 
 /// One proxy cached-version candidate row loaded for eviction evaluation.
+/// Only versions whose bytes are cached locally (`downloaded = true`) are
+/// candidates; see [`load_proxy_candidates`].
 #[derive(Debug, Clone)]
 pub struct ProxyCandidateRow {
     /// `proxy_cached_version.id`.
@@ -57,12 +59,10 @@ pub struct ProxyCandidateRow {
     pub name: String,
     /// Normalized version.
     pub version: String,
-    /// When the entry was first cached.
+    /// When the version was first seen upstream (the package-delay anchor).
     pub first_seen_at: DateTime<Utc>,
     /// Last pull timestamp, or `None` if never pulled.
     pub last_downloaded_at: Option<DateTime<Utc>>,
-    /// Whether the artifact bytes were downloaded (so eviction must decref a blob).
-    pub downloaded: bool,
 }
 
 /// An append-only audit row to persist after a decision is applied (or previewed).
@@ -418,8 +418,15 @@ where
         .collect())
 }
 
-/// Load the proxy cached-version candidates for a proxy repository. Only rows
-/// that are actually cached (not `not_found` tombstones) are returned.
+/// Load the proxy cached-version candidates for a proxy repository: only rows
+/// whose bytes are cached locally (`downloaded = true`, not a `not_found`
+/// tombstone).
+///
+/// Metadata-only rows (`downloaded = false`: versions seen in an upstream
+/// listing but never pulled, or already evicted) hold nothing to evict. They
+/// are excluded so a run neither "evicts" them again nor writes an audit row
+/// per never-pulled version on every pass, and so their `first_seen_at` — the
+/// package-delay anchor — is never disturbed.
 pub async fn load_proxy_candidates<'e, E>(
     executor: E,
     repository_id: i64,
@@ -429,9 +436,9 @@ where
 {
     let rows = sqlx::query!(
         r#"
-        SELECT id, name, version, first_seen_at, last_downloaded_at, downloaded
+        SELECT id, name, version, first_seen_at, last_downloaded_at
         FROM proxy_cached_version
-        WHERE repository_id = $1 AND not_found = false
+        WHERE repository_id = $1 AND downloaded AND not_found = false
         ORDER BY name, version
         "#,
         repository_id,
@@ -447,7 +454,6 @@ where
             version: r.version,
             first_seen_at: r.first_seen_at,
             last_downloaded_at: r.last_downloaded_at,
-            downloaded: r.downloaded,
         })
         .collect())
 }
