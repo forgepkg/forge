@@ -16,14 +16,22 @@
 //!   404s on direct download inside the delay window, then becomes visible; the
 //!   delay-404 is NOT written to the negative cache.
 //! * **genuine 404** — an unknown id is negatively cached (no re-fetch within
-//!   the not-found TTL).
+//!   the not-found TTL); a version marker hides a listed version only within
+//!   the TTL, an upstream listing clears it, and a version known only from a
+//!   (failed or 404) download attempt is never listed.
+//! * **self-healing cache** — a downloaded version whose local copy vanished
+//!   is fetched again.
+//! * **verified upstream bytes** — a mis-identified upstream `.nuspec` is not
+//!   served; a rejected package is not re-downloaded on every retry.
+//! * **upstream registration** — listed / published / dependency groups of
+//!   versions not downloaded yet, bounded page fetches, flat-view fallback.
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -40,17 +48,32 @@ use tokio::net::TcpListener;
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────
 
-/// Shared mock state: the package corpus + per-resource hit counters.
+/// `lower_id -> (version -> nupkg bytes)`.
+type Corpus = HashMap<String, HashMap<String, Vec<u8>>>;
+
+/// Shared mock state: the package corpus + per-resource hit counters, plus
+/// knobs to script misbehaving upstreams.
 struct MockState {
     base: String,
-    /// `lower_id -> (version -> nupkg bytes)`.
-    packages: HashMap<String, HashMap<String, Vec<u8>>>,
+    packages: Mutex<Corpus>,
     index_hits: AtomicUsize,
     flat_index_hits: AtomicUsize,
     nupkg_hits: AtomicUsize,
     nuspec_hits: AtomicUsize,
+    registration_hits: AtomicUsize,
+    registration_page_hits: AtomicUsize,
     /// When set, every route requires this `Authorization` header value.
     required_auth: Option<String>,
+    /// `(lower_id, version)` whose `.nupkg` answers 500 (a transient failure).
+    failing: Mutex<HashSet<(String, String)>>,
+    /// `(lower_id, version)` whose `.nupkg` answers 404 although listed.
+    missing: Mutex<HashSet<(String, String)>>,
+    /// `(lower_id, version)` whose `.nuspec` is served as these bytes.
+    nuspec_override: Mutex<HashMap<(String, String), Vec<u8>>>,
+    /// `lower_id -> registration index document`.
+    registrations: Mutex<HashMap<String, serde_json::Value>>,
+    /// `"{lower_id}/{file}" -> registration page document`.
+    registration_pages: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 impl MockState {
@@ -64,6 +87,15 @@ impl MockState {
                     == Some(expected.as_str())
             }
         }
+    }
+
+    fn package(&self, id: &str, version: &str) -> Option<Vec<u8>> {
+        self.packages
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|v| v.get(version))
+            .cloned()
     }
 }
 
@@ -86,6 +118,57 @@ impl MockUpstream {
     }
     fn nuspec_hits(&self) -> usize {
         self.state.nuspec_hits.load(Ordering::SeqCst)
+    }
+    fn registration_hits(&self) -> usize {
+        self.state.registration_hits.load(Ordering::SeqCst)
+    }
+    fn registration_page_hits(&self) -> usize {
+        self.state.registration_page_hits.load(Ordering::SeqCst)
+    }
+    /// Publish (or replace) a version upstream.
+    fn publish(&self, lower_id: &str, version: &str, bytes: Vec<u8>) {
+        self.state
+            .packages
+            .lock()
+            .unwrap()
+            .entry(lower_id.to_string())
+            .or_default()
+            .insert(version.to_string(), bytes);
+    }
+    fn fail_nupkg(&self, lower_id: &str, version: &str) {
+        self.state
+            .failing
+            .lock()
+            .unwrap()
+            .insert((lower_id.to_string(), version.to_string()));
+    }
+    fn miss_nupkg(&self, lower_id: &str, version: &str) {
+        self.state
+            .missing
+            .lock()
+            .unwrap()
+            .insert((lower_id.to_string(), version.to_string()));
+    }
+    fn override_nuspec(&self, lower_id: &str, version: &str, bytes: Vec<u8>) {
+        self.state
+            .nuspec_override
+            .lock()
+            .unwrap()
+            .insert((lower_id.to_string(), version.to_string()), bytes);
+    }
+    fn set_registration(&self, lower_id: &str, doc: serde_json::Value) {
+        self.state
+            .registrations
+            .lock()
+            .unwrap()
+            .insert(lower_id.to_string(), doc);
+    }
+    fn set_registration_page(&self, lower_id: &str, file: &str, doc: serde_json::Value) {
+        self.state
+            .registration_pages
+            .lock()
+            .unwrap()
+            .insert(format!("{lower_id}/{file}"), doc);
     }
 }
 
@@ -117,9 +200,14 @@ async fn serve_flat_index(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     st.flat_index_hits.fetch_add(1, Ordering::SeqCst);
-    match st.packages.get(&id) {
-        Some(vers) => {
-            let mut versions: Vec<String> = vers.keys().cloned().collect();
+    let versions = st
+        .packages
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|vers| vers.keys().cloned().collect::<Vec<_>>());
+    match versions {
+        Some(mut versions) => {
             versions.sort();
             (
                 StatusCode::OK,
@@ -139,21 +227,58 @@ async fn serve_nupkg(
     if !st.authorized(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let key = (id.clone(), version.clone());
     if file.ends_with(".nuspec") {
         st.nuspec_hits.fetch_add(1, Ordering::SeqCst);
-        return match st.packages.get(&id).and_then(|v| v.get(&version)) {
-            Some(bytes) => (StatusCode::OK, nuspec_of(bytes)).into_response(),
+        if let Some(bytes) = st.nuspec_override.lock().unwrap().get(&key) {
+            return (StatusCode::OK, bytes.clone()).into_response();
+        }
+        return match st.package(&id, &version) {
+            Some(bytes) => (StatusCode::OK, nuspec_of(&bytes)).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
     st.nupkg_hits.fetch_add(1, Ordering::SeqCst);
-    match st.packages.get(&id).and_then(|v| v.get(&version)) {
+    if st.failing.lock().unwrap().contains(&key) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if st.missing.lock().unwrap().contains(&key) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match st.package(&id, &version) {
         Some(bytes) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
-            bytes.clone(),
+            bytes,
         )
             .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn serve_registration(
+    State(st): State<Arc<MockState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    st.registration_hits.fetch_add(1, Ordering::SeqCst);
+    match st.registrations.lock().unwrap().get(&id) {
+        Some(doc) => (StatusCode::OK, axum::Json(doc.clone())).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn serve_registration_page(
+    State(st): State<Arc<MockState>>,
+    Path((id, file)): Path<(String, String)>,
+) -> impl IntoResponse {
+    st.registration_page_hits.fetch_add(1, Ordering::SeqCst);
+    match st
+        .registration_pages
+        .lock()
+        .unwrap()
+        .get(&format!("{id}/{file}"))
+    {
+        Some(doc) => (StatusCode::OK, axum::Json(doc.clone())).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -174,16 +299,13 @@ fn nuspec_of(nupkg: &[u8]) -> Vec<u8> {
 }
 
 /// Boot the mock upstream feed on an ephemeral loopback port.
-async fn start_mock(packages: HashMap<String, HashMap<String, Vec<u8>>>) -> MockUpstream {
+async fn start_mock(packages: Corpus) -> MockUpstream {
     start_mock_with_auth(packages, None).await
 }
 
 /// Like [`start_mock`], but every route answers 401 unless the request carries
 /// `Authorization: <required_auth>`.
-async fn start_mock_with_auth(
-    packages: HashMap<String, HashMap<String, Vec<u8>>>,
-    required_auth: Option<String>,
-) -> MockUpstream {
+async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -> MockUpstream {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("bind mock upstream");
@@ -192,18 +314,30 @@ async fn start_mock_with_auth(
 
     let state = Arc::new(MockState {
         base: base.clone(),
-        packages,
+        packages: Mutex::new(packages),
         index_hits: AtomicUsize::new(0),
         flat_index_hits: AtomicUsize::new(0),
         nupkg_hits: AtomicUsize::new(0),
         nuspec_hits: AtomicUsize::new(0),
+        registration_hits: AtomicUsize::new(0),
+        registration_page_hits: AtomicUsize::new(0),
         required_auth,
+        failing: Mutex::default(),
+        missing: Mutex::default(),
+        nuspec_override: Mutex::default(),
+        registrations: Mutex::default(),
+        registration_pages: Mutex::default(),
     });
 
     let app = Router::new()
         .route("/index.json", get(serve_index))
         .route("/flat/{id}/index.json", get(serve_flat_index))
         .route("/flat/{id}/{version}/{file}", get(serve_nupkg))
+        .route("/registration/{id}/index.json", get(serve_registration))
+        .route(
+            "/registration/{id}/page/{file}",
+            get(serve_registration_page),
+        )
         .with_state(state.clone());
 
     let task = tokio::spawn(async move {
@@ -516,7 +650,7 @@ async fn repo_id(pool: &PgPool, name: &str) -> i64 {
         .id
 }
 
-fn sample_corpus(version: &str) -> HashMap<String, HashMap<String, Vec<u8>>> {
+fn sample_corpus(version: &str) -> Corpus {
     let mut corpus = HashMap::new();
     let mut vers = HashMap::new();
     vers.insert(version.to_string(), sample_nupkg());
@@ -679,4 +813,565 @@ impl forge_core::repo::hosted::BlobFetch for StoreBlobs {
             .into_bytes()
             .to_vec())
     }
+}
+
+// ── Listing visibility, self-healing cache, verified upstream bytes ─────────
+
+/// A minimal `.nupkg` for `id@version`.
+fn make_nupkg(id: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let nuspec = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>test</authors>
+    <description>generated test package</description>
+  </metadata>
+</package>"#
+    );
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zw.start_file(
+        format!("{id}.nuspec"),
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zw.write_all(nuspec.as_bytes()).unwrap();
+    zw.finish().unwrap().into_inner()
+}
+
+/// A corpus of one package with generated `versions`.
+fn corpus_of(id: &str, versions: &[&str]) -> Corpus {
+    let mut corpus = Corpus::new();
+    let entry = corpus.entry(id.to_lowercase()).or_default();
+    for v in versions {
+        entry.insert(v.to_string(), make_nupkg(id, v));
+    }
+    corpus
+}
+
+fn versions_of(entries: &[forge_core::repo::VersionEntry]) -> Vec<String> {
+    entries.iter().map(|v| v.version.clone()).collect()
+}
+
+/// Versions of the single search hit for `q` (empty when there is no hit).
+async fn searched_versions(px: &ProxyRepo, repo: &str, q: &str) -> Vec<String> {
+    let result = px
+        .search(
+            repo,
+            &forge_core::repo::SearchParams {
+                q: q.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    result
+        .hits
+        .first()
+        .map(|h| versions_of(&h.versions))
+        .unwrap_or_default()
+}
+
+/// H3: requesting a version before it is released plants a not-found marker;
+/// once the upstream publishes it, the next listing refresh must clear the
+/// marker (even within `not_found_ttl`) so `index.json`, registration and
+/// search offer the release — and it downloads.
+#[tokio::test]
+async fn planted_not_found_marker_is_cleared_by_a_later_listing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "2.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+
+    // The release appears upstream; a fresh cache stands in for an expired
+    // metadata TTL (the not-found TTL of 600 s has NOT elapsed).
+    mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"],
+        "an upstream listing containing the version clears its marker"
+    );
+    assert_eq!(
+        px.registration(&repo, "Contoso.Lib").await.unwrap().len(),
+        2
+    );
+    assert_eq!(
+        searched_versions(&px, &repo, "contoso").await,
+        ["1.0.0", "2.0.0"]
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "2.0.0")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// H3: a download attempt that fails with an upstream 5xx must not leave a
+/// phantom version behind for floating ranges to resolve to.
+#[tokio::test]
+async fn failed_download_does_not_list_a_phantom_version() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    mock.fail_nupkg("contoso.lib", "9.9.9");
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "9.9.9")
+        .await
+        .is_err());
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    let reg = px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(reg.len(), 1, "{reg:?}");
+    assert_eq!(searched_versions(&px, &repo, "contoso").await, ["1.0.0"]);
+}
+
+/// H3: a not-found marker on a listed version hides it from listings only
+/// within `not_found_ttl`.
+#[tokio::test]
+async fn listings_honour_not_found_only_within_the_ttl() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "1.1.0"])).await;
+    // Listed upstream, but the package itself 404s (e.g. replication lag).
+    mock.miss_nupkg("contoso.lib", "1.1.0");
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "1.1.0"]
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.1.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "a live marker hides the version"
+    );
+
+    sqlx::query(
+        "UPDATE proxy_cached_version SET not_found_at = now() - interval '2 hours' \
+         WHERE name = 'contoso.lib' AND version = '1.1.0'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "1.1.0"],
+        "an expired marker hides nothing (the listing is still cached)"
+    );
+    assert_eq!(
+        px.registration(&repo, "Contoso.Lib").await.unwrap().len(),
+        2
+    );
+}
+
+/// H3: a row planted by an early request must not count towards the package
+/// delay of the release that later appears: its delay window starts at the
+/// first upstream confirmation.
+#[tokio::test]
+async fn planted_row_does_not_shorten_the_package_delay() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "2.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    // Pretend the request happened long ago.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE name = 'contoso.lib' AND version = '2.0.0'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(
+        px.list_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap()
+            .is_empty(),
+        "both versions are inside the delay window"
+    );
+    let row = forge_db::proxy_dao::get_cached_version(
+        &pool,
+        repo_id(&pool, &repo).await,
+        "contoso.lib",
+        "2.0.0",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!row.not_found);
+    assert!(
+        chrono::Utc::now() - row.first_seen_at < chrono::Duration::minutes(5),
+        "the delay window restarts at the first upstream sighting, got {}",
+        row.first_seen_at
+    );
+}
+
+/// H2: a row marked downloaded whose local copy was deleted (retention) is
+/// fetched again instead of 404ing forever; a row whose `downloaded` flag was
+/// reset (proxy eviction) is re-fetched too. `first_seen_at` survives both.
+#[tokio::test]
+async fn missing_local_copy_is_fetched_again() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let repo_id = repo_id(&pool, &repo).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    // Discover and clear the delay window.
+    assert!(px
+        .list_versions(&repo, "Sample.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let first_seen = |pool: PgPool| async move {
+        forge_db::proxy_dao::get_cached_version(&pool, repo_id, "sample.lib", "1.2.3")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let before = first_seen(pool.clone()).await.first_seen_at;
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.nupkg_hits(), 1);
+
+    // Retention hard-deleted the component but left the row `downloaded`.
+    sqlx::query("DELETE FROM component WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        px.resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+            .await
+            .unwrap()
+            .is_some(),
+        "a vanished local copy is re-fetched"
+    );
+    assert_eq!(mock.nupkg_hits(), 2);
+    let row = first_seen(pool.clone()).await;
+    assert!(row.downloaded);
+    assert_eq!(row.first_seen_at, before);
+    // Served locally again afterwards.
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.nupkg_hits(), 2);
+
+    // Eviction that keeps the row but resets `downloaded`.
+    sqlx::query("DELETE FROM component WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE proxy_cached_version SET downloaded = false WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Sample.Lib").await.unwrap()),
+        ["1.2.3"],
+        "an evicted version stays listed (no new delay window)"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.nupkg_hits(), 3);
+    assert_eq!(first_seen(pool).await.first_seen_at, before);
+}
+
+/// M9: an upstream package rejected for its content (here: not a zip) is
+/// remembered, so client retries fail fast instead of re-downloading it.
+#[tokio::test]
+async fn rejected_upstream_package_is_not_downloaded_on_every_retry() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = Corpus::new();
+    corpus
+        .entry("broken.pkg".into())
+        .or_default()
+        .insert("1.0.0".into(), b"definitely not a zip".to_vec());
+    let mock = start_mock(corpus).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let first = px
+        .resolve_nupkg(&repo, "Broken.Pkg", "1.0.0")
+        .await
+        .expect_err("unparseable package");
+    assert!(
+        first.to_string().contains("parse upstream nupkg"),
+        "{first}"
+    );
+    assert_eq!(mock.nupkg_hits(), 1);
+
+    let again = px
+        .resolve_nupkg(&repo, "Broken.Pkg", "1.0.0")
+        .await
+        .expect_err("still rejected");
+    assert!(again.to_string().contains("rejected recently"), "{again}");
+    assert_eq!(mock.nupkg_hits(), 1, "no second download within the TTL");
+}
+
+/// M10: an upstream `.nuspec` is served only when it is a manifest of exactly
+/// the requested identity; otherwise the proxy falls back to the (verified)
+/// package and serves its manifest.
+#[tokio::test]
+async fn upstream_nuspec_must_name_the_requested_package() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let blobs: Arc<dyn forge_core::repo::hosted::BlobFetch> =
+        Arc::new(StoreBlobs(common::blob_store().await));
+
+    let genuine = nuspec_of(&sample_nupkg());
+    for bogus in [
+        nuspec_of(&make_nupkg("Evil.Pkg", "1.2.3")),
+        nuspec_of(&make_nupkg("Sample.Lib", "6.6.6")),
+        br#"{"Code":"Success","AccessKeyId":"ASIA..."}"#.to_vec(),
+    ] {
+        let mock = start_mock(sample_corpus("1.2.3")).await;
+        mock.override_nuspec("sample.lib", "1.2.3", bogus.clone());
+        let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128)).with_blob_fetch(blobs.clone());
+
+        let served = px
+            .resolve_nuspec(&repo, "Sample.Lib", "1.2.3")
+            .await
+            .unwrap()
+            .expect("manifest from the verified package");
+        assert_ne!(served, bogus);
+        assert_eq!(served, genuine);
+        assert_eq!(mock.nupkg_hits(), 1, "fell back to the package");
+    }
+}
+
+/// M11: registration of versions not downloaded yet takes `listed`,
+/// `published` and the dependency groups from the upstream registration; the
+/// listing state also reaches the flat index and search. Cached for the TTL.
+#[tokio::test]
+async fn registration_uses_upstream_metadata_for_versions_not_downloaded() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0"])).await;
+    mock.set_registration(
+        "contoso.lib",
+        serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": format!("{}/registration/contoso.lib/index.json#page/1.0.0/2.0.0", mock.base),
+                "lower": "1.0.0",
+                "upper": "2.0.0",
+                "count": 2,
+                "items": [
+                    { "catalogEntry": {
+                        "id": "Contoso.Lib", "version": "1.0.0", "listed": false,
+                        "published": "1900-01-01T00:00:00+00:00", "dependencyGroups": []
+                    } },
+                    { "catalogEntry": {
+                        "id": "Contoso.Lib", "version": "2.0.0",
+                        "published": "2026-05-01T10:00:00+00:00",
+                        "dependencyGroups": [ {
+                            "targetFramework": "net8.0",
+                            "dependencies": [ { "id": "Newtonsoft.Json", "range": "[13.0.1, )" } ]
+                        } ]
+                    } }
+                ]
+            }]
+        }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let reg = px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(reg.len(), 2);
+    assert_eq!(reg[0].version, "1.0.0");
+    assert!(!reg[0].listed, "upstream-unlisted version is unlisted");
+    assert!(reg[1].listed);
+    assert_eq!(reg[1].original_id, "Contoso.Lib");
+    assert_eq!(
+        reg[1].published,
+        Some("2026-05-01T10:00:00Z".parse().unwrap())
+    );
+    let groups = forge_nuget::nuspec::dependency_groups_from_nuspec(
+        reg[1].nuspec_bytes.as_deref().expect("dependency groups"),
+    )
+    .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].target_framework.as_deref(), Some("net8.0"));
+    assert_eq!(groups[0].dependencies[0].id, "Newtonsoft.Json");
+    assert_eq!(
+        groups[0].dependencies[0].range.as_deref(),
+        Some("[13.0.1, )")
+    );
+    assert_eq!(mock.nupkg_hits(), 0, "no package download for metadata");
+
+    // The listing state is persisted for the flat index and search.
+    let listed: Vec<(String, bool)> = px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.version, v.listed))
+        .collect();
+    assert_eq!(
+        listed,
+        [("1.0.0".to_string(), false), ("2.0.0".to_string(), true)]
+    );
+    assert_eq!(searched_versions(&px, &repo, "contoso").await, ["2.0.0"]);
+
+    // Cached for the metadata TTL.
+    px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(mock.registration_hits(), 1);
+}
+
+/// M11: non-inlined registration pages are fetched newest first and bounded
+/// per request; older versions keep the flat-container view. Pages are cached.
+#[tokio::test]
+async fn registration_pages_are_fetched_bounded_and_cached() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let versions: Vec<String> = (1..=12).map(|n| format!("{n}.0.0")).collect();
+    let refs: Vec<&str> = versions.iter().map(String::as_str).collect();
+    let mock = start_mock(corpus_of("Contoso.Lib", &refs)).await;
+    let pages: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "@id": format!("{}/registration/contoso.lib/page/{v}.json", mock.base),
+                "lower": v, "upper": v, "count": 1,
+            })
+        })
+        .collect();
+    mock.set_registration(
+        "contoso.lib",
+        serde_json::json!({ "count": pages.len(), "items": pages }),
+    );
+    for v in &versions {
+        mock.set_registration_page(
+            "contoso.lib",
+            &format!("{v}.json"),
+            serde_json::json!({ "items": [ { "catalogEntry": {
+                "id": "Contoso.Lib", "version": v, "listed": true,
+                "dependencyGroups": [ { "dependencies": [ { "id": format!("Dep.{v}") } ] } ]
+            } } ] }),
+        );
+    }
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let reg = px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(reg.len(), 12);
+    assert_eq!(mock.registration_page_hits(), 10, "bounded page fetches");
+    let with_deps: Vec<&str> = reg
+        .iter()
+        .filter(|e| e.nuspec_bytes.is_some())
+        .map(|e| e.version.as_str())
+        .collect();
+    assert_eq!(with_deps.len(), 10);
+    assert!(!with_deps.contains(&"1.0.0") && !with_deps.contains(&"2.0.0"));
+    let newest = forge_nuget::nuspec::dependency_groups_from_nuspec(
+        reg[11].nuspec_bytes.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(newest[0].target_framework, None);
+    assert_eq!(newest[0].dependencies[0].id, "Dep.12.0.0");
+
+    px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(mock.registration_page_hits(), 10, "pages are cached");
+    assert_eq!(mock.registration_hits(), 1);
+}
+
+/// M11: without an upstream registration the flat-container view is served
+/// (listed, no dependency groups), as before.
+#[tokio::test]
+async fn registration_without_upstream_registration_keeps_the_flat_view() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let reg = px.registration(&repo, "Contoso.Lib").await.unwrap();
+    assert_eq!(reg.len(), 1);
+    assert!(reg[0].listed);
+    assert!(reg[0].nuspec_bytes.is_none());
+    assert!(reg[0].published.is_none());
+    assert_eq!(mock.registration_hits(), 1);
+}
+
+/// L8: ids are lowercased like NuGet clients do (`ToLowerInvariant`), so a
+/// package with non-ASCII capitals resolves upstream and caches.
+#[tokio::test]
+async fn unicode_package_ids_resolve_like_nuget_clients() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Ünicode.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Ünicode.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "ÜNICODE.LIB", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(px
+        .resolve_nupkg(&repo, "ünicode.lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.nupkg_hits(), 1, "both spellings hit one cached copy");
 }

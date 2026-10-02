@@ -218,7 +218,10 @@ pub async fn search_packages(
                     all.push(BrowseItem {
                         repo: repo.name.clone(),
                         repo_kind: repo.kind.clone(),
-                        id: hit.original_id.to_ascii_lowercase(),
+                        id: state
+                            .formats
+                            .for_repository(repo)
+                            .lower_id(&hit.original_id),
                         original_id: hit.original_id,
                         latest_version: hit.latest_version,
                         listed: true,
@@ -471,6 +474,7 @@ async fn delayed_proxy_versions(
         SELECT version, listed, first_seen_at
         FROM proxy_cached_version
         WHERE repository_id = $1 AND name = $2 AND version <> '*' AND not_found = false
+          AND confirmed
         "#,
         repo.id,
         lower_id,
