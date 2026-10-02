@@ -6,11 +6,18 @@
 //! `encryption_key_one_active` guarantees at most one `active` key per
 //! layer+scope, and [`PgKeyStore::insert_active`] flips the previous active key
 //! to `retiring` in the same transaction so a rotation can never leave zero or
-//! two active keys. Two instances rotating concurrently serialize on a
-//! transaction-scoped advisory lock keyed by layer+scope (the plan's
-//! "advisory-locked create-if-absent" bootstrap); the loser of any remaining
-//! race is rejected by the unique constraints and surfaces as
-//! [`CryptoError::Store`].
+//! two active keys.
+//!
+//! Every mutation that creates or moves a parent reference (inserting a key,
+//! the compare-and-swap re-wrap, the commit-time-checked KEK revocation) runs
+//! in a transaction holding one **scope-wide** transaction-scoped advisory lock
+//! ([`lock_scope`]). Under READ COMMITTED each statement after the lock sees
+//! everything earlier lock holders committed, so the "parent is not revoked" /
+//! "nothing references this KEK" checks are evaluated against committed state
+//! and cannot interleave: a DEK is never wrapped under a revoked KEK, however
+//! rotations on different instances race. The loser of any remaining race
+//! (e.g. two concurrent first inserts) is rejected by the unique constraints
+//! and surfaces as [`CryptoError::Store`].
 
 use async_trait::async_trait;
 use forge_crypto::envelope::Algorithm;
@@ -71,18 +78,17 @@ impl Row {
     }
 }
 
-/// Serialize key-row mutations of one layer+scope across instances: a
-/// transaction-scoped advisory lock (released automatically at commit/rollback,
-/// so a crash can never leak it). The key hashes a namespaced string so it
-/// cannot collide with other forge advisory-lock users.
-async fn lock_layer_scope(
+/// Serialize key-row mutations of one scope across instances (both layers: a
+/// DEK's parent check must not interleave with a KEK revocation): a
+/// transaction-scoped advisory lock, released automatically at
+/// commit/rollback, so a crash can never leak it. The key hashes a namespaced
+/// string so it cannot collide with other forge advisory-lock users.
+async fn lock_scope(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    layer: KeyLayer,
     scope: &str,
 ) -> Result<(), CryptoError> {
     sqlx::query!(
-        r#"SELECT pg_advisory_xact_lock(hashtextextended('forge.encryption_key.' || $1 || '.' || $2, 0))"#,
-        layer.as_str(),
+        r#"SELECT pg_advisory_xact_lock(hashtextextended('forge.encryption_key.scope.' || $1, 0))"#,
         scope,
     )
     .execute(&mut **tx)
@@ -91,11 +97,45 @@ async fn lock_layer_scope(
     Ok(())
 }
 
+/// Refuse a DEK insert whose wrapping KEK is missing or revoked. Must run
+/// under [`lock_scope`], so a concurrent revocation is either visible here or
+/// waits for this transaction (and then sees the new DEK's reference).
+async fn check_dek_parent(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new: &NewKeyRecord,
+) -> Result<(), CryptoError> {
+    let (KeyLayer::Dek, Some(kek_version)) = (new.layer, new.wrapping_kek_version) else {
+        return Ok(());
+    };
+    let usable = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM encryption_key
+            WHERE layer = 'kek' AND scope = $1 AND version = $2 AND state <> 'revoked'
+        ) AS "usable!"
+        "#,
+        new.scope,
+        kek_version,
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(store_err)?;
+    if usable {
+        Ok(())
+    } else {
+        Err(CryptoError::KeyRevoked {
+            layer: "kek",
+            version: kek_version,
+        })
+    }
+}
+
 #[async_trait]
 impl KeyStore for PgKeyStore {
     async fn insert_active(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
-        lock_layer_scope(&mut tx, new.layer, &new.scope).await?;
+        lock_scope(&mut tx, &new.scope).await?;
+        check_dek_parent(&mut tx, &new).await?;
 
         // Retire the current active key (if any)…
         sqlx::query!(
@@ -143,7 +183,7 @@ impl KeyStore for PgKeyStore {
 
     async fn insert_active_if_absent(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
-        lock_layer_scope(&mut tx, new.layer, &new.scope).await?;
+        lock_scope(&mut tx, &new.scope).await?;
 
         // Under the lock, the check-then-insert is race-free.
         let existing = sqlx::query_as!(
@@ -165,6 +205,7 @@ impl KeyStore for PgKeyStore {
             tx.commit().await.map_err(store_err)?;
             return row.into_record();
         }
+        check_dek_parent(&mut tx, &new).await?;
 
         let row = sqlx::query_as!(
             Row,
@@ -269,32 +310,73 @@ impl KeyStore for PgKeyStore {
 
     async fn update_wrapped(
         &self,
-        id: i64,
+        current: &KeyRecord,
         wrapped_key: &[u8],
         root_key_id: Option<&str>,
         root_key_version: Option<&str>,
         wrapping_kek_version: Option<i32>,
-    ) -> Result<(), CryptoError> {
+    ) -> Result<bool, CryptoError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        lock_scope(&mut tx, &current.scope).await?;
+        // Compare-and-swap on the row as the caller read it (wrapped bytes +
+        // parent reference), never onto a revoked row, and — for a DEK — only
+        // under a KEK that is still usable at commit time.
         let res = sqlx::query!(
             r#"
-            UPDATE encryption_key
+            UPDATE encryption_key AS e
             SET wrapped_key = $2, root_key_id = $3, root_key_version = $4,
                 wrapping_kek_version = $5
-            WHERE id = $1
+            WHERE e.id = $1
+              AND e.state <> 'revoked'
+              AND e.wrapped_key = $6
+              AND e.root_key_version IS NOT DISTINCT FROM $7
+              AND e.wrapping_kek_version IS NOT DISTINCT FROM $8
+              AND ($5::int4 IS NULL OR EXISTS (
+                    SELECT 1 FROM encryption_key k
+                    WHERE k.layer = 'kek' AND k.scope = e.scope
+                      AND k.version = $5 AND k.state <> 'revoked'))
             "#,
-            id,
+            current.id,
             wrapped_key,
             root_key_id,
             root_key_version,
             wrapping_kek_version,
+            current.wrapped_key,
+            current.root_key_version,
+            current.wrapping_kek_version,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(store_err)?;
-        if res.rows_affected() == 0 {
-            return Err(CryptoError::Store(format!("no encryption_key row id {id}")));
-        }
-        Ok(())
+        tx.commit().await.map_err(store_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    async fn revoke_kek_if_unreferenced(&self, kek: &KeyRecord) -> Result<bool, CryptoError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        lock_scope(&mut tx, &kek.scope).await?;
+        // Reference check and state flip in one statement under the scope
+        // lock: every re-wrap/insert that names this KEK either committed
+        // before (and is seen here) or waits for this transaction (and then
+        // finds the KEK revoked).
+        let res = sqlx::query!(
+            r#"
+            UPDATE encryption_key AS k
+            SET state = 'revoked', rotated_at = COALESCE(k.rotated_at, now())
+            WHERE k.id = $1 AND k.layer = 'kek' AND k.state = 'retiring'
+              AND NOT EXISTS (
+                    SELECT 1 FROM encryption_key d
+                    WHERE d.layer = 'dek' AND d.scope = k.scope
+                      AND d.state <> 'revoked'
+                      AND d.wrapping_kek_version = k.version)
+            "#,
+            kek.id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn set_state(&self, id: i64, state: KeyState) -> Result<(), CryptoError> {

@@ -782,6 +782,10 @@ async fn group_member_validation() {
 
 // ── §12.5: secret encryption at rest ────────────────────────────────────────
 
+/// Serializes the crypto-enabled tests of this binary: they share the
+/// cluster-wide rotation advisory lock (and the `default` key scope).
+static CRYPTO_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Root-key env var for the crypto-enabled server below. One fixed key for the
 /// whole test binary: the Postgres container (and so the `encryption_key`
 /// rows) is shared, so every crypto-enabled server must reach the same root.
@@ -799,6 +803,7 @@ fn ensure_crypto_root_env() -> &'static str {
 /// decrypting to the original value.
 #[tokio::test]
 async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
+    let _serial = CRYPTO_SERIAL.lock().await;
     let var = ensure_crypto_root_env();
     let crypto_block = format!(
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
@@ -947,6 +952,86 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
         forge_crypto::ExposeSecret::expose_secret(&secret),
         "s3cret-at-rest"
     );
+}
+
+/// Review M13: admin rotations take the rotation worker's cluster-wide
+/// advisory lock, so a rotation requested while another one (the worker, or
+/// an admin request on another instance) is running gets 409 instead of
+/// racing it; once the lock is free the same request succeeds.
+#[tokio::test]
+async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}", common::unique());
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+
+    // Another holder of the rotation lock (as the worker's pass would be).
+    let mut holder = srv.pool.acquire().await.unwrap();
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(forge_server::crypto::ROTATION_LOCK_KEY)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    assert!(got, "test must hold the rotation lock");
+
+    for layer in ["dek", "kek", "root"] {
+        let resp = client
+            .post(format!("{}/admin/crypto/rotate/{layer}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "rotate/{layer} must not run while a rotation holds the lock"
+        );
+    }
+    // An unknown layer is still a plain 400, lock or not.
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/bogus", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(forge_server::crypto::ROTATION_LOCK_KEY)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    drop(holder);
+
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/kek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "free lock: the rotation runs");
+    // …and released it again: a second rotation is not locked out.
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/root", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the admin rotation released the lock");
 }
 
 /// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports

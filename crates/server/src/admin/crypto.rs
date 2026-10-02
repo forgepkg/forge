@@ -15,6 +15,11 @@
 //! When encryption is disabled, `keys` reports `enabled: false` and rotation
 //! returns **409 Conflict** (the operator asked for something the deployment
 //! is not configured to do).
+//!
+//! Rotations take the same cluster-wide advisory lock as the background
+//! rotation worker ([`crate::crypto::try_rotation_lock`]), so at most one
+//! rotation (admin or worker, on any instance) runs at a time; a request that
+//! finds it taken gets **409 Conflict** and can simply be retried.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -75,6 +80,15 @@ fn crypto_error(e: impl std::fmt::Display) -> Response {
         .into_response()
 }
 
+fn rotation_in_progress() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "a key rotation is already running (the rotation worker or another admin \
+         request); retry shortly",
+    )
+        .into_response()
+}
+
 fn disabled() -> Response {
     (
         StatusCode::CONFLICT,
@@ -104,10 +118,17 @@ pub async fn list_keys(State(state): State<AppState>) -> Response {
         Ok(p) => p,
         Err(e) => return crypto_error(e),
     };
+    let realm_backfill_pending =
+        match secret_dao::plaintext_realm_secrets_pending(&state.pool, crate::auth::secret_keys)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return crypto_error(e),
+        };
     Json(json!({
         "enabled": true,
         "root_key_version": root_version,
-        "plaintext_backfill_pending": backfill_pending,
+        "plaintext_backfill_pending": backfill_pending || realm_backfill_pending,
         "keys": keys,
     }))
     .into_response()
@@ -118,8 +139,30 @@ pub async fn rotate(State(state): State<AppState>, Path(layer): Path<String>) ->
     let Some(envelope) = &state.envelope else {
         return disabled();
     };
+    if !matches!(layer.as_str(), "dek" | "kek" | "root") {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown rotation layer {layer:?} (expected dek|kek|root)"),
+        )
+            .into_response();
+    }
+    let lock = match crate::crypto::try_rotation_lock(&state.pool).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return rotation_in_progress(),
+        Err(e) => return crypto_error(format!("{e:#}")),
+    };
+    let response = rotate_locked(&state, envelope, &layer).await;
+    lock.release().await;
+    response
+}
 
-    match layer.as_str() {
+/// The rotation itself, run while holding the cluster-wide rotation lock.
+async fn rotate_locked(
+    state: &AppState,
+    envelope: &forge_crypto::service::EnvelopeService,
+    layer: &str,
+) -> Response {
+    match layer {
         "dek" => {
             let rec = match envelope.rotate_dek().await {
                 Ok(r) => r,
