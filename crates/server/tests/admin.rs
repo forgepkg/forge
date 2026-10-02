@@ -199,8 +199,9 @@ async fn remote_url_scheme_guarded_private_accepted() {
     assert_eq!(resp.status(), 201, "loopback remote_url is accepted");
 }
 
-/// Token issue returns the plaintext **once**; the issued token then
-/// authenticates against the admin API; revoke disables it.
+/// Token issue returns the plaintext **once**; an admin-scoped token then
+/// authenticates against the admin API (an unscoped one is refused, see
+/// [`unscoped_admin_token_cannot_use_admin_api`]); revoke disables it.
 #[tokio::test]
 async fn token_issue_use_and_revoke() {
     let srv = common::start().await;
@@ -226,11 +227,11 @@ async fn token_issue_use_and_revoke() {
         .as_i64()
         .unwrap();
 
-    // Issue a token.
+    // Issue an admin-scoped (automation) token.
     let resp = client
         .post(format!("{}/admin/users/{admin_id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&json!({"name": "ci"}))
+        .json(&json!({"name": "ci", "scope": {"actions": ["admin"]}}))
         .send()
         .await
         .unwrap();
@@ -239,6 +240,7 @@ async fn token_issue_use_and_revoke() {
     let token = body["token"].as_str().unwrap().to_string();
     let token_id = body["id"].as_i64().unwrap();
     assert!(!token.is_empty());
+    assert_eq!(body["scope"], json!({"actions": ["admin"]}), "scope echoed");
 
     // The token authenticates via the X-NuGet-ApiKey header on the admin API.
     let resp = client
@@ -266,6 +268,292 @@ async fn token_issue_use_and_revoke() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "revoked token must be rejected");
+}
+
+/// Look up the bootstrap admin's user id.
+async fn admin_id(srv: &common::TestServer) -> i64 {
+    let (u, p) = srv.admin_basic();
+    let users: Value = srv
+        .client()
+        .get(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["username"] == json!(u))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap()
+}
+
+/// Issue a token for the bootstrap admin with an optional scope (as the
+/// admin, password-authenticated); returns the plaintext secret.
+async fn admin_token_with_scope(srv: &common::TestServer, scope: Option<Value>) -> String {
+    let (u, p) = srv.admin_basic();
+    let id = admin_id(srv).await;
+    let mut body = json!({"name": "b4"});
+    if let Some(scope) = scope {
+        body["scope"] = scope;
+    }
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_string()
+}
+
+/// B4: an admin's **unscoped** API token is not an admin credential: it cannot
+/// mint tokens or create users (403), so a leaked feed token cannot outlive
+/// its own revocation. It keeps its owner's feed reach.
+#[tokio::test]
+async fn unscoped_admin_token_cannot_use_admin_api() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    // Both the legacy "no scope" and an empty scope object.
+    for scope in [
+        None,
+        Some(json!({})),
+        Some(json!({"actions": ["read", "write", "delete"]})),
+    ] {
+        let token = admin_token_with_scope(&srv, scope.clone()).await;
+
+        let resp = client
+            .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+            .header("X-NuGet-ApiKey", &token)
+            .json(&json!({"name": "minted-by-token"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{scope:?}: token must not mint tokens");
+
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .header("X-NuGet-ApiKey", &token)
+            .json(&json!({
+                "username": format!("evil{}", common::unique()),
+                "password": "pw123456",
+                "is_admin": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{scope:?}: token must not create users");
+
+        let resp = client
+            .get(format!("{}/admin/repositories", srv.base_url))
+            .header("X-NuGet-ApiKey", &token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{scope:?}: no admin reads either");
+    }
+
+    // The unscoped token still publishes (the owner's write reach is kept).
+    let repo = format!("b4feed{}", common::unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(srv.admin_basic().0, Some(srv.admin_basic().1))
+        .json(&json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let token = admin_token_with_scope(&srv, None).await;
+    let form = reqwest::multipart::Form::new().part(
+        "package",
+        reqwest::multipart::Part::bytes(common::make_nupkg("B4.Pkg", "1.0.0"))
+            .file_name("package.nupkg")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+    let resp = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "unscoped admin token still publishes");
+
+    // The password principal is unaffected.
+    let (u, p) = srv.admin_basic();
+    let resp = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "by-password"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "password admin mints tokens");
+}
+
+/// B4: a token whose scope explicitly lists `admin` (and does not restrict
+/// repositories) may call the admin API, including minting tokens; a
+/// repo-restricted admin scope may not.
+#[tokio::test]
+async fn admin_scoped_token_can_use_admin_api() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    let token = admin_token_with_scope(&srv, Some(json!({"actions": ["admin"]}))).await;
+    let resp = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .json(&json!({"name": "minted-by-admin-token"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "admin-scoped token mints tokens");
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .json(&json!({
+            "username": format!("automated{}", common::unique()),
+            "password": "pw123456",
+            "is_admin": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "admin-scoped token creates users");
+
+    let repo_id = repository_dao::insert_repository(
+        &srv.pool,
+        NewRepository::hosted(format!("b4scoped{}", common::unique())),
+    )
+    .await
+    .unwrap()
+    .id;
+    let token = admin_token_with_scope(
+        &srv,
+        Some(json!({"actions": ["admin"], "repositories": [repo_id]})),
+    )
+    .await;
+    let resp = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .json(&json!({"name": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "repo-restricted scope is never global admin"
+    );
+}
+
+/// L6: token views carry the stored scope, and a scope with an unknown key is
+/// rejected instead of issuing (or leaving) an unscoped token.
+#[tokio::test]
+async fn token_scope_is_listed_and_unknown_keys_rejected() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    let resp = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "typo", "scope": {"repos": [3]}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "mistyped scope key must be rejected, got {}",
+        resp.status()
+    );
+    let resp = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "typo", "scop": {"actions": ["read"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "mistyped top-level key must be rejected, got {}",
+        resp.status()
+    );
+
+    let name = format!("scoped{}", common::unique());
+    let created: Value = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": name, "scope": {"actions": ["read"]}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = created["id"].as_i64().unwrap();
+    assert_eq!(created["scope"], json!({"actions": ["read"]}));
+
+    let list: Value = client
+        .get(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == json!(token_id))
+        .expect("token listed");
+    assert_eq!(listed["scope"], json!({"actions": ["read"]}));
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t.get("scope").is_some()));
+
+    // PATCH with a mistyped key is rejected and leaves the scope in place.
+    for body in [
+        json!({"scope": {"repos": [1]}}),
+        json!({"scop": {"actions": ["write"]}}),
+    ] {
+        let resp = client
+            .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "{body}: {}", resp.status());
+    }
+    let stored = forge_db::token_dao::find_token_by_id(&srv.pool, token_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .scope;
+    assert_eq!(
+        stored,
+        Some(json!({"actions": ["read"]})),
+        "scope unchanged"
+    );
 }
 
 /// Deleting a **proxy** repository that has cached packages must decrement the
@@ -962,5 +1250,525 @@ async fn reauth_revokes_sessions() {
         me().await.unwrap().status(),
         401,
         "reauth kills the live session"
+    );
+}
+
+// ── repository update semantics (M2), names (M18), anonymous_read (M20) ─────
+
+/// Whether any password (plaintext column or sealed blob) is stored. Tests on
+/// a crypto-less server use this rather than the plaintext column: a
+/// crypto-enabled server started by a parallel test backfills plaintext
+/// passwords of the shared database into sealed blobs.
+async fn has_password(pool: &sqlx::PgPool, id: i64) -> bool {
+    let (_, pw, enc, ..) = stored_creds(pool, id).await;
+    pw.is_some() || enc
+}
+
+/// The stored credential columns of a repository:
+/// `(username, plaintext password, has encrypted blob, metadata ttl, not-found ttl)`.
+async fn stored_creds(
+    pool: &sqlx::PgPool,
+    id: i64,
+) -> (
+    Option<String>,
+    Option<String>,
+    bool,
+    Option<i32>,
+    Option<i32>,
+) {
+    let row = sqlx::query!(
+        r#"
+        SELECT upstream_username, upstream_password, upstream_password_enc,
+               metadata_ttl_seconds, not_found_ttl_seconds
+        FROM repository WHERE id = $1
+        "#,
+        id
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        row.upstream_username,
+        row.upstream_password,
+        row.upstream_password_enc.is_some(),
+        row.metadata_ttl_seconds,
+        row.not_found_ttl_seconds,
+    )
+}
+
+/// Create a proxy with credentials and TTLs via the admin API; returns its id.
+async fn create_cred_proxy(srv: &common::TestServer, name: &str, url: &str) -> i64 {
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": url,
+            "upstream_username": "svc",
+            "upstream_password": "private-pat",
+            "metadata_ttl_seconds": 60,
+            "not_found_ttl_seconds": 30,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap()
+}
+
+async fn put_repo(srv: &common::TestServer, name: &str, body: Value) -> reqwest::Response {
+    let (u, p) = srv.admin_basic();
+    srv.client()
+        .put(format!("{}/admin/repositories/{name}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// M2: update body semantics — absent keeps, `null` clears (TTLs fall back to
+/// the default), a value sets.
+#[tokio::test]
+async fn repo_update_absent_keeps_null_clears() {
+    let srv = common::start().await;
+    let name = format!("credsem{}", common::unique());
+    let id = create_cred_proxy(&srv, &name, "https://feed.example.com/v3/index.json").await;
+
+    // Absent fields keep everything (incl. the password).
+    let resp = put_repo(&srv, &name, json!({"online": true})).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(false));
+    assert_eq!(body["has_upstream_password"], json!(true));
+    let (user, _, _, meta, nf) = stored_creds(&srv.pool, id).await;
+    assert_eq!(
+        (user.as_deref(), meta, nf),
+        (Some("svc"), Some(60), Some(30))
+    );
+    assert!(has_password(&srv.pool, id).await, "password kept");
+
+    // A value sets.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"upstream_username": "svc2", "metadata_ttl_seconds": 120}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let (user, _, _, meta, nf) = stored_creds(&srv.pool, id).await;
+    assert_eq!(
+        (user.as_deref(), meta, nf),
+        (Some("svc2"), Some(120), Some(30))
+    );
+    assert!(has_password(&srv.pool, id).await, "password kept");
+
+    // `null` clears each of the four fields.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({
+            "upstream_username": null,
+            "upstream_password": null,
+            "metadata_ttl_seconds": null,
+            "not_found_ttl_seconds": null,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_username"], Value::Null);
+    assert_eq!(body["has_upstream_password"], json!(false));
+    assert_eq!(body["metadata_ttl_seconds"], Value::Null);
+    assert_eq!(body["not_found_ttl_seconds"], Value::Null);
+    assert_eq!(
+        stored_creds(&srv.pool, id).await,
+        (None, None, false, None, None)
+    );
+}
+
+/// M2: credentials stay with their origin. A same-origin path change keeps
+/// them; a different host, scheme or port drops username and password unless
+/// the request sets a new password, and the response says so.
+#[tokio::test]
+async fn repo_update_origin_change_drops_credentials() {
+    let srv = common::start().await;
+    let name = format!("credorigin{}", common::unique());
+    let id = create_cred_proxy(&srv, &name, "https://feed.example.com/v3/index.json").await;
+
+    // Same origin (default port spelled out), different path: kept.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://FEED.example.com:443/other/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(false));
+    assert_eq!(stored_creds(&srv.pool, id).await.0.as_deref(), Some("svc"));
+    assert!(has_password(&srv.pool, id).await, "password kept");
+
+    // A new origin with a new password: the new credentials are kept.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({
+            "remote_url": "https://mirror.example.net/v3/index.json",
+            "upstream_username": "mirror",
+            "upstream_password": "mirror-pat",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(false));
+    assert_eq!(
+        stored_creds(&srv.pool, id).await.0.as_deref(),
+        Some("mirror")
+    );
+    assert!(has_password(&srv.pool, id).await, "new password stored");
+
+    // Repointing to a different origin without a new password drops both.
+    for url in [
+        "https://api.nuget.org/v3/index.json",     // host
+        "http://api.nuget.org/v3/index.json",      // scheme
+        "http://api.nuget.org:8080/v3/index.json", // port
+    ] {
+        sqlx::query!(
+            "UPDATE repository SET upstream_username = 'svc', upstream_password = 'pat' WHERE id = $1",
+            id
+        )
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+        let resp = put_repo(&srv, &name, json!({"remote_url": url})).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["upstream_credentials_dropped"], json!(true), "{url}");
+        assert_eq!(body["has_upstream_password"], json!(false), "{url}");
+        assert_eq!(body["upstream_username"], Value::Null, "{url}");
+        let (user, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+        assert_eq!((user, pw, enc), (None, None, false), "{url}");
+    }
+
+    // Nothing stored: nothing reported as dropped.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed.example.com/v3/index.json"}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(false));
+
+    // A username sent along an origin change is applied; the old password is not.
+    sqlx::query!(
+        "UPDATE repository SET upstream_username = 'svc', upstream_password = 'pat' WHERE id = $1",
+        id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://other.example.com/v3/index.json", "upstream_username": "new"}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(true));
+    assert_eq!(stored_creds(&srv.pool, id).await.0.as_deref(), Some("new"));
+    assert!(!has_password(&srv.pool, id).await, "old password dropped");
+}
+
+/// M2 with secret encryption: an origin change drops the encrypted blob too,
+/// a kept legacy plaintext password is sealed (never carried forward), and
+/// `null` clears the blob.
+#[tokio::test]
+async fn repo_update_with_encryption_never_keeps_plaintext() {
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let name = format!("credenc{}", common::unique());
+    let id = create_cred_proxy(&srv, &name, "https://feed.example.com/v3/index.json").await;
+    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((pw, enc), (None, true), "sealed at create");
+
+    // A legacy (pre-backfill) plaintext value on a kept password is sealed.
+    sqlx::query!(
+        "UPDATE repository SET upstream_password = 'legacy-pat', upstream_password_enc = NULL WHERE id = $1",
+        id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let resp = put_repo(&srv, &name, json!({"online": true})).await;
+    assert_eq!(resp.status(), 200);
+    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((pw, enc), (None, true), "plaintext not carried forward");
+    let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, id)
+        .await
+        .unwrap()
+        .expect("still stored");
+    assert_eq!(
+        forge_crypto::ExposeSecret::expose_secret(&secret),
+        "legacy-pat"
+    );
+
+    // Both a plaintext leftover and a blob: the update nulls the plaintext.
+    sqlx::query!(
+        "UPDATE repository SET upstream_password = 'leftover' WHERE id = $1",
+        id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    put_repo(&srv, &name, json!({"online": true})).await;
+    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((pw, enc), (None, true));
+
+    // An origin change without a new password drops the sealed blob.
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://api.nuget.org/v3/index.json"}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["upstream_credentials_dropped"], json!(true));
+    let (user, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((user, pw, enc), (None, None, false));
+
+    // Set, then clear with `null`.
+    put_repo(&srv, &name, json!({"upstream_password": "fresh"})).await;
+    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((pw, enc), (None, true));
+    put_repo(&srv, &name, json!({"upstream_password": null})).await;
+    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((pw, enc), (None, false));
+}
+
+/// M18: repository names are URL path segments: anything outside
+/// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and the reserved `new`, is a 400 on
+/// create and on rename.
+#[tokio::test]
+async fn repository_names_are_validated() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let create = |name: String| {
+        let client = client.clone();
+        let (u, p) = (u.clone(), p.clone());
+        let url = format!("{}/admin/repositories", srv.base_url);
+        async move {
+            client
+                .post(url)
+                .basic_auth(&u, Some(&p))
+                .json(&json!({"name": name, "kind": "hosted"}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    for bad in [
+        "Team Packages".to_string(),
+        "a%20b".to_string(),
+        "a/b".to_string(),
+        "".to_string(),
+        "-leading".to_string(),
+        ".hidden".to_string(),
+        "x".repeat(65),
+        "new".to_string(),
+        "NEW".to_string(),
+        "nëw".to_string(),
+    ] {
+        let resp = create(bad.clone()).await;
+        assert_eq!(resp.status(), 400, "{bad:?} must be rejected");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains("repository name"), "{bad:?}: {msg}");
+    }
+
+    let s = common::unique();
+    for good in [
+        format!("Team.Packages_{s}"),
+        format!("a-{s}"),
+        format!("9{s}"),
+        format!("{s}{}", "x".repeat(64 - s.to_string().len())),
+        format!("new{s}"),
+    ] {
+        assert_eq!(
+            create(good.clone()).await.status(),
+            201,
+            "{good:?} is valid"
+        );
+    }
+
+    // Rename is validated too; an unchanged name is not re-checked.
+    let name = format!("a-{s}");
+    let resp = put_repo(&srv, &name, json!({"name": "has space"})).await;
+    assert_eq!(resp.status(), 400);
+    let resp = put_repo(&srv, &name, json!({"name": "New"})).await;
+    assert_eq!(resp.status(), 400);
+    let resp = put_repo(&srv, &name, json!({"name": name})).await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// M20: turning `anonymous_read` off also deletes the anonymous role's
+/// unscoped read grant on the repository (what migration 0007 synthesized),
+/// while an update that leaves the flag off does not touch explicit grants.
+#[tokio::test]
+async fn anonymous_read_off_deletes_the_synthesized_grant() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            anonymous_mode: "all".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
+        .await
+        .unwrap()
+        .unwrap();
+    let anon_grant = |repo_id: i64| {
+        let pool = srv.pool.clone();
+        async move {
+            forge_db::authz_dao::list_grants_for_role(&pool, anon_role)
+                .await
+                .unwrap()
+                .iter()
+                .any(|g| g.repository_id == Some(repo_id) && g.action == "read")
+        }
+    };
+
+    // An upgraded repository: the flag plus the grant 0007 synthesized from it.
+    let public = format!("anonoff{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": public, "kind": "hosted", "anonymous_read": true}))
+        .send()
+        .await
+        .unwrap();
+    let public_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    forge_db::authz_dao::add_grant(&srv.pool, anon_role, Some(public_id), "read", None)
+        .await
+        .unwrap();
+    let index = format!("{}/v3/{public}/index.json", srv.base_url);
+    assert_eq!(client.get(&index).send().await.unwrap().status(), 200);
+
+    let resp = put_repo(&srv, &public, json!({"anonymous_read": false})).await;
+    assert_eq!(resp.status(), 200);
+    assert!(!anon_grant(public_id).await, "synthesized grant removed");
+    assert_eq!(
+        client.get(&index).send().await.unwrap().status(),
+        401,
+        "anonymous read really ends"
+    );
+
+    // A repository that was never anonymous_read keeps an explicit grant even
+    // when an update (the SPA sends the whole form) repeats `false`.
+    let explicit = format!("anonexplicit{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": explicit, "kind": "hosted", "anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    let explicit_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    forge_db::authz_dao::add_grant(&srv.pool, anon_role, Some(explicit_id), "read", None)
+        .await
+        .unwrap();
+    let resp = put_repo(
+        &srv,
+        &explicit,
+        json!({"anonymous_read": false, "online": true}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(anon_grant(explicit_id).await, "explicit RBAC grant kept");
+}
+
+/// M20: `legacy_open_access` is readable and can be switched off through the
+/// admin API (admin-only). The shared test DB is a fresh install (`false`), so
+/// only the idempotent "off" direction is exercised here; both directions and
+/// the effect on new users are covered by `forge-db`'s `rbac_migrate` tests
+/// and the e2e upgrade scenario.
+#[tokio::test]
+async fn legacy_open_access_setting_endpoint() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let url = format!("{}/admin/settings/legacy-open-access", srv.base_url);
+
+    let resp = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"enabled": false})
+    );
+
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"enabled": false})
+    );
+
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"enable": false}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "unknown key rejected");
+
+    // Admin-only.
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    let token = admin_token_with_scope(&srv, None).await;
+    let resp = client
+        .put(&url)
+        .header("X-NuGet-ApiKey", &token)
+        .json(&json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "an unscoped token cannot change settings"
     );
 }

@@ -535,3 +535,101 @@ async fn fresh_install_create_hook_is_noop() {
         "fresh-install new user has an empty effective set"
     );
 }
+
+/// M20: on an upgraded install, `legacy_open_access` can be switched off
+/// ([`authz_dao::set_legacy_open_access`]): new users then get no automatic
+/// `authenticated` role (neither from the creation hook nor from a re-run of
+/// the legacy mapping), while existing assignments are left alone. And
+/// removing a repository's synthesized anonymous grant (what turning its
+/// `anonymous_read` off does) sticks across a re-run of the mapping.
+#[tokio::test]
+async fn legacy_open_access_can_be_switched_off() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0006");
+    let old_user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('old', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed pre-existing user");
+    let public_repo: i64 = sqlx::query_scalar(
+        "INSERT INTO repository (name, kind, anonymous_read) VALUES ('pub', 'hosted', true) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed public repo");
+    migrator().await.run(&pool).await.expect("migrate all");
+    assert!(
+        authz_dao::legacy_open_access(&pool).await.expect("flag"),
+        "precondition: upgraded (open) install"
+    );
+    let anon_grant = |pool: PgPool| async move {
+        authz_dao::load_anonymous_effective(&pool)
+            .await
+            .expect("anonymous effective")
+            .grants
+            .iter()
+            .any(|g| g.action == "read" && g.repository_id == Some(public_repo))
+    };
+    assert!(anon_grant(pool.clone()).await, "0007 synthesized the grant");
+
+    // Switch the flag off; it reads back as off.
+    authz_dao::set_legacy_open_access(&pool, false)
+        .await
+        .expect("switch off");
+    assert!(!authz_dao::legacy_open_access(&pool).await.expect("flag"));
+
+    // A user created now gets no automatic role…
+    let new_user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('new', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert user");
+    assert!(
+        !authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
+            .await
+            .expect("hook")
+    );
+
+    // …and the repository's anonymous_read is switched off with its grant.
+    sqlx::query("UPDATE repository SET anonymous_read = false WHERE id = $1")
+        .bind(public_repo)
+        .execute(&pool)
+        .await
+        .expect("flag off");
+    assert!(authz_dao::delete_anonymous_read_grant(&pool, public_repo)
+        .await
+        .expect("delete grant"));
+
+    // Re-running the mapping re-adds neither.
+    authz_dao::apply_legacy_migration(&pool)
+        .await
+        .expect("re-run");
+    assert!(
+        !authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
+            .await
+            .expect("query"),
+        "no authenticated role once the flag is off"
+    );
+    assert!(
+        !anon_grant(pool.clone()).await,
+        "the revoked grant stays gone"
+    );
+    assert!(
+        authz_dao::user_has_role(&pool, old_user, AUTHENTICATED_ROLE)
+            .await
+            .expect("query"),
+        "existing assignments are not revoked by the switch"
+    );
+
+    // The switch works both ways.
+    authz_dao::set_legacy_open_access(&pool, true)
+        .await
+        .expect("switch on");
+    assert!(authz_dao::legacy_open_access(&pool).await.expect("flag"));
+}

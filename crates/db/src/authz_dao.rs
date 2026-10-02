@@ -718,20 +718,29 @@ pub async fn create_content_selector(
 }
 
 /// Update a content selector's `description` / `includes` / `excludes` (name is
-/// immutable). Bumps `updated_at`. Returns the updated row, or `None` if absent.
+/// immutable) with **PATCH semantics**: a `None` field keeps the stored value,
+/// `Some` replaces it. Bumps `updated_at`. Returns the updated row, or `None`
+/// if absent.
+///
+/// Keeping omitted lists matters for safety: an empty `includes` means
+/// match-all, so resetting an omitted list to `[]` would silently widen every
+/// grant that uses the selector.
 pub async fn update_content_selector(
     pool: &PgPool,
     id: i64,
-    description: &str,
-    includes: &[String],
-    excludes: &[String],
+    description: Option<&str>,
+    includes: Option<&[String]>,
+    excludes: Option<&[String]>,
 ) -> sqlx::Result<Option<ContentSelector>> {
-    let inc = serde_json::to_value(includes).expect("string vec serializes");
-    let exc = serde_json::to_value(excludes).expect("string vec serializes");
+    let inc = includes.map(|v| serde_json::to_value(v).expect("string vec serializes"));
+    let exc = excludes.map(|v| serde_json::to_value(v).expect("string vec serializes"));
     let row = sqlx::query!(
         r#"
         UPDATE content_selector
-        SET description = $2, includes = $3, excludes = $4, updated_at = now()
+        SET description = COALESCE($2, description),
+            includes    = COALESCE($3, includes),
+            excludes    = COALESCE($4, excludes),
+            updated_at  = now()
         WHERE id = $1
         RETURNING id, name, description, includes, excludes
         "#,
@@ -793,6 +802,10 @@ pub async fn list_roles_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Ve
 /// slice-1 "open access" behavior. `true` ⇒ upgrade (existing users keep
 /// read/write everywhere and NEW users are auto-assigned the `authenticated`
 /// role); `false`/absent ⇒ fresh install, fail-closed default.
+///
+/// Stored in `forge_setting` (migration 0007 writes it once). Operators switch
+/// it off with `PUT /admin/settings/legacy-open-access {"enabled": false}`
+/// ([`set_legacy_open_access`]).
 pub const LEGACY_OPEN_ACCESS_KEY: &str = "legacy_open_access";
 
 /// Read a `forge_setting` value by key. Returns `None` when the key is unset.
@@ -828,6 +841,58 @@ pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<
 /// the setting defaults to the secure, closed behavior.
 pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
     Ok(get_setting(pool, LEGACY_OPEN_ACCESS_KEY).await? == Some("true".to_string()))
+}
+
+/// Switch [`LEGACY_OPEN_ACCESS_KEY`] on or off (the admin
+/// `PUT /admin/settings/legacy-open-access` endpoint).
+///
+/// The flag is read live by [`assign_authenticated_if_legacy_open`] (every
+/// user-creation path) and by step 3 of [`apply_legacy_migration`], so turning
+/// it off stops *new* users from receiving the built-in `authenticated` role
+/// (read + write on every repository) from the next creation on. It does not
+/// touch existing assignments: users that already hold `authenticated` keep it
+/// until it is unassigned (or the role's grants are removed).
+pub async fn set_legacy_open_access(pool: &PgPool, enabled: bool) -> sqlx::Result<()> {
+    set_setting(
+        pool,
+        LEGACY_OPEN_ACCESS_KEY,
+        if enabled { "true" } else { "false" },
+    )
+    .await
+}
+
+/// Delete the unscoped `(anonymous role, repository, read)` grant — the grant
+/// migration 0007 synthesized from `repository.anonymous_read` — for
+/// `repository_id`. Returns whether a row was removed.
+///
+/// Called in the same transaction that turns a repository's `anonymous_read`
+/// off: the seam honours the flag *and* the grant, so leaving the synthesized
+/// grant behind would keep the repository anonymously readable. Selector-scoped
+/// anonymous grants are not touched (migration 0007 never creates those; they
+/// can only come from an explicit RBAC edit).
+pub async fn delete_anonymous_read_grant<'e, E>(
+    executor: E,
+    repository_id: i64,
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        DELETE FROM repository_privilege rp
+        USING role r
+        WHERE rp.role_id = r.id
+          AND r.name = $2
+          AND rp.repository_id = $1
+          AND rp.action = 'read'
+          AND rp.selector_id IS NULL
+        "#,
+        repository_id,
+        ANONYMOUS_ROLE,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Re-apply the idempotent behavior-preserving legacy mapping (the same

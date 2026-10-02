@@ -960,3 +960,239 @@ async fn fresh_install_defaults_closed_over_http() {
         "bootstrap admin reads on a fresh install"
     );
 }
+
+// ── API tokens and the admin API (B4) ──────────────────────────────────────
+
+/// An admin's unscoped API token (the stack's push token) cannot use the admin
+/// API — not to create users, not to mint tokens — while an explicitly
+/// admin-scoped token can. The same unscoped token still publishes.
+#[tokio::test]
+async fn admin_api_requires_admin_scoped_token() {
+    let srv = start_stack().await;
+    let admin_id = forge_db::user_dao::find_user_by_username(
+        &srv.pool,
+        srv.admin_user.as_deref().expect("admin user"),
+    )
+    .await
+    .expect("lookup")
+    .expect("bootstrap admin present")
+    .id;
+    let create_user = |token: String, name: &'static str| {
+        let client = srv.client();
+        let url = format!("{}/admin/users", srv.base_url);
+        async move {
+            client
+                .post(url)
+                .header("X-NuGet-ApiKey", token)
+                .json(&serde_json::json!({"username": name, "password": "pw", "is_admin": true}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let mint = |token: String| {
+        let client = srv.client();
+        let url = format!("{}/admin/users/{admin_id}/tokens", srv.base_url);
+        async move {
+            client
+                .post(url)
+                .header("X-NuGet-ApiKey", token)
+                .json(&serde_json::json!({"name": "minted"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    let unscoped = srv.admin_token.clone();
+    assert_eq!(
+        create_user(unscoped.clone(), "token-made-admin").await,
+        StatusCode::FORBIDDEN,
+        "an unscoped admin token must not create (admin) users"
+    );
+    assert_eq!(
+        mint(unscoped.clone()).await,
+        StatusCode::FORBIDDEN,
+        "an unscoped admin token must not mint tokens"
+    );
+
+    // It is still the admin's push credential.
+    assert_eq!(
+        srv.create_repo(serde_json::json!({"name": "b4-feed", "kind": "hosted"}))
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(
+        srv.push_nupkg("b4-feed", make_nupkg("B4.Pkg", "1.0.0"))
+            .await
+            .status(),
+        201,
+        "the unscoped token keeps the admin's write reach"
+    );
+
+    let automation = srv
+        .issue_token(admin_id, Some(serde_json::json!({"actions": ["admin"]})))
+        .await;
+    assert_eq!(
+        mint(automation.clone()).await,
+        StatusCode::CREATED,
+        "an admin-scoped token may mint tokens"
+    );
+    assert_eq!(
+        create_user(automation, "automation-made").await,
+        StatusCode::CREATED,
+        "an admin-scoped token may create users"
+    );
+}
+
+// ── public read for signed-in principals (L6) ───────────────────────────────
+
+/// A signed-in user without grants reads what anonymous callers can (the
+/// `anonymous_read` flag, the anonymous role's grants) but cannot write it, and
+/// a token scoped elsewhere gains nothing from it.
+#[tokio::test]
+async fn signed_in_user_reads_anonymous_readable_repos() {
+    let srv = start_stack().await;
+    for (repo, anonymous_read) in [("l6-flag", true), ("l6-grant", false), ("l6-priv", false)] {
+        assert_eq!(
+            srv.create_repo(
+                serde_json::json!({"name": repo, "kind": "hosted", "anonymous_read": anonymous_read})
+            )
+            .await
+            .status(),
+            201
+        );
+    }
+    let anon_role = srv.role_id("anonymous").await;
+    assert_eq!(
+        srv.add_grant(anon_role, Some("l6-grant"), "read", None)
+            .await
+            .status(),
+        201
+    );
+
+    let uid = srv.create_user("l6-user", "pw").await;
+    let token = srv.issue_token(uid, None).await;
+    for repo in ["l6-flag", "l6-grant"] {
+        assert_eq!(
+            srv.read_index_with_token(repo, &token).await,
+            StatusCode::OK,
+            "{repo}: a roleless user reads what anonymous can"
+        );
+    }
+    assert_eq!(
+        srv.read_index_with_token("l6-priv", &token).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        srv.push_nupkg_with_token("l6-flag", &token, make_nupkg("L6.Pkg", "1.0.0"))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "public reach is read-only"
+    );
+
+    let priv_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, "l6-priv")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let scoped = srv
+        .issue_token(uid, Some(serde_json::json!({"repositories": [priv_id]})))
+        .await;
+    assert_eq!(
+        srv.read_index_with_token("l6-flag", &scoped).await,
+        StatusCode::FORBIDDEN,
+        "a token scoped elsewhere cannot read the public repo"
+    );
+}
+
+// ── upgraded installs: switching the legacy behavior off (M20) ─────────────
+
+/// On an upgraded install: turning a repository's `anonymous_read` off really
+/// ends anonymous access (the synthesized anonymous grant is deleted too), and
+/// switching `legacy_open_access` off stops new users from inheriting the
+/// `authenticated` role while existing users keep it.
+#[tokio::test]
+async fn upgrade_legacy_access_can_be_switched_off_over_http() {
+    let srv = StackBuilder::default()
+        .anon(AnonMode::All)
+        .start_upgrade_seeded(|pool| async move {
+            sqlx::query(
+                "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('legacy-user', 'x', false)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed legacy user");
+            sqlx::query(
+                "INSERT INTO repository (name, kind, anonymous_read) VALUES ('up-pub', 'hosted', true)",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed public repo");
+        })
+        .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let index = format!("{}/v3/up-pub/index.json", srv.base_url);
+    assert_eq!(client.get(&index).send().await.unwrap().status(), 200);
+
+    // anonymous_read off ⇒ anonymous is denied (flag *and* grant are gone).
+    let resp = client
+        .put(format!("{}/admin/repositories/up-pub", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        client.get(&index).send().await.unwrap().status(),
+        401,
+        "turning anonymous_read off ends anonymous access on an upgraded install"
+    );
+
+    // While legacy open access is on, a new user reads everything.
+    let settings = format!("{}/admin/settings/legacy-open-access", srv.base_url);
+    let state: Value = client
+        .get(&settings)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state, serde_json::json!({"enabled": true}));
+    let before = srv.create_user("before-switch", "pw").await;
+    let before_token = srv.issue_token(before, None).await;
+    assert_eq!(
+        srv.read_index_with_token("up-pub", &before_token).await,
+        StatusCode::OK
+    );
+
+    // Switch it off: the next new user is deny-by-default.
+    let resp = client
+        .put(&settings)
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let after = srv.create_user("after-switch", "pw").await;
+    let after_token = srv.issue_token(after, None).await;
+    assert_eq!(
+        srv.read_index_with_token("up-pub", &after_token).await,
+        StatusCode::FORBIDDEN,
+        "new users no longer inherit `authenticated`"
+    );
+    assert_eq!(
+        srv.read_index_with_token("up-pub", &before_token).await,
+        StatusCode::OK,
+        "existing assignments are left to the operator"
+    );
+}

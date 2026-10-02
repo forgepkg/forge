@@ -1077,3 +1077,59 @@ async fn proxy_lock_cached_version_for_update_blocks_concurrent_tx() {
     assert_eq!(re_locked.version, version);
     tx_c.commit().await.expect("commit c");
 }
+
+/// L6: the nesting-depth guard counts the longest path *above* the group too,
+/// not only the depth below the new member.
+#[tokio::test]
+async fn add_group_member_checked_counts_depth_above_the_group() {
+    use forge_db::repository_dao::{self, AddMemberOutcome, NewRepository};
+
+    let pool = common::pool().await;
+    let n = common::unique();
+    let make = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let name = format!("depthup-{kind}-{n}-{}", common::unique());
+            let new = if kind == "leaf" {
+                NewRepository::hosted(name)
+            } else {
+                NewRepository::group(name)
+            };
+            repository_dao::insert_repository(&pool, new)
+                .await
+                .expect("insert repo")
+        }
+    };
+    let a = make("a").await;
+    let b = make("b").await;
+    let c = make("c").await;
+    let mid = make("mid").await;
+    let leaf = make("leaf").await;
+
+    // Two ancestor chains above `mid`: a -> b -> mid (2 edges) and c -> mid.
+    for (group, member) in [(&a, &b), (&b, &mid), (&c, &mid)] {
+        assert_eq!(
+            repository_dao::add_group_member_checked(&pool, group.id, member.id, 10, 20)
+                .await
+                .expect("add"),
+            AddMemberOutcome::Added
+        );
+    }
+
+    // mid -> leaf creates a -> b -> mid -> leaf (3 edges): too deep for 2,
+    // although only one edge lies below `mid`.
+    assert_eq!(
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 2)
+            .await
+            .expect("add"),
+        AddMemberOutcome::TooDeep,
+        "the path above the group counts"
+    );
+    assert_eq!(
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 3)
+            .await
+            .expect("add"),
+        AddMemberOutcome::Added,
+        "3 edges fit a limit of 3"
+    );
+}

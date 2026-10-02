@@ -17,6 +17,15 @@
 //! * [`members`] — group membership management.
 //! * [`crypto`] — §12.5 secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
+//! * [`settings`] — install-wide switches (`legacy_open_access`).
+//!
+//! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
+//! login: a token-authenticated caller passes [`require_admin`] only when the
+//! token's scope lists the `admin` action explicitly (and does not restrict
+//! repositories) — e.g. `{"actions": ["admin"]}` for automation. An unscoped
+//! token of an admin account gets 403 here (it keeps the owner's
+//! read/write/delete reach on the feed). Password and session principals are
+//! unaffected.
 
 pub mod content_selectors;
 pub mod crypto;
@@ -27,6 +36,7 @@ pub mod realms;
 pub mod repositories;
 pub mod retention;
 pub mod roles;
+pub mod settings;
 pub mod token_scope;
 pub mod tokens;
 pub mod user_roles;
@@ -54,6 +64,13 @@ use crate::state::AppState;
 /// (within the cache TTL / on invalidation). Fail-closed: an evaluation error
 /// denies. A 401 (vs 403) distinction is kept for anonymous/unauthenticated so a
 /// client knows to authenticate.
+///
+/// **Tokens (B4).** For a token principal (`token_id: Some`) the verdict is the
+/// *token's* effective set, in which `admin` survives only when the token's
+/// scope names the `admin` action and does not restrict repositories (see
+/// `EffectiveSet::intersect_scope`). An unscoped token of an admin is
+/// therefore refused with 403: otherwise a leaked feed token could create
+/// admins and mint replacement tokens, surviving its own revocation.
 ///
 /// [`Authz::is_global_admin`]: forge_core::auth::authz::Authz::is_global_admin
 pub async fn require_admin(
@@ -175,6 +192,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .delete(realms::delete),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
+        .route(
+            "/settings/legacy-open-access",
+            get(settings::get_legacy_open_access).put(settings::put_legacy_open_access),
+        )
         .route("/users/{id}/effective", get(effective::for_user))
         .route("/anonymous/effective", get(effective::for_anonymous))
         // --- §12.5: secret encryption at rest -------------------------------

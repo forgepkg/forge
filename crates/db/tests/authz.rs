@@ -276,3 +276,116 @@ async fn admin_role_dao_constant_matches_db() {
         .expect("query")
         .is_some());
 }
+
+/// M1: `update_content_selector` has PATCH semantics — an omitted field keeps
+/// its stored value. (An omitted `includes` reset to `[]` would mean
+/// match-all and silently widen every grant using the selector.)
+#[tokio::test]
+async fn update_content_selector_keeps_omitted_fields() {
+    let pool = common::pool().await;
+    let name = format!("patchsel-{}", common::unique());
+    let sel = forge_db::authz_dao::create_content_selector(
+        &pool,
+        &name,
+        "desc",
+        &["company.*".to_string()],
+        &["company.secret*".to_string()],
+    )
+    .await
+    .expect("create");
+
+    let upd = forge_db::authz_dao::update_content_selector(&pool, sel.id, Some("new"), None, None)
+        .await
+        .expect("update")
+        .expect("selector exists");
+    assert_eq!(upd.description, "new");
+    assert_eq!(upd.includes, serde_json::json!(["company.*"]), "kept");
+    assert_eq!(upd.excludes, serde_json::json!(["company.secret*"]), "kept");
+
+    let includes = ["internal.*".to_string()];
+    let upd =
+        forge_db::authz_dao::update_content_selector(&pool, sel.id, None, Some(&includes), None)
+            .await
+            .expect("update")
+            .expect("selector exists");
+    assert_eq!(upd.description, "new", "kept");
+    assert_eq!(upd.includes, serde_json::json!(["internal.*"]), "replaced");
+    assert_eq!(upd.excludes, serde_json::json!(["company.secret*"]), "kept");
+
+    // An explicit empty list is still a real value.
+    let upd = forge_db::authz_dao::update_content_selector(&pool, sel.id, None, None, Some(&[]))
+        .await
+        .expect("update")
+        .expect("selector exists");
+    assert_eq!(upd.includes, serde_json::json!(["internal.*"]), "kept");
+    assert_eq!(upd.excludes, serde_json::json!([]), "cleared explicitly");
+
+    assert!(
+        forge_db::authz_dao::update_content_selector(&pool, -1, Some("x"), None, None)
+            .await
+            .expect("update")
+            .is_none(),
+        "unknown id"
+    );
+}
+
+/// M20: turning `anonymous_read` off deletes exactly the synthesized grant —
+/// the anonymous role's unscoped `read` on that repository — and nothing else.
+#[tokio::test]
+async fn delete_anonymous_read_grant_removes_only_the_synthesized_grant() {
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo = make_repo(&pool, n).await;
+    let other_repo = make_repo(&pool, common::unique()).await;
+    let anon = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::ANONYMOUS_ROLE)
+        .await
+        .expect("query")
+        .expect("anonymous role seeded");
+    let custom = make_role(&pool, common::unique()).await;
+    let sel = forge_db::authz_dao::insert_content_selector(
+        &pool,
+        &format!("anonsel-{n}"),
+        &["pub.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("selector");
+    for (role, repo_id, action, selector) in [
+        (anon, repo, "read", None),
+        (anon, repo, "read", Some(sel)),
+        (anon, other_repo, "read", None),
+        (custom, repo, "read", None),
+    ] {
+        forge_db::authz_dao::add_grant(&pool, role, Some(repo_id), action, selector)
+            .await
+            .expect("grant");
+    }
+
+    assert!(
+        forge_db::authz_dao::delete_anonymous_read_grant(&pool, repo)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        !forge_db::authz_dao::delete_anonymous_read_grant(&pool, repo)
+            .await
+            .expect("delete again"),
+        "idempotent"
+    );
+
+    let anon_grants = forge_db::authz_dao::list_grants_for_role(&pool, anon)
+        .await
+        .expect("list");
+    let on = |repo_id: i64, selector: Option<i64>| {
+        anon_grants.iter().any(|g| {
+            g.repository_id == Some(repo_id) && g.action == "read" && g.selector_id == selector
+        })
+    };
+    assert!(!on(repo, None), "the synthesized grant is gone");
+    assert!(on(repo, Some(sel)), "a selector-scoped grant stays");
+    assert!(on(other_repo, None), "other repositories are untouched");
+    let custom_grants = forge_db::authz_dao::list_grants_for_role(&pool, custom)
+        .await
+        .expect("list");
+    assert_eq!(custom_grants.len(), 1, "other roles are untouched");
+}
