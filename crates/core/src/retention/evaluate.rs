@@ -319,6 +319,12 @@ pub fn evaluate(
             }
 
             if let Some((rule, reason)) = winning {
+                // Unlisting an already-unlisted version is a no-op: skip it
+                // so a standing unlist rule does not re-touch `updated_at`
+                // and append an audit row for the same versions every run.
+                if rule.action == Action::Unlist && !cand.listed {
+                    continue;
+                }
                 decisions.push(Decision {
                     component_id: cand.component_id,
                     package_name: cand.package_name.clone(),
@@ -787,6 +793,38 @@ mod tests {
         let d = evaluate(&fmt(), now(), &p, &cands);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].action, Action::Unlist);
+    }
+
+    #[test]
+    fn unlist_skips_versions_that_are_already_unlisted() {
+        let mut hidden = comp(1, "lib", "1.0.0", 100, None);
+        hidden.listed = false;
+        let cands = vec![hidden, comp(2, "lib", "1.1.0", 100, None)];
+        let p = policy_with(vec![rule(
+            "u",
+            Action::Unlist,
+            Criteria {
+                older_than_days: Some(30),
+                ..Default::default()
+            },
+        )]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.1.0"]);
+
+        // A hard-delete rule still reaches an unlisted version.
+        let mut hidden = comp(1, "lib", "1.0.0", 100, None);
+        hidden.listed = false;
+        let p = policy_with(vec![rule(
+            "d",
+            Action::HardDelete,
+            Criteria {
+                older_than_days: Some(30),
+                ..Default::default()
+            },
+        )]);
+        let d = evaluate(&fmt(), now(), &p, &[hidden]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].action, Action::HardDelete);
     }
 
     #[test]
