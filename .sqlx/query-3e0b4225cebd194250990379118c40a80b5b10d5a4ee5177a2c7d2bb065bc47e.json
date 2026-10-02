@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE content_selector\n        SET description = $2, includes = $3, excludes = $4, updated_at = now()\n        WHERE id = $1\n        RETURNING id, name, description, includes, excludes\n        ",
+  "query": "\n        UPDATE content_selector\n        SET description = COALESCE($2, description),\n            includes    = COALESCE($3, includes),\n            excludes    = COALESCE($4, excludes),\n            updated_at  = now()\n        WHERE id = $1\n        RETURNING id, name, description, includes, excludes\n        ",
   "describe": {
     "columns": [
       {
@@ -75,5 +75,5 @@
       false
     ]
   },
-  "hash": "bfd9ff86d35cb7ed70941058ee553cd24bae66250d5adb8682490f50a3f44690"
+  "hash": "3e0b4225cebd194250990379118c40a80b5b10d5a4ee5177a2c7d2bb065bc47e"
 }

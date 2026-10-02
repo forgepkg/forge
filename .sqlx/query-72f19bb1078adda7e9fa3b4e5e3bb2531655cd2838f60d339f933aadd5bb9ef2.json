@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO token (user_id, name, token_hash, expires_at)\n        VALUES ($1, $2, $3, $4)\n        RETURNING\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at\n        ",
+  "query": "\n        SELECT\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at, scope\n        FROM token\n        WHERE user_id = $1\n        ORDER BY created_at\n        ",
   "describe": {
     "columns": [
       {
@@ -90,14 +90,22 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "scope",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "token",
+            "name": "scope"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Text",
-        "Text",
-        "Timestamptz"
+        "Int8"
       ]
     },
     "nullable": [
@@ -108,8 +116,9 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "8f781a868cf66513c520e20f6135644f15e5731f02b95ba3d4c0e387c200ad98"
+  "hash": "72f19bb1078adda7e9fa3b4e5e3bb2531655cd2838f60d339f933aadd5bb9ef2"
 }

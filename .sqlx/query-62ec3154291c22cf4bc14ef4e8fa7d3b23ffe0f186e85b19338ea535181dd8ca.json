@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at\n        FROM token\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at, scope\n        FROM token\n        WHERE token_hash = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -90,11 +90,22 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 8,
+        "name": "scope",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "token",
+            "name": "scope"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -105,8 +116,9 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "c6dbc33f5640f6990cb1614aeac647c4c90fb1e5bf71c68c0f190268cfa455e4"
+  "hash": "62ec3154291c22cf4bc14ef4e8fa7d3b23ffe0f186e85b19338ea535181dd8ca"
 }

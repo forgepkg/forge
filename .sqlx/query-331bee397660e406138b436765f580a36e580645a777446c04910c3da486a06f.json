@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH RECURSIVE reach(id, depth, path) AS (\n            SELECT $1::bigint, 0, ARRAY[$1::bigint]\n          UNION ALL\n            SELECT gm.member_id, reach.depth + 1, reach.path || gm.member_id\n            FROM group_member gm\n            JOIN reach ON gm.group_id = reach.id\n            WHERE NOT gm.member_id = ANY(reach.path)\n              AND reach.depth < $3\n        ),\n        up(id, depth, path) AS (\n            SELECT $2::bigint, 0, ARRAY[$2::bigint]\n          UNION ALL\n            SELECT gm.group_id, up.depth + 1, up.path || gm.group_id\n            FROM group_member gm\n            JOIN up ON gm.member_id = up.id\n            WHERE NOT gm.group_id = ANY(up.path)\n              AND up.depth < $3\n        )\n        SELECT\n            EXISTS (SELECT 1 FROM reach WHERE id = $2)        AS \"would_cycle!\",\n            (SELECT COALESCE(MAX(depth), 0) FROM up)\n              + 1\n              + (SELECT COALESCE(MAX(depth), 0) FROM reach) > $3 AS \"too_deep!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "would_cycle!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "too_deep!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "331bee397660e406138b436765f580a36e580645a777446c04910c3da486a06f"
+}
