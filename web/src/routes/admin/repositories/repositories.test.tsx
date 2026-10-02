@@ -141,7 +141,7 @@ describe('admin repositories', () => {
       ],
     })
 
-    await renderAt('/admin/repositories')
+    await renderAt('/manage/repositories')
 
     expect(await screen.findByText('hosted-1')).toBeInTheDocument()
     expect(screen.getByText('proxy-1')).toBeInTheDocument()
@@ -159,7 +159,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/new')
+    await renderAt('/manage/repositories/new')
 
     await user.type(await screen.findByLabelText('Name'), 'brand-new')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
@@ -184,7 +184,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/grp/members')
+    await renderAt('/manage/repositories/grp/members')
 
     // The existing member is shown with its priority.
     expect(await screen.findByText('existing')).toBeInTheDocument()
@@ -217,7 +217,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/grp/members')
+    await renderAt('/manage/repositories/grp/members')
 
     await user.selectOptions(
       await screen.findByLabelText('Repository'),

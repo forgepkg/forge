@@ -13,7 +13,7 @@ import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 
-export const Route = createFileRoute('/_app/admin/repositories/$repo')({
+export const Route = createFileRoute('/_app/manage/repositories/$repo')({
   component: EditRepository,
 })
 
@@ -49,7 +49,7 @@ function EditRepository() {
         // The name may have changed; keep the URL in sync.
         if (updated.name !== name) {
           void navigate({
-            to: '/admin/repositories/$repo',
+            to: '/manage/repositories/$repo',
             params: { repo: updated.name },
           })
         }
@@ -65,7 +65,7 @@ function EditRepository() {
         </Heading>
         {repo.data.kind === 'group' && (
           <Link
-            to="/admin/repositories/$repo/members"
+            to="/manage/repositories/$repo/members"
             params={{ repo: repo.data.name }}
             className="rounded-lg border border-zinc-950/10 px-3 py-1.5 text-sm/6 font-medium text-zinc-950 hover:bg-zinc-950/[2.5%] dark:border-white/15 dark:text-white dark:hover:bg-white/5"
           >
@@ -91,7 +91,7 @@ function EditRepository() {
           update.isError ? update.error.body || update.error.message : null
         }
         onSubmit={handleSubmit}
-        onCancel={() => void navigate({ to: '/admin/repositories' })}
+        onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
     </section>
   )

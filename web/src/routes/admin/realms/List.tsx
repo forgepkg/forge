@@ -24,7 +24,7 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
-export const Route = createFileRoute('/_app/admin/realms')({
+export const Route = createFileRoute('/_app/manage/realms')({
   component: RealmsList,
 })
 
@@ -68,7 +68,7 @@ function RealmsList() {
             routing sign-ins.
           </Text>
         </div>
-        <Button href="/admin/realms/new">New realm</Button>
+        <Button href="/manage/realms/new">New realm</Button>
       </div>
 
       {mutationError && (
@@ -180,7 +180,7 @@ function RealmRow({
       </TableCell>
       <TableCell>
         <Link
-          to="/admin/realms/$realmId"
+          to="/manage/realms/$realmId"
           params={{ realmId: String(realm.id) }}
           className="font-medium text-sky-600 hover:underline dark:text-sky-400"
         >
@@ -204,7 +204,7 @@ function RealmRow({
       <TableCell>
         <span className="flex items-center gap-3">
           <Link
-            to="/admin/realms/$realmId"
+            to="/manage/realms/$realmId"
             params={{ realmId: String(realm.id) }}
             className="text-sky-600 hover:underline dark:text-sky-400"
           >

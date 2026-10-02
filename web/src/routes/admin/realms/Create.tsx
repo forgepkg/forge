@@ -8,7 +8,7 @@ import {
   type RealmFormValues,
 } from '~/components/RealmForm'
 
-export const Route = createFileRoute('/_app/admin/realms/new')({
+export const Route = createFileRoute('/_app/manage/realms/new')({
   component: CreateRealmScreen,
 })
 
@@ -33,7 +33,7 @@ function CreateRealmScreen() {
       },
       {
         onSuccess: () => {
-          void navigate({ to: '/admin/realms' })
+          void navigate({ to: '/manage/realms' })
         },
       },
     )
@@ -49,7 +49,7 @@ function CreateRealmScreen() {
           create.isError ? create.error.body || create.error.message : null
         }
         onSubmit={handleSubmit}
-        onCancel={() => void navigate({ to: '/admin/realms' })}
+        onCancel={() => void navigate({ to: '/manage/realms' })}
       />
     </section>
   )

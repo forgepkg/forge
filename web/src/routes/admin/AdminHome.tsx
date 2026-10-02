@@ -3,23 +3,23 @@ import { createFileRoute, Link } from '@tanstack/react-router'
 import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 
-export const Route = createFileRoute('/_app/admin/')({
+export const Route = createFileRoute('/_app/manage/')({
   component: AdminHome,
 })
 
 const SECTIONS = [
   {
-    to: '/admin/repositories',
+    to: '/manage/repositories',
     title: 'Repositories',
     description: 'Hosted, proxy, and group repositories with retention.',
   },
   {
-    to: '/admin/users',
+    to: '/manage/users',
     title: 'Users & tokens',
     description: 'Accounts, admin flags, and per-user registry tokens.',
   },
   {
-    to: '/admin/realms',
+    to: '/manage/realms',
     title: 'Authentication',
     description: 'Login realms: local passwords, OIDC, credential forwarding.',
   },

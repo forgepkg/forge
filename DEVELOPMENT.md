@@ -79,7 +79,10 @@ The UI is a **TanStack Router SPA** in [`web/`](./web), built by Vite into
 `web/dist/`. There is **no Node server in production**: the Rust `forge-server`
 serves `web/dist/` directly (a `ServeDir` with an `index.html` SPA fallback,
 mounted *after* `/admin`, `/browse`, `/v3`), and the browser calls the Rust HTTP
-API on the **same origin** with relative URLs. The SPA uses server-side
+API on the **same origin** with relative URLs. `index.html` is served
+`Cache-Control: no-cache`, the content-hashed `/assets/*` files
+`public, max-age=31536000, immutable`, and a missing `/assets/*` file is a 404
+(a tab left open across a deploy reloads once to pick up the new chunks). The SPA uses server-side
 password/OIDC sessions and restores its identity through `/auth/me`. Repository
 tokens remain credentials for NuGet clients; the browser does not use a pasted
 token in `localStorage` as its primary login model.
@@ -137,12 +140,17 @@ token sign-in, admin gating, creating a repo, and push-then-see-package. If
 Playwright can't download a browser in a restricted environment, `pnpm run
 e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 
-> **Known limitation:** the admin UI routes reuse the `/admin/*` paths owned by
-> the admin REST API, so a **hard refresh / bookmark / deep-link** of an
-> `/admin/<sub>` page is answered by the API, not the SPA. In-app navigation
-> (clicking through the nav) is unaffected. Pinned by
-> `web/e2e/specs/admin-deeplink.spec.ts`; a fix (move the admin UI off `/admin/*`)
-> is a tracked follow-up.
+> **Admin UI paths:** the admin screens live under **`/manage/*`**
+> (`/manage/repositories`, `/manage/users/<id>`, `/manage/realms`, ...);
+> `/admin/*` belongs to the admin REST API, which is routed before the SPA
+> fallback. (Until 0.1.0 the UI shared `/admin/*`, so a refresh, bookmark or
+> deep link of an admin screen got raw JSON, a 404 or a 405.) A browser
+> navigation (`Sec-Fetch-Dest: document`, or an `Accept` preferring
+> `text/html`) to a former UI path such as `/admin/repositories?x=1` is
+> 302-redirected to `/manage/repositories?x=1`; API requests to `/admin/*` are
+> unchanged. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
+> `crates/server/tests/web_ui.rs`. In Vite dev (`:8420`) `/manage/*` is served
+> by Vite itself; `/admin` is still proxied to the API.
 
 ## Doing it by hand
 
@@ -243,7 +251,7 @@ realms (interactive IdP login) and `credential_forwarding` realms (validate a
 login by forwarding it to an upstream like a Nexus over HTTP Basic), plus
 `workload_identity` realms for non-interactive, direct-token OIDC trusted
 publishing. Manage
-them under **Admin → Authentication** or via `/admin/realms` (CRUD +
+them under **Admin → Authentication** (`/manage/realms`) or via the `/admin/realms` API (CRUD +
 `PUT /admin/realms/order`); changes apply at runtime — no redeploy. Secrets in
 a realm config (`client_secret`, `key_pepper`) are write-only: responses carry
 `<key>_set` markers, and an update that omits/blanks a secret keeps the stored

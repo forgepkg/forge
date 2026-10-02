@@ -11,7 +11,7 @@ import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 
-export const Route = createFileRoute('/_app/admin/realms/$realmId')({
+export const Route = createFileRoute('/_app/manage/realms/$realmId')({
   component: EditRealmScreen,
 })
 
@@ -78,7 +78,7 @@ function EditRealmScreen() {
           update.isError ? update.error.body || update.error.message : null
         }
         onSubmit={handleSubmit}
-        onCancel={() => void navigate({ to: '/admin/realms' })}
+        onCancel={() => void navigate({ to: '/manage/realms' })}
       />
     </section>
   )

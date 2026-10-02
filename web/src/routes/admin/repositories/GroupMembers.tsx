@@ -17,7 +17,7 @@ import { PriorityList } from '~/components/PriorityList'
 import { ErrorState } from '~/components/ErrorState'
 
 export const Route = createFileRoute(
-  '/_app/admin/repositories/$repo/members',
+  '/_app/manage/repositories/$repo/members',
 )({
   component: GroupMembers,
 })
@@ -88,7 +88,7 @@ function GroupMembers() {
     <section className="space-y-6">
       <div>
         <Link
-          to="/admin/repositories/$repo"
+          to="/manage/repositories/$repo"
           params={{ repo: name }}
           className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
         >
@@ -172,7 +172,7 @@ function GroupMembers() {
       <div>
         <button
           type="button"
-          onClick={() => void navigate({ to: '/admin/repositories' })}
+          onClick={() => void navigate({ to: '/manage/repositories' })}
           className="text-sm/6 text-zinc-500 hover:underline dark:text-zinc-400"
         >
           Done

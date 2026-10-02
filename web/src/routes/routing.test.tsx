@@ -16,7 +16,7 @@ import { routeTree } from '~/routeTree.gen'
 /**
  * Router-integration tests against the **real** route tree (plan §2 testing):
  *   - the Admin nav link is hidden for a reader and shown for an admin;
- *   - the `_app/admin` guard redirects a non-admin to Browse and an
+ *   - the `_app/manage` guard redirects a non-admin to Browse and an
  *     unauthenticated visitor to /login;
  *   - an admin reaches the admin landing.
  *
@@ -129,24 +129,24 @@ describe('app routing + admin gating', () => {
     )
   })
 
-  it('redirects a non-admin away from /admin to Browse', async () => {
+  it('redirects a non-admin away from /manage to Browse', async () => {
     setSession('reader-csrf')
     mockMe(readerMe)
 
-    const router = await renderApp('/admin')
+    const router = await renderApp('/manage')
 
     expect(router.state.location.pathname).toBe('/')
     // Did not render the admin landing.
     expect(screen.queryByText('Administration')).not.toBeInTheDocument()
   })
 
-  it('lets an admin reach the admin landing at /admin', async () => {
+  it('lets an admin reach the admin landing at /manage', async () => {
     setSession('admin-csrf')
     mockMe(adminMe)
 
-    const router = await renderApp('/admin')
+    const router = await renderApp('/manage')
 
-    expect(router.state.location.pathname).toBe('/admin')
+    expect(router.state.location.pathname).toBe('/manage')
     expect(await screen.findByText('Administration')).toBeInTheDocument()
   })
 
@@ -214,14 +214,14 @@ describe('app routing + admin gating', () => {
     expect(getCsrfToken()).toBeNull()
   })
 
-  it('redirects an unauthenticated visitor from /admin to /login', async () => {
+  it('redirects an unauthenticated visitor from /manage to /login', async () => {
     mockMe(null)
 
-    const router = await renderApp('/admin')
+    const router = await renderApp('/manage')
 
     expect(router.state.location.pathname).toBe('/login')
     // The app-level login gate records the attempted URL so login can return
     // the user there after signing in.
-    expect(router.state.location.search).toMatchObject({ redirect: '/admin' })
+    expect(router.state.location.search).toMatchObject({ redirect: '/manage' })
   })
 })

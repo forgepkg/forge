@@ -21,7 +21,7 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
-export const Route = createFileRoute('/_app/admin/users')({
+export const Route = createFileRoute('/_app/manage/users')({
   component: UsersList,
 })
 
@@ -131,7 +131,7 @@ function UserRow({
           type="button"
           onClick={() =>
             void navigate({
-              to: '/admin/users/$userId',
+              to: '/manage/users/$userId',
               params: { userId: String(user.id) },
             })
           }
@@ -153,7 +153,7 @@ function UserRow({
       <TableCell>
         <span className="flex items-center gap-3">
           <Link
-            to="/admin/users/$userId"
+            to="/manage/users/$userId"
             params={{ userId: String(user.id) }}
             className="text-sky-600 hover:underline dark:text-sky-400"
           >

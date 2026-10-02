@@ -62,7 +62,7 @@ export const Route = createFileRoute('/_app')({
 const NAV_ITEMS = [
   { label: 'Browse', to: '/', adminOnly: false },
   { label: 'Tokens', to: '/tokens', adminOnly: false },
-  { label: 'Admin', to: '/admin', adminOnly: true },
+  { label: 'Admin', to: '/manage', adminOnly: true },
 ] as const
 
 /** Whether a nav target is the current location (Browse only matches exactly). */
