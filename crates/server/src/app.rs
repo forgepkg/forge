@@ -197,10 +197,13 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it), and a loud one when the existing account still has the
-/// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. A no-op when
-/// `auth.bootstrap_admin` is unset.
+/// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. When
+/// `auth.bootstrap_admin` is unset (the documented production state once the
+/// account exists) nothing is created, but the placeholder check still runs
+/// for the default `admin` account and every account a marker names.
 pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let Some(ba) = &config.auth.bootstrap_admin else {
+        warn_on_placeholder_accounts(pool).await;
         return Ok(());
     };
     let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{}", ba.username);
@@ -321,6 +324,41 @@ pub async fn has_placeholder_password(user: &AppUser) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Boot-time placeholder check when no bootstrap admin is configured: the
+/// default `admin` account and every account a "created once" marker names.
+/// Best effort — a lookup failure is logged, never fatal.
+async fn warn_on_placeholder_accounts(pool: &PgPool) {
+    let pattern = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:%");
+    let markers: Vec<String> = match sqlx::query_scalar(
+        "SELECT key FROM forge_setting WHERE key LIKE $1",
+    )
+    .bind(&pattern)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(error = %e, "bootstrap marker lookup failed; placeholder check limited to `admin`");
+            Vec::new()
+        }
+    };
+    let prefix = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:");
+    let mut usernames: Vec<String> = markers
+        .iter()
+        .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    usernames.push("admin".to_string());
+    usernames.sort();
+    usernames.dedup();
+    for username in usernames {
+        match user_dao::find_user_by_username(pool, &username).await {
+            Ok(Some(user)) if user.active => warn_if_placeholder_password(&user).await,
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, %username, "placeholder password check failed"),
+        }
+    }
 }
 
 /// Boot-time check of an existing bootstrap account: warn loudly while it
