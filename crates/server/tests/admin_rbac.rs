@@ -635,12 +635,20 @@ async fn content_selector_patch_keeps_omitted_fields() {
     );
 }
 
-/// L6: a signed-in user without grants can read a repository anonymous callers
-/// can read (`anonymous_read`), but cannot write it; a token scoped to another
-/// repository gains nothing from it.
+/// L6: with `anonymous_mode = "all"` a signed-in user without grants can read
+/// a repository anonymous callers can read (`anonymous_read`), but cannot
+/// write it; a token scoped to another repository gains nothing from it.
 #[tokio::test]
 async fn signed_in_user_reads_anonymous_read_repo() {
-    let srv = common::start().await;
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            anonymous_mode: "all".into(),
+            ..Default::default()
+        },
+    )
+    .await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let (user_id, username, password) = make_user(&srv).await;

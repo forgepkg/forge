@@ -1055,7 +1055,7 @@ async fn admin_api_requires_admin_scoped_token() {
 /// a token scoped elsewhere gains nothing from it.
 #[tokio::test]
 async fn signed_in_user_reads_anonymous_readable_repos() {
-    let srv = start_stack().await;
+    let srv = StackBuilder::default().anon(AnonMode::All).start().await;
     for (repo, anonymous_read) in [("l6-flag", true), ("l6-grant", false), ("l6-priv", false)] {
         assert_eq!(
             srv.create_repo(
@@ -1107,6 +1107,28 @@ async fn signed_in_user_reads_anonymous_readable_repos() {
         srv.read_index_with_token("l6-flag", &scoped).await,
         StatusCode::FORBIDDEN,
         "a token scoped elsewhere cannot read the public repo"
+    );
+}
+
+/// The public reach follows `anonymous_mode`: with anonymous access off (or
+/// limited to an allowlist the server cannot judge per principal) a signed-in
+/// user without grants does not inherit the `anonymous_read` flag.
+#[tokio::test]
+async fn signed_in_user_gets_no_public_reach_when_anonymous_access_is_off() {
+    let srv = start_stack().await;
+    assert_eq!(
+        srv.create_repo(
+            serde_json::json!({"name": "l6-off", "kind": "hosted", "anonymous_read": true})
+        )
+        .await
+        .status(),
+        201
+    );
+    let uid = srv.create_user("l6-off-user", "pw").await;
+    let token = srv.issue_token(uid, None).await;
+    assert_eq!(
+        srv.read_index_with_token("l6-off", &token).await,
+        StatusCode::FORBIDDEN
     );
 }
 

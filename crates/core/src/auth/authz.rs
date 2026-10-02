@@ -70,12 +70,34 @@ use crate::authz::{parse_token_scope, Action, EffectiveSet, PackageFilter, Token
 pub struct Authz {
     pool: PgPool,
     cache: Cache,
+    /// Whether authenticated principals also hold the public read reach (see
+    /// [`Self::can_read`]). Off unless the server reads anonymously for
+    /// everyone (`anonymous_mode = "all"`).
+    public_read_for_signed_in: bool,
 }
 
 impl Authz {
-    /// Build the service from the shared DB pool and cache.
+    /// Build the service from the shared DB pool and cache. Authenticated
+    /// principals hold only their own grants until
+    /// [`Self::with_public_read_for_signed_in`] says otherwise.
     pub fn new(pool: PgPool, cache: Cache) -> Self {
-        Authz { pool, cache }
+        Authz {
+            pool,
+            cache,
+            public_read_for_signed_in: false,
+        }
+    }
+
+    /// Give authenticated principals the public read reach as well. The server
+    /// enables this only for `anonymous_mode = "all"`, where anyone may read
+    /// those repositories anyway. Under `off` the reach is inert for everyone,
+    /// and under `allowlist` it depends on the caller's address and `Host`,
+    /// which authorization does not see — granting it there would let a
+    /// signed-in user (or their token, or a workload) read from anywhere what
+    /// only allowlisted networks may read anonymously.
+    pub fn with_public_read_for_signed_in(mut self, enabled: bool) -> Self {
+        self.public_read_for_signed_in = enabled;
+        self
     }
 
     /// May `principal` read (download / list / search) `repo`?
@@ -86,11 +108,12 @@ impl Authz {
     /// created with `anonymous_read = true` even on a fresh, default-deny RBAC
     /// install. RBAC grants are still consulted for everything else.
     ///
-    /// Authenticated principals (users, tokens, workloads) hold the same public
+    /// With [`Self::with_public_read_for_signed_in`] (`anonymous_mode = "all"`),
+    /// authenticated principals (users, tokens, workloads) hold the same public
     /// reach — the flag and the `anonymous` role's `read` grants — on top of
     /// their own grants, so a signed-in user without grants is not denied a repo
-    /// an anonymous caller may read. For a token this is still intersected with
-    /// the token's scope.
+    /// any anonymous caller may read. For a token this is still intersected
+    /// with the token's scope.
     ///
     /// Fail-closed: an evaluation error logs and denies.
     pub async fn can_read(&self, principal: &Principal, repo: &Repository) -> bool {
@@ -258,7 +281,7 @@ impl Authz {
                 )
                 .await
                 .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
-                if let Some(flag) = public_read {
+                if let Some(flag) = public_read.filter(|_| self.public_read_for_signed_in) {
                     owner = self.add_public_read(owner, flag).await;
                 }
 
@@ -278,10 +301,12 @@ impl Authz {
                     .map_err(
                         |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
                     )?;
-                Ok(match public_read {
-                    Some(flag) => self.add_public_read(role, flag).await,
-                    None => role,
-                })
+                Ok(
+                    match public_read.filter(|_| self.public_read_for_signed_in) {
+                        Some(flag) => self.add_public_read(role, flag).await,
+                        None => role,
+                    },
+                )
             }
         }
     }

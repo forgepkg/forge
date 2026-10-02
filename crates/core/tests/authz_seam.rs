@@ -590,14 +590,16 @@ async fn mistyped_token_scope_denies_everything() {
     assert!(!az.can_read(&p, &other).await, "and is not unscoped");
 }
 
-/// L6: a signed-in principal without grants may read what an anonymous caller
-/// may (the `anonymous_read` flag and the anonymous role's read grants), still
-/// cut down to any token scope and never extended to writes.
+/// L6: under `anonymous_mode = "all"` a signed-in principal without grants
+/// may read what an anonymous caller may (the `anonymous_read` flag and the
+/// anonymous role's read grants), still cut down to any token scope and never
+/// extended to writes. Without that switch it holds only its own grants.
 #[tokio::test]
 async fn signed_in_user_reads_what_anonymous_reads() {
     let pool = pool().await;
     let cache = Cache::l1_only(64);
-    let az = Authz::new(pool.clone(), cache.clone());
+    let az = Authz::new(pool.clone(), cache.clone()).with_public_read_for_signed_in(true);
+    let az_default = Authz::new(pool.clone(), cache.clone());
 
     let flagged = repository_dao::insert_repository(
         &pool,
@@ -629,6 +631,11 @@ async fn signed_in_user_reads_what_anonymous_reads() {
 
     let uid = make_user(&pool, unique(), false).await;
     let p = user(uid, false);
+    assert!(
+        !az_default.can_read(&p, &flagged).await,
+        "no public reach for signed-in callers unless anonymous_mode = all"
+    );
+    assert!(!az_default.can_read(&p, &granted).await);
     assert!(az.can_read(&p, &flagged).await, "anonymous_read flag");
     assert!(
         az.package_filter(&p, &flagged).await.allows("Any.Package"),
