@@ -5,6 +5,12 @@
 //! separator, e.g. `FORGE_SERVER__BIND`, `FORGE_S3__ACCESS_KEY`,
 //! `FORGE_AUTH__ANONYMOUS_MODE`.
 //!
+//! Secret string keys ([`SECRET_KEYS`]: database/Redis URLs, S3 keys, the
+//! bootstrap-admin password, the OIDC client secret, the credential-forwarding
+//! pepper) are read from the environment **verbatim** — never type-sniffed, so
+//! a numeric or bracketed password stays a string — and configuration errors
+//! never echo their values.
+//!
 //! The raw deserialized shape ([`Config`]) is validated into typed runtime
 //! values where useful (e.g. the anonymous policy + trusted-proxy CIDRs are
 //! parsed once via [`Config::anon_policy`] / [`Config::trusted_proxy_cidrs`]).
@@ -13,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use figment::providers::{Env, Format, Toml};
+use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use forge_core::auth::client_ip::AnonPolicy;
 use ipnet::IpNet;
@@ -79,7 +85,7 @@ pub struct ServerConfig {
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
     /// Permit starting with **known-insecure placeholder credentials** (the
-    /// `changeme` / empty bootstrap-admin password, `minioadmin` S3 keys).
+    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys).
     /// Default `false`: such a config refuses to start, so a copied dev config
     /// or the image's baked defaults never reach production unnoticed. Set
     /// `true` only for local development / compose stacks.
@@ -458,18 +464,42 @@ fn default_negative_ttl() -> u64 {
 }
 
 /// `auth.bootstrap_admin.*`
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Configured entirely through the environment in the container image
+/// (`FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD`, optionally `…__USERNAME`). A block
+/// **without a (non-blank) password means "no bootstrap admin"**: the loader
+/// drops it ([`Config::load`]), so removing the password once real admins
+/// exist is a normal configuration, not a startup error.
+#[derive(Clone, Deserialize)]
 pub struct BootstrapAdmin {
-    /// Admin username to create on first run if absent.
+    /// Admin username to create on first run if absent. Default `admin`.
+    #[serde(default = "default_bootstrap_username")]
     pub username: String,
-    /// Plaintext password (hashed with argon2id on creation).
+    /// Plaintext password (hashed with argon2id on creation). Required for the
+    /// bootstrap admin to exist; **redacted** from `Debug`.
+    #[serde(default)]
     pub password: String,
+}
+
+fn default_bootstrap_username() -> String {
+    "admin".into()
+}
+
+/// Manual `Debug` that **redacts the password**.
+impl std::fmt::Debug for BootstrapAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapAdmin")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `redis.*` (optional).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RedisConfig {
-    /// `redis://…` URL. Absent ⇒ L1-only caching.
+    /// `redis://…` URL. Absent or blank ⇒ L1-only caching (a blank
+    /// `FORGE_REDIS__URL=` disables Redis, see [`Config::load`]).
     #[serde(default)]
     pub url: Option<String>,
     /// Connect / reconnect deadline in milliseconds. Default 2000.
@@ -1159,11 +1189,98 @@ fn default_retention_lease() -> i64 {
     300
 }
 
+/// Dotted config keys holding **secret strings**. Their `FORGE_*` environment
+/// values are taken verbatim (figment's `Env` provider would otherwise parse
+/// `12345` as an integer, `true` as a bool or `[a]` as an array, and the type
+/// error would print the value), and errors at these keys never echo the
+/// value ([`ConfigError::Load`]).
+pub const SECRET_KEYS: &[&str] = &[
+    "database.url",
+    "redis.url",
+    "s3.access_key",
+    "s3.secret_key",
+    "auth.bootstrap_admin.password",
+    "auth.upstream_basic.cache.key_pepper",
+    "oidc.client_secret",
+];
+
+/// Whether an error at config key `path` must not echo its value: one of
+/// [`SECRET_KEYS`], or any key whose name marks it as a credential.
+fn is_secret_path(path: &[String]) -> bool {
+    let joined = path.join(".");
+    SECRET_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&joined))
+        || path.last().is_some_and(|leaf| {
+            let leaf = leaf.to_ascii_lowercase();
+            ["password", "secret", "pepper", "token"]
+                .iter()
+                .any(|marker| leaf.contains(marker))
+        })
+}
+
+/// The type of a figment value without the value itself.
+fn actual_kind(actual: &figment::error::Actual) -> figment::error::Actual {
+    use figment::error::Actual;
+    let name = match actual {
+        Actual::Bool(_) => "bool",
+        Actual::Unsigned(_) => "unsigned int",
+        Actual::Signed(_) => "signed int",
+        Actual::Float(_) => "float",
+        Actual::Char(_) => "char",
+        Actual::Str(_) => "string",
+        Actual::Bytes(_) => "bytes",
+        Actual::Other(_) => "value",
+        other => return other.clone(),
+    };
+    Actual::Other(format!("{name} (value redacted)"))
+}
+
+/// Render a figment error chain with the values of secret keys redacted (the
+/// key name, the expected type and the source are kept, so the message still
+/// says what to fix).
+fn redacted_load_error(err: &figment::Error) -> String {
+    use figment::error::Kind;
+    err.clone()
+        .into_iter()
+        .map(|mut e| {
+            if is_secret_path(&e.path) {
+                e.kind = match e.kind {
+                    Kind::InvalidType(actual, expected) => {
+                        Kind::InvalidType(actual_kind(&actual), expected)
+                    }
+                    Kind::InvalidValue(actual, expected) => {
+                        Kind::InvalidValue(actual_kind(&actual), expected)
+                    }
+                    Kind::UnknownVariant(_, expected) => Kind::Message(format!(
+                        "unknown variant (value redacted), expected one of {expected:?}"
+                    )),
+                    Kind::Unsupported(actual) => Kind::Unsupported(actual_kind(&actual)),
+                    other => other,
+                };
+            }
+            e.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Layer the `FORGE_*` environment over `fig`: every key through figment's
+/// typed `Env` provider except [`SECRET_KEYS`], which are merged verbatim as
+/// strings (same `FORGE_` prefix and `__` nesting).
+fn merge_env(fig: Figment) -> Figment {
+    let env = || Env::prefixed("FORGE_").split("__");
+    let mut fig = fig.merge(env().ignore(SECRET_KEYS));
+    for (key, value) in env().only(SECRET_KEYS).iter() {
+        fig = fig.merge(Serialized::default(key.as_str(), value));
+    }
+    fig
+}
+
 /// Configuration load / validation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// A required key was missing or the file/env was malformed.
-    #[error("configuration error: {0}")]
+    /// A required key was missing or the file/env was malformed. The message
+    /// never echoes the value of a secret key (see [`SECRET_KEYS`]).
+    #[error("configuration error: {}", redacted_load_error(.0))]
     Load(#[from] Box<figment::Error>),
     /// A value was present but invalid (bad CIDR, bad bind addr, unknown mode).
     #[error("invalid configuration: {0}")]
@@ -1173,24 +1290,64 @@ pub enum ConfigError {
 impl Config {
     /// Load configuration from an optional TOML file plus `FORGE_*` env
     /// overrides. Nested keys use `__` (e.g. `FORGE_SERVER__BIND`).
+    ///
+    /// `toml_path` is loaded from **exactly** that path (no parent-directory
+    /// search) and must exist: an explicitly configured `FORGE_CONFIG` that
+    /// points nowhere fails startup instead of silently running on env and
+    /// built-in defaults. Secret keys ([`SECRET_KEYS`]) are read from the
+    /// environment verbatim as strings.
     pub fn load(toml_path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut fig = Figment::new();
         if let Some(path) = toml_path {
-            fig = fig.merge(Toml::file(path));
+            if !path.is_file() {
+                return Err(ConfigError::Invalid(format!(
+                    "configuration file {} does not exist (FORGE_CONFIG must name an \
+                     existing TOML file; unset it to configure through FORGE_* \
+                     environment variables only)",
+                    path.display()
+                )));
+            }
+            fig = fig.merge(Toml::file_exact(path));
         }
-        // `FORGE_` prefix, `__` separates nested keys, lowercase the rest.
-        fig = fig.merge(Env::prefixed("FORGE_").split("__"));
-        let cfg: Config = fig.extract().map_err(Box::new)?;
-        cfg.validate()?;
-        Ok(cfg)
+        Self::from_figment(merge_env(fig))
     }
 
     /// Parse the configuration from an explicit [`Figment`] (used by tests to
     /// inject providers without touching the real environment).
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
-        let cfg: Config = fig.extract().map_err(Box::new)?;
+        let mut cfg: Config = fig.extract().map_err(Box::new)?;
+        cfg.normalize();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Apply the "blank means unset" rules that serde cannot express:
+    /// * an `auth.bootstrap_admin` block without a non-blank password is
+    ///   dropped — no password configured means no bootstrap admin (the image
+    ///   is configured purely through env, and removing the password after
+    ///   the first start is the documented flow);
+    /// * a blank `redis.url` (e.g. `FORGE_REDIS__URL=`) means no Redis.
+    fn normalize(&mut self) {
+        if self
+            .auth
+            .bootstrap_admin
+            .as_ref()
+            .is_some_and(|ba| ba.password.trim().is_empty())
+        {
+            tracing::info!(
+                "auth.bootstrap_admin has no password configured; no bootstrap admin \
+                 will be created"
+            );
+            self.auth.bootstrap_admin = None;
+        }
+        if self
+            .redis
+            .url
+            .as_deref()
+            .is_some_and(|u| u.trim().is_empty())
+        {
+            self.redis.url = None;
+        }
     }
 
     /// Validate cross-cutting invariants that serde cannot express.
@@ -1317,13 +1474,14 @@ impl Config {
 
     /// Refuse known-insecure placeholder credentials unless
     /// `server.allow_insecure_defaults` opts in (dev/compose only): a
-    /// `changeme` or empty bootstrap-admin password, or `minioadmin` S3 keys.
+    /// `changeme` bootstrap-admin password, or `minioadmin` S3 keys. (A blank
+    /// bootstrap password is not a placeholder: it means "no bootstrap admin",
+    /// see [`Self::normalize`].)
     fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
         let mut found = Vec::new();
         if let Some(ba) = &self.auth.bootstrap_admin {
-            let pw = ba.password.trim();
-            if pw.is_empty() || pw.eq_ignore_ascii_case("changeme") {
-                found.push("auth.bootstrap_admin.password is a placeholder (\"changeme\"/empty)");
+            if ba.password.trim().eq_ignore_ascii_case("changeme") {
+                found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder");
             }
         }
         if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
@@ -2303,10 +2461,6 @@ mod tests {
                 "[auth]",
                 "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
             ),
-            (
-                "[auth]",
-                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
-            ),
             ("access_key = \"test\"", "access_key = \"minioadmin\""),
             ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
         ] {
@@ -2322,6 +2476,183 @@ mod tests {
             let cfg = Config::from_figment(fig_from_toml(&allowed)).expect("dev opt-in");
             assert!(cfg.server.allow_insecure_defaults);
         }
+    }
+
+    /// Review M15: the image configures the bootstrap admin through env only,
+    /// and "no password configured" means "no bootstrap admin" — never a
+    /// startup refusal (a blank password used to be refused as a placeholder).
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn missing_or_blank_bootstrap_password_means_no_bootstrap_admin() {
+        for block in [
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"   \"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"",
+        ] {
+            let toml = MINIMAL.replace("[auth]", block);
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("starts");
+            assert!(cfg.auth.bootstrap_admin.is_none(), "{block}");
+        }
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            // Username without a password (the password was removed after the
+            // first start, as docs/deployment.md tells operators to do).
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "admin");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
+            assert!(cfg.auth.bootstrap_admin.is_none());
+            // Password only: the username defaults to `admin`.
+            jail.clear_env();
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "Real-Pw-1");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
+            let ba = cfg.auth.bootstrap_admin.expect("bootstrap admin from env");
+            assert_eq!(ba.username, "admin");
+            assert_eq!(ba.password, "Real-Pw-1");
+            assert!(!format!("{ba:?}").contains("Real-Pw-1"), "Debug redacts");
+            Ok(())
+        });
+    }
+
+    /// The image's baked config carries no bootstrap admin and no
+    /// `allow_password_basic`, and loads with only the required env set.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn docker_image_config_starts_without_a_bootstrap_password() {
+        let baked = include_str!("../../../docker/forge.docker.toml");
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", baked)?;
+            jail.set_env("FORGE_DATABASE__URL", "postgres://forge:pw@db/forge");
+            jail.set_env("FORGE_S3__ACCESS_KEY", "real-access");
+            jail.set_env("FORGE_S3__SECRET_KEY", "real-secret");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml")))
+                .expect("the image starts without any bootstrap password");
+            assert!(cfg.auth.bootstrap_admin.is_none());
+            assert!(!cfg.auth.allow_password_basic);
+            assert!(!cfg.server.allow_insecure_defaults);
+
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "First-Run-Pw");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            let ba = cfg
+                .auth
+                .bootstrap_admin
+                .expect("env-driven bootstrap admin");
+            assert_eq!(
+                (ba.username.as_str(), ba.password.as_str()),
+                ("admin", "First-Run-Pw")
+            );
+            Ok(())
+        });
+    }
+
+    /// Review L9: secret env values are taken verbatim as strings — figment
+    /// would otherwise type-sniff them (`12345` → integer, `true` → bool,
+    /// `[x]` → array) and refuse them as "invalid type", echoing the value.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn secret_env_values_are_read_verbatim_as_strings() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "1234567890");
+            jail.set_env("FORGE_S3__ACCESS_KEY", "true");
+            jail.set_env("FORGE_S3__SECRET_KEY", "[not-a-list]");
+            jail.set_env("FORGE_DATABASE__URL", "postgres://u:{p}@db/forge");
+            jail.set_env("FORGE_OIDC__ISSUER", "https://idp.test/v2.0");
+            jail.set_env("FORGE_OIDC__CLIENT_ID", "cid");
+            jail.set_env("FORGE_OIDC__CLIENT_SECRET", "0x1F");
+            jail.set_env(
+                "FORGE_OIDC__REDIRECT_URL",
+                "https://forge.example.com/auth/oidc/callback",
+            );
+            // A non-secret key keeps figment's typed parsing.
+            jail.set_env("FORGE_CACHE__L1_MAX_CAPACITY", "42");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
+            assert_eq!(ba.password, "1234567890");
+            assert_eq!(cfg.s3.access_key, "true");
+            assert_eq!(cfg.s3.secret_key, "[not-a-list]");
+            assert_eq!(cfg.database.url, "postgres://u:{p}@db/forge");
+            assert_eq!(cfg.oidc.as_ref().expect("oidc").client_secret, "0x1F");
+            assert_eq!(cfg.cache.l1_max_capacity, 42);
+            Ok(())
+        });
+    }
+
+    /// Review L9: a config error at a secret key names the key and the
+    /// expected type but never echoes the value.
+    #[test]
+    fn config_errors_never_echo_secret_values() {
+        for (from, to, key) in [
+            (
+                "secret_key = \"test\"",
+                "secret_key = 98765432101",
+                "secret_key",
+            ),
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\npassword = 55555555555",
+                "password",
+            ),
+            (
+                "url = \"postgres://forge:forge@localhost/forge\"",
+                "url = 77777777777",
+                "url",
+            ),
+        ] {
+            let toml = MINIMAL.replace(from, to);
+            let msg = Config::from_figment(fig_from_toml(&toml))
+                .unwrap_err()
+                .to_string();
+            let value = to.rsplit(' ').next().unwrap();
+            assert!(!msg.contains(value), "value echoed: {msg}");
+            assert!(msg.contains(key), "{msg}");
+            assert!(msg.contains("redacted"), "{msg}");
+        }
+        // Non-secret keys keep the full message (useful for typos).
+        let toml = MINIMAL.replace(
+            "secret_key = \"test\"",
+            "secret_key = \"test\"\nconditional_writes = \"sometimes\"",
+        );
+        let msg = Config::from_figment(fig_from_toml(&toml))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("sometimes"), "{msg}");
+    }
+
+    /// Review L9: an explicitly configured config file that does not exist
+    /// fails startup (it used to be silently ignored), and the path is used
+    /// exactly — never searched for in parent directories.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn explicit_config_path_must_exist_exactly() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            let err = Config::load(Some(std::path::Path::new("missing.toml"))).unwrap_err();
+            assert!(err.to_string().contains("does not exist"), "{err}");
+            assert!(err.to_string().contains("missing.toml"), "{err}");
+
+            // figment's `Toml::file` would find ../forge.toml; the exact loader
+            // does not.
+            jail.change_dir(jail.create_dir("sub")?)?;
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(err.to_string().contains("does not exist"), "{err}");
+            Ok(())
+        });
+    }
+
+    /// `.env.example`: a blank `FORGE_REDIS__URL` disables Redis instead of
+    /// handing the cache an empty URL (which failed startup).
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn blank_redis_url_means_no_redis() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_REDIS__URL", "");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert!(cfg.redis.url.is_none());
+            jail.set_env("FORGE_REDIS__URL", "redis://cache:6379");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.redis.url.as_deref(), Some("redis://cache:6379"));
+            Ok(())
+        });
     }
 
     // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────

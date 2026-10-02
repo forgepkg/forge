@@ -8,7 +8,9 @@
 //! * a deleted bootstrap admin is not re-created on restart — including one
 //!   whose account existed before the "created once" marker was recorded;
 //! * an existing bootstrap account still using the placeholder password is
-//!   detected at boot.
+//!   detected at boot;
+//! * a bootstrap-admin block without a password starts the server with no
+//!   bootstrap admin (review M15: the documented "remove the password" step).
 //!
 //! Requires Postgres + an S3 gateway (testcontainers, or the
 //! `FORGE_TEST_DATABASE_URL` / `FORGE_TEST_S3_ENDPOINT` overrides).
@@ -363,6 +365,38 @@ async fn placeholder_bootstrap_password_is_detected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "startup is not refused");
+}
+
+/// Review M15: following the deployment guide ("remove the password from the
+/// environment") leaves a bootstrap-admin block without a password. That must
+/// start normally and simply create no bootstrap admin.
+#[tokio::test]
+async fn bootstrap_block_without_password_starts_without_a_bootstrap_admin() {
+    let name = format!("nopw{}", common::unique());
+    let pool = common::pool().await;
+    let srv = common::start_with(
+        pool.clone(),
+        common::ServerOpts {
+            bootstrap_admin: Some((name.clone(), String::new())),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(srv.state.config.auth.bootstrap_admin.is_none());
+    let resp = srv
+        .client()
+        .get(format!("{}/healthz", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        forge_db::user_dao::find_user_by_username(&pool, &name)
+            .await
+            .unwrap()
+            .is_none(),
+        "no password configured means no bootstrap admin"
+    );
 }
 
 #[tokio::test]
