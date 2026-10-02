@@ -864,13 +864,18 @@ impl HostedWrite {
 
         // Lock the component row so any concurrent redeploy serializes behind
         // this hard delete (NO advisory locks — a plain row-level FOR UPDATE).
-        sqlx::query!(
+        // A concurrent delete that won the lock has already removed the row:
+        // that is a plain not-found for this caller, not an internal error.
+        let locked = sqlx::query!(
             r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
             comp.id
         )
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(RepoError::from)?;
+        if locked.is_none() {
+            return Ok(DeleteOutcome::NotFound);
+        }
 
         let assets = asset_dao::assets_for_component(&mut *tx, comp.id)
             .await
