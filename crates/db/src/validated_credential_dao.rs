@@ -17,16 +17,34 @@
 //! that bounds the trust window. Infrastructure errors / timeouts are
 //! **fail-closed**: the caller writes *no* row, so the next attempt re-forwards.
 //!
-//! ## Singleflight (no advisory locks)
+//! ## Singleflight (no advisory locks, no lock held across the network)
 //!
 //! A burst of identical NuGet requests across instances must forward upstream
-//! **once**. We coalesce on a **row lock**, never `pg_advisory_*`:
-//! [`begin_singleflight`] does `INSERT … ON CONFLICT DO NOTHING` on the unique
-//! `(provider_id, username, cred_hmac)` triple to materialize an anchor row,
-//! then `SELECT … FOR UPDATE` to take a row-level lock inside the caller's
-//! transaction. The first caller holds the lock, forwards upstream, writes the
-//! verdict, and commits; concurrent callers block on the lock and, once it is
-//! released, read the freshly-written verdict. See [`upsert_verdict`].
+//! **once**, but a fill must never pin a pooled connection while the upstream
+//! answers (an upstream stall or a password spray would otherwise drain the
+//! pool and take every DB-backed request down with it). The singleflight is
+//! therefore a short-lived **lease** recorded on the row itself, never a held
+//! transaction and never `pg_advisory_*`:
+//!
+//! 1. [`claim_singleflight`] — one autocommit `INSERT … ON CONFLICT DO UPDATE …
+//!    WHERE` on the unique `(provider_id, username, cred_hmac)` triple. It
+//!    stamps a fresh `claim_token` + `claimed_until` lease onto the row unless a
+//!    fresh verdict or a live peer claim is already there. Exactly one caller
+//!    wins a given lease.
+//! 2. The winner forwards upstream holding **no** connection, then
+//!    [`finalize_claim`] writes the verdict in a second short transaction,
+//!    *conditioned on still holding its `claim_token`*. A revocation that
+//!    deleted the row meanwhile (or a peer that took over a lapsed lease)
+//!    fences the stale result: nothing is written.
+//! 3. A winner that cannot produce a definitive verdict (upstream outage)
+//!    [`release_claim`]s, so peers take over at once instead of waiting out
+//!    the lease.
+//! 4. Losers poll [`claim_state`] (one indexed `SELECT`, no lock) until the
+//!    verdict lands or the lease lapses, then claim it themselves — a crashed
+//!    or cancelled winner delays its peers by at most one lease.
+//!
+//! A claim row is never a verdict on its own: it is written with an expired
+//! `expires_at`, so [`get_verdict`] keeps ignoring it.
 //!
 //! ## Side tables
 //!
@@ -41,8 +59,11 @@
 //!   [`AUTH_SUCCESS_METHODS_KEPT`] most recently used methods per user. Used to
 //!   decide when an upstream (e.g. Nexus) can be cut off.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::model::ValidatedCredential;
 
@@ -92,9 +113,11 @@ pub async fn get_verdict(
 /// Insert-or-replace the verdict for a triple, refreshing `verdict` and
 /// `expires_at` (and `created_at`) on conflict. Returns the persisted row.
 ///
-/// Called by the singleflight winner after a *real* upstream success/reject.
-/// An infrastructure error / timeout must **never** be persisted (fail-closed),
-/// so callers only invoke this for a definitive `true`/`false` verdict.
+/// An unconditional write (no singleflight lease, no revocation fence): the
+/// production fill path is [`claim_singleflight`] → [`finalize_claim`]. Any
+/// lease on the row is cleared. An infrastructure error / timeout must
+/// **never** be persisted (fail-closed), so callers only invoke this for a
+/// definitive `true`/`false` verdict.
 pub async fn upsert_verdict(pool: &PgPool, new: NewVerdict) -> sqlx::Result<ValidatedCredential> {
     sqlx::query_as!(
         ValidatedCredential,
@@ -103,9 +126,11 @@ pub async fn upsert_verdict(pool: &PgPool, new: NewVerdict) -> sqlx::Result<Vali
             (provider_id, username, cred_hmac, verdict, expires_at)
         VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (provider_id, username, cred_hmac)
-        DO UPDATE SET verdict    = EXCLUDED.verdict,
-                      expires_at = EXCLUDED.expires_at,
-                      created_at = now()
+        DO UPDATE SET verdict       = EXCLUDED.verdict,
+                      expires_at    = EXCLUDED.expires_at,
+                      created_at    = now(),
+                      claim_token   = NULL,
+                      claimed_until = NULL
         RETURNING id, provider_id, username, cred_hmac, verdict, expires_at, created_at
         "#,
         new.provider_id,
@@ -118,81 +143,201 @@ pub async fn upsert_verdict(pool: &PgPool, new: NewVerdict) -> sqlx::Result<Vali
     .await
 }
 
-/// Singleflight anchor: materialize the row for `(provider_id, username,
-/// cred_hmac)` (if absent) and take a row-level `FOR UPDATE` lock on it inside
-/// `tx`, so concurrent identical credential checks forward upstream **once**.
+/// Outcome of a [`claim_singleflight`] attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// This caller holds the lease identified by `token` and must forward
+    /// upstream, then either [`finalize_claim`] (definitive verdict) or
+    /// [`release_claim`] (no verdict).
+    Won { token: Uuid },
+    /// The row already carries a fresh verdict (a peer wrote it): use it, do
+    /// not forward.
+    Verdict(bool),
+    /// A peer holds a live lease: poll [`claim_state`] and retry.
+    Busy,
+}
+
+/// What a polling loser sees on the row (see [`claim_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    /// A fresh verdict landed.
+    Fresh(bool),
+    /// A peer still holds a live lease.
+    Claimed,
+    /// Neither: the row is gone, expired, released or its lease lapsed — the
+    /// caller may [`claim_singleflight`] it.
+    Open,
+}
+
+/// Try to win the singleflight lease for `(provider_id, username, cred_hmac)`.
 ///
-/// Returns the locked row when one already carries a verdict (a peer won the
-/// race and wrote it — the caller should re-read via [`get_verdict`] / use the
-/// returned row instead of forwarding), or `None` when this caller is the
-/// singleflight **winner** and must forward upstream then [`upsert_verdict`].
+/// One autocommit statement — no transaction or row lock outlives it. The
+/// upsert materializes an anchor row (an *expired* negative verdict, so it is
+/// never served as a cached verdict) and stamps `claim_token = token`,
+/// `claimed_until = now() + lease` onto it, but only when the row carries
+/// neither a fresh verdict nor a live peer lease. Concurrent claimers serialize
+/// on the unique index, so exactly one of them wins a lease; a lapsed lease
+/// (crashed / cancelled winner) is simply re-claimed.
 ///
-/// Coalescing is purely a ROW lock (no `pg_advisory_*`): the `INSERT … ON
-/// CONFLICT DO NOTHING` is a no-op for the loser, and the subsequent `SELECT …
-/// FOR UPDATE` blocks until the winner's transaction commits. To distinguish
-/// "I am the winner" from "a peer already produced a fresh verdict", we insert a
-/// sentinel anchor (an *expired* negative row) and treat a row that is still the
-/// sentinel — i.e. expired — as "winner: go forward". A row with a future
-/// `expires_at` means a peer wrote a real verdict while we waited.
-pub async fn begin_singleflight(
-    tx: &mut Transaction<'_, Postgres>,
+/// `lease` must outlast the winner's upstream forward plus its verdict write;
+/// a winner that overruns may find its lease taken over and its verdict
+/// fenced, which costs a duplicate forward but never correctness.
+pub async fn claim_singleflight(
+    pool: &PgPool,
     provider_id: &str,
     username: &str,
     cred_hmac: &str,
-) -> sqlx::Result<Option<ValidatedCredential>> {
-    // Materialize an expired sentinel anchor if no row exists yet. The sentinel
-    // has `expires_at = -infinity`-ish (epoch) so it never counts as a valid
-    // cached verdict; it exists only to give us a row to lock.
-    sqlx::query!(
+    lease: Duration,
+) -> sqlx::Result<Claim> {
+    let token = Uuid::new_v4();
+    let won = sqlx::query_scalar!(
         r#"
-        INSERT INTO validated_credential
-            (provider_id, username, cred_hmac, verdict, expires_at)
-        VALUES ($1, $2, $3, false, to_timestamp(0))
-        ON CONFLICT (provider_id, username, cred_hmac) DO NOTHING
+        INSERT INTO validated_credential AS vc
+            (provider_id, username, cred_hmac, verdict, expires_at,
+             claim_token, claimed_until)
+        VALUES ($1, $2, $3, false, to_timestamp(0),
+                $4, now() + make_interval(secs => $5))
+        ON CONFLICT (provider_id, username, cred_hmac) DO UPDATE
+        SET claim_token   = EXCLUDED.claim_token,
+            claimed_until = EXCLUDED.claimed_until
+        WHERE vc.expires_at <= now()
+          AND (vc.claimed_until IS NULL OR vc.claimed_until <= now())
+        RETURNING vc.id
         "#,
         provider_id,
         username,
         cred_hmac,
+        token,
+        lease.as_secs_f64(),
     )
-    .execute(&mut **tx)
+    .fetch_optional(pool)
     .await?;
+    if won.is_some() {
+        return Ok(Claim::Won { token });
+    }
+    Ok(
+        match claim_state(pool, provider_id, username, cred_hmac).await? {
+            ClaimState::Fresh(verdict) => Claim::Verdict(verdict),
+            // `Open` here means the blocking row vanished or its lease lapsed
+            // between the two statements; the caller's next poll re-claims it.
+            ClaimState::Claimed | ClaimState::Open => Claim::Busy,
+        },
+    )
+}
 
-    // Take the row lock. Whoever holds it is serialized against peers for this
-    // triple. Blocks until any in-flight winner commits.
-    let row = sqlx::query_as!(
-        ValidatedCredential,
+/// Read the singleflight state of a triple without locking anything: the
+/// polling loser's view (see [`ClaimState`]).
+pub async fn claim_state(
+    pool: &PgPool,
+    provider_id: &str,
+    username: &str,
+    cred_hmac: &str,
+) -> sqlx::Result<ClaimState> {
+    let row = sqlx::query!(
         r#"
-        SELECT id, provider_id, username, cred_hmac, verdict, expires_at, created_at
+        SELECT verdict,
+               expires_at > now() AS "fresh!",
+               COALESCE(claimed_until > now(), false) AS "claimed!"
         FROM validated_credential
         WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3
-        FOR UPDATE
         "#,
         provider_id,
         username,
         cred_hmac,
     )
-    .fetch_one(&mut **tx)
+    .fetch_optional(pool)
     .await?;
+    Ok(match row {
+        Some(r) if r.fresh => ClaimState::Fresh(r.verdict),
+        Some(r) if r.claimed => ClaimState::Claimed,
+        _ => ClaimState::Open,
+    })
+}
 
-    // A future expiry means a peer already wrote a real verdict while we waited
-    // on the lock: hand it back so the caller can use it without forwarding. An
-    // expired row is still the sentinel (or a stale verdict): this caller is the
-    // winner and must forward upstream.
-    if row.expires_at > Utc::now() {
-        Ok(Some(row))
-    } else {
-        Ok(None)
+/// Write the winner's definitive verdict — in a short transaction of its own,
+/// **only if it still holds `token`** — and, for an accept, record the
+/// `auth_success` cutoff-log row. Returns `false` (nothing written) when the
+/// claim was fenced: a revocation deleted the row while the winner was
+/// forwarding, or a peer took over a lapsed lease.
+///
+/// The transaction first share-locks the user's revocation tag
+/// ([`lock_user_tag`]), so it linearizes with [`revoke_by_username`]: either
+/// this write commits first and the revocation deletes it, or the revocation
+/// commits first and its delete removes the claim row this write is
+/// conditioned on. A stale validation can never resurrect a revoked verdict.
+pub async fn finalize_claim(pool: &PgPool, new: NewVerdict, token: Uuid) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    lock_user_tag(&mut tx, &new.username).await?;
+    let written = sqlx::query!(
+        r#"
+        UPDATE validated_credential
+        SET verdict       = $4,
+            expires_at    = $5,
+            created_at    = now(),
+            claim_token   = NULL,
+            claimed_until = NULL
+        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3
+          AND claim_token = $6
+        "#,
+        new.provider_id,
+        new.username,
+        new.cred_hmac,
+        new.verdict,
+        new.expires_at,
+        token,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if written == 0 {
+        tx.rollback().await?;
+        return Ok(false);
     }
+    // Accepts only: a rejected attempt leaves no durable trace here.
+    if new.verdict {
+        record_auth_success(&mut tx, &new.username, &new.provider_id).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Give up a lease without a verdict (the upstream was unavailable, or the
+/// winner was cancelled): delete the claim row so peers take over immediately
+/// and an outage leaves nothing behind. A no-op when `token` no longer holds
+/// the row, and it never deletes a fresh verdict.
+pub async fn release_claim(
+    pool: &PgPool,
+    provider_id: &str,
+    username: &str,
+    cred_hmac: &str,
+    token: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        DELETE FROM validated_credential
+        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3
+          AND claim_token = $4
+          AND expires_at <= now()
+        "#,
+        provider_id,
+        username,
+        cred_hmac,
+        token,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Materialize and share-lock the durable revocation tag for `username`.
 ///
-/// Production credential fills call this before taking the per-credential row
-/// lock and before forwarding upstream. [`revoke_by_username`] advances the same
-/// row under an exclusive lock, so revocation either happens before a fill (the
-/// fill is a fresh post-revocation validation) or waits for it and then deletes
-/// its verdict. There is no absent-row gap in which a stale fill can resurrect a
-/// deleted verdict.
+/// Production credential fills call this inside [`finalize_claim`]'s short
+/// verdict-write transaction (never across the upstream forward).
+/// [`revoke_by_username`] advances the same row under an exclusive lock, so a
+/// revocation either commits before the verdict write (and its delete removes
+/// the claim the write is conditioned on, fencing it) or waits for that write
+/// and then deletes the verdict. There is no gap in which a stale fill can
+/// resurrect a deleted verdict.
 ///
 /// The row this creates is **transient**, not a durable record of the attempt:
 /// once no verdict rows remain for the username (rejected/sprayed usernames
@@ -318,43 +463,10 @@ pub async fn list_auth_successes(pool: &PgPool, username: &str) -> sqlx::Result<
     .await
 }
 
-/// Finalize the singleflight: write the real verdict onto the anchor row that
-/// the caller locked via [`begin_singleflight`], **inside the same
-/// transaction**. The caller commits `tx` afterwards, which releases the row
-/// lock and lets waiting peers read the verdict.
-///
-/// Using the same `tx` is essential: the row is `FOR UPDATE`-locked by this
-/// transaction, so the write must go through it (a second connection would
-/// deadlock against the held lock).
-pub async fn finalize_singleflight(
-    tx: &mut Transaction<'_, Postgres>,
-    new: NewVerdict,
-) -> sqlx::Result<ValidatedCredential> {
-    sqlx::query_as!(
-        ValidatedCredential,
-        r#"
-        INSERT INTO validated_credential
-            (provider_id, username, cred_hmac, verdict, expires_at)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (provider_id, username, cred_hmac)
-        DO UPDATE SET verdict    = EXCLUDED.verdict,
-                      expires_at = EXCLUDED.expires_at,
-                      created_at = now()
-        RETURNING id, provider_id, username, cred_hmac, verdict, expires_at, created_at
-        "#,
-        new.provider_id,
-        new.username,
-        new.cred_hmac,
-        new.verdict,
-        new.expires_at,
-    )
-    .fetch_one(&mut **tx)
-    .await
-}
-
 /// Revoke every cached verdict for a username (optionally scoped to one
 /// provider): the admin "force re-auth user X" / deactivate-user path. Returns
-/// the number of rows deleted. The caller must also drop the matching cache
+/// the number of rows deleted (verdicts plus any in-flight singleflight
+/// claims, whose winners are thereby fenced — see [`finalize_claim`]). The caller must also drop the matching cache
 /// entries via the [`forge_cache`] invalidation backplane.
 pub async fn revoke_by_username(
     pool: &PgPool,
@@ -364,9 +476,10 @@ pub async fn revoke_by_username(
     let mut tx = pool.begin().await?;
 
     // The upsert is the revocation's linearization point. It takes an exclusive
-    // row lock and therefore waits for every pre-existing fill holding the
-    // shared user-tag lock. New fills observe the advanced generation and run
-    // only after this transaction commits.
+    // row lock and therefore waits for every in-progress verdict write holding
+    // the shared user-tag lock (a short transaction — never an upstream
+    // forward). Verdict writes that start later wait for this commit and then
+    // find their claim row deleted below, so they write nothing.
     sqlx::query(
         r#"
         INSERT INTO validated_credential_tag (username, generation)
@@ -397,10 +510,20 @@ pub async fn revoke_by_username(
 }
 
 /// Delete all expired rows (the background sweeper). Returns the count removed.
+///
+/// A row carrying a **live** singleflight lease is kept: deleting it would
+/// fence the in-flight winner (its verdict would be discarded) and let a peer
+/// start a duplicate forward. Lapsed leases are swept like any expired row.
 pub async fn sweep_expired(pool: &PgPool) -> sqlx::Result<u64> {
-    let res = sqlx::query!(r#"DELETE FROM validated_credential WHERE expires_at <= now()"#,)
-        .execute(pool)
-        .await?;
+    let res = sqlx::query!(
+        r#"
+        DELETE FROM validated_credential
+        WHERE expires_at <= now()
+          AND (claimed_until IS NULL OR claimed_until <= now())
+        "#,
+    )
+    .execute(pool)
+    .await?;
     Ok(res.rows_affected())
 }
 

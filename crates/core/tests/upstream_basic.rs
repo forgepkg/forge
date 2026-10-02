@@ -11,7 +11,11 @@
 //!   * `required_groups` unmet → `Rejected` despite a 200;
 //!   * `admin_group` present in the body → `suggested_is_admin = true`;
 //!   * an unreachable upstream makes the forward fail → `Unavailable`
-//!     (fail-closed), nothing cached.
+//!     (fail-closed), nothing cached;
+//!   * a redirect (an SSO front 302-ing to a login page that answers 200) is
+//!     not followed and is `Unavailable` — even when 302 is listed as a
+//!     success status — never `Authenticated` (review M3);
+//!   * a stalled upstream is cut off by the configured `request_timeout`.
 //!
 //! Requires Docker (Postgres testcontainer) on the host.
 
@@ -25,7 +29,7 @@ use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, Password
 use forge_core::auth::{
     CredKeyPepper, UpstreamBasicConfig, UpstreamBasicProvider, ValidatedCredentialCache,
 };
-use forge_core::net::ssrf::outbound_client;
+use forge_core::net::ssrf::credential_forward_client;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -44,9 +48,10 @@ fn ip() -> IpAddr {
     "203.0.113.7".parse().unwrap()
 }
 
-/// Build a provider whose SSRF-guarded client allows private ranges (so it can
-/// reach the loopback wiremock server) and whose cache uses an L1-only cache
-/// over the shared Postgres pool (the authoritative store).
+/// Build a provider with the production credential-forwarding client (no
+/// redirects; loopback upstreams are permitted, so it reaches the wiremock
+/// server) and an L1-only cache over the shared Postgres pool (the
+/// authoritative store).
 async fn make_provider(
     config: UpstreamBasicConfig,
     positive_ttl: Duration,
@@ -59,7 +64,7 @@ async fn make_provider(
         positive_ttl,
         Duration::from_secs(30),
     );
-    let client = outbound_client().expect("outbound client");
+    let client = credential_forward_client(config.connect_timeout).expect("forwarding client");
     UpstreamBasicProvider::new(config, client, cache)
 }
 
@@ -299,5 +304,93 @@ async fn unreachable_upstream_is_unavailable() {
     assert_eq!(
         provider.authenticate(&cred(&user, "pw")).await,
         AuthOutcome::Unavailable
+    );
+}
+
+/// Review M3: an upstream behind SSO answers bad credentials with a 302 to a
+/// login page that itself returns 200. Following the redirect and judging the
+/// final status would accept ANY password. The redirect must not be followed
+/// and must fail closed (`Unavailable`, nothing cached).
+#[tokio::test]
+async fn redirect_to_a_200_page_is_unavailable_not_authenticated() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/sso/login"))
+        // Not cached: the second attempt forwards again.
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/sso/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>sign in</html>"))
+        // The login page is never fetched (redirects are not followed).
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/status", server.uri());
+    let provider = make_provider(config_for(url), Duration::from_secs(300)).await;
+    let user = unique_user("up-redirect");
+
+    assert_eq!(
+        provider.authenticate(&cred(&user, "any-password")).await,
+        AuthOutcome::Unavailable,
+        "a redirect is never a valid verdict"
+    );
+    assert_eq!(
+        provider.authenticate(&cred(&user, "any-password")).await,
+        AuthOutcome::Unavailable,
+        "and it is not cached"
+    );
+}
+
+/// A 3xx fails closed even if an operator listed it as a success status: a
+/// redirect says nothing about the credential.
+#[tokio::test]
+async fn redirect_listed_as_success_is_still_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/sso/login"))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(format!("{}/status", server.uri()));
+    config.success_status = vec![200, 302];
+    let provider = make_provider(config, Duration::from_secs(300)).await;
+    let user = unique_user("up-redirect-success");
+
+    assert_eq!(
+        provider.authenticate(&cred(&user, "pw")).await,
+        AuthOutcome::Unavailable
+    );
+}
+
+/// The configured `request_timeout` bounds every forward: a stalled upstream
+/// is cut off (fail closed) instead of holding the request open.
+#[tokio::test]
+async fn stalled_upstream_hits_the_request_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(format!("{}/status", server.uri()));
+    config.request_timeout = Duration::from_millis(300);
+    let provider = make_provider(config, Duration::from_secs(300)).await;
+    let user = unique_user("up-stalled");
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        provider.authenticate(&cred(&user, "pw")).await,
+        AuthOutcome::Unavailable
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the forward was cut off by request_timeout, took {:?}",
+        started.elapsed()
     );
 }

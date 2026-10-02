@@ -60,6 +60,9 @@ login_mode = "identifier_first" # (default: "identifier_first")
 # session_absolute_ttl_seconds = 604800
 # How long an instance trusts its cached snapshot of the auth_realm table.
 realm_cache_ttl_seconds = 10    # (default: 10)
+# Concurrent upstream credential forwards (verdict-cache misses) allowed per
+# credential-forwarding realm, per instance; excess logins fail closed (401).
+credential_forward_max_concurrent = 32  # (default: 32)
 
 # Optional: bootstrap admin created on first run if no admin users exist.
 # Omit the whole section to skip.

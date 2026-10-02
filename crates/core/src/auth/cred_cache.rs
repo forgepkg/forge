@@ -47,26 +47,72 @@
 //! not cache, so the next attempt re-forwards. A flapping upstream therefore
 //! never locks everyone out past the blip, and an outage never opens a hole.
 //!
-//! ## Singleflight (no advisory locks)
+//! ## Singleflight (no advisory locks, no connection held across the network)
 //!
-//! A miss runs the upstream forward through a ROW-lock singleflight in the DAO
-//! (`begin_singleflight` → `finalize_singleflight`), so a burst of identical
-//! credentials across instances forwards **once**. moka's `try_get_with` (inside
-//! the cache crate) additionally coalesces in-process. There are **no Postgres
-//! advisory locks**.
+//! A miss runs the upstream forward through a lease-based singleflight in the
+//! DAO, so a burst of identical credentials across instances forwards **once**
+//! — without ever pinning a pooled connection while the upstream answers (an
+//! upstream stall or a password spray with rotating usernames would otherwise
+//! drain the pool and take every DB-backed request down with it):
+//!
+//! 1. a short statement claims a lease on the credential's row
+//!    ([`vc_dao::claim_singleflight`]) and commits;
+//! 2. the winner forwards holding no connection, under a hard deadline
+//!    ([`ValidatedCredentialCache::with_forward_timeout`]) that the lease
+//!    outlasts;
+//! 3. the verdict is written in a second short transaction conditioned on the
+//!    winner still holding its claim ([`vc_dao::finalize_claim`]) — a
+//!    revocation that landed mid-forward fences the stale result, which then
+//!    fails closed;
+//! 4. losers poll the row with backoff (no lock, no permit held) until the
+//!    verdict lands or the lease lapses, then take over.
+//!
+//! moka's `try_get_with` (inside the cache crate) additionally coalesces
+//! in-process. There are **no Postgres advisory locks**.
+//!
+//! ## Bounded concurrency
+//!
+//! Each provider bounds its concurrent upstream forwards with a semaphore
+//! ([`ForwardLimits`], default [`DEFAULT_MAX_CONCURRENT_FORWARDS`] per
+//! provider per instance). A miss that finds every permit taken fails closed
+//! as [`CredCacheError::Unavailable`] at once — before it writes anything — so
+//! a spray of distinct credentials cannot queue unbounded upstream work.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use forge_cache::Cache;
-use forge_db::validated_credential_dao::{self as vc_dao, NewVerdict};
+use forge_db::validated_credential_dao::{self as vc_dao, Claim, ClaimState, NewVerdict};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
+use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Default cap on concurrent upstream forwards per credential-forwarding
+/// provider, per instance (see [`ForwardLimits`]).
+pub const DEFAULT_MAX_CONCURRENT_FORWARDS: usize = 32;
+
+/// Default hard deadline for one upstream forward (see
+/// [`ValidatedCredentialCache::with_forward_timeout`]). Providers normally set
+/// their own, tighter request timeout.
+pub const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much longer a singleflight lease lives than the forward deadline: room
+/// for the verdict write plus clock jitter between this instance and Postgres
+/// (which stamps the lease), so a healthy winner never loses its lease.
+const CLAIM_LEASE_MARGIN: Duration = Duration::from_secs(5);
+
+/// First / maximum delay between a losing caller's polls of the claimed row.
+const POLL_INITIAL: Duration = Duration::from_millis(20);
+const POLL_MAX: Duration = Duration::from_millis(500);
 
 /// Cache namespace for validated-credential verdicts, keyed by the credential
 /// HMAC. The HMAC already includes the provider id, so all providers can share
@@ -184,11 +230,62 @@ impl From<sqlx::Error> for CredCacheError {
     }
 }
 
+/// Per-provider bounds on concurrent upstream credential forwards.
+///
+/// One semaphore per provider id, created on first use with
+/// `max_per_provider` permits. Keep a single registry for the life of the
+/// process (the server holds it next to its realm snapshot cache) and hand each
+/// provider's semaphore to its [`ValidatedCredentialCache`] via
+/// [`ValidatedCredentialCache::with_forward_limit`], so rebuilding a provider —
+/// e.g. on a realm-snapshot refresh — never resets the bound while forwards
+/// started by the previous build are still in flight.
+pub struct ForwardLimits {
+    max_per_provider: usize,
+    semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl ForwardLimits {
+    /// A registry granting `max_per_provider` concurrent forwards to each
+    /// provider (clamped to at least 1 — zero would deny every miss).
+    pub fn new(max_per_provider: usize) -> Self {
+        Self {
+            max_per_provider: max_per_provider.max(1),
+            semaphores: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The (shared) semaphore bounding `provider_id`'s forwards.
+    pub fn for_provider(&self, provider_id: &str) -> Arc<Semaphore> {
+        let mut map = self
+            .semaphores
+            .lock()
+            .expect("forward-limit registry mutex not poisoned");
+        map.entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_provider)))
+            .clone()
+    }
+}
+
+impl Default for ForwardLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_CONCURRENT_FORWARDS)
+    }
+}
+
+impl fmt::Debug for ForwardLimits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForwardLimits")
+            .field("max_per_provider", &self.max_per_provider)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The validated-credential cache: HMAC key derivation + L1/L2 hot path over the
 /// Postgres `validated_credential` authoritative store, with positive/negative
-/// TTLs, singleflighted upstream forwarding, and revoke-by-username.
+/// TTLs, lease-singleflighted and concurrency-bounded upstream forwarding, and
+/// revoke-by-username.
 ///
-/// Cheaply [`Clone`]able (shares the [`Cache`] and [`PgPool`]).
+/// Cheaply [`Clone`]able (shares the [`Cache`], [`PgPool`] and forward limit).
 #[derive(Clone)]
 pub struct ValidatedCredentialCache {
     cache: Cache,
@@ -196,6 +293,8 @@ pub struct ValidatedCredentialCache {
     pepper: CredKeyPepper,
     positive_ttl: Duration,
     negative_ttl: Duration,
+    forward_timeout: Duration,
+    forward_limit: Arc<Semaphore>,
 }
 
 impl fmt::Debug for ValidatedCredentialCache {
@@ -204,6 +303,7 @@ impl fmt::Debug for ValidatedCredentialCache {
             .field("pepper", &self.pepper)
             .field("positive_ttl", &self.positive_ttl)
             .field("negative_ttl", &self.negative_ttl)
+            .field("forward_timeout", &self.forward_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -212,6 +312,11 @@ impl ValidatedCredentialCache {
     /// Build the cache. `positive_ttl` bounds how long a *good* credential is
     /// trusted without re-forwarding; `negative_ttl` (kept short) bounds how long
     /// a *bad* one is remembered.
+    ///
+    /// Forwards get [`DEFAULT_FORWARD_TIMEOUT`] and a private semaphore of
+    /// [`DEFAULT_MAX_CONCURRENT_FORWARDS`] permits; long-lived wiring should
+    /// share a [`ForwardLimits`] semaphore instead (see
+    /// [`Self::with_forward_limit`]).
     pub fn new(
         cache: Cache,
         pool: PgPool,
@@ -225,7 +330,25 @@ impl ValidatedCredentialCache {
             pepper,
             positive_ttl,
             negative_ttl,
+            forward_timeout: DEFAULT_FORWARD_TIMEOUT,
+            forward_limit: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FORWARDS)),
         }
+    }
+
+    /// Bound this provider's concurrent upstream forwards by `limit` (typically
+    /// [`ForwardLimits::for_provider`]). A miss that finds no free permit fails
+    /// closed ([`CredCacheError::Unavailable`]) instead of queueing.
+    pub fn with_forward_limit(mut self, limit: Arc<Semaphore>) -> Self {
+        self.forward_limit = limit;
+        self
+    }
+
+    /// Hard deadline for one upstream forward; an overrun counts as
+    /// [`UpstreamVerdict::Unavailable`]. The singleflight lease is derived from
+    /// it, so it must cover the provider's whole request (connect + response).
+    pub fn with_forward_timeout(mut self, timeout: Duration) -> Self {
+        self.forward_timeout = timeout;
+        self
     }
 
     /// Validate `(provider_id, username, password)` through the cache.
@@ -237,9 +360,10 @@ impl ValidatedCredentialCache {
     ///
     /// `forward` is the actual upstream HTTP Basic call (Phase 4). It is invoked
     /// **at most once** per credential per TTL window per cluster (singleflight),
-    /// and only on a genuine miss. It receives nothing but its own captured
-    /// state — the plaintext password is the caller's to hold for the duration of
-    /// the request and is never persisted here.
+    /// and only on a genuine miss. No database connection is held while it runs.
+    /// It receives nothing but its own captured state — the plaintext password
+    /// is the caller's to hold for the duration of the request and is never
+    /// persisted here.
     pub async fn check<F, Fut>(
         &self,
         provider_id: &str,
@@ -261,12 +385,16 @@ impl ValidatedCredentialCache {
         // — and re-checked on read — for the authoritative, per-verdict bound.
         // A negative entry that out-lives its DB expiry is re-derived on the next
         // Postgres read (the DAO treats an expired row as a miss).
-        let pool = self.pool.clone();
-        let provider = provider_id.to_string();
-        let user = username.to_string();
-        let key_for_factory = key.clone();
-        let positive_ttl = self.positive_ttl;
-        let negative_ttl = self.negative_ttl;
+        let fill = Fill {
+            pool: self.pool.clone(),
+            provider_id: provider_id.to_string(),
+            username: username.to_string(),
+            cred_hmac: key.clone(),
+            positive_ttl: self.positive_ttl,
+            negative_ttl: self.negative_ttl,
+            forward_timeout: self.forward_timeout,
+            forward_limit: self.forward_limit.clone(),
+        };
 
         let verdict: CachedVerdict = self
             .cache
@@ -275,18 +403,7 @@ impl ValidatedCredentialCache {
                 &key,
                 std::slice::from_ref(&user_tag),
                 self.positive_ttl,
-                || async move {
-                    load_or_forward(
-                        &pool,
-                        &provider,
-                        &user,
-                        &key_for_factory,
-                        positive_ttl,
-                        negative_ttl,
-                        forward,
-                    )
-                    .await
-                },
+                || async move { fill.load_or_forward(forward).await },
             )
             .await?;
 
@@ -302,6 +419,10 @@ impl ValidatedCredentialCache {
     /// the user's cache tag. Provider ids are already framed into each HMAC key,
     /// so a provider-scoped DB revoke may safely evict that user's entries from
     /// every provider without invalidating unrelated users.
+    ///
+    /// A forward in flight for the user is not waited for at the database: its
+    /// claim row is deleted with the verdicts, so its result is discarded (that
+    /// one request fails closed) and the next request re-forwards.
     pub async fn revoke_user(
         &self,
         username: &str,
@@ -341,80 +462,239 @@ pub async fn revoke_credentials_for_user(
     Ok(deleted)
 }
 
-/// The cache factory: read the authoritative Postgres verdict; on a true miss,
-/// run the singleflighted upstream forward and persist the definitive verdict.
-///
-/// Returns `Err(Unavailable)` (never cached) when the upstream is down on a
-/// miss — fail-closed.
-#[allow(clippy::too_many_arguments)]
-async fn load_or_forward<F, Fut>(
-    pool: &PgPool,
-    provider_id: &str,
-    username: &str,
-    cred_hmac: &str,
+/// Everything one cache-miss fill needs, owned so the factory future is
+/// `'static`-friendly for the cache crate's coalescing.
+struct Fill {
+    pool: PgPool,
+    provider_id: String,
+    username: String,
+    cred_hmac: String,
     positive_ttl: Duration,
     negative_ttl: Duration,
-    forward: F,
-) -> Result<CachedVerdict, CredCacheError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = UpstreamVerdict>,
-{
-    // 1. Authoritative read: a non-expired row short-circuits the forward (this
-    //    is what a cold/Redis-less instance relies on).
-    if let Some(row) = vc_dao::get_verdict(pool, provider_id, username, cred_hmac).await? {
-        return Ok(CachedVerdict { valid: row.verdict });
+    forward_timeout: Duration,
+    forward_limit: Arc<Semaphore>,
+}
+
+impl Fill {
+    /// The singleflight lease: the forward deadline plus a margin for the
+    /// verdict write.
+    fn lease(&self) -> Duration {
+        self.forward_timeout + CLAIM_LEASE_MARGIN
     }
 
-    // 2. Singleflight: take the ROW lock. If a peer wrote a fresh verdict while
-    //    we waited, use it without forwarding.
-    let mut tx = pool.begin().await?;
-    vc_dao::lock_user_tag(&mut tx, username).await?;
-    if let Some(row) = vc_dao::begin_singleflight(&mut tx, provider_id, username, cred_hmac).await?
+    /// The cache factory: read the authoritative Postgres verdict; on a true
+    /// miss, win (or wait out) the lease singleflight, forward, and persist the
+    /// definitive verdict. No connection or transaction is held across the
+    /// forward or across a loser's waits.
+    ///
+    /// Returns `Err(Unavailable)` (never cached) when the upstream is down, the
+    /// provider's forward limit is exhausted, the verdict was fenced by a
+    /// concurrent revocation, or a peer's forward did not settle in time —
+    /// fail-closed in every case.
+    async fn load_or_forward<F, Fut>(&self, forward: F) -> Result<CachedVerdict, CredCacheError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = UpstreamVerdict>,
     {
-        tx.commit().await?;
-        return Ok(CachedVerdict { valid: row.verdict });
+        // 1. Authoritative read: a non-expired row short-circuits the forward
+        //    (this is what a cold/Redis-less instance relies on).
+        if let Some(row) = vc_dao::get_verdict(
+            &self.pool,
+            &self.provider_id,
+            &self.username,
+            &self.cred_hmac,
+        )
+        .await?
+        {
+            return Ok(CachedVerdict { valid: row.verdict });
+        }
+
+        // A loser waits at most two leases overall: long enough for a stalled
+        // winner to time out and one takeover to finish.
+        let deadline = Instant::now() + self.lease() * 2;
+        let mut forward = Some(forward);
+        let mut backoff = POLL_INITIAL;
+        loop {
+            // 2. Bound concurrency *before* touching the row, so a saturated
+            //    instance fails fast and writes nothing.
+            let Ok(permit) = self.forward_limit.clone().try_acquire_owned() else {
+                tracing::warn!(
+                    provider = %self.provider_id,
+                    "credential forwarding concurrency limit reached; failing closed"
+                );
+                return Err(CredCacheError::Unavailable);
+            };
+
+            // 3. Claim the singleflight lease (one short statement).
+            match vc_dao::claim_singleflight(
+                &self.pool,
+                &self.provider_id,
+                &self.username,
+                &self.cred_hmac,
+                self.lease(),
+            )
+            .await?
+            {
+                Claim::Verdict(valid) => return Ok(CachedVerdict { valid }),
+                Claim::Won { token } => {
+                    let forward = forward.take().expect("a fill wins its lease at most once");
+                    return self.forward_as_winner(token, permit, forward).await;
+                }
+                Claim::Busy => drop(permit),
+            }
+
+            // 4. A peer (another instance) is forwarding this credential: poll
+            //    its row, holding neither a connection nor a permit, until the
+            //    verdict lands or the lease lapses — then take over.
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    tracing::warn!(
+                        provider = %self.provider_id,
+                        "peer credential forward did not settle in time; failing closed"
+                    );
+                    return Err(CredCacheError::Unavailable);
+                }
+                tokio::time::sleep(backoff.min(deadline - now)).await;
+                backoff = (backoff * 2).min(POLL_MAX);
+                match vc_dao::claim_state(
+                    &self.pool,
+                    &self.provider_id,
+                    &self.username,
+                    &self.cred_hmac,
+                )
+                .await?
+                {
+                    ClaimState::Fresh(valid) => return Ok(CachedVerdict { valid }),
+                    ClaimState::Claimed => continue,
+                    ClaimState::Open => break,
+                }
+            }
+        }
     }
 
-    // 3. We are the winner: forward upstream (the plaintext leaves only here,
-    //    over the Basic header the provider builds).
-    let verdict = forward().await;
-    let (valid, ttl) = match verdict {
-        UpstreamVerdict::Valid => (true, positive_ttl),
-        UpstreamVerdict::Rejected => (false, negative_ttl),
-        UpstreamVerdict::Unavailable => {
-            // Fail-closed: persist nothing, release the lock, deny. The sentinel
-            // anchor row stays expired so it never counts as a cached verdict and
-            // is reaped by the sweeper.
-            tx.rollback().await.ok();
+    /// The lease winner's half: forward (the plaintext leaves only here, over
+    /// the Basic header the provider builds) under the hard deadline, then
+    /// write the verdict conditioned on still holding the lease.
+    async fn forward_as_winner<F, Fut>(
+        &self,
+        token: Uuid,
+        permit: OwnedSemaphorePermit,
+        forward: F,
+    ) -> Result<CachedVerdict, CredCacheError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = UpstreamVerdict>,
+    {
+        // Releases the lease if this future is dropped mid-forward (client
+        // disconnect), so peers need not wait the lease out.
+        let mut guard = ClaimGuard {
+            fill: Some((
+                self.pool.clone(),
+                self.provider_id.clone(),
+                self.username.clone(),
+                self.cred_hmac.clone(),
+                token,
+            )),
+        };
+
+        let verdict = match tokio::time::timeout(self.forward_timeout, forward()).await {
+            Ok(verdict) => verdict,
+            Err(_) => {
+                tracing::warn!(
+                    provider = %self.provider_id,
+                    timeout_ms = self.forward_timeout.as_millis() as u64,
+                    "upstream credential forward exceeded its deadline (fail-closed)"
+                );
+                UpstreamVerdict::Unavailable
+            }
+        };
+        drop(permit);
+
+        let (valid, ttl) = match verdict {
+            UpstreamVerdict::Valid => (true, self.positive_ttl),
+            UpstreamVerdict::Rejected => (false, self.negative_ttl),
+            UpstreamVerdict::Unavailable => {
+                // Fail-closed: persist nothing, hand the lease back so a peer
+                // may retry at once, deny.
+                guard.disarm();
+                if let Err(e) = vc_dao::release_claim(
+                    &self.pool,
+                    &self.provider_id,
+                    &self.username,
+                    &self.cred_hmac,
+                    token,
+                )
+                .await
+                {
+                    // The lease simply lapses instead.
+                    tracing::warn!(error = %e, "releasing a credential-forward claim failed");
+                }
+                return Err(CredCacheError::Unavailable);
+            }
+        };
+
+        let expires_at = Utc::now()
+            + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
+        // On a store error the lease stays and lapses on its own.
+        guard.disarm();
+        let written = vc_dao::finalize_claim(
+            &self.pool,
+            NewVerdict {
+                provider_id: self.provider_id.clone(),
+                username: self.username.clone(),
+                cred_hmac: self.cred_hmac.clone(),
+                verdict: valid,
+                expires_at,
+            },
+            token,
+        )
+        .await?;
+        if !written {
+            // Fenced: the user's verdicts were revoked (or the lease taken over)
+            // while we forwarded. This answer predates the revocation, so it
+            // must not be served — not even to this caller (the cache layer
+            // would keep it). Fail closed; the next request re-forwards.
+            tracing::info!(
+                provider = %self.provider_id,
+                "credential verdict discarded: revoked while the forward was in flight"
+            );
             return Err(CredCacheError::Unavailable);
         }
-    };
 
-    // Record the successful validation for the "who still authenticates
-    // through which upstream?" cutoff log — accepts only; a rejected attempt
-    // leaves no durable trace anywhere (its tag row and negative verdict are
-    // both swept once the negative TTL lapses).
-    if valid {
-        vc_dao::record_auth_success(&mut tx, username, provider_id).await?;
+        Ok(CachedVerdict { valid })
     }
+}
 
-    let expires_at = Utc::now()
-        + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
-    vc_dao::finalize_singleflight(
-        &mut tx,
-        NewVerdict {
-            provider_id: provider_id.to_string(),
-            username: username.to_string(),
-            cred_hmac: cred_hmac.to_string(),
-            verdict: valid,
-            expires_at,
-        },
-    )
-    .await?;
-    tx.commit().await?;
+/// Releases a won lease from a background task when the winning fill is
+/// dropped before it settled (e.g. the client disconnected mid-forward).
+struct ClaimGuard {
+    fill: Option<(PgPool, String, String, String, Uuid)>,
+}
 
-    Ok(CachedVerdict { valid })
+impl ClaimGuard {
+    /// The fill settled the lease itself: do nothing on drop.
+    fn disarm(&mut self) {
+        self.fill = None;
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        let Some((pool, provider_id, username, cred_hmac, token)) = self.fill.take() else {
+            return;
+        };
+        // Best effort: without a runtime the lease just lapses.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) =
+                    vc_dao::release_claim(&pool, &provider_id, &username, &cred_hmac, token).await
+                {
+                    tracing::debug!(error = %e, "releasing an abandoned credential-forward claim failed");
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]

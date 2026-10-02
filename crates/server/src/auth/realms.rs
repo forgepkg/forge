@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 
 use forge_cache::Cache;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, CredKeyPepper, LocalPasswordProvider, UpstreamBasicProvider,
-    ValidatedCredentialCache,
+    AuthProvider, Chain, ChainSource, CredKeyPepper, ForwardLimits, LocalPasswordProvider,
+    UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_crypto::service::EnvelopeService;
@@ -412,12 +412,20 @@ pub struct RealmAuth {
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
     /// Decrypts `auth_realm.secrets_enc` when secret encryption is enabled.
     envelope: Option<Arc<EnvelopeService>>,
+    /// Per-provider bounds on concurrent upstream credential forwards
+    /// (`auth.credential_forward_max_concurrent`). Lives here, not in the
+    /// snapshot, so a snapshot rebuild never resets a bound while forwards
+    /// started by the previous build are still in flight.
+    forward_limits: Arc<ForwardLimits>,
 }
 
 impl RealmAuth {
     /// Build the (empty) cache; the first `snapshot()` call populates it.
     pub fn new(pool: PgPool, cache: Cache, config: Arc<Config>) -> Self {
         let ttl = Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1));
+        let forward_limits = Arc::new(ForwardLimits::new(
+            config.auth.credential_forward_max_concurrent,
+        ));
         Self {
             pool,
             cache,
@@ -425,6 +433,7 @@ impl RealmAuth {
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
             envelope: None,
+            forward_limits,
         }
     }
 
@@ -570,27 +579,36 @@ impl RealmAuth {
     ) -> anyhow::Result<Box<dyn AuthProvider>> {
         let cfg: CredForwardRealmConfig =
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
-        let client =
-            ssrf::outbound_client().map_err(|e| anyhow::anyhow!("build outbound client: {e}"))?;
+        let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
+        let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
+        // Never follows redirects: a 3xx is judged (as unavailable) by the
+        // provider instead of the page it points at.
+        let client = ssrf::credential_forward_client(connect_timeout)
+            .map_err(|e| anyhow::anyhow!("build credential-forwarding client: {e}"))?;
+        // Realm-scoped: keys the validated-credential cache per realm.
+        let provider_id = format!("realm:{}", realm.name);
         let cred_cache = ValidatedCredentialCache::new(
             self.cache.clone(),
             self.pool.clone(),
             CredKeyPepper::new(cfg.key_pepper.clone().into_bytes()),
             Duration::from_secs(cfg.positive_ttl_secs),
             Duration::from_secs(cfg.negative_ttl_secs),
-        );
+        )
+        .with_forward_limit(self.forward_limits.for_provider(&provider_id))
+        // The request's own timeout normally fires first (and is logged as
+        // such); the cache's deadline is the backstop its lease is sized by.
+        .with_forward_timeout(request_timeout + Duration::from_secs(1));
         let core = forge_core::auth::UpstreamBasicConfig {
             url: cfg.url,
             method: cfg.method.to_ascii_uppercase(),
             success_status: cfg.success_status,
             reject_status: cfg.reject_status,
-            connect_timeout: Duration::from_millis(cfg.connect_timeout_ms),
-            request_timeout: Duration::from_millis(cfg.request_timeout_ms),
+            connect_timeout,
+            request_timeout,
             required_groups: cfg.required_groups,
             groups_path: cfg.groups_path,
             admin_group: cfg.admin_group,
-            // Realm-scoped: keys the validated-credential cache per realm.
-            provider_id: format!("realm:{}", realm.name),
+            provider_id,
             auto_provision: cfg.auto_provision,
             realm_id: Some(realm.id),
         };

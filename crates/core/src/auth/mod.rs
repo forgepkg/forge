@@ -37,8 +37,9 @@ pub use chain::{
 };
 pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
 pub use cred_cache::{
-    cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, UpstreamVerdict,
-    ValidatedCredentialCache,
+    cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
+    UpstreamVerdict, ValidatedCredentialCache, DEFAULT_FORWARD_TIMEOUT,
+    DEFAULT_MAX_CONCURRENT_FORWARDS,
 };
 pub use local_password::LocalPasswordProvider;
 pub use login_throttle::LoginThrottle;

@@ -253,6 +253,18 @@ pub struct AuthConfig {
     /// Length (seconds) of the password-failure window / lockout.
     #[serde(default = "default_login_failure_window")]
     pub login_failure_window_seconds: u64,
+    /// Maximum concurrent upstream credential forwards **per
+    /// credential-forwarding realm, per instance** (verdict-cache misses
+    /// only; cache hits never forward). A miss beyond the bound fails closed
+    /// (401) instead of queueing, so an upstream stall or a password spray
+    /// cannot pile up unbounded outbound work. Forwards never hold a database
+    /// connection, whatever this is set to. Values below 1 are treated as 1.
+    #[serde(default = "default_credential_forward_max_concurrent")]
+    pub credential_forward_max_concurrent: usize,
+}
+
+fn default_credential_forward_max_concurrent() -> usize {
+    forge_core::auth::DEFAULT_MAX_CONCURRENT_FORWARDS
 }
 
 fn default_login_max_failures() -> u32 {
