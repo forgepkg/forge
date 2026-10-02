@@ -1,0 +1,40 @@
+# Dependency update PRs (review L12). Security updates are raised as soon as an
+# advisory lands; version updates are batched weekly and grouped per ecosystem
+# so the queue stays reviewable. CI's `audit` job (cargo-audit) is the gate for
+# Rust advisories; accepted ones are listed in .cargo/audit.toml.
+version: 2
+updates:
+  # Rust workspace (Cargo.toml / Cargo.lock at the root).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  # Web SPA (pnpm lockfile; Dependabot's npm ecosystem handles pnpm).
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      web-minor-and-patch:
+        update-types: [minor, patch]
+
+  # GitHub Actions: keeps the SHA pins (and their `# vX.Y.Z` comments) current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Dockerfile base images (pinned by digest; Dependabot bumps tag + digest).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

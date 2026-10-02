@@ -1,0 +1,9 @@
+# cargo-audit configuration, read by the `audit` CI job (.github/workflows/ci.yml)
+# and by a local `cargo audit`. Every accepted advisory needs a one-line
+# rationale; remove the entry as soon as an update makes it unnecessary.
+[advisories]
+ignore = [
+    # rsa 0.9 Marvin timing side channel (no fixed release): used only by the
+    # forge-e2e test crate's mock OIDC issuer to sign test JWTs; not in forge-server.
+    "RUSTSEC-2023-0071",
+]
