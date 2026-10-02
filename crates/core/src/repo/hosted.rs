@@ -561,28 +561,36 @@ impl HostedWrite {
 
         let nupkg_hash512 = nupkg.sha512_base64.clone();
 
-        let outcome = if let Some(comp) = existing {
-            if !repo_row.allow_redeploy {
-                // Duplicate and redeploy disabled → 409. Drop the tx; the
-                // pending blobs become orphans the reconciler cleans up.
-                return Err(WriteError::Conflict {
-                    id: parsed.original_id.clone(),
-                    version: parsed.version.clone(),
-                });
+        let replaced = match existing {
+            Some(comp) => {
+                if !repo_row.allow_redeploy {
+                    // Duplicate and redeploy disabled → 409. Drop the tx; the
+                    // pending blobs become orphans the reconciler cleans up.
+                    return Err(WriteError::Conflict {
+                        id: parsed.original_id.clone(),
+                        version: parsed.version.clone(),
+                    });
+                }
+                // `false`: a concurrent hard delete removed the version
+                // before this push could lock it, so it is a fresh insert.
+                self.redeploy_in_tx(
+                    &mut tx,
+                    &comp,
+                    &nupkg_sha,
+                    nupkg.ingest_token,
+                    nupkg_size,
+                    &nupkg_hash512,
+                    &nuspec_sha,
+                    nuspec.ingest_token,
+                    nuspec_size,
+                    &parsed,
+                )
+                .await?
             }
-            self.redeploy_in_tx(
-                &mut tx,
-                &comp,
-                &nupkg_sha,
-                nupkg.ingest_token,
-                nupkg_size,
-                &nupkg_hash512,
-                &nuspec_sha,
-                nuspec.ingest_token,
-                nuspec_size,
-                &parsed,
-            )
-            .await?;
+            None => false,
+        };
+
+        let outcome = if replaced {
             PublishOutcome::Replaced
         } else {
             let inserted = self
@@ -700,16 +708,21 @@ impl HostedWrite {
         nuspec_ingest_token: uuid::Uuid,
         nuspec_size: i64,
         parsed: &crate::ParsedUpload,
-    ) -> Result<(), WriteError> {
+    ) -> Result<bool, WriteError> {
         // Lock the component row so concurrent redeploys serialize (NO advisory
-        // locks — a plain row-level FOR UPDATE).
-        sqlx::query!(
+        // locks — a plain row-level FOR UPDATE). A concurrent hard delete that
+        // won the lock has removed the row: report that (`false`) before
+        // touching any reference, so the caller inserts the version afresh.
+        let locked = sqlx::query!(
             r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
             comp.id
         )
-        .fetch_one(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(RepoError::from)?;
+        if locked.is_none() {
+            return Ok(false);
+        }
 
         // Incref the new blobs first.
         blob_dao::commit_ingest_and_incref(tx, nupkg_sha, nupkg_ingest_token)
@@ -761,7 +774,8 @@ impl HostedWrite {
             nuspec_sha,
             nuspec_size,
         )
-        .await
+        .await?;
+        Ok(true)
     }
 
     /// Insert the canonical `.nupkg` and `.nuspec` asset rows for a component.
