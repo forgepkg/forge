@@ -217,6 +217,79 @@ async fn worker_skips_revived_blob() {
     store.delete(&key).await.unwrap();
 }
 
+/// Counter drift (the pre-0.1.0 double decrement could leave `ref_count = 0`
+/// on a blob an asset still names) must never let the worker delete it: the
+/// reservation sees the asset, repairs the counter, and keeps the object.
+#[tokio::test]
+async fn worker_never_deletes_a_blob_an_asset_still_names() {
+    let _test_guard = OUTBOX_TEST_LOCK.lock().await;
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+
+    let n = common::unique();
+    let (sha, key) = ingest_and_commit(&cas, &pool, format!("outbox-drift-{n}").into_bytes()).await;
+
+    // One live asset reference.
+    let repo_id: i64 = sqlx::query_scalar(
+        "INSERT INTO repository (name, kind) VALUES ($1, 'hosted') RETURNING id",
+    )
+    .bind(format!("drift-{n}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let component_id: i64 = sqlx::query_scalar(
+        "INSERT INTO component (repository_id, name, original_id, version, version_original) \
+         VALUES ($1, 'drift.pkg', 'Drift.Pkg', '1.0.0', '1.0.0') RETURNING id",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset (component_id, path, content_type, blob_sha256, size) \
+         VALUES ($1, 'drift.pkg.1.0.0.nupkg', 'application/octet-stream', $2, 1)",
+    )
+    .bind(component_id)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Drift: the counter says nobody references it, and a delete is due.
+    sqlx::query("UPDATE blob SET ref_count = 0 WHERE sha256 = $1")
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at) \
+         VALUES ('delete_object', $1, $2, now())",
+    )
+    .bind(&sha)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    drain_outbox_for(&pool, &store, &sha).await;
+
+    assert!(store.head(&key).await.unwrap(), "referenced object kept");
+    let blob = forge_db::blob_dao::get_blob(&pool, &sha)
+        .await
+        .unwrap()
+        .expect("blob row kept");
+    assert_eq!(blob.ref_count, 1, "counter repaired to the asset count");
+
+    // Cleanup.
+    sqlx::query("DELETE FROM repository WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.delete(&key).await.unwrap();
+}
+
 /// The hard interleaving: an ingest registers, observes the old deduplicated S3
 /// object, and only later attaches its DB reference. A deleter must be unable to
 /// reserve in that gap; otherwise it could remove the object before incref.

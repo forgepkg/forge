@@ -15,15 +15,18 @@
 --      * A fresh 0.1.0 install (and any clean upgrade) has no drift, so it ends
 --        up with a fully validated constraint. `blob` holds one row per unique
 --        stored file, so the validation scan is cheap.
---      * A pre-release install that already hit B1 may hold negative rows.
---        Failing the migration there would stop the server from booting over
---        state it cannot repair by itself (the true count depends on which
---        objects still exist). Instead the constraint stays NOT VALID — it is
---        still enforced for every row inserted or updated from now on, so a
---        further decrement of a drifted row fails rather than deleting — and a
---        WARNING names the remedy. After repairing the rows (for committed
---        blobs: `ref_count = (SELECT count(*) FROM asset WHERE blob_sha256 =
---        blob.sha256)`, and verifying the S3 object still exists), run
+--      * A pre-release install that already hit B1 holds committed blobs
+--        whose `ref_count` is below the number of assets naming them (often
+--        0 with one reference left, sometimes negative). Those are repaired
+--        first: `ref_count` is raised to the true asset count, which can only
+--        prevent deletions, never cause one. A WARNING reports how many, as
+--        their S3 objects may already be gone (restore them from the backup).
+--      * Should any row still be negative after that (a non-committed blob),
+--        failing the migration would stop the server from booting over state
+--        it cannot repair by itself. Instead the constraint stays NOT VALID —
+--        it is still enforced for every row inserted or updated from now on,
+--        so a further decrement of a drifted row fails rather than deleting —
+--        and a WARNING names the remedy. After repairing the rows, run
 --        `ALTER TABLE blob VALIDATE CONSTRAINT blob_ref_count_nonnegative;`.
 --        VALIDATE only takes a SHARE UPDATE EXCLUSIVE lock, so it can run
 --        online.
@@ -32,8 +35,26 @@ ALTER TABLE blob
 
 DO $$
 DECLARE
+    repaired bigint;
     drifted bigint;
 BEGIN
+    WITH actual AS (
+        SELECT b.sha256, count(a.id) AS n
+        FROM blob b
+        LEFT JOIN asset a ON a.blob_sha256 = b.sha256
+        WHERE b.state = 'committed'
+        GROUP BY b.sha256
+    )
+    UPDATE blob
+    SET ref_count = actual.n
+    FROM actual
+    WHERE blob.sha256 = actual.sha256 AND blob.ref_count < actual.n;
+    GET DIAGNOSTICS repaired = ROW_COUNT;
+    IF repaired > 0 THEN
+        RAISE WARNING 'repaired % blob ref_count(s) below their asset references (pre-0.1.0 double-decrement drift); check that their S3 objects still exist and restore any missing ones from the backup',
+            repaired;
+    END IF;
+
     SELECT count(*) INTO drifted FROM blob WHERE ref_count < 0;
     IF drifted = 0 THEN
         ALTER TABLE blob VALIDATE CONSTRAINT blob_ref_count_nonnegative;

@@ -498,6 +498,30 @@ async fn reserve_delete(
         return Ok(ReserveDeleteOutcome::Referenced);
     }
 
+    // Defence in depth against counter drift: never reserve a blob that an
+    // asset still names, whatever `ref_count` says. Drift is repaired here, to
+    // the true asset count, under the blob row lock every increment and
+    // decrement also takes, so later decrements stay correct.
+    let referenced: i64 = sqlx::query_scalar("SELECT count(*) FROM asset WHERE blob_sha256 = $1")
+        .bind(sha256)
+        .fetch_one(&mut *tx)
+        .await?;
+    if referenced > 0 {
+        tracing::warn!(
+            sha256,
+            ref_count,
+            referenced,
+            "blob ref_count drifted below its asset references; repaired, not deleting"
+        );
+        sqlx::query("UPDATE blob SET ref_count = $2 WHERE sha256 = $1")
+            .bind(sha256)
+            .bind(referenced)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(ReserveDeleteOutcome::Referenced);
+    }
+
     let state: String = row.try_get("state")?;
     let original_state = if state == "deleting" {
         let started: DateTime<Utc> = row.try_get("delete_started_at")?;

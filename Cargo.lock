@@ -1657,6 +1657,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
