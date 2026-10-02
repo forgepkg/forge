@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO validated_credential AS vc\n            (provider_id, username, cred_hmac, verdict, expires_at,\n             claim_token, claimed_until)\n        VALUES ($1, $2, $3, false, to_timestamp(0),\n                $4, now() + make_interval(secs => $5))\n        ON CONFLICT (provider_id, username, cred_hmac) DO UPDATE\n        SET claim_token   = EXCLUDED.claim_token,\n            claimed_until = EXCLUDED.claimed_until\n        WHERE vc.expires_at <= now()\n          AND (vc.claimed_until IS NULL OR vc.claimed_until <= now())\n        RETURNING vc.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6de8b2ec8c8e457860d60b183bb998f9134f5d0901f1db334cb745856cae491b"
+}

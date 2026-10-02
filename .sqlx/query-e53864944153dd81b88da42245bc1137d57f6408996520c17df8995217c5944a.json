@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, provider_id, username, cred_hmac, verdict, expires_at, created_at\n        FROM validated_credential\n        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3\n        FOR UPDATE\n        ",
+  "query": "\n        INSERT INTO validated_credential\n            (provider_id, username, cred_hmac, verdict, expires_at)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (provider_id, username, cred_hmac)\n        DO UPDATE SET verdict       = EXCLUDED.verdict,\n                      expires_at    = EXCLUDED.expires_at,\n                      created_at    = now(),\n                      claim_token   = NULL,\n                      claimed_until = NULL\n        RETURNING id, provider_id, username, cred_hmac, verdict, expires_at, created_at\n        ",
   "describe": {
     "columns": [
       {
@@ -85,7 +85,9 @@
       "Left": [
         "Text",
         "Text",
-        "Text"
+        "Text",
+        "Bool",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -98,5 +100,5 @@
       false
     ]
   },
-  "hash": "bdd0db6b5fd8888a864df148bcbccc55f31ac00951b5497d77c65bb9c1d548ae"
+  "hash": "e53864944153dd81b88da42245bc1137d57f6408996520c17df8995217c5944a"
 }

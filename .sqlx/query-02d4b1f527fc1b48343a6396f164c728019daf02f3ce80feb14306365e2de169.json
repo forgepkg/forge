@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM validated_credential\n        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3\n          AND claim_token = $4\n          AND expires_at <= now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "02d4b1f527fc1b48343a6396f164c728019daf02f3ce80feb14306365e2de169"
+}
