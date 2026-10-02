@@ -1330,3 +1330,380 @@ async fn prefer_hosted_hides_proxy_versions_of_internal_ids() {
         2
     );
 }
+
+// ── prefer_hosted is decided over every hosted leaf (review B2) ─────────────
+
+/// Grant the built-in `anonymous` role `read` on `repo`.
+async fn grant_anon_read(pool: &PgPool, repo: &Repository) {
+    let anon_role = authz_dao::role_id_by_name(pool, authz_dao::ANONYMOUS_ROLE)
+        .await
+        .expect("query")
+        .expect("anonymous role seeded");
+    authz_dao::add_grant(pool, anon_role, Some(repo.id), "read", None)
+        .await
+        .expect("anon read grant");
+}
+
+/// A [`FakeProxy`] serving the attacker's `99.0.0`, keyed by its member id.
+fn shadowing_proxy(proxy: &Repository) -> HashMap<i64, Arc<FakeProxy>> {
+    let mut proxies = HashMap::new();
+    proxies.insert(
+        proxy.id,
+        Arc::new(FakeProxy {
+            versions: vec!["99.0.0"],
+            fail: false,
+        }),
+    );
+    proxies
+}
+
+/// The caller can see the group and the public proxy but not the hosted copy
+/// of `sample`: every read must look like an unknown package, never fall
+/// through to the proxy's higher version.
+async fn assert_internal_id_not_served(g: &GroupRepo, group: &str, who: &str) {
+    assert!(
+        g.list_versions(group, "sample").await.unwrap().is_empty(),
+        "{who}: flat index must not list the proxy's versions of an internal id"
+    );
+    assert!(
+        g.resolve_nupkg(group, "sample", "99.0.0")
+            .await
+            .unwrap()
+            .is_none(),
+        "{who}: the proxy's nupkg of an internal id must not be downloadable"
+    );
+    assert!(
+        g.resolve_nuspec(group, "sample", "99.0.0")
+            .await
+            .unwrap()
+            .is_none(),
+        "{who}: the proxy's nuspec of an internal id must not be served"
+    );
+    assert!(
+        g.registration(group, "sample").await.unwrap().is_empty(),
+        "{who}: registration must not carry the proxy's versions"
+    );
+    let search = g
+        .search(
+            group,
+            &SearchParams {
+                q: "sample".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (search.total_hits, search.hits.len()),
+        (0, 0),
+        "{who}: search must drop the proxy hit for an internal id"
+    );
+}
+
+/// Mixed-anonymity group: anonymous group + anonymous proxy + private hosted
+/// member owning the id. The anonymous caller cannot see the hosted copy, yet
+/// must not be handed the proxy's (attacker's) version; ids the hosted members
+/// do not own still come from the proxy, and an authenticated caller still
+/// gets the hosted copy.
+#[tokio::test]
+async fn prefer_hosted_shields_internal_ids_from_anonymous_callers() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    // The proxy even outranks the hosted member.
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+    grant_anon_read(&pool, &group).await;
+    grant_anon_read(&pool, &proxy).await;
+
+    let g = mixed_group_repo(&pool, blobs.clone(), anon(), shadowing_proxy(&proxy));
+    assert_internal_id_not_served(&g, &group.name, "anonymous").await;
+    assert_eq!(
+        g.list_versions(&group.name, "other").await.unwrap().len(),
+        1,
+        "ids no hosted leaf owns are still proxied for the anonymous caller"
+    );
+
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, shadowing_proxy(&proxy));
+    let versions: Vec<String> = g
+        .list_versions(&group.name, "sample")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version)
+        .collect();
+    assert_eq!(
+        versions,
+        ["1.0.0"],
+        "authenticated caller gets the hosted copy"
+    );
+}
+
+/// A caller whose read grant on the hosted member is selector-scoped away from
+/// the id is treated like one who cannot read the member at all.
+#[tokio::test]
+async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+
+    let suffix = common::unique();
+    let account = user_dao::insert_user(
+        &pool,
+        NewUser::local(format!("scoped-user-{suffix}"), "x".into(), false, true),
+    )
+    .await
+    .expect("insert user");
+    let role = authz_dao::insert_role(&pool, &format!("scoped-{suffix}"), "B2 regression")
+        .await
+        .expect("insert role");
+    let selector = authz_dao::insert_content_selector(
+        &pool,
+        &format!("scoped-other-{suffix}"),
+        &["other.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("insert selector");
+    for (repo, selector) in [
+        (group.id, None),
+        (proxy.id, None),
+        (hosted.id, Some(selector)),
+    ] {
+        authz_dao::add_grant(&pool, role.id, Some(repo), "read", selector)
+            .await
+            .expect("grant read");
+    }
+    authz_dao::assign_role(&pool, account.id, role.id)
+        .await
+        .expect("assign role");
+    let principal = Principal::User {
+        user_id: account.id,
+        token_id: None,
+        is_admin: false,
+    };
+
+    let g = mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));
+    assert_internal_id_not_served(&g, &group.name, "selector-scoped").await;
+}
+
+/// The owning hosted leaf sits in a nested group the caller cannot read at
+/// all; ownership is still decided over it.
+#[tokio::test]
+async fn prefer_hosted_counts_hosted_leaves_behind_unreadable_nested_groups() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await; // no anonymous grant
+    let outer = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    repository_dao::add_group_member(&pool, inner.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 10)
+        .await
+        .unwrap();
+    grant_anon_read(&pool, &outer).await;
+    grant_anon_read(&pool, &proxy).await;
+    // Even read on the hosted leaf itself does not help while the inner group
+    // blocks descent — the leaf still owns the id.
+    grant_anon_read(&pool, &hosted).await;
+
+    let g = mixed_group_repo(&pool, blobs, anon(), shadowing_proxy(&proxy));
+    assert_internal_id_not_served(&g, &outer.name, "anonymous (nested)").await;
+}
+
+/// Ownership counts unlisted versions too, and opting out of prefer_hosted
+/// restores the proxy for callers who cannot see the hosted copy.
+#[tokio::test]
+async fn prefer_hosted_ownership_includes_unlisted_and_respects_opt_out() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "1.0.0", "h").await;
+    assert!(
+        component_dao::set_listed(&pool, hosted.id, "sample", "1.0.0", false)
+            .await
+            .unwrap()
+    );
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+    grant_anon_read(&pool, &group).await;
+    grant_anon_read(&pool, &proxy).await;
+
+    let g = mixed_group_repo(&pool, blobs.clone(), anon(), shadowing_proxy(&proxy));
+    assert_internal_id_not_served(&g, &group.name, "anonymous (unlisted owner)").await;
+
+    // An authenticated caller sees the hosted member, whose only version is
+    // unlisted: search drops the proxy hit and has no hosted hit to show.
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    let params = SearchParams {
+        q: "sample".into(),
+        ..SearchParams::default()
+    };
+    assert_eq!(g.search(&group.name, &params).await.unwrap().total_hits, 0);
+
+    set_prefer_hosted(&pool, &group, false).await;
+    let g = mixed_group_repo(&pool, blobs, anon(), shadowing_proxy(&proxy));
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        1,
+        "without prefer_hosted the proxy serves the id"
+    );
+}
+
+// ── group search enriches only the final page (review M8) ───────────────────
+
+/// [`StubBlobs`] that counts every blob read (the S3 manifest fetches search
+/// enrichment performs).
+#[derive(Clone)]
+struct CountingBlobs {
+    inner: StubBlobs,
+    fetches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl BlobFetch for CountingBlobs {
+    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_all(s3_key).await
+    }
+}
+
+struct CountingBlobsFactory {
+    pool: PgPool,
+    blobs: CountingBlobs,
+}
+
+impl MemberOpsFactory for CountingBlobsFactory {
+    fn ops_for(&self, _member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        Ok(Arc::new(HostedRepo::new(
+            self.pool.clone(),
+            Arc::new(NugetFormat::new()),
+            Arc::new(self.blobs.clone()),
+        )))
+    }
+}
+
+/// Two hosted members with 30 ids each (10 shared). A paged group search reads
+/// manifests for the returned page only — not for every member's full result —
+/// while totals, order, paging and the highest-priority winner are unchanged
+/// and each hit's manifest comes from the member that won it.
+#[tokio::test]
+async fn group_search_enriches_only_the_final_page() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let high = seed_member(&pool, false).await;
+    let low = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    let prefix = format!("Paged{}", common::unique());
+    // high: ids 00..29, low: ids 20..49 → 50 distinct ids, 20..29 shared.
+    for n in 0..30 {
+        let id = format!("{prefix}.P{n:02}");
+        seed_version(&pool, &mut blobs, high.id, &id, "2.0.0", "high").await;
+    }
+    for n in 20..50 {
+        let id = format!("{prefix}.P{n:02}");
+        seed_version(&pool, &mut blobs, low.id, &id, "1.0.0", "low").await;
+    }
+    repository_dao::add_group_member(&pool, group.id, high.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, low.id, 10)
+        .await
+        .unwrap();
+
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(CountingBlobsFactory {
+        pool: pool.clone(),
+        blobs: CountingBlobs {
+            inner: blobs,
+            fetches: fetches.clone(),
+        },
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    let g = GroupRepo::new(
+        pool.clone(),
+        user(&pool).await,
+        factory,
+        authz,
+        TEST_MAX_DEPTH,
+    )
+    .with_format(Arc::new(NugetFormat::new()));
+
+    let result = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: prefix.clone(),
+                skip: 27,
+                take: 5,
+                prerelease: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_hits, 50, "totals count every merged id");
+    let page: Vec<(String, String)> = result
+        .hits
+        .iter()
+        .map(|h| (h.original_id.clone(), h.latest_version.clone()))
+        .collect();
+    let expected: Vec<(String, String)> = (27..32)
+        .map(|n| {
+            let version = if n < 30 { "2.0.0" } else { "1.0.0" };
+            (format!("{prefix}.P{n:02}"), version.to_string())
+        })
+        .collect();
+    assert_eq!(page, expected, "merged order, paging and winners unchanged");
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        5,
+        "only the 5 returned hits read a manifest (not 30 + 30)"
+    );
+    for hit in &result.hits {
+        let winner = if hit.latest_version == "2.0.0" {
+            "high"
+        } else {
+            "low"
+        };
+        assert_eq!(
+            hit.nuspec_bytes.as_deref(),
+            Some(format!("nuspec-{winner}").as_bytes()),
+            "{}: manifest comes from the winning member",
+            hit.original_id
+        );
+        assert_eq!(hit.total_downloads, Some(0), "download totals attached");
+    }
+}

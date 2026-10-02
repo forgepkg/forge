@@ -146,6 +146,33 @@ pub async fn list_components_for_repo_matching(
     .await
 }
 
+/// The subset of `names` (lowercased package ids) that have at least one
+/// component row — any version, listed or not — in any of `repository_ids`.
+///
+/// One batched existence query, used by group resolution's dependency-confusion
+/// guard to decide whether a hosted leaf owns an id regardless of who asks.
+/// Each returned name appears once; order is unspecified.
+pub async fn names_present_in_repositories(
+    pool: &PgPool,
+    repository_ids: &[i64],
+    names: &[String],
+) -> sqlx::Result<Vec<String>> {
+    if repository_ids.is_empty() || names.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT name AS "name!"
+        FROM component
+        WHERE repository_id = ANY($1) AND name = ANY($2)
+        "#,
+        repository_ids,
+        names,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Set the `listed` flag on a specific component version. Returns whether a row
 /// was updated.
 pub async fn set_listed(
