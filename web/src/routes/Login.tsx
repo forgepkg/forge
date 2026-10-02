@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { createFileRoute, useRouter, useSearch } from '@tanstack/react-router'
 
-import { meKeys } from '~/api/me'
 import {
   fetchLoginOptions,
   identify,
@@ -14,6 +13,7 @@ import {
 import { ApiError } from '~/lib/httpClient'
 import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
+import { safeReturnTo } from '~/lib/returnTo'
 import { AuthLayout } from '~/components/catalyst/auth-layout'
 import { Button } from '~/components/catalyst/button'
 import { Field, Label } from '~/components/catalyst/fieldset'
@@ -22,7 +22,11 @@ import { Input } from '~/components/catalyst/input'
 import { Text } from '~/components/catalyst/text'
 
 interface LoginSearch {
-  /** Where to return after a successful sign-in (set by the admin guard). */
+  /**
+   * Where to return after a successful sign-in (set by the route guards and
+   * the expired-session handler). Untrusted: always passed through
+   * `safeReturnTo` before use.
+   */
   redirect?: string
   /** Set when the session expired mid-use (the guard / a 401 redirected here). */
   expired?: boolean
@@ -137,7 +141,29 @@ function Login() {
 function oidcUrl(loginUrl: string, redirect?: string): string {
   if (!redirect) return loginUrl
   const sep = loginUrl.includes('?') ? '&' : '?'
-  return `${loginUrl}${sep}redirect_to=${encodeURIComponent(redirect)}`
+  return `${loginUrl}${sep}redirect_to=${encodeURIComponent(safeReturnTo(redirect))}`
+}
+
+/**
+ * The inline message for a failed sign-in step. A 429 is the login lockout
+ * (too many recent failures for this username from this address), which is
+ * neither a wrong password nor an unreachable server.
+ */
+function signInErrorMessage(err: unknown): string {
+  if (err instanceof ApiError && err.status === 429) {
+    const wait = err.retryAfterSeconds
+    const when =
+      wait === undefined
+        ? 'in a few minutes'
+        : wait < 60
+          ? `in ${wait} second${wait === 1 ? '' : 's'}`
+          : `in ${Math.ceil(wait / 60)} minute${Math.ceil(wait / 60) === 1 ? '' : 's'}`
+    return `Too many failed sign-in attempts. Sign-in is temporarily locked; try again ${when}.`
+  }
+  if (err instanceof ApiError && err.isAuthError) {
+    return 'Invalid username or password'
+  }
+  return 'Could not sign in. Is the server reachable?'
 }
 
 /** Shared hook: perform `POST /auth/login` and enter session mode. */
@@ -152,18 +178,18 @@ function usePasswordLogin(redirect?: string) {
     setError(null)
     try {
       const session = await login({ username, password })
-      // The cookie is now set; persist the CSRF token (session mode) and let
-      // the shell re-fetch the identity.
+      // The cookie is now set. Drop every cached query before entering the
+      // app — none of it may belong to whoever used this browser before —
+      // then persist the CSRF token (session mode); the shell fetches the
+      // identity fresh.
+      queryClient.clear()
       setSession(session.csrf_token)
-      queryClient.removeQueries({ queryKey: meKeys.self() })
-      void router.navigate({ to: redirect ?? '/' })
+      // Stay "submitting" while the app loads; this screen is leaving (the
+      // reset below only matters if a guard sends us back here).
+      await router.navigate({ href: safeReturnTo(redirect) })
+      setSubmitting(false)
     } catch (err) {
-      setError(
-        err instanceof ApiError && err.isAuthError
-          ? 'Invalid username or password'
-          : 'Could not sign in. Is the server reachable?',
-      )
-    } finally {
+      setError(signInErrorMessage(err))
       setSubmitting(false)
     }
   }
@@ -208,8 +234,8 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
         return // the browser is leaving; keep "submitting" until it does
       }
       setStep('password')
-    } catch {
-      setError('Could not sign in. Is the server reachable?')
+    } catch (err) {
+      setError(signInErrorMessage(err))
     } finally {
       setSubmitting(false)
     }

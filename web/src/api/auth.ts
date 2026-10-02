@@ -74,15 +74,25 @@ export function fetchLoginOptions(signal?: AbortSignal): Promise<LoginOptions> {
 
 /** `POST /auth/identify` — identifier-first routing for a username. */
 export function identify(username: string): Promise<IdentifyResponse> {
-  return httpClient.post<IdentifyResponse>('/auth/identify', { username })
+  return httpClient.post<IdentifyResponse>(
+    '/auth/identify',
+    { username },
+    { skipUnauthorizedHandler: true },
+  )
 }
 
-/** `POST /auth/login` — password login; 200 sets the session cookie. */
+/**
+ * `POST /auth/login` — password login; 200 sets the session cookie. A 401
+ * here is a wrong password, not an expired session, so it never triggers the
+ * app's "session expired" handling.
+ */
 export function login(body: {
   username: string
   password: string
 }): Promise<LoginResponse> {
-  return httpClient.post<LoginResponse>('/auth/login', body)
+  return httpClient.post<LoginResponse>('/auth/login', body, {
+    skipUnauthorizedHandler: true,
+  })
 }
 
 /** `GET /auth/me` — the active cookie session (401 when none). */
@@ -97,8 +107,8 @@ export function fetchAuthSession(signal?: AbortSignal): Promise<AuthSession> {
  * cookie, and a token stored by an earlier session can be stale, so the app
  * shell calls this once per load: without the current token every mutating
  * request (and logout) would be refused. Best-effort — any failure resolves
- * to `null` and leaves the stored token alone (a 401 already clears it in
- * `httpClient`).
+ * to `null` and leaves the stored token alone (a 401 already clears it and
+ * reports the expired session in `httpClient`).
  */
 export async function syncAuthSession(
   signal?: AbortSignal,
@@ -124,7 +134,13 @@ export const authSessionQueryOptions = queryOptions<AuthSession | null>({
   retry: false,
 })
 
-/** `POST /auth/logout` — invalidate the cookie session (CSRF-guarded). */
+/**
+ * `POST /auth/logout` — invalidate the cookie session (CSRF-guarded). The
+ * caller treats a 401 (session already gone) as success, so it is not
+ * reported as an expired session.
+ */
 export function logout(): Promise<void> {
-  return httpClient.post<void>('/auth/logout')
+  return httpClient.post<void>('/auth/logout', undefined, {
+    skipUnauthorizedHandler: true,
+  })
 }

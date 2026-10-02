@@ -82,12 +82,17 @@ function testQueryClient() {
   })
 }
 
-async function renderBrowse(initialPath = '/') {
+/** Mount the app at `initialPath`, or with a history stack (last = current). */
+async function renderBrowse(initialPath: string | string[] = '/') {
   const queryClient = testQueryClient()
+  const entries = Array.isArray(initialPath) ? initialPath : [initialPath]
   const router = createRouter({
     routeTree,
     context: { queryClient },
-    history: createMemoryHistory({ initialEntries: [initialPath] }),
+    history: createMemoryHistory({
+      initialEntries: entries,
+      initialIndex: entries.length - 1,
+    }),
   })
   render(
     <QueryClientProvider client={queryClient}>
@@ -216,5 +221,42 @@ describe('RepoBrowse (per-repo search)', () => {
     await waitFor(() =>
       expect(router.state.location.search).toMatchObject({ q: 'json' }),
     )
+  })
+
+  it('Back after typing a query leaves the search instead of getting stuck', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    const user = userEvent.setup()
+    const router = await renderBrowse(['/', '/repos/nuget'])
+
+    await user.type(await screen.findByLabelText('Search packages'), 'json')
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({ q: 'json' }),
+    )
+
+    // The debounced query replaced the entry, so one Back leaves the repo.
+    router.history.back()
+    await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+    await new Promise((r) => setTimeout(r, 500))
+    expect(router.state.location.pathname).toBe('/')
+  })
+
+  it('Back to an earlier search shows that query and stays there', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    const router = await renderBrowse([
+      '/repos/nuget?q=alpha',
+      '/repos/nuget?q=beta',
+    ])
+    const box = await screen.findByLabelText('Search packages')
+    expect(box).toHaveValue('beta')
+
+    router.history.back()
+
+    await waitFor(() => expect(box).toHaveValue('alpha'))
+    // The input no longer drags the URL back to the newer query.
+    await new Promise((r) => setTimeout(r, 500))
+    expect(router.state.location.search).toMatchObject({ q: 'alpha' })
+    expect(box).toHaveValue('alpha')
   })
 })

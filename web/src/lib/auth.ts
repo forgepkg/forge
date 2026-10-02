@@ -81,15 +81,21 @@ export function setSession(csrf: string): void {
  * Clear the stored CSRF token (called on logout or a 401). The caller is
  * responsible for `POST /auth/logout` (the cookie is httpOnly; only the server
  * can invalidate it).
+ *
+ * Subscribers are notified **only when a token was actually stored**: every
+ * 401 calls this, and a notification makes the app shell refetch the
+ * identity, so notifying for an already-cleared session would turn each 401
+ * into another request (and another 401) without end.
  */
 export function clearSession(): void {
+  const hadSession = getCsrfToken() !== null
   try {
     localStorage.removeItem(CSRF_KEY)
     localStorage.removeItem(LEGACY_TOKEN_KEY)
   } catch {
     /* ignore */
   }
-  notify()
+  if (hadSession) notify()
 }
 
 /** Whether we currently hold a credential the API will accept. */

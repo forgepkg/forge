@@ -229,6 +229,29 @@ describe('admin realms list', () => {
     )
   })
 
+  it('shows the server error when the enabled toggle is refused', async () => {
+    mockApi({
+      realms: threeRealms,
+      onPatch: () =>
+        new Response('cannot disable the last enabled password realm', {
+          status: 409,
+        }),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    await u.click(toggle)
+
+    const row = toggle.closest('tr')!
+    expect(await within(row).findByRole('alert')).toHaveTextContent(
+      'Could not disable local: cannot disable the last enabled password realm',
+    )
+    // The checkbox still shows the stored state.
+    expect(toggle).toBeChecked()
+  })
+
   it('delete asks for confirmation then DELETEs', async () => {
     let deleted: number | null = null
     mockApi({
