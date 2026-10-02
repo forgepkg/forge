@@ -1868,14 +1868,19 @@ impl Config {
             if tok.is_empty() {
                 continue;
             }
+            // Mapped-IPv4 entries (`::ffff:10.0.0.1`) become plain IPv4: peers
+            // are canonicalized before matching.
+            use forge_core::auth::client_ip::canonical_net;
             if let Ok(net) = tok.parse::<IpNet>() {
-                out.push(net);
+                out.push(canonical_net(net));
             } else if let Ok(ip) = tok.parse::<std::net::IpAddr>() {
                 let prefix = match ip {
                     std::net::IpAddr::V4(_) => 32,
                     std::net::IpAddr::V6(_) => 128,
                 };
-                out.push(IpNet::new(ip, prefix).expect("full-length prefix is valid"));
+                out.push(canonical_net(
+                    IpNet::new(ip, prefix).expect("full-length prefix is valid"),
+                ));
             } else {
                 return Err(ConfigError::Invalid(format!(
                     "invalid trusted_proxy_cidr {tok:?}"
@@ -2732,6 +2737,21 @@ mod tests {
     /// Secret env values keep their pre-0.1.0 normalization: surrounding
     /// whitespace (a trailing newline from a secret file) is trimmed and one
     /// pair of surrounding double quotes is removed.
+    #[test]
+    fn trusted_proxy_cidrs_accept_ipv4_mapped_entries() {
+        let mut cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        cfg.auth.trusted_proxy_cidrs =
+            vec!["::ffff:172.17.0.1".into(), "::ffff:10.0.0.0/104".into()];
+        let nets = cfg.trusted_proxy_cidrs().expect("parse");
+        assert_eq!(
+            nets,
+            vec![
+                "172.17.0.1/32".parse::<IpNet>().unwrap(),
+                "10.0.0.0/8".parse::<IpNet>().unwrap()
+            ]
+        );
+    }
+
     #[test]
     fn secret_env_values_are_trimmed_and_unquoted() {
         figment::Jail::expect_with(|jail| {

@@ -174,9 +174,25 @@ pub struct AllowlistParseError {
     pub entry: String,
 }
 
+/// An IPv4-mapped IPv6 network (`::ffff:a.b.c.d/(96+n)`) as the IPv4 network
+/// `a.b.c.d/n`; any other network unchanged. Peer and forwarded addresses are
+/// canonicalized (`to_canonical`) before they are matched, so a configured
+/// entry in the mapped form — as older logs printed peers on a `[::]` bind —
+/// would otherwise never match anything.
+pub fn canonical_net(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net {
+        if let (Some(v4), true) = (v6.addr().to_ipv4_mapped(), v6.prefix_len() >= 96) {
+            if let Ok(mapped) = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96) {
+                return IpNet::V4(mapped.trunc());
+            }
+        }
+    }
+    net
+}
+
 fn parse_cidr_or_host(tok: &str) -> Result<IpNet, AllowlistParseError> {
     if let Ok(net) = tok.parse::<IpNet>() {
-        return Ok(net);
+        return Ok(canonical_net(net));
     }
     if let Ok(ip) = tok.parse::<IpAddr>() {
         // Single host: full-length prefix.
@@ -185,9 +201,11 @@ fn parse_cidr_or_host(tok: &str) -> Result<IpNet, AllowlistParseError> {
             IpAddr::V6(_) => 128,
         };
         // `new` only fails on an out-of-range prefix, which 32/128 never are.
-        return IpNet::new(ip, prefix).map_err(|_| AllowlistParseError {
-            entry: tok.to_string(),
-        });
+        return IpNet::new(ip, prefix)
+            .map(canonical_net)
+            .map_err(|_| AllowlistParseError {
+                entry: tok.to_string(),
+            });
     }
     Err(AllowlistParseError {
         entry: tok.to_string(),
@@ -344,6 +362,24 @@ mod tests {
         assert!(p.allows(ip("::ffff:127.0.0.1")));
         assert!(p.allows(ip("::ffff:192.168.1.1")));
         assert!(!p.allows(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_are_configured_as_ipv4() {
+        // An entry written in the mapped form still matches once peers are
+        // canonicalized.
+        assert_eq!(
+            canonical_net("::ffff:172.17.0.0/112".parse().unwrap()),
+            "172.17.0.0/16".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            canonical_net("2001:db8::/32".parse().unwrap()),
+            "2001:db8::/32".parse::<IpNet>().unwrap()
+        );
+        let p = AnonPolicy::allowlist_from_tokens(["::ffff:172.17.0.1"]).unwrap();
+        assert!(p.allows(ip("172.17.0.1")));
+        assert!(p.allows(ip("::ffff:172.17.0.1")));
+        assert!(!p.allows(ip("172.17.0.2")));
     }
 
     // ── AnonPolicy ───────────────────────────────────────────────────────
