@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 1 AS \"one!\" FROM encryption_key\n        WHERE layer = 'dek' AND scope = $1 AND version = $2 AND state <> 'revoked'\n        FOR SHARE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "636818c0bab920ce1efc3a3fd56ce36a0bfa708f5bd27b6733889a649fad447c"
+}

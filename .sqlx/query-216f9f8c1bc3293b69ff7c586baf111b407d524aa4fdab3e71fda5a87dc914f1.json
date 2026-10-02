@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT pg_advisory_xact_lock(hashtextextended('forge.encryption_key.' || $1 || '.' || $2, 0))",
+  "query": "SELECT pg_advisory_xact_lock(hashtextextended('forge.encryption_key.scope.' || $1, 0))",
   "describe": {
     "columns": [
       {
@@ -12,7 +12,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
         "Text"
       ]
     },
@@ -20,5 +19,5 @@
       null
     ]
   },
-  "hash": "15fc380ee61bed5f637bb84b8a1df3fa863564144ba1afdef1aceb7880016ab7"
+  "hash": "216f9f8c1bc3293b69ff7c586baf111b407d524aa4fdab3e71fda5a87dc914f1"
 }

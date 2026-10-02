@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH dek AS (\n            SELECT 1 AS usable FROM encryption_key\n            WHERE layer = 'dek' AND scope = $3 AND version = $4 AND state <> 'revoked'\n            FOR SHARE\n        ), upd AS (\n            UPDATE repository\n            SET upstream_password_enc = $2, upstream_password = NULL\n            WHERE id = $1 AND ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek))\n            RETURNING id\n        )\n        SELECT\n            EXISTS (SELECT 1 FROM upd) AS \"updated!\",\n            ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek)) AS \"dek_usable!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "updated!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "dek_usable!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "f93ff96a2492f95ca8124d67017056e02e2ead95a055e14e2c1defe7780ff64a"
+}

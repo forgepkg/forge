@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE encryption_key\n            SET state = 'revoked', rotated_at = COALESCE(rotated_at, now())\n            WHERE id = ANY($1) AND state = 'retiring'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "437f4196969038a515fd2cec47ffa5761fc84593bf6f4dc7e64bf2117859ac68"
+}
