@@ -162,8 +162,16 @@ pub async fn resolve_user(
 
     // 3. Auto-provision a fresh, password-less user, then link.
     if policy.auto_provision {
-        let user = provision_oidc_user(pool, login, mapped).await?;
-        let user = finalize(pool, user, login, &identity_claims, mapped, true).await?;
+        let user = match provision_oidc_user(pool, login, mapped).await? {
+            Provisioned::New(user) => {
+                finalize(pool, user, login, &identity_claims, mapped, true).await?
+            }
+            // A concurrent first login provisioned and linked the identity
+            // while this one was still looking for a free username.
+            Provisioned::AlreadyLinked(user) => {
+                finalize(pool, user, login, &identity_claims, mapped, false).await?
+            }
+        };
         // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
         // freshly auto-provisioned OIDC user must inherit the `authenticated` role
         // immediately so it has the slice-1 "read/write everywhere" reach —
@@ -182,16 +190,30 @@ pub async fn resolve_user(
     Err(ResolveError::NotProvisioned)
 }
 
-/// Insert the auto-provisioned, password-less OIDC user. Retries on a
-/// username collision with a concurrent insert (two first logins picking the
-/// same free name at once): the retry allocates the next free suffix, and the
-/// link step in [`finalize`] then settles which account the identity belongs
-/// to.
+/// Outcome of [`provision_oidc_user`].
+enum Provisioned {
+    /// This call inserted the account; [`finalize`] must still link it.
+    New(AppUser),
+    /// A concurrent first login already provisioned and linked the identity.
+    AlreadyLinked(AppUser),
+}
+
+/// Upper bound on username-collision retries while provisioning. Each
+/// collision means a concurrent insert won that name, so the bound only needs
+/// to exceed the number of first logins for one identity racing at once.
+const PROVISION_ATTEMPTS: u32 = 16;
+
+/// Insert the auto-provisioned, password-less OIDC user. A username collision
+/// with a concurrent insert (several first logins picking the same free name
+/// at once) is retried: if a concurrent login has meanwhile linked this very
+/// identity, its account is adopted instead of provisioning another one;
+/// otherwise the retry allocates the next free suffix, and the link step in
+/// [`finalize`] settles which account the identity belongs to.
 async fn provision_oidc_user(
     pool: &PgPool,
     login: &ValidatedLogin,
     mapped: &MappedClaims,
-) -> Result<AppUser, ResolveError> {
+) -> Result<Provisioned, ResolveError> {
     let mut attempt = 0;
     loop {
         let username = unique_username(pool, &mapped.username).await?;
@@ -213,11 +235,18 @@ async fn provision_oidc_user(
         )
         .await;
         match inserted {
-            Ok(user) => return Ok(user),
+            Ok(user) => return Ok(Provisioned::New(user)),
             Err(sqlx::Error::Database(db))
-                if db.code().as_deref() == Some("23505") && attempt < 3 =>
+                if db.code().as_deref() == Some("23505") && attempt < PROVISION_ATTEMPTS =>
             {
                 attempt += 1;
+                if let Some(user) =
+                    external_identity_dao::find_user_by_subject(pool, &login.issuer, &login.subject)
+                        .await
+                        .map_err(|e| ResolveError::Db(e.to_string()))?
+                {
+                    return Ok(Provisioned::AlreadyLinked(user));
+                }
             }
             Err(e) => return Err(ResolveError::Db(e.to_string())),
         }
