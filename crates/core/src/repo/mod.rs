@@ -238,9 +238,9 @@ impl SearchQuery {
     pub fn parse(q: &str) -> Self {
         let mut out = SearchQuery::default();
         for token in q.split_whitespace() {
-            // Full Unicode lowercasing, like the format's `lower_id`: stored
-            // ids are lowercased that way, so `Ünicode` must find `ünicode.lib`.
-            let token = token.trim_matches('"').to_lowercase();
+            // Lowered like stored ids (the format's `lower_id`), so `Ünicode`
+            // finds `ünicode.lib`.
+            let token = crate::format::lower_invariant(token.trim_matches('"'));
             if token.is_empty() {
                 continue;
             }

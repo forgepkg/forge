@@ -140,9 +140,11 @@ impl SelectorPatterns {
 fn build_globset(patterns: &[String]) -> Result<GlobSet, SelectorCompileError> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
-        let glob = Glob::new(&p.to_lowercase()).map_err(|source| SelectorCompileError {
-            pattern: p.clone(),
-            source,
+        let glob = Glob::new(&crate::format::lower_invariant(p)).map_err(|source| {
+            SelectorCompileError {
+                pattern: p.clone(),
+                source,
+            }
         })?;
         builder.add(glob);
     }
@@ -168,7 +170,7 @@ impl CompiledSelector {
     /// Does this selector match `package_name`? The name is lowercased before
     /// matching. Excludes win over includes; an empty include list matches all.
     pub fn matches(&self, package_name: &str) -> bool {
-        let name = package_name.to_lowercase();
+        let name = crate::format::lower_invariant(package_name);
         if self.excludes.is_match(&name) {
             return false;
         }

@@ -145,7 +145,7 @@ fn rule_filters_match(rule: &RetentionRule, package_name: &str, version: &str) -
     if let Some(prefix) = &rule.package_name_prefix {
         // Case-insensitive prefix match. `package_name` is already lowercased by
         // the loader; lowercase the configured prefix to be safe.
-        if !package_name.starts_with(&prefix.to_lowercase()) {
+        if !package_name.starts_with(&crate::format::lower_invariant(prefix)) {
             return false;
         }
     }

@@ -171,7 +171,7 @@ impl GroupGraph {
     /// Visible leaf ids for `package_id`, in the same package-specific stable
     /// pre-order as the former path-expanding traversal.
     fn visible_leaves(&self, package_id: &str) -> Arc<VisibleLeaves> {
-        let key = package_id.to_lowercase();
+        let key = crate::format::lower_invariant(package_id);
         if let Some(cached) = self
             .visible_leaf_cache
             .lock()
@@ -453,7 +453,7 @@ impl GroupRepo {
     fn lower_id(&self, id: &str) -> String {
         match &self.format {
             Some(format) => format.lower_id(id),
-            None => id.to_lowercase(),
+            None => crate::format::lower_invariant(id),
         }
     }
 
@@ -599,10 +599,8 @@ impl GroupRepo {
 
         let mut ranked: Vec<RankedHit> = by_id.into_values().collect();
         ranked.sort_by(|a, b| {
-            a.hit
-                .original_id
-                .to_lowercase()
-                .cmp(&b.hit.original_id.to_lowercase())
+            crate::format::lower_invariant(&a.hit.original_id)
+                .cmp(&crate::format::lower_invariant(&b.hit.original_id))
         });
         let total_hits = ranked.len();
         let page: Vec<RankedHit> = ranked
@@ -786,7 +784,7 @@ struct RankedHit {
 
 /// Keep the highest-priority (lowest rank) hit per package id.
 fn insert_ranked(by_id: &mut BTreeMap<String, RankedHit>, ranked: RankedHit) {
-    match by_id.entry(ranked.hit.original_id.to_lowercase()) {
+    match by_id.entry(crate::format::lower_invariant(&ranked.hit.original_id)) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(ranked);
         }

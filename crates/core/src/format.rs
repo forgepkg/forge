@@ -16,6 +16,27 @@ use crate::domain::{DependencyGroup, FormatError, ParsedUpload};
 pub trait ReadSeek: std::io::Read + std::io::Seek + Send {}
 impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
 
+/// Lowercase a package id (or a search term) the way .NET's
+/// `ToLowerInvariant()` does, so stored names match what NuGet clients
+/// request: character by character with the simple (1:1) Unicode mapping —
+/// no context rules (a final `Σ` lowers to `σ`, not `ς`) and no expansions.
+/// `char::to_lowercase` is already context-free; its only multi-character
+/// result is `İ` (U+0130), whose simple mapping is a plain `i`.
+pub fn lower_invariant(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\u{130}' {
+                return 'i';
+            }
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) => l,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// A package format (e.g. NuGet). Object-safe so it can be registered as
 /// `Arc<dyn Format>` in a format registry.
 pub trait Format: Send + Sync {
@@ -103,8 +124,20 @@ mod tests {
         }
 
         fn lower_id(&self, id: &str) -> String {
-            id.to_lowercase()
+            super::lower_invariant(id)
         }
+    }
+
+    #[test]
+    fn lower_invariant_matches_dotnet_simple_mapping() {
+        use super::lower_invariant;
+        assert_eq!(lower_invariant("Newtonsoft.JSON"), "newtonsoft.json");
+        assert_eq!(lower_invariant("Ünicode.Lib"), "ünicode.lib");
+        // No final-sigma context rule: `ToLowerInvariant` gives `οδοσ`.
+        assert_eq!(lower_invariant("ΟΔΟΣ"), "οδοσ");
+        // No expansion: U+0130 lowers to a single `i`.
+        assert_eq!(lower_invariant("İstanbul"), "istanbul");
+        assert_eq!(lower_invariant("İstanbul").chars().count(), 8);
     }
 
     #[test]

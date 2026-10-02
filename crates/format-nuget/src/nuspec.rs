@@ -103,10 +103,11 @@ pub fn validate_package_id(id: &str) -> Result<(), FormatError> {
 
 /// Lowercase a package id for case-insensitive lookups, matching NuGet's
 /// `ToLowerInvariant()`: ids may contain non-ASCII letters (see
-/// [`validate_package_id`]), so this is full Unicode lowering
-/// (`Ünicode.Lib` → `ünicode.lib`), not ASCII-only.
+/// [`validate_package_id`]), so this lowers every letter (`Ünicode.Lib` →
+/// `ünicode.lib`), character by character like .NET
+/// ([`forge_core::format::lower_invariant`]).
 pub fn lower_id(id: &str) -> String {
-    id.trim().to_lowercase()
+    forge_core::format::lower_invariant(id.trim())
 }
 
 /// Display metadata of a `.nuspec`, for registration catalog entries and

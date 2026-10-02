@@ -136,9 +136,8 @@ impl HostedRepo {
         }
 
         hits.sort_by(|a, b| {
-            a.original_id
-                .to_lowercase()
-                .cmp(&b.original_id.to_lowercase())
+            crate::format::lower_invariant(&a.original_id)
+                .cmp(&crate::format::lower_invariant(&b.original_id))
         });
         let total_hits = hits.len();
         let mut hits: Vec<SearchHit> = hits
