@@ -93,6 +93,13 @@ pub async fn upsert_pending(
 /// If a deletion owner crashed, a caller may fence it out and receive
 /// `CompleteStaleDeletion`; finishing that idempotent delete lets the ingest
 /// create a clean pending row on its next attempt.
+///
+/// A deletion that finalizes between this call's `INSERT … ON CONFLICT DO
+/// NOTHING` (which saw the old row and so inserted nothing) and its row lock
+/// leaves no row to lock. That attempt is rolled back and retried at once: the
+/// next `INSERT` creates a fresh pending incarnation. Should the row keep
+/// vanishing, the call degrades to `DeletionInProgress` so the caller backs
+/// off and retries instead of failing the upload.
 #[allow(clippy::too_many_arguments)]
 pub async fn begin_ingest(
     pool: &PgPool,
@@ -102,6 +109,39 @@ pub async fn begin_ingest(
     lease_expires_at: DateTime<Utc>,
     stale_deletion_before: DateTime<Utc>,
 ) -> sqlx::Result<BeginIngestOutcome> {
+    /// Immediate retries after the blob row vanished under a finalizing
+    /// deletion. Each one requires a *new* deletion to finalize in between, so
+    /// more than one retry is already exceptional.
+    const VANISHED_RETRIES: usize = 3;
+
+    for _ in 0..VANISHED_RETRIES {
+        if let Some(outcome) = begin_ingest_attempt(
+            pool,
+            sha256,
+            size,
+            s3_key,
+            lease_expires_at,
+            stale_deletion_before,
+        )
+        .await?
+        {
+            return Ok(outcome);
+        }
+    }
+    Ok(BeginIngestOutcome::DeletionInProgress)
+}
+
+/// One [`begin_ingest`] transaction. `None` means the row was deleted by a
+/// concurrently finalizing deletion after the insert observed it; nothing was
+/// written and the caller should retry.
+async fn begin_ingest_attempt(
+    pool: &PgPool,
+    sha256: &str,
+    size: i64,
+    s3_key: &str,
+    lease_expires_at: DateTime<Utc>,
+    stale_deletion_before: DateTime<Utc>,
+) -> sqlx::Result<Option<BeginIngestOutcome>> {
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         r#"
@@ -118,7 +158,9 @@ pub async fn begin_ingest(
     .rows_affected()
         > 0;
 
-    let row = sqlx::query(
+    // `ON CONFLICT DO NOTHING` does not lock the conflicting row, so a
+    // deletion may finalize (delete it) before this lock is granted.
+    let Some(row) = sqlx::query(
         r#"
         SELECT state, s3_key, delete_started_at
         FROM blob
@@ -127,8 +169,12 @@ pub async fn begin_ingest(
         "#,
     )
     .bind(sha256)
-    .fetch_one(&mut *tx)
-    .await?;
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
 
     let state: String = row.try_get("state")?;
     if state == "deleting" {
@@ -148,17 +194,17 @@ pub async fn begin_ingest(
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            return Ok(BeginIngestOutcome::CompleteStaleDeletion(
+            return Ok(Some(BeginIngestOutcome::CompleteStaleDeletion(
                 BlobDeletionReservation {
                     sha256: sha256.to_owned(),
                     s3_key: stored_key,
                     token,
                 },
-            ));
+            )));
         }
 
         tx.rollback().await?;
-        return Ok(BeginIngestOutcome::DeletionInProgress);
+        return Ok(Some(BeginIngestOutcome::DeletionInProgress));
     }
 
     // Stale leases are no longer deletion fences. Prune them on this hot path
@@ -183,11 +229,11 @@ pub async fn begin_ingest(
     tx.commit().await?;
 
     let stored_key: String = row.try_get("s3_key")?;
-    Ok(BeginIngestOutcome::Ready {
+    Ok(Some(BeginIngestOutcome::Ready {
         token,
         inserted,
         s3_key: stored_key,
-    })
+    }))
 }
 
 /// Fetch a blob by content hash.
@@ -304,6 +350,13 @@ pub async fn refresh_ingest(
 ///
 /// Returns `true` if the ref count hit zero (and a delete was enqueued),
 /// `false` otherwise (nothing enqueued).
+///
+/// Callers must decrement only for asset rows they actually removed in the
+/// same transaction (e.g. via `DELETE … RETURNING blob_sha256` after locking
+/// the owning component), or two concurrent deletes of one reference both
+/// decrement it. A decrement below zero violates the
+/// `blob_ref_count_nonnegative` constraint and aborts the transaction instead
+/// of enqueueing a delete for an object other rows may still reference.
 ///
 /// Note: `grace` is truncated to whole seconds before being passed to
 /// `make_interval`; sub-second precision is lost.
@@ -613,6 +666,10 @@ pub async fn prune_expired_ingests(pool: &PgPool, limit: i64) -> sqlx::Result<u6
 /// These are uploads whose owning transaction never committed (the asset insert
 /// and `commit_and_incref` never ran). Used by the orphan reconciler to find S3
 /// objects to drop. Accepts any executor.
+///
+/// `pending` and `deleting` rows are zero-ref by construction; the explicit
+/// `ref_count = 0` lets the `blob_zero_ref_created_at_idx` partial index serve
+/// the scan (and mirrors the reservation's own referenced check).
 pub async fn list_stale_pending<'e, E>(
     executor: E,
     cutoff: DateTime<Utc>,
@@ -626,7 +683,8 @@ where
         r#"
         SELECT sha256, size, s3_key, ref_count, state, created_at
         FROM blob
-        WHERE created_at < $1
+        WHERE ref_count = 0
+          AND created_at < $1
           AND (
               state = 'pending'
               OR (

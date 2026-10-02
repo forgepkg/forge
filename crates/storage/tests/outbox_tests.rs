@@ -468,3 +468,62 @@ async fn superseded_outbox_row_does_not_cut_the_newer_grace_short() {
         .unwrap();
     store.delete(&stored.s3_key).await.unwrap();
 }
+
+/// M19: `prune_processed` drains processed rows past the retention window in
+/// batches (more rows than one batch here) and leaves recent processed rows
+/// and unprocessed rows of any age alone. (The unprocessed row is scheduled in
+/// the future so sibling tests' worker runs never claim it.)
+#[tokio::test]
+async fn prune_processed_drops_only_expired_processed_rows() {
+    let _test_guard = OUTBOX_TEST_LOCK.lock().await;
+    let pool = common::pool().await;
+    let tag = format!("prune-{}", common::unique());
+
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at, created_at) \
+         SELECT 'delete_object', $1 || '-old-' || g, 'k', now() - interval '30 days', \
+                now() - interval '20 days', now() - interval '30 days' \
+         FROM generate_series(1, 1005) g",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at) \
+         VALUES ('delete_object', $1 || '-recent', 'k', now(), now() - interval '1 day')",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, created_at) \
+         VALUES ('delete_object', $1 || '-pending', 'k', now() + interval '30 days', \
+                 now() - interval '30 days')",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pruned = outbox_worker::prune_processed(&pool, Duration::days(7))
+        .await
+        .unwrap();
+    assert!(
+        pruned >= 1005,
+        "every expired processed row pruned (got {pruned})"
+    );
+
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT sha256 FROM blob_outbox WHERE sha256 LIKE $1 || '-%' ORDER BY sha256",
+    )
+    .bind(&tag)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        left,
+        vec![format!("{tag}-pending"), format!("{tag}-recent")]
+    );
+}

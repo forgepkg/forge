@@ -537,6 +537,12 @@ pub struct OutboxConfig {
     /// Worker poll interval (seconds).
     #[serde(default = "default_outbox_poll")]
     pub poll_interval_seconds: u64,
+    /// How long (seconds) a *processed* `blob_outbox` row is kept before the
+    /// reconciler loop prunes it (default 7 days). Processed rows are only a
+    /// history of completed deletes — GC never reads them — so this bounds
+    /// table growth. `0` disables pruning (keep every row).
+    #[serde(default = "default_outbox_processed_retention")]
+    pub processed_retention_seconds: u64,
 }
 
 impl Default for OutboxConfig {
@@ -545,6 +551,7 @@ impl Default for OutboxConfig {
             batch_size: default_outbox_batch(),
             grace_seconds: default_outbox_grace(),
             poll_interval_seconds: default_outbox_poll(),
+            processed_retention_seconds: default_outbox_processed_retention(),
         }
     }
 }
@@ -557,6 +564,16 @@ impl OutboxConfig {
     /// Grace period as a chrono [`chrono::Duration`].
     pub fn grace(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.grace_seconds)
+    }
+    /// Retention for processed outbox rows, or `None` when pruning is
+    /// disabled (`processed_retention_seconds = 0`). Clamped to 100 years so
+    /// the cutoff arithmetic can never overflow.
+    pub fn processed_retention(&self) -> Option<chrono::Duration> {
+        const MAX_SECS: u64 = 100 * 365 * 24 * 3600;
+        match self.processed_retention_seconds {
+            0 => None,
+            secs => Some(chrono::Duration::seconds(secs.min(MAX_SECS) as i64)),
+        }
     }
 }
 
@@ -1129,6 +1146,9 @@ fn default_outbox_grace() -> i64 {
 fn default_outbox_poll() -> u64 {
     10
 }
+fn default_outbox_processed_retention() -> u64 {
+    7 * 24 * 3600
+}
 fn default_retention_poll() -> u64 {
     30
 }
@@ -1667,6 +1687,7 @@ mod tests {
         assert!(cfg.redis.url.is_none());
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
+        assert_eq!(cfg.outbox.processed_retention_seconds, 7 * 24 * 3600);
         assert!(cfg.retention.enabled);
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
         assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
