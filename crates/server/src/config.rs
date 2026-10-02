@@ -1372,9 +1372,27 @@ fn merge_env(fig: Figment) -> Figment {
     let env = || Env::prefixed("FORGE_").split("__");
     let mut fig = fig.merge(env().ignore(SECRET_KEYS));
     for (key, value) in env().only(SECRET_KEYS).iter() {
-        fig = fig.merge(Serialized::default(key.as_str(), value));
+        fig = fig.merge(Serialized::default(
+            key.as_str(),
+            normalize_secret_env(&value),
+        ));
     }
     fig
+}
+
+/// Normalize a secret's environment value the way figment's typed parsing
+/// (which every other `FORGE_*` value still gets) and earlier releases did:
+/// surrounding whitespace — a trailing newline from a secret file or
+/// `kubectl create secret --from-file` — is trimmed, and one pair of
+/// surrounding double quotes (an `--env-file` written as `KEY="value"`) is
+/// removed. The value is never type-converted.
+fn normalize_secret_env(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// Configuration load / validation errors.
@@ -1382,11 +1400,21 @@ fn merge_env(fig: Figment) -> Figment {
 pub enum ConfigError {
     /// A required key was missing or the file/env was malformed. The message
     /// never echoes the value of a secret key (see [`SECRET_KEYS`]).
-    #[error("configuration error: {}", redacted_load_error(.0))]
-    Load(#[from] Box<figment::Error>),
+    ///
+    /// Holds the already-redacted message rather than the figment error, so
+    /// no `source()` chain (an `anyhow` report prints one) can show the raw
+    /// value either.
+    #[error("configuration error: {0}")]
+    Load(String),
     /// A value was present but invalid (bad CIDR, bad bind addr, unknown mode).
     #[error("invalid configuration: {0}")]
     Invalid(String),
+}
+
+impl From<Box<figment::Error>> for ConfigError {
+    fn from(err: Box<figment::Error>) -> Self {
+        ConfigError::Load(redacted_load_error(&err))
+    }
 }
 
 impl Config {
@@ -2701,6 +2729,26 @@ mod tests {
         });
     }
 
+    /// Secret env values keep their pre-0.1.0 normalization: surrounding
+    /// whitespace (a trailing newline from a secret file) is trimmed and one
+    /// pair of surrounding double quotes is removed.
+    #[test]
+    fn secret_env_values_are_trimmed_and_unquoted() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_S3__SECRET_KEY", "s3-secret\n");
+            jail.set_env(
+                "FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD",
+                "\"pw with \"inner\" quotes\"",
+            );
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.secret_key, "s3-secret");
+            let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
+            assert_eq!(ba.password, "pw with \"inner\" quotes");
+            Ok(())
+        });
+    }
+
     /// Review L9: a config error at a secret key names the key and the
     /// expected type but never echoes the value.
     #[test]
@@ -2723,11 +2771,15 @@ mod tests {
             ),
         ] {
             let toml = MINIMAL.replace(from, to);
-            let msg = Config::from_figment(fig_from_toml(&toml))
-                .unwrap_err()
-                .to_string();
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            // No source chain: `main` reports errors through anyhow, whose
+            // Debug output prints every `source()`.
+            assert!(std::error::Error::source(&err).is_none());
+            let debug = format!("{err:?}");
+            let msg = err.to_string();
             let value = to.rsplit(' ').next().unwrap();
             assert!(!msg.contains(value), "value echoed: {msg}");
+            assert!(!debug.contains(value), "value echoed in Debug: {debug}");
             assert!(msg.contains(key), "{msg}");
             assert!(msg.contains("redacted"), "{msg}");
         }
