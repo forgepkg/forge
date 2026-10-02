@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::domain::{FormatError, ParsedUpload};
+use crate::domain::{DependencyGroup, FormatError, ParsedUpload};
 
 /// A reader that supports seeking and is movable across threads.
 ///
@@ -35,6 +35,34 @@ pub trait Format: Send + Sync {
 
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
+
+    /// The identity a standalone manifest (e.g. a `.nuspec`) declares, as
+    /// `(lower_id, normalized version)`. A proxy verifies a manifest fetched
+    /// from its upstream with this before serving or caching it. The default
+    /// rejects every manifest, so a format without manifest support never has
+    /// an unverified upstream manifest served.
+    fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
+        let _ = manifest;
+        Err(FormatError::MalformedManifest(format!(
+            "{} manifests cannot be verified",
+            self.id()
+        )))
+    }
+
+    /// Render a minimal manifest declaring `id`, `version` and `deps`, for a
+    /// version whose metadata is known only from an upstream index (a proxied
+    /// version that is not downloaded yet), so it is read back through the
+    /// same manifest parsing as a stored one. `None` (the default) when the
+    /// format cannot express one.
+    fn synthesize_manifest(
+        &self,
+        id: &str,
+        version: &str,
+        deps: &[DependencyGroup],
+    ) -> Option<Vec<u8>> {
+        let _ = (id, version, deps);
+        None
+    }
 }
 
 #[cfg(test)]

@@ -106,6 +106,17 @@ max_package_bytes        = 1073741824  # (default: 1 GiB)
 # to a temp file.
 spool_memory_bytes       = 2097152     # (default: 2 MiB)
 
+[nuget]
+# .nupkg archive safety limits for published and proxied packages. Only the
+# .nuspec manifest is ever decompressed, so it alone is capped by size and
+# compression ratio; other entries (large native binaries included) are only
+# bounded by the archive-shape limits below.
+max_entries                  = 10000        # (default: 10000)
+max_central_directory_bytes  = 16777216     # (default: 16 MiB) zip directory loaded to open a package
+max_total_uncompressed_bytes = 17179869184  # (default: 16 GiB) total declared size of all entries
+max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upstream .nuspec a proxy verifies
+max_nuspec_compression_ratio = 200          # (default: 200)
+
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
 default_ttl_seconds = 30        # (default: 30)

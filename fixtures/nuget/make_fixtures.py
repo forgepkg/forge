@@ -12,8 +12,11 @@ The fixtures intentionally cover:
   * two different nuspec `xmlns` schema versions (Addendum A3 — the parser must
     be namespace-insensitive);
   * grouped and flat dependency declarations;
-  * a "zip bomb" archive with a hugely compressible entry (Addendum A2 — the
-    parser must reject it via its uncompressed-size / ratio caps).
+  * a "zip bomb" archive with a hugely compressible payload entry next to a
+    valid manifest. Only the .nuspec is ever decompressed, so the parser must
+    ACCEPT it under the default limits (large native packages look like this)
+    and reject it only via the total-declared-size budget; manifest bombs are
+    generated in the Rust tests.
 """
 import os
 import zipfile
@@ -98,10 +101,9 @@ def write_nupkg(path, nuspec_name, nuspec_body, extra=None):
 
 
 def write_zip_bomb(path):
-    # A single, highly compressible entry far larger than the .nuspec cap.
-    # ~64 MiB of zeros compresses to a few KiB → trips both the size and the
-    # ratio guards. We still include a valid nuspec so the failure is clearly
-    # attributable to the bomb entry, not a missing manifest.
+    # A single, highly compressible payload entry: ~64 MiB of zeros compresses
+    # to a few KiB. It is never decompressed (only the .nuspec is), so only a
+    # tight total-declared-size budget rejects the archive.
     bomb = b"\x00" * (64 * 1024 * 1024 + 1)
     write_nupkg(
         path,

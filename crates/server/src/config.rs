@@ -54,6 +54,10 @@ pub struct Config {
     /// Proxy-repository upstream HTTP tuning (timeouts, size caps, spooling).
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// `.nupkg` archive safety limits (zip-bomb defenses) for published and
+    /// proxied packages.
+    #[serde(default)]
+    pub nuget: NugetConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -806,6 +810,104 @@ fn default_proxy_spool_memory_bytes() -> u64 {
     2 * 1024 * 1024
 }
 
+/// `nuget.*` — `.nupkg` archive safety limits, applied when a package is
+/// published and when a proxy caches an upstream package (and, for
+/// `max_nuspec_bytes`, to an upstream `.nuspec` a proxy verifies).
+///
+/// Only the `.nuspec` manifest is ever decompressed, so it alone is capped by
+/// size and compression ratio; every other entry (native binaries of hundreds
+/// of MiB included) is only bounded by the archive-shape limits, which reject
+/// pathological archives before the zip central directory is loaded.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NugetConfig {
+    /// Maximum number of entries in a package archive. Default 10 000.
+    #[serde(default = "default_nuget_max_entries")]
+    pub max_entries: usize,
+    /// Maximum size of the zip central directory (per-entry metadata loaded
+    /// into memory to open the archive). Default 16 MiB.
+    #[serde(default = "default_nuget_max_central_directory_bytes")]
+    pub max_central_directory_bytes: u64,
+    /// Maximum total declared uncompressed size of all entries. Nothing but
+    /// the manifest is decompressed, so this only rejects absurd archives.
+    /// Default 16 GiB.
+    #[serde(default = "default_nuget_max_total_uncompressed_bytes")]
+    pub max_total_uncompressed_bytes: u64,
+    /// Maximum size of the `.nuspec` manifest (read into memory, stored, and
+    /// re-parsed for registration/search). Default 1 MiB.
+    #[serde(default = "default_nuget_max_nuspec_bytes")]
+    pub max_nuspec_bytes: u64,
+    /// Maximum compression ratio of the `.nuspec` entry. Default 200.
+    #[serde(default = "default_nuget_max_nuspec_compression_ratio")]
+    pub max_nuspec_compression_ratio: u64,
+}
+
+impl Default for NugetConfig {
+    fn default() -> Self {
+        NugetConfig {
+            max_entries: default_nuget_max_entries(),
+            max_central_directory_bytes: default_nuget_max_central_directory_bytes(),
+            max_total_uncompressed_bytes: default_nuget_max_total_uncompressed_bytes(),
+            max_nuspec_bytes: default_nuget_max_nuspec_bytes(),
+            max_nuspec_compression_ratio: default_nuget_max_nuspec_compression_ratio(),
+        }
+    }
+}
+
+impl NugetConfig {
+    /// The limits handed to [`forge_nuget::NugetFormat::with_limits`].
+    pub fn limits(&self) -> forge_nuget::model::NupkgLimits {
+        forge_nuget::model::NupkgLimits {
+            max_entries: self.max_entries,
+            max_central_directory_bytes: self.max_central_directory_bytes,
+            max_total_uncompressed: self.max_total_uncompressed_bytes,
+            max_nuspec_bytes: self.max_nuspec_bytes,
+            max_nuspec_compression_ratio: self.max_nuspec_compression_ratio,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            ("nuget.max_entries", self.max_entries as u64),
+            (
+                "nuget.max_central_directory_bytes",
+                self.max_central_directory_bytes,
+            ),
+            (
+                "nuget.max_total_uncompressed_bytes",
+                self.max_total_uncompressed_bytes,
+            ),
+            ("nuget.max_nuspec_bytes", self.max_nuspec_bytes),
+            (
+                "nuget.max_nuspec_compression_ratio",
+                self.max_nuspec_compression_ratio,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} must be greater than 0"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_nuget_max_entries() -> usize {
+    forge_nuget::model::NupkgLimits::default().max_entries
+}
+fn default_nuget_max_central_directory_bytes() -> u64 {
+    forge_nuget::model::NupkgLimits::default().max_central_directory_bytes
+}
+fn default_nuget_max_total_uncompressed_bytes() -> u64 {
+    forge_nuget::model::NupkgLimits::default().max_total_uncompressed
+}
+fn default_nuget_max_nuspec_bytes() -> u64 {
+    forge_nuget::model::NupkgLimits::default().max_nuspec_bytes
+}
+fn default_nuget_max_nuspec_compression_ratio() -> u64 {
+    forge_nuget::model::NupkgLimits::default().max_nuspec_compression_ratio
+}
+
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -1369,6 +1471,7 @@ impl Config {
         }
         self.validate_crypto()?;
         self.proxy.validate()?;
+        self.nuget.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
         if self.server.max_upload_bytes == 0 {
@@ -1829,6 +1932,28 @@ mod tests {
         );
         let cfg = Config::from_figment(fig_from_toml(&dev)).expect("valid");
         assert!(cfg.deployment_warnings().is_empty(), "dev mode stays quiet");
+    }
+
+    #[test]
+    fn nuget_archive_limits_default_and_override() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(
+            cfg.nuget.limits(),
+            forge_nuget::model::NupkgLimits::default()
+        );
+        assert_eq!(cfg.nuget.max_nuspec_bytes, 1024 * 1024);
+
+        let tuned = format!(
+            "{MINIMAL}\n[nuget]\nmax_entries = 50000\nmax_total_uncompressed_bytes = 68719476736\n"
+        );
+        let cfg = Config::from_figment(fig_from_toml(&tuned)).expect("valid");
+        assert_eq!(cfg.nuget.limits().max_entries, 50_000);
+        assert_eq!(cfg.nuget.limits().max_total_uncompressed, 64 << 30);
+        assert_eq!(cfg.nuget.max_nuspec_compression_ratio, 200);
+
+        let zero = format!("{MINIMAL}\n[nuget]\nmax_nuspec_bytes = 0\n");
+        let err = Config::from_figment(fig_from_toml(&zero)).unwrap_err();
+        assert!(err.to_string().contains("nuget.max_nuspec_bytes"), "{err}");
     }
 
     #[test]

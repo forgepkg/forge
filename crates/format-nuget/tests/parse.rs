@@ -74,14 +74,40 @@ fn parses_second_namespace_with_flat_deps_and_prerelease() {
     );
 }
 
+/// The `zip-bomb.nupkg` fixture holds a 64 MiB + 1 entry of zeros (ratio ~1000)
+/// next to a valid manifest. Only the `.nuspec` is ever decompressed, so that
+/// payload is harmless and must not fail the package — large native packages
+/// (CUDA, libtorch, …) look exactly like this. (It used to be rejected by
+/// per-entry size/ratio caps applied to every entry.)
 #[test]
-fn rejects_zip_bomb() {
+fn large_compressible_payload_entry_is_accepted() {
     let fmt = NugetFormat::new();
     let mut f = fixture("zip-bomb.nupkg");
-    let err = fmt
+    let parsed = fmt
         .parse_upload(&mut f)
-        .expect_err("zip bomb must be rejected");
-    // The huge entry trips the per-entry size / compression-ratio guard.
+        .expect("a large payload entry is not a bomb for the manifest reader");
+    assert_eq!(parsed.id, "sample.lib");
+}
+
+/// A manifest that would decompress to far more than the `.nuspec` cap is a
+/// bomb: rejected before it is read into memory.
+#[test]
+fn rejects_nuspec_bomb() {
+    use std::io::Write;
+    let padding = " ".repeat(4 * 1024 * 1024);
+    let nuspec = format!(
+        "<package><metadata><id>Bomb</id><version>1.0.0</version>\
+         <description>{padding}</description></metadata></package>"
+    );
+    let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zw.start_file("Bomb.nuspec", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zw.write_all(nuspec.as_bytes()).unwrap();
+    let mut cur = std::io::Cursor::new(zw.finish().unwrap().into_inner());
+
+    let err = NugetFormat::new()
+        .parse_upload(&mut cur)
+        .expect_err("nuspec bomb must be rejected");
     match err {
         FormatError::InvalidPackage(msg) => {
             assert!(msg.contains("limit"), "unexpected message: {msg}");
@@ -91,9 +117,9 @@ fn rejects_zip_bomb() {
 }
 
 #[test]
-fn small_per_entry_limit_also_rejects_bomb() {
-    // Even if the total budget were generous, a tight per-archive entry cap
-    // catches the oversized payload.
+fn small_total_budget_also_rejects_bomb() {
+    // The total declared uncompressed size stays bounded: a tight budget
+    // rejects the fixture's oversized payload without decompressing it.
     let limits = NupkgLimits {
         max_total_uncompressed: 4 * 1024 * 1024,
         ..NupkgLimits::default()

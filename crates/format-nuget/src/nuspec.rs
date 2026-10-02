@@ -9,7 +9,9 @@
 //! `<dependencies>` groups are extracted. The raw manifest bytes are carried in
 //! [`ParsedUpload::nuspec_bytes`] so the server can store and re-serve them.
 
-use std::io::Read;
+use std::cell::Cell;
+use std::io::{Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 use forge_core::format::ReadSeek;
@@ -99,10 +101,12 @@ pub fn validate_package_id(id: &str) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// Lowercase a package id using ASCII (invariant) lowering, matching
-/// `ToLowerInvariant()`.
+/// Lowercase a package id for case-insensitive lookups, matching NuGet's
+/// `ToLowerInvariant()`: ids may contain non-ASCII letters (see
+/// [`validate_package_id`]), so this is full Unicode lowering
+/// (`Ünicode.Lib` → `ünicode.lib`), not ASCII-only.
 pub fn lower_id(id: &str) -> String {
-    id.trim().to_ascii_lowercase()
+    id.trim().to_lowercase()
 }
 
 /// Display metadata of a `.nuspec`, for registration catalog entries and
@@ -180,10 +184,92 @@ pub fn dependency_groups_from_nuspec(bytes: &[u8]) -> Result<Vec<DependencyGroup
     Ok(parse_nuspec(bytes).map_err(FormatError::from)?.deps)
 }
 
+/// The identity a standalone `.nuspec` declares, as `(lower_id, normalized
+/// version)`. Used to verify a manifest fetched from an upstream before it is
+/// served or cached; a manifest over `limits.max_nuspec_bytes` is rejected.
+pub fn manifest_identity(
+    bytes: &[u8],
+    limits: &NupkgLimits,
+) -> Result<(String, String), FormatError> {
+    if bytes.len() as u64 > limits.max_nuspec_bytes {
+        return Err(NupkgError::LimitExceeded(format!(
+            ".nuspec of {} bytes exceeds max {}",
+            bytes.len(),
+            limits.max_nuspec_bytes
+        ))
+        .into());
+    }
+    let raw = parse_nuspec(bytes)?;
+    Ok((lower_id(&raw.id), version::normalize(&raw.version)?))
+}
+
+/// Render a minimal `.nuspec` declaring `id`, `version` and `deps`.
+///
+/// A proxy knows the dependency groups of a version it has not downloaded yet
+/// only from the upstream registration; rendering them as a manifest lets the
+/// registration and package-detail views parse them through
+/// [`dependency_groups_from_nuspec`] exactly like a stored manifest.
+pub fn synthesize_nuspec(id: &str, version: &str, deps: &[DependencyGroup]) -> Vec<u8> {
+    use quick_xml::escape::escape;
+    use std::fmt::Write as _;
+
+    let mut xml = String::from(concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+        "<package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">\n",
+        "  <metadata>\n",
+    ));
+    let _ = writeln!(xml, "    <id>{}</id>", escape(id));
+    let _ = writeln!(xml, "    <version>{}</version>", escape(version));
+    if !deps.is_empty() {
+        xml.push_str("    <dependencies>\n");
+        for group in deps {
+            match &group.target_framework {
+                Some(tfm) => {
+                    let _ = writeln!(xml, "      <group targetFramework=\"{}\">", escape(tfm));
+                }
+                None => xml.push_str("      <group>\n"),
+            }
+            for dep in &group.dependencies {
+                let _ = write!(xml, "        <dependency id=\"{}\"", escape(&dep.id));
+                if let Some(range) = &dep.range {
+                    let _ = write!(xml, " version=\"{}\"", escape(range));
+                }
+                xml.push_str(" />\n");
+            }
+            xml.push_str("      </group>\n");
+        }
+        xml.push_str("    </dependencies>\n");
+    }
+    xml.push_str("  </metadata>\n</package>\n");
+    xml.into_bytes()
+}
+
 /// Locate and read the `*.nuspec` entry out of the zip, enforcing limits.
+///
+/// Only the manifest is decompressed, so the size and compression-ratio caps
+/// apply to it alone; other entries are bounded only by the archive-shape
+/// limits (entry count, central-directory size, total declared size).
 fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u8>, NupkgError> {
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| NupkgError::InvalidZip(e.to_string()))?;
+    // Vet the end-of-central-directory records before the zip reader loads
+    // the central directory, and bound what it may read while doing so.
+    let vetted = check_archive_directory(file, limits)?;
+    let budget = Rc::new(Cell::new(Some(vetted)));
+    let reader = BudgetReader {
+        inner: file,
+        budget: budget.clone(),
+    };
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+        if budget.get() == Some(0) {
+            NupkgError::LimitExceeded(format!(
+                "zip central directory exceeds max {} bytes",
+                limits.max_central_directory_bytes
+            ))
+        } else {
+            NupkgError::InvalidZip(e.to_string())
+        }
+    })?;
+    // The directory is loaded; reading entries is no longer budgeted.
+    budget.set(None);
 
     if archive.len() > limits.max_entries {
         return Err(NupkgError::LimitExceeded(format!(
@@ -212,32 +298,10 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
             )));
         }
 
-        let size = entry.size();
-        let name = entry.name().to_string();
-
-        // Per-entry uncompressed cap: reject any single oversized member,
-        // since a real package never needs an entry this large and an attacker
-        // could otherwise smuggle a bomb past the total budget.
-        if size > limits.max_entry_uncompressed {
-            return Err(NupkgError::LimitExceeded(format!(
-                "entry {name:?} uncompressed size {size} exceeds per-entry max {}",
-                limits.max_entry_uncompressed
-            )));
-        }
-
-        // Per-entry compression-ratio cap: catches highly compressible bombs
-        // even when each individual entry is under the size cap.
-        let compressed = entry.compressed_size();
-        if let Some(ratio) = size.checked_div(compressed) {
-            if ratio > limits.max_compression_ratio {
-                return Err(NupkgError::LimitExceeded(format!(
-                    "entry {name:?} compression ratio {ratio} exceeds max {}",
-                    limits.max_compression_ratio
-                )));
-            }
-        }
-
-        total_uncompressed = total_uncompressed.saturating_add(size);
+        // Entries other than the manifest are never decompressed, so neither
+        // their individual size nor their compression ratio matters here; the
+        // total declared size only rejects absurd archives.
+        total_uncompressed = total_uncompressed.saturating_add(entry.size());
         if total_uncompressed > limits.max_total_uncompressed {
             return Err(NupkgError::LimitExceeded(format!(
                 "total uncompressed size exceeds max {}",
@@ -245,7 +309,8 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
             )));
         }
 
-        if is_nuspec_name(&name) {
+        let name = entry.name();
+        if is_nuspec_name(name) {
             let depth = name.bytes().filter(|&b| b == b'/').count();
             if depth < best_depth {
                 best_depth = depth;
@@ -256,7 +321,7 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
 
     let index = nuspec_index.ok_or(NupkgError::MissingNuspec)?;
 
-    // Second pass: decompress just the chosen .nuspec under per-entry caps.
+    // Second pass: decompress just the chosen .nuspec under the manifest caps.
     let mut entry = archive
         .by_index(index)
         .map_err(|e| NupkgError::InvalidZip(e.to_string()))?;
@@ -271,19 +336,16 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
 
     let compressed = entry.compressed_size();
     if let Some(ratio) = declared.checked_div(compressed) {
-        if ratio > limits.max_compression_ratio {
+        if ratio > limits.max_nuspec_compression_ratio {
             return Err(NupkgError::LimitExceeded(format!(
                 ".nuspec compression ratio {ratio} exceeds max {}",
-                limits.max_compression_ratio
+                limits.max_nuspec_compression_ratio
             )));
         }
     }
 
     // Read with a hard cap (declared size may lie; the +1 detects overruns).
-    let cap = limits
-        .max_nuspec_bytes
-        .min(limits.max_entry_uncompressed)
-        .saturating_add(1);
+    let cap = limits.max_nuspec_bytes.saturating_add(1);
     let mut buf = Vec::new();
     let read = entry
         .by_ref()
@@ -297,6 +359,230 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
     }
 
     Ok(buf)
+}
+
+/// End-of-central-directory record signature (`PK\x05\x06`) and fixed size.
+const EOCD_SIG: [u8; 4] = *b"PK\x05\x06";
+const EOCD_LEN: u64 = 22;
+/// ZIP64 end-of-central-directory locator signature (`PK\x06\x07`) and size.
+const ZIP64_LOCATOR_SIG: [u8; 4] = *b"PK\x06\x07";
+const ZIP64_LOCATOR_LEN: u64 = 20;
+/// ZIP64 end-of-central-directory record signature (`PK\x06\x06`) and the
+/// size of its fixed part.
+const ZIP64_EOCD_SIG: [u8; 4] = *b"PK\x06\x06";
+const ZIP64_EOCD_LEN: u64 = 56;
+/// Where a well-formed archive's trailing records can start, counted from the
+/// end of the file: the EOCD with a maximal comment, preceded by the ZIP64
+/// locator and record.
+const ZIP_TRAILER_WINDOW: u64 = EOCD_LEN + u16::MAX as u64 + ZIP64_LOCATOR_LEN + ZIP64_EOCD_LEN;
+/// Read-ahead allowance on top of the vetted region (the zip reader scans in
+/// small blocks and probes a few headers around the central directory).
+const ZIP_READ_SLACK: u64 = 64 * 1024;
+
+/// Vet the archive's end-of-central-directory records against the entry-count
+/// and central-directory limits **before** `zip::ZipArchive::new` parses (and
+/// allocates for) the central directory they describe. Returns how many bytes
+/// the zip reader may read while opening the archive.
+///
+/// The zip reader searches backwards for an EOCD record and falls back to an
+/// earlier candidate when a later one does not parse, so every candidate it
+/// could reach within the returned read budget is checked here — EOCD and
+/// ZIP64 records alike, plus the ZIP64 record each locator points at.
+fn check_archive_directory(
+    file: &mut dyn ReadSeek,
+    limits: &NupkgLimits,
+) -> Result<u64, NupkgError> {
+    let len = file.seek(SeekFrom::End(0))?;
+    let trailer = ZIP_TRAILER_WINDOW.min(len);
+    let mut found_eocd = false;
+    let mut max_directory: u64 = 0;
+    for pos in find_signatures(file, len - trailer, len, &EOCD_SIG)? {
+        found_eocd = true;
+        max_directory = max_directory.max(check_eocd_candidate(file, pos, len, limits)?);
+    }
+    if !found_eocd {
+        return Err(NupkgError::InvalidZip(
+            "no end-of-central-directory record near the end of the archive".into(),
+        ));
+    }
+    for pos in find_signatures(file, len - trailer, len, &ZIP64_EOCD_SIG)? {
+        max_directory = max_directory.max(check_zip64_record(file, pos, len, limits)?);
+    }
+
+    // The zip reader may walk back past the trailer only as far as the read
+    // budget allows; vet every candidate in that extra stretch as well.
+    let budget = trailer
+        .saturating_add(max_directory)
+        .saturating_add(ZIP_READ_SLACK);
+    let reach = budget.min(len);
+    if reach > trailer {
+        for pos in find_signatures(file, len - reach, len - trailer, &EOCD_SIG)? {
+            check_eocd_candidate(file, pos, len, limits)?;
+        }
+        for pos in find_signatures(file, len - reach, len - trailer, &ZIP64_EOCD_SIG)? {
+            check_zip64_record(file, pos, len, limits)?;
+        }
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(budget)
+}
+
+/// Check one EOCD candidate at `pos`. Returns the largest central-directory
+/// size it declares.
+///
+/// Mirrors how the zip reader interprets the record: when a field holds the
+/// ZIP64 marker (`0xFFFF…`) and a ZIP64 locator precedes the record, only the
+/// ZIP64 record's counts are used (the one at the locator's offset is checked
+/// here; one found elsewhere is covered by the signature scan), otherwise the
+/// 32-bit counts are.
+fn check_eocd_candidate(
+    file: &mut dyn ReadSeek,
+    pos: u64,
+    len: u64,
+    limits: &NupkgLimits,
+) -> Result<u64, NupkgError> {
+    if pos + EOCD_LEN > len {
+        return Ok(0);
+    }
+    let rec = read_at(file, pos, EOCD_LEN as usize)?;
+    let (on_disk, total) = (le_u16(&rec, 8), le_u16(&rec, 10));
+    let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
+    let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
+
+    // A ZIP64 locator sits immediately before the EOCD.
+    if zip64_marker && pos >= ZIP64_LOCATOR_LEN {
+        let loc = read_at(file, pos - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR_LEN as usize)?;
+        if loc[..4] == ZIP64_LOCATOR_SIG {
+            let record = le_u64(&loc, 8);
+            if record < pos && read_at(file, record, 4)? == ZIP64_EOCD_SIG {
+                return check_zip64_record(file, record, len, limits);
+            }
+            return Ok(0);
+        }
+    }
+    check_directory_limits(u64::from(on_disk.max(total)), u64::from(directory), limits)?;
+    Ok(u64::from(directory))
+}
+
+/// Check one ZIP64 end-of-central-directory record at `pos`. Returns the
+/// central-directory size it declares.
+fn check_zip64_record(
+    file: &mut dyn ReadSeek,
+    pos: u64,
+    len: u64,
+    limits: &NupkgLimits,
+) -> Result<u64, NupkgError> {
+    if pos + ZIP64_EOCD_LEN > len {
+        return Ok(0);
+    }
+    let rec = read_at(file, pos, ZIP64_EOCD_LEN as usize)?;
+    let entries = le_u64(&rec, 24).max(le_u64(&rec, 32));
+    let directory = le_u64(&rec, 40);
+    check_directory_limits(entries, directory, limits)?;
+    Ok(directory)
+}
+
+fn check_directory_limits(
+    entries: u64,
+    directory: u64,
+    limits: &NupkgLimits,
+) -> Result<(), NupkgError> {
+    if entries > limits.max_entries as u64 {
+        return Err(NupkgError::LimitExceeded(format!(
+            "{entries} entries exceeds max {}",
+            limits.max_entries
+        )));
+    }
+    if directory > limits.max_central_directory_bytes {
+        return Err(NupkgError::LimitExceeded(format!(
+            "zip central directory of {directory} bytes exceeds max {}",
+            limits.max_central_directory_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// Offsets of every occurrence of `sig` starting in `[start, end)`, read in
+/// bounded chunks.
+fn find_signatures(
+    file: &mut dyn ReadSeek,
+    start: u64,
+    end: u64,
+    sig: &[u8; 4],
+) -> Result<Vec<u64>, NupkgError> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut out = Vec::new();
+    let mut chunk_start = start;
+    let mut buf = Vec::new();
+    while chunk_start < end {
+        // Overlap by the signature length so a match across chunks is seen.
+        let chunk_end = (chunk_start + CHUNK + 3).min(end + 3);
+        buf.clear();
+        file.seek(SeekFrom::Start(chunk_start))?;
+        (&mut *file)
+            .take(chunk_end - chunk_start)
+            .read_to_end(&mut buf)?;
+        for (i, window) in buf.windows(4).enumerate() {
+            let at = chunk_start + i as u64;
+            if at < end.min(chunk_start + CHUNK) && window == sig {
+                out.push(at);
+            }
+        }
+        chunk_start += CHUNK;
+    }
+    Ok(out)
+}
+
+fn read_at(file: &mut dyn ReadSeek, pos: u64, len: usize) -> Result<Vec<u8>, NupkgError> {
+    let mut buf = vec![0u8; len];
+    file.seek(SeekFrom::Start(pos))?;
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn le_u16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+fn le_u32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn le_u64(b: &[u8], at: usize) -> u64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(raw)
+}
+
+/// A reader that fails once more than its budget has been read through it
+/// (while a budget is set). Bounds what `zip::ZipArchive::new` may read — its
+/// EOCD search and the central directory — to the region
+/// [`check_archive_directory`] vetted. The budget is shared so it can be lifted
+/// once the archive is open.
+struct BudgetReader<'a> {
+    inner: &'a mut dyn ReadSeek,
+    budget: Rc<Cell<Option<u64>>>,
+}
+
+impl Read for BudgetReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(left) = self.budget.get() else {
+            return self.inner.read(buf);
+        };
+        if left == 0 {
+            return Err(std::io::Error::other("zip directory read budget exhausted"));
+        }
+        let cap = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.budget.set(Some(left - n as u64));
+        Ok(n)
+    }
+}
+
+impl Seek for BudgetReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
 }
 
 fn is_nuspec_name(name: &str) -> bool {
@@ -676,9 +962,13 @@ mod tests {
     }
 
     #[test]
-    fn lower_id_is_ascii_invariant() {
+    fn lower_id_is_unicode_invariant() {
         assert_eq!(lower_id("Newtonsoft.JSON"), "newtonsoft.json");
         assert_eq!(lower_id("  Foo.Bar  "), "foo.bar");
+        // Non-ASCII letters are valid in ids, so they must lower too: NuGet
+        // clients request `ünicode.lib` (`ToLowerInvariant()`).
+        assert_eq!(lower_id("Ünicode.Lib"), "ünicode.lib");
+        assert_eq!(lower_id("ÆØÅ.Pakke"), lower_id("æøå.pakke"));
     }
 
     #[test]
@@ -730,6 +1020,11 @@ mod tests {
         for ok in ["A", "Newtonsoft.Json", "my_pkg-2.x", "Ünicode.Lib"] {
             assert!(validate_package_id(ok).is_ok(), "{ok}");
         }
+        // An accepted non-ASCII id is stored under the id clients look up.
+        let unicode = r#"<package><metadata><id>Ünicode.Lib</id><version>1.0.0</version></metadata></package>"#;
+        let parsed = parse_nupkg(&mut nupkg_with(unicode), &NupkgLimits::default()).unwrap();
+        assert_eq!(parsed.id, "ünicode.lib");
+        assert_eq!(parsed.original_id, "Ünicode.Lib");
         let long = "a".repeat(101);
         for bad in [
             "",
@@ -751,6 +1046,169 @@ mod tests {
             .unwrap();
         zw.write_all(nuspec.as_bytes()).unwrap();
         std::io::Cursor::new(zw.finish().unwrap().into_inner())
+    }
+
+    /// A zip holding `entries` (name, bytes), deflated.
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            zw.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(body).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    const OK_NUSPEC: &str =
+        r#"<package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
+
+    /// Offset of the (last) EOCD record of a comment-less archive.
+    fn eocd_offset(zip: &[u8]) -> usize {
+        zip.len() - EOCD_LEN as usize
+    }
+
+    #[test]
+    fn large_and_compressible_payload_entries_are_not_capped() {
+        // A payload entry compressed far beyond the old per-entry ratio cap
+        // (200) is never decompressed, so it must not fail the package (the
+        // `zip-bomb.nupkg` fixture covers the old 64 MiB per-entry size cap).
+        let payload = vec![0u8; 4 * 1024 * 1024];
+        let zip = zip_of(&[
+            ("p.nuspec", OK_NUSPEC.as_bytes()),
+            ("runtimes/x/native.so", &payload),
+        ]);
+        let parsed = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap();
+        assert_eq!(parsed.id, "a.b");
+    }
+
+    #[test]
+    fn total_declared_size_is_still_bounded() {
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes()), ("big.bin", &payload)]);
+        let limits = NupkgLimits {
+            max_total_uncompressed: 1024 * 1024,
+            ..NupkgLimits::default()
+        };
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &limits).unwrap_err();
+        assert!(err.to_string().contains("total uncompressed"), "{err}");
+    }
+
+    #[test]
+    fn nuspec_size_and_ratio_caps_apply_to_the_manifest() {
+        // Oversized manifest (declared size over the cap).
+        let padding = " ".repeat(2 * 1024 * 1024);
+        let big = format!("<package><metadata><id>A.B</id><version>1.0.0</version><description>{padding}</description></metadata></package>");
+        let zip = zip_of(&[("p.nuspec", big.as_bytes())]);
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(err.to_string().contains(".nuspec declared size"), "{err}");
+
+        // A manifest under the size cap but compressed far beyond the ratio cap.
+        let padding = " ".repeat(512 * 1024);
+        let bomb = format!("<package><metadata><id>A.B</id><version>1.0.0</version><description>{padding}</description></metadata></package>");
+        let zip = zip_of(&[("p.nuspec", bomb.as_bytes())]);
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("compression ratio"), "{err}");
+    }
+
+    #[test]
+    fn eocd_entry_count_is_checked_before_the_directory_is_parsed() {
+        let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
+        let eocd = eocd_offset(&zip);
+        assert_eq!(zip[eocd..eocd + 4], EOCD_SIG);
+        // Claim 60 000 entries; the zip reader would only notice the lie
+        // while walking the directory — the pre-check refuses up front.
+        zip[eocd + 8..eocd + 10].copy_from_slice(&60_000u16.to_le_bytes());
+        zip[eocd + 10..eocd + 12].copy_from_slice(&60_000u16.to_le_bytes());
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("60000 entries exceeds max"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn eocd_directory_size_is_checked_before_the_directory_is_parsed() {
+        let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
+        let eocd = eocd_offset(&zip);
+        zip[eocd + 12..eocd + 16].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(err.to_string().contains("central directory"), "{err}");
+    }
+
+    #[test]
+    fn zip64_entry_count_is_checked_before_the_directory_is_parsed() {
+        // An empty archive with a ZIP64 trailer claiming a million entries:
+        // [ZIP64 EOCD record][ZIP64 locator][EOCD with 0xFFFF markers].
+        let mut zip = Vec::new();
+        zip.extend_from_slice(&ZIP64_EOCD_SIG);
+        zip.extend_from_slice(&44u64.to_le_bytes()); // size of the remaining record
+        zip.extend_from_slice(&45u16.to_le_bytes()); // version made by
+        zip.extend_from_slice(&45u16.to_le_bytes()); // version needed
+        zip.extend_from_slice(&0u32.to_le_bytes()); // this disk
+        zip.extend_from_slice(&0u32.to_le_bytes()); // disk with the directory
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes()); // entries on this disk
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes()); // total entries
+        zip.extend_from_slice(&0u64.to_le_bytes()); // directory size
+        zip.extend_from_slice(&0u64.to_le_bytes()); // directory offset
+        zip.extend_from_slice(&ZIP64_LOCATOR_SIG);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes()); // ZIP64 record offset
+        zip.extend_from_slice(&1u32.to_le_bytes());
+        zip.extend_from_slice(&EOCD_SIG);
+        zip.extend_from_slice(&[0, 0, 0, 0]);
+        zip.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        zip.extend_from_slice(&[0xFF; 8]);
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("1000000 entries exceeds max"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn archive_without_a_trailing_eocd_is_rejected() {
+        let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
+        // Push the real EOCD out of the trailer window with junk.
+        zip.extend(std::iter::repeat_n(0u8, 128 * 1024));
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("end-of-central-directory"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn synthesized_nuspec_escapes_and_round_trips() {
+        let deps = vec![
+            DependencyGroup {
+                target_framework: Some("net8.0".into()),
+                dependencies: vec![
+                    Dependency {
+                        id: "A&B".into(),
+                        range: Some("[1.0.0, 2.0.0)".into()),
+                    },
+                    Dependency {
+                        id: "C".into(),
+                        range: None,
+                    },
+                ],
+            },
+            DependencyGroup {
+                target_framework: None,
+                dependencies: Vec::new(),
+            },
+        ];
+        let xml = synthesize_nuspec("Weird<Id>", "1.0.0", &deps);
+        let raw = parse_nuspec(&xml).unwrap();
+        assert_eq!(raw.id, "Weird<Id>");
+        assert_eq!(raw.version, "1.0.0");
+        assert_eq!(raw.deps, deps);
+        assert!(parse_nuspec(&synthesize_nuspec("X", "2.0.0", &[]))
+            .unwrap()
+            .deps
+            .is_empty());
     }
 
     #[test]
