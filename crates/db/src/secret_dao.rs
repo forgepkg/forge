@@ -367,7 +367,7 @@ pub async fn referenced_dek_versions(
     pool: &PgPool,
 ) -> Result<std::collections::HashSet<i32>, SecretDbError> {
     let mut conn = pool.acquire().await?;
-    scan_referenced_dek_versions(&mut *conn).await
+    scan_referenced_dek_versions(&mut conn).await
 }
 
 /// [`referenced_dek_versions`] on one connection (inside the revocation
@@ -475,7 +475,7 @@ pub async fn revoke_unreferenced_deks(
         tx.commit().await?;
         return Ok(0);
     }
-    let referenced = scan_referenced_dek_versions(&mut *tx).await?;
+    let referenced = scan_referenced_dek_versions(&mut tx).await?;
     let (ids, versions): (Vec<i64>, Vec<i32>) = retiring
         .iter()
         .filter(|dek| !referenced.contains(&dek.version))
@@ -595,7 +595,7 @@ pub async fn insert_realm_with_secrets(
     let mut tx = pool.begin().await?;
     let row = auth_realm_dao::insert_realm(&mut *tx, new).await?;
     let blob = seal_realm_secrets(envelope, row.id, &secrets).await?;
-    lock_sealing_dek(&mut *tx, envelope, &blob).await?;
+    lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row = auth_realm_dao::update_realm_and_secrets(
         &mut *tx,
         row.id,
@@ -645,7 +645,7 @@ pub async fn update_realm_with_secrets(
     };
     // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
     let mut tx = pool.begin().await?;
-    lock_sealing_dek(&mut *tx, envelope, sealed).await?;
+    lock_sealing_dek(&mut tx, envelope, sealed).await?;
     let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(sealed)).await?;
     tx.commit().await?;
     Ok(row)
