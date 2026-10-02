@@ -138,7 +138,9 @@ pub struct BeginLogin {
 /// redirect target recovered from the consumed `oidc_flow` row.
 #[derive(Debug, Clone)]
 pub struct ValidatedLogin {
-    /// `iss` of the ID token (already validated to equal the configured issuer).
+    /// `iss` of the ID token, verbatim (already validated to equal the
+    /// discovered issuer, which matches the configured one up to a trailing
+    /// slash).
     pub issuer: String,
     /// `sub` of the ID token — the stable identity join key.
     pub subject: String,

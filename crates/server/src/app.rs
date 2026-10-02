@@ -11,6 +11,7 @@ use axum::Router;
 use forge_core::auth::session_source::SessionCookieSource;
 use forge_core::auth::token::{BasicAuthSource, PrincipalSource, TokenHeaderSource};
 use forge_db::authz_dao;
+use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -163,23 +164,40 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
 /// bootstrap admin was created, so a later deletion sticks across restarts.
 pub const BOOTSTRAP_ADMIN_CREATED_KEY: &str = "bootstrap_admin_created";
 
+/// The placeholder bootstrap-admin password shipped in the example and dev
+/// configs. Startup config validation refuses it for new deployments, but an
+/// account created with it earlier keeps it — there is no password-change
+/// flow — so boot checks the stored hash too.
+const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
+
 /// Create the bootstrap admin user if it does not already exist and was never
 /// created before (see [`BOOTSTRAP_ADMIN_CREATED_KEY`]).
 ///
+/// Whenever the bootstrap username **exists**, the "created once" marker is
+/// recorded (if missing) as well. That covers installs whose account predates
+/// the marker and a boot that crashed between creating the account and
+/// recording the marker; without it, deleting the account later would bring it
+/// back — with full admin rights and the configured password — on the next
+/// restart. A concurrent instance creating the account at the same moment is
+/// handled the same way.
+///
 /// Logs a warning while the bootstrap password remains in use (the admin should
-/// rotate it). A no-op when `auth.bootstrap_admin` is unset or the username
-/// already exists.
+/// rotate it), and a loud one when the existing account still has the
+/// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. A no-op when
+/// `auth.bootstrap_admin` is unset.
 pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let Some(ba) = &config.auth.bootstrap_admin else {
         return Ok(());
     };
+    let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{}", ba.username);
 
-    if user_dao::find_user_by_username(pool, &ba.username)
+    if let Some(existing) = user_dao::find_user_by_username(pool, &ba.username)
         .await
         .context("bootstrap admin lookup")?
-        .is_some()
     {
         tracing::debug!(username = %ba.username, "bootstrap admin already exists; skipping");
+        record_bootstrap_marker(pool, &marker, existing.id).await?;
+        warn_if_placeholder_password(&existing).await;
         return Ok(());
     }
 
@@ -187,7 +205,6 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     // after setting up a real admin or an IdP) must not get it back — with
     // full admin rights and the password still in the environment — on the
     // next restart.
-    let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{}", ba.username);
     if authz_dao::get_setting(pool, &marker)
         .await
         .context("bootstrap admin marker")?
@@ -212,12 +229,25 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     .context("hashing task")?
     .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?;
 
-    let user = user_dao::insert_user(
+    let user = match user_dao::insert_user(
         pool,
         NewUser::local(ba.username.clone(), password_hash, true, true),
     )
     .await
-    .context("insert bootstrap admin")?;
+    {
+        Ok(user) => user,
+        // A peer instance booting concurrently created it first: adopt that
+        // account (it does the role grant) and make sure the marker exists.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            let existing = user_dao::find_user_by_username(pool, &ba.username)
+                .await
+                .context("bootstrap admin lookup")?
+                .context("bootstrap admin vanished right after a unique violation")?;
+            record_bootstrap_marker(pool, &marker, existing.id).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("insert bootstrap admin")),
+    };
 
     // §12.4 Phase 5: the bootstrap admin is granted the built-in `admin` role,
     // not just the slice-1 `is_admin` flag, so it is an admin under fine-grained
@@ -230,15 +260,71 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
             .await
             .context("grant admin role to bootstrap admin")?;
     }
-    authz_dao::set_setting(pool, &marker, &user.id.to_string())
-        .await
-        .context("record bootstrap admin marker")?;
+    // A crash before this line leaves the account without the marker; the
+    // next boot records it (see the existing-account branch above).
+    record_bootstrap_marker(pool, &marker, user.id).await?;
 
     tracing::warn!(
         username = %ba.username,
         "created bootstrap admin from config; change its password as soon as possible"
     );
+    if ba.password == PLACEHOLDER_BOOTSTRAP_PASSWORD {
+        warn_placeholder(&ba.username);
+    }
     Ok(())
+}
+
+/// Record the bootstrap "created once" marker unless it is already there.
+async fn record_bootstrap_marker(pool: &PgPool, marker: &str, user_id: i64) -> anyhow::Result<()> {
+    if authz_dao::get_setting(pool, marker)
+        .await
+        .context("bootstrap admin marker")?
+        .is_none()
+    {
+        authz_dao::set_setting(pool, marker, &user_id.to_string())
+            .await
+            .context("record bootstrap admin marker")?;
+    }
+    Ok(())
+}
+
+/// Whether `user`'s stored local password is the shipped placeholder
+/// ([`PLACEHOLDER_BOOTSTRAP_PASSWORD`]). `false` for accounts without a local
+/// password or with an unparseable hash. Runs argon2 on a blocking thread.
+pub async fn has_placeholder_password(user: &AppUser) -> bool {
+    let Some(stored) = user.password_hash.clone() else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        use argon2::{Argon2, PasswordHash, PasswordVerifier};
+        PasswordHash::new(&stored)
+            .map(|parsed| {
+                Argon2::default()
+                    .verify_password(PLACEHOLDER_BOOTSTRAP_PASSWORD.as_bytes(), &parsed)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Boot-time check of an existing bootstrap account: warn loudly while it
+/// still accepts the placeholder password. Startup is not refused — there is
+/// no password-change flow to get out of that state.
+async fn warn_if_placeholder_password(user: &AppUser) {
+    if has_placeholder_password(user).await {
+        warn_placeholder(&user.username);
+    }
+}
+
+fn warn_placeholder(username: &str) {
+    tracing::error!(
+        username = %username,
+        "SECURITY WARNING: the bootstrap admin account still accepts the placeholder password \"{PLACEHOLDER_BOOTSTRAP_PASSWORD}\" — \
+         anyone who can reach this instance can sign in as an administrator. Create a real \
+         admin (or configure an identity provider) and deactivate or delete this account."
+    );
 }
 
 /// One-shot import of the legacy `[oidc]` / `[auth.upstream_basic]` config

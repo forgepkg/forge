@@ -5,7 +5,10 @@
 //!   credentials (which the CSRF token does not cover);
 //! * removing the built-in `admin` role actually revokes admin, including for
 //!   users that also carry the legacy `is_admin` flag;
-//! * a deleted bootstrap admin is not re-created on restart.
+//! * a deleted bootstrap admin is not re-created on restart — including one
+//!   whose account existed before the "created once" marker was recorded;
+//! * an existing bootstrap account still using the placeholder password is
+//!   detected at boot.
 //!
 //! Requires Postgres + an S3 gateway (testcontainers, or the
 //! `FORGE_TEST_DATABASE_URL` / `FORGE_TEST_S3_ENDPOINT` overrides).
@@ -257,6 +260,109 @@ async fn deleted_bootstrap_admin_is_not_recreated_on_restart() {
             .is_none(),
         "a deleted bootstrap admin stays deleted"
     );
+}
+
+/// Review L7(a): when the bootstrap username already exists at boot (an
+/// install that predates the marker, or a boot that crashed between creating
+/// the account and recording the marker), the marker is recorded then — so
+/// deleting the account afterwards still sticks across restarts.
+#[tokio::test]
+async fn bootstrap_marker_is_recorded_for_a_preexisting_account() {
+    let name = format!("bootpre{}", common::unique());
+    let pool = common::pool().await;
+    // The account exists, but no marker was ever written for it.
+    let user = forge_db::user_dao::insert_user(
+        &pool,
+        forge_db::user_dao::NewUser::local(name.clone(), "$argon2id$unused".into(), true, true),
+    )
+    .await
+    .unwrap();
+    let marker = format!("{}:{name}", forge_server::app::BOOTSTRAP_ADMIN_CREATED_KEY);
+    assert!(forge_db::authz_dao::get_setting(&pool, &marker)
+        .await
+        .unwrap()
+        .is_none());
+
+    let opts = || common::ServerOpts {
+        bootstrap_admin: Some((name.clone(), "bootpw".into())),
+        ..Default::default()
+    };
+    let srv = common::start_with(pool.clone(), opts()).await;
+    assert_eq!(
+        forge_db::authz_dao::get_setting(&pool, &marker)
+            .await
+            .unwrap(),
+        Some(user.id.to_string()),
+        "boot records the marker for an existing bootstrap account"
+    );
+    assert!(forge_db::user_dao::delete_user(&pool, user.id)
+        .await
+        .unwrap());
+    drop(srv);
+
+    let _restarted = common::start_with(pool.clone(), opts()).await;
+    assert!(
+        forge_db::user_dao::find_user_by_username(&pool, &name)
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleted pre-marker bootstrap admin stays deleted"
+    );
+}
+
+/// Review L7(a): boot detects an existing bootstrap account that still
+/// accepts the shipped placeholder password (it logs a loud warning; startup
+/// is not refused since there is no password-change flow).
+#[tokio::test]
+async fn placeholder_bootstrap_password_is_detected() {
+    use argon2::PasswordHasher;
+    let hash = |pw: &str| {
+        argon2::Argon2::default()
+            .hash_password(pw.as_bytes())
+            .unwrap()
+            .to_string()
+    };
+    let user = |password_hash: Option<String>| forge_db::model::AppUser {
+        id: 1,
+        username: "admin".into(),
+        password_hash,
+        is_admin: true,
+        active: true,
+        auth_source: "local".into(),
+        external_subject: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    assert!(forge_server::app::has_placeholder_password(&user(Some(hash("changeme")))).await);
+    assert!(!forge_server::app::has_placeholder_password(&user(Some(hash("a-real-secret")))).await);
+    assert!(!forge_server::app::has_placeholder_password(&user(None)).await);
+    assert!(!forge_server::app::has_placeholder_password(&user(Some("garbage".into()))).await);
+
+    // An existing placeholder account does not stop the server from booting.
+    let name = format!("bootph{}", common::unique());
+    let pool = common::pool().await;
+    forge_db::user_dao::insert_user(
+        &pool,
+        forge_db::user_dao::NewUser::local(name.clone(), hash("changeme"), true, true),
+    )
+    .await
+    .unwrap();
+    let srv = common::start_with(
+        pool.clone(),
+        common::ServerOpts {
+            bootstrap_admin: Some((name.clone(), "rotated-in-config".into())),
+            ..Default::default()
+        },
+    )
+    .await;
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&name, Some("changeme"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "startup is not refused");
 }
 
 #[tokio::test]

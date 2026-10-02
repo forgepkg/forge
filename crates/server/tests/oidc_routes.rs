@@ -13,7 +13,9 @@
 //!     principal chain);
 //!   * an unknown `state` is rejected (400);
 //!   * `POST /auth/logout` clears the cookie + revokes the session (CSRF
-//!     enforced), after which the cookie no longer authenticates.
+//!     enforced), after which the cookie no longer authenticates;
+//!   * an IdP whose issuer ends in `/` (Auth0-style) completes the login
+//!     (review L7(b)).
 //!
 //! Requires Docker.
 
@@ -85,18 +87,27 @@ struct MockIdp {
 
 impl MockIdp {
     async fn start() -> Self {
+        Self::start_with_issuer_suffix("").await
+    }
+
+    /// Like [`Self::start`], but the IdP's issuer identifier is its base URL
+    /// plus `suffix` (e.g. `"/"` for an Auth0-style `https://tenant/` issuer):
+    /// discovery advertises it, and [`Self::issuer`] (used in tokens and the
+    /// `[oidc]` block) carries it.
+    async fn start_with_issuer_suffix(suffix: &str) -> Self {
         let server = MockServer::start().await;
-        let issuer = server.uri();
+        let base = server.uri();
+        let issuer = format!("{base}{suffix}");
         let signer = TestSigner::new("k1");
 
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "issuer": issuer,
-                "authorization_endpoint": format!("{issuer}/authorize"),
-                "token_endpoint": format!("{issuer}/token"),
-                "jwks_uri": format!("{issuer}/jwks"),
-                "end_session_endpoint": format!("{issuer}/logout"),
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "jwks_uri": format!("{base}/jwks"),
+                "end_session_endpoint": format!("{base}/logout"),
             })))
             .mount(&server)
             .await;
@@ -394,6 +405,83 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["user"]["username"], json!(username));
     assert_eq!(body["is_admin"], json!(true), "roles claim granted admin");
+}
+
+/// Review L7(b): an issuer that ends in `/` (Auth0: `https://tenant.auth0.com/`)
+/// used to fail every login — the verifier compared the token's `iss` against
+/// the slash-stripped cache-key form. The full browser flow must now succeed
+/// and link the identity under the issuer exactly as the IdP spells it.
+#[tokio::test]
+async fn callback_accepts_trailing_slash_issuer() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start_with_issuer_suffix("/").await;
+    assert!(idp.issuer.ends_with('/'));
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let username = format!("slash-{n}");
+    let sub = format!("sub-slash-{n}");
+
+    let resp = no_redirect_client()
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(&idp.issuer, &sub, &username, &nonce, json!([])))
+        .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .header("cookie", &flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302, "trailing-slash issuer login completes");
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("session cookie set")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie = session_cookie_from(&set_cookie);
+    let resp = no_redirect_client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["user"]["username"],
+        json!(username)
+    );
+
+    let linked_issuer: String =
+        sqlx::query_scalar("SELECT issuer FROM external_identity WHERE subject = $1")
+            .bind(&sub)
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        linked_issuer, idp.issuer,
+        "linked under the IdP's exact issuer"
+    );
 }
 
 #[tokio::test]

@@ -12,6 +12,8 @@
 //!     rejected);
 //!   * `resolve_user` provisions on first login, links by username, recomputes
 //!     `is_admin` from the group/role claim, and rejects inactive users;
+//!   * concurrent first logins for one identity all resolve to the single
+//!     linked account and leave no orphan accounts behind (review L7(c));
 //!   * `SessionService` round-trips create → validate → revoke and rotates.
 //!
 //! Requires Docker.
@@ -635,6 +637,65 @@ async fn resolve_user_rejects_inactive_linked_user() {
         matches!(res, Err(oidc::ResolveError::Inactive)),
         "got {res:?}"
     );
+}
+
+/// Review L7(c): concurrent first logins for the same new `(issuer, subject)`
+/// all miss the link lookup and provision. Exactly one account wins the
+/// unique link; every caller must come back with THAT account (a session is
+/// minted for whatever `resolve_user` returns), and the duplicates it
+/// provisioned must be gone — no orphan accounts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_logins_resolve_to_the_linked_account_without_orphans() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+
+    for round in 0..3 {
+        let n = unique();
+        let sub = format!("sub-race-{n}");
+        let username = format!("racer-{n}");
+        let validated = run_login(&pool, &idp, &sub, &username, json!([])).await;
+        let mapped = map_claims(&validated.claims, &admin_mapping());
+
+        let results = futures_util::future::join_all((0..8).map(|_| {
+            let (pool, validated, mapped) = (pool.clone(), validated.clone(), mapped.clone());
+            tokio::spawn(async move {
+                oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default()).await
+            })
+        }))
+        .await;
+        let ids: Vec<i64> = results
+            .into_iter()
+            .map(|r| {
+                r.unwrap()
+                    .expect("every concurrent first login resolves")
+                    .id
+            })
+            .collect();
+
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT user_id FROM external_identity WHERE issuer = $1 AND subject = $2",
+        )
+        .bind(&validated.issuer)
+        .bind(&sub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            ids.iter().all(|id| *id == linked),
+            "round {round}: every login resolves to the linked account {linked}, got {ids:?}"
+        );
+        let accounts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM app_user WHERE auth_source = 'oidc' AND external_subject = $1",
+        )
+        .bind(&sub)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            accounts, 1,
+            "round {round}: no orphan accounts are left behind"
+        );
+    }
 }
 
 // ── SessionService ────────────────────────────────────────────────────────────
