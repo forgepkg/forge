@@ -15,6 +15,9 @@
 //! * A `down` switch makes every request answer `503` (an outage from forge's
 //!   point of view ⇒ `Unavailable` ⇒ fail-closed, nothing cached), so the
 //!   fail-closed scenario can be driven deterministically.
+//! * A `redirect` switch makes `/status` answer `302` to an SSO-style login
+//!   page (`/sso/login`) that itself answers `200` — the shape that must never
+//!   be mistaken for a valid credential. The login page counts its own hits.
 //!
 //! The forge server reaches this over its outbound client; loopback upstreams
 //! are permitted since 12.7 §3.6 (scheme-only guard), so no special opt-out is
@@ -50,6 +53,10 @@ struct Inner {
     hits: AtomicUsize,
     /// When set, every request answers `503` (simulated upstream outage).
     down: AtomicBool,
+    /// When set, `/status` answers `302 Location: /sso/login`.
+    redirect: AtomicBool,
+    /// Requests the `/sso/login` page received.
+    login_page_hits: AtomicUsize,
 }
 
 /// A running in-process mock Basic-auth upstream.
@@ -91,6 +98,8 @@ impl MockBasicUpstream {
             accounts: table,
             hits: AtomicUsize::new(0),
             down: AtomicBool::new(false),
+            redirect: AtomicBool::new(false),
+            login_page_hits: AtomicUsize::new(0),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -102,7 +111,10 @@ impl MockBasicUpstream {
         let ctx = Ctx {
             inner: inner.clone(),
         };
-        let app = Router::new().route("/status", get(status)).with_state(ctx);
+        let app = Router::new()
+            .route("/status", get(status))
+            .route("/sso/login", get(sso_login))
+            .with_state(ctx);
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
@@ -128,6 +140,17 @@ impl MockBasicUpstream {
     /// Flip the outage switch: when `true`, every request answers `503`.
     pub fn set_down(&self, down: bool) {
         self.inner.down.store(down, Ordering::SeqCst);
+    }
+
+    /// Flip the SSO-redirect switch: when `true`, `/status` answers `302` to
+    /// `/sso/login` (which answers `200`) for every credential.
+    pub fn set_redirect(&self, redirect: bool) {
+        self.inner.redirect.store(redirect, Ordering::SeqCst);
+    }
+
+    /// Number of requests the `/sso/login` page has received.
+    pub fn login_page_hits(&self) -> usize {
+        self.inner.login_page_hits.load(Ordering::SeqCst)
     }
 
     /// The `[auth]` + `[auth.upstream_basic]` TOML block pointing forge at this
@@ -196,6 +219,11 @@ async fn status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "upstream down").into_response();
     }
 
+    if ctx.inner.redirect.load(Ordering::SeqCst) {
+        // An SSO front: bounce every credential to a login page.
+        return (StatusCode::FOUND, [(header::LOCATION, "/sso/login")]).into_response();
+    }
+
     let Some((user, pass)) = decode_basic(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -209,6 +237,14 @@ async fn status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         // Wrong password or unknown user → definitive rejection.
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// `GET /sso/login` — the SSO login form a redirecting upstream bounces to.
+/// Always `200`: following the redirect and trusting this status would accept
+/// any password.
+async fn sso_login(State(ctx): State<Ctx>) -> Response {
+    ctx.inner.login_page_hits.fetch_add(1, Ordering::SeqCst);
+    (StatusCode::OK, "<html><body>Sign in</body></html>").into_response()
 }
 
 /// Decode an `Authorization: Basic base64(user:pass)` header into its parts.

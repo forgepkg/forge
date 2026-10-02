@@ -24,6 +24,12 @@
 //! 8. admin `reauth` purges the cached verdict → the next request re-forwards.
 //! 9. `required_groups` gate: a user lacking the required group is rejected
 //!    despite a valid password.
+//! 11. an SSO-style upstream that 302s every credential to a 200 login page is
+//!     never trusted: the redirect is not followed and the login fails closed.
+//! 12. admin deactivation cuts a federated user off: verdicts purged, logins
+//!     refused even though the upstream still accepts the password, and the
+//!     account is not resurrected by auto-provisioning.
+//! 13. deleting a user purges its cached verdicts.
 //!
 //! Requires Docker.
 
@@ -518,4 +524,163 @@ async fn cross_instance_reauth_invalidates_peer_cache() {
         2,
         "B re-forwards after the cross-instance reauth invalidation"
     );
+}
+
+// ── 11. SSO redirect is never a valid verdict ─────────────────────────────────
+
+#[tokio::test]
+async fn redirecting_upstream_fails_closed() {
+    let mock = MockBasicUpstream::start(vec![(UP_USER, UP_PASS, vec![])]).await;
+    let srv = start_credforward_stack(&mock, 300, 30, &[], "").await;
+    mock.set_redirect(true);
+
+    let resp = me_basic(&srv, "sso-victim", "any-password-at-all").await;
+    assert_eq!(
+        resp.status(),
+        401,
+        "a 302 to a 200 login page must not authenticate"
+    );
+    assert_eq!(mock.hits(), 1, "the credential was forwarded once");
+    assert_eq!(
+        mock.login_page_hits(),
+        0,
+        "the redirect is not followed (the password never reaches the login page)"
+    );
+    assert!(
+        user_row(&srv.pool, "sso-victim").await.is_none(),
+        "nothing is provisioned"
+    );
+    let (total, _) = verdict_counts(&srv.pool, "sso-victim").await;
+    assert_eq!(
+        total, 0,
+        "a redirect is treated as unavailable: nothing cached"
+    );
+}
+
+/// `PATCH /admin/users/{id}` as the stack's bootstrap admin.
+async fn set_active(srv: &TestServer, user_id: i64, active: bool) -> reqwest::Response {
+    let (admin_u, admin_p) = srv.admin_basic();
+    srv.client()
+        .patch(format!("{}/admin/users/{user_id}", srv.base_url))
+        .basic_auth(&admin_u, Some(&admin_p))
+        .json(&serde_json::json!({ "active": active }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn user_id(pool: &sqlx::PgPool, username: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT id FROM app_user WHERE username = $1")
+        .bind(username)
+        .fetch_one(pool)
+        .await
+        .expect("provisioned id")
+}
+
+// ── 12. deactivation cuts a federated user off ────────────────────────────────
+
+#[tokio::test]
+async fn deactivated_upstream_user_is_cut_off_and_not_resurrected() {
+    let mock = MockBasicUpstream::start(vec![(UP_USER, UP_PASS, vec![])]).await;
+    let srv = start_credforward_stack(&mock, 300, 30, &[], "").await;
+
+    // Provision + warm a positive verdict (and a browser session).
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    let resp = srv
+        .client()
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&serde_json::json!({ "username": UP_USER, "password": UP_PASS }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "browser login works before deactivation"
+    );
+    let id = user_id(&srv.pool, UP_USER).await;
+    assert_eq!(verdict_counts(&srv.pool, UP_USER).await.1, 1);
+
+    let resp = set_active(&srv, id, false).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        verdict_counts(&srv.pool, UP_USER).await.0,
+        0,
+        "deactivation purges the user's cached verdicts"
+    );
+    let live_sessions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM session WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(live_sessions, 0, "deactivation revokes the user's sessions");
+
+    // The upstream still accepts the password, but forge refuses the account
+    // and auto-provisioning does not bring it back.
+    let hits_before = mock.hits();
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 401);
+    assert_eq!(
+        mock.hits(),
+        hits_before + 1,
+        "the purged verdict forced a fresh upstream validation"
+    );
+    let resp = srv
+        .client()
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&serde_json::json!({ "username": UP_USER, "password": UP_PASS }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "no browser session for a deactivated user"
+    );
+    let active: bool = sqlx::query_scalar("SELECT active FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(
+        !active,
+        "a valid upstream login must not reactivate the account"
+    );
+
+    // Reactivation lets the user back in.
+    assert_eq!(set_active(&srv, id, true).await.status(), 200);
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+}
+
+// ── 13. deleting a user purges its cached verdicts ────────────────────────────
+
+#[tokio::test]
+async fn delete_user_purges_cached_verdicts() {
+    let mock = MockBasicUpstream::start(vec![(UP_USER, UP_PASS, vec![])]).await;
+    let srv = start_credforward_stack(&mock, 300, 30, &[], "").await;
+    let (admin_u, admin_p) = srv.admin_basic();
+
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    assert_eq!(verdict_counts(&srv.pool, UP_USER).await.1, 1);
+    let id = user_id(&srv.pool, UP_USER).await;
+
+    let resp = srv
+        .client()
+        .delete(format!("{}/admin/users/{id}", srv.base_url))
+        .basic_auth(&admin_u, Some(&admin_p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        verdict_counts(&srv.pool, UP_USER).await.0,
+        0,
+        "no cached verdict outlives the deleted account"
+    );
+
+    // The next login re-validates upstream (auto-provisioning then re-creates
+    // the account by design — deactivate, not delete, to block a user).
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    assert_eq!(mock.hits(), 2, "the deleted user's verdict was not reused");
 }

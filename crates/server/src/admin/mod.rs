@@ -126,7 +126,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::delete(members::remove),
         )
         .route("/users", get(users::list).post(users::create))
-        .route("/users/{id}", axum::routing::delete(users::delete))
+        .route(
+            "/users/{id}",
+            axum::routing::patch(users::update).delete(users::delete),
+        )
         .route("/users/{id}/reauth", axum::routing::post(users::reauth))
         .route(
             "/users/{id}/tokens",

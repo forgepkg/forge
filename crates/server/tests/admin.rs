@@ -687,3 +687,280 @@ async fn crypto_disabled_reports_and_rejects() {
         .unwrap();
     assert_eq!(resp.status(), 409, "rotation without [crypto] must 409");
 }
+
+/// Create a local user through the admin API and sign it in through
+/// `/auth/login`; returns `(user_id, session_cookie_pair, csrf_token)`.
+async fn create_and_login(
+    srv: &common::TestServer,
+    username: &str,
+    password: &str,
+) -> (i64, String, String) {
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let created: Value = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": password, "is_admin": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_id = created["id"].as_i64().expect("user id");
+    let resp = client
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "login succeeds");
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let body: Value = resp.json().await.unwrap();
+    let csrf = body["csrf_token"].as_str().expect("csrf").to_string();
+    (user_id, cookie, csrf)
+}
+
+/// Review M5: `PATCH /admin/users/{id}` with `{"active": false}` cuts a user
+/// off everywhere — its live browser session is revoked, its API token and
+/// password stop working — and `{"active": true}` restores password/token
+/// access (the revoked session stays dead). Bad bodies, unknown ids and
+/// non-admin callers are refused.
+#[tokio::test]
+async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("deact{}", common::unique());
+    let password = "pw123456";
+    let (user_id, cookie, csrf) = create_and_login(&srv, &username, password).await;
+
+    // The user mints a token from its session.
+    let resp = client
+        .post(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"name": "cli"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let token = resp.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let me_with_token = || {
+        client
+            .get(format!("{}/admin/me", srv.base_url))
+            .header("X-NuGet-ApiKey", &token)
+            .send()
+    };
+    assert_eq!(me_with_token().await.unwrap().status(), 200);
+
+    // Validation: empty body, unknown fields, unknown id, non-admin caller.
+    let patch = |id: i64, body: Value| {
+        client
+            .patch(format!("{}/admin/users/{id}", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+    };
+    assert_eq!(patch(user_id, json!({})).await.unwrap().status(), 400);
+    assert_eq!(
+        patch(user_id, json!({"active": false, "is_admin": true}))
+            .await
+            .unwrap()
+            .status(),
+        422,
+        "unknown fields are rejected, not ignored"
+    );
+    assert_eq!(
+        patch(9_999_999, json!({"active": false}))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let resp = client
+        .patch(format!("{}/admin/users/{user_id}", srv.base_url))
+        .basic_auth(&username, Some(password))
+        .json(&json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "non-admin cannot deactivate");
+
+    // Deactivate.
+    let resp = patch(user_id, json!({"active": false})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["active"], json!(false));
+    assert_eq!(view["id"], json!(user_id));
+
+    let live_sessions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM session WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(live_sessions, 0, "deactivation revokes every session");
+
+    let resp = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "the browser session is dead");
+    assert_eq!(
+        me_with_token().await.unwrap().status(),
+        401,
+        "API tokens of an inactive user are refused"
+    );
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some(password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "password auth is refused");
+    let resp = client
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&json!({"username": username, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "no new session for an inactive user");
+
+    // Reactivate: password and token work again; the old session does not.
+    let resp = patch(user_id, json!({"active": true})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["active"], json!(true));
+    assert_eq!(me_with_token().await.unwrap().status(), 200);
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some(password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "a revoked session stays revoked");
+}
+
+/// Review M5 / L6: the cookie-authenticated `/auth/me` and `/auth/tokens`
+/// endpoints check the session user's live `active` flag, not just the
+/// session row — even a session that was never revoked (e.g. the account was
+/// disabled directly in the database) grants nothing once the user is
+/// inactive: no listing, no minting, no revoking.
+#[tokio::test]
+async fn auth_tokens_refuse_inactive_user_with_live_session() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let username = format!("inact{}", common::unique());
+    let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+
+    let resp = client
+        .post(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"name": "before"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let token_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+
+    // Disable the account without touching its session.
+    sqlx::query("UPDATE app_user SET active = false WHERE id = $1")
+        .bind(user_id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+
+    let resp = client
+        .get(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "list refused for an inactive user");
+    let resp = client
+        .post(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"name": "after"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "mint refused for an inactive user");
+    let resp = client
+        .delete(format!("{}/auth/tokens/{token_id}", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "revoke refused for an inactive user");
+    let resp = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    let minted: i64 = sqlx::query_scalar("SELECT count(*) FROM token WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert_eq!(minted, 1, "no token was minted for the inactive user");
+}
+
+/// Review M5: `POST /admin/users/{id}/reauth` also revokes the user's browser
+/// sessions, so a signed-in browser has to log in (and re-validate) again.
+#[tokio::test]
+async fn reauth_revokes_sessions() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("reauthsess{}", common::unique());
+    let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456").await;
+
+    let me = || {
+        client
+            .get(format!("{}/auth/me", srv.base_url))
+            .header("cookie", &cookie)
+            .send()
+    };
+    assert_eq!(me().await.unwrap().status(), 200);
+
+    let resp = client
+        .post(format!("{}/admin/users/{user_id}/reauth", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        me().await.unwrap().status(),
+        401,
+        "reauth kills the live session"
+    );
+}
