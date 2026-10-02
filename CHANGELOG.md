@@ -103,15 +103,30 @@ First production release.
   read verbatim.
 - Release images are signed by digest before any tag points at them; the
   verification command pins the exact release workflow; actions and base
-  images are pinned by digest; CI scans dependencies. The RUSTSEC advisories
-  in the AWS SDK's legacy HTTP stack are gone from the dependency tree.
+  images are pinned by digest; CI audits the Rust and shipped web
+  dependencies, and Dependabot keeps them current. The RUSTSEC advisories in
+  the AWS SDK's legacy HTTP stack are gone from the dependency tree.
+- With `anonymous_mode = "all"`, signed-in users can read what anonymous
+  callers can; under `off` and `allowlist` they hold only their own grants
+  (the allowlist depends on the caller's network, which a signed-in user or
+  token must not carry elsewhere).
+- Unknown and federated usernames take the same time in the password chain,
+  so response timing no longer reveals which upstream users exist.
+- Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
+  (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
+- A cancelled admin key rotation can no longer leave the rotation lock held
+  on a pooled connection.
 
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
   decrement shared blobs exactly once; the losing request gets 404 and
   `blob.ref_count` can no longer go negative. Before, a retry could delete a
-  blob another repository still served.
+  blob another repository still served. Garbage collection also refuses to
+  delete any blob an asset still names, repairing a drifted counter instead,
+  and a redeploy that races a delete publishes the version afresh.
+- Writers lock shared blob rows in one order, and a repository delete that
+  Postgres aborts as a deadlock victim is retried.
 - A repository delete is atomic with its emptiness check or proxy purge, and
   a publish racing garbage collection retries instead of failing.
 - Retention: hosted-scope rules on a proxy repository are rejected (they
@@ -125,17 +140,24 @@ First production release.
   lists a phantom version; a missing local copy is fetched again;
   registration carries the upstream's dependency groups, listing state and
   publish date for versions not yet downloaded; a rejected package is not
-  re-downloaded on every retry.
+  re-downloaded on every retry; rows created only by requests for versions
+  the upstream never had are pruned after the not-found window.
 - Large packages with big native payloads publish and proxy: size and ratio
-  caps apply to the `.nuspec` only, the ZIP directory is checked before
-  parsing, and the limits are configurable under `[nuget]`.
-- Package ids and search terms are lowercased with full Unicode rules, as
-  NuGet clients do.
+  caps apply to the `.nuspec` only, the ZIP directory the reader will use is
+  checked before parsing, and the limits are configurable under `[nuget]`.
+- Package ids, search terms, selectors and retention prefixes are lowercased
+  character by character like .NET's `ToLowerInvariant`, so ids with
+  non-ASCII letters resolve as NuGet clients request them.
 - Group search enriches only the page it returns.
 - Nested-group depth counts the levels above the new member too.
-- Signed-in users can read repositories that anonymous users can read.
-- OIDC issuers whose identifier ends in `/` validate; two concurrent first
-  sign-ins no longer create an orphan account.
+- OIDC issuers whose identifier ends in `/` validate; concurrent first
+  sign-ins for one identity resolve to one account, with no orphans or
+  errors.
+- Secret encryption: enabling it later removes plaintext copies only after
+  checking the ciphertext holds the same password; a stale or undecryptable
+  ciphertext is replaced from the plaintext instead.
+- Boot warns about an account that still accepts the placeholder password
+  `changeme` even when no bootstrap admin is configured.
 - The Redis L1 cache is flushed on the first backplane subscription, so an
   instance that starts while Redis is slow does not serve stale entries.
 - Interrupted multipart uploads are aborted. Garbage-collection tables are
@@ -156,7 +178,9 @@ First production release.
 - The image sets `allow_password_basic = false` (credential-forwarding realms
   still enable the wire Basic path) and runs as UID 10001.
 - `FORGE_CONFIG` must name an existing file. A blank `FORGE_REDIS__URL`
-  disables Redis.
+  disables Redis. Secret environment values are never type-converted;
+  surrounding whitespace and one pair of surrounding double quotes are
+  removed, as before.
 - Repository names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; `new` is
   reserved.
 - Repository updates: an absent field keeps its value, JSON `null` clears it.
@@ -195,6 +219,14 @@ First production release.
 - With `anonymous_mode = "allowlist"`, preserve the `Host` header at the
   reverse proxy (`proxy_set_header Host $host`) or list the names clients
   use in `server.allowed_hosts`.
+- Pre-release installs: a repository whose `anonymous_read` was switched off
+  *before* this upgrade may still carry its synthesized anonymous read grant
+  (only switches made from now on remove it). Check
+  `GET /admin/anonymous/effective` and delete grants you did not intend.
+- Pre-release installs on a database whose `LC_CTYPE` is `C` (the
+  CloudNativePG default): Postgres cannot lowercase non-ASCII letters there,
+  so migration 0019 leaves package ids with non-ASCII capitals as they were;
+  delete and re-push such packages.
 
 ### Known limitations
 
@@ -220,6 +252,7 @@ First production release.
   reads; NuGet clients can still read those anonymously.
 - There is no web console yet for RBAC roles and grants, retention, user
   deactivation or key rotation; use the `/admin` API.
+- CI does not scan the container image for OS-package vulnerabilities.
 
 [Unreleased]: https://github.com/schmitch/repo/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/schmitch/repo/releases/tag/v0.1.0
