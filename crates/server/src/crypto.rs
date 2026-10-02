@@ -96,23 +96,29 @@ impl Drop for RotationLock {
 /// Try to take the cluster-wide rotation lock without waiting. `Ok(None)` when
 /// another instance (or request) holds it.
 pub async fn try_rotation_lock(pool: &PgPool) -> anyhow::Result<Option<RotationLock>> {
-    let mut conn = pool
+    let conn = pool
         .acquire()
         .await
         .context("acquire advisory-lock connection")?;
+    // Guard the connection *before* asking for the lock: if this future is
+    // cancelled after the server granted it but before the reply was read,
+    // the guard's drop closes the connection (releasing the lock) rather
+    // than returning a lock-holding connection to the pool.
+    let mut guard = RotationLock {
+        conn,
+        released: false,
+    };
     let got: bool = sqlx::query_scalar(r#"SELECT pg_try_advisory_lock($1)"#)
         .bind(ROTATION_LOCK_KEY)
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut *guard.conn)
         .await
         .context("try advisory lock")?;
     if !got {
         // Not held: the connection goes straight back to the pool.
+        guard.released = true;
         return Ok(None);
     }
-    Ok(Some(RotationLock {
-        conn,
-        released: false,
-    }))
+    Ok(Some(guard))
 }
 
 /// Build the [`EnvelopeService`] from the `[crypto]` config, or `None` when
