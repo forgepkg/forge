@@ -384,45 +384,43 @@ const ZIP_READ_SLACK: u64 = 64 * 1024;
 /// allocates for) the central directory they describe. Returns how many bytes
 /// the zip reader may read while opening the archive.
 ///
-/// The zip reader searches backwards for an EOCD record and falls back to an
-/// earlier candidate when a later one does not parse, so every candidate it
-/// could reach within the returned read budget is checked here — EOCD and
-/// ZIP64 records alike, plus the ZIP64 record each locator points at.
+/// Mirrors the zip reader's choice: it searches backwards and uses the last
+/// EOCD signature whose record and comment fit in the file (plus, for ZIP64,
+/// the record its locator names). Earlier signature matches — which ordinary
+/// compressed data or a package signature contains by chance — are never
+/// vetted: the reader consults them only when that record fails a later
+/// consistency check, and whatever it reads then stays inside the returned
+/// read budget, which is derived from the vetted record alone.
 fn check_archive_directory(
     file: &mut dyn ReadSeek,
     limits: &NupkgLimits,
 ) -> Result<u64, NupkgError> {
     let len = file.seek(SeekFrom::End(0))?;
     let trailer = ZIP_TRAILER_WINDOW.min(len);
-    let mut found_eocd = false;
-    let mut max_directory: u64 = 0;
-    for pos in find_signatures(file, len - trailer, len, &EOCD_SIG)? {
-        found_eocd = true;
-        max_directory = max_directory.max(check_eocd_candidate(file, pos, len, limits)?);
+    let mut chosen = None;
+    for pos in find_signatures(file, len - trailer, len, &EOCD_SIG)?
+        .into_iter()
+        .rev()
+    {
+        if pos + EOCD_LEN > len {
+            continue;
+        }
+        let rec = read_at(file, pos, EOCD_LEN as usize)?;
+        let comment = u64::from(le_u16(&rec, 20));
+        if pos + EOCD_LEN + comment <= len {
+            chosen = Some(pos);
+            break;
+        }
     }
-    if !found_eocd {
+    let Some(pos) = chosen else {
         return Err(NupkgError::InvalidZip(
             "no end-of-central-directory record near the end of the archive".into(),
         ));
-    }
-    for pos in find_signatures(file, len - trailer, len, &ZIP64_EOCD_SIG)? {
-        max_directory = max_directory.max(check_zip64_record(file, pos, len, limits)?);
-    }
-
-    // The zip reader may walk back past the trailer only as far as the read
-    // budget allows; vet every candidate in that extra stretch as well.
+    };
+    let directory = check_eocd_candidate(file, pos, len, limits)?;
     let budget = trailer
-        .saturating_add(max_directory)
+        .saturating_add(directory)
         .saturating_add(ZIP_READ_SLACK);
-    let reach = budget.min(len);
-    if reach > trailer {
-        for pos in find_signatures(file, len - reach, len - trailer, &EOCD_SIG)? {
-            check_eocd_candidate(file, pos, len, limits)?;
-        }
-        for pos in find_signatures(file, len - reach, len - trailer, &ZIP64_EOCD_SIG)? {
-            check_zip64_record(file, pos, len, limits)?;
-        }
-    }
     file.seek(SeekFrom::Start(0))?;
     Ok(budget)
 }
@@ -432,9 +430,8 @@ fn check_archive_directory(
 ///
 /// Mirrors how the zip reader interprets the record: when a field holds the
 /// ZIP64 marker (`0xFFFF…`) and a ZIP64 locator precedes the record, only the
-/// ZIP64 record's counts are used (the one at the locator's offset is checked
-/// here; one found elsewhere is covered by the signature scan), otherwise the
-/// 32-bit counts are.
+/// ZIP64 record's counts are used (the one at the locator's offset), otherwise
+/// the 32-bit counts are.
 fn check_eocd_candidate(
     file: &mut dyn ReadSeek,
     pos: u64,
@@ -1165,6 +1162,34 @@ mod tests {
             err.to_string().contains("1000000 entries exceeds max"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn signature_lookalikes_in_entry_data_are_not_vetted() {
+        // Stored (uncompressed) payload bytes that happen to contain EOCD and
+        // ZIP64-record signatures with absurd counts, inside the trailing
+        // window. The zip reader uses the real EOCD at the end, so must we.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&EOCD_SIG);
+        payload.extend_from_slice(&[0xFF; 18]);
+        payload.extend_from_slice(&ZIP64_EOCD_SIG);
+        payload.extend_from_slice(&[0xFF; 52]);
+        payload.extend(std::iter::repeat_n(7u8, 1024));
+        let zip = {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zw.start_file("p.nuspec", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(OK_NUSPEC.as_bytes()).unwrap();
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("lib/payload.bin", stored).unwrap();
+            zw.write_all(&payload).unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        assert!(zip.windows(4).filter(|w| *w == EOCD_SIG).count() >= 2);
+        let parsed = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap();
+        assert_eq!(parsed.id, "a.b");
     }
 
     #[test]
