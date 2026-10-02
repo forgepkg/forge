@@ -238,7 +238,9 @@ impl SearchQuery {
     pub fn parse(q: &str) -> Self {
         let mut out = SearchQuery::default();
         for token in q.split_whitespace() {
-            let token = token.trim_matches('"').to_ascii_lowercase();
+            // Full Unicode lowercasing, like the format's `lower_id`: stored
+            // ids are lowercased that way, so `Ünicode` must find `ünicode.lib`.
+            let token = token.trim_matches('"').to_lowercase();
             if token.is_empty() {
                 continue;
             }
@@ -659,5 +661,11 @@ mod search_query_tests {
         assert!(SearchQuery::parse("").matches("anything"));
         assert_eq!(SearchQuery::parse("a bcd").prefilter(), Some("bcd"));
         assert_eq!(SearchQuery::parse("packageid:x.y").prefilter(), Some("x.y"));
+    }
+
+    #[test]
+    fn lowercases_non_ascii_terms_like_stored_ids() {
+        assert!(SearchQuery::parse("Ünicode").matches("ünicode.lib"));
+        assert!(SearchQuery::parse("PackageId:Ünicode.Lib").matches("ünicode.lib"));
     }
 }
