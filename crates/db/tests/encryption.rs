@@ -764,15 +764,53 @@ async fn upstream_password_end_to_end() {
     .execute(&pool)
     .await
     .unwrap();
+    // A row whose envelope is stale (the password was changed while
+    // encryption was off) and one whose envelope does not decrypt: in both
+    // the plaintext is the copy to keep, so it is sealed afresh.
+    let mut stale = NewRepository::proxy("crypt-stale");
+    stale.upstream_password = Some("new-pw".to_string());
+    let stale = repository_dao::insert_repository(&pool, stale)
+        .await
+        .unwrap();
+    let stale_blob = envelope
+        .seal(
+            &secret("old-pw"),
+            forge_crypto::envelope::AeadBinding {
+                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
+                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
+                row_pk: stale.id,
+            },
+        )
+        .await
+        .unwrap();
+    let mut broken = NewRepository::proxy("crypt-broken");
+    broken.upstream_password = Some("broken-pw".to_string());
+    let broken = repository_dao::insert_repository(&pool, broken)
+        .await
+        .unwrap();
+    for (id, blob) in [
+        (stale.id, stale_blob),
+        (broken.id, b"not an envelope".to_vec()),
+    ] {
+        sqlx::query!(
+            r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
+            id,
+            &blob
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     assert!(secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
 
-    // One pass seals the plaintext-only row and clears the leftover copy.
+    // One pass seals the plaintext-only row, clears the verified leftover
+    // copy and re-seals the stale and the undecryptable rows.
     let done = secret_dao::backfill_upstream_passwords(&pool, &envelope, 100)
         .await
         .expect("backfill");
-    assert_eq!(done, 2);
+    assert_eq!(done, 4);
     // Every plaintext copy is gone, not just the un-sealed ones.
     assert!(!secret_dao::plaintext_passwords_pending(&pool)
         .await
@@ -795,7 +833,12 @@ async fn upstream_password_end_to_end() {
         0
     );
     // The original plaintexts survive the round trip, now only as envelopes.
-    for (id, expected) in [(legacy.id, "legacy-pw"), (leftover.id, "leftover-pw")] {
+    for (id, expected) in [
+        (legacy.id, "legacy-pw"),
+        (leftover.id, "leftover-pw"),
+        (stale.id, "new-pw"),
+        (broken.id, "broken-pw"),
+    ] {
         let got = secret_dao::get_upstream_password(&pool, &envelope, id)
             .await
             .unwrap()
@@ -829,8 +872,8 @@ async fn upstream_password_end_to_end() {
         }
     }
     assert_eq!(
-        resealed, 3,
-        "repo1 + legacy + leftover re-encrypted under the new DEK"
+        resealed, 5,
+        "repo1 + legacy + leftover + stale + broken re-encrypted under the new DEK"
     );
 
     // Everything still decrypts and now references the active DEK.

@@ -217,23 +217,81 @@ pub async fn backfill_upstream_passwords(
     envelope: &EnvelopeService,
     batch: i64,
 ) -> Result<usize, SecretDbError> {
-    let cleared = sqlx::query!(
+    // Rows that carry both copies (left by builds that kept the plaintext
+    // after sealing it). The plaintext is dropped only once the ciphertext is
+    // known to hold the same password; when it holds another one, or does
+    // not decrypt at all, the plaintext is the newer (or the only
+    // recoverable) copy, so it is sealed afresh and replaces the ciphertext.
+    let both = sqlx::query!(
         r#"
-        UPDATE repository
-        SET upstream_password = NULL
-        WHERE id IN (
-            SELECT id FROM repository
-            WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL
-            ORDER BY id
-            LIMIT $1
-        )
-          AND upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL
+        SELECT id,
+               upstream_password AS "upstream_password!",
+               upstream_password_enc AS "upstream_password_enc!"
+        FROM repository
+        WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL
+        ORDER BY id
+        LIMIT $1
         "#,
         batch,
     )
-    .execute(pool)
-    .await?
-    .rows_affected();
+    .fetch_all(pool)
+    .await?;
+    let mut cleared: u64 = 0;
+    for row in both {
+        let matches = match envelope
+            .open(&row.upstream_password_enc, binding(row.id))
+            .await
+        {
+            Ok(opened) => opened.expose_secret() == row.upstream_password.as_str(),
+            Err(err) => {
+                tracing::warn!(
+                    repository_id = row.id,
+                    error = %err,
+                    "stored upstream password ciphertext does not decrypt; re-sealing it from the plaintext copy"
+                );
+                false
+            }
+        };
+        let res = if matches {
+            sqlx::query!(
+                r#"
+                UPDATE repository SET upstream_password = NULL
+                WHERE id = $1 AND upstream_password = $2 AND upstream_password_enc = $3
+                "#,
+                row.id,
+                row.upstream_password,
+                row.upstream_password_enc,
+            )
+            .execute(pool)
+            .await?
+        } else {
+            let secret = PlaintextSecret::from(row.upstream_password.clone());
+            let blob = envelope.seal(&secret, binding(row.id)).await?;
+            let dek_version = EnvelopeService::blob_dek_version(&blob)?;
+            sqlx::query!(
+                r#"
+                WITH dek AS (
+                    SELECT 1 FROM encryption_key
+                    WHERE layer = 'dek' AND scope = $5 AND version = $6 AND state <> 'revoked'
+                    FOR SHARE
+                )
+                UPDATE repository
+                SET upstream_password_enc = $2, upstream_password = NULL
+                WHERE id = $1 AND upstream_password = $3 AND upstream_password_enc = $4
+                  AND EXISTS (SELECT 1 FROM dek)
+                "#,
+                row.id,
+                &blob,
+                row.upstream_password,
+                row.upstream_password_enc,
+                envelope.scope(),
+                dek_version,
+            )
+            .execute(pool)
+            .await?
+        };
+        cleared += res.rows_affected();
+    }
 
     let rows = sqlx::query!(
         r#"
