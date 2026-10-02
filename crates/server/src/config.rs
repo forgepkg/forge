@@ -85,6 +85,16 @@ pub struct ServerConfig {
     /// `true` only for local development / compose stacks.
     #[serde(default)]
     pub allow_insecure_defaults: bool,
+    /// Extra `Host` names (an optional `:port` is ignored) under which the
+    /// server is legitimately reached, besides the host of
+    /// [`Self::public_base_url`]. Only consulted for the
+    /// `auth.anonymous_mode = "allowlist"` grant: an unauthenticated request
+    /// whose `Host` matches neither is not served anonymously by IP (a
+    /// DNS-rebinding page in an internal user's browser presents its own host
+    /// name). Add the names a reverse proxy rewrites `Host` to, or that
+    /// internal clients use. Default empty.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_max_upload_bytes() -> u64 {
@@ -261,6 +271,13 @@ pub struct AuthConfig {
     /// connection, whatever this is set to. Values below 1 are treated as 1.
     #[serde(default = "default_credential_forward_max_concurrent")]
     pub credential_forward_max_concurrent: usize,
+    /// Most argon2 password verifications (local-password logins and Basic
+    /// password auth) running at once on this instance; each holds ~19 MiB
+    /// and a CPU core. Further attempts queue up to a few seconds, then fail
+    /// as "unavailable" (denied, not counted as a failed password). `0`
+    /// (default) means the number of available CPUs.
+    #[serde(default)]
+    pub password_verify_concurrency: usize,
 }
 
 fn default_credential_forward_max_concurrent() -> usize {

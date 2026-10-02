@@ -81,6 +81,14 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
         public_origin: crate::middleware::principal::origin_of(&state.config.public_base_url()),
+        // DNS-rebinding guard for the IP-allowlist anonymous grant.
+        allowed_hosts: Arc::new(
+            crate::middleware::principal::allowed_hosts(
+                &state.config.public_base_url(),
+                &state.config.server.allowed_hosts,
+            )
+            .map_err(anyhow::Error::msg)?,
+        ),
     })
 }
 

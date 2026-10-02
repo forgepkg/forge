@@ -35,14 +35,16 @@ pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
     StaticChainSource,
 };
-pub use client_ip::{resolve_client_ip, AllowlistParseError, AnonPolicy};
+pub use client_ip::{forwarded_for, resolve_client_ip, AllowlistParseError, AnonPolicy};
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
     UpstreamVerdict, ValidatedCredentialCache, DEFAULT_FORWARD_TIMEOUT,
     DEFAULT_MAX_CONCURRENT_FORWARDS,
 };
-pub use local_password::LocalPasswordProvider;
-pub use login_throttle::LoginThrottle;
+pub use local_password::{LimiterSaturated, LocalPasswordProvider, PasswordHashLimiter};
+pub use login_throttle::{
+    username_for_log, AttemptRefused, LoginAttempt, LoginThrottle, MAX_USERNAME_BYTES,
+};
 pub use principal::{Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};

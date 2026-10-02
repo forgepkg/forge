@@ -34,9 +34,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forge_cache::Cache;
+use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
     AuthProvider, Chain, ChainSource, CredKeyPepper, ForwardLimits, LocalPasswordProvider,
-    UpstreamBasicProvider, ValidatedCredentialCache,
+    PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_crypto::service::EnvelopeService;
@@ -417,6 +418,9 @@ pub struct RealmAuth {
     /// snapshot, so a snapshot rebuild never resets a bound while forwards
     /// started by the previous build are still in flight.
     forward_limits: Arc<ForwardLimits>,
+    /// Bounds concurrent argon2 verifications across every snapshot's local
+    /// provider (`auth.password_verify_concurrency`); outlives rebuilds.
+    password_limiter: Arc<PasswordHashLimiter>,
 }
 
 impl RealmAuth {
@@ -426,6 +430,10 @@ impl RealmAuth {
         let forward_limits = Arc::new(ForwardLimits::new(
             config.auth.credential_forward_max_concurrent,
         ));
+        let password_limiter = Arc::new(PasswordHashLimiter::new(
+            config.auth.password_verify_concurrency,
+            DEFAULT_QUEUE_TIMEOUT,
+        ));
         Self {
             pool,
             cache,
@@ -434,6 +442,7 @@ impl RealmAuth {
             snapshot: tokio::sync::RwLock::new(None),
             envelope: None,
             forward_limits,
+            password_limiter,
         }
     }
 
@@ -490,7 +499,10 @@ impl RealmAuth {
             };
             match realm.kind.as_str() {
                 KIND_LOCAL => {
-                    providers.push(Box::new(LocalPasswordProvider::new(self.pool.clone())));
+                    providers.push(Box::new(LocalPasswordProvider::with_limiter(
+                        self.pool.clone(),
+                        self.password_limiter.clone(),
+                    )));
                 }
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
                     Ok(p) => {

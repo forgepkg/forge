@@ -14,14 +14,17 @@
 mod common;
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use argon2::Argon2;
 use argon2::PasswordHasher;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use forge_core::auth::chain::{Chain, ChainOutcome};
-use forge_core::auth::local_password::LocalPasswordProvider;
+use forge_core::auth::local_password::{LocalPasswordProvider, PasswordHashLimiter};
+use forge_core::auth::login_throttle::{LoginThrottle, MAX_USERNAME_BYTES};
 use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential};
 use forge_core::auth::token::{
     generate_token_secret, hash_token, BasicAuthSource, PrincipalSource, SourceOutcome,
@@ -361,4 +364,244 @@ async fn basic_with_explicit_chain_matches_default() {
         src_off.resolve(&basic_header(&username, "pw"), ip()).await,
         SourceOutcome::Invalid
     );
+}
+
+// ── Hardening: argon2 bound, federated skip, lockout races, username bound ──
+
+/// A limiter whose semaphore has no permits: any argon2 verification gives up
+/// after a short queue timeout, so a test can tell which paths hash at all.
+fn saturated_limiter() -> Arc<PasswordHashLimiter> {
+    Arc::new(PasswordHashLimiter::from_semaphore(
+        Arc::new(tokio::sync::Semaphore::new(0)),
+        Duration::from_millis(50),
+    ))
+}
+
+/// A provider that counts its calls, optionally sleeping first, and answers a
+/// fixed outcome.
+struct CountingProvider {
+    source: AuthSource,
+    outcome: AuthOutcome,
+    delay: Duration,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingProvider {
+    fn new(source: AuthSource, outcome: AuthOutcome, delay: Duration) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                source,
+                outcome,
+                delay,
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for CountingProvider {
+    fn id(&self) -> &str {
+        "counting"
+    }
+    fn source(&self) -> AuthSource {
+        self.source
+    }
+    async fn authenticate(&self, _cred: &PasswordCredential<'_>) -> AuthOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        self.outcome.clone()
+    }
+}
+
+#[tokio::test]
+async fn federated_account_skips_without_argon2_unknown_and_inactive_still_pay() {
+    // M4(a): a federated account (no local hash) is skipped at once — with no
+    // argon2 slot available it still answers Skip — while unknown usernames
+    // and inactive local accounts keep the dummy verification (they need a
+    // slot, so here they come back Unavailable).
+    let pool = common::pool().await;
+    let federated = format!("federated-{}", common::unique());
+    user_dao::insert_user(
+        &pool,
+        NewUser {
+            username: federated.clone(),
+            password_hash: None,
+            is_admin: false,
+            active: true,
+            auth_source: "upstream-basic".to_string(),
+            external_subject: Some(federated.clone()),
+        },
+    )
+    .await
+    .expect("insert federated user");
+    let inactive = insert_local(&pool, "pw", false, false).await;
+    let provider = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter());
+
+    assert_eq!(
+        provider.authenticate(&cred(&federated, "pw")).await,
+        AuthOutcome::Skip
+    );
+    assert_eq!(
+        provider
+            .authenticate(&cred(&format!("ghost-{}", common::unique()), "pw"))
+            .await,
+        AuthOutcome::Unavailable
+    );
+    assert_eq!(
+        provider.authenticate(&cred(&inactive, "pw")).await,
+        AuthOutcome::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
+    // M4(b): with every argon2 slot busy, a local account's correct password
+    // is neither a failure (no lockout) nor forwarded to a later provider.
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", false, true).await;
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![
+        Box::new(LocalPasswordProvider::with_limiter(
+            pool.clone(),
+            saturated_limiter(),
+        )),
+        Box::new(upstream),
+    ]));
+    assert_eq!(
+        chain.authenticate(&cred(&username, "pw")).await,
+        ChainOutcome::Unavailable
+    );
+
+    let throttle = Arc::new(LoginThrottle::new(2, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    for _ in 0..5 {
+        assert_eq!(
+            src.resolve(&basic_header(&username, "pw"), ip()).await,
+            SourceOutcome::Invalid
+        );
+    }
+    assert!(
+        !throttle.is_locked(ip(), &username),
+        "an overload is not a failed password"
+    );
+    assert_eq!(throttle.tracked(), 0);
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "a local account's password never reaches the upstream"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_wrong_passwords_cannot_outrun_the_lockout() {
+    // M4(c): a burst of concurrent guesses used to pass the lockout check
+    // before the first failure was recorded. Attempts are now reserved up
+    // front, so only the budget (3) ever reaches the chain.
+    let pool = common::pool().await;
+    let (provider, calls) = CountingProvider::new(
+        AuthSource::Local,
+        AuthOutcome::Rejected,
+        Duration::from_millis(200),
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(provider)]));
+    let throttle = Arc::new(LoginThrottle::new(3, Duration::from_secs(60)));
+    let src = Arc::new(
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone()),
+    );
+    let username = format!("burst-{}", common::unique());
+    let headers = basic_header(&username, "guess");
+
+    let tasks: Vec<_> = (0..12)
+        .map(|_| {
+            let src = src.clone();
+            let headers = headers.clone();
+            tokio::spawn(async move { src.resolve(&headers, ip()).await })
+        })
+        .collect();
+    for task in tasks {
+        assert_eq!(task.await.unwrap(), SourceOutcome::Invalid);
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "only the lockout budget reaches the chain"
+    );
+    assert!(throttle.is_locked(ip(), &username));
+}
+
+#[tokio::test]
+async fn concurrent_correct_passwords_are_serialized_not_locked_out() {
+    // The reservation must not refuse a client that legitimately sends more
+    // parallel requests than the budget (a NuGet restore over Basic): the
+    // extra attempts wait for a slot and then succeed.
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", false, true).await;
+    let (provider, calls) = CountingProvider::new(
+        AuthSource::Local,
+        AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity::local(username.clone())),
+        Duration::from_millis(100),
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(provider)]));
+    let throttle = Arc::new(LoginThrottle::new(2, Duration::from_secs(60)));
+    let src = Arc::new(
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone()),
+    );
+    let tasks: Vec<_> = (0..6)
+        .map(|_| {
+            let src = src.clone();
+            let headers = basic_header(&username, "pw");
+            tokio::spawn(async move { src.resolve(&headers, ip()).await })
+        })
+        .collect();
+    for task in tasks {
+        assert!(matches!(
+            task.await.unwrap(),
+            SourceOutcome::Authenticated(Principal::User { .. })
+        ));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    assert_eq!(throttle.tracked(), 0, "successes leave nothing behind");
+}
+
+#[tokio::test]
+async fn oversized_basic_username_is_invalid_and_never_tracked() {
+    // B3: an oversized Basic username is refused before the token lookup, the
+    // chain and the lockout map; one at the limit is processed normally.
+    let pool = common::pool().await;
+    let (provider, calls) =
+        CountingProvider::new(AuthSource::Local, AuthOutcome::Rejected, Duration::ZERO);
+    let chain = Arc::new(Chain::new(vec![Box::new(provider)]));
+    let throttle = Arc::new(LoginThrottle::default());
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+
+    let huge = "u".repeat(MAX_USERNAME_BYTES + 1);
+    for _ in 0..3 {
+        assert_eq!(
+            src.resolve(&basic_header(&huge, "pw"), ip()).await,
+            SourceOutcome::Invalid
+        );
+    }
+    assert_eq!(
+        throttle.tracked(),
+        0,
+        "oversized usernames never enter the map"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let at_limit = "u".repeat(MAX_USERNAME_BYTES);
+    assert_eq!(
+        src.resolve(&basic_header(&at_limit, "pw"), ip()).await,
+        SourceOutcome::Invalid
+    );
+    assert_eq!(throttle.tracked(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

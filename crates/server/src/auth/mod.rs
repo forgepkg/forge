@@ -38,7 +38,8 @@ use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
 use forge_cache::Cache;
 use forge_core::auth::chain::{provision_and_map, ChainOutcome};
-use forge_core::auth::client_ip::resolve_client_ip;
+use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip};
+use forge_core::auth::login_throttle::{username_for_log, AttemptRefused, MAX_USERNAME_BYTES};
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
@@ -688,7 +689,9 @@ struct LoginBody {
 /// chain with the same fail-closed semantics, but is **not** gated by
 /// `auth.allow_password_basic` (that flag governs API Basic auth only). The
 /// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
-/// are a uniform 401 (no username-exists oracle).
+/// are a uniform 401 (no username-exists oracle). A username over
+/// [`MAX_USERNAME_BYTES`] is refused the same way before any lookup or lockout
+/// bookkeeping (it is never counted, so it cannot grow the lockout map).
 async fn password_login(
     State(state): State<AppState>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -704,21 +707,36 @@ async fn password_login(
         // whether to even offer the form from /auth/login-options).
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     };
-    if body.username.trim().is_empty() || body.password.is_empty() {
+    if body.username.trim().is_empty()
+        || body.username.len() > MAX_USERNAME_BYTES
+        || body.password.is_empty()
+    {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
 
     let client_ip = login_client_ip(&state, connect, &headers);
-    // Too many recent failures for this (IP, username): refuse before running
-    // the chain (no argon2 work, nothing forwarded upstream).
-    if state.login_throttle.is_locked(client_ip, &body.username) {
-        tracing::warn!(username = %body.username, ip = %client_ip, "password login throttled");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-in attempts; try again later",
-        )
-            .into_response();
-    }
+    // Reserve the attempt against the (IP, username) lockout budget before
+    // running the chain; a locked pair is refused without any provider work
+    // (no argon2, nothing forwarded upstream).
+    let attempt = match state.login_throttle.begin(client_ip, &body.username).await {
+        Ok(attempt) => attempt,
+        Err(refused) => {
+            let username = username_for_log(&body.username);
+            match refused {
+                AttemptRefused::Locked => {
+                    tracing::warn!(%username, ip = %client_ip, "password login throttled");
+                }
+                AttemptRefused::Busy => {
+                    tracing::warn!(%username, ip = %client_ip, "password login: too many concurrent attempts");
+                }
+            }
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed sign-in attempts; try again later",
+            )
+                .into_response();
+        }
+    };
     let cred = PasswordCredential {
         username: &body.username,
         password: &body.password,
@@ -727,15 +745,15 @@ async fn password_login(
     let identity = match chain.authenticate(&cred).await {
         ChainOutcome::Authenticated { identity, .. } => identity,
         // Uniform wire response for rejected / outage / unknown (fail-closed;
-        // upstream health goes to logs, not to the caller). An outage is not
-        // the caller's fault and does not count towards the lockout.
+        // upstream health goes to logs, not to the caller). An outage (or an
+        // argon2 overload) is not the caller's fault and does not count
+        // towards the lockout.
         ChainOutcome::Unavailable => {
+            attempt.released();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
-            state
-                .login_throttle
-                .record_failure(client_ip, &body.username);
+            attempt.failed();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
     };
@@ -743,19 +761,16 @@ async fn password_login(
     let principal = match provision_and_map(&state.pool, &identity).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            state
-                .login_throttle
-                .record_failure(client_ip, &body.username);
+            attempt.failed();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
+            attempt.released();
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
-    state
-        .login_throttle
-        .record_success(client_ip, &body.username);
+    attempt.succeeded();
     if identity.admin_authoritative {
         // The upstream may just have granted/revoked admin: drop the cached
         // effective set so the new session sees it immediately.
@@ -794,8 +809,9 @@ async fn password_login(
         .into_response()
 }
 
-/// Resolve the client IP for the login audit trail: honors `X-Forwarded-For`
-/// behind the configured trusted proxies, mirroring the principal middleware.
+/// Resolve the client IP for the lockout key and the login audit trail: honors
+/// every `X-Forwarded-For` line behind the configured trusted proxies and
+/// canonicalizes IPv4-mapped addresses, mirroring the principal middleware.
 /// Loopback when no connect info is available (in-process router tests).
 fn login_client_ip(
     state: &AppState,
@@ -805,9 +821,9 @@ fn login_client_ip(
     let peer = connect
         .map(|Extension(ci)| ci.0.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let xff = forwarded_for(headers);
     let trusted = state.config.trusted_proxy_cidrs().unwrap_or_default();
-    resolve_client_ip(peer, xff, &trusted)
+    resolve_client_ip(peer, xff.as_deref(), &trusted)
 }
 
 /// `POST /auth/identify` request body.

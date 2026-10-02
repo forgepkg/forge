@@ -19,6 +19,11 @@ allow_insecure_defaults = true  # (default: false)
 # Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
 # (never buffered in memory); larger pushes get HTTP 413.
 max_upload_bytes = 536870912    # (default: 512 MiB)
+# Host names (port ignored) clients reach this server under besides the host of
+# public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
+# anonymous_mode = "allowlist": a request naming any other host is not served
+# anonymously by IP (DNS-rebinding guard).
+allowed_hosts = []              # (default: [])
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
@@ -50,6 +55,10 @@ allow_password_basic = false    # (default: false)
 # password auth; 0 disables.
 login_max_failures = 10             # (default: 10)
 login_failure_window_seconds = 300  # (default: 300)
+# Most argon2 password verifications running at once (~19 MiB and a core each);
+# more queue for a few seconds, then fail as unavailable (not counted as a
+# failed password). 0 = the number of available CPUs.
+password_verify_concurrency = 0     # (default: 0)
 # 12.7 login UX: "identifier_first" (ask username, then route to a password
 # prompt or an OIDC redirect) or "combined" (always show username+password +
 # a button per enabled OIDC realm).

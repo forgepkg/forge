@@ -31,6 +31,18 @@
 //! with **403** before authentication — this covers Basic credentials a
 //! browser cached from the `/v3` login prompt, which the token cannot.
 //!
+//! ## Client IP and DNS rebinding
+//! The client IP is resolved from the socket peer and **every**
+//! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
+//! addresses canonicalized ([`forge_core::auth::client_ip`]). The IP-allowlist
+//! anonymous grant (`anonymous_mode = "allowlist"`) additionally requires the
+//! request's `Host` to name this server (the host of `server.public_base_url`
+//! or an entry of `server.allowed_hosts`): a DNS-rebinding page in an internal
+//! user's browser reaches the server from an allowlisted IP but under its own
+//! host name, and such a request is treated as unauthenticated instead.
+//! Requests with credentials, and handlers that ignore the principal (health
+//! probes), do not depend on the host.
+//!
 //! ## Stale session cookies
 //! A session cookie that no longer names a live session is treated as absent
 //! (anonymous policy applies) and cleared on the response, so an expired
@@ -43,7 +55,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::client_ip::{resolve_client_ip, AnonPolicy};
+use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip, AnonPolicy};
 use forge_core::auth::principal::Principal;
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{resolve_principal_with_origin, AuthError, PrincipalSource};
@@ -79,6 +91,52 @@ pub struct PrincipalLayer {
     /// The deployment's own origin (`scheme://host[:port]` of
     /// `server.public_base_url`), accepted as a same-origin `Origin` header.
     pub public_origin: Option<String>,
+    /// Normalized host names ([`allowed_hosts`]) a request's `Host` must name
+    /// for the IP-allowlist anonymous grant to apply (DNS-rebinding guard).
+    pub allowed_hosts: Arc<Vec<String>>,
+}
+
+/// The lowercase host of an authority (`host[:port]`, IPv6 in brackets),
+/// without port or trailing dot; `None` if it does not parse.
+fn normalize_host(authority: &str) -> Option<String> {
+    let authority: http::uri::Authority = authority.trim().parse().ok()?;
+    let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// The host names a request may address for the IP-allowlist anonymous grant:
+/// the host of `public_base_url` plus each `extra` entry (`host` or
+/// `host:port`; the port is ignored — a rebinding page cannot present this
+/// server's host name, whatever the port). An unparsable entry is an error.
+pub fn allowed_hosts(public_base_url: &str, extra: &[String]) -> Result<Vec<String>, String> {
+    let mut hosts = Vec::with_capacity(extra.len() + 1);
+    if let Some(host) = url::Url::parse(public_base_url)
+        .ok()
+        .and_then(|u| u.host_str().and_then(normalize_host))
+    {
+        hosts.push(host);
+    }
+    for entry in extra {
+        match normalize_host(entry) {
+            Some(host) => hosts.push(host),
+            None => return Err(format!("invalid server.allowed_hosts entry {entry:?}")),
+        }
+    }
+    Ok(hosts)
+}
+
+/// Whether the request addresses one of `allowed` (its `Host` header, or the
+/// URI authority of an HTTP/2 request). A missing or unparsable host never
+/// matches.
+fn host_is_allowed<B>(req: &Request<B>, allowed: &[String]) -> bool {
+    let host = match req.headers().get(header::HOST) {
+        Some(value) => value.to_str().ok().and_then(normalize_host),
+        None => req
+            .uri()
+            .authority()
+            .and_then(|a| normalize_host(a.as_str())),
+    };
+    host.is_some_and(|host| allowed.contains(&host))
 }
 
 /// Refuse a state-changing request a **browser** marked as cross-site.
@@ -168,18 +226,20 @@ pub async fn attach_principal(
         return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
     }
 
-    let xff = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-
+    let xff = forwarded_for(req.headers());
     let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
 
+    // DNS-rebinding guard: the IP-allowlist grant applies only to requests
+    // addressing this server by one of its own host names.
+    let anon = match &*layer.anon {
+        AnonPolicy::Allowlist(_) if !host_is_allowed(&req, &layer.allowed_hosts) => {
+            &AnonPolicy::Off
+        }
+        policy => policy,
+    };
+
     let resolved =
-        match resolve_principal_with_origin(&layer.sources, req.headers(), client_ip, &layer.anon)
-            .await
-        {
+        match resolve_principal_with_origin(&layer.sources, req.headers(), client_ip, anon).await {
             Ok(r) => r,
             Err(AuthError::Unauthorized) => {
                 return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
@@ -299,6 +359,9 @@ mod tests {
             sessions: None,
             cookie_secure: false,
             public_origin: Some("https://forge.example".into()),
+            allowed_hosts: Arc::new(
+                allowed_hosts("https://forge.example", &["forge.internal".into()]).unwrap(),
+            ),
         }
     }
 
@@ -555,6 +618,162 @@ mod tests {
             Some("http://localhost:8421")
         );
         assert_eq!(origin_of("not a url"), None);
+    }
+
+    #[test]
+    fn allowed_hosts_normalize_case_port_and_trailing_dot() {
+        assert_eq!(
+            allowed_hosts(
+                "https://Forge.Example:8443/base",
+                &[
+                    "forge.internal:8421".into(),
+                    "[::1]".into(),
+                    "Mirror.Local.".into()
+                ]
+            )
+            .unwrap(),
+            vec!["forge.example", "forge.internal", "[::1]", "mirror.local"]
+        );
+        assert!(allowed_hosts("https://forge.example", &["a/b c".into()]).is_err());
+        assert_eq!(normalize_host("[::1]:8421").as_deref(), Some("[::1]"));
+    }
+
+    #[tokio::test]
+    async fn ip_allowlist_anonymous_requires_a_known_host() {
+        // L7 (DNS rebinding): an allowlisted peer (loopback here) that names a
+        // foreign host is not served anonymously; this server's own names are.
+        let anon = AnonPolicy::allowlist_from_tokens(["loopback"]).unwrap();
+        let app = app(layer(
+            vec![Box::new(StubSource {
+                outcome: SourceOutcome::NoCredentials,
+                require_header: true,
+            })],
+            anon,
+        ));
+        let principal_for = |host: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut b = Request::builder().uri("/");
+                if let Some(host) = host {
+                    b = b.header(header::HOST, host);
+                }
+                body_string(app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap()).await
+            }
+        };
+        for host in ["forge.example", "FORGE.example:443", "forge.internal:8421"] {
+            assert_eq!(principal_for(Some(host)).await, "anonymous", "{host}");
+        }
+        for host in [
+            Some("rebind.attacker.example"),
+            Some("forge.example.evil"),
+            None,
+        ] {
+            assert_eq!(principal_for(host).await, "unauthenticated", "{host:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_host_does_not_affect_other_policies_or_credentials() {
+        // `all` grants regardless of host; credentials never depend on it.
+        let anon_all = app(layer(
+            vec![Box::new(StubSource {
+                outcome: SourceOutcome::NoCredentials,
+                require_header: true,
+            })],
+            AnonPolicy::All,
+        ));
+        let resp = anon_all
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "rebind.attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "anonymous");
+
+        let authed = app(layer(
+            vec![Box::new(StubSource {
+                outcome: SourceOutcome::Authenticated(Principal::User {
+                    user_id: 1,
+                    token_id: Some(2),
+                    is_admin: false,
+                }),
+                require_header: true,
+            })],
+            AnonPolicy::allowlist_from_tokens(["loopback"]).unwrap(),
+        ));
+        let resp = authed
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "rebind.attacker.example")
+                    .header(AUTHORIZATION, "Basic x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "user:false");
+    }
+
+    /// Echoes the resolved principal's IP (anonymous) for the XFF tests.
+    fn ip_app(layer: PrincipalLayer) -> Router {
+        async fn echo_ip(req: Request<Body>) -> Response {
+            match principal_of(&req) {
+                Principal::Anonymous { ip } => ip.to_string(),
+                _ => "unauthenticated".to_string(),
+            }
+            .into_response()
+        }
+        Router::new()
+            .route("/", get(echo_ip))
+            .layer(axum::middleware::from_fn_with_state(
+                layer.clone(),
+                attach_principal,
+            ))
+            .with_state(layer)
+    }
+
+    #[tokio::test]
+    async fn every_xff_line_is_walked_and_mapped_peers_are_canonical() {
+        // M12: the client's own XFF line comes first; the trusted proxy (the
+        // loopback peer here) appends the real client as a second line.
+        let mut l = layer(
+            vec![Box::new(StubSource {
+                outcome: SourceOutcome::NoCredentials,
+                require_header: true,
+            })],
+            AnonPolicy::All,
+        );
+        l.trusted_proxies = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
+        let resp = ip_app(l.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-forwarded-for", "192.0.2.1")
+                    .header("x-forwarded-for", "198.51.100.7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "198.51.100.7");
+
+        // An IPv4-mapped trusted peer is recognized as the IPv4 proxy.
+        let mut req = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "::ffff:198.51.100.8")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            40000,
+        )));
+        let resp = ip_app(l).oneshot(req).await.unwrap();
+        assert_eq!(body_string(resp).await, "198.51.100.8");
     }
 
     async fn body_string(resp: Response) -> String {
