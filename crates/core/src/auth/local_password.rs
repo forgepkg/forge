@@ -169,6 +169,9 @@ impl PasswordHashLimiter {
 pub struct LocalPasswordProvider {
     pool: PgPool,
     limiter: Arc<PasswordHashLimiter>,
+    /// A credential-forwarding provider follows this one in the chain; see
+    /// [`Self::forwarding_follows`].
+    forwarding_follows: bool,
 }
 
 impl LocalPasswordProvider {
@@ -184,7 +187,34 @@ impl LocalPasswordProvider {
     /// Build the provider with an explicit verification limiter (the server
     /// shares one configured limiter across every realm-built provider).
     pub fn with_limiter(pool: PgPool, limiter: Arc<PasswordHashLimiter>) -> Self {
-        Self { pool, limiter }
+        Self {
+            pool,
+            limiter,
+            forwarding_follows: false,
+        }
+    }
+
+    /// Declare that a credential-forwarding provider follows this one in the
+    /// chain. Names that are not local password accounts — unknown ones and
+    /// federated accounts without a local hash — are then skipped at once,
+    /// with no dummy argon2: both are forwarded upstream next, so they cost
+    /// the same and stay indistinguishable from each other, while a local
+    /// account is told apart anyway (it is never forwarded). In a local-only
+    /// chain both pay the dummy verification instead, so no name's kind
+    /// shows in the response time.
+    pub fn forwarding_follows(mut self, yes: bool) -> Self {
+        self.forwarding_follows = yes;
+        self
+    }
+
+    /// `Skip` for a name that is not a local password account: at once when
+    /// forwarding follows, after a dummy verification otherwise.
+    async fn skip_foreign(&self, candidate: &str) -> AuthOutcome {
+        if self.forwarding_follows {
+            AuthOutcome::Skip
+        } else {
+            self.skip_after_dummy_verify(candidate).await
+        }
     }
 
     /// Burn one argon2 verification on the dummy hash, then report `Skip`: the
@@ -226,23 +256,21 @@ impl AuthProvider for LocalPasswordProvider {
         AuthSource::Local
     }
 
-    /// One deliberate timing difference: a **federated** account (an
-    /// `app_user` without a local `password_hash`, provisioned by
-    /// `upstream-basic` or `oidc`) skips at once, without the dummy argon2.
+    /// Timing: when a credential-forwarding provider follows (see
+    /// [`Self::forwarding_follows`]), unknown usernames and **federated**
+    /// accounts (an `app_user` without a local `password_hash`) skip at once.
     /// NuGet sends Basic credentials on every request, and for a
     /// credential-forwarded user the forwarding provider behind this one
     /// answers from its verdict cache; a dummy hash in front of it would make
-    /// every such request cost a full argon2 verification. The price is that
-    /// response timing can reveal "this username is a federated account".
-    /// Unknown usernames and inactive local accounts still pay the dummy
-    /// verification, so local password accounts stay indistinguishable from
-    /// names that do not exist.
+    /// every such request cost a full argon2 verification. In a local-only
+    /// chain both pay the dummy verification. Inactive local accounts always
+    /// do, so in no chain does the response time single out a kind of name.
     async fn authenticate(&self, cred: &PasswordCredential<'_>) -> AuthOutcome {
         let user = match forge_db::user_dao::find_user_by_username(&self.pool, cred.username).await
         {
             Ok(Some(u)) => u,
             // Unknown user → not ours; a later provider may own this username.
-            Ok(None) => return self.skip_after_dummy_verify(cred.password).await,
+            Ok(None) => return self.skip_foreign(cred.password).await,
             Err(e) => {
                 // A DB error is an infrastructure failure: fail closed, never
                 // grant — but let the chain decide the wire verdict.
@@ -253,9 +281,8 @@ impl AuthProvider for LocalPasswordProvider {
 
         // Users with no local password (auth_source upstream-basic / oidc) can
         // never authenticate via the local store — this username is not ours.
-        // No dummy verification (see the trade-off above).
         let Some(stored) = user.password_hash.clone() else {
-            return AuthOutcome::Skip;
+            return self.skip_foreign(cred.password).await;
         };
 
         // Inactive users never authenticate locally. Slice 1 returned `None`

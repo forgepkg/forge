@@ -417,11 +417,13 @@ impl AuthProvider for CountingProvider {
 }
 
 #[tokio::test]
-async fn federated_account_skips_without_argon2_unknown_and_inactive_still_pay() {
-    // M4(a): a federated account (no local hash) is skipped at once — with no
-    // argon2 slot available it still answers Skip — while unknown usernames
-    // and inactive local accounts keep the dummy verification (they need a
-    // slot, so here they come back Unavailable).
+async fn foreign_names_cost_the_same_as_each_other() {
+    // M4(a) + review: names the local store does not own — unknown usernames
+    // and federated accounts (no local hash) — are treated alike. Ahead of a
+    // credential-forwarding provider both skip at once (no argon2 slot
+    // needed, so even a saturated limiter answers Skip); in a local-only
+    // chain both pay the dummy verification (they need a slot, so here they
+    // come back Unavailable). Inactive local accounts always pay it.
     let pool = common::pool().await;
     let federated = format!("federated-{}", common::unique());
     user_dao::insert_user(
@@ -438,22 +440,30 @@ async fn federated_account_skips_without_argon2_unknown_and_inactive_still_pay()
     .await
     .expect("insert federated user");
     let inactive = insert_local(&pool, "pw", false, false).await;
-    let provider = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter());
+    let ghost = format!("ghost-{}", common::unique());
 
+    let forwarding = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter())
+        .forwarding_follows(true);
+    for name in [&federated, &ghost] {
+        assert_eq!(
+            forwarding.authenticate(&cred(name, "pw")).await,
+            AuthOutcome::Skip,
+            "{name}"
+        );
+    }
     assert_eq!(
-        provider.authenticate(&cred(&federated, "pw")).await,
-        AuthOutcome::Skip
-    );
-    assert_eq!(
-        provider
-            .authenticate(&cred(&format!("ghost-{}", common::unique()), "pw"))
-            .await,
+        forwarding.authenticate(&cred(&inactive, "pw")).await,
         AuthOutcome::Unavailable
     );
-    assert_eq!(
-        provider.authenticate(&cred(&inactive, "pw")).await,
-        AuthOutcome::Unavailable
-    );
+
+    let local_only = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter());
+    for name in [&federated, &ghost, &inactive] {
+        assert_eq!(
+            local_only.authenticate(&cred(name, "pw")).await,
+            AuthOutcome::Unavailable,
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]

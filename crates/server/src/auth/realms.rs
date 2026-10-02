@@ -487,6 +487,15 @@ impl RealmAuth {
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
 
+        // Does an enabled credential-forwarding realm come after the local one?
+        // Then names the local store does not own go upstream next, and the
+        // local provider need not equalize their timing with a dummy hash.
+        let enabled: Vec<&_> = realms.iter().filter(|r| r.enabled).collect();
+        let forwarding_follows_local = enabled
+            .iter()
+            .position(|r| r.kind == KIND_LOCAL)
+            .is_some_and(|i| enabled[i + 1..].iter().any(|r| r.kind == KIND_CRED_FORWARD));
+
         for realm in realms.iter().filter(|r| r.enabled) {
             // The logical config (encrypted secrets merged in). A realm whose
             // secrets cannot be decrypted is skipped: fail closed.
@@ -499,10 +508,13 @@ impl RealmAuth {
             };
             match realm.kind.as_str() {
                 KIND_LOCAL => {
-                    providers.push(Box::new(LocalPasswordProvider::with_limiter(
-                        self.pool.clone(),
-                        self.password_limiter.clone(),
-                    )));
+                    providers.push(Box::new(
+                        LocalPasswordProvider::with_limiter(
+                            self.pool.clone(),
+                            self.password_limiter.clone(),
+                        )
+                        .forwarding_follows(forwarding_follows_local),
+                    ));
                 }
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
                     Ok(p) => {
