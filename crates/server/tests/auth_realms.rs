@@ -231,6 +231,49 @@ async fn oversized_login_username_is_refused_without_growing_the_lockout_map() {
     assert_eq!(srv.state.login_throttle.tracked(), 1);
 }
 
+/// A locked (IP, username) pair is a 429 whose `Retry-After` is the failure
+/// window, so the sign-in page can say how long to wait.
+#[tokio::test]
+async fn login_lockout_is_429_with_retry_after() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let login = format!("{}/auth/login", srv.base_url);
+    let username = format!("ghost{}", common::unique());
+
+    let max = srv.state.config.auth.login_max_failures;
+    for _ in 0..max {
+        let resp = client
+            .post(&login)
+            .json(&json!({ "username": username, "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    let resp = client
+        .post(&login)
+        .json(&json!({ "username": username, "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After on a lockout")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        retry_after,
+        srv.state
+            .config
+            .auth
+            .login_failure_window_seconds
+            .to_string()
+    );
+}
+
 /// `/admin/realms` CRUD: the seeded local realm is listed and protected,
 /// secrets are write-only (redacted to `<key>_set` markers), invalid configs
 /// are 400, and reorder demands the complete id set.

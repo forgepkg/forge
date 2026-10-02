@@ -722,16 +722,22 @@ async fn password_login(
         Ok(attempt) => attempt,
         Err(refused) => {
             let username = username_for_log(&body.username);
-            match refused {
+            // `Retry-After` (seconds) lets the UI say how long to wait: a
+            // locked pair clears within one failure window (an upper bound),
+            // a pair saturated by in-flight attempts within moments.
+            let retry_after = match refused {
                 AttemptRefused::Locked => {
                     tracing::warn!(%username, ip = %client_ip, "password login throttled");
+                    state.config.auth.login_failure_window_seconds.max(1)
                 }
                 AttemptRefused::Busy => {
                     tracing::warn!(%username, ip = %client_ip, "password login: too many concurrent attempts");
+                    1
                 }
-            }
+            };
             return (
                 StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
                 "too many failed sign-in attempts; try again later",
             )
                 .into_response();
