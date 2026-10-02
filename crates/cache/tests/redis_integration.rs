@@ -8,6 +8,11 @@
 //!   * `invalidate` on instance A drives instance B to drop its L1 entry, via
 //!     the pub/sub backplane (polled until processed, with a timeout).
 //!
+//! No test sleeps "until the subscriber is up": `Cache::with_redis*` returns
+//! only once its backplane subscription is live (bounded by the Redis
+//! timeouts, which [`connect`] sets generously so a loaded CI box cannot hit
+//! the bound), and a subscription that comes up late flushes L1.
+//!
 //! Docker was available in the authoring environment, so this test is NOT
 //! `#[ignore]`d. It does require Docker at run time; if Docker is absent the
 //! container start panics with a clear message (the unit tests in `l1_unit.rs`
@@ -17,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use forge_cache::Cache;
+use forge_cache::{Cache, RedisTimeouts};
 use redis::AsyncCommands;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -77,16 +82,33 @@ async fn redis_url() -> String {
     REDIS_URL.get().unwrap().clone()
 }
 
+/// A Redis-backed cache whose construction waits for its backplane
+/// subscription; the timeouts (and so that bounded wait) are generous so the
+/// tests do not depend on how loaded the machine is.
+async fn connect(url: &str) -> Cache {
+    Cache::with_redis_timeouts(
+        1000,
+        url,
+        RedisTimeouts {
+            connect: Duration::from_secs(10),
+            response: Duration::from_secs(10),
+        },
+    )
+    .await
+    .expect("cache connects to redis")
+}
+
+/// How long a test waits for a backplane message to be applied.
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l2_sharing_and_backplane_invalidation() {
     let url = redis_url().await;
 
-    let a = Cache::with_redis(1000, &url)
-        .await
-        .expect("instance A connects to redis");
-    let b = Cache::with_redis(1000, &url)
-        .await
-        .expect("instance B connects to redis");
+    // Both instances are subscribed when construction returns (review L1):
+    // no sleep, no race with A's invalidation below.
+    let a = connect(&url).await;
+    let b = connect(&url).await;
 
     let a_calls = Arc::new(AtomicUsize::new(0));
     let b_calls = Arc::new(AtomicUsize::new(0));
@@ -155,7 +177,7 @@ async fn l2_sharing_and_backplane_invalidation() {
     a.invalidate("pkg", "Newtonsoft.Json").await;
 
     // Poll until B has observed the tag barrier and re-runs its factory.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let b_calls_probe = b_calls.clone();
         let probe = b
@@ -190,10 +212,8 @@ async fn l2_sharing_and_backplane_invalidation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
     let url = redis_url().await;
-    let a = Cache::with_redis(1000, &url).await.unwrap();
-    let b = Cache::with_redis(1000, &url).await.unwrap();
-    // Let both detached subscribers finish subscribing before publishing.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
 
     let factory_started = Arc::new(tokio::sync::Notify::new());
     let release_factory = Arc::new(tokio::sync::Notify::new());
@@ -224,7 +244,7 @@ async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
     release_factory.notify_one();
     assert_eq!(fill.await.unwrap(), "STALE-FILL");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let probe = b
             .get_or_try_insert_with::<String, _, _, TestError>(
@@ -248,10 +268,9 @@ async fn remote_namespace_invalidation_clears_an_inflight_l2_fill() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tag_generation_prevents_three_node_stale_l2_relay() {
     let url = redis_url().await;
-    let a = Cache::with_redis(1000, &url).await.unwrap();
-    let b = Cache::with_redis(1000, &url).await.unwrap();
-    let c = Cache::with_redis(1000, &url).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let c = connect(&url).await;
 
     // Keep C's namespace read fence occupied even after the stale relay fill
     // completes. In the former delete/re-delete design this held C's subscriber
@@ -391,8 +410,7 @@ async fn tag_generation_keys_carry_a_ttl() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
     let url = redis_url().await;
-    let cache = Cache::with_redis(1000, &url).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cache = connect(&url).await;
 
     let old: String = cache
         .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
@@ -411,7 +429,7 @@ async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
         .await
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let value = cache
             .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
