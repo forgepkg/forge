@@ -335,6 +335,19 @@ fn spawn_reconciler(
                     Err(e) => tracing::error!(error = %e, "blob_outbox prune failed"),
                 }
             }
+            // Proxy versions only ever requested, never listed or served
+            // upstream, once their negative-cache window has lapsed.
+            match forge_db::proxy_dao::prune_unconfirmed(
+                &pool,
+                forge_core::repo::proxy::DEFAULT_NOT_FOUND_TTL_SECONDS,
+                1000,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(pruned = n, "pruned unconfirmed proxy versions"),
+                Err(e) => tracing::error!(error = %e, "proxy version prune failed"),
+            }
         }
     })
 }

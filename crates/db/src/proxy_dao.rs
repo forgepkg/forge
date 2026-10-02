@@ -121,6 +121,48 @@ pub async fn insert_unconfirmed_cached_version(
     Ok(())
 }
 
+/// Delete up to `limit` cached-version rows that neither an upstream listing
+/// nor a successful download ever confirmed — rows a download attempt created
+/// for a version the upstream never served — once their repository's
+/// negative-cache window (`not_found_ttl_seconds`, else `default_ttl_seconds`)
+/// has lapsed. Any reader can create such a row by requesting an arbitrary
+/// version, so without this they would accumulate forever. Returns how many
+/// rows were removed.
+///
+/// The `confirmed`/`downloaded` conditions are repeated on the outer `DELETE`
+/// so a row a concurrent download confirms meanwhile is re-checked after its
+/// lock is released and kept.
+pub async fn prune_unconfirmed(
+    pool: &PgPool,
+    default_ttl_seconds: i64,
+    limit: i64,
+) -> sqlx::Result<u64> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM proxy_cached_version
+        WHERE id = ANY(ARRAY(
+                SELECT v.id
+                FROM proxy_cached_version v
+                JOIN repository r ON r.id = v.repository_id
+                WHERE NOT v.confirmed
+                  AND NOT v.downloaded
+                  AND COALESCE(v.not_found_at, v.first_seen_at)
+                      < now() - make_interval(
+                            secs => COALESCE(r.not_found_ttl_seconds::bigint, $1::bigint)::double precision
+                        )
+                LIMIT $2
+            ))
+          AND NOT confirmed
+          AND NOT downloaded
+        "#,
+        default_ttl_seconds,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Finalize a successful download of the row `id` inside the caller's
 /// transaction: mark it downloaded, clear any not-found marker and confirm it.
 /// A row confirmed only now (it was created by the download singleflight)

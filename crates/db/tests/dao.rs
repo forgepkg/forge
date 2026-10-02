@@ -1230,6 +1230,51 @@ async fn proxy_repo(pool: &sqlx::PgPool, suffix: u64) -> i64 {
         .id
 }
 
+/// Rows only a download attempt created (never listed or served upstream)
+/// are pruned once the repository's negative-cache window lapsed; confirmed
+/// and recent rows are kept.
+#[tokio::test]
+async fn proxy_prune_unconfirmed_drops_only_expired_unconfirmed_rows() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+    let name = format!("pkg-{n}");
+
+    for v in ["9.0.0", "9.0.1"] {
+        proxy_dao::insert_unconfirmed_cached_version(pool, repo_id, &name, v)
+            .await
+            .unwrap();
+    }
+    proxy_dao::upsert_cached_versions(pool, repo_id, &name, &["1.0.0".to_string()])
+        .await
+        .unwrap();
+    // 9.0.0 and the confirmed 1.0.0 were first seen long ago; 9.0.1 just now.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '1 day' \
+         WHERE repository_id = $1 AND version IN ('9.0.0', '1.0.0')",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // A large batch so rows of other tests in the shared database cannot
+    // crowd this repository's row out of the batch.
+    proxy_dao::prune_unconfirmed(pool, 600, 1_000_000)
+        .await
+        .unwrap();
+
+    let mut left: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM proxy_cached_version WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    left.sort();
+    assert_eq!(left, ["1.0.0", "9.0.1"]);
+}
+
 #[tokio::test]
 async fn proxy_upsert_cached_version_insert_then_conflict_is_noop() {
     let pool = pool().await;

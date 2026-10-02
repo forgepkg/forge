@@ -120,7 +120,7 @@ pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
-const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
+pub const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
 /// A published `(id, version)`'s manifest is immutable, so an upstream
 /// `.nuspec` can be cached far longer than the version listing.
 const NUSPEC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
