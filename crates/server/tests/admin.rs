@@ -1772,3 +1772,358 @@ async fn legacy_open_access_setting_endpoint() {
         "an unscoped token cannot change settings"
     );
 }
+
+// ── delete concurrency (review 2026-10-02 B1 / L3) ──────────────────────────
+
+/// A 64-hex-char test sha unique to this run (`tag` keeps tests apart).
+fn test_sha(tag: &str) -> String {
+    format!("{:0>64}", format!("{tag}{}", common::unique()))
+}
+
+/// Seed a package `name`/`version` in `repo_id` whose single asset references
+/// the (already inserted) blob `sha`, incrementing its ref-count — what a
+/// publish or a proxy cache fill commits.
+async fn seed_package(pool: &sqlx::PgPool, repo_id: i64, name: &str, version: &str, sha: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    insert_package_in(&mut tx, repo_id, name, version, sha).await;
+    tx.commit().await.unwrap();
+}
+
+/// The writes of [`seed_package`], inside the caller's (open) transaction.
+async fn insert_package_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo_id: i64,
+    name: &str,
+    version: &str,
+    sha: &str,
+) {
+    let comp = component_dao::insert_component(
+        &mut **tx,
+        NewComponent {
+            repository_id: repo_id,
+            name: name.into(),
+            original_id: name.into(),
+            version: version.into(),
+            version_original: version.into(),
+            listed: true,
+        },
+    )
+    .await
+    .unwrap();
+    asset_dao::insert_asset(
+        &mut **tx,
+        NewAsset {
+            component_id: comp.id,
+            path: format!("{name}.{version}.nupkg"),
+            content_type: "application/octet-stream".into(),
+            blob_sha256: sha.into(),
+            size: 123,
+            sha512_base64: Some("c2hh".into()),
+        },
+    )
+    .await
+    .unwrap();
+    blob_dao::commit_and_incref(tx, sha).await.unwrap();
+}
+
+async fn ref_count(pool: &sqlx::PgPool, sha: &str) -> i64 {
+    blob_dao::get_blob(pool, sha)
+        .await
+        .unwrap()
+        .expect("blob row present")
+        .ref_count
+}
+
+async fn outbox_deletes(pool: &sqlx::PgPool, sha: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM blob_outbox WHERE sha256 = $1 AND op = 'delete_object'",
+    )
+    .bind(sha)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The backend pid of an open transaction.
+async fn backend_pid(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+}
+
+/// Wait until at least `n` backends are blocked — directly or through another
+/// blocked backend — behind the locks held by `holder_pid`. Makes the
+/// interleavings below deterministic instead of sleep-based.
+async fn wait_blocked_behind(pool: &sqlx::PgPool, holder_pid: i32, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE waiter(pid) AS (
+                SELECT pid FROM pg_stat_activity
+                WHERE $1 = ANY(pg_blocking_pids(pid))
+                UNION
+                SELECT a.pid FROM pg_stat_activity a
+                JOIN waiter w ON w.pid = ANY(pg_blocking_pids(a.pid))
+            )
+            SELECT count(*) FROM waiter
+            "#,
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {blocked} of {n} backends ever blocked behind pid {holder_pid}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Fire two identical admin `DELETE`s at `url` while the test holds the blob
+/// row of `sha` `FOR UPDATE`, release it only once both requests are parked
+/// behind that lock (directly or behind each other), and return both statuses
+/// sorted. Before the B1 fix both requests read the same asset set without a
+/// lock and each decremented the shared blob.
+async fn race_two_deletes(srv: &common::TestServer, url: &str, sha: &str) -> Vec<u16> {
+    let (u, p) = srv.admin_basic();
+    let mut holder = srv.pool.begin().await.unwrap();
+    let pid = backend_pid(&mut holder).await;
+    sqlx::query("SELECT 1 FROM blob WHERE sha256 = $1 FOR UPDATE")
+        .bind(sha)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let send = || {
+        let (client, url, u, p) = (srv.client(), url.to_string(), u.clone(), p.clone());
+        tokio::spawn(async move {
+            client
+                .delete(url)
+                .basic_auth(u, Some(p))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    let (a, b) = (send(), send());
+    wait_blocked_behind(&srv.pool, pid, 2).await;
+    holder.commit().await.unwrap();
+
+    let mut statuses = vec![a.await.unwrap(), b.await.unwrap()];
+    statuses.sort_unstable();
+    statuses
+}
+
+/// B1: two overlapping admin hard deletes of the same version, whose blob is
+/// shared with another repository, must decrement the blob exactly once — the
+/// loser finds the version gone (404) — so the other repository keeps its
+/// reference and no S3 delete is queued.
+#[tokio::test]
+async fn concurrent_hard_deletes_decrement_shared_blob_once() {
+    let srv = common::start().await;
+    let s = common::unique();
+    let dev =
+        repository_dao::insert_repository(&srv.pool, NewRepository::hosted(format!("dev{s}")))
+            .await
+            .unwrap();
+    let release =
+        repository_dao::insert_repository(&srv.pool, NewRepository::hosted(format!("rel{s}")))
+            .await
+            .unwrap();
+    let sha = test_sha("b1hd");
+    blob_dao::upsert_pending(&srv.pool, &sha, 123, &format!("blobs/{sha}"))
+        .await
+        .unwrap();
+    seed_package(&srv.pool, dev.id, "shared", "1.0.0", &sha).await;
+    seed_package(&srv.pool, release.id, "shared", "1.0.0", &sha).await;
+    assert_eq!(ref_count(&srv.pool, &sha).await, 2);
+
+    let url = format!(
+        "{}/admin/repositories/{}/packages/shared/1.0.0",
+        srv.base_url, dev.name
+    );
+    let statuses = race_two_deletes(&srv, &url, &sha).await;
+    assert_eq!(statuses, vec![204, 404], "exactly one delete wins");
+
+    assert_eq!(
+        ref_count(&srv.pool, &sha).await,
+        1,
+        "the shared blob must be decremented once, not twice"
+    );
+    assert_eq!(
+        outbox_deletes(&srv.pool, &sha).await,
+        0,
+        "a still-referenced blob must not be queued for deletion"
+    );
+    assert!(
+        component_dao::find_component(&srv.pool, release.id, "shared", "1.0.0")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other repository's package is untouched"
+    );
+}
+
+/// B1 (repository purge): two overlapping deletes of a proxy repository whose
+/// cached blob is shared with another repository must decrement it once.
+#[tokio::test]
+async fn concurrent_proxy_repo_deletes_decrement_shared_blob_once() {
+    let srv = common::start().await;
+    let s = common::unique();
+    let proxy = repository_dao::insert_repository(
+        &srv.pool,
+        NewRepository {
+            remote_url: Some("https://api.nuget.org/v3/index.json".into()),
+            ..NewRepository::proxy(format!("pxrace{s}"))
+        },
+    )
+    .await
+    .unwrap();
+    let hosted =
+        repository_dao::insert_repository(&srv.pool, NewRepository::hosted(format!("hxrace{s}")))
+            .await
+            .unwrap();
+    let sha = test_sha("b1px");
+    blob_dao::upsert_pending(&srv.pool, &sha, 123, &format!("blobs/{sha}"))
+        .await
+        .unwrap();
+    seed_package(&srv.pool, proxy.id, "cached", "2.0.0", &sha).await;
+    seed_package(&srv.pool, hosted.id, "cached", "2.0.0", &sha).await;
+
+    let url = format!("{}/admin/repositories/{}", srv.base_url, proxy.name);
+    let statuses = race_two_deletes(&srv, &url, &sha).await;
+    assert_eq!(statuses, vec![204, 404], "exactly one delete wins");
+
+    assert_eq!(ref_count(&srv.pool, &sha).await, 1);
+    assert_eq!(outbox_deletes(&srv.pool, &sha).await, 0);
+}
+
+/// L3: a proxy cache fill that commits while the repository delete is in
+/// flight must be purged *with* its blob decrement. The delete locks the
+/// repository row first, so it waits for the fill and then sees its component;
+/// before the fix the emptiness snapshot was taken outside the delete
+/// transaction and the FK cascade dropped the new asset, leaking its blob
+/// reference.
+#[tokio::test]
+async fn proxy_repo_delete_accounts_for_inflight_cache_fill() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let s = common::unique();
+    let proxy = repository_dao::insert_repository(
+        &srv.pool,
+        NewRepository {
+            remote_url: Some("https://api.nuget.org/v3/index.json".into()),
+            ..NewRepository::proxy(format!("pxfill{s}"))
+        },
+    )
+    .await
+    .unwrap();
+    let sha = test_sha("l3px");
+    blob_dao::upsert_pending(&srv.pool, &sha, 123, &format!("blobs/{sha}"))
+        .await
+        .unwrap();
+
+    // The in-flight fill: its component insert holds FOR KEY SHARE on the
+    // repository row until it commits.
+    let mut fill = srv.pool.begin().await.unwrap();
+    let pid = backend_pid(&mut fill).await;
+    insert_package_in(&mut fill, proxy.id, "late", "1.0.0", &sha).await;
+
+    let delete = {
+        let (client, url) = (
+            srv.client(),
+            format!("{}/admin/repositories/{}", srv.base_url, proxy.name),
+        );
+        tokio::spawn(async move {
+            client
+                .delete(url)
+                .basic_auth(u, Some(p))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    wait_blocked_behind(&srv.pool, pid, 1).await;
+    fill.commit().await.unwrap();
+
+    assert_eq!(delete.await.unwrap(), 204);
+    assert!(repository_dao::find_repository_by_id(&srv.pool, proxy.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        ref_count(&srv.pool, &sha).await,
+        0,
+        "the late component's blob reference must be released"
+    );
+    assert_eq!(
+        outbox_deletes(&srv.pool, &sha).await,
+        1,
+        "the now-unreferenced blob is queued for deletion"
+    );
+}
+
+/// L3: a publish that commits while a hosted repository delete is in flight
+/// must make the delete refuse (409) instead of cascade-deleting the freshly
+/// published package.
+#[tokio::test]
+async fn hosted_repo_delete_refuses_inflight_publish() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let s = common::unique();
+    let hosted =
+        repository_dao::insert_repository(&srv.pool, NewRepository::hosted(format!("hpub{s}")))
+            .await
+            .unwrap();
+    let sha = test_sha("l3h");
+    blob_dao::upsert_pending(&srv.pool, &sha, 123, &format!("blobs/{sha}"))
+        .await
+        .unwrap();
+
+    let mut publish = srv.pool.begin().await.unwrap();
+    let pid = backend_pid(&mut publish).await;
+    insert_package_in(&mut publish, hosted.id, "fresh", "1.0.0", &sha).await;
+
+    let delete = {
+        let (client, url) = (
+            srv.client(),
+            format!("{}/admin/repositories/{}", srv.base_url, hosted.name),
+        );
+        tokio::spawn(async move {
+            client
+                .delete(url)
+                .basic_auth(u, Some(p))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    wait_blocked_behind(&srv.pool, pid, 1).await;
+    publish.commit().await.unwrap();
+
+    assert_eq!(
+        delete.await.unwrap(),
+        409,
+        "a package published mid-delete must block the delete"
+    );
+    assert!(
+        component_dao::find_component(&srv.pool, hosted.id, "fresh", "1.0.0")
+            .await
+            .unwrap()
+            .is_some(),
+        "the published package survives"
+    );
+    assert_eq!(ref_count(&srv.pool, &sha).await, 1);
+}

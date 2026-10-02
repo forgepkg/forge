@@ -483,14 +483,41 @@ where
     .await
 }
 
+/// Lock a repository row `FOR UPDATE` inside the caller's transaction.
+/// Returns `false` when the row does not exist (or a concurrent delete removed
+/// it first).
+///
+/// Taken before a repository delete inspects or purges its components: the
+/// lock conflicts with the `FOR KEY SHARE` lock every `component` insert's
+/// foreign-key check takes on the repository row, so no publish or proxy
+/// cache fill can commit a new component between the check/purge and the
+/// delete (an in-flight one is waited for and then seen by the check).
+pub async fn lock_repository<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query_scalar!(r#"SELECT id FROM repository WHERE id = $1 FOR UPDATE"#, id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Delete a repository by id. Returns whether a row was deleted.
 ///
-/// FK constraints cascade `group_member` rows that reference it (as group or
-/// member); component/asset rows must already be gone (the admin layer hard-
-/// deletes packages first) or the FK will reject the delete.
-pub async fn delete_repository(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+/// Every dependent row cascades via `ON DELETE CASCADE` — `group_member` rows
+/// naming it as group or member, proxy caches, retention state, grants, **and
+/// its `component`/`asset` rows**. The cascade does not touch `blob` reference
+/// counts, so callers must first remove components through
+/// `component_dao::hard_delete_all_components` (or refuse when any remain),
+/// in the same transaction and after [`lock_repository`]; otherwise the
+/// cascaded assets' blobs keep their references forever and their S3 objects
+/// are never reclaimed.
+pub async fn delete_repository<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let res = sqlx::query!(r#"DELETE FROM repository WHERE id = $1"#, id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected() > 0)
 }

@@ -1,7 +1,8 @@
 //! Data access for `component`.
 
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
+use crate::blob_dao;
 use crate::model::Component;
 
 /// All settable fields when creating a component row.
@@ -222,4 +223,122 @@ where
     .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
+}
+
+/// Hard-delete one component version inside `tx`: remove the component and
+/// all its assets and decrement each referenced blob (enqueuing a deferred S3
+/// delete when one reaches zero refs, see
+/// [`blob_dao::decref_and_maybe_enqueue_delete`]). Returns `false` when the
+/// version does not exist — including when a concurrent hard delete removed it
+/// first.
+///
+/// Concurrency: the component row is locked `FOR UPDATE` **before** its assets
+/// are touched, and only the blob references whose asset rows this
+/// transaction's own `DELETE … RETURNING` removed are decremented. A second
+/// overlapping delete (a client retry, a double click, a retention run) blocks
+/// on the row lock, then finds the row gone and decrements nothing — the
+/// unlocked read-then-decref this replaces let both decrement, driving a blob
+/// shared with another repository to zero refs while still referenced. The
+/// lock also serializes against redeploys (which lock the same row) and
+/// against asset inserts (whose foreign-key check takes `FOR KEY SHARE` on it).
+pub async fn hard_delete_component(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    name: &str,
+    version: &str,
+    grace: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let Some(id) = sqlx::query_scalar!(
+        r#"
+        SELECT id
+        FROM component
+        WHERE repository_id = $1 AND name = $2 AND version = $3
+        FOR UPDATE
+        "#,
+        repository_id,
+        name,
+        version,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(false);
+    };
+    delete_locked_components(tx, &[id], grace).await?;
+    Ok(true)
+}
+
+/// Hard-delete **every** component of `repository_id` inside `tx`, with the
+/// same per-reference decrement guarantees as [`hard_delete_component`].
+/// Returns the number of components removed.
+///
+/// Used when a repository is deleted. The caller must already hold the
+/// repository row `FOR UPDATE` (see `repository_dao::lock_repository`): that
+/// blocks new component inserts, whose foreign-key check needs `FOR KEY SHARE`
+/// on it, so nothing can be added between this purge and the repository
+/// delete in the same transaction.
+pub async fn hard_delete_all_components(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    grace: chrono::Duration,
+) -> sqlx::Result<u64> {
+    // Lock in id order so overlapping purges acquire row locks consistently.
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT id
+        FROM component
+        WHERE repository_id = $1
+        ORDER BY id
+        FOR UPDATE
+        "#,
+        repository_id,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    delete_locked_components(tx, &ids, grace).await?;
+    Ok(ids.len() as u64)
+}
+
+/// Whether `repository_id` owns any component. Pass the transaction that holds
+/// the repository row lock so the answer stays true until commit.
+pub async fn repository_has_components<'e, E>(executor: E, repository_id: i64) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let exists = sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM component WHERE repository_id = $1) AS "exists!""#,
+        repository_id,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok(exists)
+}
+
+/// Delete the assets and rows of components the caller has locked `FOR
+/// UPDATE`, decrementing one blob reference per asset row actually deleted.
+async fn delete_locked_components(
+    tx: &mut Transaction<'_, Postgres>,
+    ids: &[i64],
+    grace: chrono::Duration,
+) -> sqlx::Result<()> {
+    let mut blob_refs = sqlx::query_scalar!(
+        r#"DELETE FROM asset WHERE component_id = ANY($1) RETURNING blob_sha256"#,
+        ids,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    // Decrement in a stable order so concurrent deletes touching overlapping
+    // blobs lock the blob rows in the same order (no lock-order deadlock).
+    // Duplicates are kept: each asset row holds one reference.
+    blob_refs.sort_unstable();
+    for sha256 in &blob_refs {
+        blob_dao::decref_and_maybe_enqueue_delete(tx, sha256, grace).await?;
+    }
+    sqlx::query!(r#"DELETE FROM component WHERE id = ANY($1)"#, ids)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }

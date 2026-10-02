@@ -18,9 +18,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
+use forge_db::component_dao;
 use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
-use forge_db::{asset_dao, blob_dao, component_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -588,69 +588,74 @@ pub async fn update(
 /// - **Proxy** repos hold only a reconstructible upstream cache, so deletion
 ///   transactionally decrefs every referenced blob (enqueuing outbox deletes at
 ///   zero refs) and removes the components before dropping the repository.
+///
+/// The emptiness check (hosted) or purge (proxy) and the delete run in **one**
+/// transaction that first locks the repository row `FOR UPDATE`
+/// ([`repository_dao::lock_repository`]). That lock conflicts with the
+/// `FOR KEY SHARE` lock a concurrent component insert takes for its foreign
+/// key, so a publish or cache fill cannot commit in between and be
+/// cascade-deleted without its blob decrement; an overlapping delete of the
+/// same repository waits and then answers 404 without decrementing again.
 pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return db_error(e),
     };
-
-    // Hosted repos may still own (non-reproducible) components; require them
-    // gone first so the deletion is an explicit admin action.
-    if existing.kind() == RepoKind::Hosted {
-        match component_dao::list_components_for_repo(&state.pool, existing.id).await {
-            Ok(comps) if !comps.is_empty() => {
-                return (
-                    StatusCode::CONFLICT,
-                    "repository still has packages; hard-delete them first",
-                )
-                    .into_response();
-            }
-            Ok(_) => {}
-            Err(e) => return db_error(e),
-        }
-    } else {
-        // Proxy (and any non-hosted) repos: decref every blob referenced by the
-        // repo's cached components so blob GC stays correct, then the cascade
-        // can safely drop the now-zero-ref component/asset rows.
-        let grace = state.config.outbox.grace();
-        if let Err(e) = purge_repo_blob_refs(&state, existing.id, grace).await {
-            return db_error(e);
-        }
-    }
-
-    match repository_dao::delete_repository(&state.pool, existing.id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let grace = state.config.outbox.grace();
+    match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
+        Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(RepoDelete::HasPackages) => (
+            StatusCode::CONFLICT,
+            "repository still has packages; hard-delete them first",
+        )
+            .into_response(),
         Err(e) => db_error(e),
     }
 }
 
-/// Transactionally decrement the ref-count of every blob referenced by any asset
-/// of any component in `repo_id`, enqueuing an outbox delete when a blob reaches
-/// zero refs, then delete the components (assets cascade via FK). Mirrors the
-/// per-package [`hard_delete`] path so blob GC stays correct when a whole
-/// repository is removed.
-async fn purge_repo_blob_refs(
+/// Outcome of [`delete_repository_locked`].
+enum RepoDelete {
+    Deleted,
+    NotFound,
+    /// A hosted repository still owns components.
+    HasPackages,
+}
+
+/// Lock, check/purge and delete a repository in one transaction (see
+/// [`delete`]).
+async fn delete_repository_locked(
     state: &AppState,
     repo_id: i64,
+    kind: RepoKind,
     grace: chrono::Duration,
-) -> sqlx::Result<()> {
-    let components = component_dao::list_components_for_repo(&state.pool, repo_id).await?;
-    if components.is_empty() {
-        return Ok(());
+) -> sqlx::Result<RepoDelete> {
+    let mut tx = state.pool.begin().await?;
+    if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
+        return Ok(RepoDelete::NotFound);
     }
 
-    let mut tx = state.pool.begin().await?;
-    for comp in &components {
-        let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
-        for asset in &assets {
-            blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
+    if kind == RepoKind::Hosted {
+        // Hosted repos may still own (non-reproducible) components; require them
+        // gone first so the deletion is an explicit admin action.
+        if component_dao::repository_has_components(&mut *tx, repo_id).await? {
+            return Ok(RepoDelete::HasPackages);
         }
-        component_dao::delete_component(&mut *tx, repo_id, &comp.name, &comp.version).await?;
+    } else {
+        // Proxy (and any non-hosted) repos: decref every blob referenced by the
+        // repo's cached components so blob GC stays correct, and remove them
+        // before the cascade could drop them unaccounted.
+        component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
+
+    let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(if deleted {
+        RepoDelete::Deleted
+    } else {
+        RepoDelete::NotFound
+    })
 }
 
 /// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
@@ -695,8 +700,11 @@ pub async fn hard_delete_package(
 }
 
 /// Transactionally remove a component, its assets, and decref each referenced
-/// blob (enqueuing an outbox delete when a blob reaches zero refs). Mirrors the
-/// hosted write path's hard-delete so blob GC stays correct.
+/// blob (enqueuing an outbox delete when a blob reaches zero refs) through
+/// [`component_dao::hard_delete_component`], which locks the component row
+/// first and decrements only the references it actually deleted — so two
+/// overlapping hard deletes of one version decrement once (the loser gets
+/// `false` → 404).
 async fn hard_delete(
     state: &AppState,
     repo_id: i64,
@@ -705,23 +713,10 @@ async fn hard_delete(
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
     let mut tx = state.pool.begin().await?;
-
-    let Some(comp) = component_dao::find_component(&mut *tx, repo_id, lower_id, version).await?
-    else {
-        return Ok(false);
-    };
-
-    // Decref every blob this component's assets reference.
-    let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
-    for asset in &assets {
-        blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
-    }
-
-    // Remove the component (assets cascade via FK).
-    component_dao::delete_component(&mut *tx, repo_id, lower_id, version).await?;
-
+    let deleted =
+        component_dao::hard_delete_component(&mut tx, repo_id, lower_id, version, grace).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(deleted)
 }
 
 /// Whether a `sqlx::Error` is a Postgres unique-violation (23505).
