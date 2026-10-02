@@ -81,12 +81,15 @@ impl HostedRepo {
     /// Build one exact search result while applying package authorization
     /// before paging. Hosted search currently loads its small Slice-1 corpus in
     /// one query, so doing this here avoids reloading that corpus once per
-    /// selector page.
+    /// selector page. With `enrich`, the returned page carries manifests and
+    /// download totals ([`Self::enrich_hits`]); a group searches its members
+    /// without and enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
         params: &SearchParams,
         filter: &PackageFilter,
+        enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let query = SearchQuery::parse(&params.q);
@@ -143,7 +146,9 @@ impl HostedRepo {
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
-        self.enrich_hits(repo_id, &mut hits).await?;
+        if enrich {
+            self.enrich_hits(repo_id, &mut hits).await?;
+        }
         Ok(SearchResult { total_hits, hits })
     }
 
@@ -343,7 +348,7 @@ impl RepoReadOps for HostedRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+        self.search_filtered(repo, params, &PackageFilter::AllowAll, true)
             .await
     }
 
@@ -353,7 +358,28 @@ impl RepoReadOps for HostedRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, filter).await
+        self.search_filtered(repo, params, filter, true).await
+    }
+
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter, false).await
+    }
+
+    async fn enrich_search_hits(
+        &self,
+        repo: &str,
+        hits: &mut [SearchHit],
+    ) -> Result<(), RepoError> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let repo_id = self.repo_id(repo).await?;
+        self.enrich_hits(repo_id, hits).await
     }
 }
 

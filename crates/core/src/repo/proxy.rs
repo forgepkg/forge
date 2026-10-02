@@ -1021,11 +1021,15 @@ impl ProxyRepo {
     /// Search the locally known proxy corpus once, applying authorization
     /// before total-count calculation and client paging. The id substring
     /// filter runs in PostgreSQL so a large proxy cache is not loaded whole.
+    /// With `enrich`, the returned page carries cached manifests
+    /// ([`Self::enrich_hits`]); a group searches its members without and
+    /// enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
         params: &SearchParams,
         filter: &PackageFilter,
+        enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let now = Utc::now();
@@ -1091,17 +1095,41 @@ impl ProxyRepo {
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
-        // Manifests are known for cached packages only (no upstream fan-out
-        // per search hit).
-        for hit in &mut hits {
-            hit.nuspec_bytes = self
-                .local_nuspec(repo_row.id, &hit.original_id, &hit.latest_version)
-                .await
-                .unwrap_or(None);
+        if enrich {
+            self.enrich_hits(repo_row.id, &mut hits).await;
         }
         Ok(SearchResult { total_hits, hits })
     }
+
+    /// Attach each hit's latest manifest. Manifests are known for cached
+    /// packages only (no upstream fan-out per search hit); the local reads run
+    /// with bounded concurrency, and a failed read leaves that hit without one.
+    async fn enrich_hits(&self, repo_id: i64, hits: &mut [SearchHit]) {
+        use futures_util::StreamExt;
+        let wanted: Vec<(String, String)> = hits
+            .iter()
+            .map(|hit| (hit.original_id.clone(), hit.latest_version.clone()))
+            .collect();
+        let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
+            .map(|(id, version)| async move {
+                self.local_nuspec(repo_id, &id, &version)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "search: manifest fetch failed");
+                        None
+                    })
+            })
+            .buffered(SEARCH_ENRICH_CONCURRENCY)
+            .collect()
+            .await;
+        for (hit, manifest) in hits.iter_mut().zip(manifests) {
+            hit.nuspec_bytes = manifest;
+        }
+    }
 }
+
+/// Concurrent local manifest reads while enriching one proxy search page.
+const SEARCH_ENRICH_CONCURRENCY: usize = 8;
 
 /// Fire a best-effort proxy download-tracking bump off the response hot path
 /// (slice 12.1 §3.7). Failures are logged, not propagated — the data only feeds
@@ -1306,7 +1334,7 @@ impl RepoReadOps for ProxyRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+        self.search_filtered(repo, params, &PackageFilter::AllowAll, true)
             .await
     }
 
@@ -1316,6 +1344,28 @@ impl RepoReadOps for ProxyRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, filter).await
+        self.search_filtered(repo, params, filter, true).await
+    }
+
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter, false).await
+    }
+
+    async fn enrich_search_hits(
+        &self,
+        repo: &str,
+        hits: &mut [SearchHit],
+    ) -> Result<(), RepoError> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let repo_row = self.proxy_repo(repo).await?;
+        self.enrich_hits(repo_row.id, hits).await;
+        Ok(())
     }
 }
