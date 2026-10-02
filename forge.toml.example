@@ -1,7 +1,8 @@
 # envisia-forge configuration (TOML form).
 #
 # Copy this to `forge.toml` (loaded automatically if present in the working
-# directory) or point $FORGE_CONFIG at it. This file is the base layer; any
+# directory) or point $FORGE_CONFIG at it (the file must then exist: a missing
+# $FORGE_CONFIG file fails startup). This file is the base layer; any
 # `FORGE_*` environment variable overrides the matching key (see .env.example).
 # Nested keys map section-by-section: `[auth].bootstrap_admin.username` is set
 # via `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME`.
@@ -73,14 +74,17 @@ realm_cache_ttl_seconds = 10    # (default: 10)
 # credential-forwarding realm, per instance; excess logins fail closed (401).
 credential_forward_max_concurrent = 32  # (default: 32)
 
-# Optional: bootstrap admin created on first run if no admin users exist.
-# Omit the whole section to skip.
+# Optional: bootstrap admin, created once on the first start with a password.
+# Omit the section, or leave the password empty/unset, for no bootstrap admin
+# (remove the password once real admins exist). "changeme" is refused unless
+# server.allow_insecure_defaults = true.
 [auth.bootstrap_admin]
-username = "admin"
+username = "admin"              # (default: "admin")
 password = "changeme"
 
 [redis]
-# Optional shared L2 cache + invalidation backplane. Omit for L1-only caching.
+# Optional shared L2 cache + invalidation backplane. Omit (or leave the url
+# blank) for L1-only caching.
 # url = "redis://localhost:6379"
 # A slower/partitioned Redis is treated as a cache miss instead of hanging reads.
 # connect_timeout_ms  = 2000    # (default: 2000)

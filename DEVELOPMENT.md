@@ -222,8 +222,8 @@ Key knobs:
 | `auth.anonymous_mode` | `off` / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
 | `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
-| `auth.bootstrap_admin` | First-run admin username/password. |
-| `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme`/empty or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
+| `auth.bootstrap_admin` | First-run admin username (default `admin`) / password. No or a blank password means no bootstrap admin. |
+| `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
@@ -476,10 +476,12 @@ with the operator's normal rolling strategy.
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
 (`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
 anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
-`allow_password_basic`, bootstrap admin `admin` with a placeholder password).
-The placeholder credentials (`minioadmin` S3 keys, `changeme`) are **refused at
-startup** unless overridden; only the dev compose stack sets
-`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true`. Override anything via `FORGE_*`
+`allow_password_basic=false`, no bootstrap admin — that comes only from
+`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env). The placeholder credentials
+(`minioadmin` S3 keys, a `changeme` password) are **refused at startup** unless
+overridden; only the dev compose stack sets
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin/changeme and
+`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
 env vars (double-underscore nesting). Required at runtime (no safe default):
 
 | Env var | Example |
@@ -489,7 +491,7 @@ env vars (double-underscore nesting). Required at runtime (no safe default):
 | `FORGE_S3__BUCKET` | `forge` |
 | `FORGE_S3__ACCESS_KEY` | `…` |
 | `FORGE_S3__SECRET_KEY` | `…` |
-| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | a real password (the placeholder is refused) |
+| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
 
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
 URLs). For a production deployment (TLS, secret encryption, trusted proxies,

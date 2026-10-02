@@ -109,9 +109,13 @@ docker run --rm -p 8421:8421 \
   envisia-forge:latest
 ```
 
-The image refuses to start while its placeholder credentials (`minioadmin` S3
-keys, bootstrap password `changeme`) are in effect, and defaults to
-`anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads).
+The image refuses to start with placeholder credentials (`minioadmin` S3 keys,
+a `changeme` bootstrap password). It bakes no bootstrap admin:
+`FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start, and
+once it is removed the image simply starts without one. It defaults to
+`anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads)
+and `allow_password_basic = false` (clients use API tokens; see
+[docs/deployment.md](docs/deployment.md)).
 
 ### Point a `dotnet` client at it
 
