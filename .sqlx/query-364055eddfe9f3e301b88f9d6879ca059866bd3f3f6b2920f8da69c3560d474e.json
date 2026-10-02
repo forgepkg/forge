@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM proxy_cached_version WHERE id = $1",
+  "query": "UPDATE proxy_cached_version SET downloaded = false WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "eb29562ad02a8d7445789be64b21cb6c44b7f9da19e2e0745c682749eeda37a0"
+  "hash": "364055eddfe9f3e301b88f9d6879ca059866bd3f3f6b2920f8da69c3560d474e"
 }

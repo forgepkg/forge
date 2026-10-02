@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, version, last_downloaded_at\n        FROM proxy_cached_version\n        WHERE id = $1 AND repository_id = $2\n        FOR UPDATE\n        ",
+  "query": "\n        SELECT id, name, version, first_seen_at, last_downloaded_at\n        FROM proxy_cached_version\n        WHERE repository_id = $1 AND downloaded AND not_found = false\n        ORDER BY name, version\n        ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "first_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "first_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "last_downloaded_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -50,7 +61,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -58,8 +68,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "7935485a4e611ef4893ca49e9412406dc0a70f10fb0a1c92a7f265e03e45eb55"
+  "hash": "85f2b3b4df860e356ed2be97519bca10e16011ca3ffb89f0e7e207fe1d81a62d"
 }
