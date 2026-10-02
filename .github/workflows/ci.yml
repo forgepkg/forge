@@ -211,6 +211,10 @@ jobs:
         run: pnpm run test
       - name: Production build (vite build -> web/dist)
         run: pnpm run build
+      # Known-vulnerability check of the shipped (non-dev) web dependencies;
+      # the Rust side is covered by the `audit` job.
+      - name: Dependency audit (pnpm audit --prod)
+        run: pnpm audit --prod
       - name: Upload built SPA
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

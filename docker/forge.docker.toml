@@ -53,8 +53,9 @@ force_path_style = true
 anonymous_mode = "off"
 # HTTP Basic with a USER PASSWORD on the API/feed (tokens in Basic are always
 # accepted). Off: the web UI signs in through /auth/login (not affected by this
-# flag), NuGet clients and scripts use API tokens, and enabled
-# credential-forwarding realms turn the wire password path on by themselves.
+# flag), NuGet clients and scripts use API tokens, and an enabled
+# credential-forwarding realm turns the wire password path on by itself (for
+# the whole chain, so local users' passwords then work over Basic as well).
 # Set FORGE_AUTH__ALLOW_PASSWORD_BASIC=true only if a client must send a local
 # user's password over Basic (e.g. `curl -u user:password` against /admin).
 allow_password_basic = false

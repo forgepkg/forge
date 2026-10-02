@@ -88,11 +88,13 @@ without a bootstrap admin.
 The image defaults to `allow_password_basic = false`: the web UI signs in
 through its login form (not affected by this setting), and NuGet clients and
 scripts authenticate with API tokens (a token in the Basic password field is
-always accepted). Enabled credential-forwarding realms turn the Basic password
-path on by themselves, because their users have no tokens until they first
-sign in. Set `FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must
-send a local user's password over Basic, for example `curl -u user:password`
-against `/admin`.
+always accepted). An enabled credential-forwarding realm turns the Basic
+password path on by itself, because its users have no tokens until they first
+sign in — and that path runs the whole password chain, so **local** users'
+passwords are then accepted over Basic too, whatever this setting says. Set
+`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must send a local
+user's password over Basic without such a realm, for example
+`curl -u user:password` against `/admin`.
 
 ## Secret encryption at rest
 
