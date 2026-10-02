@@ -13,10 +13,14 @@
 //! 2. **Group by package id.** Within a group, order versions newest-first using
 //!    [`Format::compare_versions`] (format-agnostic — we never import a concrete
 //!    format here).
-//! 3. **Compute protections per group**: the union, across all rules, of
-//!    `keep_last_n` (newest N by version order) and `keep_n_most_downloaded`
-//!    (N most-recently-downloaded, nulls last). A protected version is **never**
-//!    deleted.
+//! 3. **Compute protections per group, per rule.** Each rule's protections
+//!    are taken over that rule's own *pool* — the group's versions its
+//!    `release_type` / `package_name_prefix` filters admit: `keep_last_n` is
+//!    the newest N **listed** versions of the pool (unlisted versions neither
+//!    count nor are protected), `keep_n_most_downloaded` the N most-recently
+//!    downloaded versions of the pool, listed or not (nulls last). The
+//!    protected set is the **union** over all rules; a protected version is
+//!    **never** deleted or unlisted, by any rule.
 //! 4. For each version, a rule *selects* it iff the rule's filters match **and**
 //!    all of the rule's present triggers are satisfied (ANDed):
 //!    `older_than_days` (age since `created_at`) and `not_downloaded_for_days`
@@ -28,8 +32,9 @@
 //!
 //! `scope: proxy_cached` rules evict a cached version when `not_pulled_for_days`
 //! is satisfied, comparing against `last_downloaded_at` or, when never pulled,
-//! `first_seen_at`. Proxy entries are never unlisted — eviction is always a
-//! delete; they re-cache on the next pull.
+//! `first_seen_at`. Only versions whose bytes are cached locally are
+//! candidates. Proxy entries are never unlisted — eviction always deletes the
+//! cached bytes (the version stays listed and re-caches on the next pull).
 
 use chrono::{DateTime, Utc};
 
@@ -202,48 +207,54 @@ fn triggers_match(
     }
 }
 
-/// Compute the indices (into the group's newest-first ordering) that are
-/// **protected** by the union of all rules' `keep_last_n` /
-/// `keep_n_most_downloaded`.
+/// Compute which of a group's versions (indices into its newest-first
+/// ordering) are **protected**: the union, over every hosted rule, of that
+/// rule's `keep_last_n` / `keep_n_most_downloaded` protections.
+///
+/// Each rule's protections are computed over the versions the rule itself
+/// governs — those its `release_type` / `package_name_prefix` filters admit —
+/// never over the whole package. Otherwise a `releases`-only rule with
+/// `keep_last_n: 3` would "protect" the three newest prereleases and leave
+/// every stable release unprotected. `keep_last_n` further counts only
+/// **listed** versions, so unlisted versions cannot use up its slots;
+/// `keep_n_most_downloaded` ranks listed and unlisted versions alike by
+/// download recency (see [`Criteria`]).
 ///
 /// `ordered` is the group's components sorted newest-first (by version).
 fn protected_indices(policy: &RetentionPolicy, ordered: &[&CandidateComponent]) -> Vec<bool> {
     let mut protected = vec![false; ordered.len()];
 
-    // Largest keep_last_n across all rules wins (union of protections).
-    let max_keep_last_n = policy
-        .rules
-        .iter()
-        .filter(|r| r.scope == Scope::Hosted)
-        .filter_map(|r| r.criteria.keep_last_n)
-        .max();
-    if let Some(n) = max_keep_last_n {
-        for slot in protected.iter_mut().take(n as usize) {
-            *slot = true;
+    for rule in policy.rules.iter().filter(|r| r.scope == Scope::Hosted) {
+        let c = &rule.criteria;
+        if !c.has_protection() {
+            continue;
         }
-    }
+        // The rule's pool, still newest-first.
+        let pool: Vec<usize> = (0..ordered.len())
+            .filter(|&i| rule_filters_match(rule, &ordered[i].package_name, &ordered[i].version))
+            .collect();
 
-    // Largest keep_n_most_downloaded across all rules.
-    let max_keep_downloaded = policy
-        .rules
-        .iter()
-        .filter(|r| r.scope == Scope::Hosted)
-        .filter_map(|r| r.criteria.keep_n_most_downloaded)
-        .max();
-    if let Some(n) = max_keep_downloaded {
-        // Order indices by download recency: most-recent first, nulls last,
-        // version-desc (the existing order) as a stable tiebreaker.
-        let mut by_download: Vec<usize> = (0..ordered.len()).collect();
-        by_download.sort_by(|&a, &b| {
-            match (ordered[a].last_downloaded_at, ordered[b].last_downloaded_at) {
-                (Some(x), Some(y)) => y.cmp(&x), // more recent first
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.cmp(&b), // preserve version-desc order
+        if let Some(n) = c.keep_last_n {
+            for &idx in pool.iter().filter(|&&i| ordered[i].listed).take(n as usize) {
+                protected[idx] = true;
             }
-        });
-        for &idx in by_download.iter().take(n as usize) {
-            protected[idx] = true;
+        }
+
+        if let Some(n) = c.keep_n_most_downloaded {
+            // Order by download recency: most-recent first, nulls last. The
+            // sort is stable, so ties keep the pool's version-desc order.
+            let mut by_download = pool.clone();
+            by_download.sort_by(|&a, &b| {
+                match (ordered[a].last_downloaded_at, ordered[b].last_downloaded_at) {
+                    (Some(x), Some(y)) => y.cmp(&x), // more recent first
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+            for &idx in by_download.iter().take(n as usize) {
+                protected[idx] = true;
+            }
         }
     }
 
@@ -834,6 +845,201 @@ mod tests {
             pairs,
             vec![("a".into(), "1.0.0".into()), ("b".into(), "1.0.0".into())]
         );
+    }
+
+    // ---- protections are computed over each rule's own pool (M6) ----
+
+    fn unlisted(mut c: CandidateComponent) -> CandidateComponent {
+        c.listed = false;
+        c
+    }
+
+    #[test]
+    fn keep_last_n_counts_only_versions_the_rule_filters_admit() {
+        // Regression (M6): a releases-only rule with keep_last_n=3 used to
+        // "protect" the three newest versions of the whole package — here the
+        // betas, which the rule never touches — and delete every stable
+        // release. It must protect the three newest stable releases instead.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "1.1.0", 100, None),
+            comp(3, "lib", "1.2.0", 100, None),
+            comp(4, "lib", "1.3.0", 100, None),
+            comp(5, "lib", "2.0.0-beta.1", 100, None),
+            comp(6, "lib", "2.0.0-beta.2", 100, None),
+            comp(7, "lib", "2.0.0-beta.3", 100, None),
+        ];
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Releases,
+            ..rule(
+                "releases",
+                Action::HardDelete,
+                Criteria {
+                    keep_last_n: Some(3),
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
+    }
+
+    #[test]
+    fn keep_last_n_skips_unlisted_versions() {
+        // Regression (M6): unlisted versions used to fill keep_last_n's slots,
+        // so unlisting the two newest versions left no listed version
+        // protected. The newest N *listed* versions are kept; unlisted ones
+        // are neither counted nor protected.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "1.1.0", 100, None),
+            comp(3, "lib", "1.2.0", 100, None),
+            unlisted(comp(4, "lib", "1.3.0", 100, None)),
+            unlisted(comp(5, "lib", "1.4.0", 100, None)),
+        ];
+        let p = policy_with(vec![rule(
+            "r",
+            Action::HardDelete,
+            Criteria {
+                keep_last_n: Some(2),
+                older_than_days: Some(30),
+                ..Default::default()
+            },
+        )]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.3.0", "1.4.0"]);
+    }
+
+    #[test]
+    fn keep_last_n_of_a_prefix_rule_does_not_protect_other_packages() {
+        // A prefix-scoped rule's protection covers only the packages it
+        // governs; it must not shield an unrelated package from a sweep.
+        let cands = vec![
+            comp(1, "acme.core", "1.0.0", 100, None),
+            comp(2, "acme.core", "2.0.0", 100, None),
+            comp(3, "other.lib", "1.0.0", 100, None),
+            comp(4, "other.lib", "2.0.0", 100, None),
+        ];
+        let p = policy_with(vec![
+            RetentionRule {
+                package_name_prefix: Some("Acme.".into()),
+                ..rule(
+                    "acme",
+                    Action::HardDelete,
+                    Criteria {
+                        keep_last_n: Some(5),
+                        older_than_days: Some(30),
+                        ..Default::default()
+                    },
+                )
+            },
+            rule(
+                "sweep",
+                Action::HardDelete,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        let mut pairs: Vec<(String, String)> = d
+            .iter()
+            .map(|x| (x.package_name.clone(), x.version.clone()))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("other.lib".into(), "1.0.0".into()),
+                ("other.lib".into(), "2.0.0".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn protection_from_a_filtered_rule_still_shields_against_other_rules() {
+        // The per-rule protected sets are unioned: the newest prerelease kept
+        // by the prereleases rule survives the any-version sweep too.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "2.0.0-beta.1", 100, None),
+            comp(3, "lib", "2.0.0-beta.2", 100, None),
+        ];
+        let p = policy_with(vec![
+            RetentionRule {
+                release_type: ReleaseType::Prereleases,
+                ..rule(
+                    "pre",
+                    Action::HardDelete,
+                    Criteria {
+                        keep_last_n: Some(1),
+                        older_than_days: Some(30),
+                        ..Default::default()
+                    },
+                )
+            },
+            rule(
+                "sweep",
+                Action::HardDelete,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0", "2.0.0-beta.1"]);
+    }
+
+    #[test]
+    fn keep_n_most_downloaded_ranks_only_versions_the_rule_filters_admit() {
+        // Regression (M6, keep_n_most_downloaded): the most recently pulled
+        // version overall is a beta the releases-only rule never touches; it
+        // used to take the only slot, leaving every stable release exposed.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, Some(50)),
+            comp(2, "lib", "1.1.0", 100, Some(20)),
+            comp(3, "lib", "2.0.0-beta", 100, Some(1)),
+        ];
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Releases,
+            ..rule(
+                "releases",
+                Action::HardDelete,
+                Criteria {
+                    keep_n_most_downloaded: Some(1),
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
+    }
+
+    #[test]
+    fn keep_n_most_downloaded_counts_unlisted_versions_in_use() {
+        // Download recency, not listing, marks a version as in use: an
+        // unlisted version still being restored by exact version keeps its
+        // keep_n_most_downloaded slot.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, Some(50)),
+            unlisted(comp(2, "lib", "1.1.0", 100, Some(1))),
+            comp(3, "lib", "1.2.0", 100, None),
+        ];
+        let p = policy_with(vec![rule(
+            "r",
+            Action::HardDelete,
+            Criteria {
+                keep_n_most_downloaded: Some(1),
+                older_than_days: Some(30),
+                ..Default::default()
+            },
+        )]);
+        let d = evaluate(&fmt(), now(), &p, &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.2.0"]);
     }
 
     // ---- proxy ----
