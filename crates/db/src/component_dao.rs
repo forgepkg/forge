@@ -324,18 +324,21 @@ async fn delete_locked_components(
     ids: &[i64],
     grace: chrono::Duration,
 ) -> sqlx::Result<()> {
-    let mut blob_refs = sqlx::query_scalar!(
-        r#"DELETE FROM asset WHERE component_id = ANY($1) RETURNING blob_sha256"#,
+    let mut blob_refs = sqlx::query!(
+        r#"DELETE FROM asset WHERE component_id = ANY($1)
+           RETURNING component_id, path, blob_sha256"#,
         ids,
     )
     .fetch_all(&mut **tx)
     .await?;
-    // Decrement in a stable order so concurrent deletes touching overlapping
-    // blobs lock the blob rows in the same order (no lock-order deadlock).
+    // Decrement in the order every other writer locks blob rows — one
+    // component at a time, its assets by path (the `.nupkg` before the
+    // `.nuspec`, as publish, redeploy, NuGet DELETE and retention do) — so a
+    // concurrent writer sharing the same blobs cannot deadlock with this one.
     // Duplicates are kept: each asset row holds one reference.
-    blob_refs.sort_unstable();
-    for sha256 in &blob_refs {
-        blob_dao::decref_and_maybe_enqueue_delete(tx, sha256, grace).await?;
+    blob_refs.sort_unstable_by(|a, b| (a.component_id, &a.path).cmp(&(b.component_id, &b.path)));
+    for row in &blob_refs {
+        blob_dao::decref_and_maybe_enqueue_delete(tx, &row.blob_sha256, grace).await?;
     }
     sqlx::query!(r#"DELETE FROM component WHERE id = ANY($1)"#, ids)
         .execute(&mut **tx)

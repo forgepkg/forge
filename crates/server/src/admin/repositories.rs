@@ -631,6 +631,31 @@ async fn delete_repository_locked(
     kind: RepoKind,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
+    // A proxy delete locks the repository row before its cached versions,
+    // while a concurrent cache fill or retention eviction holds a cached
+    // version and then needs the repository row: Postgres resolves that
+    // deadlock by aborting one side. The whole transaction rolled back, so
+    // retrying the delete is safe.
+    let mut attempt = 0;
+    loop {
+        match delete_repository_once(state, repo_id, kind, grace).await {
+            Err(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some("40P01") && attempt < 3 =>
+            {
+                attempt += 1;
+                tracing::warn!(repo_id, attempt, "repository delete deadlocked; retrying");
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn delete_repository_once(
+    state: &AppState,
+    repo_id: i64,
+    kind: RepoKind,
+    grace: chrono::Duration,
+) -> sqlx::Result<RepoDelete> {
     let mut tx = state.pool.begin().await?;
     if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
         return Ok(RepoDelete::NotFound);
