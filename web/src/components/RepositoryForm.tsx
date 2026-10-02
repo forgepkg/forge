@@ -1,6 +1,11 @@
 import { useState } from 'react'
 
-import type { CreateRepo, RepoKind, RepoView } from '~/api/repositories'
+import type {
+  CreateRepo,
+  RepoKind,
+  RepoView,
+  UpdateRepo,
+} from '~/api/repositories'
 import { Button } from '~/components/catalyst/button'
 import {
   Checkbox,
@@ -32,13 +37,54 @@ import { Select } from '~/components/catalyst/select'
  *                 (`GroupMembers`)
  *
  * On **create** `kind` is selectable; on **edit** it is fixed (identity column,
- * not updatable server-side) and shown read-only. The form computes a
- * `CreateRepo`-shaped payload; the Edit screen maps it to the partial
- * `UpdateRepo` (dropping identity fields + an empty password).
+ * not updatable server-side) and shown read-only. The form emits its values;
+ * `toCreateBody` / `toUpdateBody` turn them into the request bodies. An update
+ * carries only the fields the admin changed (absent = keep); the nullable
+ * proxy fields are sent as `null` only when explicitly cleared (an emptied TTL
+ * reverts to the server default, "Remove stored credentials" clears both
+ * upstream credentials).
  *
  * Validation is inline/controlled (matching the codebase's Login form pattern):
- * a name is required and a proxy requires a `remote_url`.
+ * the name must match the server's rule ({@link validateRepoName}) and a proxy
+ * requires a `remote_url`.
  */
+
+/**
+ * The server's repository-name rule: 1–64 characters, letters, digits, `.`,
+ * `_`, `-`, starting with a letter or digit (the name is a URL path segment of
+ * the feed, `/v3/<name>/index.json`).
+ */
+export const REPO_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/**
+ * Validate a repository name; returns the inline error, or `null` when valid.
+ * `new` (any case) is reserved: it is the create screen's path segment
+ * (`/manage/repositories/new`), so a repository with that name could never
+ * be opened for editing.
+ */
+export function validateRepoName(raw: string): string | null {
+  const name = raw.trim()
+  if (name === '') return 'A repository name is required.'
+  if (name.toLowerCase() === 'new') {
+    return '"new" is reserved and cannot be used as a repository name.'
+  }
+  if (!REPO_NAME_PATTERN.test(name)) {
+    return name.length > 64
+      ? 'A repository name can be at most 64 characters long.'
+      : 'Use only letters, digits, ".", "_" and "-", starting with a letter or digit (no spaces).'
+  }
+  return null
+}
+
+/** `scheme://host[:port]` of a URL, or `null` when it does not parse. */
+function originOf(url: string | null | undefined): string | null {
+  if (!url) return null
+  try {
+    return new URL(url.trim()).origin
+  } catch {
+    return null
+  }
+}
 
 /** A draft mirrors the form fields; numbers are kept as strings while editing. */
 export interface RepoFormValues {
@@ -53,6 +99,8 @@ export interface RepoFormValues {
   upstream_username: string
   /** Newly-typed password; blank ⇒ "leave unchanged" on edit / "none" on create. */
   upstream_password: string
+  /** Edit only: "Remove stored credentials" — clear username and password. */
+  clear_credentials: boolean
   metadata_ttl_seconds: string
   not_found_ttl_seconds: string
 }
@@ -85,6 +133,7 @@ function seed(existing?: RepoView): RepoFormValues {
     upstream_username: existing?.upstream_username ?? '',
     // Never seed the password — it is write-only and redacted on read.
     upstream_password: '',
+    clear_credentials: false,
     metadata_ttl_seconds:
       existing?.metadata_ttl_seconds != null
         ? String(existing.metadata_ttl_seconds)
@@ -113,8 +162,14 @@ export function RepositoryForm({
 
   function validate(): boolean {
     const next: Record<string, string> = {}
-    if (values.name.trim() === '') {
-      next.name = 'A repository name is required.'
+    // On edit only a *changed* name is checked, so a repository created
+    // before the rule existed can still be edited without renaming it.
+    const nameError =
+      mode === 'edit' && values.name.trim() === existing?.name
+        ? null
+        : validateRepoName(values.name)
+    if (nameError) {
+      next.name = nameError
     }
     if (values.kind === 'proxy' && values.remote_url.trim() === '') {
       next.remote_url = 'A proxy repository requires a remote URL.'
@@ -139,6 +194,19 @@ export function RepositoryForm({
   const isHosted = values.kind === 'hosted'
   const isGroup = values.kind === 'group'
 
+  // Edit only: what is stored server-side for the upstream credentials.
+  const hasStoredCredentials =
+    mode === 'edit' &&
+    (!!existing?.has_upstream_password || !!existing?.upstream_username)
+  // The server drops stored credentials when the remote URL moves to a
+  // different origin without a new password (they belong to the old host).
+  const credentialsWillDrop =
+    hasStoredCredentials &&
+    !values.clear_credentials &&
+    values.upstream_password === '' &&
+    values.remote_url.trim() !== (existing?.remote_url ?? '') &&
+    originOf(values.remote_url) !== originOf(existing?.remote_url)
+
   return (
     <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
       <Field>
@@ -150,6 +218,10 @@ export function RepositoryForm({
           autoFocus={mode === 'create'}
           invalid={!!errors.name}
         />
+        <Description>
+          Part of the feed URL (<span className="font-mono">/v3/&lt;name&gt;/index.json</span>):
+          letters, digits, ".", "_" and "-", up to 64 characters.
+        </Description>
         {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
       </Field>
 
@@ -269,7 +341,18 @@ export function RepositoryForm({
               </Field>
             </div>
 
-            <Field>
+            {credentialsWillDrop && (
+              <p
+                role="status"
+                className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
+              >
+                The remote URL now points to a different host. The stored
+                upstream credentials will be dropped when you save, unless you
+                enter a new password for the new host.
+              </p>
+            )}
+
+            <Field disabled={values.clear_credentials}>
               <Label>Upstream username</Label>
               <Input
                 type="text"
@@ -279,7 +362,7 @@ export function RepositoryForm({
               />
             </Field>
 
-            <Field>
+            <Field disabled={values.clear_credentials}>
               <Label>Upstream password</Label>
               <Input
                 type="password"
@@ -298,6 +381,46 @@ export function RepositoryForm({
                   : 'Write-only. The stored secret is never shown after saving.'}
               </Description>
             </Field>
+
+            {hasStoredCredentials &&
+              (values.clear_credentials ? (
+                <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm/6 text-zinc-600 dark:text-zinc-400">
+                  <span role="status">
+                    The stored upstream username and password will be removed
+                    when you save.
+                  </span>
+                  <Button
+                    plain
+                    type="button"
+                    onClick={() =>
+                      setValues((v) => ({
+                        ...v,
+                        clear_credentials: false,
+                        upstream_username: existing?.upstream_username ?? '',
+                      }))
+                    }
+                  >
+                    Keep them
+                  </Button>
+                </p>
+              ) : (
+                <div>
+                  <Button
+                    outline
+                    type="button"
+                    onClick={() =>
+                      setValues((v) => ({
+                        ...v,
+                        clear_credentials: true,
+                        upstream_username: '',
+                        upstream_password: '',
+                      }))
+                    }
+                  >
+                    Remove stored credentials
+                  </Button>
+                </div>
+              ))}
           </FieldGroup>
         </Fieldset>
       )}
@@ -384,6 +507,66 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     }
     if (values.upstream_password !== '') {
       body.upstream_password = values.upstream_password
+    }
+  }
+  return body
+}
+
+/**
+ * Build the partial `UpdateRepo` body for an edit: only fields that differ
+ * from `existing` are sent (absent = keep). `kind` / `format` are identity
+ * columns and never sent. For the nullable proxy fields:
+ *
+ *  - a TTL emptied by the admin is sent as `null` (revert to the server
+ *    default); an untouched TTL is omitted;
+ *  - the username is sent when changed (`null` when emptied); the password
+ *    only when a new one was typed (it is write-only, so blank = keep);
+ *  - "Remove stored credentials" sends both as `null`.
+ *
+ * Changing `remote_url` to another origin without a new password makes the
+ * server drop the stored credentials (the form warns about it).
+ */
+export function toUpdateBody(
+  values: RepoFormValues,
+  existing: RepoView,
+): UpdateRepo {
+  const before = seed(existing)
+  const body: UpdateRepo = {}
+  const name = values.name.trim()
+  if (name !== existing.name) body.name = name
+  if (values.anonymous_read !== before.anonymous_read) {
+    body.anonymous_read = values.anonymous_read
+  }
+  if (values.online !== before.online) body.online = values.online
+  if (values.kind === 'hosted' && values.allow_redeploy !== before.allow_redeploy) {
+    body.allow_redeploy = values.allow_redeploy
+  }
+  if (values.kind === 'group' && values.prefer_hosted !== before.prefer_hosted) {
+    body.prefer_hosted = values.prefer_hosted
+  }
+  if (values.kind === 'proxy') {
+    const remoteUrl = values.remote_url.trim()
+    if (remoteUrl !== before.remote_url) body.remote_url = remoteUrl
+    const delay = Number(values.package_delay_seconds) || 0
+    if (delay !== existing.package_delay_seconds) {
+      body.package_delay_seconds = delay
+    }
+    for (const key of ['metadata_ttl_seconds', 'not_found_ttl_seconds'] as const) {
+      if (values[key].trim() !== before[key].trim()) {
+        body[key] = parseTtl(values[key])
+      }
+    }
+    if (values.clear_credentials) {
+      body.upstream_username = null
+      body.upstream_password = null
+    } else {
+      const username = values.upstream_username.trim()
+      if (username !== before.upstream_username.trim()) {
+        body.upstream_username = username === '' ? null : username
+      }
+      if (values.upstream_password !== '') {
+        body.upstream_password = values.upstream_password
+      }
     }
   }
   return body

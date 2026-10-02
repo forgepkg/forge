@@ -13,8 +13,9 @@ import { httpClient } from '~/lib/httpClient'
  *  - `GET /admin/repositories` returns a **bare array** of `RepoView` (no
  *    `{ total, items }` envelope — slice-1 admin list is unpaginated).
  *  - `CreateRepo` / `UpdateRepo` are the request bodies. On update an absent
- *    `upstream_password` leaves the stored secret unchanged; a present value
- *    replaces it. `kind` / `format` are not updatable.
+ *    field keeps the stored value; the nullable proxy fields (credentials,
+ *    TTLs) are cleared by an explicit `null`. `kind` / `format` are not
+ *    updatable.
  *  - `MemberView` / `AddMember` (`crates/server/src/admin/members.rs`) drive the
  *    group editor; `priority` is unique within a group (a duplicate → 409).
  *
@@ -77,9 +78,12 @@ export interface CreateRepo {
 
 /**
  * `PUT /admin/repositories/{name}` request body (`UpdateRepo`). Every field is
- * optional; an absent field keeps the stored value. An absent `upstream_password`
- * keeps the stored secret, a present one replaces it. `kind` / `format` are
- * identity columns and are not updatable.
+ * optional; an absent field keeps the stored value. For `upstream_username`,
+ * `upstream_password`, `metadata_ttl_seconds` and `not_found_ttl_seconds`:
+ * absent = keep, `null` = clear (a TTL reverts to the server default), a value
+ * = set. Changing `remote_url` to a different origin without a new
+ * `upstream_password` makes the server drop the stored credentials. `kind` /
+ * `format` are identity columns and are not updatable.
  */
 export interface UpdateRepo {
   name?: string

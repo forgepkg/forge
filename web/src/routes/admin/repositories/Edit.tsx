@@ -1,12 +1,14 @@
+import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
-import type { UpdateRepo } from '~/api/repositories'
+import type { RepoView } from '~/api/repositories'
 import {
   useRepository,
   useUpdateRepository,
 } from '~/queries/useRepositories'
 import {
   RepositoryForm,
+  toUpdateBody,
   type RepoFormValues,
 } from '~/components/RepositoryForm'
 import { Heading } from '~/components/catalyst/heading'
@@ -19,16 +21,24 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
 
 /**
  * Edit-repository screen (plan §Phase 4). Loads the (redacted) repository, seeds
- * the shared form, and PUTs a partial `UpdateRepo`. The `upstream_password` is
- * **write-only**: it is never seeded from the GET and is only included in the
- * update when the admin typed a new one (an empty field leaves the stored secret
- * unchanged — slice-1 redaction). Group repos get a link to the Members editor.
+ * the shared form, and PUTs a partial `UpdateRepo` holding only the changed
+ * fields (`toUpdateBody`). The `upstream_password` is **write-only**: it is
+ * never seeded from the GET and is only included in the update when the admin
+ * typed a new one (an empty field leaves the stored secret unchanged — slice-1
+ * redaction); "Remove stored credentials" clears it explicitly. Group repos
+ * get a link to the Members editor.
  */
 function EditRepository() {
   const { repo: name } = Route.useParams()
   const navigate = useNavigate()
   const repo = useRepository(name)
   const update = useUpdateRepository(name)
+  // The view the server returned for the last save: the form is re-seeded
+  // from it, so a typed password or a "remove credentials" choice is not
+  // re-sent by the next save.
+  const [saved, setSaved] = useState<{ view: RepoView; n: number } | null>(
+    null,
+  )
 
   if (repo.isError) {
     return (
@@ -43,9 +53,13 @@ function EditRepository() {
     return <Text>Loading repository…</Text>
   }
 
+  // (Only while it is still this repository: the route can switch params.)
+  const current = saved?.view.name === name ? saved.view : repo.data
+
   function handleSubmit(values: RepoFormValues) {
-    update.mutate(toUpdateBody(values), {
+    update.mutate(toUpdateBody(values, current), {
       onSuccess: (updated) => {
+        setSaved((prev) => ({ view: updated, n: (prev?.n ?? 0) + 1 }))
         // The name may have changed; keep the URL in sync.
         if (updated.name !== name) {
           void navigate({
@@ -84,8 +98,9 @@ function EditRepository() {
       )}
 
       <RepositoryForm
+        key={`${name}:${saved?.n ?? 0}`}
         mode="edit"
-        existing={repo.data}
+        existing={current}
         submitting={update.isPending}
         serverError={
           update.isError ? update.error.body || update.error.message : null
@@ -95,44 +110,4 @@ function EditRepository() {
       />
     </section>
   )
-}
-
-/**
- * Map form values to a partial `UpdateRepo`. `kind` / `format` are identity
- * columns and never sent. An empty `upstream_password` is omitted so the stored
- * secret is left unchanged; an empty TTL becomes `null` (server default).
- */
-function toUpdateBody(values: RepoFormValues): UpdateRepo {
-  const body: UpdateRepo = {
-    name: values.name.trim(),
-    anonymous_read: values.anonymous_read,
-    online: values.online,
-  }
-  if (values.kind === 'hosted') {
-    body.allow_redeploy = values.allow_redeploy
-  }
-  if (values.kind === 'group') {
-    body.prefer_hosted = values.prefer_hosted
-  }
-  if (values.kind === 'proxy') {
-    body.remote_url = values.remote_url.trim()
-    body.package_delay_seconds = Number(values.package_delay_seconds) || 0
-    body.metadata_ttl_seconds = parseTtl(values.metadata_ttl_seconds)
-    body.not_found_ttl_seconds = parseTtl(values.not_found_ttl_seconds)
-    body.upstream_username =
-      values.upstream_username.trim() === ''
-        ? null
-        : values.upstream_username.trim()
-    // Only replace the password when a new one was typed.
-    if (values.upstream_password !== '') {
-      body.upstream_password = values.upstream_password
-    }
-  }
-  return body
-}
-
-function parseTtl(raw: string): number | null {
-  if (raw.trim() === '') return null
-  const n = Number(raw)
-  return Number.isFinite(n) ? n : null
 }
