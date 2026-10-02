@@ -26,7 +26,7 @@ pub async fn insert_token(pool: &PgPool, new: NewToken) -> sqlx::Result<Token> {
         VALUES ($1, $2, $3, $4)
         RETURNING
             id, user_id, name, token_hash, expires_at, revoked_at,
-            last_used_at, created_at
+            last_used_at, created_at, scope
         "#,
         new.user_id,
         new.name,
@@ -45,7 +45,7 @@ pub async fn find_token_by_hash(pool: &PgPool, token_hash: &str) -> sqlx::Result
         r#"
         SELECT
             id, user_id, name, token_hash, expires_at, revoked_at,
-            last_used_at, created_at
+            last_used_at, created_at, scope
         FROM token
         WHERE token_hash = $1
         "#,
@@ -63,7 +63,7 @@ pub async fn find_token_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<Tok
         r#"
         SELECT
             id, user_id, name, token_hash, expires_at, revoked_at,
-            last_used_at, created_at
+            last_used_at, created_at, scope
         FROM token
         WHERE id = $1
         "#,
@@ -81,7 +81,7 @@ pub async fn list_tokens_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<V
         r#"
         SELECT
             id, user_id, name, token_hash, expires_at, revoked_at,
-            last_used_at, created_at
+            last_used_at, created_at, scope
         FROM token
         WHERE user_id = $1
         ORDER BY created_at

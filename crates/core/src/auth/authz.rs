@@ -30,10 +30,19 @@
 //!   admin, never remove it.
 //! * **Anonymous** — exactly the built-in `anonymous` role's grants (cached under
 //!   one shared key). On an un-migrated install that role has no grants ⇒ deny.
+//! * **Public read** — for `read` (the [`Authz::can_read`] gate and the read
+//!   package filter) every principal additionally holds the anonymous reach:
+//!   the `anonymous` role's `read` grants and the repository's
+//!   `anonymous_read` flag. Signing in therefore never loses access an
+//!   anonymous caller would have. This is added to the owner set *before* any
+//!   token scope is applied, so it is still cut down to the token's scope.
 //! * **Token-scoped** — when the principal carries a `token_id`, the token's
 //!   optional `scope` is loaded (outside the per-user cache) and **intersected**
 //!   with the owner's effective set *after* the cache lookup. A token can only
-//!   narrow, never widen.
+//!   narrow, never widen, and it holds `admin` only when its scope lists the
+//!   `admin` action explicitly; an unscoped token (`NULL` scope) is evaluated
+//!   as the default scope, i.e. the owner's set without `admin`. See
+//!   [`EffectiveSet::intersect_scope`].
 //! * **Unauthenticated** — always denied.
 //!
 //! ## Fail-closed
@@ -77,12 +86,18 @@ impl Authz {
     /// created with `anonymous_read = true` even on a fresh, default-deny RBAC
     /// install. RBAC grants are still consulted for everything else.
     ///
+    /// Authenticated principals (users, tokens, workloads) hold the same public
+    /// reach — the flag and the `anonymous` role's `read` grants — on top of
+    /// their own grants, so a signed-in user without grants is not denied a repo
+    /// an anonymous caller may read. For a token this is still intersected with
+    /// the token's scope.
+    ///
     /// Fail-closed: an evaluation error logs and denies.
     pub async fn can_read(&self, principal: &Principal, repo: &Repository) -> bool {
-        if repo.anonymous_read && matches!(principal, Principal::Anonymous { .. }) {
-            return true;
+        match self.read_effective(principal, repo).await {
+            Ok(eff) => eff.allows_repo(Action::Read, repo.id),
+            Err(()) => false,
         }
-        self.allows(principal, Action::Read, repo.id).await
     }
 
     /// May `principal` write (push / relist) to `repo`?
@@ -148,17 +163,16 @@ impl Authz {
         repo: &Repository,
         action: Action,
     ) -> PackageFilter {
-        // `anonymous_read` grants the anonymous principal full package visibility
-        // (mirrors the repo-level fast-path in `can_read`); without this, an
-        // anon-readable repo's gate would pass but every package would be
-        // filtered out on a default-deny RBAC install.
-        if action == Action::Read
-            && repo.anonymous_read
-            && matches!(principal, Principal::Anonymous { .. })
-        {
-            return PackageFilter::AllowAll;
-        }
-        match self.effective(principal).await {
+        // Reads use the same set as `can_read` (own grants + public reach,
+        // then the token scope): `anonymous_read` grants full package
+        // visibility; without it, an anon-readable repo's gate would pass but
+        // every package would be filtered out on a default-deny RBAC install.
+        let eff = if action == Action::Read {
+            self.read_effective(principal, repo).await
+        } else {
+            self.effective(principal).await
+        };
+        match eff {
             Ok(eff) => eff.package_filter_for(action, repo.id),
             Err(()) => PackageFilter::DenyAll,
         }
@@ -177,19 +191,66 @@ impl Authz {
     /// then token-scope intersection). Returns `Err(())` on any failure; the
     /// error has already been logged. The caller maps `Err` to deny.
     async fn effective(&self, principal: &Principal) -> Result<EffectiveSet, ()> {
+        self.effective_with(principal, None).await
+    }
+
+    /// The effective set for **reading** `repo`: the principal's own set plus
+    /// the public read reach (the `anonymous` role's `read` grants and
+    /// `repo.anonymous_read`), with any token scope applied *after* the union
+    /// so a token can never read beyond its scope.
+    async fn read_effective(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+    ) -> Result<EffectiveSet, ()> {
+        let flag = repo.anonymous_read.then_some(repo.id);
+        self.effective_with(principal, Some(flag)).await
+    }
+
+    /// The anonymous role's effective set (cached under one shared key).
+    async fn anonymous_set(&self) -> Result<EffectiveSet, ()> {
+        authz_cache::load_anonymous_effective(&self.pool, &self.cache)
+            .await
+            .map_err(|e| tracing::error!(error = %e, "authz anonymous load failed"))
+    }
+
+    /// Add the public read reach to an authenticated principal's own set. A
+    /// failed anonymous-set load only drops that extra reach (logged), it never
+    /// grants: the principal keeps exactly its own grants.
+    async fn add_public_read(
+        &self,
+        own: EffectiveSet,
+        anonymous_read_repo: Option<i64>,
+    ) -> EffectiveSet {
+        match self.anonymous_set().await {
+            Ok(public) => own.with_public_read(&public, anonymous_read_repo),
+            Err(()) => own.with_public_read(&EffectiveSet::empty(), anonymous_read_repo),
+        }
+    }
+
+    /// Shared body of [`Self::effective`] / [`Self::read_effective`]. With
+    /// `public_read = Some(flag)` the public read reach is added (`flag` is the
+    /// repository id when its `anonymous_read` is set), before any token scope.
+    async fn effective_with(
+        &self,
+        principal: &Principal,
+        public_read: Option<Option<i64>>,
+    ) -> Result<EffectiveSet, ()> {
         match principal {
             Principal::Unauthenticated => Ok(EffectiveSet::empty()),
             Principal::Anonymous { .. } => {
-                authz_cache::load_anonymous_effective(&self.pool, &self.cache)
-                    .await
-                    .map_err(|e| tracing::error!(error = %e, "authz anonymous load failed"))
+                let anon = self.anonymous_set().await?;
+                Ok(match public_read {
+                    Some(flag) => anon.with_public_read(&EffectiveSet::empty(), flag),
+                    None => anon,
+                })
             }
             Principal::User {
                 user_id,
                 token_id,
                 is_admin,
             } => {
-                let owner = authz_cache::load_user_effective(
+                let mut owner = authz_cache::load_user_effective(
                     &self.pool,
                     &self.cache,
                     *user_id,
@@ -197,6 +258,9 @@ impl Authz {
                 )
                 .await
                 .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
+                if let Some(flag) = public_read {
+                    owner = self.add_public_read(owner, flag).await;
+                }
 
                 match token_id {
                     None => Ok(owner),
@@ -204,15 +268,20 @@ impl Authz {
                 }
             }
             // WIF (slice 12.8): a workload is authorized purely by the single
-            // forge role its realm's claim-rules mapped it to. No `app_user`, no
-            // token scope, no dual-read admin fallback — the role's grants are
-            // the whole story (a deleted role resolves to deny-all).
+            // forge role its realm's claim-rules mapped it to (plus, for reads,
+            // the public reach every principal holds). No `app_user`, no token
+            // scope, no dual-read admin fallback — a deleted role resolves to
+            // deny-all.
             Principal::Workload { role_id, .. } => {
-                authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
+                let role = authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
                     .await
                     .map_err(
                         |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
-                    )
+                    )?;
+                Ok(match public_read {
+                    Some(flag) => self.add_public_read(role, flag).await,
+                    None => role,
+                })
             }
         }
     }
@@ -220,7 +289,9 @@ impl Authz {
     /// Load and apply a token's `scope`, intersecting it with the owner set.
     ///
     /// The scope is read **outside** the per-user cache (the cache holds the
-    /// shared owner set). `NULL` scope ⇒ no narrowing. A malformed scope is
+    /// shared owner set). `NULL` scope ⇒ the default scope: the owner's
+    /// `read` / `write` / `delete` reach, never `admin` (B4: an API token is not
+    /// an admin credential unless its scope names `admin`). A malformed scope is
     /// fail-closed: rather than fall back to the owner's full set (which would
     /// silently widen the token), the token is treated as carrying an
     /// **empty-allowlist** scope — it can touch nothing — and the error is logged.
@@ -234,7 +305,7 @@ impl Authz {
             .map_err(|e| tracing::error!(error = %e, token_id, "authz token-scope load failed"))?;
 
         match parse_token_scope(raw) {
-            Ok(None) => Ok(owner),
+            Ok(None) => Ok(owner.intersect_scope(&TokenScope::default())),
             Ok(Some(scope)) => Ok(owner.intersect_scope(&scope)),
             Err(e) => {
                 tracing::error!(error = %e, token_id, "malformed token scope; denying (fail-closed)");

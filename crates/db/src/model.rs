@@ -299,6 +299,9 @@ pub struct Token {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// The per-token privilege scope jsonb (§12.4), exactly as stored; `None`
+    /// for an unscoped token. Evaluated by `forge-core`'s `parse_token_scope`.
+    pub scope: Option<JsonValue>,
 }
 
 /// A row of `external_identity` (slice 12.2).
