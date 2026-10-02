@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM asset WHERE component_id = ANY($1)\n           RETURNING component_id, path, blob_sha256",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "component_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "component_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "blob_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "592204a0349c4fca483fb82d2336129cb1db0a4c121074b28beb1499fe334988"
+}
