@@ -39,10 +39,12 @@
 //! * **Owner members** (`group_member.owner`): by default every hosted leaf
 //!   owns ids for both guards above. Once a group flags at least one member,
 //!   only the flagged members, and the hosted leaves inside a flagged nested
-//!   group, do: only they hide proxy versions under prefer-hosted, and only
-//!   they serve ids under a reserved prefix. Someone who can push to another
-//!   hosted member (a scratch or developer feed in the same group) can then
-//!   neither publish an internal name the group serves nor take a public id
+//!   group, do. Under prefer-hosted, an id an owner has is then served by
+//!   the owners alone: neither a proxy nor another hosted member adds
+//!   versions to it. Only owners serve ids under a reserved prefix. Someone
+//!   who can push to another hosted member (a scratch or developer feed in
+//!   the same group) can then neither publish an internal name the group
+//!   serves, nor add a version to an owner's package, nor take a public id
 //!   away from its proxy.
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
@@ -203,6 +205,16 @@ impl GroupGraph {
                 .owner_leaf_ids
                 .as_ref()
                 .is_none_or(|owners| owners.contains(&leaf.id))
+    }
+
+    /// Whether `leaf` gives way under prefer-hosted once an owning hosted
+    /// leaf has the id: every proxy, and, when the group names owners, every
+    /// leaf that is not one.
+    fn yields_to_owners(&self, leaf: &Repository) -> bool {
+        match &self.owner_leaf_ids {
+            None => is_proxy(leaf),
+            Some(owners) => !owners.contains(&leaf.id),
+        }
     }
 
     /// Visible leaf ids for `package_id`, in the same package-specific stable
@@ -593,8 +605,9 @@ impl GroupRepo {
     /// The members allowed to serve `package_id`: for an id under a reserved
     /// prefix only the members that may serve it
     /// ([`GroupGraph::may_serve_reserved`]); otherwise the visible members,
-    /// minus every proxy member when the group prefers hosted packages and
-    /// **any** owning hosted leaf of the group has the id
+    /// minus every member that yields to owners
+    /// ([`GroupGraph::yields_to_owners`]) when the group prefers hosted
+    /// packages and **any** owning hosted leaf of the group has the id
     /// ([`Self::hosted_owned_ids`]) — whether or not this principal can see
     /// that leaf. A caller who cannot is then left with no serving member and
     /// gets the ordinary not-found answer. A lookup failure propagates (fail
@@ -612,15 +625,16 @@ impl GroupRepo {
                 .filter(|m| graph.may_serve_reserved(&m.repo))
                 .collect());
         }
-        if !members.iter().any(|m| is_proxy(&m.repo)) {
+        if !graph.prefer_hosted || !members.iter().any(|m| graph.yields_to_owners(&m.repo)) {
             return Ok(members);
         }
-        let hosted_only =
-            graph.prefer_hosted && !self.hosted_owned_ids(graph, &[lower]).await?.is_empty();
-        if !hosted_only {
+        if self.hosted_owned_ids(graph, &[lower]).await?.is_empty() {
             return Ok(members);
         }
-        Ok(members.into_iter().filter(|m| !is_proxy(&m.repo)).collect())
+        Ok(members
+            .into_iter()
+            .filter(|m| !graph.yields_to_owners(&m.repo))
+            .collect())
     }
 
     /// Merge member search results with the caller's package predicate pushed
@@ -644,7 +658,7 @@ impl GroupRepo {
         // `member_ops[i]` reads `graph.leaves[i]`.
         let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
         let mut by_id: BTreeMap<String, RankedHit> = BTreeMap::new();
-        let mut proxy_hits: Vec<RankedHit> = Vec::new();
+        let mut yielding_hits: Vec<RankedHit> = Vec::new();
         let mut failures = MemberFailures::default();
         for (member, leaf) in graph.leaves.iter().enumerate() {
             let ops = self.factory.ops_for(leaf)?;
@@ -673,24 +687,24 @@ impl GroupRepo {
                 {
                     continue;
                 }
-                if is_proxy(leaf) && graph.prefer_hosted {
+                if graph.prefer_hosted && graph.yields_to_owners(leaf) {
                     // Decided below against every owning hosted leaf of the group.
-                    proxy_hits.push(ranked);
+                    yielding_hits.push(ranked);
                     continue;
                 }
                 insert_ranked(&mut by_id, ranked);
             }
         }
         failures.into_result()?;
-        if !proxy_hits.is_empty() {
-            let candidates: Vec<String> = proxy_hits
+        if !yielding_hits.is_empty() {
+            let candidates: Vec<String> = yielding_hits
                 .iter()
                 .map(|ranked| self.lower_id(&ranked.hit.original_id))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
             let owned = self.hosted_owned_ids(&graph, &candidates).await?;
-            for ranked in proxy_hits {
+            for ranked in yielding_hits {
                 if !owned.contains(&self.lower_id(&ranked.hit.original_id)) {
                     insert_ranked(&mut by_id, ranked);
                 }

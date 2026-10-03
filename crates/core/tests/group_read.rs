@@ -1824,6 +1824,16 @@ async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
     .await;
     seed_version(&pool, &mut blobs, dev.id, "Acme.Internal", "99.0.0", "dev").await;
     seed_version(&pool, &mut blobs, dev.id, "Sample", "1.0.0", "dev-sample").await;
+    seed_version(
+        &pool,
+        &mut blobs,
+        releases.id,
+        "Contoso.Lib",
+        "1.0.0",
+        "lib",
+    )
+    .await;
+    seed_version(&pool, &mut blobs, dev.id, "Contoso.Lib", "9.0.0", "dev-lib").await;
 
     // No owner flagged: every hosted member is trusted (the old behaviour).
     let g = mixed_group_repo(
@@ -1840,6 +1850,10 @@ async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
         sorted_versions(&g, &group.name, "sample").await,
         ["1.0.0"],
         "dev claims the public id"
+    );
+    assert_eq!(
+        sorted_versions(&g, &group.name, "contoso.lib").await,
+        ["1.0.0", "9.0.0"]
     );
 
     // `releases` owns the group's ids.
@@ -1884,6 +1898,34 @@ async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
         .find(|hit| hit.original_id.eq_ignore_ascii_case("acme.internal"))
         .expect("the owner's package is found");
     assert_eq!(internal.latest_version, "1.0.0");
+    // An id the owner has, outside the reserved prefixes: dev cannot add a
+    // version to it either, in any read.
+    assert_eq!(
+        sorted_versions(&g, &group.name, "contoso.lib").await,
+        ["1.0.0"]
+    );
+    assert!(g
+        .resolve_nupkg(&group.name, "contoso.lib", "9.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    let hits = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "contoso".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .hits;
+    let lib = hits
+        .iter()
+        .find(|hit| hit.original_id.eq_ignore_ascii_case("contoso.lib"))
+        .expect("the owner's package is found");
+    assert_eq!(lib.latest_version, "1.0.0");
+    assert_eq!(lib.versions.len(), 1, "{lib:?}");
 
     // A flagged nested group: its hosted leaves own ids too.
     let inner = seed_group(&pool).await;

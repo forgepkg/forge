@@ -341,13 +341,18 @@ First production release.
 - The AES-GCM and XChaCha20-Poly1305 key schedules and the decoded root key
   are wiped from memory after use.
 - With `auto_provision = false`, a credential-forwarding realm that maps an
-  admin group now applies an upstream admin demotion too (flag, `admin`
-  role, sessions ended). Before, a demoted user kept signing in as an admin.
+  admin group now applies the upstream admin verdict to existing accounts
+  in both directions, as with auto-provisioning: a user removed from the
+  admin group upstream loses the flag and the `admin` role and is signed
+  out; before, they kept signing in as an admin. A user added to that group
+  upstream becomes an admin at their next login, where before they did not.
 - A group can name the members that own its package ids
-  (`group_member.owner`). Once any member is flagged, only owners hide proxy
-  versions under `prefer_hosted` and serve ids under `reserved_prefixes`, so
-  a writer of a developer feed in the same group can no longer publish an
-  internal name or take a public id away from the proxy. An owner must be
+  (`group_member.owner`). Once any member is flagged, only owners claim ids:
+  with `prefer_hosted`, an id an owner has is served by the owners alone (no
+  proxy or other hosted member adds versions to it), and only owners serve
+  ids under `reserved_prefixes`. A writer of a developer feed in the same
+  group can no longer publish an internal name, add a version to an owner's
+  package, or take a public id away from the proxy. An owner must be
   unflagged before it can be removed from the group or deleted, so a group
   never falls back to trusting every member unnoticed; the web UI marks
   owners.
@@ -457,6 +462,7 @@ First production release.
 - Repository updates: an absent field keeps its value, JSON `null` clears it.
 - New settings: `auth.password_verify_concurrency`,
   `auth.credential_forward_max_concurrent`, `server.allowed_hosts`,
+  `crypto.accept_row_bound_secrets`,
   `outbox.processed_retention_seconds`, `retention.audit_retention_seconds`,
   `server.staging_dir`, `server.max_staging_bytes`, and the `[nuget]`
   archive limits. New endpoints: `PATCH /admin/users/{id}`,
@@ -595,7 +601,9 @@ First production release.
   equally: anyone who can push to any hosted member can publish under the
   group's `reserved_prefixes`, and with `prefer_hosted` can claim any
   public package id for the whole group. Flag the trusted members as owners
-  when a group mixes feeds with different writers.
+  when a group mixes feeds with different writers. Owners claim only the
+  ids they have: an id no owner has is still served by every member, so
+  reserve the internal prefixes as well.
 - While Redis is unreachable, an instance hears no invalidations from the
   others and converges by TTL (60 s for authorization).
 - Login lockouts and failure counts are per instance and lost on restart
