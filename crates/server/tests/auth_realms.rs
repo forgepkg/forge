@@ -321,13 +321,18 @@ async fn admin_realm_crud_with_write_only_secrets() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
-    // Valid create → 201; the secret comes back redacted.
+    // Valid create → 201; the secret comes back redacted. Created disabled:
+    // the tests of this binary share one database, and an enabled realm for
+    // an unresolvable upstream would join their login chains, turning their
+    // failed logins into uncounted outages (the lockout tests then saw 401
+    // instead of 429).
     let resp = client
         .post(format!("{}/admin/realms", srv.base_url))
         .basic_auth(&admin, Some(&password))
         .json(&json!({
             "kind": "credential_forwarding",
             "name": name,
+            "enabled": false,
             "config": { "url": "https://nexus.internal/status", "key_pepper": "s3cret" }
         }))
         .send()
