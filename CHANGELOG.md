@@ -187,6 +187,12 @@ The release workflow publishes the section whose heading matches the tag
   `.nuspec` or `<metadata>` could be taken for the manifest, so Forge and a
   NuGet client could see different identities for one package — enough to
   publish past an id-scoped grant.
+- Request bounds on the feed: a search `q` is cut to 256 bytes and at most
+  8 distinct terms (each term costs a substring scan per candidate id, and
+  `q` was unbounded), and a push whose multipart body does not reach its
+  package part's headers within 64 KiB is refused with 400 (the parser
+  buffered everything before the first boundary in memory, up to the whole
+  upload limit).
 
 ## [0.1.0]
 

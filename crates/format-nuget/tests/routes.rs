@@ -1148,6 +1148,41 @@ async fn put_multipart(
     (status, out)
 }
 
+/// The multipart parser buffers everything before the first part in memory:
+/// a body that does not reach its first part's headers within 64 KiB is
+/// refused (it used to be buffered up to the whole upload limit).
+#[tokio::test]
+async fn push_with_an_oversized_multipart_preamble_is_refused() {
+    let w = MockWrite::found();
+    let last = w.last_upload.clone();
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let boundary = "TESTBOUNDARY1234";
+    let mut body = vec![b'x'; 1024 * 1024];
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"package\"; filename=\"p.nupkg\"\r\n\r\n",
+    );
+    body.extend_from_slice(b"PK\x03\x04-nupkg-bytes");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/package")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("X-NuGet-ApiKey", "key")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(last.lock().unwrap().as_ref().is_none_or(Vec::is_empty));
+
+    // A short preamble is still fine.
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"PK\x03\x04").await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn publish_routes_present_for_hosted_only() {
     // Proxy repos do not mount /package; PUT yields 405 (method not allowed) on

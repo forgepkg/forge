@@ -244,9 +244,33 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
-    /// Parse a raw `q` value.
+    /// Longest `q` honored, in bytes; the rest is ignored. Real queries are a
+    /// few words; an unbounded one made every candidate id pay one substring
+    /// scan per term.
+    pub const MAX_QUERY_BYTES: usize = 256;
+    /// Most distinct terms, and most `packageid:` values, a query keeps.
+    pub const MAX_TERMS: usize = 8;
+
+    /// Parse a raw `q` value (bounded by [`Self::MAX_QUERY_BYTES`] and
+    /// [`Self::MAX_TERMS`]; repeated terms count once).
     pub fn parse(q: &str) -> Self {
+        let q = if q.len() > Self::MAX_QUERY_BYTES {
+            let mut end = Self::MAX_QUERY_BYTES;
+            while !q.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Drop the token the cut split, unless it is the only one.
+            let cut = &q[..end];
+            cut.rfind(char::is_whitespace).map_or(cut, |at| &cut[..at])
+        } else {
+            q
+        };
         let mut out = SearchQuery::default();
+        let keep = |list: &mut Vec<String>, value: String| {
+            if list.len() < Self::MAX_TERMS && !list.contains(&value) {
+                list.push(value);
+            }
+        };
         for token in q.split_whitespace() {
             // Lowered like stored ids (the format's `lower_id`), so `Ünicode`
             // finds `ünicode.lib`.
@@ -256,11 +280,11 @@ impl SearchQuery {
             }
             match token.split_once(':') {
                 Some(("packageid", value)) if !value.is_empty() => {
-                    out.exact_ids.push(value.to_string())
+                    keep(&mut out.exact_ids, value.to_string())
                 }
-                Some((_, value)) if !value.is_empty() => out.terms.push(value.to_string()),
+                Some((_, value)) if !value.is_empty() => keep(&mut out.terms, value.to_string()),
                 Some(_) => {}
-                None => out.terms.push(token),
+                None => keep(&mut out.terms, token),
             }
         }
         out
@@ -726,6 +750,16 @@ mod search_query_tests {
         assert_eq!(q.terms, ["json", "serializer"]);
 
         assert!(SearchQuery::parse("   ").is_empty());
+
+        // Bounded: a huge or repetitive `q` keeps a few distinct terms.
+        let q = SearchQuery::parse(&"a b c d e f g h i j k l ".repeat(5_000));
+        assert_eq!(q.terms.len(), SearchQuery::MAX_TERMS);
+        let q = SearchQuery::parse(&"same ".repeat(1_000));
+        assert_eq!(q.terms, ["same"]);
+        let q = SearchQuery::parse(&"ü".repeat(10_000));
+        assert!(q.terms[0].len() <= SearchQuery::MAX_QUERY_BYTES);
+        let q = SearchQuery::parse(&"packageid:x ".repeat(100));
+        assert_eq!(q.exact_ids, ["x"]);
         assert!(SearchQuery::parse("").matches("anything"));
         assert_eq!(SearchQuery::parse("a bcd").prefilter(), Some("bcd"));
         assert_eq!(SearchQuery::parse("packageid:x.y").prefilter(), Some("x.y"));
