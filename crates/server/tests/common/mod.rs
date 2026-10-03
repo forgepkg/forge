@@ -223,6 +223,10 @@ pub struct TestServer {
     pub state: AppState,
     pub admin_user: Option<String>,
     pub admin_pass: Option<String>,
+    /// An admin-scoped API token of the bootstrap admin (`{"actions":
+    /// ["admin"]}`): the admin API refuses a password sent over Basic, so
+    /// [`TestServer::admin_basic`] carries this in the password field.
+    pub admin_scoped_token: Option<String>,
     handle: tokio::task::JoinHandle<()>,
     workers: Option<WorkerHandles>,
 }
@@ -343,15 +347,50 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .ok();
     });
 
+    let admin_scoped_token = match &opts.bootstrap_admin {
+        Some((username, _)) => mint_admin_scoped_token(&pool, username).await,
+        None => None,
+    };
+
     TestServer {
         base_url: format!("http://{addr}"),
         pool,
         state,
         admin_user: opts.bootstrap_admin.as_ref().map(|(u, _)| u.clone()),
         admin_pass: opts.bootstrap_admin.as_ref().map(|(_, p)| p.clone()),
+        admin_scoped_token,
         handle,
         workers,
     }
+}
+
+/// Mint (directly in the database) an admin-scoped API token for `username`;
+/// `None` when no such account exists (a bootstrap admin that was not created).
+pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<String> {
+    let user = forge_db::user_dao::find_user_by_username(pool, username)
+        .await
+        .expect("admin lookup")?;
+    let secret = forge_core::auth::generate_token_secret();
+    let token = forge_db::token_dao::insert_token(
+        pool,
+        forge_db::token_dao::NewToken {
+            user_id: user.id,
+            name: "test-admin".into(),
+            token_hash: forge_core::auth::hash_token(&secret),
+            expires_at: None,
+            minted_with_forwarded_credential: false,
+        },
+    )
+    .await
+    .expect("insert admin token");
+    forge_db::token_dao::set_token_scope(
+        pool,
+        token.id,
+        Some(&serde_json::json!({ "actions": ["admin"] })),
+    )
+    .await
+    .expect("scope admin token");
+    Some(secret)
 }
 
 /// Start a server with a **unique** bootstrap admin (so parallel tests sharing
@@ -369,14 +408,88 @@ pub async fn start() -> TestServer {
     .await
 }
 
+/// A browser session for tests: the cookie pair plus its CSRF token.
+#[derive(Clone, Debug)]
+pub struct BrowserSession {
+    /// `forge_session=<secret>`.
+    pub cookie: String,
+    /// The session's double-submit CSRF token.
+    pub csrf: String,
+}
+
+impl BrowserSession {
+    /// Attach the session cookie and CSRF header to a request.
+    pub fn apply(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        rb.header("cookie", &self.cookie)
+            .header("x-csrf-token", &self.csrf)
+    }
+}
+
 impl TestServer {
+    /// Sign `username` in through `/auth/login` (password realms).
+    pub async fn login(&self, username: &str, password: &str) -> BrowserSession {
+        let resp = self
+            .client()
+            .post(format!("{}/auth/login", self.base_url))
+            .json(&serde_json::json!({"username": username, "password": password}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "login of {username}");
+        let cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        BrowserSession {
+            cookie,
+            csrf: body["csrf_token"].as_str().expect("csrf").to_string(),
+        }
+    }
+
+    /// Mint a browser session for `user_id` directly (for accounts without a
+    /// local password, e.g. credential-forwarding users).
+    pub async fn session_for(&self, user_id: i64) -> BrowserSession {
+        let issued = self
+            .state
+            .sessions
+            .create_for_user(user_id, None, None)
+            .await
+            .expect("create session");
+        BrowserSession {
+            cookie: format!(
+                "{}={}",
+                forge_core::auth::SESSION_COOKIE,
+                issued.cookie_secret
+            ),
+            csrf: issued.session.csrf_secret,
+        }
+    }
+
     /// A reqwest client (no default auth).
     pub fn client(&self) -> reqwest::Client {
         reqwest::Client::new()
     }
 
-    /// Basic-auth header value for the bootstrap admin.
+    /// Basic credentials for the bootstrap admin: its username and an
+    /// **admin-scoped token** in the password field (the admin API refuses a
+    /// password sent over Basic). For the real password use
+    /// [`TestServer::admin_password_basic`].
     pub fn admin_basic(&self) -> (String, String) {
+        (
+            self.admin_user.clone().expect("admin user"),
+            self.admin_scoped_token.clone().expect("admin token"),
+        )
+    }
+
+    /// The bootstrap admin's username and real password.
+    pub fn admin_password_basic(&self) -> (String, String) {
         (
             self.admin_user.clone().expect("admin user"),
             self.admin_pass.clone().expect("admin pass"),

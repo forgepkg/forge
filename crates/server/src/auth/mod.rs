@@ -527,6 +527,7 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
             user_id: u.id,
             token_id: None,
             is_admin: u.is_admin,
+            method: forge_core::auth::AuthMethod::Session,
         })
         .await;
     Json(AuthMe {
@@ -621,6 +622,9 @@ async fn create_token(
         name: body.name,
         token_hash,
         expires_at: body.expires_at,
+        // An upstream-basic account's session came from credential
+        // forwarding; an admin-forced reauth revokes such tokens.
+        minted_with_forwarded_credential: user.auth_source == "upstream-basic",
     };
     match token_dao::insert_token(&state.pool, new).await {
         Ok(t) => (

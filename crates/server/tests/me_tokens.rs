@@ -1,8 +1,8 @@
 //! E2E: self-service token management (`/admin/me/tokens`).
 //!
 //! Any signed-in user manages their **own** tokens without admin rights; the
-//! routes require a password/realm-authenticated principal (a token cannot
-//! mint or revoke tokens), and one user can never touch another user's tokens.
+//! routes require a browser session (neither a token nor a password sent over
+//! Basic can mint or revoke tokens), and one user can never touch another user's tokens.
 
 mod common;
 
@@ -30,11 +30,11 @@ async fn self_token_lifecycle() {
     let srv = common::start().await;
     let client = srv.client();
     let (u, p) = make_user(&srv).await;
+    let sess_u = srv.login(&u, &p).await;
 
     // Mint: 201 with the one-time plaintext.
-    let resp = client
-        .post(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let resp = sess_u
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
         .json(&json!({"name": "my-laptop"}))
         .send()
         .await
@@ -58,9 +58,8 @@ async fn self_token_lifecycle() {
     assert_eq!(me["user"]["username"], json!(u));
 
     // List: metadata only, never the secret or hash.
-    let resp = client
-        .get(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let resp = sess_u
+        .apply(client.get(format!("{}/admin/me/tokens", srv.base_url)))
         .send()
         .await
         .unwrap();
@@ -81,16 +80,14 @@ async fn self_token_lifecycle() {
     );
 
     // Revoke own token: 204, then a second revoke is 404.
-    let resp = client
-        .delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let resp = sess_u
+        .apply(client.delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url)))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let resp = client
-        .delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let resp = sess_u
+        .apply(client.delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url)))
         .send()
         .await
         .unwrap();
@@ -162,10 +159,11 @@ async fn cannot_revoke_foreign_token() {
     let client = srv.client();
     let (owner_u, owner_p) = make_user(&srv).await;
     let (other_u, other_p) = make_user(&srv).await;
+    let sess_owner_u = srv.login(&owner_u, &owner_p).await;
+    let sess_other_u = srv.login(&other_u, &other_p).await;
 
-    let resp = client
-        .post(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&owner_u, Some(&owner_p))
+    let resp = sess_owner_u
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
         .json(&json!({"name": "owned"}))
         .send()
         .await
@@ -174,18 +172,16 @@ async fn cannot_revoke_foreign_token() {
     let created: Value = resp.json().await.unwrap();
     let token_id = created["id"].as_i64().unwrap();
 
-    let resp = client
-        .delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url))
-        .basic_auth(&other_u, Some(&other_p))
+    let resp = sess_other_u
+        .apply(client.delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url)))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404, "foreign token id must answer 404");
 
     // The owner's token is still active and revocable by the owner.
-    let resp = client
-        .delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url))
-        .basic_auth(&owner_u, Some(&owner_p))
+    let resp = sess_owner_u
+        .apply(client.delete(format!("{}/admin/me/tokens/{token_id}", srv.base_url)))
         .send()
         .await
         .unwrap();
@@ -199,24 +195,23 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
     let srv = common::start().await;
     let client = srv.client();
     let (u, p) = make_user(&srv).await;
+    let sess_u = srv.login(&u, &p).await;
 
     for body in [
         json!({"name": "typo", "scope": {"repos": [1]}}),
         json!({"name": "typo", "scope": {"actions": ["read"], "repository": [1]}}),
         json!({"name": "typo", "scop": {"actions": ["read"]}}),
     ] {
-        let resp = client
-            .post(format!("{}/admin/me/tokens", srv.base_url))
-            .basic_auth(&u, Some(&p))
+        let resp = sess_u
+            .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
             .json(&body)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "{body}");
     }
-    let listed: Value = client
-        .get(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let listed: Value = sess_u
+        .apply(client.get(format!("{}/admin/me/tokens", srv.base_url)))
         .send()
         .await
         .unwrap()
@@ -228,9 +223,8 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
         "no token was issued for a rejected scope"
     );
 
-    let resp = client
-        .post(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let resp = sess_u
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
         .json(&json!({"name": "ro", "scope": {"actions": ["read"]}}))
         .send()
         .await
@@ -238,9 +232,8 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
     assert_eq!(resp.status(), 201);
     let created: Value = resp.json().await.unwrap();
     assert_eq!(created["scope"], json!({"actions": ["read"]}));
-    let listed: Value = client
-        .get(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let listed: Value = sess_u
+        .apply(client.get(format!("{}/admin/me/tokens", srv.base_url)))
         .send()
         .await
         .unwrap()
@@ -256,10 +249,10 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
 async fn admin_scoped_token_cannot_manage_own_tokens() {
     let srv = common::start().await;
     let client = srv.client();
-    let (u, p) = srv.admin_basic();
-    let created: Value = client
-        .post(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&u, Some(&p))
+    let (u, p) = srv.admin_password_basic();
+    let sess_u = srv.login(&u, &p).await;
+    let created: Value = sess_u
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
         .json(&json!({"name": "automation", "scope": {"actions": ["admin"]}}))
         .send()
         .await

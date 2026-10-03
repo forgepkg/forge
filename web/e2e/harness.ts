@@ -160,28 +160,27 @@ function startServer() {
   })
 }
 
-/** Basic-auth header for the bootstrap admin. */
-function adminAuthHeader(): string {
-  const b64 = Buffer.from(`${ADMIN_USER}:${ADMIN_PASS}`).toString('base64')
-  return `Basic ${b64}`
-}
-
-/** Mint an admin API token, mirroring the slice-1 Rust harness flow. */
+/**
+ * Mint an admin-scoped API token for the bootstrap admin. The admin API
+ * refuses a password sent over HTTP Basic, so sign in through `/auth/login`
+ * (session cookie + CSRF token) and mint the token from that session.
+ */
 async function mintAdminToken(): Promise<string> {
-  const auth = adminAuthHeader()
-  const usersRes = await fetch(`${BASE_URL}/admin/users`, {
-    headers: { authorization: auth },
-  })
-  if (!usersRes.ok) throw new Error(`GET /admin/users -> ${usersRes.status}`)
-  const users: Array<{ id: number; username: string }> = await usersRes.json()
-  const admin = users.find((u) => u.username === ADMIN_USER)
-  if (!admin) throw new Error('bootstrap admin user not found')
-  const tokRes = await fetch(`${BASE_URL}/admin/users/${admin.id}/tokens`, {
+  const login = await fetch(`${BASE_URL}/auth/login`, {
     method: 'POST',
-    headers: { authorization: auth, 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'e2e' }),
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASS }),
   })
-  if (!tokRes.ok) throw new Error(`POST tokens -> ${tokRes.status}`)
+  if (!login.ok) throw new Error(`POST /auth/login -> ${login.status}`)
+  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]
+  const { csrf_token: csrf }: { csrf_token: string } = await login.json()
+  if (!cookie || !csrf) throw new Error('login returned no session')
+  const tokRes = await fetch(`${BASE_URL}/admin/me/tokens`, {
+    method: 'POST',
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'e2e', scope: { actions: ['admin'] } }),
+  })
+  if (!tokRes.ok) throw new Error(`POST /admin/me/tokens -> ${tokRes.status}`)
   const body: { token: string } = await tokRes.json()
   if (!body.token) throw new Error('token response missing plaintext token')
   return body.token

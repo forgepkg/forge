@@ -377,6 +377,7 @@ mod tests {
                     user_id: 1,
                     token_id: None,
                     is_admin: true,
+                    method: forge_core::auth::AuthMethod::Password,
                 })
             } else {
                 SourceOutcome::NoCredentials
@@ -463,6 +464,7 @@ mod tests {
                     user_id: 2,
                     token_id: Some(9),
                     is_admin: false,
+                    method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
             }),
@@ -565,6 +567,7 @@ mod tests {
                 user_id: 1,
                 token_id: None,
                 is_admin: true,
+                method: forge_core::auth::AuthMethod::Password,
             }),
             require_header: true,
         })];
@@ -700,6 +703,7 @@ mod tests {
                     user_id: 1,
                     token_id: Some(2),
                     is_admin: false,
+                    method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
             })],
@@ -787,6 +791,7 @@ mod tests {
             user_id: 1,
             token_id: Some(2),
             is_admin: true,
+            method: forge_core::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
             outcome: SourceOutcome::Authenticated(authed),

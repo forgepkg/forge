@@ -24,8 +24,13 @@
 //! token's scope lists the `admin` action explicitly (and does not restrict
 //! repositories) — e.g. `{"actions": ["admin"]}` for automation. An unscoped
 //! token of an admin account gets 403 here (it keeps the owner's
-//! read/write/delete reach on the feed). Password and session principals are
-//! unaffected.
+//! read/write/delete reach on the feed).
+//!
+//! **Passwords and `/admin/*`.** A password sent over HTTP Basic is refused
+//! here (403) even for an administrator: NuGet clients store that password
+//! and replay it on every feed request, and with credential forwarding it is
+//! the upstream directory's password. Administration takes a browser session
+//! (sign in through `/auth/login` or OIDC) or an admin-scoped token.
 
 pub mod content_selectors;
 pub mod crypto;
@@ -48,7 +53,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use forge_core::auth::principal::Principal;
+use forge_core::auth::principal::{AuthMethod, Principal};
 
 use crate::middleware::principal_of;
 use crate::state::AppState;
@@ -82,6 +87,19 @@ pub async fn require_admin(
     match principal {
         Principal::Anonymous { .. } | Principal::Unauthenticated => {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        }
+        // A password replayed over HTTP Basic is a feed credential, never an
+        // admin login (see the module docs).
+        Principal::User {
+            method: AuthMethod::Password,
+            ..
+        } => {
+            return (
+                StatusCode::FORBIDDEN,
+                "the admin API needs a signed-in session or an admin-scoped API token; \
+                 a password sent over HTTP Basic is not accepted here",
+            )
+                .into_response();
         }
         // A user or a WIF workload may hold the admin role; the RBAC check below
         // is authoritative.

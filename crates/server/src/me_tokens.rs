@@ -9,8 +9,10 @@
 //! * Tokens are credentials for the package feed / API — they are **not** a way
 //!   to sign in to the UI, and a token must not be able to mint further tokens
 //!   (otherwise revoking one would not cut off access). Every route here
-//!   therefore requires a principal authenticated by **password or realm
-//!   session** (`token_id == None`); token-authenticated callers get 403.
+//!   therefore requires a **browser session** ([`AuthMethod::Session`]):
+//!   token-authenticated callers get 403, and so does a password sent over
+//!   HTTP Basic — a password that NuGet clients store and replay on every feed
+//!   request must not be able to mint long-lived credentials.
 //! * Cookie-authenticated mutations are CSRF-checked by the principal
 //!   middleware (`X-CSRF-Token`); `POST` also requires a JSON content type.
 //! * Reuses the admin token DTOs: the plaintext secret is returned exactly once
@@ -24,31 +26,43 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
-use forge_core::auth::principal::Principal;
+use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_db::token_dao::{self, NewToken};
+use forge_db::user_dao;
 
 use crate::admin::db_error;
 use crate::admin::tokens::{store_scope, CreateToken, CreatedToken, TokenView};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Resolve the calling user id, enforcing the "session or password, never a
-/// token" rule. Returns the user id or the (boxed, to keep the `Err` variant
-/// small) error response to send.
+/// Resolve the calling user id, enforcing the "browser session only" rule.
+/// Returns the user id or the (boxed, to keep the `Err` variant small) error
+/// response to send.
 fn session_user_of<B>(req: &axum::http::Request<B>) -> Result<i64, Box<Response>> {
     match principal_of(req) {
         Principal::User {
             user_id,
-            token_id: None,
+            method: AuthMethod::Session,
             ..
         } => Ok(user_id),
         Principal::User {
-            token_id: Some(_), ..
+            method: AuthMethod::Token,
+            ..
         } => Err(Box::new(
             (
                 StatusCode::FORBIDDEN,
                 "tokens cannot manage tokens; sign in with your password or identity provider",
+            )
+                .into_response(),
+        )),
+        Principal::User {
+            method: AuthMethod::Password,
+            ..
+        } => Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "tokens are managed from a signed-in session; a password sent over HTTP Basic cannot mint them",
             )
                 .into_response(),
         )),
@@ -101,6 +115,13 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid body: {e}")).into_response(),
     };
 
+    // A session of an upstream-basic account was established by credential
+    // forwarding: such a token must not outlive an admin-forced reauth.
+    let forwarded = match user_dao::find_user_by_id(&state.pool, user_id).await {
+        Ok(Some(user)) => user.auth_source == "upstream-basic",
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+        Err(e) => return db_error(e),
+    };
     let secret = generate_token_secret();
     let token_hash = hash_token(&secret);
     let new = NewToken {
@@ -108,6 +129,7 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
         name: body.name.clone(),
         token_hash,
         expires_at: body.expires_at,
+        minted_with_forwarded_credential: forwarded,
     };
     let t = match token_dao::insert_token(&state.pool, new).await {
         Ok(t) => t,

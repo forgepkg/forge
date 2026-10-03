@@ -50,7 +50,7 @@ fn clears_session_cookie(resp: &reqwest::Response) -> bool {
 #[tokio::test]
 async fn dead_session_cookie_does_not_lock_out_login_and_is_cleared() {
     let srv = common::start().await;
-    let (admin, password) = srv.admin_basic();
+    let (admin, password) = srv.admin_password_basic();
     let client = srv.client();
 
     // Log in, then revoke the session server-side (the same end state as an
@@ -104,7 +104,7 @@ async fn dead_session_cookie_does_not_lock_out_login_and_is_cleared() {
     let resp = client
         .post(format!("{}/auth/login", srv.base_url))
         .header("cookie", &cookie)
-        .json(&json!({ "username": admin, "password": password }))
+        .json(&json!({ "username": admin, "password": srv.admin_pass.as_deref().unwrap() }))
         .send()
         .await
         .unwrap();
@@ -193,10 +193,10 @@ async fn removing_the_admin_role_revokes_admin() {
         .expect("admin created via the API holds the admin role");
     let admin_role_id = admin_role["id"].as_i64().unwrap();
 
+    let session = srv.login(&username, "pw-second").await;
     let as_user = |path: &str| {
-        client
-            .get(format!("{}{path}", srv.base_url))
-            .basic_auth(&username, Some("pw-second"))
+        session
+            .apply(client.get(format!("{}{path}", srv.base_url)))
             .send()
     };
     assert_eq!(as_user("/admin/users").await.unwrap().status(), 200);

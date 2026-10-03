@@ -17,6 +17,24 @@ pub struct UserPrincipal {
     pub is_admin: bool,
 }
 
+/// How a [`Principal::User`] proved its identity on this request.
+///
+/// Recorded so that endpoints can demand a particular kind of credential: the
+/// admin API and token minting accept a browser session (or, for the admin
+/// API, an explicitly admin-scoped token) but never a password replayed over
+/// HTTP Basic — a password that NuGet clients store and send on every feed
+/// request must not double as an administrator login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// An API token (`X-NuGet-ApiKey`, or the password field of HTTP Basic).
+    Token,
+    /// A password sent with the request over HTTP Basic, verified by the
+    /// password chain (locally or by credential forwarding).
+    Password,
+    /// A browser session cookie, minted by an interactive login.
+    Session,
+}
+
 /// Who is making a request, after credential resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Principal {
@@ -35,6 +53,8 @@ pub enum Principal {
         token_id: Option<i64>,
         /// Admin flag.
         is_admin: bool,
+        /// The kind of credential that authenticated this request.
+        method: AuthMethod,
     },
     /// A verified **workload** (slice 12.8, WIF): a non-interactive CI/automation
     /// caller authenticated by a validated OIDC `id_token` (no `app_user` row,
@@ -71,12 +91,27 @@ pub enum Principal {
 }
 
 impl Principal {
-    /// Build a [`Principal::User`] from a [`UserPrincipal`].
+    /// Build a [`Principal::User`] from a [`UserPrincipal`] verified on this
+    /// request: [`AuthMethod::Token`] when a token was used, else
+    /// [`AuthMethod::Password`].
     pub fn from_user(u: UserPrincipal) -> Self {
         Principal::User {
             user_id: u.user_id,
             token_id: u.token_id,
             is_admin: u.is_admin,
+            method: if u.token_id.is_some() {
+                AuthMethod::Token
+            } else {
+                AuthMethod::Password
+            },
+        }
+    }
+
+    /// The [`AuthMethod`] of a user principal (`None` otherwise).
+    pub fn auth_method(&self) -> Option<AuthMethod> {
+        match self {
+            Principal::User { method, .. } => Some(*method),
+            _ => None,
         }
     }
 
@@ -103,6 +138,7 @@ mod tests {
                 user_id: 7,
                 token_id: Some(3),
                 is_admin: true,
+                method: AuthMethod::Token
             }
         );
     }
@@ -112,7 +148,8 @@ mod tests {
         assert!(Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false
+            is_admin: false,
+            method: AuthMethod::Password
         }
         .is_user());
         assert!(!Principal::Unauthenticated.is_user());

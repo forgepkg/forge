@@ -158,15 +158,23 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 cargo xtask up                # infra only
 SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 
-# create a hosted repo (admin API uses HTTP Basic; allow_password_basic=true in forge.toml)
-curl -u admin:changeme -X POST localhost:8421/admin/repositories \
+# sign in: the admin API takes a session (or an admin-scoped token), never a
+# password over HTTP Basic. Keep the cookie and echo the CSRF token.
+CSRF=$(curl -sc /tmp/forge.jar localhost:8421/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"changeme"}' | sed 's/.*"csrf_token":"\([^"]*\)".*/\1/')
+
+# create a hosted repo
+curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/repositories \
   -H 'content-type: application/json' \
   -d '{"name":"nuget","kind":"hosted","anonymous_read":true}'
 
-# mint a push token (admin is user id 1)
-curl -u admin:changeme -X POST localhost:8421/admin/users/1/tokens \
+# mint a push token for yourself
+curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
+# For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
+# and send it as the Basic password (curl -u admin:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
 curl -X PUT localhost:8421/v3/nuget/package \

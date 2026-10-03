@@ -45,7 +45,7 @@ pub use local_password::{LimiterSaturated, LocalPasswordProvider, PasswordHashLi
 pub use login_throttle::{
     username_for_log, AttemptRefused, LoginAttempt, LoginThrottle, MAX_USERNAME_BYTES,
 };
-pub use principal::{Principal, UserPrincipal};
+pub use principal::{AuthMethod, Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
 pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
 pub use token::{

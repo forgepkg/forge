@@ -282,6 +282,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
             name: format!("tok-{}", common::unique()),
             token_hash: hash_token(&secret),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await
@@ -328,6 +329,7 @@ async fn basic_revoked_token_falls_through_to_password_chain() {
             name: format!("tok-{}", common::unique()),
             token_hash: hash_token(&secret),
             expires_at: Some(Utc::now() + ChronoDuration::hours(1)),
+            minted_with_forwarded_credential: false,
         },
     )
     .await

@@ -139,6 +139,7 @@ async fn user(pool: &PgPool) -> Principal {
         user_id: u.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     }
 }
 
@@ -718,6 +719,7 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         user_id: account.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
     let g = group_repo(&pool, blobs.clone(), principal);
 
@@ -1497,6 +1499,7 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
         user_id: account.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
 
     let g = mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));

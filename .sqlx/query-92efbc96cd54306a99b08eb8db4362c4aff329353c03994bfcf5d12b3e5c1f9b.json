@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO token (user_id, name, token_hash, expires_at)\n        VALUES ($1, $2, $3, $4)\n        RETURNING\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at, scope\n        ",
+  "query": "\n        INSERT INTO token\n            (user_id, name, token_hash, expires_at, minted_with_forwarded_credential)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING\n            id, user_id, name, token_hash, expires_at, revoked_at,\n            last_used_at, created_at, scope\n        ",
   "describe": {
     "columns": [
       {
@@ -108,7 +108,8 @@
         "Int8",
         "Text",
         "Text",
-        "Timestamptz"
+        "Timestamptz",
+        "Bool"
       ]
     },
     "nullable": [
@@ -123,5 +124,5 @@
       true
     ]
   },
-  "hash": "95be215caa187814ec47a2c5c1d5a7d662fa3d084f67084d2ed9cc800a6f89d5"
+  "hash": "92efbc96cd54306a99b08eb8db4362c4aff329353c03994bfcf5d12b3e5c1f9b"
 }

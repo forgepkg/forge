@@ -649,6 +649,7 @@ mod tests {
             user_id: 1,
             token_id: Some(2),
             is_admin: false,
+            method: crate::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::Authenticated(authed))),
@@ -668,6 +669,7 @@ mod tests {
             user_id: 1,
             token_id: None,
             is_admin: true,
+            method: crate::auth::AuthMethod::Password,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::Reject)),
@@ -704,6 +706,7 @@ mod tests {
             user_id: 1,
             token_id: None,
             is_admin: false,
+            method: crate::auth::AuthMethod::Password,
         };
         // An explicit credential wins before the cookie source: not ambient.
         let sources: Vec<Box<dyn PrincipalSource>> = vec![

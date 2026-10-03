@@ -1084,6 +1084,7 @@ async fn user_and_token_round_trip() {
             name: "ci".to_string(),
             token_hash: hash.clone(),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await

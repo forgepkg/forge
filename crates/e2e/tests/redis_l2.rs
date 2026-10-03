@@ -119,6 +119,7 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
         user_id: user.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
     assert!(
         !b.state.authz.is_global_admin(&principal).await,

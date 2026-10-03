@@ -18,6 +18,12 @@ The release workflow publishes the section whose heading matches the tag
   are not merged: the oldest keeps the name, the others are renamed
   `<name>#<id>` and a warning names each one. Review and delete or rename
   them; their tokens keep working.
+- A password sent over HTTP Basic no longer reaches the admin API or token
+  minting, even for an administrator (403). Scripts that ran
+  `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
+  (session cookie + `X-CSRF-Token`) or use an admin-scoped token
+  (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
+  `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
 
 ### Security
 
@@ -58,6 +64,14 @@ The release workflow publishes the section whose heading matches the tag
   password valid or substitute an IdP signing key for every instance.
   `rediss://` (TLS) Redis URLs are now supported, and the deployment guide
   documents how to isolate Redis.
+- The principal records how it authenticated (token, password over Basic,
+  or browser session). The admin API accepts a session or an admin-scoped
+  token, never a password replayed over Basic; minting tokens
+  (`/admin/me/tokens`) takes a session. Before, the password a NuGet client
+  stores and sends on every feed request — with credential forwarding, the
+  directory password — was a full admin credential that could mint tokens
+  outliving it. An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
+  also revokes the tokens a user minted from a credential-forwarding session.
 
 ## [0.1.0]
 

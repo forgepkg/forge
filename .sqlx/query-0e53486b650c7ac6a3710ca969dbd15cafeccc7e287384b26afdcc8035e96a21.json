@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE token\n        SET revoked_at = now()\n        WHERE user_id = $1\n          AND minted_with_forwarded_credential\n          AND revoked_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e53486b650c7ac6a3710ca969dbd15cafeccc7e287384b26afdcc8035e96a21"
+}

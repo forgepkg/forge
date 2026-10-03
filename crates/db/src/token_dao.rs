@@ -15,6 +15,9 @@ pub struct NewToken {
     pub name: String,
     pub token_hash: String,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Minted from a session that credential forwarding established: revoked
+    /// by [`revoke_forwarded_tokens_for_user`] (an admin-forced reauth).
+    pub minted_with_forwarded_credential: bool,
 }
 
 /// Insert a token, returning the persisted row.
@@ -22,8 +25,9 @@ pub async fn insert_token(pool: &PgPool, new: NewToken) -> sqlx::Result<Token> {
     sqlx::query_as!(
         Token,
         r#"
-        INSERT INTO token (user_id, name, token_hash, expires_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO token
+            (user_id, name, token_hash, expires_at, minted_with_forwarded_credential)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING
             id, user_id, name, token_hash, expires_at, revoked_at,
             last_used_at, created_at, scope
@@ -32,6 +36,7 @@ pub async fn insert_token(pool: &PgPool, new: NewToken) -> sqlx::Result<Token> {
         new.name,
         new.token_hash,
         new.expires_at,
+        new.minted_with_forwarded_credential,
     )
     .fetch_one(pool)
     .await
@@ -151,4 +156,24 @@ pub async fn touch_last_used(pool: &PgPool, id: i64) -> sqlx::Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Revoke every live token of `user_id` that was minted from a session
+/// credential forwarding established (see [`NewToken`]). Returns how many
+/// were revoked. Used by the admin-forced reauth: such a token must not
+/// outlive the upstream verdict it was minted on.
+pub async fn revoke_forwarded_tokens_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<u64> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE token
+        SET revoked_at = now()
+        WHERE user_id = $1
+          AND minted_with_forwarded_credential
+          AND revoked_at IS NULL
+        "#,
+        user_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }

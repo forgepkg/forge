@@ -86,7 +86,7 @@ async fn password_login_session_round_trip() {
     // Correct password → 200 + cookie + identity body with the CSRF token.
     let resp = client
         .post(format!("{}/auth/login", srv.base_url))
-        .json(&json!({ "username": admin, "password": password }))
+        .json(&json!({ "username": admin, "password": srv.admin_pass.as_deref().unwrap() }))
         .send()
         .await
         .unwrap();

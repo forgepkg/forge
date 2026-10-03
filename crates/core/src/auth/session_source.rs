@@ -94,6 +94,7 @@ impl PrincipalSource for SessionCookieSource {
                 user_id: user.id,
                 token_id: None,
                 is_admin: user.is_admin,
+                method: crate::auth::AuthMethod::Session,
             }),
             // The session points at a vanished or deactivated user: it grants
             // nothing, so clear it like an expired one.

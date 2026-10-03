@@ -534,6 +534,10 @@ impl StackBuilder {
 
         let admin_user = self.bootstrap_admin.as_ref().map(|(u, _)| u.clone());
         let admin_pass = self.bootstrap_admin.as_ref().map(|(_, p)| p.clone());
+        let admin_scoped_token = match &admin_user {
+            Some(username) => mint_admin_scoped_token(&pool, username).await,
+            None => None,
+        };
 
         let mut srv = TestServer {
             base_url,
@@ -542,6 +546,7 @@ impl StackBuilder {
             state,
             admin_user,
             admin_pass,
+            admin_scoped_token,
             admin_token: String::new(),
             use_redis: self.use_redis,
             handle,
@@ -586,6 +591,10 @@ pub struct TestServer {
     pub admin_user: Option<String>,
     /// Bootstrap admin password (if any).
     pub admin_pass: Option<String>,
+    /// An admin-scoped API token of the bootstrap admin (`{"actions":
+    /// ["admin"]}`), minted directly in the database. The admin API refuses a
+    /// password sent over Basic, so [`TestServer::admin_basic`] carries this.
+    pub admin_scoped_token: Option<String>,
     /// A plaintext API token for the bootstrap admin (empty if no admin).
     pub admin_token: String,
     use_redis: bool,
@@ -661,8 +670,19 @@ impl TestServer {
         panic!("GET {url} never returned JSON: {last_err}");
     }
 
-    /// Basic-auth credentials for the bootstrap admin.
+    /// Basic credentials for the bootstrap admin: its username and an
+    /// **admin-scoped token** in the password field (the admin API refuses a
+    /// password sent over Basic). For the real password use
+    /// [`TestServer::admin_password_basic`].
     pub fn admin_basic(&self) -> (String, String) {
+        (
+            self.admin_user.clone().expect("admin user"),
+            self.admin_scoped_token.clone().expect("admin token"),
+        )
+    }
+
+    /// The bootstrap admin's username and real password.
+    pub fn admin_password_basic(&self) -> (String, String) {
         (
             self.admin_user.clone().expect("admin user"),
             self.admin_pass.clone().expect("admin pass"),
@@ -689,6 +709,7 @@ impl TestServer {
         // The peer shares the admin token already minted on the primary.
         peer.admin_user = self.admin_user.clone();
         peer.admin_pass = self.admin_pass.clone();
+        peer.admin_scoped_token = self.admin_scoped_token.clone();
         peer.admin_token = self.admin_token.clone();
         peer
     }
@@ -719,6 +740,7 @@ impl TestServer {
         let mut peer = builder.serve(self.db_url.clone(), pool, false).await;
         peer.admin_user = self.admin_user.clone();
         peer.admin_pass = self.admin_pass.clone();
+        peer.admin_scoped_token = self.admin_scoped_token.clone();
         peer.admin_token = self.admin_token.clone();
         peer
     }
@@ -746,6 +768,7 @@ impl TestServer {
         let mut peer = builder.serve(self.db_url.clone(), pool, false).await;
         peer.admin_user = self.admin_user.clone();
         peer.admin_pass = self.admin_pass.clone();
+        peer.admin_scoped_token = self.admin_scoped_token.clone();
         peer.admin_token = self.admin_token.clone();
         peer
     }
@@ -1054,4 +1077,33 @@ pub fn make_nupkg_with_desc(id: &str, version: &str, desc: &str) -> Vec<u8> {
     zw.start_file(format!("{id}.nuspec"), opts).unwrap();
     zw.write_all(nuspec.as_bytes()).unwrap();
     zw.finish().unwrap().into_inner()
+}
+
+/// Mint (directly in the database) an admin-scoped API token for `username`;
+/// `None` when no such account exists (a bootstrap admin that was not created).
+pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<String> {
+    let user = forge_db::user_dao::find_user_by_username(pool, username)
+        .await
+        .expect("admin lookup")?;
+    let secret = forge_core::auth::generate_token_secret();
+    let token = forge_db::token_dao::insert_token(
+        pool,
+        forge_db::token_dao::NewToken {
+            user_id: user.id,
+            name: "e2e-admin".into(),
+            token_hash: forge_core::auth::hash_token(&secret),
+            expires_at: None,
+            minted_with_forwarded_credential: false,
+        },
+    )
+    .await
+    .expect("insert admin token");
+    forge_db::token_dao::set_token_scope(
+        pool,
+        token.id,
+        Some(&serde_json::json!({ "actions": ["admin"] })),
+    )
+    .await
+    .expect("scope admin token");
+    Some(secret)
 }

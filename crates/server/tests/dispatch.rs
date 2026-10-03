@@ -242,7 +242,9 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
 
     let login = client
         .post(format!("{}/auth/login", srv.base_url))
-        .json(&serde_json::json!({"username": admin, "password": password}))
+        .json(
+            &serde_json::json!({"username": admin, "password": srv.admin_pass.as_deref().unwrap()}),
+        )
         .send()
         .await
         .unwrap();

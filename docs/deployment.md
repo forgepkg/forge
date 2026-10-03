@@ -93,8 +93,14 @@ password path on by itself, because its users have no tokens until they first
 sign in — and that path runs the whole password chain, so **local** users'
 passwords are then accepted over Basic too, whatever this setting says. Set
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must send a local
-user's password over Basic without such a realm, for example
-`curl -u user:password` against `/admin`.
+user's password over Basic without such a realm.
+
+A password sent over Basic is a **feed** credential only: the admin API
+(`/admin/*`) and token minting refuse it with 403, even for an administrator,
+because NuGet clients store that password and replay it on every request.
+Administer through a browser session (the web UI, or `POST /auth/login` plus
+the returned CSRF token), or mint an admin-scoped token
+(`{"scope": {"actions": ["admin"]}}`) for automation.
 
 ## Secret encryption at rest
 
