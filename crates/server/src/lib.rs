@@ -19,6 +19,7 @@ pub mod health;
 pub mod me;
 pub mod me_tokens;
 pub mod middleware;
+pub mod serve;
 pub mod state;
 pub mod web_ui;
 pub mod workers;

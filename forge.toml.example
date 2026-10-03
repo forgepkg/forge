@@ -25,6 +25,14 @@ max_upload_bytes = 536870912    # (default: 512 MiB)
 # anonymous_mode = "allowlist": a request naming any other host is not served
 # anonymously by IP (DNS-rebinding guard).
 allowed_hosts = []              # (default: [])
+# Connection and request time limits. A client that takes longer to send its
+# request headers, or whose request body stalls longer, is cut off; a handler
+# that has not answered within request_timeout_seconds gets 408 (an already
+# streaming download is not cut off). Keep request_timeout_seconds above the
+# slowest push of max_upload_bytes you expect. 0 disables a limit.
+header_read_timeout_seconds = 30 # (default: 30)
+body_idle_timeout_seconds = 60   # (default: 60)
+request_timeout_seconds = 900    # (default: 900)
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"

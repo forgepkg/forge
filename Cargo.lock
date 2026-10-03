@@ -1740,6 +1740,8 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "jsonwebtoken",
  "rand 0.10.3",

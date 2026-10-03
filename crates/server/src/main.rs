@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NugetFormat::with_limits(config.nuget.limits()));
     let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
     let layer = principal_layer(&state)?;
+    let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 
     // Background workers (outbox / reconciler / proxy refresh / …), each
     // supervised: a panicking loop is logged and restarted.
@@ -120,13 +121,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {bind_addr}"))?;
     tracing::info!(%bind_addr, "forge-server listening");
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    forge_server::serve::serve(listener, app, serve_options, shutdown_signal()).await;
 
     // In-flight requests have drained; stop the background loops. Every worker
     // step is idempotent / lease-fenced, so an interrupted pass is resumed by

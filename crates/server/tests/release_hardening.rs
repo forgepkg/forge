@@ -206,6 +206,137 @@ async fn https_deployments_use_host_prefixed_cookies() {
     assert_eq!(status(format!("forge_session={secret}")).await, 401);
 }
 
+/// API responses and credentialed feed responses are never stored by a
+/// cache; feed responses say what they vary on; and a plain-http deployment
+/// sends no HSTS.
+#[tokio::test]
+async fn api_and_credentialed_feed_responses_are_not_cached() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("cache{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(
+        resp.headers()["cache-control"],
+        "private, no-store",
+        "admin API"
+    );
+    let header = |resp: &reqwest::Response, name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+
+    let resp = client
+        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "cache-control").as_deref(),
+        Some("private, no-store")
+    );
+    let vary = header(&resp, "vary").unwrap_or_default();
+    for name in ["Authorization", "Cookie", "X-NuGet-ApiKey"] {
+        assert!(vary.contains(name), "Vary {vary:?} lacks {name}");
+    }
+    assert!(header(&resp, "strict-transport-security").is_none());
+
+    // Without credentials the feed answer may be cached, but only per Vary.
+    let resp = client
+        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(header(&resp, "cache-control").is_none());
+    assert!(header(&resp, "vary").is_some_and(|v| v.contains("Authorization")));
+
+    let resp = client
+        .get(format!("{}/auth/login-options", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        header(&resp, "cache-control").as_deref(),
+        Some("private, no-store")
+    );
+}
+
+#[tokio::test]
+async fn https_deployments_send_hsts() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            public_base_url: Some("https://forge.example".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let resp = srv
+        .client()
+        .get(format!("{}/auth/login-options", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("strict-transport-security")
+            .map(|v| v.to_str().unwrap()),
+        Some("max-age=31536000")
+    );
+}
+
+/// A client trickling its request headers, or stalling its request body, is
+/// cut off instead of holding a connection and a task open forever.
+#[tokio::test]
+async fn slow_headers_and_stalled_bodies_are_cut_off() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            server_extra: Some(
+                "header_read_timeout_seconds = 1\nbody_idle_timeout_seconds = 1".into(),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    let addr = srv.base_url.trim_start_matches("http://").to_string();
+    for (what, request) in [
+        (
+            "slow headers",
+            "GET /health HTTP/1.1\r\nHost: x\r\n".to_string(),
+        ),
+        (
+            "stalled body",
+            "POST /auth/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+             Content-Length: 100\r\n\r\n{\"username\":"
+                .to_string(),
+        ),
+    ] {
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut buf),
+        )
+        .await;
+        assert!(ended.is_ok(), "{what}: the server kept the request open");
+    }
+}
+
 #[tokio::test]
 async fn cross_site_browser_mutations_are_refused_even_with_basic() {
     let srv = common::start().await;

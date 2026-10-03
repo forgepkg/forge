@@ -171,6 +171,15 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
 - Do not rewrite the `Origin` or `Sec-Fetch-Site` headers. Forge refuses
   state-changing browser requests that are cross-site, so a proxy that strips
   or fakes these headers breaks that protection.
+- With an `https://` `public_base_url` Forge sends
+  `Strict-Transport-Security: max-age=31536000`; serve it over https only.
+  API responses and every feed response to a request with credentials are
+  `Cache-Control: private, no-store`, and feed responses carry
+  `Vary: Authorization, Cookie, X-NuGet-ApiKey`: keep a caching proxy from
+  overriding either.
+- Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
+  `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
+  own timeouts at least as long for package pushes.
 
 Minimal nginx example:
 

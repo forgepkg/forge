@@ -164,6 +164,16 @@ The release workflow publishes the section whose heading matches the tag
   `prefer_hosted` only shields ids a hosted member already has, so an
   internal name was open to a public look-alike until its first publish (or
   after its last version was deleted).
+- HTTP hardening: API responses (`/admin`, `/auth`, `/browse`) and feed
+  responses to a request with credentials are `Cache-Control: private,
+  no-store`, and feed responses carry `Vary: Authorization, Cookie,
+  X-NuGet-ApiKey`, so a shared cache can neither store a private package nor
+  serve one caller's answer to another; an https deployment sends HSTS. The
+  server now enforces a header-read timeout (`server.header_read_timeout_seconds`,
+  default 30 s — `axum::serve` never armed hyper's, so a client trickling
+  headers held a connection forever), a request-body idle timeout
+  (`body_idle_timeout_seconds`, 60 s) and a response timeout
+  (`request_timeout_seconds`, 900 s, answered with 408).
 
 ## [0.1.0]
 

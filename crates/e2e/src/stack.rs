@@ -1,7 +1,6 @@
 //! The e2e stack harness: containers, fresh-per-test databases, and a running
 //! axum server (with optional peer instances sharing the same DB + S3 + Redis).
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -522,14 +521,10 @@ impl StackBuilder {
             None
         };
 
+        let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
         let app = build_router(state.clone(), layer);
         let handle = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .ok();
+            forge_server::serve::serve(listener, app, serve_options, std::future::pending()).await;
         });
 
         let admin_user = self.bootstrap_admin.as_ref().map(|(u, _)| u.clone());

@@ -2,10 +2,11 @@
 //! layer, and the startup routine (connect, migrate, bootstrap admin).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::auth::WorkloadIdentitySource;
 use anyhow::Context;
-use axum::http::{header, HeaderValue};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::routing::any;
 use axum::Router;
 use forge_core::auth::session_source::SessionCookieSource;
@@ -15,6 +16,7 @@ use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
 
 use crate::admin::admin_router;
 use crate::auth::auth_router;
@@ -147,33 +149,109 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
             .layer(axum::middleware::from_fn(legacy_admin_ui_redirect));
     }
 
-    app.layer(axum::middleware::from_fn_with_state(
-        layer.clone(),
-        attach_principal,
-    ))
-    // Baseline browser hardening for the SPA and every API response (added only
-    // when a handler did not set its own): no MIME sniffing, no framing
-    // (clickjacking on the admin UI), no cross-origin referrer leakage.
-    .layer(SetResponseHeaderLayer::if_not_present(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    ))
-    .layer(SetResponseHeaderLayer::if_not_present(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    ))
-    .layer(SetResponseHeaderLayer::if_not_present(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("frame-ancestors 'none'"),
-    ))
-    .layer(SetResponseHeaderLayer::if_not_present(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("same-origin"),
-    ))
-    // Request spans (method, path, status, latency) for every route; emitted
-    // at DEBUG, so `RUST_LOG=tower_http=debug` turns on an access log.
-    .layer(tower_http::trace::TraceLayer::new_for_http())
-    .with_state(state)
+    let hsts = state.cookie_secure;
+    let server = state.config.server.clone();
+    let app = app
+        .layer(axum::middleware::from_fn_with_state(
+            layer.clone(),
+            attach_principal,
+        ))
+        // Caching and transport policy for every response, including the
+        // ones the principal middleware answers itself.
+        .layer(axum::middleware::from_fn(move |req, next| {
+            response_policy(hsts, req, next)
+        }));
+    // A stalled upload or a handler that never answers must not pin a task
+    // and a connection forever (header reads are bounded in `serve`).
+    let app = if server.body_idle_timeout_seconds > 0 {
+        app.layer(RequestBodyTimeoutLayer::new(Duration::from_secs(
+            server.body_idle_timeout_seconds,
+        )))
+    } else {
+        app
+    };
+    let app = if server.request_timeout_seconds > 0 {
+        app.layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(server.request_timeout_seconds),
+        ))
+    } else {
+        app
+    };
+    app
+        // Baseline browser hardening for the SPA and every API response (added only
+        // when a handler did not set its own): no MIME sniffing, no framing
+        // (clickjacking on the admin UI), no cross-origin referrer leakage.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("same-origin"),
+        ))
+        // Request spans (method, path, status, latency) for every route; emitted
+        // at DEBUG, so `RUST_LOG=tower_http=debug` turns on an access log.
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// `Vary` of every feed response: what a response may depend on besides the
+/// URL, so a shared cache never hands one caller's answer to another.
+const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
+
+/// Response caching and transport policy:
+///
+/// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
+///   private, no-store` — they carry user data, tokens and CSRF secrets;
+/// * feed responses (`/v3/...`) carry [`FEED_VARY`], and are `private,
+///   no-store` whenever the request presented credentials, so a private
+///   package is never stored by a shared cache or served to someone else;
+/// * with an `https` public URL every response carries HSTS.
+///
+/// The SPA keeps its own cache headers (hashed assets are immutable).
+async fn response_policy(
+    hsts: bool,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let under = |prefix: &str| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    let api = under("/admin") || under("/auth") || under("/browse");
+    let feed = under("/v3");
+    let headers = req.headers();
+    let credentials = headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key("x-nuget-apikey")
+        || headers.contains_key(header::COOKIE);
+    let mut resp = next.run(req).await;
+    let out = resp.headers_mut();
+    if api || (feed && credentials) {
+        out.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    }
+    if feed {
+        out.append(header::VARY, HeaderValue::from_static(FEED_VARY));
+    }
+    if hsts && !out.contains_key(header::STRICT_TRANSPORT_SECURITY) {
+        out.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    resp
 }
 
 /// `forge_setting` key prefix (`<prefix>:<username>`) recording that the

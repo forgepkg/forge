@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.8" }
 
 # Static file serving (SPA assets + index.html fallback)
-tower-http = { version = "0.7", features = ["fs", "trace", "set-header"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "set-header", "timeout"] }
 
 # Database
 sqlx = { version = "0.9", features = [

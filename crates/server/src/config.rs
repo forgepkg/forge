@@ -105,10 +105,37 @@ pub struct ServerConfig {
     /// internal clients use. Default empty.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Seconds a client may take to send a request's headers before the
+    /// connection is closed (slow-header "slowloris" defence). `0` disables.
+    /// Default 30.
+    #[serde(default = "default_header_read_timeout_seconds")]
+    pub header_read_timeout_seconds: u64,
+    /// Seconds a request body may stall (no data arriving) before the request
+    /// is aborted. `0` disables. Default 60.
+    #[serde(default = "default_body_idle_timeout_seconds")]
+    pub body_idle_timeout_seconds: u64,
+    /// Seconds a handler has to produce its response (`408` after that); a
+    /// response body already streaming, such as a package download, is not cut
+    /// off. Covers reading an upload, so keep it above the slowest expected
+    /// push of `max_upload_bytes`. `0` disables. Default 900.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
 }
 
 fn default_max_upload_bytes() -> u64 {
     512 * 1024 * 1024
+}
+
+fn default_header_read_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_body_idle_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    900
 }
 
 impl ServerConfig {

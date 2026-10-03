@@ -7,7 +7,6 @@
 
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -167,6 +166,7 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
         .public_base_url
         .as_deref()
         .unwrap_or("http://test.local");
+    let server_extra = opts.server_extra.as_deref().unwrap_or("");
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -183,6 +183,7 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
 [server]
 bind = "127.0.0.1:0"
 public_base_url = "{public_base_url}"
+{server_extra}
 
 [database]
 url = "{db_url}"
@@ -262,6 +263,8 @@ pub struct ServerOpts {
     /// `server.public_base_url` (default `http://test.local`); an `https://`
     /// URL makes the server issue `Secure` (`__Host-`) cookies.
     pub public_base_url: Option<String>,
+    /// Extra raw TOML lines for the `[server]` section (e.g. timeouts).
+    pub server_extra: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -274,6 +277,7 @@ impl Default for ServerOpts {
             oidc_block: None,
             crypto_block: None,
             public_base_url: None,
+            server_extra: None,
         }
     }
 }
@@ -329,18 +333,14 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         None
     };
 
+    let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
     let app = build_router(state.clone(), layer);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral");
     let addr = listener.local_addr().expect("local addr");
     let handle = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .ok();
+        forge_server::serve::serve(listener, app, serve_options, std::future::pending()).await;
     });
 
     let admin_scoped_token = match &opts.bootstrap_admin {

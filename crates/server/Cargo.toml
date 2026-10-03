@@ -25,6 +25,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 axum = { workspace = true, features = ["multipart"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { workspace = true }
+# The HTTP server loop (`serve`): hyper's header-read timeout needs a timer,
+# which `axum::serve` does not configure.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
 sqlx = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
