@@ -28,8 +28,7 @@ use serde::{Deserialize, Serialize};
 use super::db_error;
 use crate::state::AppState;
 
-/// A grant view. `repository` is the repo **name** (resolved from the id) or
-/// `null` for an ANY-repo grant.
+/// A grant view. `repository_id` is `null` for an ANY-repo grant.
 #[derive(Debug, Serialize)]
 pub struct GrantView {
     pub id: i64,
@@ -51,12 +50,19 @@ impl From<GrantRow> for GrantView {
     }
 }
 
-/// Add-grant request.
+/// Add-grant request. Unknown fields are rejected: a mistyped field silently
+/// ignored would leave `repository` absent, which means *every* repository.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddGrant {
-    /// Repository **name**; omit / `null` for an ANY-repo (wildcard) grant.
+    /// Repository **name**; omit / `null` (and no `repository_id`) for an
+    /// ANY-repo (wildcard) grant.
     #[serde(default)]
     pub repository: Option<String>,
+    /// Repository id, as [`GrantView`] lists it (an alternative to
+    /// `repository`; give at most one).
+    #[serde(default)]
+    pub repository_id: Option<i64>,
     /// Action verb: `read` / `write` / `delete` / `admin`.
     pub action: String,
     /// Optional content-selector id to scope the grant.
@@ -107,10 +113,24 @@ pub async fn add(
         Err(e) => return db_error(e),
     }
 
-    // Resolve the optional repository name → id (None ⇒ ANY).
-    let repository_id = match &body.repository {
-        None => None,
-        Some(name) => match repository_dao::find_repository_by_name(&state.pool, name).await {
+    // Resolve the optional repository (name or id) → id (neither ⇒ ANY).
+    let repository_id = match (&body.repository, body.repository_id) {
+        (Some(_), Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "give either repository or repository_id, not both",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+        (Some(name), None) => {
+            match repository_dao::find_repository_by_name(&state.pool, name).await {
+                Ok(Some(r)) => Some(r.id),
+                Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+                Err(e) => return db_error(e),
+            }
+        }
+        (None, Some(id)) => match repository_dao::find_repository_by_id(&state.pool, id).await {
             Ok(Some(r)) => Some(r.id),
             Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
             Err(e) => return db_error(e),

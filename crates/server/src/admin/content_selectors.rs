@@ -50,6 +50,7 @@ impl From<ContentSelector> for SelectorView {
 
 /// Create-selector request.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSelector {
     pub name: String,
     #[serde(default)]
@@ -68,6 +69,7 @@ pub struct CreateSelector {
 /// scoped selector into "every package" for every grant that uses it. To
 /// really make a selector match all packages, send `"includes": []`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSelector {
     #[serde(default)]
     pub description: Option<String>,

@@ -42,6 +42,7 @@ impl From<Role> for RoleView {
 /// Assign-role request. The role is identified by **name** (a stable,
 /// human-meaningful identifier) or by `role_id`; at least one is required.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignRole {
     #[serde(default)]
     pub role: Option<String>,

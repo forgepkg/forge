@@ -307,6 +307,77 @@ async fn grant_changes_decision_and_invalidates_cache() {
 }
 
 /// Unassigning a role denies a previously-allowed user.
+/// A grant body that names its repository the way the grant listing does
+/// (`repository_id`) is scoped to that repository, and a body with a field the
+/// API does not know is refused instead of silently becoming a grant on every
+/// repository. Content selectors likewise refuse a mistyped `include`.
+#[tokio::test]
+async fn rbac_bodies_reject_unknown_fields() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let repo = make_repo(&srv).await;
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repository WHERE name = $1")
+        .bind(&repo)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": format!("strict-{}", common::unique())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants_url = format!("{}/admin/roles/{}/grants", srv.base_url, role["id"]);
+    let put = |body: Value| {
+        client
+            .put(&grants_url)
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+    };
+
+    // The listing's own shape, sent back.
+    let resp = put(json!({"repository_id": repo_id, "action": "read"}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // A mistyped field, and both names at once, are refused.
+    let resp = put(json!({"repo": repo, "action": "write"})).await.unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+    let resp = put(json!({"repository": repo, "repository_id": repo_id, "action": "write"}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let grants: Value = client
+        .get(&grants_url)
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants = grants.as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0]["repository_id"], repo_id);
+    assert_eq!(grants[0]["action"], "read");
+
+    let resp = client
+        .post(format!("{}/admin/content-selectors", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": format!("sel{}", common::unique()), "include": ["acme.*"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
 #[tokio::test]
 async fn unassign_role_denies() {
     let srv = common::start().await;
