@@ -1,17 +1,20 @@
 //! The retention **apply** path (design §3.6 step 9, §3.4 outbox integration).
 //!
 //! Turns the pure evaluator's [`Decision`] / [`ProxyDecision`] sets into durable
-//! mutations. Each decision runs in its **own** small transaction so concurrent
-//! pushes can interleave and a crash mid-run loses at most the in-flight
-//! decision (already-committed ones are durable + idempotent). Within that one
-//! transaction we:
+//! mutations in small transactions: one per proxy eviction, and one per batch
+//! of up to [`HOSTED_BATCH`] hosted decisions of the same package. Concurrent
+//! pushes interleave between them, and a crash mid-run loses at most the
+//! in-flight transaction (committed ones are durable + idempotent). Within
+//! each transaction we:
 //!
 //! 1. Fence the step to its run ([`RunFence`]): the run must still own its
 //!    lease and the stored policy must still be the one it evaluated, or the
 //!    run **stops** (the rest is left to the next run under the current
-//!    policy). Then lock the package's versions and **re-evaluate** them: a
-//!    decision the current state no longer produces (say `keep_last_n` now
-//!    protects the version because a newer one was unlisted) is skipped.
+//!    policy). For hosted decisions, then lock the package's versions and
+//!    **re-evaluate** them, once per batch: a decision the current state no
+//!    longer produces (say `keep_last_n` now protects the version because a
+//!    newer one was unlisted) is skipped. The versions stay locked until the
+//!    batch commits, so that one evaluation holds for the whole batch.
 //!    `SELECT … FOR UPDATE` the target row (component or proxy cached
 //!    version) by **id** and re-verify it still matches the decision. A
 //!    concurrent redeploy / re-push / admin delete that changed the row makes
@@ -33,6 +36,8 @@
 //! When `dry_run` is set (preview or a `dry_run_only` policy) no mutation runs;
 //! we still record `dry_run = true` audit rows so an operator can inspect what
 //! *would* happen.
+
+use std::collections::HashMap;
 
 use chrono::Duration;
 use serde_json::Value as JsonValue;
@@ -67,7 +72,7 @@ enum Step {
 
 /// Everything the apply path needs that is not in the decision itself.
 pub struct ApplyContext<'a> {
-    /// The metadata pool (each decision opens its own short tx on it).
+    /// The metadata pool (each batch or eviction opens its own short tx on it).
     pub pool: &'a PgPool,
     /// Repository the decisions belong to (for the unlist/delete DAO calls and
     /// the audit rows).
@@ -111,11 +116,19 @@ fn reason_json<R: serde::Serialize>(reason: &R) -> JsonValue {
     serde_json::to_value(reason).unwrap_or_else(|_| JsonValue::Object(Default::default()))
 }
 
+/// The most hosted decisions of one package applied in one transaction: the
+/// package's versions are locked and re-evaluated once per batch, not once
+/// per decision, so a package with thousands of versions costs one lock of
+/// its versions per hundred decisions.
+const HOSTED_BATCH: usize = 100;
+
 /// Apply a set of hosted + proxy decisions, returning the run summary.
 ///
-/// Decisions are applied independently; an error on one decision aborts that
-/// decision's transaction (rolling back its effect *and* audit together) and
-/// propagates, leaving earlier committed decisions intact.
+/// Hosted decisions are applied per package in batches of up to
+/// [`HOSTED_BATCH`], proxy evictions one by one; each batch or eviction is one
+/// transaction. An error aborts that transaction (rolling back its effects
+/// *and* audits together) and propagates, leaving earlier committed ones
+/// intact.
 pub async fn apply(
     ctx: &ApplyContext<'_>,
     hosted: &[Decision],
@@ -127,21 +140,46 @@ pub async fn apply(
         ..Default::default()
     };
 
-    let mut started = 0;
-    for d in hosted {
-        started += 1;
-        if apply_hosted(ctx, d, &mut summary).await? == Step::Stop {
-            return Ok(stopped(ctx, summary, total - started + 1));
+    let mut done = 0;
+    if ctx.dry_run {
+        for d in hosted {
+            record_hosted_dry_run(ctx, d, &mut summary).await?;
+        }
+        done += hosted.len();
+    } else {
+        for batch in package_batches(hosted) {
+            if apply_hosted_batch(ctx, &batch, &mut summary).await? == Step::Stop {
+                return Ok(stopped(ctx, summary, total - done));
+            }
+            done += batch.len();
         }
     }
     for d in proxy {
-        started += 1;
         if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
-            return Ok(stopped(ctx, summary, total - started + 1));
+            return Ok(stopped(ctx, summary, total - done));
         }
+        done += 1;
     }
 
     Ok(summary)
+}
+
+/// `hosted` grouped by package, in the order the packages first appear, and
+/// split into batches of at most [`HOSTED_BATCH`].
+fn package_batches(hosted: &[Decision]) -> Vec<Vec<&Decision>> {
+    let mut packages: Vec<Vec<&Decision>> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for d in hosted {
+        let i = *index.entry(d.package_name.as_str()).or_insert_with(|| {
+            packages.push(Vec::new());
+            packages.len() - 1
+        });
+        packages[i].push(d);
+    }
+    packages
+        .iter()
+        .flat_map(|decisions| decisions.chunks(HOSTED_BATCH).map(<[_]>::to_vec))
+        .collect()
 }
 
 /// The summary of a run that stopped with `remaining` decisions unapplied
@@ -158,16 +196,16 @@ fn stopped(ctx: &ApplyContext<'_>, mut summary: RunSummary, remaining: usize) ->
     summary
 }
 
-/// Whether evaluating the package's current versions (locked by this call)
-/// under the run's policy still yields `d`.
-async fn still_decided(
+/// What evaluating `package_name`'s current versions (locked by this call)
+/// under the run's policy decides now, by component id.
+async fn decided_now(
     tx: &mut sqlx::PgConnection,
     ctx: &ApplyContext<'_>,
     fence: &RunFence<'_>,
-    d: &Decision,
-) -> Result<bool, sqlx::Error> {
+    package_name: &str,
+) -> Result<HashMap<i64, Action>, sqlx::Error> {
     let candidates: Vec<CandidateComponent> =
-        retention_dao::lock_package_candidates(tx, ctx.repository_id, &d.package_name)
+        retention_dao::lock_package_candidates(tx, ctx.repository_id, package_name)
             .await?
             .into_iter()
             .map(|r| CandidateComponent {
@@ -181,68 +219,100 @@ async fn still_decided(
             .collect();
     let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
     Ok(evaluate(fence.format, now, fence.policy, &candidates)
-        .iter()
-        .any(|again| again.component_id == d.component_id && again.action == d.action))
+        .into_iter()
+        .map(|again| (again.component_id, again.action))
+        .collect())
 }
 
-/// Apply one hosted decision in its own transaction.
-async fn apply_hosted(
+/// Record one hosted decision of a dry run: the audit row only.
+async fn record_hosted_dry_run(
     ctx: &ApplyContext<'_>,
     d: &Decision,
     summary: &mut RunSummary,
-) -> Result<Step, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     let reason = reason_json(&d.reason);
 
-    // Dry run: record intent, mutate nothing.
-    if ctx.dry_run {
-        let mut tx = ctx.pool.begin().await?;
-        retention_dao::insert_audit(
-            &mut *tx,
-            &AuditRow {
-                repository_id: ctx.repository_id,
-                run_id: ctx.run_id,
-                rule_id: d.rule_id.clone(),
-                action: action_str(d.action).to_string(),
-                target_kind: "component".to_string(),
-                package_name: d.package_name.clone(),
-                version: d.version.clone(),
-                component_id: Some(d.component_id),
-                blob_sha256: None,
-                ref_count_after: None,
-                blob_delete_enqueued: false,
-                dry_run: true,
-                reason,
-            },
-        )
-        .await?;
-        tx.commit().await?;
-        match d.action {
-            Action::Unlist => summary.unlisted += 1,
-            Action::HardDelete => summary.deleted += 1,
-        }
-        return Ok(Step::Continue);
-    }
-
     let mut tx = ctx.pool.begin().await?;
+    retention_dao::insert_audit(
+        &mut *tx,
+        &AuditRow {
+            repository_id: ctx.repository_id,
+            run_id: ctx.run_id,
+            rule_id: d.rule_id.clone(),
+            action: action_str(d.action).to_string(),
+            target_kind: "component".to_string(),
+            package_name: d.package_name.clone(),
+            version: d.version.clone(),
+            component_id: Some(d.component_id),
+            blob_sha256: None,
+            ref_count_after: None,
+            blob_delete_enqueued: false,
+            dry_run: true,
+            reason,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    match d.action {
+        Action::Unlist => summary.unlisted += 1,
+        Action::HardDelete => summary.deleted += 1,
+    }
+    Ok(())
+}
 
-    if let Some(fence) = &ctx.fence {
-        if !retention_dao::lock_run_fence(
-            &mut tx,
-            ctx.repository_id,
-            ctx.run_id,
-            fence.stored_policy,
-        )
-        .await?
-        {
-            return Ok(Step::Stop);
+/// Apply a batch of one package's hosted decisions in one transaction. With a
+/// fence, the run's lease and policy are checked first (or the run stops),
+/// then the package's versions are locked and re-evaluated once; a decision
+/// they no longer produce is skipped.
+async fn apply_hosted_batch(
+    ctx: &ApplyContext<'_>,
+    batch: &[&Decision],
+    summary: &mut RunSummary,
+) -> Result<Step, sqlx::Error> {
+    let Some(first) = batch.first() else {
+        return Ok(Step::Continue);
+    };
+    let mut tx = ctx.pool.begin().await?;
+    let decided = match &ctx.fence {
+        Some(fence) => {
+            if !retention_dao::lock_run_fence(
+                &mut tx,
+                ctx.repository_id,
+                ctx.run_id,
+                fence.stored_policy,
+            )
+            .await?
+            {
+                return Ok(Step::Stop);
+            }
+            Some(decided_now(&mut tx, ctx, fence, &first.package_name).await?)
         }
-        if !still_decided(&mut tx, ctx, fence, d).await? {
+        None => None,
+    };
+    for d in batch {
+        let still = decided
+            .as_ref()
+            .is_none_or(|now| now.get(&d.component_id) == Some(&d.action));
+        if still {
+            apply_hosted(&mut tx, ctx, d, summary).await?;
+        } else {
             audit_skipped(&mut tx, ctx, d, "component").await?;
-            tx.commit().await?;
             summary.skipped += 1;
-            return Ok(Step::Continue);
         }
     }
+    tx.commit().await?;
+    Ok(Step::Continue)
+}
+
+/// Apply one hosted decision inside its batch's transaction: lock the
+/// component by id and re-verify it before acting.
+async fn apply_hosted(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ctx: &ApplyContext<'_>,
+    d: &Decision,
+    summary: &mut RunSummary,
+) -> Result<(), sqlx::Error> {
+    let reason = reason_json(&d.reason);
 
     // Re-verify: lock the component row by id. A concurrent hard delete may have
     // removed it; a redeploy may have swapped its assets. Lock first so our read
@@ -257,15 +327,14 @@ async fn apply_hosted(
         d.component_id,
         ctx.repository_id,
     )
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     let Some(row) = locked else {
         // Gone under us — skip, audit as skipped.
-        audit_skipped(&mut tx, ctx, d, "component").await?;
-        tx.commit().await?;
+        audit_skipped(tx, ctx, d, "component").await?;
         summary.skipped += 1;
-        return Ok(Step::Continue);
+        return Ok(());
     };
     // Downloaded while this run was working: no longer cold — skip.
     if downloaded_since(
@@ -273,10 +342,9 @@ async fn apply_hosted(
         d.reason.not_downloaded_for_days.is_some(),
         row.last_downloaded_at,
     ) {
-        audit_skipped(&mut tx, ctx, d, "component").await?;
-        tx.commit().await?;
+        audit_skipped(tx, ctx, d, "component").await?;
         summary.skipped += 1;
-        return Ok(Step::Continue);
+        return Ok(());
     }
 
     match d.action {
@@ -285,10 +353,10 @@ async fn apply_hosted(
                 r#"UPDATE component SET listed = false, updated_at = now() WHERE id = $1"#,
                 row.id,
             )
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             retention_dao::insert_audit(
-                &mut *tx,
+                &mut **tx,
                 &AuditRow {
                     repository_id: ctx.repository_id,
                     run_id: ctx.run_id,
@@ -306,11 +374,10 @@ async fn apply_hosted(
                 },
             )
             .await?;
-            tx.commit().await?;
             summary.unlisted += 1;
         }
         Action::HardDelete => {
-            let assets = asset_dao::assets_for_component(&mut *tx, row.id).await?;
+            let assets = asset_dao::assets_for_component(&mut **tx, row.id).await?;
 
             // Track the primary .nupkg blob for the audit row; decref every
             // referenced blob (an asset set may share or differ).
@@ -320,10 +387,10 @@ async fn apply_hosted(
 
             for asset in &assets {
                 sqlx::query!(r#"DELETE FROM asset WHERE id = $1"#, asset.id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                 let enqueued = blob_dao::decref_and_maybe_enqueue_delete(
-                    &mut tx,
+                    tx,
                     &asset.blob_sha256,
                     ctx.delete_grace,
                 )
@@ -334,7 +401,7 @@ async fn apply_hosted(
                     r#"SELECT ref_count FROM blob WHERE sha256 = $1"#,
                     asset.blob_sha256,
                 )
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?
                 // The row may already be gone if a parallel reconciler removed a
                 // zero-ref blob between decref and read; treat as 0.
@@ -351,11 +418,11 @@ async fn apply_hosted(
                 }
             }
 
-            component_dao::delete_component(&mut *tx, ctx.repository_id, &row.name, &row.version)
+            component_dao::delete_component(&mut **tx, ctx.repository_id, &row.name, &row.version)
                 .await?;
 
             retention_dao::insert_audit(
-                &mut *tx,
+                &mut **tx,
                 &AuditRow {
                     repository_id: ctx.repository_id,
                     run_id: ctx.run_id,
@@ -376,12 +443,11 @@ async fn apply_hosted(
                 },
             )
             .await?;
-            tx.commit().await?;
             summary.deleted += 1;
         }
     }
 
-    Ok(Step::Continue)
+    Ok(())
 }
 
 /// Apply one proxy eviction in its own transaction. Eviction deletes the cached

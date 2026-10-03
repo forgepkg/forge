@@ -155,7 +155,7 @@ impl RetentionWorker {
         // like any other failed run instead of unwinding past `fail_run` and
         // leaving the ledger row `running` until its lease expires. Nothing is
         // shared mutably across the unwind: every applied decision committed
-        // in its own transaction, and the in-flight one rolled back on drop.
+        // in its batch's transaction, and the in-flight one rolled back on drop.
         let result = AssertUnwindSafe(self.process(&repo, run_id))
             .catch_unwind()
             .await

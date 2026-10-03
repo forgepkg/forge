@@ -856,3 +856,67 @@ async fn a_policy_change_or_lost_lease_stops_the_run() {
         }
     }
 }
+
+/// Review: re-evaluating a package once per decision was quadratic. Its
+/// decisions are now applied in batches that re-evaluate it once each; every
+/// batch still honours a protection gained after the evaluation (here: the
+/// newest `big` version unlisted, so `keep_last_n: 1` now protects the one
+/// before it, whichever batch holds that decision).
+#[tokio::test]
+async fn a_package_with_many_versions_is_applied_in_batches() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-batch-{n}")))
+            .await
+            .unwrap();
+    let mut tag = (1u64 << 48) | (n << 16);
+    for (package, count) in [("big", 230), ("small", 2)] {
+        for i in 0..count {
+            tag += 1;
+            let sha = seed_blob(&pool, tag, 1).await;
+            seed_component(&pool, repo.id, package, &format!("1.0.{i}"), &sha, 100).await;
+        }
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{
+                "id": "latest",
+                "action": "hard_delete",
+                "criteria": { "keep_last_n": 1, "older_than_days": 30 }
+            }]
+        }),
+    )
+    .await;
+    let (claimed, run_id, policy, decisions) = claim_and_evaluate(&pool, repo.id).await;
+    assert_eq!(decisions.len(), 229 + 1);
+
+    sqlx::query(
+        "UPDATE component SET listed = false \
+         WHERE repository_id = $1 AND name = 'big' AND version = '1.0.229'",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let summary = apply_fenced(&pool, &claimed, run_id, &policy, &decisions).await;
+    assert_eq!((summary.deleted, summary.skipped), (228 + 1, 1));
+    assert!(component_exists(&pool, repo.id, "big", "1.0.228").await);
+    assert!(component_exists(&pool, repo.id, "big", "1.0.229").await);
+    assert!(!component_exists(&pool, repo.id, "big", "1.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "big", "1.0.227").await);
+    assert!(component_exists(&pool, repo.id, "small", "1.0.1").await);
+    assert!(!component_exists(&pool, repo.id, "small", "1.0.0").await);
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM retention_audit WHERE run_id = $1 AND action = 'hard_delete'",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 229);
+}

@@ -424,7 +424,10 @@ First production release.
   its policy was edited, disabled or switched to `dry_run_only`, or when it
   lost its lease. A decision the package's current versions no longer
   produce is skipped: with `keep_last_n: 1`, unlisting 2.0.0 mid-run no
-  longer lets the run delete 1.0.0 and leave no listed version.
+  longer lets the run delete 1.0.0 and leave no listed version. A
+  package's decisions are applied in transactions of up to 100, each
+  re-checking the package once, so packages with thousands of versions do
+  not pay for a full re-check per version.
 - `retention_audit` is indexed for component deletes, which scanned the
   whole table while holding locks, and rows older than
   `retention.audit_retention_seconds` (default 90 days) are pruned.
