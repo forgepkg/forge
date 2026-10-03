@@ -338,9 +338,14 @@ async fn finalize(
         } else {
             user
         };
-        authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
+        let changed = authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?;
+        if changed && !mapped.is_admin {
+            crate::auth::chain::revoke_sessions_on_demotion(pool, user.id)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?;
+        }
         user
     } else {
         user

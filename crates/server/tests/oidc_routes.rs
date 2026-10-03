@@ -942,3 +942,39 @@ async fn oidc_login_starts_are_rate_limited() {
     assert_eq!(resp.status(), 429);
     assert!(resp.headers().get("retry-after").is_some());
 }
+
+#[tokio::test]
+async fn idp_demotion_ends_sessions_opened_as_admin() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let (sub, username) = (format!("sub-{n}"), format!("demoted-{n}"));
+    let me = |cookie: String| {
+        let req = no_redirect_client()
+            .get(format!("{}/auth/me", srv.base_url))
+            .header("cookie", format!("forge_session={cookie}"));
+        async move { req.send().await.unwrap() }
+    };
+
+    let (as_admin, _) =
+        login_and_get_cookie(&idp, &srv, &sub, &username, json!(["forge-admins"])).await;
+    let body: Value = me(as_admin.clone()).await.json().await.unwrap();
+    assert_eq!(body["is_admin"], json!(true));
+
+    // The IdP no longer lists the admin group: the next login demotes, and
+    // the session opened as an admin ends with it.
+    let (demoted, _) = login_and_get_cookie(&idp, &srv, &sub, &username, json!([])).await;
+    assert_eq!(me(as_admin).await.status(), 401);
+    let body: Value = me(demoted).await.json().await.unwrap();
+    assert_eq!(body["is_admin"], json!(false));
+}

@@ -258,6 +258,9 @@ pub struct BasicAuthSource {
     /// browser login endpoint. Disabled unless wired via
     /// [`BasicAuthSource::with_throttle`].
     throttle: Arc<LoginThrottle>,
+    /// The authorization cache: an authoritative upstream login may grant or
+    /// revoke admin, and the user's cached effective set must follow at once.
+    authz_cache: Option<forge_cache::Cache>,
 }
 
 impl BasicAuthSource {
@@ -295,6 +298,7 @@ impl BasicAuthSource {
             pool,
             chain,
             throttle: Arc::new(LoginThrottle::disabled()),
+            authz_cache: None,
         }
     }
 
@@ -302,6 +306,13 @@ impl BasicAuthSource {
     /// path is never throttled: token secrets are high-entropy).
     pub fn with_throttle(mut self, throttle: Arc<LoginThrottle>) -> Self {
         self.throttle = throttle;
+        self
+    }
+
+    /// Drop a user's cached effective set when an authoritative upstream
+    /// login re-synced their admin role (as the browser login does).
+    pub fn with_authz_cache(mut self, cache: forge_cache::Cache) -> Self {
+        self.authz_cache = Some(cache);
         self
     }
 }
@@ -393,6 +404,14 @@ impl PrincipalSource for BasicAuthSource {
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             attempt.succeeded();
+                            if identity.admin_authoritative {
+                                // The upstream may just have granted or
+                                // revoked admin: this very request must be
+                                // authorized against the new role set.
+                                if let Some(cache) = &self.authz_cache {
+                                    crate::authz::invalidate_user(cache, up.user_id).await;
+                                }
+                            }
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
                         // Vouched-for but no (active) app_user row, or a DB

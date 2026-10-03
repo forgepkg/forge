@@ -46,8 +46,8 @@ struct Account {
 /// Shared mock state: the credential table, the request hit counter, and the
 /// `down` (outage) switch.
 struct Inner {
-    /// `username -> account`.
-    accounts: HashMap<String, Account>,
+    /// `username -> account` (groups can change mid-test: [`MockBasicUpstream::set_groups`]).
+    accounts: std::sync::Mutex<HashMap<String, Account>>,
     /// Total number of forwarded requests this mock has *received* (every call,
     /// regardless of verdict). Tests assert exact counts against this.
     hits: AtomicUsize,
@@ -95,7 +95,7 @@ impl MockBasicUpstream {
             .collect();
 
         let inner = Arc::new(Inner {
-            accounts: table,
+            accounts: std::sync::Mutex::new(table),
             hits: AtomicUsize::new(0),
             down: AtomicBool::new(false),
             redirect: AtomicBool::new(false),
@@ -146,6 +146,14 @@ impl MockBasicUpstream {
     /// `/sso/login` (which answers `200`) for every credential.
     pub fn set_redirect(&self, redirect: bool) {
         self.inner.redirect.store(redirect, Ordering::SeqCst);
+    }
+
+    /// Replace the groups the upstream advertises for `user` (e.g. an upstream
+    /// admin demotion).
+    pub fn set_groups(&self, user: &str, groups: &[&str]) {
+        if let Some(account) = self.inner.accounts.lock().unwrap().get_mut(user) {
+            account.groups = groups.iter().map(|g| g.to_string()).collect();
+        }
     }
 
     /// Number of requests the `/sso/login` page has received.
@@ -228,7 +236,8 @@ async fn status(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    match ctx.inner.accounts.get(&user) {
+    let account = ctx.inner.accounts.lock().unwrap().get(&user).cloned();
+    match account {
         Some(acct) if acct.password == pass => Json(json!({
             "userId": user,
             "roles": acct.groups,

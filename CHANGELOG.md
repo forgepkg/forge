@@ -147,6 +147,14 @@ The release workflow publishes the section whose heading matches the tag
   once is not authenticated by it, and neither copy is cleared — before, the
   first one won, which let a cookie planted for a narrower path or a parent
   domain fix the browser's session.
+- Admin changes from an identity source take effect at once: a NuGet
+  client's Basic login that re-reads the upstream's groups now drops the
+  user's cached authorization set (as the browser login already did), so a
+  demoted admin is not served as an admin until the cache expires; and a
+  demotion by an upstream or an IdP ends the user's browser sessions. Editing
+  a credential-forwarding realm retires the credential verdicts cached under
+  its old config (they are keyed by it), so e.g. a newly required group
+  applies to the next request rather than after `positive_ttl_secs`.
 
 ## [0.1.0]
 

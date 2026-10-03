@@ -653,10 +653,19 @@ impl RealmAuth {
             .map_err(|e| anyhow::anyhow!("build credential-forwarding client: {e}"))?;
         // Realm-scoped: keys the validated-credential cache per realm.
         let provider_id = format!("realm:{}", realm.name);
+        // Bind cached verdicts to this exact realm config: after an edit (a
+        // new required group or identity_path, another URL, …) every verdict
+        // cached under the old config is unreachable, so none outlives the
+        // policy that produced it.
+        let mut pepper = cfg.key_pepper.clone().into_bytes();
+        pepper.push(0);
+        pepper.extend_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(
+            config.to_string().as_bytes(),
+        ));
         let cred_cache = ValidatedCredentialCache::new(
             self.cache.clone(),
             self.pool.clone(),
-            CredKeyPepper::new(cfg.key_pepper.clone().into_bytes()),
+            CredKeyPepper::new(pepper),
             Duration::from_secs(cfg.positive_ttl_secs),
             Duration::from_secs(cfg.negative_ttl_secs),
         )
