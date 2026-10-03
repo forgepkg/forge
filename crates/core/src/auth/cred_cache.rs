@@ -12,10 +12,13 @@
 //!   ([`forge_db::validated_credential_dao`]). A cold instance with no Redis
 //!   still reads it and avoids re-forwarding (the no in-memory-only-authoritative
 //!   -state rule).
-//! * **Hot path:** [`forge_cache::Cache`] (L1 moka + optional L2 Redis) keyed by
-//!   the credential HMAC, with the Postgres read as its factory. Invalidation
-//!   broadcasts on the cache backplane so a revoke on one node drops the L1 entry
-//!   on every node.
+//! * **Hot path:** [`forge_cache::Cache`], **in-process only**
+//!   ([`forge_cache::Cache::get_or_try_insert_local_with_tags`]) and keyed by
+//!   the credential HMAC, with the Postgres read as its factory. A verdict is
+//!   an authentication decision, so it never lives in Redis (anyone with
+//!   access to Redis could otherwise mark any password valid). Invalidation
+//!   broadcasts on the cache backplane so a revoke on one node drops the L1
+//!   entry on every node.
 //! * **Success log:** every definitive upstream ACCEPT also records
 //!   `(username, provider_id)` in `auth_success`
 //!   ([`forge_db::validated_credential_dao::record_auth_success`]) — rejected
@@ -353,7 +356,7 @@ impl ValidatedCredentialCache {
 
     /// Validate `(provider_id, username, password)` through the cache.
     ///
-    /// Lookup order: L1 → L2 → Postgres `validated_credential` → (on a true miss)
+    /// Lookup order: L1 → Postgres `validated_credential` → (on a true miss)
     /// the singleflighted `forward` upstream call. A returned `Ok(true)` means
     /// the credential is valid; `Ok(false)` means definitively rejected;
     /// [`CredCacheError::Unavailable`] means fail-closed (deny; do not grant).
@@ -398,7 +401,7 @@ impl ValidatedCredentialCache {
 
         let verdict: CachedVerdict = self
             .cache
-            .get_or_try_insert_with_tags(
+            .get_or_try_insert_local_with_tags(
                 NS_CRED,
                 &key,
                 std::slice::from_ref(&user_tag),
@@ -412,7 +415,7 @@ impl ValidatedCredentialCache {
 
     /// Revoke every cached verdict for `username` (optionally scoped to one
     /// provider): delete the authoritative rows **and** broadcast a cache-layer
-    /// invalidation so peer instances drop their L1/L2 entries.
+    /// invalidation so peer instances drop their L1 entries.
     ///
     /// Because the cache key is the (peppered) credential HMAC, we cannot target
     /// the exact L1 keys for a username without the passwords — so we invalidate
@@ -442,7 +445,7 @@ impl ValidatedCredentialCache {
 /// This is the admin "force re-auth user X" / deactivate-user path: it deletes
 /// the authoritative `validated_credential` rows for the username (across all
 /// providers) and broadcasts a cache-layer invalidation of the shared
-/// validated-credential namespace so peer instances drop their L1/L2 entries
+/// validated-credential namespace so peer instances drop their L1 entries
 /// on the next read. The pepper is irrelevant here — revocation is keyed by
 /// username, not by the credential HMAC. Returns the number of authoritative
 /// rows deleted.

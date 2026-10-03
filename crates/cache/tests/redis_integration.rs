@@ -493,3 +493,123 @@ async fn l2_payload_of_another_type_is_a_miss_not_a_panic() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+/// Security-relevant values are cached in process only: a local entry is
+/// never written to Redis (a peer with a cold L1 runs its own factory), and a
+/// value planted in Redis under the same key is never read back by a local
+/// lookup — anyone who can write to Redis must not be able to supply an
+/// authorization set or a credential verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_entries_never_touch_redis() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let key = format!("local-{}", std::process::id());
+
+    // A caches locally; B (cold L1, shared L2) must not find it in Redis.
+    let v = a
+        .get_or_try_insert_local::<String, _, _, TestError>(
+            "sec",
+            &key,
+            Duration::from_secs(300),
+            || async { Ok("genuine-a".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(v, "genuine-a");
+    let seen_by_b = b
+        .get_or_try_insert_with::<String, _, _, TestError>(
+            "sec",
+            &key,
+            Duration::from_secs(300),
+            || async { Ok("b-factory".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seen_by_b, "b-factory",
+        "a local entry must not be shared through Redis"
+    );
+
+    // B's shared write above is now in Redis ("planted"). A fresh instance's
+    // local lookup must ignore it and run its own factory.
+    let c = connect(&url).await;
+    let v = c
+        .get_or_try_insert_local::<String, _, _, TestError>(
+            "sec",
+            &key,
+            Duration::from_secs(300),
+            || async { Ok("genuine-c".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        v, "genuine-c",
+        "a local lookup must never read a Redis entry"
+    );
+}
+
+/// Local entries still honor cross-instance invalidation over the
+/// backplane: an invalidation on one instance evicts every instance's copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_entries_are_invalidated_across_instances() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let key = format!("local-inv-{}", std::process::id());
+
+    let v = a
+        .get_or_try_insert_local::<i64, _, _, TestError>(
+            "sec",
+            &key,
+            Duration::from_secs(300),
+            || async { Ok(1) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(v, 1);
+    b.invalidate("sec", &key).await;
+
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    loop {
+        let v = a
+            .get_or_try_insert_local::<i64, _, _, TestError>(
+                "sec",
+                &key,
+                Duration::from_secs(300),
+                || async { Ok(2) },
+            )
+            .await
+            .unwrap();
+        if v == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backplane never evicted the local entry"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `rediss://` (TLS) URLs are supported: the client accepts them and only
+/// the connection itself fails against a closed port.
+#[tokio::test]
+async fn rediss_urls_are_supported() {
+    let err = Cache::with_redis_timeouts(
+        10,
+        "rediss://127.0.0.1:9/",
+        RedisTimeouts {
+            connect: Duration::from_millis(200),
+            response: Duration::from_millis(200),
+        },
+    )
+    .await
+    .err()
+    .expect("nothing listens on port 9");
+    let message = err.to_string();
+    assert!(
+        !message.contains("feature is not enabled") && !message.contains("TLS"),
+        "{message}"
+    );
+}

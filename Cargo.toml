@@ -69,7 +69,9 @@ moka = { version = "0.12", features = ["future"] }
 globset = { version = "0.4" }
 
 # Redis (optional)
-redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+# `tokio-rustls-comp`: `rediss://` URLs (TLS, verified against the system
+# trust store).
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "connection-manager"] }
 
 # Futures combinators (Stream adapters for redis pub/sub)
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

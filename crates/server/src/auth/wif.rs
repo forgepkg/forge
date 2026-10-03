@@ -67,6 +67,9 @@ fn default_positive_cache() -> u64 {
 const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_POSITIVE_CACHE_SECONDS: u64 = 5 * 60;
+/// Cache namespace for positive workload-token verdicts. In-process only
+/// ([`forge_cache::Cache::get_or_try_insert_local`]): a verdict stored in Redis
+/// could be planted by anyone with access to it.
 const NS_WIF_VERIFIED: &str = "wif_verified";
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const GITLAB_COM_ISSUER: &str = "https://gitlab.com";
@@ -348,7 +351,7 @@ impl WorkloadIdentityRealm {
         };
 
         self.cache
-            .get_or_try_insert_with(NS_WIF_VERIFIED, &key, ttl, verify)
+            .get_or_try_insert_local(NS_WIF_VERIFIED, &key, ttl, verify)
             .await
     }
 }

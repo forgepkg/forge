@@ -50,6 +50,14 @@ The release workflow publishes the section whose heading matches the tag
   id could steer the proxy's credentialed upstream requests to other paths
   and queries of the upstream host, and planted bogus names in the proxy's
   version table.
+- Redis is treated as a trust boundary: authorization sets, credential
+  verdicts, OIDC discovery documents and key sets, and workload-identity
+  verdicts are cached in each instance's memory only and never read from or
+  written to Redis (which still relays their invalidations). Before, anyone
+  able to write to Redis could plant an admin authorization set, mark a
+  password valid or substitute an IdP signing key for every instance.
+  `rediss://` (TLS) Redis URLs are now supported, and the deployment guide
+  documents how to isolate Redis.
 
 ## [0.1.0]
 

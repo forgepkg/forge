@@ -12,7 +12,7 @@ CI publishing without stored API keys see
 | PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. |
 | S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … The bucket is created if missing. |
 | TLS termination | A reverse proxy or load balancer in front of Forge (nginx, Traefik, an ingress, an ALB). Forge itself speaks plain HTTP. |
-| Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. |
+| Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. |
 
 Forge is a single stateless process. The API, the NuGet feed and the web UI
 share one port (`8421`), so one upstream on the reverse proxy is enough.
@@ -231,6 +231,24 @@ Instances coordinate through PostgreSQL (row locks and leases), so any number
 can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
 password-failure lockout is kept in memory on each instance.
+
+### Redis is a trust boundary
+
+Anything that can write to Redis can write Forge's shared cache. Forge
+therefore keeps every value a security decision rests on **out of Redis**:
+authorization sets, credential-forwarding verdicts, OIDC discovery documents
+and signing keys, and workload-identity token verdicts are cached in each
+instance's memory only. Redis carries only their invalidations, so the worst
+a Redis writer can do to them is evict them early. Upstream package metadata
+(proxy listings, manifests, registrations) is still shared through Redis;
+proxied packages themselves are checked against the requested id and
+version before they are served.
+
+Still treat Redis like the database: a dedicated instance (or ACL user) for
+Forge, `requirepass`/ACL credentials in the URL, not reachable from outside
+the deployment, and TLS when it crosses a network you do not control
+(`FORGE_REDIS__URL=rediss://user:password@redis.internal:6380`; the server
+verifies the certificate against the system trust store).
 
 ## Backup and restore
 

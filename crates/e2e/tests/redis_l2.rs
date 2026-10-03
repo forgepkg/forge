@@ -70,3 +70,58 @@ fn forge_e2e_unique() -> u64 {
     static C: AtomicU64 = AtomicU64::new(0);
     C.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Redis is a trust boundary: a value planted in Redis under an authorization
+/// cache key (here: an admin effective set for an ordinary user, written via
+/// the shared L2 API exactly as a Redis writer could) must never be used by
+/// another instance. Authorization sets are cached in process only.
+#[tokio::test]
+async fn a_planted_redis_authz_entry_is_never_trusted() {
+    use forge_core::auth::Principal;
+    use forge_core::authz::cache::NS_AUTHZ;
+    use forge_core::authz::RawEffectiveSet;
+    use forge_db::user_dao::{self, NewUser};
+
+    let a = StackBuilder::default().with_redis().start().await;
+    let b = a.spawn_peer().await;
+    let user = user_dao::insert_user(
+        &a.pool,
+        NewUser::local(
+            format!("plain{}", forge_e2e_unique()),
+            "x".into(),
+            false,
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Plant an admin set for the user in the shared L2.
+    let forged: RawEffectiveSet = a
+        .state
+        .cache
+        .get_or_try_insert_with::<RawEffectiveSet, _, _, std::convert::Infallible>(
+            NS_AUTHZ,
+            &format!("user:{}", user.id),
+            Duration::from_secs(60),
+            || async {
+                Ok(RawEffectiveSet {
+                    is_admin: true,
+                    grants: Vec::new(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+    assert!(forged.is_admin);
+
+    let principal = Principal::User {
+        user_id: user.id,
+        token_id: None,
+        is_admin: false,
+    };
+    assert!(
+        !b.state.authz.is_global_admin(&principal).await,
+        "an authz set read from Redis would make an ordinary user admin"
+    );
+}

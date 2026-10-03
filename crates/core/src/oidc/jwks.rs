@@ -6,6 +6,11 @@
 //! [`crate::net::ssrf::guarded_client`]) and a [`forge_cache::Cache`], which is
 //! what makes the whole module unit-testable with a [`wiremock`] HTTP server and
 //! a self-signed token — no real IdP, no real network.
+//!
+//! Discovery documents and key sets decide which tokens verify, so they are
+//! cached **in-process only** ([`Cache::get_or_try_insert_local`]): never read
+//! from Redis, where anyone with access to it could plant their own signing
+//! key. Each instance fetches them itself; Redis only relays invalidations.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -250,7 +255,7 @@ impl OidcMetadataClient {
 
         let doc: DiscoveryDocument = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_DISCOVERY,
                 &self.issuer,
                 self.discovery_ttl,
@@ -275,7 +280,7 @@ impl OidcMetadataClient {
 
         let doc: WorkloadDiscoveryDocument = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_WORKLOAD_DISCOVERY,
                 &self.issuer,
                 self.discovery_ttl,
@@ -301,7 +306,7 @@ impl OidcMetadataClient {
         let http = self.http.clone();
         let url = jwks_uri.to_string();
         self.cache
-            .get_or_try_insert_with(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
+            .get_or_try_insert_local(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
                 fetch_json::<JwkSet>(&http, &url, "jwks").await
             })
             .await
@@ -309,7 +314,7 @@ impl OidcMetadataClient {
 
     /// Force a cache-bypassing JWKS refetch: drop the cached entry (which also
     /// broadcasts an invalidation to peer instances via the cache backplane,
-    /// when Redis L2 is configured), then repopulate it.
+    /// when Redis is configured), then repopulate it.
     ///
     /// Per-instance coalescing means a rotation storm refetches at most once per
     /// instance; we deliberately use **no** advisory lock — an occasional
@@ -321,13 +326,13 @@ impl OidcMetadataClient {
 
     /// Claim the issuer's single unknown-`kid` refresh slot for the cooldown
     /// window. The cache's per-key coalescing means concurrent misses share one
-    /// winner; a Redis-backed cache also bounds normal multi-instance traffic.
+    /// winner per instance.
     async fn acquire_unknown_kid_refresh(&self) -> bool {
         let candidate = uuid::Uuid::new_v4().to_string();
         let produced = candidate.clone();
         let cached = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_JWKS_KID_REFRESH,
                 &self.issuer,
                 DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN,
