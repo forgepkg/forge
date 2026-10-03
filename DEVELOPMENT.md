@@ -224,8 +224,9 @@ password supplied to NuGet should be a **token**.
   feed), flag the trusted ones as owners — `"owner": true` when adding the
   member, or `PATCH /admin/repositories/all/members/releases`
   `{"owner": true}`. Once any member is flagged, only owners (and the hosted
-  repositories inside an owning nested group) hide proxy versions and serve
-  reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
+  repositories inside an owning nested group) claim ids: an id an owner has
+  is served by the owners alone (no proxy or other hosted member adds
+  versions to it), and only owners serve reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
   the group or deleting it; both are refused with 409 otherwise.
 
 ## Configuration
