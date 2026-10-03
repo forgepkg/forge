@@ -115,6 +115,7 @@ fn ctx<'a>(pool: &'a PgPool, repo_id: i64, name: &'a str, run_id: uuid::Uuid) ->
         delete_grace: GRACE,
         dry_run: false,
         evaluated_at: None,
+        fence: None,
     }
 }
 

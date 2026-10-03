@@ -16,7 +16,7 @@ pub mod evaluate;
 pub mod model;
 pub mod worker;
 
-pub use apply::{apply, ApplyContext};
+pub use apply::{apply, ApplyContext, RunFence};
 pub use evaluate::{
     evaluate, evaluate_proxy, CandidateComponent, Decision, DecisionReason, ProxyCandidate,
     ProxyDecision,

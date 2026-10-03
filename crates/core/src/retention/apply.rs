@@ -6,10 +6,16 @@
 //! decision (already-committed ones are durable + idempotent). Within that one
 //! transaction we:
 //!
-//! 1. `SELECT … FOR UPDATE` the target row (component or proxy cached version)
-//!    by **id** and re-verify it still matches the decision. A concurrent
-//!    redeploy / re-push / admin delete that changed the row makes us **skip**
-//!    (audited as `skipped`) rather than act on stale state.
+//! 1. Fence the step to its run ([`RunFence`]): the run must still own its
+//!    lease and the stored policy must still be the one it evaluated, or the
+//!    run **stops** (the rest is left to the next run under the current
+//!    policy). Then lock the package's versions and **re-evaluate** them: a
+//!    decision the current state no longer produces (say `keep_last_n` now
+//!    protects the version because a newer one was unlisted) is skipped.
+//!    `SELECT … FOR UPDATE` the target row (component or proxy cached
+//!    version) by **id** and re-verify it still matches the decision. A
+//!    concurrent redeploy / re-push / admin delete that changed the row makes
+//!    us **skip** (audited as `skipped`) rather than act on stale state.
 //! 2. For a hard delete: delete the asset rows, then
 //!    [`blob_dao::decref_and_maybe_enqueue_delete`] each referenced blob — this
 //!    is the **only** blob-GC path; it decrements `ref_count` and, iff it hits
@@ -35,8 +41,29 @@ use sqlx::PgPool;
 use forge_db::retention_dao::{self, AuditRow, RunSummary};
 use forge_db::{asset_dao, blob_dao, component_dao};
 
-use crate::retention::evaluate::{Decision, ProxyDecision};
-use crate::retention::model::Action;
+use crate::format::Format;
+use crate::retention::evaluate::{evaluate, CandidateComponent, Decision, ProxyDecision};
+use crate::retention::model::{Action, RetentionPolicy};
+
+/// What a run's decisions were made under, re-checked before each one is
+/// applied (see the module docs).
+pub struct RunFence<'a> {
+    /// The policy as stored in `repository.retention_policy` when the run
+    /// claimed the repository.
+    pub stored_policy: &'a JsonValue,
+    /// The same policy, parsed: re-evaluates a package's versions.
+    pub policy: &'a RetentionPolicy,
+    /// The repository's format: orders versions for the re-evaluation.
+    pub format: &'a dyn Format,
+}
+
+/// Whether the run goes on after a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Continue,
+    /// The run lost its lease or its policy changed.
+    Stop,
+}
 
 /// Everything the apply path needs that is not in the decision itself.
 pub struct ApplyContext<'a> {
@@ -60,6 +87,9 @@ pub struct ApplyContext<'a> {
     /// downloaded after this instant (it is no longer cold). `None` disables
     /// the re-check.
     pub evaluated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fence and re-evaluate every mutating step (the worker always sets
+    /// it). `None` applies the decisions as given.
+    pub fence: Option<RunFence<'a>>,
 }
 
 /// Whether a download-driven decision became stale: the target was fetched
@@ -91,19 +121,68 @@ pub async fn apply(
     hosted: &[Decision],
     proxy: &[ProxyDecision],
 ) -> Result<RunSummary, sqlx::Error> {
+    let total = hosted.len() + proxy.len();
     let mut summary = RunSummary {
-        evaluated: (hosted.len() + proxy.len()) as u64,
+        evaluated: total as u64,
         ..Default::default()
     };
 
+    let mut started = 0;
     for d in hosted {
-        apply_hosted(ctx, d, &mut summary).await?;
+        started += 1;
+        if apply_hosted(ctx, d, &mut summary).await? == Step::Stop {
+            return Ok(stopped(ctx, summary, total - started + 1));
+        }
     }
     for d in proxy {
-        apply_proxy(ctx, d, &mut summary).await?;
+        started += 1;
+        if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
+            return Ok(stopped(ctx, summary, total - started + 1));
+        }
     }
 
     Ok(summary)
+}
+
+/// The summary of a run that stopped with `remaining` decisions unapplied
+/// (counted as skipped; the next run re-evaluates them).
+fn stopped(ctx: &ApplyContext<'_>, mut summary: RunSummary, remaining: usize) -> RunSummary {
+    tracing::info!(
+        repository = ctx.repository_name,
+        run_id = %ctx.run_id,
+        remaining,
+        "retention run stopped: it lost its lease or its policy changed; \
+         the next run re-evaluates the rest"
+    );
+    summary.skipped += remaining as u64;
+    summary
+}
+
+/// Whether evaluating the package's current versions (locked by this call)
+/// under the run's policy still yields `d`.
+async fn still_decided(
+    tx: &mut sqlx::PgConnection,
+    ctx: &ApplyContext<'_>,
+    fence: &RunFence<'_>,
+    d: &Decision,
+) -> Result<bool, sqlx::Error> {
+    let candidates: Vec<CandidateComponent> =
+        retention_dao::lock_package_candidates(tx, ctx.repository_id, &d.package_name)
+            .await?
+            .into_iter()
+            .map(|r| CandidateComponent {
+                component_id: r.component_id,
+                package_name: r.name,
+                version: r.version,
+                listed: r.listed,
+                created_at: r.created_at,
+                last_downloaded_at: r.last_downloaded_at,
+            })
+            .collect();
+    let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
+    Ok(evaluate(fence.format, now, fence.policy, &candidates)
+        .iter()
+        .any(|again| again.component_id == d.component_id && again.action == d.action))
 }
 
 /// Apply one hosted decision in its own transaction.
@@ -111,7 +190,7 @@ async fn apply_hosted(
     ctx: &ApplyContext<'_>,
     d: &Decision,
     summary: &mut RunSummary,
-) -> Result<(), sqlx::Error> {
+) -> Result<Step, sqlx::Error> {
     let reason = reason_json(&d.reason);
 
     // Dry run: record intent, mutate nothing.
@@ -141,10 +220,29 @@ async fn apply_hosted(
             Action::Unlist => summary.unlisted += 1,
             Action::HardDelete => summary.deleted += 1,
         }
-        return Ok(());
+        return Ok(Step::Continue);
     }
 
     let mut tx = ctx.pool.begin().await?;
+
+    if let Some(fence) = &ctx.fence {
+        if !retention_dao::lock_run_fence(
+            &mut tx,
+            ctx.repository_id,
+            ctx.run_id,
+            fence.stored_policy,
+        )
+        .await?
+        {
+            return Ok(Step::Stop);
+        }
+        if !still_decided(&mut tx, ctx, fence, d).await? {
+            audit_skipped(&mut tx, ctx, d, "component").await?;
+            tx.commit().await?;
+            summary.skipped += 1;
+            return Ok(Step::Continue);
+        }
+    }
 
     // Re-verify: lock the component row by id. A concurrent hard delete may have
     // removed it; a redeploy may have swapped its assets. Lock first so our read
@@ -167,7 +265,7 @@ async fn apply_hosted(
         audit_skipped(&mut tx, ctx, d, "component").await?;
         tx.commit().await?;
         summary.skipped += 1;
-        return Ok(());
+        return Ok(Step::Continue);
     };
     // Downloaded while this run was working: no longer cold — skip.
     if downloaded_since(
@@ -178,7 +276,7 @@ async fn apply_hosted(
         audit_skipped(&mut tx, ctx, d, "component").await?;
         tx.commit().await?;
         summary.skipped += 1;
-        return Ok(());
+        return Ok(Step::Continue);
     }
 
     match d.action {
@@ -283,7 +381,7 @@ async fn apply_hosted(
         }
     }
 
-    Ok(())
+    Ok(Step::Continue)
 }
 
 /// Apply one proxy eviction in its own transaction. Eviction deletes the cached
@@ -301,7 +399,7 @@ async fn apply_proxy(
     ctx: &ApplyContext<'_>,
     d: &ProxyDecision,
     summary: &mut RunSummary,
-) -> Result<(), sqlx::Error> {
+) -> Result<Step, sqlx::Error> {
     let reason = reason_json(&d.reason);
 
     if ctx.dry_run {
@@ -327,10 +425,23 @@ async fn apply_proxy(
         .await?;
         tx.commit().await?;
         summary.deleted += 1;
-        return Ok(());
+        return Ok(Step::Continue);
     }
 
     let mut tx = ctx.pool.begin().await?;
+
+    if let Some(fence) = &ctx.fence {
+        if !retention_dao::lock_run_fence(
+            &mut tx,
+            ctx.repository_id,
+            ctx.run_id,
+            fence.stored_policy,
+        )
+        .await?
+        {
+            return Ok(Step::Stop);
+        }
+    }
 
     // Lock the cached-version row by id (the proxy's download finalize locks
     // the same row first, so the two serialize). Skip if it is gone, or if it
@@ -352,7 +463,7 @@ async fn apply_proxy(
         audit_skipped_proxy(&mut tx, ctx, d).await?;
         tx.commit().await?;
         summary.skipped += 1;
-        return Ok(());
+        return Ok(Step::Continue);
     };
     // Pulled while this run was working: no longer cold — skip.
     if downloaded_since(
@@ -363,7 +474,7 @@ async fn apply_proxy(
         audit_skipped_proxy(&mut tx, ctx, d).await?;
         tx.commit().await?;
         summary.skipped += 1;
-        return Ok(());
+        return Ok(Step::Continue);
     }
 
     // Delete the parallel component + its assets (decref their blobs), if any.
@@ -446,7 +557,7 @@ async fn apply_proxy(
     tx.commit().await?;
     summary.deleted += 1;
 
-    Ok(())
+    Ok(Step::Continue)
 }
 
 fn action_str(a: Action) -> &'static str {

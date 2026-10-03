@@ -35,7 +35,7 @@ use forge_db::retention_dao::{self, RunSummary};
 
 use crate::format::Format;
 use crate::repo::CacheInvalidator;
-use crate::retention::apply::{apply, ApplyContext};
+use crate::retention::apply::{apply, ApplyContext, RunFence};
 use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
 use crate::retention::model::{validate_policy, RetentionPolicy};
 
@@ -280,6 +280,11 @@ impl RetentionWorker {
             delete_grace: self.config.delete_grace,
             dry_run: policy.dry_run_only,
             evaluated_at: Some(now),
+            fence: Some(RunFence {
+                stored_policy: &repo.policy,
+                policy: &policy,
+                format: self.format.as_ref(),
+            }),
         };
         let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
 

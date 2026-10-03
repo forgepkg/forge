@@ -679,3 +679,180 @@ async fn dropped_tick_aborts_its_lease_heartbeat() {
 
     blocker.rollback().await.unwrap();
 }
+
+/// Claim `repo_id`'s run and evaluate its hosted versions as the worker does,
+/// stopping before the apply step so a test can change state in between.
+async fn claim_and_evaluate(
+    pool: &PgPool,
+    repo_id: i64,
+) -> (
+    retention_dao::ClaimedRepo,
+    uuid::Uuid,
+    forge_core::retention::model::RetentionPolicy,
+    Vec<forge_core::retention::evaluate::Decision>,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    let (claimed, run_id) = retention_dao::claim_next_due_repo(
+        &mut tx,
+        Utc::now(),
+        Duration::seconds(300),
+        Some(repo_id),
+    )
+    .await
+    .unwrap()
+    .expect("due");
+    tx.commit().await.unwrap();
+    let policy: forge_core::retention::model::RetentionPolicy =
+        serde_json::from_value(claimed.policy.clone()).unwrap();
+    let candidates: Vec<_> = retention_dao::load_candidate_components(pool, repo_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(
+            |(r, _)| forge_core::retention::evaluate::CandidateComponent {
+                component_id: r.component_id,
+                package_name: r.name,
+                version: r.version,
+                listed: r.listed,
+                created_at: r.created_at,
+                last_downloaded_at: r.last_downloaded_at,
+            },
+        )
+        .collect();
+    let decisions = forge_core::retention::evaluate::evaluate(
+        &NugetFormat::default(),
+        Utc::now(),
+        &policy,
+        &candidates,
+    );
+    (claimed, run_id, policy, decisions)
+}
+
+async fn apply_fenced(
+    pool: &PgPool,
+    claimed: &retention_dao::ClaimedRepo,
+    run_id: uuid::Uuid,
+    policy: &forge_core::retention::model::RetentionPolicy,
+    decisions: &[forge_core::retention::evaluate::Decision],
+) -> retention_dao::RunSummary {
+    let format = NugetFormat::default();
+    let ctx = forge_core::retention::apply::ApplyContext {
+        pool,
+        repository_id: claimed.repository_id,
+        repository_name: &claimed.name,
+        run_id,
+        delete_grace: Duration::seconds(60),
+        dry_run: false,
+        evaluated_at: Some(Utc::now()),
+        fence: Some(forge_core::retention::apply::RunFence {
+            stored_policy: &claimed.policy,
+            policy,
+            format: &format,
+        }),
+    };
+    forge_core::retention::apply::apply(&ctx, decisions, &[])
+        .await
+        .unwrap()
+}
+
+/// Review: `keep_last_n: 1` protects 2.0.0, so 1.0.0 is decided for deletion;
+/// the owner unlists 2.0.0 before the decision is applied. Re-evaluated under
+/// the lock, 1.0.0 is now the newest listed version and protected: it must
+/// not be deleted (that would leave the package without a listed version).
+#[tokio::test]
+async fn a_protection_gained_mid_run_is_honoured() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-fence-{n}")))
+            .await
+            .unwrap();
+    for (i, version) in ["1.0.0", "2.0.0"].into_iter().enumerate() {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{
+                "id": "latest",
+                "action": "hard_delete",
+                "criteria": { "keep_last_n": 1, "older_than_days": 30 }
+            }]
+        }),
+    )
+    .await;
+    let (claimed, run_id, policy, decisions) = claim_and_evaluate(&pool, repo.id).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].version, "1.0.0");
+
+    sqlx::query(
+        "UPDATE component SET listed = false WHERE repository_id = $1 AND version = '2.0.0'",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let summary = apply_fenced(&pool, &claimed, run_id, &policy, &decisions).await;
+    assert_eq!((summary.deleted, summary.skipped), (0, 1));
+    assert!(component_exists(&pool, repo.id, "lib", "1.0.0").await);
+}
+
+/// A policy edited (or disabled) while a run is applying stops the run: no
+/// further decision made under the old policy is applied. So does a run
+/// that lost its lease.
+#[tokio::test]
+async fn a_policy_change_or_lost_lease_stops_the_run() {
+    let pool = pool().await;
+    let n = unique();
+    let policy_json = json!({
+        "version": 1,
+        "rules": [{
+            "id": "latest",
+            "action": "hard_delete",
+            "criteria": { "keep_last_n": 1, "older_than_days": 30 }
+        }]
+    });
+    for lose_lease in [false, true] {
+        let repo = repository_dao::insert_repository(
+            &pool,
+            NewRepository::hosted(format!("rw-stop-{n}-{lose_lease}")),
+        )
+        .await
+        .unwrap();
+        for (i, version) in ["1.0.0", "2.0.0", "3.0.0"].into_iter().enumerate() {
+            let sha = seed_blob(&pool, n * 100 + 10 * lose_lease as u64 + i as u64, 1).await;
+            seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        }
+        arm(&pool, repo.id, &policy_json).await;
+        let (claimed, run_id, policy, decisions) = claim_and_evaluate(&pool, repo.id).await;
+        assert_eq!(decisions.len(), 2);
+
+        if lose_lease {
+            sqlx::query("UPDATE retention_run SET current_run_id = gen_random_uuid() WHERE repository_id = $1")
+                .bind(repo.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            let mut keep_all = policy_json.clone();
+            keep_all["rules"][0]["criteria"]["keep_last_n"] = json!(5);
+            retention_dao::write_policy(&pool, repo.id, Some(&keep_all))
+                .await
+                .unwrap();
+        }
+
+        let summary = apply_fenced(&pool, &claimed, run_id, &policy, &decisions).await;
+        assert_eq!(
+            (summary.deleted, summary.skipped),
+            (0, 2),
+            "lose_lease={lose_lease}"
+        );
+        for version in ["1.0.0", "2.0.0", "3.0.0"] {
+            assert!(component_exists(&pool, repo.id, "lib", version).await);
+        }
+    }
+}
