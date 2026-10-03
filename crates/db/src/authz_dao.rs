@@ -819,6 +819,14 @@ where
         .await
 }
 
+/// Delete a `forge_setting` row by key. Returns whether it existed.
+pub async fn delete_setting(pool: &PgPool, key: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query!(r#"DELETE FROM forge_setting WHERE key = $1"#, key)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Upsert a `forge_setting` value by key (e.g. one-shot import markers like
 /// the 12.7 `auth_realms_seeded` flag).
 pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {

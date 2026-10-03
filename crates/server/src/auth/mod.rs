@@ -62,8 +62,9 @@ mod redirect;
 mod wif;
 
 pub use realms::{
-    merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config, OidcRealmRuntime,
-    RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+    forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config,
+    OidcRealmRuntime, RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC,
+    KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
 pub(crate) use wif::workload_identity_config_sha256;

@@ -126,6 +126,31 @@ pub async fn pool() -> PgPool {
     pool
 }
 
+/// A migrated pool over a fresh, uniquely named database on the same Postgres
+/// server, for tests that change install-wide state (seeded realms, settings)
+/// the rest of the binary must not see.
+pub async fn fresh_pool() -> PgPool {
+    let admin = pool().await;
+    let name = format!("forge_fresh_{}_{}", std::process::id(), unique());
+    // The name is generated here, never user input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .execute(&admin)
+        .await
+        .expect("create database");
+    let shared = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => format!("postgres://forge:forge@{}/forge", pg_endpoint().await),
+    };
+    let (server, _db) = shared.rsplit_once('/').expect("database url with a path");
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&format!("{server}/{name}"))
+        .await
+        .expect("connect fresh database");
+    forge_db::migrate(&pool).await.expect("migrate");
+    pool
+}
+
 async fn blob_store() -> BlobStore {
     let endpoint = s3_endpoint().await.to_string();
     let store = BlobStore::new(S3Config {

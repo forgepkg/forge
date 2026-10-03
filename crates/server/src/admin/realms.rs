@@ -24,7 +24,7 @@ use serde_json::Value as JsonValue;
 
 use super::db_error;
 use crate::auth::{
-    merge_secrets, redact_config, secret_keys, validate_config, KIND_LOCAL, KIND_OIDC,
+    forget_seed, merge_secrets, redact_config, secret_keys, validate_config, KIND_LOCAL, KIND_OIDC,
     KIND_WORKLOAD_IDENTITY,
 };
 use crate::state::AppState;
@@ -348,6 +348,13 @@ pub async fn update(
         }
     }
 
+    if body.config.is_some() {
+        // An operator edit of a seeded realm wins over its legacy config block.
+        if let Err(e) = forget_seed(&state.pool, &existing).await {
+            return db_error(e);
+        }
+    }
+
     let upd = AuthRealmUpdate {
         name: body
             .name
@@ -404,8 +411,13 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         Ok(Some(r)) if r.kind == KIND_LOCAL => {
             bad_request("the built-in local realm cannot be deleted; disable it instead")
         }
-        Ok(Some(_)) => match auth_realm_dao::delete_realm(&state.pool, id).await {
+        Ok(Some(r)) => match auth_realm_dao::delete_realm(&state.pool, id).await {
             Ok(true) => {
+                // The kind's next boot re-imports a still-present legacy block
+                // as a fresh row; a stale marker must not outlive this one.
+                if let Err(e) = forget_seed(&state.pool, &r).await {
+                    tracing::warn!(realm = %r.name, error = %e, "seed marker not dropped");
+                }
                 state.realms.invalidate().await;
                 StatusCode::NO_CONTENT.into_response()
             }
