@@ -656,3 +656,26 @@ async fn repository_formats_other_than_nuget_are_rejected() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 }
+
+/// An instance without `[crypto]` refuses to start on a database that holds
+/// sealed secrets (it would otherwise run with every sealed credential
+/// unusable and write new secrets in plaintext).
+#[tokio::test]
+async fn sealed_secrets_without_crypto_config_refuse_startup() {
+    let pool = common::pool().await;
+    let repo = forge_db::repository_dao::insert_repository(
+        &pool,
+        forge_db::repository_dao::NewRepository::hosted(format!("sealed{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE repository SET upstream_password_enc = '\\x00' WHERE id = $1")
+        .bind(repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = forge_server::crypto::refuse_sealed_secrets_without_envelope(&pool)
+        .await
+        .expect_err("sealed secrets without an envelope service");
+    assert!(err.to_string().contains("encrypted secrets"), "{err}");
+}

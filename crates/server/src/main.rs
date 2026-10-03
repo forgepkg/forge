@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("bootstrap secret encryption")?;
     }
+    if envelope.is_none() {
+        forge_server::crypto::refuse_sealed_secrets_without_envelope(&pool).await?;
+    }
 
     // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
     // auth_realm rows (drift-detected); the DB is the authority. After the

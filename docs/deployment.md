@@ -123,9 +123,13 @@ The root key is part of your backup. Without it, stored secrets cannot be
 recovered, although packages and metadata are unaffected. AWS KMS is not
 supported yet.
 
-Enabling encryption on an existing installation is safe: at startup (and on
-every pass of the rotation worker) existing plaintext proxy passwords and
-realm secrets are encrypted and the plaintext copies are removed.
+Enabling encryption on an existing installation is safe, but enable it on
+**every instance at once** (a full restart, not a rolling one): at startup
+(and on every pass of the rotation worker) existing plaintext proxy passwords
+and realm secrets are encrypted and the plaintext copies are removed, and an
+instance still running without `[crypto]` cannot read them from then on.
+Turning encryption off again is not supported: an instance without `[crypto]`
+refuses to start while the database holds encrypted secrets.
 `GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
 plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
@@ -152,8 +156,11 @@ rolling restart after each:
    both roots, so neither fails to unwrap (an instance that has not restarted
    yet may wrap a KEK back under the old root; that is harmless and converges
    once every instance runs phase 2).
-3. Once `GET /admin/crypto/keys` shows every KEK on the new
-   `root_key_version`, remove the previous key and roll out once more.
+3. Once `GET /admin/crypto/keys` shows every **non-revoked** KEK on the new
+   `root_key_version` (revoked KEKs keep the old one and are never used
+   again), remove the previous key and roll out once more. Keep the old root
+   key with your backups for as long as you keep a database backup taken
+   before the rotation: restoring such a backup needs it.
 
 Swapping in one step makes the instances that still run with only the old
 key fail to unwrap KEKs that a new instance has already re-wrapped.
@@ -291,7 +298,9 @@ away, so a bucket copied *later* could already lack them. Either:
   garbage collection deletes an object only after that grace period, so a
   later bucket state can already lack objects the restored database still
   references). Keep noncurrent versions longer than your backup retention; or
-- stop Forge (or at least its garbage collection) while both copies are taken.
+- stop **every** Forge instance while both copies are taken (garbage
+  collection runs on every instance and has no separate switch;
+  `retention.enabled = false` does not stop it).
 
 Objects written after the database snapshot are harmless: nothing in the
 restored database references them. They only use storage.
