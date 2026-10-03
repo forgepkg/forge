@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO app_user\n            (username, password_hash, is_admin, active, auth_source,\n             external_subject, last_auth_source_at, realm_id)\n        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now(), $4)\n        ON CONFLICT (username) DO UPDATE SET\n            is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,\n            last_auth_source_at = now(),\n            -- Touch updated_at only when the admin flag actually changes.\n            updated_at = CASE\n                WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()\n                ELSE app_user.updated_at\n            END\n        WHERE app_user.auth_source = 'upstream-basic'\n          AND NOT app_user.realm_orphaned\n          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id\n        RETURNING\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, is_admin, active, auth_source,\n             external_subject, last_auth_source_at, realm_id)\n        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now(), $4)\n        ON CONFLICT (username) DO UPDATE SET\n            is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,\n            last_auth_source_at = now(),\n            -- Touch updated_at only when the admin flag actually changes.\n            updated_at = CASE\n                WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()\n                ELSE app_user.updated_at\n            END\n        WHERE app_user.auth_source = 'upstream-basic'\n          AND NOT app_user.realm_orphaned\n          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id\n        RETURNING\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at,\n            (xmax = 0) AS \"inserted!\"\n        ",
   "describe": {
     "columns": [
       {
@@ -101,6 +101,12 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 9,
+        "name": "inserted!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -120,8 +126,9 @@
       false,
       true,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "3d9a042fdcc24cc32b19d9d06d19f86720f23f32c7906c1d05c65ac79c465e77"
+  "hash": "399ea55f2fe5c21f3b42b3971782754b295b264b1af74d29a72ca10ad08b05f4"
 }

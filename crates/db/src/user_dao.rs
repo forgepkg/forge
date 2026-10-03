@@ -105,11 +105,30 @@ pub async fn provision_upstream_user(
     admin_authoritative: bool,
     realm_id: Option<i64>,
 ) -> sqlx::Result<Option<AppUser>> {
+    Ok(provision_upstream_user_tracked(
+        pool,
+        username,
+        suggested_is_admin,
+        admin_authoritative,
+        realm_id,
+    )
+    .await?
+    .map(|(user, _)| user))
+}
+
+/// [`provision_upstream_user`], also reporting whether this call created the
+/// account (`true`) rather than refreshing an existing one.
+pub async fn provision_upstream_user_tracked(
+    pool: &PgPool,
+    username: &str,
+    suggested_is_admin: bool,
+    admin_authoritative: bool,
+    realm_id: Option<i64>,
+) -> sqlx::Result<Option<(AppUser, bool)>> {
     let Some(username) = lookup_key(username) else {
         return Ok(None);
     };
-    sqlx::query_as!(
-        AppUser,
+    let row = sqlx::query!(
         r#"
         INSERT INTO app_user
             (username, password_hash, is_admin, active, auth_source,
@@ -128,7 +147,8 @@ pub async fn provision_upstream_user(
           AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id
         RETURNING
             id, username, password_hash, is_admin, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, created_at, updated_at,
+            (xmax = 0) AS "inserted!"
         "#,
         username,
         suggested_is_admin,
@@ -136,7 +156,23 @@ pub async fn provision_upstream_user(
         realm_id,
     )
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(row.map(|r| {
+        (
+            AppUser {
+                id: r.id,
+                username: r.username,
+                password_hash: r.password_hash,
+                is_admin: r.is_admin,
+                active: r.active,
+                auth_source: r.auth_source,
+                external_subject: r.external_subject,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            },
+            r.inserted,
+        )
+    }))
 }
 
 /// Find the `'upstream-basic'` user an upstream realm vouched for: the username
