@@ -295,7 +295,7 @@ pub struct WorkloadIdentityRealm {
 
 impl WorkloadIdentityRealm {
     /// Build the runtime from a realm row, reusing the shared cache for
-    /// discovery/JWKS and the SSRF-guarded outbound client (12.7 §3.6).
+    /// discovery/JWKS and the no-redirect, https-only metadata client.
     pub fn build(realm: &AuthRealm, cache: &Cache) -> anyhow::Result<Self> {
         let normalized = validate_workload_identity_config(&realm.config)
             .map_err(|e| anyhow::anyhow!("config: {e}"))?;
@@ -305,7 +305,7 @@ impl WorkloadIdentityRealm {
         .into();
         let config: WorkloadIdentityRealmConfig =
             serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("config: {e}"))?;
-        let http = ssrf::outbound_metadata_client()
+        let http = ssrf::outbound_metadata_client(config.allow_http_issuer)
             .map_err(|e| anyhow::anyhow!("build outbound metadata client: {e}"))?;
         let meta = OidcMetadataClient::new(config.issuer.clone(), http, cache.clone());
         let verification_policy_hash = verification_policy_hash(&config);

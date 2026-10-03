@@ -273,6 +273,11 @@ pub struct AuthConfig {
     /// Length (seconds) of the password-failure window / lockout.
     #[serde(default = "default_login_failure_window")]
     pub login_failure_window_seconds: u64,
+    /// OIDC login starts (`GET /auth/oidc/login`) allowed per client network
+    /// (IPv6: per /64) and minute, per instance. Each start stores a flow
+    /// row. `0` disables the limit.
+    #[serde(default = "default_oidc_login_starts_per_minute")]
+    pub oidc_login_starts_per_minute: u32,
     /// Maximum concurrent upstream credential forwards **per
     /// credential-forwarding realm, per instance** (verdict-cache misses
     /// only; cache hits never forward). A miss beyond the bound fails closed
@@ -300,6 +305,10 @@ fn default_login_max_failures() -> u32 {
 
 fn default_login_failure_window() -> u64 {
     300
+}
+
+fn default_oidc_login_starts_per_minute() -> u32 {
+    30
 }
 
 fn default_login_mode() -> String {
@@ -1031,6 +1040,11 @@ pub struct OidcConfig {
     /// recommended to avoid the Graph "groups overage" callout).
     #[serde(default = "default_admin_claim")]
     pub admin_claim: String,
+    /// Allow-gate: claim name → allowed values. Every listed claim must carry
+    /// one of its values or the login is refused (e.g. `tid` for one Entra
+    /// tenant, `hd` for a Google Workspace domain, `groups`). Empty ⇒ off.
+    #[serde(default)]
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
 
     // ---- session lifecycle ----
     /// Idle timeout (seconds): a session expires this long after its last use.

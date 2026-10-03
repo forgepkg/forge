@@ -41,6 +41,8 @@ export interface OidcRealmConfig {
   admin_claim?: string
   /** Email domains routed to this IdP by identifier-first. */
   login_domains?: string[]
+  /** Allow-gate: claim name -> allowed values (e.g. `{ tid: ['<tenant>'] }`). */
+  required_claims?: Record<string, string[]>
   button_label?: string | null
 }
 

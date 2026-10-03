@@ -10,6 +10,10 @@
 /// The safe fallback target when no (or an unsafe) `redirect_to` is supplied.
 const DEFAULT_TARGET: &str = "/";
 
+/// Longest accepted `redirect_to` (bytes). It is stored in the flow row, so
+/// an unbounded value would let anyone grow the table cheaply.
+pub const MAX_REDIRECT_TO_BYTES: usize = 2048;
+
 /// Sanitize a requested post-login target into a safe same-origin relative path.
 ///
 /// Returns [`DEFAULT_TARGET`] (`/`) unless `raw` is a clean relative path:
@@ -21,6 +25,9 @@ pub fn sanitize_redirect_to(raw: Option<&str>) -> String {
         return DEFAULT_TARGET.to_string();
     };
 
+    if candidate.len() > MAX_REDIRECT_TO_BYTES {
+        return DEFAULT_TARGET.to_string();
+    }
     // Must be an absolute path on this origin.
     if !candidate.starts_with('/') {
         return DEFAULT_TARGET.to_string();
@@ -49,6 +56,14 @@ pub fn sanitize_redirect_to(raw: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_targets_default_to_root() {
+        let long = format!("/{}", "a".repeat(MAX_REDIRECT_TO_BYTES));
+        assert_eq!(sanitize_redirect_to(Some(&long)), "/");
+        let fits = format!("/{}", "a".repeat(MAX_REDIRECT_TO_BYTES - 1));
+        assert_eq!(sanitize_redirect_to(Some(&fits)), fits);
+    }
 
     #[test]
     fn none_and_empty_default_to_root() {

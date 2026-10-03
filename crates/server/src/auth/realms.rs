@@ -178,6 +178,11 @@ pub struct OidcRealmConfig {
     /// Claim matched against `admin_groups`.
     #[serde(default = "default_admin_claim")]
     pub admin_claim: String,
+    /// Allow-gate: claim name → allowed values; every listed claim must carry
+    /// one of them, or the login is refused (e.g. `{"tid": ["<tenant id>"]}`
+    /// for a multi-tenant Entra app, `{"hd": ["corp.example"]}` for Google).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
     /// Identifier-first routing rule (§3.4): a login identifier whose email
     /// domain (the part after `@`, case-insensitive) is in this list is routed
     /// to this realm (`oidc_redirect`). Empty ⇒ never matched by identifier;
@@ -327,12 +332,39 @@ pub fn redact_config(kind: &str, config: &JsonValue) -> JsonValue {
     doc
 }
 
+/// Config keys a realm's stored secrets are bound to: the secret belongs to
+/// that party, so changing any of them requires entering the secret again.
+fn secret_binding_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        // The client secret is the IdP's credential for this client.
+        KIND_OIDC => &["issuer", "client_id"],
+        _ => &[],
+    }
+}
+
+/// Whether `key` differs between two config documents (strings compared
+/// trimmed and without a trailing `/`).
+fn binding_changed(stored: &JsonValue, incoming: &JsonValue, key: &str) -> bool {
+    let norm = |doc: &JsonValue| {
+        doc.get(key)
+            .and_then(JsonValue::as_str)
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+    };
+    norm(stored) != norm(incoming)
+}
+
 /// Merge a config **update** with the stored document's secrets: when the
 /// incoming document omits a secret key (or sends `null` / `""`), the stored
 /// value is kept — secrets are write-only, so the admin UI round-trips the
-/// redacted view without clobbering them.
+/// redacted view without clobbering them. A stored secret is **not** carried
+/// over when the party it belongs to changes (an OIDC realm's `issuer` or
+/// `client_id`): sending the old IdP's client secret to a new issuer would
+/// hand it to whoever runs that issuer, so the update must supply a new one.
 pub fn merge_secrets(kind: &str, stored: &JsonValue, incoming: &JsonValue) -> JsonValue {
     let mut doc = incoming.clone();
+    let rebound = secret_binding_keys(kind)
+        .iter()
+        .any(|key| binding_changed(stored, incoming, key));
     if let JsonValue::Object(map) = &mut doc {
         for key in secret_keys(kind) {
             // Drop the redaction marker if the UI echoed it back.
@@ -343,10 +375,13 @@ pub fn merge_secrets(kind: &str, stored: &JsonValue, incoming: &JsonValue) -> Js
                 _ => false,
             };
             if incoming_blank {
-                if let Some(stored_secret) = stored.get(*key) {
-                    map.insert((*key).to_string(), stored_secret.clone());
-                } else {
-                    map.remove(*key);
+                match stored.get(*key).filter(|_| !rebound) {
+                    Some(stored_secret) => {
+                        map.insert((*key).to_string(), stored_secret.clone());
+                    }
+                    None => {
+                        map.remove(*key);
+                    }
                 }
             }
         }
@@ -677,6 +712,7 @@ impl RealmAuth {
             link_existing_by_username: cfg.link_existing_by_username,
             admin_groups: cfg.admin_groups.clone(),
             admin_claim: cfg.admin_claim.clone(),
+            required_claims: cfg.required_claims.clone(),
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
@@ -829,6 +865,7 @@ pub async fn seed_auth_realms(
             link_existing_by_username: o.link_existing_by_username,
             admin_groups: o.admin_groups.clone(),
             admin_claim: o.admin_claim.clone(),
+            required_claims: o.required_claims.clone(),
             login_domains: Vec::new(),
             button_label: None,
         };
@@ -1016,6 +1053,33 @@ mod tests {
         let red = redact_config(KIND_OIDC, &cfg);
         assert!(red.get("client_secret").is_none());
         assert_eq!(red["client_secret_set"], json!(false));
+    }
+
+    #[test]
+    fn oidc_client_secret_is_dropped_when_the_issuer_or_client_changes() {
+        let stored = json!({"issuer": "https://idp.example/", "client_id": "forge", "client_secret": "s3cret"});
+        // Same issuer (trailing slash aside) and client: the secret is kept.
+        let kept = merge_secrets(
+            KIND_OIDC,
+            &stored,
+            &json!({"issuer": "https://idp.example", "client_id": "forge", "client_secret_set": true}),
+        );
+        assert_eq!(kept["client_secret"], json!("s3cret"));
+        // A new issuer or client id must come with a new secret.
+        for incoming in [
+            json!({"issuer": "https://evil.example", "client_id": "forge"}),
+            json!({"issuer": "https://idp.example", "client_id": "other"}),
+        ] {
+            let merged = merge_secrets(KIND_OIDC, &stored, &incoming);
+            assert!(merged.get("client_secret").is_none(), "{incoming}");
+            assert!(validate_config(KIND_OIDC, &merged).is_err());
+        }
+        let supplied = merge_secrets(
+            KIND_OIDC,
+            &stored,
+            &json!({"issuer": "https://evil.example", "client_id": "forge", "client_secret": "new"}),
+        );
+        assert_eq!(supplied["client_secret"], json!("new"));
     }
 
     #[test]

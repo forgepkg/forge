@@ -185,6 +185,7 @@ fn admin_mapping() -> ClaimMapping {
         display_name_claim: "name".into(),
         admin_claim: "roles".into(),
         admin_groups: vec!["forge-admins".into()],
+        required_claims: Default::default(),
     }
 }
 
@@ -411,6 +412,7 @@ async fn complete_login_surfaces_provider_error() {
             error: Some("access_denied".into()),
             error_description: Some("user cancelled".into()),
             state: Some("s".into()),
+            browser_binding: Some(oidc::browser_binding("s")),
             ..Default::default()
         },
     )
@@ -419,6 +421,28 @@ async fn complete_login_surfaces_provider_error() {
         Err(FlowError::Provider { error, .. }) => assert_eq!(error, "access_denied"),
         other => panic!("expected provider error, got {other:?}"),
     }
+}
+
+/// An `error` callback that is not bound to this browser's flow is a
+/// browser mismatch: its `error`/`error_description` text is anyone's, so it
+/// is never surfaced (or logged) as the IdP's answer.
+#[tokio::test]
+async fn unbound_provider_error_is_a_browser_mismatch() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let res = complete_login(
+        &pool,
+        &idp.meta(),
+        &idp.client(),
+        &CallbackParams {
+            error: Some("access_denied\nforged log line".into()),
+            error_description: Some("x".repeat(100_000)),
+            state: Some("s".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(res, Err(FlowError::BrowserMismatch)), "{res:?}");
 }
 
 // ── resolve_user ──────────────────────────────────────────────────────────────

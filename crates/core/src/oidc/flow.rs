@@ -96,7 +96,7 @@ pub struct ClientParams {
     pub client_id: String,
     /// OAuth client secret. **Never logged** — the manual [`std::fmt::Debug`]
     /// impl below redacts it; it is sent only to the token endpoint over the
-    /// SSRF-guarded TLS client.
+    /// No-redirect, https-only TLS client.
     pub client_secret: String,
     /// Absolute redirect URL registered with the IdP
     /// (`{public_base_url}/auth/oidc/callback`).
@@ -254,21 +254,24 @@ pub async fn complete_login(
     client: &ClientParams,
     params: &CallbackParams,
 ) -> Result<ValidatedLogin, FlowError> {
-    // 1. IdP-signalled error.
+    let state = params.state.as_deref().ok_or(FlowError::UnknownState)?;
+
+    // 1. The flow must have been started by this browser (login CSRF defense).
+    //    Checked before the consume so a forged callback can't burn the row,
+    //    and before an IdP-signalled error is surfaced: an unbound callback's
+    //    `error`/`error_description` are anyone's text, not the IdP's.
+    match params.browser_binding.as_deref() {
+        Some(presented) if browser_binding_matches(state, presented) => {}
+        _ => return Err(FlowError::BrowserMismatch),
+    }
+
+    // 2. IdP-signalled error (the flow is spent either way).
     if let Some(error) = &params.error {
+        let _ = oidc_flow_dao::consume(pool, state).await;
         return Err(FlowError::Provider {
             error: error.clone(),
             description: params.error_description.clone(),
         });
-    }
-
-    let state = params.state.as_deref().ok_or(FlowError::UnknownState)?;
-
-    // 2. The flow must have been started by this browser (login CSRF defense).
-    //    Checked before the consume so a forged callback can't burn the row.
-    match params.browser_binding.as_deref() {
-        Some(presented) if browser_binding_matches(state, presented) => {}
-        _ => return Err(FlowError::BrowserMismatch),
     }
 
     // 3. Single-use consume. A replayed state finds nothing here.
@@ -324,8 +327,11 @@ struct TokenEndpointResponse {
     error_description: Option<String>,
 }
 
+/// Largest token-endpoint response read into memory.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// POST the authorization-code grant to the token endpoint and return the raw
-/// `id_token` JWS. Uses the metadata client's SSRF-guarded HTTP client.
+/// `id_token` JWS. Uses the metadata client's no-redirect HTTP client.
 async fn exchange_code(
     meta: &OidcMetadataClient,
     token_endpoint: &str,
@@ -351,10 +357,23 @@ async fn exchange_code(
         .map_err(|e| FlowError::TokenHttp(e.to_string()))?;
 
     let status = resp.status();
-    let bytes = resp
-        .bytes()
+    // A redirect is never followed (the request body carries the client
+    // secret); report it rather than parsing the 3xx body.
+    if status.is_redirection() {
+        return Err(FlowError::TokenHttp(format!(
+            "status {status} (redirects are not followed)"
+        )));
+    }
+    let bytes = super::jwks::read_capped(resp, MAX_TOKEN_RESPONSE_BYTES)
         .await
-        .map_err(|e| FlowError::TokenHttp(format!("read body: {e}")))?;
+        .map_err(|e| match e {
+            super::jwks::ReadCappedError::TooLarge => {
+                FlowError::TokenResponse("token response too large".into())
+            }
+            super::jwks::ReadCappedError::Read(e) => {
+                FlowError::TokenHttp(format!("read body: {e}"))
+            }
+        })?;
     let parsed: TokenEndpointResponse = serde_json::from_slice(&bytes)
         .map_err(|e| FlowError::TokenResponse(format!("parse: {e}")))?;
 

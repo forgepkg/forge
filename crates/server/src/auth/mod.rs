@@ -93,15 +93,16 @@ impl OidcRuntime {
     /// public base URL (which decides the cookie `Secure` attribute) + the
     /// shared cache.
     ///
-    /// The HTTP client is the shared redirect-capped outbound client (12.7
-    /// §3.6: scheme-only guard) used for discovery/JWKS/token calls.
+    /// The HTTP client follows no redirects and is https-only unless the realm
+    /// allows a plain-http development issuer (see
+    /// [`outbound_metadata_client`]); it serves discovery/JWKS/token calls.
     pub fn build(
         oidc: &OidcConfig,
         pool: sqlx::PgPool,
         public_base_url: &str,
         cache: Cache,
     ) -> anyhow::Result<Self> {
-        let http = outbound_metadata_client()
+        let http = outbound_metadata_client(oidc.allow_private_issuer)
             .map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
         let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache);
 
@@ -118,6 +119,7 @@ impl OidcRuntime {
             display_name_claim: oidc.display_name_claim.clone(),
             admin_claim: oidc.admin_claim.clone(),
             admin_groups: oidc.admin_groups.clone(),
+            required_claims: oidc.required_claims.clone(),
         };
         let policy = ResolvePolicy {
             auto_provision: oidc.auto_provision,
@@ -182,8 +184,38 @@ async fn snapshot_or_resp(state: &AppState) -> Result<Arc<realms::RealmSnapshot>
     })
 }
 
+/// At most this much of a value goes into a log line.
+const MAX_LOGGED_CHARS: usize = 256;
+
+/// `value` cut to [`MAX_LOGGED_CHARS`] characters (log it with `?` so control
+/// characters are escaped).
+fn bounded_for_log(value: &str) -> String {
+    match value.char_indices().nth(MAX_LOGGED_CHARS) {
+        Some((cut, _)) => format!("{}…", &value[..cut]),
+        None => value.to_string(),
+    }
+}
+
 /// `GET /auth/oidc/login` — begin the auth-code + PKCE flow and 302 to the IdP.
-async fn oidc_login(State(state): State<AppState>, Query(q): Query<LoginQuery>) -> Response {
+///
+/// Every call stores a flow row, so starts are rate-limited per client
+/// network (`auth.oidc_login_starts_per_minute`, keyed like the login
+/// lockout: IPv6 by /64) before any work happens.
+async fn oidc_login(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
+    let client_ip = login_client_ip(&state, connect, &headers);
+    if !state.oidc_login_starts.allow(client_ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "too many sign-in attempts; try again later",
+        )
+            .into_response();
+    }
     let snap = match snapshot_or_resp(&state).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -275,10 +307,22 @@ async fn oidc_callback_inner(
         Ok(v) => v,
         Err(e) => {
             // Generic message; never echo the OAuth error detail or secrets.
-            tracing::warn!(error = %e, "oidc callback failed");
+            // The text can carry IdP- (or, before the binding check, anyone-)
+            // supplied `error_description`: bounded and `?`-escaped, so it
+            // cannot forge log lines or flood the log.
+            tracing::warn!(error = ?bounded_for_log(&e.to_string()), "oidc callback failed");
             return (StatusCode::BAD_REQUEST, "oidc login failed").into_response();
         }
     };
+
+    // The realm's allow-gate (e.g. one tenant of a multi-tenant app).
+    if !forge_core::oidc::claims::claims_allowed(&validated.claims, &rt.mapping) {
+        tracing::warn!(
+            issuer = %validated.issuer,
+            "oidc login refused: the token does not carry the realm's required claims"
+        );
+        return (StatusCode::FORBIDDEN, "login not permitted").into_response();
+    }
 
     let mapped = map_claims(&validated.claims, &rt.mapping);
     let user = match resolve_user(&state.pool, &validated, &mapped, &rt.policy).await {

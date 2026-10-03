@@ -71,6 +71,9 @@ pub struct AppState {
     /// Password-failure lockout per `(client IP, username)`, shared by
     /// `POST /auth/login` and the wire Basic password path.
     pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Rate limit on starting OIDC logins, per client network
+    /// (`auth.oidc_login_starts_per_minute`).
+    pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
     /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
     /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
@@ -143,6 +146,10 @@ impl AppState {
             config.auth.login_max_failures,
             std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
         ));
+        let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
+            config.auth.oidc_login_starts_per_minute,
+            std::time::Duration::from_secs(60),
+        ));
 
         AppState {
             pool,
@@ -156,6 +163,7 @@ impl AppState {
             sessions,
             cookie_secure,
             login_throttle,
+            oidc_login_starts,
             envelope: None,
             upstream,
         }

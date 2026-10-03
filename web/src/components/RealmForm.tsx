@@ -24,6 +24,7 @@ import {
   Legend,
 } from '~/components/catalyst/fieldset'
 import { Input } from '~/components/catalyst/input'
+import { Textarea } from '~/components/catalyst/textarea'
 import { Select } from '~/components/catalyst/select'
 
 /**
@@ -71,6 +72,8 @@ export interface RealmFormValues {
   admin_groups: string
   admin_claim: string
   login_domains: string
+  /** One `claim = value, value` per line (parsed to a map on submit). */
+  required_claims: string
   button_label: string
   // credential_forwarding
   url: string
@@ -123,6 +126,26 @@ function joinList(list?: (string | number)[]): string {
   return (list ?? []).join(', ')
 }
 
+/** `{ tid: ['a', 'b'] }` -> `tid = a, b` (one claim per line). */
+export function formatClaimRules(rules?: Record<string, string[]>): string {
+  return Object.entries(rules ?? {})
+    .map(([claim, values]) => `${claim} = ${values.join(', ')}`)
+    .join('\n')
+}
+
+/** Parse `claim = value, value` lines into the `required_claims` map. */
+export function parseClaimRules(raw: string): Record<string, string[]> {
+  const rules: Record<string, string[]> = {}
+  for (const line of raw.split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq < 0) continue
+    const claim = line.slice(0, eq).trim()
+    const values = parseList(line.slice(eq + 1))
+    if (claim !== '' && values.length > 0) rules[claim] = values
+  }
+  return rules
+}
+
 function seed(existing?: RealmView): RealmFormValues {
   const oidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
   const fwd = (
@@ -161,6 +184,7 @@ function seed(existing?: RealmView): RealmFormValues {
     admin_groups: joinList(oidc.admin_groups),
     admin_claim: oidc.admin_claim ?? '',
     login_domains: joinList(oidc.login_domains),
+    required_claims: formatClaimRules(oidc.required_claims),
     button_label: oidc.button_label ?? '',
     url: fwd.url ?? '',
     method: fwd.method ?? '',
@@ -528,6 +552,23 @@ export function RealmForm({
               <Description>
                 Email domains routed to this IdP by identifier-first login.
                 Comma-separated.
+              </Description>
+            </Field>
+
+            <Field>
+              <Label>Required claims</Label>
+              <Textarea
+                rows={2}
+                value={values.required_claims}
+                onChange={(e) => set('required_claims', e.target.value)}
+                placeholder="tid = 00000000-0000-0000-0000-000000000000"
+              />
+              <Description>
+                Only tokens carrying one of the listed values may sign in, one
+                claim per line (<span className="font-mono">claim = value, value</span>).
+                Use it to restrict a multi-tenant app to your tenant
+                (<span className="font-mono">tid</span>) or a Google Workspace
+                domain (<span className="font-mono">hd</span>).
               </Description>
             </Field>
 
@@ -1237,6 +1278,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.admin_claim.trim() !== '') config.admin_claim = values.admin_claim.trim()
     const loginDomains = parseList(values.login_domains)
     if (loginDomains.length > 0) config.login_domains = loginDomains
+    const requiredClaims = parseClaimRules(values.required_claims)
+    if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()
     return config
   }

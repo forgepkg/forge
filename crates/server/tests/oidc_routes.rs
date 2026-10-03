@@ -858,3 +858,87 @@ async fn auth_routes_absent_when_oidc_disabled() {
     // Web UI is disabled in the default harness, so an unmounted route 404s.
     assert_eq!(resp.status(), 404);
 }
+
+/// The realm's allow-gate: a token that does not carry an allowed value of a
+/// required claim (here: another tenant of a multi-tenant app) is refused
+/// with 403 and no session; an allowed one signs in.
+#[tokio::test]
+async fn required_claims_gate_the_callback() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(format!(
+                "{}[oidc.required_claims]\ntid = [\"tenant-a\"]\n",
+                idp.oidc_block()
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for (tid, expected) in [("tenant-b", 403), ("tenant-a", 302)] {
+        let n = common::unique();
+        let resp = no_redirect_client()
+            .get(format!("{}/auth/oidc/login", srv.base_url))
+            .send()
+            .await
+            .unwrap();
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        let state = state_from_url(location);
+        let flow = flow_cookie_header(&resp);
+        let nonce = peek_nonce(&srv.pool, &state).await;
+        let mut claims = id_claims(
+            &idp.issuer,
+            &format!("sub-{n}"),
+            &format!("guest-{n}"),
+            &nonce,
+            json!([]),
+        );
+        claims["tid"] = json!(tid);
+        idp.mount_token_with_claims(claims).await;
+        let resp = no_redirect_client()
+            .get(format!(
+                "{}/auth/oidc/callback?code=c&state={state}",
+                srv.base_url
+            ))
+            .header("cookie", &flow)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "tid = {tid}");
+        let sets_session = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|v| v.to_str().unwrap_or("").starts_with("forge_session="));
+        assert_eq!(sets_session, expected == 302, "tid = {tid}");
+    }
+}
+
+/// Starting an OIDC login stores a flow row, so starts are rate-limited per
+/// client network (before any other work, configured realm or not).
+#[tokio::test]
+async fn oidc_login_starts_are_rate_limited() {
+    let srv = common::start().await;
+    let client = no_redirect_client();
+    let limit = srv.state.config.auth.oidc_login_starts_per_minute;
+    for _ in 0..limit {
+        let resp = client
+            .get(format!("{}/auth/oidc/login", srv.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 429);
+    }
+    let resp = client
+        .get(format!("{}/auth/oidc/login", srv.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    assert!(resp.headers().get("retry-after").is_some());
+}

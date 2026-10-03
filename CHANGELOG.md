@@ -109,6 +109,18 @@ The release workflow publishes the section whose heading matches the tag
   guessed from many networks is backed off: past three pair budgets of
   failures in a window its attempts are spaced (1 s, doubling to 30 s)
   instead of refused, so the owner can still sign in. A success clears it.
+- OIDC hardening: a realm's stored client secret is dropped when its
+  `issuer` or `client_id` changes (the update must supply a new one, so the
+  old IdP's secret is never sent to a new issuer); discovery, JWKS and token
+  requests follow no redirects (a 307 would replay the client secret) and
+  must use https unless the realm allows a development http issuer; token
+  responses are capped at 1 MiB; `redirect_to` is capped at 2 KiB; login
+  starts are rate-limited per client network
+  (`auth.oidc_login_starts_per_minute`, default 30); a callback's IdP error
+  is only surfaced after the browser binding is checked and is logged
+  bounded and escaped. Realms take an optional allow-gate,
+  `required_claims` (e.g. `{"tid": ["<tenant>"]}` or `{"hd": ["corp.example"]}`):
+  a token without an allowed value is refused.
 
 ## [0.1.0]
 

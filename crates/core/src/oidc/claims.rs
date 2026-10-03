@@ -32,6 +32,11 @@ pub struct ClaimMapping {
     /// Values that grant `is_admin`. **Empty ⇒ OIDC never grants admin** (admins
     /// stay locally managed) — the safe default.
     pub admin_groups: Vec<String>,
+    /// Allow-gate: every listed claim must carry (one of) its allowed values,
+    /// or the login is refused — e.g. `tid` (Entra tenant), `hd` (Google
+    /// Workspace domain) or `groups`. Empty ⇒ any token the issuer signs for
+    /// this client may sign in.
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for ClaimMapping {
@@ -42,8 +47,34 @@ impl Default for ClaimMapping {
             display_name_claim: "name".into(),
             admin_claim: "roles".into(),
             admin_groups: Vec::new(),
+            required_claims: Default::default(),
         }
     }
+}
+
+/// Whether the verified claims pass the realm's allow-gate
+/// ([`ClaimMapping::required_claims`]): each required claim must be present
+/// and carry one of its allowed values (a string claim, or any element of an
+/// array claim). Booleans and numbers compare by their JSON text.
+pub fn claims_allowed(claims: &IdTokenClaims, mapping: &ClaimMapping) -> bool {
+    mapping.required_claims.iter().all(|(name, allowed)| {
+        let value = match name.as_str() {
+            "sub" => Some(serde_json::Value::String(claims.sub.clone())),
+            "iss" => Some(serde_json::Value::String(claims.iss.clone())),
+            _ => claims.additional.get(name).cloned(),
+        };
+        let text = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(v.to_string()),
+            _ => None,
+        };
+        let present: Vec<String> = match value {
+            Some(serde_json::Value::Array(items)) => items.iter().filter_map(text).collect(),
+            Some(other) => text(&other).into_iter().collect(),
+            None => Vec::new(),
+        };
+        present.iter().any(|p| allowed.iter().any(|a| a == p))
+    })
 }
 
 /// The user-facing facts extracted from a verified ID token.
@@ -193,7 +224,37 @@ mod tests {
             display_name_claim: "name".into(),
             admin_claim: "roles".into(),
             admin_groups: vec!["forge-admins".into()],
+            required_claims: Default::default(),
         }
+    }
+
+    #[test]
+    fn required_claims_gate_logins() {
+        let mut m = mapping();
+        let c = claims_with(
+            "sub-1",
+            json!({ "tid": "tenant-a", "groups": ["dev", "ops"], "email_verified": true }),
+        );
+        assert!(claims_allowed(&c, &m), "no gate configured");
+        m.required_claims
+            .insert("tid".into(), vec!["tenant-a".into()]);
+        assert!(claims_allowed(&c, &m));
+        m.required_claims
+            .insert("groups".into(), vec!["ops".into()]);
+        assert!(claims_allowed(&c, &m), "array claims match any element");
+        m.required_claims
+            .insert("email_verified".into(), vec!["true".into()]);
+        assert!(claims_allowed(&c, &m), "booleans compare as text");
+        m.required_claims
+            .insert("tid".into(), vec!["tenant-b".into()]);
+        assert!(
+            !claims_allowed(&c, &m),
+            "a guest from another tenant is refused"
+        );
+        let mut m = mapping();
+        m.required_claims
+            .insert("hd".into(), vec!["corp.example".into()]);
+        assert!(!claims_allowed(&c, &m), "a missing claim is refused");
     }
 
     #[test]
