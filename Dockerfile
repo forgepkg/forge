@@ -17,15 +17,16 @@
 
 
 # ── Stage 1: build the web SPA ───────────────────────────────────────────────
-# Node 22 (matches the dev/CI toolchain). corepack pins pnpm to the version in
-# web/package.json ("packageManager"), so the lockfile install is reproducible.
+# corepack pins pnpm to the version in web/package.json ("packageManager"), so
+# the lockfile install is reproducible.
 # Base images are pinned by digest (tag kept for readability); Dependabot
 # (.github/dependabot.yml) proposes tag + digest bumps.
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS web
+FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS web
 WORKDIR /web
 
-# Enable the pinned pnpm via corepack before any install.
-RUN corepack enable
+# Enable the pinned pnpm via corepack before any install. Node 25+ no longer
+# bundles corepack, so install it (pinned) from npm first.
+RUN npm install -g corepack@0.36.0 && corepack enable
 
 # Install deps first (cache layer keyed on the lockfile + manifests only).
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc ./
