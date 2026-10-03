@@ -724,6 +724,18 @@ impl HostedWrite {
         }
 
         tx.commit().await.map_err(RepoError::from)?;
+        tracing::info!(
+            target: "forge::audit",
+            repo,
+            id = %parsed.id,
+            version = %parsed.version,
+            outcome = ?outcome,
+            principal = %self
+                .publish_policy
+                .as_ref()
+                .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label()),
+            "package published"
+        );
 
         // 5. Invalidate the per-(repo,id) cache namespace.
         self.cache.invalidate_package(repo, &parsed.id).await;

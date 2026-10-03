@@ -199,10 +199,25 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let sub_req = Request::from_parts(parts, body);
 
     let router = nuget_router(repo.kind(), ctx);
-    match router.oneshot(sub_req).await {
+    let response = match router.oneshot(sub_req).await {
         Ok(resp) => resp,
         Err(infallible) => match infallible {},
+    };
+    if action != Action::Read {
+        // Every package mutation (push, unlist, relist), allowed or not,
+        // with who sent it: the trail a leaked credential's writes are
+        // traced by (workload publishes are also in trusted_publish_audit).
+        tracing::info!(
+            target: "forge::audit",
+            %method,
+            repo = %repo.name,
+            path = %rest,
+            status = response.status().as_u16(),
+            principal = %principal.audit_label(),
+            "package mutation"
+        );
     }
+    response
 }
 
 /// Map an authorization denial to the right status: unauthenticated → 401 (send

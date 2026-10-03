@@ -106,7 +106,23 @@ pub async fn require_admin(
         Principal::User { .. } | Principal::Workload { .. } => {}
     }
     if state.authz.is_global_admin(&principal).await {
-        next.run(req).await
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let response = next.run(req).await;
+        if !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD) {
+            // The administration audit trail: every change (users, roles,
+            // grants, realms, repositories, hard deletes, key rotation) with
+            // who made it.
+            tracing::info!(
+                target: "forge::audit",
+                %method,
+                path,
+                status = response.status().as_u16(),
+                principal = %principal.audit_label(),
+                "admin change"
+            );
+        }
+        response
     } else {
         (StatusCode::FORBIDDEN, "admin privileges required").into_response()
     }
