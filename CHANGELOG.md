@@ -177,6 +177,9 @@ The release workflow publishes the section whose heading matches the tag
 - The `Debug` output of the database, S3 and Redis configuration no longer
   contains secrets: connection-URL passwords and query strings and the S3
   secret key are redacted, so a logged config cannot leak them.
+- Release workflow: only version tags on the default branch decide whether a
+  release moves `:latest` / `:<major>.<minor>` (a stray tag pushed on another
+  branch — never released — kept every later release from moving them).
 
 ## [0.1.0]
 
