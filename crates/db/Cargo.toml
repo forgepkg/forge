@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 # Canonical usernames (NFC) — see `username.rs`.
 unicode-normalization = "0.1"
+# The `remote_url` origin a sealed upstream password is bound to.
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

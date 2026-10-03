@@ -340,13 +340,10 @@ pub fn redact_config(kind: &str, config: &JsonValue) -> JsonValue {
 }
 
 /// Config keys a realm's stored secrets are bound to: the secret belongs to
-/// that party, so changing any of them requires entering the secret again.
+/// that party, so changing any of them requires entering the secret again
+/// (the ciphertext is bound to them as well).
 fn secret_binding_keys(kind: &str) -> &'static [&'static str] {
-    match kind {
-        // The client secret is the IdP's credential for this client.
-        KIND_OIDC => &["issuer", "client_id"],
-        _ => &[],
-    }
+    secret_dao::realm_secret_binding_keys(kind)
 }
 
 /// Whether `key` differs between two config documents (strings compared

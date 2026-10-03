@@ -606,6 +606,7 @@ mod tests {
             table: "repository",
             column: "upstream_password_enc",
             row_pk,
+            destination: None,
         }
     }
 
