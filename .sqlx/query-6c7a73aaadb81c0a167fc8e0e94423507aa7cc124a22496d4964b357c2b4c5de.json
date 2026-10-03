@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT g.name, gm.owner\n        FROM group_member gm\n        JOIN repository g ON g.id = gm.group_id\n        WHERE gm.member_id = $1\n        ORDER BY g.name\n        FOR UPDATE OF gm\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "group_member",
+            "name": "owner"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6c7a73aaadb81c0a167fc8e0e94423507aa7cc124a22496d4964b357c2b4c5de"
+}

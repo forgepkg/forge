@@ -709,28 +709,17 @@ pub async fn update(
 /// key, so a publish or cache fill cannot commit in between and be
 /// cascade-deleted without its blob decrement; an overlapping delete of the
 /// same repository waits and then answers 404 without decrementing again.
+///
+/// A repository flagged as an owner member of a group is refused (**409**)
+/// until it is unflagged. Its memberships are locked in the same transaction
+/// ([`repository_dao::lock_memberships_for_delete`]), so a flag set
+/// concurrently cannot be cascaded away unseen.
 pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return db_error(e),
     };
-    // Deleting an owner member would silently return its groups to trusting
-    // every hosted member (see `admin::members`).
-    match repository_dao::groups_owned_by(&state.pool, existing.id).await {
-        Ok(groups) if !groups.is_empty() => {
-            return (
-                StatusCode::CONFLICT,
-                format!(
-                    "repository owns the package ids of group(s) {}; unflag it as owner first",
-                    groups.join(", ")
-                ),
-            )
-                .into_response()
-        }
-        Ok(_) => {}
-        Err(e) => return db_error(e),
-    }
     let grace = state.config.outbox.grace();
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
@@ -738,6 +727,14 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Ok(RepoDelete::HasPackages) => (
             StatusCode::CONFLICT,
             "repository still has packages; hard-delete them first",
+        )
+            .into_response(),
+        Ok(RepoDelete::OwnsGroups(groups)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "repository owns the package ids of group(s) {}; unflag it as owner first",
+                groups.join(", ")
+            ),
         )
             .into_response(),
         Err(e) => db_error(e),
@@ -750,6 +747,10 @@ enum RepoDelete {
     NotFound,
     /// A hosted repository still owns components.
     HasPackages,
+    /// The repository is flagged as an owner member of these groups:
+    /// deleting it would silently return them to trusting every hosted
+    /// member (see `admin::members`).
+    OwnsGroups(Vec<String>),
 }
 
 /// Lock, check/purge and delete a repository in one transaction (see
@@ -788,6 +789,10 @@ async fn delete_repository_once(
     let mut tx = state.pool.begin().await?;
     if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
         return Ok(RepoDelete::NotFound);
+    }
+    let owned = repository_dao::lock_memberships_for_delete(&mut *tx, repo_id).await?;
+    if !owned.is_empty() {
+        return Ok(RepoDelete::OwnsGroups(owned));
     }
 
     if kind == RepoKind::Hosted {

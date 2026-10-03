@@ -176,20 +176,36 @@ pub async fn group_owner_ids(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<i
     .await
 }
 
-/// The names of the groups `member_id` is flagged as an owner in.
-pub async fn groups_owned_by(pool: &PgPool, member_id: i64) -> sqlx::Result<Vec<String>> {
-    sqlx::query_scalar!(
+/// Lock every membership of `member_id` (`FOR UPDATE`) and return the names
+/// of the groups it is flagged as an owner in. Run it in the transaction that
+/// deletes the repository, after [`lock_repository`]: a concurrent owner flag
+/// then waits for the delete (and finds no membership) instead of landing
+/// between this check and the cascade.
+pub async fn lock_memberships_for_delete<'e, E>(
+    executor: E,
+    member_id: i64,
+) -> sqlx::Result<Vec<String>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows = sqlx::query!(
         r#"
-        SELECT g.name
+        SELECT g.name, gm.owner
         FROM group_member gm
         JOIN repository g ON g.id = gm.group_id
-        WHERE gm.member_id = $1 AND gm.owner
+        WHERE gm.member_id = $1
         ORDER BY g.name
+        FOR UPDATE OF gm
         "#,
         member_id,
     )
-    .fetch_all(pool)
-    .await
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.owner)
+        .map(|row| row.name)
+        .collect())
 }
 
 /// Flag (or unflag) `member_id` as an owner of `group_id`'s package ids.
@@ -329,11 +345,15 @@ pub enum AddMemberOutcome {
 ///
 /// Returns the [`AddMemberOutcome`]; a unique-constraint violation surfaces as
 /// [`AddMemberOutcome::Duplicate`] rather than a raw `sqlx::Error`.
+///
+/// `owner` sets [`group_member.owner`](group_owner_ids) in the same insert, so
+/// the member never serves the group's ids unflagged.
 pub async fn add_group_member_checked(
     pool: &PgPool,
     group_id: i64,
     member_id: i64,
     priority: i32,
+    owner: bool,
     max_depth: i32,
 ) -> sqlx::Result<AddMemberOutcome> {
     let mut tx = pool.begin().await?;
@@ -404,12 +424,13 @@ pub async fn add_group_member_checked(
 
     let insert = sqlx::query!(
         r#"
-        INSERT INTO group_member (group_id, member_id, priority)
-        VALUES ($1, $2, $3)
+        INSERT INTO group_member (group_id, member_id, priority, owner)
+        VALUES ($1, $2, $3, $4)
         "#,
         group_id,
         member_id,
         priority,
+        owner,
     )
     .execute(&mut *conn)
     .await;
@@ -428,23 +449,53 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
-/// Remove a member from a group. Returns whether a row was deleted.
+/// Outcome of [`remove_group_member`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveMemberOutcome {
+    /// The membership was deleted.
+    Removed,
+    /// There is no such membership.
+    NotFound,
+    /// The member is flagged as an owner of the group's ids and was kept:
+    /// removing a group's last owner would silently return it to trusting
+    /// every hosted member.
+    Owner,
+}
+
+/// Remove a member from a group unless it is flagged as an owner. The owner
+/// check is part of the `DELETE`, so a flag set concurrently is honoured
+/// (the delete re-checks the row it waited for).
 pub async fn remove_group_member(
     pool: &PgPool,
     group_id: i64,
     member_id: i64,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<RemoveMemberOutcome> {
     let res = sqlx::query!(
         r#"
         DELETE FROM group_member
-        WHERE group_id = $1 AND member_id = $2
+        WHERE group_id = $1 AND member_id = $2 AND NOT owner
         "#,
         group_id,
         member_id,
     )
     .execute(pool)
     .await?;
-    Ok(res.rows_affected() > 0)
+    if res.rows_affected() > 0 {
+        return Ok(RemoveMemberOutcome::Removed);
+    }
+    // Only picks the answer; nothing was deleted either way.
+    let kept = sqlx::query_scalar!(
+        r#"SELECT 1 AS "one!" FROM group_member WHERE group_id = $1 AND member_id = $2"#,
+        group_id,
+        member_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(if kept.is_some() {
+        RemoveMemberOutcome::Owner
+    } else {
+        RemoveMemberOutcome::NotFound
+    })
 }
 
 /// Mutable settings of an existing repository (admin update).

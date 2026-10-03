@@ -17,13 +17,15 @@
 //!   `PATCH /admin/repositories/{name}/members/{member}` `{"owner": bool}`.
 //!   A proxy member cannot be an owner (**400**). An owner cannot be removed
 //!   (**409**) until it is unflagged: removing a group's last owner would
-//!   silently return the group to trusting every hosted member.
+//!   silently return the group to trusting every hosted member. The flag is
+//!   set in the insert that adds the member, and the remove's owner check is
+//!   part of its `DELETE`, so concurrent edits cannot slip between them.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_db::model::RepoKind;
-use forge_db::repository_dao::{self, AddMemberOutcome};
+use forge_db::repository_dao::{self, AddMemberOutcome, RemoveMemberOutcome};
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
@@ -149,19 +151,12 @@ pub async fn add(
         group.id,
         member.id,
         body.priority,
+        body.owner,
         max_depth,
     )
     .await
     {
-        Ok(AddMemberOutcome::Added) if !body.owner => StatusCode::CREATED.into_response(),
-        Ok(AddMemberOutcome::Added) => {
-            match repository_dao::set_group_member_owner(&state.pool, group.id, member.id, true)
-                .await
-            {
-                Ok(_) => StatusCode::CREATED.into_response(),
-                Err(e) => db_error(e),
-            }
-        }
+        Ok(AddMemberOutcome::Added) => StatusCode::CREATED.into_response(),
         Ok(AddMemberOutcome::WouldCycle) => (
             StatusCode::CONFLICT,
             "adding this member would create a cycle in the group graph",
@@ -224,20 +219,16 @@ pub async fn remove(
         Err(e) => return db_error(e),
     };
 
-    match repository_dao::group_owner_ids(&state.pool, group.id).await {
-        Ok(owners) if owners.contains(&member.id) => {
-            return (
-                StatusCode::CONFLICT,
-                "this member owns the group's package ids; unflag it as owner before removing it",
-            )
-                .into_response()
-        }
-        Ok(_) => {}
-        Err(e) => return db_error(e),
-    }
     match repository_dao::remove_group_member(&state.pool, group.id, member.id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "membership not found").into_response(),
+        Ok(RemoveMemberOutcome::Removed) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RemoveMemberOutcome::NotFound) => {
+            (StatusCode::NOT_FOUND, "membership not found").into_response()
+        }
+        Ok(RemoveMemberOutcome::Owner) => (
+            StatusCode::CONFLICT,
+            "this member owns the group's package ids; unflag it as owner before removing it",
+        )
+            .into_response(),
         Err(e) => db_error(e),
     }
 }

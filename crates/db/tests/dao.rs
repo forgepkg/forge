@@ -89,9 +89,12 @@ async fn group_members_ordered_by_priority_desc() {
     assert_eq!(members[0].0.id, high.id);
     assert_eq!(members[2].0.id, low.id);
 
-    assert!(repository_dao::remove_group_member(pool, group.id, mid.id)
-        .await
-        .expect("remove"));
+    assert_eq!(
+        repository_dao::remove_group_member(pool, group.id, mid.id)
+            .await
+            .expect("remove"),
+        repository_dao::RemoveMemberOutcome::Removed
+    );
     let after = repository_dao::group_members(pool, group.id)
         .await
         .expect("members after");
@@ -120,14 +123,14 @@ async fn add_group_member_checked_allows_valid_nesting() {
 
     // g2 -> leaf (depth 1 below g2).
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g2.id, leaf.id, 10, 20)
+        repository_dao::add_group_member_checked(pool, g2.id, leaf.id, 10, false, 20)
             .await
             .expect("g2->leaf"),
         AddMemberOutcome::Added
     );
     // g1 -> g2 (nested group member): valid, no cycle.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, 20)
+        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, false, 20)
             .await
             .expect("g1->g2"),
         AddMemberOutcome::Added
@@ -153,10 +156,10 @@ async fn concurrent_opposite_edges_never_form_a_cycle() {
         let (p1, p2) = (pool.clone(), pool.clone());
         let (r1, r2) = tokio::join!(
             tokio::spawn(async move {
-                repository_dao::add_group_member_checked(&p1, a.id, b.id, 10, 20).await
+                repository_dao::add_group_member_checked(&p1, a.id, b.id, 10, false, 20).await
             }),
             tokio::spawn(async move {
-                repository_dao::add_group_member_checked(&p2, b.id, a.id, 10, 20).await
+                repository_dao::add_group_member_checked(&p2, b.id, a.id, 10, false, 20).await
             }),
         );
         let outcomes = [r1.unwrap().expect("a->b"), r2.unwrap().expect("b->a")];
@@ -196,14 +199,14 @@ async fn add_group_member_checked_rejects_cycle() {
 
     // g1 -> g2 is fine.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, 20)
+        repository_dao::add_group_member_checked(pool, g1.id, g2.id, 10, false, 20)
             .await
             .expect("g1->g2"),
         AddMemberOutcome::Added
     );
     // g2 -> g1 would close a cycle (g1 reachable from g2) ⇒ rejected, not inserted.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g2.id, g1.id, 10, 20)
+        repository_dao::add_group_member_checked(pool, g2.id, g1.id, 10, false, 20)
             .await
             .expect("g2->g1 checked"),
         AddMemberOutcome::WouldCycle
@@ -216,7 +219,7 @@ async fn add_group_member_checked_rejects_cycle() {
 
     // Direct self-cycle (g1 -> g1) is also a cycle.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g1.id, g1.id, 5, 20)
+        repository_dao::add_group_member_checked(pool, g1.id, g1.id, 5, false, 20)
             .await
             .expect("self checked"),
         AddMemberOutcome::WouldCycle
@@ -246,21 +249,21 @@ async fn add_group_member_checked_enforces_depth() {
 
     // mid -> leaf (depth 1).
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, mid.id, leaf.id, 1, 5)
+        repository_dao::add_group_member_checked(pool, mid.id, leaf.id, 1, false, 5)
             .await
             .expect("mid->leaf"),
         AddMemberOutcome::Added
     );
     // top -> mid with max_depth = 1 ⇒ new path top->mid->leaf is length 2 > 1.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, 1)
+        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, false, 1)
             .await
             .expect("too deep checked"),
         AddMemberOutcome::TooDeep
     );
     // With a generous depth it is fine.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, 5)
+        repository_dao::add_group_member_checked(pool, top.id, mid.id, 1, false, 5)
             .await
             .expect("ok at depth 5"),
         AddMemberOutcome::Added
@@ -282,14 +285,14 @@ async fn add_group_member_checked_reports_duplicate() {
         .expect("m");
 
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g.id, m.id, 10, 20)
+        repository_dao::add_group_member_checked(pool, g.id, m.id, 10, false, 20)
             .await
             .expect("first"),
         AddMemberOutcome::Added
     );
     // Same member again ⇒ unique violation surfaced as Duplicate.
     assert_eq!(
-        repository_dao::add_group_member_checked(pool, g.id, m.id, 11, 20)
+        repository_dao::add_group_member_checked(pool, g.id, m.id, 11, false, 20)
             .await
             .expect("dup"),
         AddMemberOutcome::Duplicate
@@ -1579,7 +1582,7 @@ async fn add_group_member_checked_counts_depth_above_the_group() {
     // Two ancestor chains above `mid`: a -> b -> mid (2 edges) and c -> mid.
     for (group, member) in [(&a, &b), (&b, &mid), (&c, &mid)] {
         assert_eq!(
-            repository_dao::add_group_member_checked(&pool, group.id, member.id, 10, 20)
+            repository_dao::add_group_member_checked(&pool, group.id, member.id, 10, false, 20)
                 .await
                 .expect("add"),
             AddMemberOutcome::Added
@@ -1589,14 +1592,14 @@ async fn add_group_member_checked_counts_depth_above_the_group() {
     // mid -> leaf creates a -> b -> mid -> leaf (3 edges): too deep for 2,
     // although only one edge lies below `mid`.
     assert_eq!(
-        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 2)
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, false, 2)
             .await
             .expect("add"),
         AddMemberOutcome::TooDeep,
         "the path above the group counts"
     );
     assert_eq!(
-        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 3)
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, false, 3)
             .await
             .expect("add"),
         AddMemberOutcome::Added,
