@@ -216,7 +216,10 @@ password supplied to NuGet should be a **token**.
   package id, proxy members are not consulted for it — so a same-named,
   higher-versioned package on a public feed cannot shadow an internal one
   (dependency confusion). Set `"prefer_hosted": false` for plain union
-  semantics.
+  semantics. That guard only knows names a hosted member already has; list
+  your organization's id prefixes in `"reserved_prefixes": ["Acme."]` so ids
+  under them never come from a proxy member, also before their first
+  internal publish.
 
 ## Configuration
 

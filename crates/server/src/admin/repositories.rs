@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
 use forge_db::component_dao;
-use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY};
+use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,6 +47,9 @@ pub struct RepoView {
     pub allow_redeploy: bool,
     /// Group dependency-confusion guard (see [`Repository::prefer_hosted`]).
     pub prefer_hosted: bool,
+    /// Group: id prefixes never served from a proxy member (see
+    /// [`Repository::reserved_prefixes`]).
+    pub reserved_prefixes: Vec<String>,
 }
 
 impl From<&Repository> for RepoView {
@@ -67,6 +70,7 @@ impl From<&Repository> for RepoView {
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
             prefer_hosted: r.prefer_hosted(),
+            reserved_prefixes: r.reserved_prefixes(),
         }
     }
 }
@@ -101,6 +105,9 @@ pub struct CreateRepo {
     /// Group only: hide proxy versions of ids a hosted member has (default on).
     #[serde(default)]
     pub prefer_hosted: Option<bool>,
+    /// Group only: id prefixes (e.g. `Acme.`) never served from a proxy member.
+    #[serde(default)]
+    pub reserved_prefixes: Option<Vec<String>>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -145,6 +152,8 @@ pub struct UpdateRepo {
     pub allow_redeploy: Option<bool>,
     /// Group only.
     pub prefer_hosted: Option<bool>,
+    /// Group only; replaces the whole list (`[]` clears it).
+    pub reserved_prefixes: Option<Vec<String>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -255,6 +264,40 @@ const MAX_PROXY_TTL_SECONDS: i32 = 7 * 24 * 60 * 60;
 /// Longest accepted `package_delay_seconds`: a year.
 const MAX_PACKAGE_DELAY_SECONDS: i32 = 365 * 24 * 60 * 60;
 
+/// Most reserved prefixes a group may carry.
+const MAX_RESERVED_PREFIXES: usize = 100;
+
+/// Validate and normalize a group's reserved id prefixes: each is a NuGet id
+/// prefix (`A-Z a-z 0-9 . _ -`, at most 100 bytes, an optional trailing `*`
+/// dropped), stored lowercase, deduplicated.
+fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
+    if raw.len() > MAX_RESERVED_PREFIXES {
+        return Err(format!(
+            "at most {MAX_RESERVED_PREFIXES} reserved_prefixes are allowed"
+        ));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for prefix in raw {
+        let prefix = prefix.trim();
+        let prefix = prefix.strip_suffix('*').unwrap_or(prefix);
+        let valid = !prefix.is_empty()
+            && prefix.len() <= 100
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !valid {
+            return Err(format!(
+                "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+            ));
+        }
+        let prefix = prefix.to_ascii_lowercase();
+        if !out.contains(&prefix) {
+            out.push(prefix);
+        }
+    }
+    Ok(out)
+}
+
 /// Reject negative or absurd proxy timings. A negative TTL made every
 /// unconfirmed row prunable at once (racing in-flight downloads), and an
 /// unbounded not-found TTL let one request hide a package for years.
@@ -334,6 +377,14 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if body.prefer_hosted.is_some() && parsed_kind != RepoKind::Group {
         return bad_request("prefer_hosted is only valid for group repositories");
     }
+    if body.reserved_prefixes.is_some() && parsed_kind != RepoKind::Group {
+        return bad_request("reserved_prefixes is only valid for group repositories");
+    }
+    let reserved_prefixes = match body.reserved_prefixes.as_deref().map(normalize_prefixes) {
+        Some(Err(msg)) => return bad_request(&msg),
+        Some(Ok(prefixes)) => Some(prefixes),
+        None => None,
+    };
     if let Err(resp) = validate_timings(
         body.package_delay_seconds,
         body.metadata_ttl_seconds,
@@ -344,6 +395,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     let mut config = json!({});
     if parsed_kind == RepoKind::Group {
         config[PREFER_HOSTED_KEY] = json!(body.prefer_hosted.unwrap_or(true));
+        if let Some(prefixes) = reserved_prefixes {
+            config[RESERVED_PREFIXES_KEY] = json!(prefixes);
+        }
     }
 
     // §12.5: with encryption enabled the password is NOT inserted as plaintext;
@@ -481,6 +535,19 @@ pub async fn update(
             config = json!({});
         }
         config[PREFER_HOSTED_KEY] = json!(prefer_hosted);
+    }
+    if let Some(prefixes) = body.reserved_prefixes.as_deref() {
+        if existing.kind() != RepoKind::Group {
+            return bad_request("reserved_prefixes is only valid for group repositories");
+        }
+        let prefixes = match normalize_prefixes(prefixes) {
+            Ok(prefixes) => prefixes,
+            Err(msg) => return bad_request(&msg),
+        };
+        if !config.is_object() {
+            config = json!({});
+        }
+        config[RESERVED_PREFIXES_KEY] = json!(prefixes);
     }
 
     // Stored credentials belong to the upstream origin they were entered for:

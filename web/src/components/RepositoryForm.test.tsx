@@ -76,6 +76,46 @@ describe('RepositoryForm', () => {
     })
   })
 
+  it('sends reserved prefixes for groups, split on commas and spaces', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    await user.type(screen.getByLabelText('Name'), 'my-group')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    await user.type(screen.getByLabelText('Reserved prefixes'), 'Acme., Contoso.Internal.')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      kind: 'group',
+      reserved_prefixes: ['Acme.', 'Contoso.Internal.'],
+    })
+  })
+
+  it('sends reserved prefixes on edit only when they change', async () => {
+    const group: RepoView = {
+      ...storedProxy,
+      kind: 'group',
+      remote_url: null,
+      prefer_hosted: true,
+      reserved_prefixes: ['acme.'],
+    }
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(group)
+    await save(user)
+    const values = lastValues(onSubmit)
+    expect(values.reserved_prefixes).toBe('acme.')
+    expect(toUpdateBody(values, group)).not.toHaveProperty('reserved_prefixes')
+    expect(
+      toUpdateBody({ ...values, reserved_prefixes: '' }, group),
+    ).toMatchObject({ reserved_prefixes: [] })
+  })
+
   it('blocks submit when the name is empty', async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -130,6 +170,7 @@ describe('RepositoryForm', () => {
       not_found_ttl_seconds: null,
       allow_redeploy: false,
       prefer_hosted: false,
+      reserved_prefixes: [],
     }
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -202,6 +243,7 @@ const storedProxy: RepoView = {
   not_found_ttl_seconds: 120,
   allow_redeploy: false,
   prefer_hosted: false,
+  reserved_prefixes: [],
 }
 
 function renderEdit(existing: RepoView = storedProxy) {

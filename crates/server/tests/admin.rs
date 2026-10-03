@@ -72,6 +72,64 @@ async fn non_admin_forbidden() {
 /// Proxy timings are bounded: a negative TTL made every unconfirmed row
 /// prunable at once, and an unbounded not-found TTL let one request hide a
 /// package for years.
+/// A group's reserved prefixes are validated, normalized (lowercase, a
+/// trailing `*` dropped, deduplicated) and only accepted on groups.
+#[tokio::test]
+async fn group_reserved_prefixes_are_validated() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let create = |body: Value| {
+        let req = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let group = format!("grp{}", common::unique());
+    let resp = create(json!({"name": group, "kind": "group",
+                             "reserved_prefixes": ["Acme.*", " Contoso.", "acme."]}))
+    .await;
+    assert_eq!(resp.status(), 201);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["reserved_prefixes"], json!(["acme.", "contoso."]));
+
+    for bad in [json!([""]), json!(["acme/"]), json!(["a b"]), json!(["*"])] {
+        let resp = create(json!({"name": format!("grp{}", common::unique()),
+                                 "kind": "group", "reserved_prefixes": bad}))
+        .await;
+        assert_eq!(resp.status(), 400, "{bad}");
+    }
+    let resp = create(
+        json!({"name": format!("h{}", common::unique()), "kind": "hosted",
+                             "reserved_prefixes": ["acme."]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 400, "only groups reserve prefixes");
+
+    // Update replaces the list; `[]` clears it.
+    let update = |body: Value| {
+        let req = client
+            .put(format!("{}/admin/repositories/{group}", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let view: Value = update(json!({"reserved_prefixes": ["Fabrikam."]}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["reserved_prefixes"], json!(["fabrikam."]));
+    assert_eq!(view["prefer_hosted"], json!(true));
+    let view: Value = update(json!({"reserved_prefixes": []}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["reserved_prefixes"], json!([]));
+}
+
 #[tokio::test]
 async fn proxy_timings_are_validated() {
     let srv = common::start().await;

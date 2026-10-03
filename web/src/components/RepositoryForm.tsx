@@ -94,6 +94,8 @@ export interface RepoFormValues {
   online: boolean
   allow_redeploy: boolean
   prefer_hosted: boolean
+  /** Comma- or newline-separated id prefixes (group). */
+  reserved_prefixes: string
   remote_url: string
   package_delay_seconds: string
   upstream_username: string
@@ -128,6 +130,7 @@ function seed(existing?: RepoView): RepoFormValues {
     online: existing?.online ?? true,
     allow_redeploy: existing?.allow_redeploy ?? false,
     prefer_hosted: existing?.prefer_hosted ?? true,
+    reserved_prefixes: (existing?.reserved_prefixes ?? []).join(', '),
     remote_url: existing?.remote_url ?? '',
     package_delay_seconds: String(existing?.package_delay_seconds ?? 0),
     upstream_username: existing?.upstream_username ?? '',
@@ -442,6 +445,20 @@ export function RepositoryForm({
               </Description>
             </CheckboxField>
           </CheckboxGroup>
+          <Field className="mt-6">
+            <Label>Reserved prefixes</Label>
+            <Description>
+              Package ids starting with one of these (e.g.{' '}
+              <code>Acme.</code>) are never served from proxy members — also
+              before the first internal version is published. Comma separated.
+            </Description>
+            <Input
+              name="reserved_prefixes"
+              value={values.reserved_prefixes}
+              onChange={(e) => set('reserved_prefixes', e.target.value)}
+              placeholder="Acme., Contoso.Internal."
+            />
+          </Field>
         </Fieldset>
       )}
 
@@ -496,6 +513,8 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   }
   if (values.kind === 'group') {
     body.prefer_hosted = values.prefer_hosted
+    const prefixes = parsePrefixes(values.reserved_prefixes)
+    if (prefixes.length > 0) body.reserved_prefixes = prefixes
   }
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()
@@ -510,6 +529,14 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     }
   }
   return body
+}
+
+/** Split the reserved-prefixes field on commas, whitespace and newlines. */
+export function parsePrefixes(raw: string): string[] {
+  return raw
+    .split(/[\s,]+/)
+    .map((p) => p.trim())
+    .filter((p) => p !== '')
 }
 
 /**
@@ -543,6 +570,12 @@ export function toUpdateBody(
   }
   if (values.kind === 'group' && values.prefer_hosted !== before.prefer_hosted) {
     body.prefer_hosted = values.prefer_hosted
+  }
+  if (values.kind === 'group') {
+    const prefixes = parsePrefixes(values.reserved_prefixes)
+    if (prefixes.join(',') !== parsePrefixes(before.reserved_prefixes).join(',')) {
+      body.reserved_prefixes = prefixes
+    }
   }
   if (values.kind === 'proxy') {
     const remoteUrl = values.remote_url.trim()

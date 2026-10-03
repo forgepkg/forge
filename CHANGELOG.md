@@ -159,6 +159,11 @@ The release workflow publishes the section whose heading matches the tag
   read (401 anonymously, 403 signed in) on the feed (`/v3/{repo}/…`) and in
   the browse API, so repository names can no longer be enumerated; a global
   admin still gets 404.
+- Groups take optional `reserved_prefixes` (API and UI, e.g. `["Acme."]`):
+  package ids under a reserved prefix are never served from a proxy member.
+  `prefer_hosted` only shields ids a hosted member already has, so an
+  internal name was open to a public look-alike until its first publish (or
+  after its last version was deleted).
 
 ## [0.1.0]
 

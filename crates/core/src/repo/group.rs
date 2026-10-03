@@ -31,6 +31,11 @@
 //!   confusion). The check is one batched existence query over the hosted
 //!   leaves; a failure of it fails the request (fail closed), and it reveals
 //!   no more than the resulting 404 does.
+//! * **Reserved prefixes** (group `config.reserved_prefixes`, e.g. `acme.`):
+//!   ids under a reserved prefix never come from a proxy member, whether or
+//!   not a hosted member has them yet — prefer-hosted alone cannot protect an
+//!   internal name before its first publish (or after its last version is
+//!   deleted).
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
 //!   remaining members. Only when *every* consulted member fails does the
@@ -150,6 +155,8 @@ struct GroupGraph {
     root_id: i64,
     /// The requested group's `prefer_hosted` option.
     prefer_hosted: bool,
+    /// The requested group's reserved id prefixes (lowercase).
+    reserved_prefixes: Vec<String>,
     max_depth: u32,
     groups: HashMap<i64, Vec<GraphMember>>,
     leaves: Vec<Repository>,
@@ -168,6 +175,14 @@ struct VisibleLeaves {
 }
 
 impl GroupGraph {
+    /// Whether the lowercase `id` falls under one of the group's reserved
+    /// prefixes (never served from a proxy member).
+    fn is_reserved(&self, lower_id: &str) -> bool {
+        self.reserved_prefixes
+            .iter()
+            .any(|prefix| lower_id.starts_with(prefix.as_str()))
+    }
+
     /// Visible leaf ids for `package_id`, in the same package-specific stable
     /// pre-order as the former path-expanding traversal.
     fn visible_leaves(&self, package_id: &str) -> Arc<VisibleLeaves> {
@@ -439,6 +454,7 @@ impl GroupRepo {
         Ok(Arc::new(GroupGraph {
             root_id: group_row.id,
             prefer_hosted: group_row.prefer_hosted(),
+            reserved_prefixes: group_row.reserved_prefixes(),
             max_depth: self.max_depth,
             groups,
             leaves,
@@ -516,13 +532,13 @@ impl GroupRepo {
         package_id: &str,
     ) -> Result<Vec<VisibleMember>, RepoError> {
         let members = self.visible_members_for_id(graph, package_id)?;
-        if !graph.prefer_hosted || !members.iter().any(|m| is_proxy(&m.repo)) {
+        if !members.iter().any(|m| is_proxy(&m.repo)) {
             return Ok(members);
         }
-        let owned = self
-            .hosted_owned_ids(graph, &[self.lower_id(package_id)])
-            .await?;
-        if owned.is_empty() {
+        let lower = self.lower_id(package_id);
+        let hosted_only = graph.is_reserved(&lower)
+            || (graph.prefer_hosted && !self.hosted_owned_ids(graph, &[lower]).await?.is_empty());
+        if !hosted_only {
             return Ok(members);
         }
         Ok(members.into_iter().filter(|m| !is_proxy(&m.repo)).collect())
@@ -573,10 +589,15 @@ impl GroupRepo {
                     continue;
                 };
                 let ranked = RankedHit { rank, member, hit };
-                if graph.prefer_hosted && is_proxy(leaf) {
-                    // Decided below against every hosted leaf of the group.
-                    proxy_hits.push(ranked);
-                    continue;
+                if is_proxy(leaf) {
+                    if graph.is_reserved(&self.lower_id(&ranked.hit.original_id)) {
+                        continue;
+                    }
+                    if graph.prefer_hosted {
+                        // Decided below against every hosted leaf of the group.
+                        proxy_hits.push(ranked);
+                        continue;
+                    }
                 }
                 insert_ranked(&mut by_id, ranked);
             }

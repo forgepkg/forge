@@ -1587,6 +1587,68 @@ async fn prefer_hosted_ownership_includes_unlisted_and_respects_opt_out() {
     );
 }
 
+/// Reserved prefixes: an internal name no hosted member has yet (before its
+/// first publish, or after its last version was deleted) is still never served
+/// from a proxy member, which prefer_hosted alone cannot ensure.
+#[tokio::test]
+async fn reserved_prefixes_keep_unpublished_internal_ids_off_proxies() {
+    let pool = common::pool().await;
+    let blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+    let set_prefixes = |prefixes: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE repository SET config = jsonb_build_object(\
+                 'prefer_hosted', true, 'reserved_prefixes', $2::jsonb) WHERE id = $1",
+            )
+            .bind(group.id)
+            .bind(prefixes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // No hosted copy and no reservation: the public package is served.
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        1
+    );
+
+    // `Samp` is reserved: nothing under it comes from the proxy.
+    set_prefixes(serde_json::json!(["samp"])).await;
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_internal_id_not_served(&g, &group.name, "reserved prefix").await;
+
+    // Another organization's prefix leaves the id alone.
+    set_prefixes(serde_json::json!(["acme."])).await;
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, shadowing_proxy(&proxy));
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        1
+    );
+}
+
 // ── group search enriches only the final page (review M8) ───────────────────
 
 /// [`StubBlobs`] that counts every blob read (the S3 manifest fetches search
