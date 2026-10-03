@@ -1558,3 +1558,63 @@ async fn usernames_are_unique_in_canonical_form() {
     .await;
     assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
 }
+
+/// Names migration 0021 left non-canonical (its SQL `lower()` follows the
+/// database collation and `btrim` trims ASCII spaces only) are brought into
+/// the form every lookup uses, so their accounts can sign in again.
+#[tokio::test]
+async fn stored_usernames_are_brought_into_canonical_form() {
+    use forge_db::user_dao::{self, NewUser};
+    let pool = common::pool().await;
+    let n = common::unique();
+    let raw = |name: String| {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
+             VALUES ($1, 'x', false, true, 'local') RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+    };
+    // A non-ASCII space btrim kept; a capital a "C" ctype does not lower.
+    let spaced = raw(format!("erin{n}\u{a0}")).await.unwrap();
+    let upper = raw(format!("Ünal{n}")).await.unwrap();
+    // A twin of an account that already holds the canonical name.
+    let holder = user_dao::insert_user(
+        &pool,
+        NewUser::local(format!("fritz{n}"), "x".into(), false, true),
+    )
+    .await
+    .unwrap();
+    let twin = raw(format!("fritz{n}\u{2003}")).await.unwrap();
+
+    let repairs = user_dao::canonicalize_stored_usernames(&pool)
+        .await
+        .unwrap();
+    let renamed = |id: i64| repairs.iter().find(|r| r.id == id).map(|r| r.to.clone());
+    assert_eq!(renamed(spaced), Some(format!("erin{n}")));
+    assert_eq!(renamed(upper), Some(format!("ünal{n}")));
+    assert_eq!(renamed(twin), Some(format!("fritz{n}#{twin}")));
+    assert_eq!(
+        renamed(holder.id),
+        None,
+        "the canonical holder keeps its name"
+    );
+
+    for (spelling, id) in [
+        (format!(" ERIN{n} "), spaced),
+        (format!("ÜNAL{n}"), upper),
+        (format!("Fritz{n}"), holder.id),
+    ] {
+        let found = user_dao::find_user_by_username(&pool, &spelling)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{spelling} finds its account"));
+        assert_eq!(found.id, id, "{spelling}");
+    }
+
+    // Idempotent: a second run has nothing left to do for these accounts.
+    let again = user_dao::canonicalize_stored_usernames(&pool)
+        .await
+        .unwrap();
+    assert!(again.iter().all(|r| ![spaced, upper, twin].contains(&r.id)));
+}

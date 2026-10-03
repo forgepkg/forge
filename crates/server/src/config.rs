@@ -106,8 +106,12 @@ pub struct ServerConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Seconds a client may take to send a request's headers before the
-    /// connection is closed (slow-header "slowloris" defence). `0` disables.
-    /// Default 30.
+    /// connection is closed (slow-header "slowloris" defence). The same timer
+    /// closes a keep-alive connection that stays idle this long, so keep it
+    /// above the upstream keep-alive idle timeout of the reverse proxy in
+    /// front (AWS ALB and ingress-nginx 60 s, Traefik 90 s, Caddy 120 s);
+    /// otherwise the proxy can reuse a connection Forge is closing and answer
+    /// 502. `0` disables. Default 150.
     #[serde(default = "default_header_read_timeout_seconds")]
     pub header_read_timeout_seconds: u64,
     /// Seconds a request body may stall (no data arriving) before the request
@@ -127,7 +131,7 @@ fn default_max_upload_bytes() -> u64 {
 }
 
 fn default_header_read_timeout_seconds() -> u64 {
-    30
+    150
 }
 
 fn default_body_idle_timeout_seconds() -> u64 {

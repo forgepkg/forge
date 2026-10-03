@@ -7,6 +7,13 @@
 //! timer-backed builder that enforces [`ServeOptions::header_read_timeout`];
 //! per-request body-idle and response timeouts are router layers
 //! ([`crate::app::build_router`]).
+//!
+//! Connections speak HTTP/1 only. The protocol-sniffing `auto` builder reads
+//! the first bytes (to tell HTTP/1 from an h2c preface) with no timer at all,
+//! so a client that connects and sends nothing, or only part of the preface,
+//! held its connection forever. Served as HTTP/1 from the first byte, the
+//! header-read timer runs from accept. Forge sits behind a TLS-terminating
+//! proxy, which speaks HTTP/1.1 to it.
 
 use std::future::Future;
 use std::time::Duration;
@@ -15,8 +22,8 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::Router;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
@@ -25,8 +32,9 @@ use tower::ServiceExt;
 /// Connection-level limits.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeOptions {
-    /// How long a client may take to send a request's headers (HTTP/1);
-    /// `None` disables the limit.
+    /// How long a client may take to send a request's headers, counted from
+    /// accept for the first request and from going idle for the next ones on
+    /// a keep-alive connection; `None` disables the limit.
     pub header_read_timeout: Option<Duration>,
 }
 
@@ -71,14 +79,12 @@ pub async fn serve(
                 req.extensions_mut().insert(ConnectInfo(peer));
                 req.map(Body::new)
             });
-        let mut builder = Builder::new(TokioExecutor::new());
+        let mut builder = http1::Builder::new();
         builder
-            .http1()
             .timer(TokioTimer::new())
             .header_read_timeout(options.header_read_timeout);
-        let connection = builder
-            .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(service))
-            .into_owned();
+        let connection =
+            builder.serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
         let connection = graceful.watch(connection);
         tokio::spawn(async move {
             if let Err(error) = connection.await {

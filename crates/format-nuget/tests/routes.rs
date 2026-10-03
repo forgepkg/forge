@@ -608,6 +608,8 @@ async fn registration_pages_large_packages() {
         .insert("big.lib".into(), (0..200).map(entry).collect());
     ops.registration
         .insert("small.lib".into(), (0..100).map(entry).collect());
+    ops.registration
+        .insert("huge.lib".into(), (0..300).map(entry).collect());
     let router = nuget_router(
         RepoKind::Hosted,
         ctx(RepoKind::Hosted, ops, MockBytes::default()),
@@ -641,11 +643,55 @@ async fn registration_pages_large_packages() {
     let page: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(page["items"].as_array().unwrap().len(), 64);
     assert_eq!(page["lower"], "1.0.64");
-    let (status, _h, _b) = get(&router, "/registration/big.lib/page/1.0.1/1.0.2.json").await;
+    for bad in [
+        "/registration/big.lib/page/not-a-version/1.0.2.json",
+        "/registration/nope.lib/page/1.0.0/1.0.63.json",
+        // More versions than any page holds: not rendered in one response.
+        "/registration/huge.lib/page/0.0.0/9.0.0.json",
+    ] {
+        let (status, _h, _b) = get(&router, bad).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+    }
+}
+
+/// A page URL from an index a client cached keeps resolving after pushes and
+/// deletes re-chunk the index: the page serves the versions in its range.
+#[tokio::test]
+async fn registration_page_urls_survive_a_rechunk() {
+    let entry = |v: String| RegistrationEntry {
+        original_id: "Big.Lib".into(),
+        version: v,
+        listed: true,
+        package_hash_sha512_base64: None,
+        nuspec_bytes: None,
+        manifest_summary: None,
+        published: None,
+    };
+    // As cached: 1.0.0 .. 1.0.199; the second page is 1.0.64 .. 1.0.127.
+    // Now 1.0.0 is deleted and a servicing release 1.0.100-fix lands inside
+    // that page's range, so every chunk boundary has moved.
+    let mut versions: Vec<RegistrationEntry> =
+        (1..200).map(|i| entry(format!("1.0.{i}"))).collect();
+    versions.insert(99, entry("1.0.100-fix".into()));
+    let mut ops = MockOps::default();
+    ops.registration.insert("big.lib".into(), versions);
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+
+    let (status, _h, body) = get(&router, "/registration/big.lib/page/1.0.64/1.0.127.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 65, "1.0.64 ..= 1.0.127 plus 1.0.100-fix");
+    assert_eq!(items[0]["catalogEntry"]["version"], "1.0.64");
+    assert_eq!(items[64]["catalogEntry"]["version"], "1.0.127");
+    assert_eq!(page["lower"], "1.0.64");
+    assert_eq!(page["upper"], "1.0.127");
     assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "only real page bounds resolve"
+        page["@id"],
+        format!("{BASE}/v3/main/registration/big.lib/page/1.0.64/1.0.127.json")
     );
 }
 
@@ -1181,6 +1227,43 @@ async fn push_with_an_oversized_multipart_preamble_is_refused() {
     // A short preamble is still fine.
     let (status, _) = put_multipart(&router, "/package", Some("key"), b"PK\x03\x04").await;
     assert_eq!(status, StatusCode::CREATED);
+}
+
+/// The preamble guard finds the boundary and the part headers when they are
+/// split across chunks, down to one byte per chunk.
+#[tokio::test]
+async fn push_trickled_byte_by_byte_is_accepted() {
+    let w = MockWrite::found();
+    let last = w.last_upload.clone();
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let boundary = "TESTBOUNDARY1234";
+    let mut body = b"preamble\r\n".to_vec();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"package\"; filename=\"p.nupkg\"\r\n\r\n",
+    );
+    body.extend_from_slice(b"PK\x03\x04-nupkg-bytes");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = body
+        .into_iter()
+        .map(|b| Ok(bytes::Bytes::from(vec![b])))
+        .collect();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/package")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("X-NuGet-ApiKey", "key")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(
+        last.lock().unwrap().as_deref(),
+        Some(&b"PK\x03\x04-nupkg-bytes"[..])
+    );
 }
 
 #[tokio::test]

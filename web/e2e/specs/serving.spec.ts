@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-import { facts } from '../helpers'
+import { createRepo, facts } from '../helpers'
 
 /**
  * Single-origin serving (plan §Testing #1, #8). The Rust server serves the SPA
@@ -75,15 +75,15 @@ test.describe('single-origin serving', () => {
 
   test('the V3 service index is served by the API', async ({ request }) => {
     const f = facts()
-    // Create a hosted, anon-readable repo, then its index.json must be JSON.
-    await request.post(`${f.baseUrl}/admin/repositories`, {
-      headers: {
-        authorization:
-          'Basic ' +
-          Buffer.from(`${f.adminUser}:${f.adminPass}`).toString('base64'),
-      },
-      data: { name: 'svcidx', kind: 'hosted', anonymous_read: true },
+    // Create a hosted, anon-readable repo (with the admin-scoped token: the
+    // admin API refuses a password over Basic), then its index.json must be
+    // JSON. A retry finds the repo already there (409).
+    const created = await createRepo({
+      name: 'svcidx',
+      kind: 'hosted',
+      anonymous_read: true,
     })
+    expect([200, 201, 409]).toContain(created.status)
     const res = await request.get(`${f.baseUrl}/v3/svcidx/index.json`)
     expect(res.ok()).toBeTruthy()
     const body = await res.json()

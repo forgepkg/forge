@@ -88,6 +88,12 @@ fn preamble_guard(
     let delimiter = format!("--{boundary}").into_bytes();
     async_stream::try_stream! {
         let mut head: Option<Vec<u8>> = Some(Vec::new());
+        let mut delimiter_at: Option<usize> = None;
+        // How far `head` has been searched for what is still being looked
+        // for. Each search resumes a needle's length before that, so a match
+        // split across chunks is found and a body trickled in tiny chunks
+        // costs linear, not quadratic, time.
+        let mut searched = 0usize;
         futures_util::pin_mut!(body);
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
@@ -96,9 +102,24 @@ fn preamble_guard(
                 // headers must end within them.
                 let room = (MAX_MULTIPART_PREAMBLE_BYTES + 1).saturating_sub(seen.len());
                 seen.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                let headers_end = find(seen, &delimiter).and_then(|at| {
-                    find(&seen[at..], b"\r\n\r\n").map(|end| at + end + 4)
-                });
+                if delimiter_at.is_none() {
+                    let from = searched.saturating_sub(delimiter.len());
+                    match find(&seen[from..], &delimiter) {
+                        Some(i) => {
+                            delimiter_at = Some(from + i);
+                            searched = from + i;
+                        }
+                        None => searched = seen.len(),
+                    }
+                }
+                let mut headers_end = None;
+                if let Some(at) = delimiter_at {
+                    let from = searched.saturating_sub(4).max(at);
+                    match find(&seen[from..], b"\r\n\r\n") {
+                        Some(i) => headers_end = Some(from + i + 4),
+                        None => searched = seen.len(),
+                    }
+                }
                 if headers_end.is_some_and(|end| end <= MAX_MULTIPART_PREAMBLE_BYTES) {
                     head = None;
                 } else if seen.len() > MAX_MULTIPART_PREAMBLE_BYTES {

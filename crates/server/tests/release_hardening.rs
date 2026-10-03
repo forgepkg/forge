@@ -314,6 +314,10 @@ async fn slow_headers_and_stalled_bodies_are_cut_off() {
     .await;
     let addr = srv.base_url.trim_start_matches("http://").to_string();
     for (what, request) in [
+        // Nothing at all, or a prefix of the h2c preface: the timer must run
+        // from accept, not only once a request line arrives.
+        ("no bytes", String::new()),
+        ("partial h2 preface", "PRI * HTTP/2.0\r\n".to_string()),
         (
             "slow headers",
             "GET /health HTTP/1.1\r\nHost: x\r\n".to_string(),

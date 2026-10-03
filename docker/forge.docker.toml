@@ -56,8 +56,9 @@ anonymous_mode = "off"
 # flag), NuGet clients and scripts use API tokens, and an enabled
 # credential-forwarding realm turns the wire password path on by itself (for
 # the whole chain, so local users' passwords then work over Basic as well).
-# Set FORGE_AUTH__ALLOW_PASSWORD_BASIC=true only if a client must send a local
-# user's password over Basic (e.g. `curl -u user:password` against /admin).
+# Set FORGE_AUTH__ALLOW_PASSWORD_BASIC=true only if a NuGet client must send a
+# local user's password over Basic. The admin API never accepts a password
+# over Basic: scripts sign in through /auth/login or use an admin-scoped token.
 allow_password_basic = false
 
 # No [auth.bootstrap_admin] block: see the header (env only).

@@ -180,6 +180,14 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
 - Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
   `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
   own timeouts at least as long for package pushes.
+- Forge speaks HTTP/1.1 to the proxy (no h2c). `header_read_timeout_seconds`
+  (default 150) also closes keep-alive connections that stay idle that long.
+  If the proxy keeps upstream connections open longer than that (Envoy and
+  Istio default to 1 hour), lower the proxy's upstream idle timeout or raise
+  this setting; otherwise the proxy can reuse a connection Forge is closing
+  and answer 502, which it does not retry for a push. AWS ALB and
+  ingress-nginx (60 s), Traefik (90 s) and Caddy (120 s) are below the
+  default.
 
 Minimal nginx example:
 

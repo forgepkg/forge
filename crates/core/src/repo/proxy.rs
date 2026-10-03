@@ -671,22 +671,31 @@ impl ProxyRepo {
         let url = format!("{base}{lower_id}/index.json");
         match self.fetch_json(repo, &url).await? {
             Some(doc) => {
-                let versions: Vec<String> = doc
-                    .get("versions")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .filter_map(|raw| self.format.normalize_version(raw).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // A document without a `versions` array is not a listing:
+                // treat it as an upstream failure (what is cached is served)
+                // rather than as "no versions", which would retire them all.
+                let Some(listed) = doc.get("versions").and_then(|v| v.as_array()) else {
+                    return Err(RepoError::Storage(format!(
+                        "upstream listing {url} has no versions array"
+                    )));
+                };
+                let versions: Vec<String> = listed
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|raw| self.format.normalize_version(raw).ok())
+                    .collect();
 
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
                 // upstream) and drop a stale package-level not-found marker.
+                // An empty listing retires nothing: a feed answers 404 for a
+                // package without versions, so an empty 200 is a degraded
+                // upstream (an offline or partially synced mirror), not a
+                // deletion of every version, downloaded ones included.
                 proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
-                proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                if !versions.is_empty() {
+                    proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                }
                 Ok(true)
             }
             None => {
@@ -972,19 +981,23 @@ impl ProxyRepo {
         };
 
         // Parse from the temp file on the blocking pool to obtain the canonical
-        // identity and the manifest.
+        // identity and the manifest, and summarize the manifest for
+        // registration and search (stored with the component, like a push).
         let parsed = {
             let format = self.format.clone();
             let path = staged.temp_path.to_path_buf();
             tokio::task::spawn_blocking(move || {
                 let mut file = std::fs::File::open(&path)?;
-                Ok::<_, std::io::Error>(format.parse_upload(&mut file))
+                Ok::<_, std::io::Error>(format.parse_upload(&mut file).map(|parsed| {
+                    let summary = format.manifest_summary(&parsed.nuspec_bytes);
+                    (parsed, summary)
+                }))
             })
             .await
             .map_err(|e| RepoError::Storage(format!("parse upstream nupkg: {e}")))?
             .map_err(|e| RepoError::Storage(format!("parse upstream nupkg: {e}")))?
         };
-        let parsed = match parsed {
+        let (parsed, manifest_summary) = match parsed {
             Ok(parsed) => parsed,
             Err(e) => {
                 return Err(self
@@ -1068,6 +1081,9 @@ impl ProxyRepo {
                 .await?
             }
         };
+        if let Some(summary) = &manifest_summary {
+            component_dao::set_manifest_summary(&mut *tx, comp.id, summary).await?;
+        }
         // Attach the .nupkg / .nuspec assets if absent. Each blob reference is
         // taken only when its asset row is actually inserted; an unused ingest
         // lease simply expires.
@@ -1242,6 +1258,47 @@ impl ProxyRepo {
             size: asset.size,
             content_type: asset.content_type,
         }))
+    }
+
+    /// The manifest of a version cached before summaries were stored:
+    /// summarized off the async workers and backfilled, so later reads skip
+    /// the fetch. `(summary, None)` once summarized; `(None, manifest)` when
+    /// it cannot be (the format layer then parses the bytes itself).
+    async fn summarize_cached(
+        &self,
+        repo_id: i64,
+        lower_id: &str,
+        component_id: i64,
+        version: &str,
+    ) -> (Option<JsonValue>, Option<Vec<u8>>) {
+        let bytes = self
+            .local_nuspec(repo_id, lower_id, version)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, id = %lower_id, %version, "cached nuspec read failed");
+                None
+            });
+        let Some(bytes) = bytes else {
+            return (None, None);
+        };
+        let format = self.format.clone();
+        let parse = bytes.clone();
+        let summary = tokio::task::spawn_blocking(move || format.manifest_summary(&parse))
+            .await
+            .ok()
+            .flatten();
+        match summary {
+            Some(summary) => {
+                if let Err(e) =
+                    component_dao::backfill_manifest_summary(&self.pool, component_id, &summary)
+                        .await
+                {
+                    tracing::warn!(error = %e, component_id, "manifest summary backfill failed");
+                }
+                (Some(summary), None)
+            }
+            None => (None, Some(bytes)),
+        }
     }
 
     /// The locally cached `.nuspec` of a downloaded version, if stored.
@@ -1556,8 +1613,11 @@ impl ProxyRepo {
     }
 
     /// Search the locally known proxy corpus once, applying authorization
-    /// before total-count calculation and client paging. The id substring
-    /// filter runs in PostgreSQL so a large proxy cache is not loaded whole.
+    /// before total-count calculation and client paging. Every per-version
+    /// condition (listing state, package delay, not-found marker, prerelease)
+    /// runs in PostgreSQL, which returns only the matching ids; versions are
+    /// loaded for the requested page alone, so an empty query over a large
+    /// proxy cache does not load every cached version.
     /// With `enrich`, the returned page carries cached manifests
     /// ([`Self::enrich_hits`]); a group searches its members without and
     /// enriches only its own final page.
@@ -1570,52 +1630,82 @@ impl ProxyRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let now = Utc::now();
+        // The `listable` conditions as bounds: past the delay window, and no
+        // not-found marker younger than the TTL.
+        let seen_before = now - Duration::seconds(i64::from(repo_row.package_delay_seconds));
+        let marked_after = now - Self::not_found_ttl(&repo_row);
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
+        let names = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT name AS "name!"
+            FROM proxy_cached_version
+            WHERE repository_id = $1 AND version <> '*' AND confirmed AND NOT upstream_missing
+              AND listed AND ($2 = '' OR strpos(name, $2) > 0)
+              AND first_seen_at <= $3
+              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
+              AND ($5 OR strpos(version, '-') = 0)
+            ORDER BY name
+            "#,
+            repo_row.id,
+            q,
+            seen_before,
+            marked_after,
+            params.prerelease,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut names: Vec<String> = names
+            .into_iter()
+            .filter(|name| filter.allows(name) && query.matches(name))
+            .collect();
+        // Byte order, as hosted and group results are ordered (SQL orders by
+        // the database collation, which may weigh punctuation differently).
+        names.sort_unstable();
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+
         let rows = sqlx::query_as!(
             forge_db::model::ProxyCachedVersion,
             r#"
             SELECT id, repository_id, name, version, listed, first_seen_at,
                    downloaded, metadata_refreshed_at, not_found, not_found_at
             FROM proxy_cached_version
-            WHERE repository_id = $1 AND version <> '*' AND confirmed AND NOT upstream_missing
-              AND listed AND ($2 = '' OR strpos(name, $2) > 0)
-            ORDER BY name
+            WHERE repository_id = $1 AND name = ANY($2::text[])
+              AND version <> '*' AND confirmed AND NOT upstream_missing AND listed
+              AND first_seen_at <= $3
+              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
+              AND ($5 OR strpos(version, '-') = 0)
             "#,
             repo_row.id,
-            q,
+            &page,
+            seen_before,
+            marked_after,
+            params.prerelease,
         )
         .fetch_all(&self.pool)
         .await?;
-
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::ProxyCachedVersion>> = BTreeMap::new();
+        let mut by_id: HashMap<String, Vec<VersionEntry>> = HashMap::new();
         for r in rows {
-            if !Self::listable(&repo_row, &r, now)
-                || !filter.allows(&r.name)
-                || !query.matches(&r.name)
-            {
-                continue;
-            }
-            by_id.entry(r.name.clone()).or_default().push(r);
+            by_id.entry(r.name.clone()).or_default().push(VersionEntry {
+                original_id: r.name,
+                version: r.version.clone(),
+                version_original: r.version,
+                listed: r.listed,
+            });
         }
 
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, rows) in by_id {
-            let mut versions: Vec<VersionEntry> = rows
-                .into_iter()
-                .filter(|r| params.prerelease || !is_prerelease(&r.version))
-                .map(|r| VersionEntry {
-                    original_id: r.name.clone(),
-                    version: r.version.clone(),
-                    version_original: r.version,
-                    listed: r.listed,
-                })
-                .collect();
-            versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
-            if versions.is_empty() {
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
+        for name in &page {
+            let Some(mut versions) = by_id.remove(name) else {
+                // Changed between the two queries.
                 continue;
-            }
+            };
+            versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -1624,14 +1714,6 @@ impl ProxyRepo {
                 ..Default::default()
             });
         }
-        hits.sort_by(|a, b| a.original_id.cmp(&b.original_id));
-
-        let total_hits = hits.len();
-        let mut hits: Vec<SearchHit> = hits
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
         if enrich {
             self.enrich_hits(repo_row.id, &mut hits).await;
         }
@@ -1690,11 +1772,6 @@ fn parse_resources(value: JsonValue) -> UpstreamResources {
         registrations_base_url: None,
         search_query_service: None,
     })
-}
-
-/// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
-fn is_prerelease(version: &str) -> bool {
-    version.contains('-')
 }
 
 #[async_trait]
@@ -1862,53 +1939,81 @@ impl RepoReadOps for ProxyRepo {
             tracing::warn!(repo = %repo_row.name, id = %lower, error = %e, "persisting upstream listing state failed");
         }
 
+        // packageHash + the stored manifest are known only for downloaded
+        // versions: one query for all of them, with the manifest summary
+        // stored at download. A version cached before summaries were stored
+        // has its manifest read once (bounded concurrency) and backfilled.
+        let mut cached: HashMap<String, component_dao::RegistrationRow> =
+            component_dao::list_registration_rows(
+                &self.pool,
+                repo_row.id,
+                &lower,
+                NUPKG_ASSET_PATH,
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.version.clone(), row))
+            .collect();
+        let unsummarized: Vec<(i64, String)> = visible
+            .iter()
+            .filter(|r| r.downloaded)
+            .filter_map(|r| cached.get(&r.version))
+            .filter(|row| row.manifest_summary.is_none())
+            .map(|row| (row.id, row.version.clone()))
+            .collect();
+        let mut manifests: HashMap<String, (Option<JsonValue>, Option<Vec<u8>>)> = {
+            use futures_util::StreamExt;
+            let (repo_id, name) = (repo_row.id, lower.as_str());
+            futures_util::stream::iter(unsummarized)
+                .map(|(component_id, version)| async move {
+                    let manifest = self
+                        .summarize_cached(repo_id, name, component_id, &version)
+                        .await;
+                    (version, manifest)
+                })
+                .buffered(8)
+                .collect::<HashMap<_, _>>()
+                .await
+        };
+
         let mut out = Vec::with_capacity(visible.len());
         for r in visible {
             let leaf = upstream.get(&r.version);
-            // packageHash + the stored manifest are known only for downloaded
-            // versions.
-            let (hash, local) = if r.downloaded {
-                match component_dao::find_component(&self.pool, repo_row.id, &r.name, &r.version)
-                    .await?
-                {
-                    Some(comp) => {
-                        let asset =
-                            asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?;
-                        let nuspec = self
-                            .local_nuspec(repo_row.id, &r.name, &r.version)
-                            .await
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(error = %e, id = %r.name, version = %r.version, "cached nuspec read failed");
-                                None
-                            });
-                        (asset.and_then(|a| a.sha512_base64), nuspec)
-                    }
-                    None => (None, None),
+            let (hash, summary, local) = match cached.remove(&r.version) {
+                Some(row) if r.downloaded => {
+                    let (summary, local) = match row.manifest_summary {
+                        Some(summary) => (Some(summary), None),
+                        None => manifests.remove(&r.version).unwrap_or_default(),
+                    };
+                    (row.package_hash_sha512_base64, summary, local)
                 }
-            } else {
-                (None, None)
+                _ => (None, None, None),
             };
             let original_id = leaf
                 .and_then(|l| l.id.clone())
                 .unwrap_or_else(|| r.name.clone());
             // Not downloaded: the dependency groups are known only from the
             // upstream registration.
-            let nuspec_bytes = local.or_else(|| {
-                leaf.and_then(|l| {
-                    self.format.synthesize_manifest(
-                        &original_id,
-                        &r.version,
-                        &l.dependency_groups(),
-                    )
+            let nuspec_bytes = if summary.is_some() {
+                None
+            } else {
+                local.or_else(|| {
+                    leaf.and_then(|l| {
+                        self.format.synthesize_manifest(
+                            &original_id,
+                            &r.version,
+                            &l.dependency_groups(),
+                        )
+                    })
                 })
-            });
+            };
             out.push(RegistrationEntry {
                 original_id,
                 version: r.version.clone(),
                 listed: leaf.map_or(r.listed, |l| l.listed),
                 package_hash_sha512_base64: hash,
                 nuspec_bytes,
-                manifest_summary: None,
+                manifest_summary: summary,
                 // Only the upstream registration knows the publish time (the
                 // cache time would be misleading).
                 published: leaf.and_then(|l| l.published),

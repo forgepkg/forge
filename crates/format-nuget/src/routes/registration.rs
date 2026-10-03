@@ -24,8 +24,8 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::repo::RegistrationEntry;
 use serde_json::{json, Value};
 
-use crate::nuspec;
 use crate::routes::{package_id, repo_error_response, RouteContext};
+use crate::{nuspec, version};
 
 /// Build the absolute `packageContent` URL for a `(lower_id, version)`.
 fn package_content_url(base: &str, lower_id: &str, version: &str) -> String {
@@ -232,8 +232,19 @@ pub fn registration_json(
     })
 }
 
-/// The registration page of `entries` (ascending) whose bounds are exactly
-/// `lower..=upper` (compared case-insensitively), with its leaves.
+/// Most versions one page request renders. A page an index advertised holds
+/// [`PAGE_SIZE`]; versions pushed into its range since then can add more.
+pub const MAX_PAGE_LEAVES: usize = 4 * PAGE_SIZE;
+
+/// The registration page `lower..=upper` over `entries` (ascending), with
+/// its leaves: every version in that range by precedence.
+///
+/// The range decides, not the current chunking. A client fetches a page by
+/// the URL of an index it may have cached, and a push, a delete, a proxy
+/// version leaving its delay window or a failing group member re-chunks the
+/// index; NuGet clients fail the whole operation on a page 404. `None` (404)
+/// for an unknown id, bounds that are not versions, or a range over more
+/// than [`MAX_PAGE_LEAVES`] versions.
 pub fn registration_page_json(
     ctx: &RouteContext,
     lower_id: &str,
@@ -241,18 +252,24 @@ pub fn registration_page_json(
     lower: &str,
     upper: &str,
 ) -> Option<Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    version::normalize(lower).ok()?;
+    version::normalize(upper).ok()?;
+    let start = entries.partition_point(|e| version::compare(&e.version, lower).is_lt());
+    let end = entries.partition_point(|e| version::compare(&e.version, upper).is_le());
+    let in_range = entries.get(start..end.max(start))?;
+    if in_range.len() > MAX_PAGE_LEAVES {
+        return None;
+    }
     let base = ctx.base();
-    entries
-        .chunks(PAGE_SIZE)
-        .find(|chunk| {
-            chunk
-                .first()
-                .is_some_and(|e| e.version.eq_ignore_ascii_case(lower))
-                && chunk
-                    .last()
-                    .is_some_and(|e| e.version.eq_ignore_ascii_case(upper))
-        })
-        .map(|chunk| page_json(&base, lower_id, chunk, true))
+    let mut page = page_json(&base, lower_id, in_range, true);
+    // The page answers for the bounds it was asked for.
+    page["@id"] = json!(page_url(&base, lower_id, lower, upper));
+    page["lower"] = json!(lower);
+    page["upper"] = json!(upper);
+    Some(page)
 }
 
 /// Handler: `GET`/`HEAD` `/registration/{id}/index.json`.
