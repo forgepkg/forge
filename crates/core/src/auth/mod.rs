@@ -43,14 +43,20 @@ pub use cred_cache::{
 };
 pub use local_password::{LimiterSaturated, LocalPasswordProvider, PasswordHashLimiter};
 pub use login_throttle::{
-    username_for_log, AttemptRefused, LoginAttempt, LoginThrottle, MAX_USERNAME_BYTES,
+    client_network, username_for_log, AttemptRefused, LoginAttempt, LoginThrottle, WindowLimiter,
+    MAX_USERNAME_BYTES,
 };
-pub use principal::{Principal, UserPrincipal};
+pub use principal::{AuthMethod, Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
-pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
+pub use session_source::{
+    cookie_value, session_cookie_name, unique_cookie_value, DuplicateCookie, SessionCookieSource,
+    SECURE_SESSION_COOKIE, SESSION_COOKIE,
+};
 pub use token::{
     generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
     verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,
     SourceOutcome, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
+// Canonical usernames live with the DAOs that enforce them.
+pub use forge_db::username::{canonical_username, InvalidUsername};

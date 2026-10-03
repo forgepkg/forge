@@ -78,9 +78,13 @@ pub async fn list(State(state): State<AppState>) -> Response {
 
 /// `POST /admin/users`
 pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>) -> Response {
-    if body.username.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "username is required").into_response();
-    }
+    // Stored canonical (trimmed, NFC, lowercased), like every login looks it up.
+    let username = match forge_core::auth::canonical_username(&body.username) {
+        Ok(u) => u,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid username: {e}")).into_response()
+        }
+    };
     if body.password.is_empty() {
         return (StatusCode::BAD_REQUEST, "password is required").into_response();
     }
@@ -90,12 +94,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(resp) => return resp,
     };
 
-    let new = NewUser::local(
-        body.username.clone(),
-        password_hash,
-        body.is_admin,
-        body.active,
-    );
+    let new = NewUser::local(username, password_hash, body.is_admin, body.active);
     let u = match user_dao::insert_user(&state.pool, new).await {
         Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {
@@ -211,9 +210,11 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 /// serving a possibly-stale cached positive, and revokes all of the user's
 /// browser sessions, so a signed-in browser must log in (and thus
 /// re-validate) again. Use after disabling the user upstream, after a password
-/// change, or to shrink the trust window. API tokens are untouched (they never
-/// depended on the upstream verdict). `204` on success (idempotent — a user
-/// with no cached verdicts or sessions still returns `204`).
+/// change, or to shrink the trust window. API tokens the user minted from a
+/// session that credential forwarding established are revoked as well (they
+/// rest on the same upstream verdict); tokens an administrator minted for the
+/// user are untouched. `204` on success (idempotent — a user with no cached
+/// verdicts, sessions or such tokens still returns `204`).
 pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let user = match user_dao::find_user_by_id(&state.pool, id).await {
         Ok(Some(u)) => u,
@@ -221,9 +222,21 @@ pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         Err(e) => return db_error(e),
     };
 
-    match revoke_sessions_and_verdicts(&state, &user).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(resp) => resp,
+    if let Err(resp) = revoke_sessions_and_verdicts(&state, &user).await {
+        return resp;
+    }
+    match forge_db::token_dao::revoke_forwarded_tokens_for_user(&state.pool, user.id).await {
+        Ok(revoked) => {
+            if revoked > 0 {
+                tracing::info!(
+                    user_id = user.id,
+                    revoked,
+                    "reauth revoked tokens minted via credential forwarding"
+                );
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => db_error(e),
     }
 }
 

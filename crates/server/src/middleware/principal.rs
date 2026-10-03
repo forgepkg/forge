@@ -57,7 +57,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip, AnonPolicy};
 use forge_core::auth::principal::Principal;
-use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
+use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
 use forge_core::auth::token::{resolve_principal_with_origin, AuthError, PrincipalSource};
 use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
@@ -196,7 +196,10 @@ pub fn origin_of(base_url: &str) -> Option<String> {
 /// `Set-Cookie` value that clears the session cookie.
 fn clear_session_cookie(secure: bool) -> String {
     let secure_attr = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
+    format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}",
+        name = session_cookie_name(secure)
+    )
 }
 
 /// Resolve the socket peer for a request.
@@ -248,7 +251,9 @@ pub async fn attach_principal(
 
     if resolved.ambient && !req.method().is_safe() && !CSRF_EXEMPT_PATHS.contains(&req.uri().path())
     {
-        if let Err(denied) = check_csrf(layer.sessions.as_ref(), req.headers()).await {
+        if let Err(denied) =
+            check_csrf(layer.sessions.as_ref(), req.headers(), layer.cookie_secure).await
+        {
             return denied;
         }
     }
@@ -272,9 +277,13 @@ pub async fn attach_principal(
 async fn check_csrf(
     sessions: Option<&SessionService>,
     headers: &HeaderMap,
+    cookie_secure: bool,
 ) -> Result<(), Response> {
     let forbidden = || (StatusCode::FORBIDDEN, "missing or invalid csrf token").into_response();
-    let (Some(sessions), Some(secret)) = (sessions, cookie_value(headers, SESSION_COOKIE)) else {
+    let secret = unique_cookie_value(headers, session_cookie_name(cookie_secure))
+        .ok()
+        .flatten();
+    let (Some(sessions), Some(secret)) = (sessions, secret) else {
         return Err(forbidden());
     };
     let presented = headers
@@ -306,6 +315,7 @@ mod tests {
     use axum::body::Body;
     use axum::routing::get;
     use axum::Router;
+    use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
     use forge_core::auth::token::SourceOutcome;
     use http::header::AUTHORIZATION;
     use http_body_util::BodyExt;
@@ -377,6 +387,7 @@ mod tests {
                     user_id: 1,
                     token_id: None,
                     is_admin: true,
+                    method: forge_core::auth::AuthMethod::Password,
                 })
             } else {
                 SourceOutcome::NoCredentials
@@ -463,6 +474,7 @@ mod tests {
                     user_id: 2,
                     token_id: Some(9),
                     is_admin: false,
+                    method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
             }),
@@ -565,6 +577,7 @@ mod tests {
                 user_id: 1,
                 token_id: None,
                 is_admin: true,
+                method: forge_core::auth::AuthMethod::Password,
             }),
             require_header: true,
         })];
@@ -700,6 +713,7 @@ mod tests {
                     user_id: 1,
                     token_id: Some(2),
                     is_admin: false,
+                    method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
             })],
@@ -787,6 +801,7 @@ mod tests {
             user_id: 1,
             token_id: Some(2),
             is_admin: true,
+            method: forge_core::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
             outcome: SourceOutcome::Authenticated(authed),

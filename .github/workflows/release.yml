@@ -60,32 +60,17 @@ jobs:
             || { echo "::error::tag is not on the default branch"; exit 1; }
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
-      # Which floating tags this release may move. `latest` goes only to the
-      # highest non-prerelease version among all release tags, and
-      # `<major>.<minor>` only to the highest non-prerelease version of its
-      # line — so a prerelease, or a patch to an older line, never moves them.
+      # Which floating tags this release may move: `latest` only for the
+      # highest non-prerelease version and `<major>.<minor>` only for the
+      # highest of its line, counting only tags on the default branch (see the
+      # script; tested by xtask/tests/release_channels.rs).
       - name: Decide floating tags
         id: channels
+        shell: bash # -eo pipefail: a failing script fails the step
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          stable_tags() { git tag --list 'v*.*.*' | sed 's/^v//' | grep -Ev -- '-' | sort -V; }
-          latest=false
-          line_latest=false
-          case "$VERSION" in
-            *-*) echo "prerelease: neither :latest nor :<major>.<minor> moves" ;;
-            *)
-              highest=$(stable_tags | tail -n 1)
-              line="${VERSION%.*}"
-              highest_in_line=$(stable_tags | grep -E "^${line//./\\.}\.[0-9]+$" | tail -n 1)
-              [ "$VERSION" = "$highest" ] && latest=true
-              [ "$VERSION" = "$highest_in_line" ] && line_latest=true
-              echo "highest=$highest highest_in_line=$highest_in_line"
-              ;;
-          esac
-          echo "latest=$latest line_latest=$line_latest"
-          echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "line_latest=$line_latest" >> "$GITHUB_OUTPUT"
+          BASE: origin/${{ github.event.repository.default_branch }}
+        run: .github/scripts/release-channels.sh "$VERSION" "$BASE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG.md
         run: |

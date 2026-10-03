@@ -158,15 +158,23 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 cargo xtask up                # infra only
 SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 
-# create a hosted repo (admin API uses HTTP Basic; allow_password_basic=true in forge.toml)
-curl -u admin:changeme -X POST localhost:8421/admin/repositories \
+# sign in: the admin API takes a session (or an admin-scoped token), never a
+# password over HTTP Basic. Keep the cookie and echo the CSRF token.
+CSRF=$(curl -sc /tmp/forge.jar localhost:8421/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"changeme"}' | sed 's/.*"csrf_token":"\([^"]*\)".*/\1/')
+
+# create a hosted repo
+curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/repositories \
   -H 'content-type: application/json' \
   -d '{"name":"nuget","kind":"hosted","anonymous_read":true}'
 
-# mint a push token (admin is user id 1)
-curl -u admin:changeme -X POST localhost:8421/admin/users/1/tokens \
+# mint a push token for yourself
+curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
+# For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
+# and send it as the Basic password (curl -u admin:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
 curl -X PUT localhost:8421/v3/nuget/package \
@@ -208,7 +216,10 @@ password supplied to NuGet should be a **token**.
   package id, proxy members are not consulted for it — so a same-named,
   higher-versioned package on a public feed cannot shadow an internal one
   (dependency confusion). Set `"prefer_hosted": false` for plain union
-  semantics.
+  semantics. That guard only knows names a hosted member already has; list
+  your organization's id prefixes in `"reserved_prefixes": ["Acme."]` so ids
+  under them never come from a proxy member, also before their first
+  internal publish.
 
 ## Configuration
 
@@ -261,6 +272,32 @@ For trust-policy validation, direct-token replay/cache limits, and GitHub
 Actions/GitLab CI examples, see
 [Trusted publishing](./docs/trusted-publishing.md).
 
+### Usernames and credential forwarding
+
+Usernames are **canonical**: surrounding whitespace is trimmed, the name is
+Unicode-NFC-normalized and lowercased, and names that are empty or contain
+control characters are refused. `Alice`, `alice` and ` alice ` are one
+account everywhere — login, the lockout, the credential cache, provisioning —
+and the database enforces it with a unique index on the canonical form.
+Migration 0021 canonicalizes existing accounts; where two collide, the oldest
+keeps the name and the others are renamed `<name>#<id>` (logged as a warning).
+
+A `credential_forwarding` realm forwards the **canonical** username with the
+password and, on success, signs the user in as that name. That is only safe
+when the upstream **binds the username to the secret**. Many do not: GitHub,
+Azure DevOps and GitLab accept a personal access token with *any* username,
+so anyone with a token could sign in as any Forge user. For such an upstream,
+set `identity_path` to where its JSON success response names the
+authenticated account (e.g. `login` for GitHub's `/user`): that name, in
+canonical form, must equal the username entered, or the login is rejected; a
+success without it fails closed.
+
+Every login sends the user's password to the realm's `url`, so it must be
+`https` — plain `http` only for a loopback sidecar, or with `"allow_http":
+true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the
+password goes straight to the configured host), follows no redirects and reads
+at most 1 MiB of a success body for `groups_path` / `identity_path`.
+
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
 recorded in `forge_setting`); afterwards the database is the authority.
@@ -297,9 +334,12 @@ State-changing cookie endpoints (`logout`, token mint/revoke) require a
 ## OIDC / Microsoft Entra login (optional)
 
 Browser login uses the **OpenID Connect authorization-code flow with PKCE**.
-A successful login creates a server-side **session** (an opaque `forge_session`
-cookie → a `session` row; the DB stores only `sha256(cookie)`, like API tokens)
-and maps the IdP identity to an `app_user`. Ordinary NuGet clients authenticate
+A successful login creates a server-side **session** (an opaque cookie → a
+`session` row; the DB stores only `sha256(cookie)`, like API tokens) and maps
+the IdP identity to an `app_user`. The cookie is `__Host-forge_session`
+(`Secure`, host-only) when `public_base_url` is `https://`, and plain
+`forge_session` on an http development setup; a request carrying the session
+cookie twice is treated as signed out. Ordinary NuGet clients authenticate
 with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
 keys after logging in (`POST /auth/tokens`). A validated workload JWT may
 instead be supplied as the Basic password, `X-NuGet-ApiKey`, or

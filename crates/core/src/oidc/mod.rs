@@ -77,9 +77,10 @@ pub struct ResolvePolicy {
     pub auto_provision: bool,
     /// Link a *new* OIDC identity to an existing `app_user` whose `username`
     /// equals the resolved username claim. **Off by default**: the username
-    /// claim is IdP-controlled and often user-editable. Even when enabled, a
-    /// user with a local password or with admin rights is never linked this
-    /// way (see [`resolve_user`]).
+    /// claim is IdP-controlled and often user-editable. Even when enabled, only
+    /// an account that no other credential owns is linked this way — never one
+    /// with a local password, admin rights, a credential-forwarding origin or
+    /// an existing IdP link (see [`resolve_user`]).
     pub link_existing_by_username: bool,
 }
 
@@ -100,11 +101,14 @@ impl Default for ResolvePolicy {
 ///    refresh the denormalized identity claims. This stable, issuer-scoped key
 ///    is the identity of an OIDC user — never the username or email.
 /// 2. **No link, matching username** + `link_existing_by_username` (off by
-///    default) → link the existing user, but **only** if it has no local
-///    password and is not an admin (column or `admin` role): a colliding
-///    `preferred_username` must never take over a password account or an
-///    administrator. Otherwise fall through (a fresh, suffixed user is
-///    provisioned instead).
+///    default) → link the existing user, but **only** if no other credential
+///    owns it: no local password, not an admin (column or `admin` role), not a
+///    credential-forwarding (`upstream-basic`) account, and not linked to any
+///    IdP identity yet (of this or another issuer). A colliding
+///    `preferred_username` must never take over a password account, an
+///    administrator, a directory account or another person's IdP account.
+///    Otherwise fall through (a fresh, suffixed user is provisioned
+///    instead).
 /// 3. **No link, no linkable match** + `auto_provision` → create a no-password
 ///    user, link.
 /// 4. **Else** → [`ResolveError::NotProvisioned`].
@@ -150,12 +154,21 @@ pub async fn resolve_user(
             let is_admin_role = authz_dao::user_has_role(pool, user.id, authz_dao::ADMIN_ROLE)
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
-            if user.password_hash.is_none() && !user.is_admin && !is_admin_role {
+            let already_linked = external_identity_dao::user_has_identity(pool, user.id)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?;
+            if user.password_hash.is_none()
+                && !user.is_admin
+                && !is_admin_role
+                && user.auth_source != "upstream-basic"
+                && !already_linked
+            {
                 return finalize(pool, user, login, &identity_claims, mapped, false).await;
             }
             tracing::warn!(
                 username = %mapped.username,
-                "oidc login not linked by username: target has a password or is an admin"
+                "oidc login not linked by username: target has a password, is an admin, \
+                 is a credential-forwarding account or is already linked to an identity"
             );
         }
     }
@@ -325,9 +338,14 @@ async fn finalize(
         } else {
             user
         };
-        authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
+        let changed = authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?;
+        if changed && !mapped.is_admin {
+            crate::auth::chain::revoke_sessions_on_demotion(pool, user.id)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?;
+        }
         user
     } else {
         user

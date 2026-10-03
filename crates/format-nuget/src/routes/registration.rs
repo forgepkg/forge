@@ -1,7 +1,12 @@
 //! Registration (`RegistrationsBaseUrl`, all 3.x variants), spec §6 +
 //! Appendix A.
 //!
-//! The index always returns a single inlined page. Each leaf carries a
+//! The index splits versions into pages of [`PAGE_SIZE`]. Up to
+//! [`MAX_INLINED_LEAVES`] versions, every page is inlined in the index;
+//! beyond that, the index lists the pages (bounds and URL only) and each is
+//! served by `/registration/{id}/page/{lower}/{upper}.json`, so a package with
+//! thousands of versions never renders them all in one response. Each leaf
+//! carries a
 //! `catalogEntry` with id, version, `listed`, `published`, `packageHash`
 //! (base64 SHA-512) + `packageHashAlgorithm`, an absolute `packageContent`
 //! URL, `dependencyGroups`, and the display metadata (description, authors,
@@ -20,7 +25,7 @@ use forge_core::repo::RegistrationEntry;
 use serde_json::{json, Value};
 
 use crate::nuspec;
-use crate::routes::{repo_error_response, RouteContext};
+use crate::routes::{package_id, repo_error_response, RouteContext};
 
 /// Build the absolute `packageContent` URL for a `(lower_id, version)`.
 fn package_content_url(base: &str, lower_id: &str, version: &str) -> String {
@@ -29,16 +34,21 @@ fn package_content_url(base: &str, lower_id: &str, version: &str) -> String {
     format!("{base}/flat/{lower_id}/{lower_ver}/{lower_id}.{lower_ver}.nupkg")
 }
 
-/// Render the `dependencyGroups` JSON array from stored nuspec bytes.
+/// Versions per registration page (nuget.org uses the same size).
+pub const PAGE_SIZE: usize = 64;
+
+/// Packages with at most this many versions get every page inlined in the
+/// registration index; larger ones are paged.
+pub const MAX_INLINED_LEAVES: usize = 128;
+
+/// Render the `dependencyGroups` JSON array of a version's manifest summary.
 ///
-/// A parse failure (or missing nuspec) yields an empty array rather than
+/// A missing or unreadable manifest yields an empty array rather than
 /// failing the whole registration page.
-fn dependency_groups(entry: &RegistrationEntry) -> Value {
-    let groups = match entry.nuspec_bytes.as_deref() {
-        Some(bytes) => nuspec::dependency_groups_from_nuspec(bytes).unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let arr: Vec<Value> = groups
+fn dependency_groups(summary: &nuspec::ManifestSummary) -> Value {
+    let arr: Vec<Value> = summary
+        .dependency_groups
+        .clone()
         .into_iter()
         .map(|g| {
             let deps: Vec<Value> = g
@@ -118,13 +128,14 @@ pub fn catalog_entry(base: &str, lower_id: &str, entry: &RegistrationEntry) -> V
         "packageContent",
         Value::String(package_content_url(base, lower_id, &entry.version)),
     );
-    put("dependencyGroups", dependency_groups(entry));
+    // The summary stored at publish; only older versions parse the manifest.
+    let summary = nuspec::summary_of(
+        entry.manifest_summary.as_ref(),
+        entry.nuspec_bytes.as_deref(),
+    );
+    put("dependencyGroups", dependency_groups(&summary));
 
-    let meta = entry
-        .nuspec_bytes
-        .as_deref()
-        .and_then(|b| nuspec::metadata_from_nuspec(b).ok())
-        .unwrap_or_default();
+    let meta = summary.metadata;
     let mut put_str = |k: &str, v: &Option<String>| {
         if let Some(v) = v {
             catalog.insert(k.to_string(), Value::String(v.clone()));
@@ -171,45 +182,84 @@ fn leaf(base: &str, lower_id: &str, entry: &RegistrationEntry) -> Value {
     })
 }
 
-/// Build the full registration index JSON for a package's versions.
+/// URL of the registration page holding `lower..=upper`.
+fn page_url(base: &str, lower_id: &str, lower: &str, upper: &str) -> String {
+    format!(
+        "{base}/registration/{lower_id}/page/{}/{}.json",
+        lower.to_ascii_lowercase(),
+        upper.to_ascii_lowercase()
+    )
+}
+
+/// One registration page (`catalog:CatalogPage`) over `entries` (ascending),
+/// with its leaves when `inline`.
+fn page_json(base: &str, lower_id: &str, entries: &[RegistrationEntry], inline: bool) -> Value {
+    let lower = entries.first().map(|e| e.version.as_str()).unwrap_or("");
+    let upper = entries.last().map(|e| e.version.as_str()).unwrap_or("");
+    let index_url = format!("{base}/registration/{lower_id}/index.json");
+    let mut page = json!({
+        "@id": page_url(base, lower_id, lower, upper),
+        "@type": "catalog:CatalogPage",
+        "count": entries.len(),
+        "lower": lower,
+        "upper": upper,
+        "parent": index_url,
+    });
+    if inline {
+        page["items"] = Value::Array(entries.iter().map(|e| leaf(base, lower_id, e)).collect());
+    }
+    page
+}
+
+/// Build the registration index JSON for a package's versions (ascending):
+/// pages of [`PAGE_SIZE`], inlined up to [`MAX_INLINED_LEAVES`] versions.
 pub fn registration_json(
     ctx: &RouteContext,
     lower_id: &str,
     entries: &[RegistrationEntry],
 ) -> Value {
     let base = ctx.base();
-    let leaves: Vec<Value> = entries.iter().map(|e| leaf(&base, lower_id, e)).collect();
-
-    // Entries are ascending by precedence, so first = lower, last = upper.
-    let lower = entries
-        .first()
-        .map(|e| e.version.clone())
-        .unwrap_or_default();
-    let upper = entries
-        .last()
-        .map(|e| e.version.clone())
-        .unwrap_or_default();
-
-    let index_url = format!("{base}/registration/{lower_id}/index.json");
+    let inline = entries.len() <= MAX_INLINED_LEAVES;
+    let pages: Vec<Value> = entries
+        .chunks(PAGE_SIZE)
+        .map(|chunk| page_json(&base, lower_id, chunk, inline))
+        .collect();
     json!({
-        "@id": index_url,
+        "@id": format!("{base}/registration/{lower_id}/index.json"),
         "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
-        "count": 1,
-        "items": [{
-            "@id": format!("{index_url}#page/{lower}/{upper}"),
-            "@type": "catalog:CatalogPage",
-            "count": leaves.len(),
-            "lower": lower,
-            "upper": upper,
-            "parent": index_url,
-            "items": leaves,
-        }],
+        "count": pages.len(),
+        "items": pages,
     })
+}
+
+/// The registration page of `entries` (ascending) whose bounds are exactly
+/// `lower..=upper` (compared case-insensitively), with its leaves.
+pub fn registration_page_json(
+    ctx: &RouteContext,
+    lower_id: &str,
+    entries: &[RegistrationEntry],
+    lower: &str,
+    upper: &str,
+) -> Option<Value> {
+    let base = ctx.base();
+    entries
+        .chunks(PAGE_SIZE)
+        .find(|chunk| {
+            chunk
+                .first()
+                .is_some_and(|e| e.version.eq_ignore_ascii_case(lower))
+                && chunk
+                    .last()
+                    .is_some_and(|e| e.version.eq_ignore_ascii_case(upper))
+        })
+        .map(|chunk| page_json(&base, lower_id, chunk, true))
 }
 
 /// Handler: `GET`/`HEAD` `/registration/{id}/index.json`.
 pub async fn index(State(ctx): State<RouteContext>, Path(id): Path<String>) -> Response {
-    let lower = ctx.format.lower_id(&id);
+    let Some(lower) = package_id(&ctx, &id) else {
+        return (StatusCode::NOT_FOUND, "registration not found").into_response();
+    };
     let entries = match ctx.ops.registration(&ctx.repo, &lower).await {
         Ok(e) => e,
         Err(e) => return repo_error_response(e),
@@ -217,7 +267,44 @@ pub async fn index(State(ctx): State<RouteContext>, Path(id): Path<String>) -> R
     if entries.is_empty() {
         return (StatusCode::NOT_FOUND, "registration not found").into_response();
     }
-    Json(registration_json(&ctx, &lower, &entries)).into_response()
+    // Rendering (and, for versions without a stored summary, manifest
+    // parsing) is CPU work: keep it off the async workers.
+    render_blocking(move || Some(registration_json(&ctx, &lower, &entries))).await
+}
+
+/// Handler: `GET`/`HEAD` `/registration/{id}/page/{lower}/{upper}.json` — one
+/// page of a paged registration index.
+pub async fn page(
+    State(ctx): State<RouteContext>,
+    Path((id, lower_version, upper_file)): Path<(String, String, String)>,
+) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "registration page not found").into_response();
+    let Some(lower) = package_id(&ctx, &id) else {
+        return not_found();
+    };
+    let Some(upper_version) = upper_file.strip_suffix(".json").map(str::to_string) else {
+        return not_found();
+    };
+    let entries = match ctx.ops.registration(&ctx.repo, &lower).await {
+        Ok(e) => e,
+        Err(e) => return repo_error_response(e),
+    };
+    render_blocking(move || {
+        registration_page_json(&ctx, &lower, &entries, &lower_version, &upper_version)
+    })
+    .await
+}
+
+/// Build a JSON document on the blocking pool; `None` answers 404.
+async fn render_blocking<F>(render: F) -> Response
+where
+    F: FnOnce() -> Option<Value> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(render).await {
+        Ok(Some(doc)) => Json(doc).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "registration page not found").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response(),
+    }
 }
 
 /// Resolve `(id, "{version}.json")` to its registration entry.
@@ -228,20 +315,18 @@ async fn find_entry(
     file: &str,
 ) -> Result<(String, RegistrationEntry), Response> {
     let not_found = || (StatusCode::NOT_FOUND, "registration leaf not found").into_response();
-    let lower = ctx.format.lower_id(id);
+    let lower = package_id(ctx, id).ok_or_else(not_found)?;
     let raw_version = file.strip_suffix(".json").ok_or_else(not_found)?;
     let version = ctx
         .format
         .normalize_version(raw_version)
         .map_err(|_| not_found())?;
-    let entries = ctx
+    // One version, looked up directly (not every version of the package).
+    let entry = ctx
         .ops
-        .registration(&ctx.repo, &lower)
+        .registration_entry(&ctx.repo, &lower, &version)
         .await
-        .map_err(repo_error_response)?;
-    let entry = entries
-        .into_iter()
-        .find(|e| e.version.eq_ignore_ascii_case(&version))
+        .map_err(repo_error_response)?
         .ok_or_else(not_found)?;
     Ok((lower, entry))
 }

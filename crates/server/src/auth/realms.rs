@@ -99,6 +99,17 @@ pub struct CredForwardRealmConfig {
     /// Optional upstream group that maps to forge admin on provision.
     #[serde(default)]
     pub admin_group: String,
+    /// `.`-separated path into the JSON success body naming the account the
+    /// upstream authenticated (e.g. `login`). When set it must equal the
+    /// canonical username, or the credential is rejected — required for an
+    /// upstream that accepts a secret with any username (personal access
+    /// tokens). Empty ⇒ the upstream must itself bind username to secret.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity_path: String,
+    /// Accept a plain-`http` `url` that is not loopback. Off: every login
+    /// sends a password there, so it must be https.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_http: bool,
     /// Auto-provision an `app_user` on first successful upstream login.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
@@ -171,6 +182,11 @@ pub struct OidcRealmConfig {
     /// Claim matched against `admin_groups`.
     #[serde(default = "default_admin_claim")]
     pub admin_claim: String,
+    /// Allow-gate: claim name → allowed values; every listed claim must carry
+    /// one of them, or the login is refused (e.g. `{"tid": ["<tenant id>"]}`
+    /// for a multi-tenant Entra app, `{"hd": ["corp.example"]}` for Google).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
     /// Identifier-first routing rule (§3.4): a login identifier whose email
     /// domain (the part after `@`, case-insensitive) is in this list is routed
     /// to this realm (`oidc_redirect`). Empty ⇒ never matched by identifier;
@@ -258,7 +274,8 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
         KIND_CRED_FORWARD => {
             let cfg: CredForwardRealmConfig = serde_json::from_value(config.clone())
                 .map_err(|e| format!("invalid config: {e}"))?;
-            ssrf::validate_url(&cfg.url).map_err(|e| format!("invalid url: {e}"))?;
+            ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
+                .map_err(|e| format!("invalid url: {e}"))?;
             if cfg.key_pepper.trim().is_empty() {
                 return Err(
                     "key_pepper must not be empty (it keys the validated-credential cache HMAC)"
@@ -320,12 +337,39 @@ pub fn redact_config(kind: &str, config: &JsonValue) -> JsonValue {
     doc
 }
 
+/// Config keys a realm's stored secrets are bound to: the secret belongs to
+/// that party, so changing any of them requires entering the secret again.
+fn secret_binding_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        // The client secret is the IdP's credential for this client.
+        KIND_OIDC => &["issuer", "client_id"],
+        _ => &[],
+    }
+}
+
+/// Whether `key` differs between two config documents (strings compared
+/// trimmed and without a trailing `/`).
+fn binding_changed(stored: &JsonValue, incoming: &JsonValue, key: &str) -> bool {
+    let norm = |doc: &JsonValue| {
+        doc.get(key)
+            .and_then(JsonValue::as_str)
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+    };
+    norm(stored) != norm(incoming)
+}
+
 /// Merge a config **update** with the stored document's secrets: when the
 /// incoming document omits a secret key (or sends `null` / `""`), the stored
 /// value is kept — secrets are write-only, so the admin UI round-trips the
-/// redacted view without clobbering them.
+/// redacted view without clobbering them. A stored secret is **not** carried
+/// over when the party it belongs to changes (an OIDC realm's `issuer` or
+/// `client_id`): sending the old IdP's client secret to a new issuer would
+/// hand it to whoever runs that issuer, so the update must supply a new one.
 pub fn merge_secrets(kind: &str, stored: &JsonValue, incoming: &JsonValue) -> JsonValue {
     let mut doc = incoming.clone();
+    let rebound = secret_binding_keys(kind)
+        .iter()
+        .any(|key| binding_changed(stored, incoming, key));
     if let JsonValue::Object(map) = &mut doc {
         for key in secret_keys(kind) {
             // Drop the redaction marker if the UI echoed it back.
@@ -336,10 +380,13 @@ pub fn merge_secrets(kind: &str, stored: &JsonValue, incoming: &JsonValue) -> Js
                 _ => false,
             };
             if incoming_blank {
-                if let Some(stored_secret) = stored.get(*key) {
-                    map.insert((*key).to_string(), stored_secret.clone());
-                } else {
-                    map.remove(*key);
+                match stored.get(*key).filter(|_| !rebound) {
+                    Some(stored_secret) => {
+                        map.insert((*key).to_string(), stored_secret.clone());
+                    }
+                    None => {
+                        map.remove(*key);
+                    }
                 }
             }
         }
@@ -603,6 +650,10 @@ impl RealmAuth {
     ) -> anyhow::Result<Box<dyn AuthProvider>> {
         let cfg: CredForwardRealmConfig =
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
+        // Also for rows stored before the https rule: never forward passwords
+        // in the clear to a non-loopback host unless the realm says so.
+        ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
+            .map_err(|e| anyhow::anyhow!("url: {e}"))?;
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
         // Never follows redirects: a 3xx is judged (as unavailable) by the
@@ -611,10 +662,19 @@ impl RealmAuth {
             .map_err(|e| anyhow::anyhow!("build credential-forwarding client: {e}"))?;
         // Realm-scoped: keys the validated-credential cache per realm.
         let provider_id = format!("realm:{}", realm.name);
+        // Bind cached verdicts to this exact realm config: after an edit (a
+        // new required group or identity_path, another URL, …) every verdict
+        // cached under the old config is unreachable, so none outlives the
+        // policy that produced it.
+        let mut pepper = cfg.key_pepper.clone().into_bytes();
+        pepper.push(0);
+        pepper.extend_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(
+            config.to_string().as_bytes(),
+        ));
         let cred_cache = ValidatedCredentialCache::new(
             self.cache.clone(),
             self.pool.clone(),
-            CredKeyPepper::new(cfg.key_pepper.clone().into_bytes()),
+            CredKeyPepper::new(pepper),
             Duration::from_secs(cfg.positive_ttl_secs),
             Duration::from_secs(cfg.negative_ttl_secs),
         )
@@ -631,6 +691,7 @@ impl RealmAuth {
             request_timeout,
             required_groups: cfg.required_groups,
             groups_path: cfg.groups_path,
+            identity_path: cfg.identity_path,
             admin_group: cfg.admin_group,
             provider_id,
             auto_provision: cfg.auto_provision,
@@ -669,6 +730,7 @@ impl RealmAuth {
             link_existing_by_username: cfg.link_existing_by_username,
             admin_groups: cfg.admin_groups.clone(),
             admin_claim: cfg.admin_claim.clone(),
+            required_claims: cfg.required_claims.clone(),
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
@@ -787,6 +849,8 @@ pub async fn seed_auth_realms(
             request_timeout_ms: ub.request_timeout_ms,
             required_groups: ub.required_groups.clone(),
             groups_path: ub.groups_path.clone(),
+            identity_path: ub.identity_path.clone(),
+            allow_http: ub.allow_http,
             admin_group: ub.admin_group.clone(),
             auto_provision: ub.auto_provision,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
@@ -820,6 +884,7 @@ pub async fn seed_auth_realms(
             link_existing_by_username: o.link_existing_by_username,
             admin_groups: o.admin_groups.clone(),
             admin_claim: o.admin_claim.clone(),
+            required_claims: o.required_claims.clone(),
             login_domains: Vec::new(),
             button_label: None,
         };
@@ -937,6 +1002,18 @@ mod tests {
             &json!({"url": "http://127.0.0.1:8081/s", "key_pepper": "p"}),
         )
         .is_ok());
+        // Passwords go there: plain http to another host needs allow_http.
+        assert!(validate_config(
+            KIND_CRED_FORWARD,
+            &json!({"url": "http://nexus.internal/s", "key_pepper": "p"}),
+        )
+        .is_err());
+        let allowed = validate_config(
+            KIND_CRED_FORWARD,
+            &json!({"url": "http://nexus.internal/s", "key_pepper": "p", "allow_http": true}),
+        )
+        .expect("explicitly allowed");
+        assert_eq!(allowed["allow_http"], true);
         assert!(validate_config(
             KIND_CRED_FORWARD,
             &json!({"url": "ftp://x/s", "key_pepper": "p"}),
@@ -1007,6 +1084,33 @@ mod tests {
         let red = redact_config(KIND_OIDC, &cfg);
         assert!(red.get("client_secret").is_none());
         assert_eq!(red["client_secret_set"], json!(false));
+    }
+
+    #[test]
+    fn oidc_client_secret_is_dropped_when_the_issuer_or_client_changes() {
+        let stored = json!({"issuer": "https://idp.example/", "client_id": "forge", "client_secret": "s3cret"});
+        // Same issuer (trailing slash aside) and client: the secret is kept.
+        let kept = merge_secrets(
+            KIND_OIDC,
+            &stored,
+            &json!({"issuer": "https://idp.example", "client_id": "forge", "client_secret_set": true}),
+        );
+        assert_eq!(kept["client_secret"], json!("s3cret"));
+        // A new issuer or client id must come with a new secret.
+        for incoming in [
+            json!({"issuer": "https://evil.example", "client_id": "forge"}),
+            json!({"issuer": "https://idp.example", "client_id": "other"}),
+        ] {
+            let merged = merge_secrets(KIND_OIDC, &stored, &incoming);
+            assert!(merged.get("client_secret").is_none(), "{incoming}");
+            assert!(validate_config(KIND_OIDC, &merged).is_err());
+        }
+        let supplied = merge_secrets(
+            KIND_OIDC,
+            &stored,
+            &json!({"issuer": "https://evil.example", "client_id": "forge", "client_secret": "new"}),
+        );
+        assert_eq!(supplied["client_secret"], json!("new"));
     }
 
     #[test]

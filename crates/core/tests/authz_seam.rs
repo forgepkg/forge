@@ -47,6 +47,7 @@ fn user(user_id: i64, is_admin: bool) -> Principal {
         user_id,
         token_id: None,
         is_admin,
+        method: forge_core::auth::AuthMethod::Password,
     }
 }
 
@@ -286,6 +287,7 @@ async fn token_scope_narrows_actions() {
             name: format!("tok-{}", unique()),
             token_hash: format!("hash-{}", unique()),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await
@@ -305,11 +307,13 @@ async fn token_scope_narrows_actions() {
         user_id: uid,
         token_id: Some(token.id),
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Token,
     };
     let unscoped = Principal::User {
         user_id: uid,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
 
     assert!(az.can_read(&scoped, &repo).await, "scoped token reads");
@@ -345,6 +349,7 @@ async fn token_scope_cannot_widen_owner() {
             name: format!("tok-{}", unique()),
             token_hash: format!("hash-{}", unique()),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await
@@ -362,6 +367,7 @@ async fn token_scope_cannot_widen_owner() {
         user_id: uid,
         token_id: Some(token.id),
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Token,
     };
     assert!(
         !az.can_read(&p, &repo_b).await,
@@ -396,6 +402,7 @@ async fn malformed_token_scope_denies_everything() {
             name: format!("tok-{}", unique()),
             token_hash: format!("hash-{}", unique()),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await
@@ -414,6 +421,7 @@ async fn malformed_token_scope_denies_everything() {
         user_id: uid,
         token_id: Some(token.id),
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Token,
     };
     assert!(
         !az.can_read(&p, &repo).await,
@@ -476,6 +484,7 @@ async fn make_token(pool: &sqlx::PgPool, uid: i64, scope: Option<serde_json::Val
             name: format!("tok-{}", unique()),
             token_hash: format!("hash-{}", unique()),
             expires_at: None,
+            minted_with_forwarded_credential: false,
         },
     )
     .await
@@ -496,6 +505,7 @@ fn token_of(uid: i64, token_id: i64, is_admin: bool) -> Principal {
         user_id: uid,
         token_id: Some(token_id),
         is_admin,
+        method: forge_core::auth::AuthMethod::Token,
     }
 }
 

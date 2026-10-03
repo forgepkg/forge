@@ -30,7 +30,15 @@ A workload token is accepted only when all of these checks pass:
   both `repository_id` and `repository_owner_id`; GitLab.com requires a numeric
   project ID (`job_project_id` or `project_id`) and namespace ID
   (`job_namespace_id` or `namespace_id`). Mutable paths and `sub` are optional
-  extra boundaries, not identity anchors; and
+  extra boundaries, not identity anchors. Any other issuer (self-managed
+  GitLab, GitHub Enterprise Server, other CI systems) must pin one of the
+  built-in stable identity claims (`sub`, `repository_id`,
+  `repository_owner_id`, `repository`, `repository_owner`,
+  `job_workflow_ref`, `workflow_ref`, `project_id`, `job_project_id`,
+  `namespace_id`, `job_namespace_id`, `project_path`, `namespace_path`) or a
+  claim the realm declares in `identity_claims` (for a CI system with its own
+  workload identifier); claims such as `actor` or `event_name` can be shared
+  by unrelated jobs and never count as an identity; and
 - the mapped role authorizes both the target repository and canonical package
   ID. Use package selectors on publisher roles to bind a CI identity to the
   package namespace it owns.
@@ -51,8 +59,10 @@ exchange for a repository-controlled short-lived publish token or consumed-`jti`
 replay prevention. Treat this as compatible direct-token support, not full
 alignment with the recommended token-exchange profile.
 
-Every successful workload publish appends a `trusted_publish_audit` row in the
-same PostgreSQL transaction as the package. It snapshots repository, realm,
+Every successful workload publish — and every unlist, relist and delete a
+workload performs — appends a `trusted_publish_audit` row (its `action` says
+which) in the same PostgreSQL transaction as the package change, behind the
+same realm fence described below. It snapshots repository, realm,
 issuer, role, canonical package ID/version, validated token `iat`, and SHA-256
 digests of subject and `jti`; raw claims and bearer tokens are not retained.
 Immediately before commit, Forge locks the current realm and role and compares
@@ -75,6 +85,14 @@ Create a `workload_identity` realm under **Admin → Authentication**. Use stabl
 numeric identity claims rather than repository/owner names, which can be
 renamed. A protected environment or exact ref is a useful additional boundary.
 
+Also pin **which workflow** may publish and **how it was triggered**:
+`job_workflow_ref` (e.g.
+`acme/widgets/.github/workflows/release.yml@refs/heads/main`) keeps any other
+workflow in the repository — including one a contributor adds in a pull
+request — from minting a usable token, and `event_name` (e.g. `push` or
+`release`) excludes `pull_request_target`, `workflow_dispatch` and similar
+triggers you did not intend.
+
 ```json
 {
   "issuer": "https://token.actions.githubusercontent.com",
@@ -88,7 +106,12 @@ renamed. A protected environment or exact ref is a useful additional boundary.
       "conditions": [
         { "claim": "repository_id", "any_of": ["987654321"] },
         { "claim": "repository_owner_id", "any_of": ["1234567"] },
-        { "claim": "ref", "any_of": ["refs/heads/main"] }
+        { "claim": "ref", "any_of": ["refs/heads/main"] },
+        {
+          "claim": "job_workflow_ref",
+          "any_of": ["acme/widgets/.github/workflows/release.yml@refs/heads/main"]
+        },
+        { "claim": "event_name", "any_of": ["push"] }
       ]
     }
   ]

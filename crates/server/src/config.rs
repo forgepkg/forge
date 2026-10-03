@@ -105,10 +105,37 @@ pub struct ServerConfig {
     /// internal clients use. Default empty.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Seconds a client may take to send a request's headers before the
+    /// connection is closed (slow-header "slowloris" defence). `0` disables.
+    /// Default 30.
+    #[serde(default = "default_header_read_timeout_seconds")]
+    pub header_read_timeout_seconds: u64,
+    /// Seconds a request body may stall (no data arriving) before the request
+    /// is aborted. `0` disables. Default 60.
+    #[serde(default = "default_body_idle_timeout_seconds")]
+    pub body_idle_timeout_seconds: u64,
+    /// Seconds a handler has to produce its response (`408` after that); a
+    /// response body already streaming, such as a package download, is not cut
+    /// off. Covers reading an upload, so keep it above the slowest expected
+    /// push of `max_upload_bytes`. `0` disables. Default 900.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
 }
 
 fn default_max_upload_bytes() -> u64 {
     512 * 1024 * 1024
+}
+
+fn default_header_read_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_body_idle_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    900
 }
 
 impl ServerConfig {
@@ -121,7 +148,7 @@ impl ServerConfig {
 }
 
 /// `database.*`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
     /// `postgres://…` connection URL.
     pub url: String,
@@ -134,6 +161,32 @@ pub struct DatabaseConfig {
     pub acquire_timeout_seconds: u64,
 }
 
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redacted_url(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_seconds", &self.acquire_timeout_seconds)
+            .finish()
+    }
+}
+
+/// A connection URL fit for logs: any password is replaced and a query
+/// string (which may carry `password=` or a TLS key path) is dropped. An
+/// unparsable URL is not shown at all.
+pub fn redacted_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "<unparsable url>".into();
+    };
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("redacted"));
+    }
+    url.to_string()
+}
+
 fn default_db_max_connections() -> u32 {
     20
 }
@@ -143,7 +196,7 @@ fn default_db_acquire_timeout() -> u64 {
 }
 
 /// `s3.*`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct S3Config {
     /// S3 endpoint URL (e.g. `http://localhost:8422` for versitygw).
     pub endpoint: String,
@@ -169,6 +222,21 @@ pub struct S3Config {
     /// HEAD-then-PUT. Pure optimization — behavior is identical either way.
     #[serde(default)]
     pub conditional_writes: ConditionalWritesMode,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &redacted_url(&self.endpoint))
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("force_path_style", &self.force_path_style)
+            .field("multipart_threshold", &self.multipart_threshold)
+            .field("conditional_writes", &self.conditional_writes)
+            .finish()
+    }
 }
 
 /// `s3.conditional_writes` values (lowercase in TOML/env).
@@ -273,6 +341,11 @@ pub struct AuthConfig {
     /// Length (seconds) of the password-failure window / lockout.
     #[serde(default = "default_login_failure_window")]
     pub login_failure_window_seconds: u64,
+    /// OIDC login starts (`GET /auth/oidc/login`) allowed per client network
+    /// (IPv6: per /64) and minute, per instance. Each start stores a flow
+    /// row. `0` disables the limit.
+    #[serde(default = "default_oidc_login_starts_per_minute")]
+    pub oidc_login_starts_per_minute: u32,
     /// Maximum concurrent upstream credential forwards **per
     /// credential-forwarding realm, per instance** (verdict-cache misses
     /// only; cache hits never forward). A miss beyond the bound fails closed
@@ -300,6 +373,10 @@ fn default_login_max_failures() -> u32 {
 
 fn default_login_failure_window() -> u64 {
     300
+}
+
+fn default_oidc_login_starts_per_minute() -> u32 {
+    30
 }
 
 fn default_login_mode() -> String {
@@ -355,6 +432,16 @@ pub struct UpstreamBasicAuthConfig {
     /// (e.g. `user.roles`). Empty ⇒ no group parsing.
     #[serde(default)]
     pub groups_path: String,
+    /// `.`-separated path into the JSON success body naming the account the
+    /// upstream authenticated (e.g. `login`); when set it must equal the
+    /// canonical username. Required for upstreams that accept a secret with
+    /// any username (personal access tokens). Empty ⇒ no identity check.
+    #[serde(default)]
+    pub identity_path: String,
+    /// Accept a plain-`http` `url` that is not loopback (passwords then travel
+    /// in the clear). Default `false`.
+    #[serde(default)]
+    pub allow_http: bool,
     /// Optional upstream group that maps to forge admin on provision (grant only).
     #[serde(default)]
     pub admin_group: String,
@@ -380,6 +467,7 @@ impl std::fmt::Debug for UpstreamBasicAuthConfig {
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("required_groups", &self.required_groups)
             .field("groups_path", &self.groups_path)
+            .field("identity_path", &self.identity_path)
             .field("admin_group", &self.admin_group)
             .field("auto_provision", &self.auto_provision)
             .field("cache", &self.cache) // cache's own Debug redacts the pepper
@@ -399,6 +487,7 @@ impl UpstreamBasicAuthConfig {
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             required_groups: self.required_groups.clone(),
             groups_path: self.groups_path.clone(),
+            identity_path: self.identity_path.clone(),
             admin_group: self.admin_group.clone(),
             provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
             auto_provision: self.auto_provision,
@@ -500,7 +589,7 @@ impl std::fmt::Debug for BootstrapAdmin {
 }
 
 /// `redis.*` (optional).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct RedisConfig {
     /// `redis://…` URL. Absent or blank ⇒ L1-only caching (a blank
     /// `FORGE_REDIS__URL=` disables Redis, see [`Config::load`]).
@@ -513,6 +602,16 @@ pub struct RedisConfig {
     /// treated as unavailable (reads fall through to the source). Default 2000.
     #[serde(default)]
     pub response_timeout_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisConfig")
+            .field("url", &self.url.as_deref().map(redacted_url))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("response_timeout_ms", &self.response_timeout_ms)
+            .finish()
+    }
 }
 
 impl RedisConfig {
@@ -1023,6 +1122,11 @@ pub struct OidcConfig {
     /// recommended to avoid the Graph "groups overage" callout).
     #[serde(default = "default_admin_claim")]
     pub admin_claim: String,
+    /// Allow-gate: claim name → allowed values. Every listed claim must carry
+    /// one of its values or the login is refused (e.g. `tid` for one Entra
+    /// tenant, `hd` for a Google Workspace domain, `groups`). Empty ⇒ off.
+    #[serde(default)]
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
 
     // ---- session lifecycle ----
     /// Idle timeout (seconds): a session expires this long after its last use.
@@ -1470,6 +1574,13 @@ impl Config {
             );
             self.auth.bootstrap_admin = None;
         }
+        // The account is stored and looked up by its canonical username;
+        // `validate` reports a name that has none.
+        if let Some(ba) = self.auth.bootstrap_admin.as_mut() {
+            if let Ok(canonical) = forge_core::auth::canonical_username(&ba.username) {
+                ba.username = canonical;
+            }
+        }
         if self
             .redis
             .url
@@ -1489,6 +1600,10 @@ impl Config {
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
+        if let Some(ba) = &self.auth.bootstrap_admin {
+            forge_core::auth::canonical_username(&ba.username)
+                .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
+        }
         match self.auth.login_mode.as_str() {
             "identifier_first" | "combined" => {}
             other => {
@@ -1754,8 +1869,10 @@ impl Config {
                     )))
                 }
             }
-            // Warn loudly about plaintext credential forwarding over http (plan
-            // §5): the user's password rides the outbound Basic header.
+            // Every login forwards the user's password there: plain http only
+            // for a loopback sidecar or when explicitly allowed.
+            forge_core::net::ssrf::validate_credential_forward_url(u.url.trim(), u.allow_http)
+                .map_err(|e| ConfigError::Invalid(format!("auth.upstream_basic.url: {e}")))?;
             if url.scheme() == "http" {
                 tracing::warn!(
                     "auth.upstream_basic.url is http://; the user's password is forwarded in cleartext — use https in production"
@@ -1965,6 +2082,30 @@ mod tests {
         );
         let cfg = Config::from_figment(fig_from_toml(&dev)).expect("valid");
         assert!(cfg.deployment_warnings().is_empty(), "dev mode stays quiet");
+    }
+
+    #[test]
+    fn debug_output_redacts_connection_secrets() {
+        let toml = MINIMAL
+            .replace(
+                "postgres://forge:forge@localhost/forge",
+                "postgres://forge:db-secret-pw@localhost/forge?sslpassword=tls-secret",
+            )
+            .replace("secret_key = \"test\"", "secret_key = \"s3-secret-key\"")
+            + "\n[redis]\nurl = \"rediss://:redis-secret-pw@cache:6380/0\"\n";
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let shown = format!("{cfg:?}");
+        for secret in [
+            "db-secret-pw",
+            "tls-secret",
+            "s3-secret-key",
+            "redis-secret-pw",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("postgres://forge:redacted@localhost/forge"));
+        assert!(shown.contains("rediss://:redacted@cache:6380/0"));
+        assert_eq!(redacted_url("not a url"), "<unparsable url>");
     }
 
     #[test]

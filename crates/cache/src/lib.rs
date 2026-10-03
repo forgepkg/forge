@@ -43,6 +43,19 @@
 //! versioned envelope carrying tag stamps. The single moka cache remains keyed
 //! by `"{ns}:{key}"`.
 //!
+//! ## Local-only entries (Redis is a trust boundary)
+//!
+//! Anyone who can write to the Redis instance can write L2 entries. For
+//! ordinary data (upstream metadata) that is tolerable; for **security
+//! decisions** it is not: a forged authorization set, credential verdict,
+//! JWKS or workload-token verdict would be accepted by every instance. Such
+//! values go through [`Cache::get_or_try_insert_local`] /
+//! [`Cache::get_or_try_insert_local_with_tags`]: they live in L1 only and
+//! are never read from or written to Redis. Redis still carries their
+//! **invalidations** (tag generations over the backplane), so an
+//! invalidation on one instance still evicts them everywhere — the worst a
+//! Redis writer can do to them is evict entries early.
+//!
 //! ## Graceful L2 degradation vs. factory errors
 //!
 //! An L2 (Redis) failure is a *cache* failure, never a source-of-truth failure:
@@ -247,6 +260,16 @@ impl NamespaceLocks {
     }
 }
 
+/// Make aws-lc-rs the process-wide rustls provider unless one is set: the
+/// Redis TLS connector builds its config from the process default, and with
+/// more than one provider compiled in rustls cannot choose by itself.
+fn install_tls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A concurrent install winning the race is just as good.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 impl Cache {
     /// Build an **L1-only** cache. No Redis calls are ever made; this is the
     /// default-correct mode from the spec.
@@ -283,6 +306,9 @@ impl Cache {
         let l1 = L1::new(l1_max_capacity);
         let namespace_locks = NamespaceLocks::default();
         let tag_versions = TagVersions::default();
+        if redis_url.starts_with("rediss://") {
+            install_tls_crypto_provider();
+        }
         let client = redis::Client::open(redis_url)?;
 
         let l2 = RedisL2::connect(client.clone(), timeouts).await?;
@@ -351,11 +377,70 @@ impl Cache {
         Fut: Future<Output = Result<T, E>>,
         E: Clone + Send + Sync + 'static,
     {
+        self.load(ns, key, tags, ttl, factory, true).await
+    }
+
+    /// Like [`Cache::get_or_try_insert_with`], but the value is cached **in
+    /// this process only**: never read from or written to Redis, so nobody
+    /// with access to Redis can supply it. Invalidations still propagate over
+    /// the backplane. Use it for every value a security decision rests on
+    /// (see the [crate docs](crate#local-only-entries-redis-is-a-trust-boundary)).
+    pub async fn get_or_try_insert_local<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        ttl: Duration,
+        factory: F,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load(ns, key, &[], ttl, factory, false).await
+    }
+
+    /// [`Cache::get_or_try_insert_local`] with logical tags, like
+    /// [`Cache::get_or_try_insert_with_tags`].
+    pub async fn get_or_try_insert_local_with_tags<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load(ns, key, tags, ttl, factory, false).await
+    }
+
+    /// The shared lookup: L1 → (L2, when `shared` and configured) → factory.
+    async fn load<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+        shared: bool,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
         let namespace_lock = self.inner.namespace_locks.get(ns);
         let _fill_guard = namespace_lock.read().await;
         let full_key = make_key(ns, key);
         let entry_tags = Arc::new(entry_tags(ns, key, tags));
-        let l2 = self.inner.l2.clone();
+        let l2 = if shared { self.inner.l2.clone() } else { None };
         let tag_versions = self.inner.tag_versions.clone();
 
         // moka's `try_get_with` coalesces concurrent loads for `full_key` and

@@ -211,6 +211,80 @@ async fn upstream_user_of_another_realm_is_not_mapped() {
     assert!(provision_and_map(&pool, &from_b).await.unwrap().is_none());
 }
 
+/// Deleting a realm orphans its users: a NULL realm is not a wildcard, so
+/// another realm whose directory knows the same username can never adopt the
+/// account (with its roles and tokens), and the orphan is flagged.
+#[tokio::test]
+async fn users_of_a_deleted_realm_are_never_adopted_by_another_realm() {
+    let pool = pool().await;
+    let username = unique_user("orphan");
+    let realm = |name: String, priority: i32| forge_db::auth_realm_dao::NewAuthRealm {
+        kind: "credential_forwarding".into(),
+        name,
+        enabled: false,
+        priority,
+        config: serde_json::json!({}),
+    };
+    let realm_a = forge_db::auth_realm_dao::insert_realm(
+        &pool,
+        realm(
+            format!("oa-{}", unique()),
+            3_000_000 + (unique() % 1_000_000) as i32,
+        ),
+    )
+    .await
+    .unwrap();
+    let realm_b = forge_db::auth_realm_dao::insert_realm(
+        &pool,
+        realm(
+            format!("ob-{}", unique()),
+            4_000_000 + (unique() % 1_000_000) as i32,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let mut from_a = upstream_identity(&username, false, true);
+    from_a.realm_id = Some(realm_a.id);
+    let original = provision_and_map(&pool, &from_a)
+        .await
+        .unwrap()
+        .expect("realm A provisions the account");
+
+    assert!(forge_db::auth_realm_dao::delete_realm(&pool, realm_a.id)
+        .await
+        .unwrap());
+    let orphaned: bool = sqlx::query_scalar("SELECT realm_orphaned FROM app_user WHERE id = $1")
+        .bind(original.user_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(orphaned, "deleting the realm flags its users");
+
+    let mut from_b = upstream_identity(&username, true, true);
+    from_b.realm_id = Some(realm_b.id);
+    from_b.admin_authoritative = true;
+    assert!(
+        provision_and_map(&pool, &from_b).await.unwrap().is_none(),
+        "realm B must not adopt realm A's orphaned account"
+    );
+    from_b.auto_provision = false;
+    assert!(provision_and_map(&pool, &from_b).await.unwrap().is_none());
+    // Not even the realm-less static wiring may claim it.
+    assert!(
+        provision_and_map(&pool, &upstream_identity(&username, false, true))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let user = user_dao::find_user_by_id(&pool, original.user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!user.is_admin, "the orphan was not touched");
+}
+
 #[tokio::test]
 async fn no_auto_provision_does_not_create_user() {
     let pool = pool().await;

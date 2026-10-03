@@ -45,6 +45,7 @@ function repo(over: Partial<RepoView>): RepoView {
     not_found_ttl_seconds: null,
     allow_redeploy: false,
     prefer_hosted: false,
+    reserved_prefixes: [],
     ...over,
   }
 }

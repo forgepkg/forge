@@ -9,6 +9,9 @@ publish.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 moka = { workspace = true }
 redis = { workspace = true }
+# Selects the TLS crypto provider for `rediss://` (rustls is built with both
+# aws-lc-rs and ring in this workspace, so it cannot pick one by itself).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -272,6 +272,7 @@ impl Authz {
                 user_id,
                 token_id,
                 is_admin,
+                ..
             } => {
                 let mut owner = authz_cache::load_user_effective(
                     &self.pool,
@@ -360,6 +361,7 @@ mod tests {
             user_id: 42,
             token_id: None,
             is_admin,
+            method: crate::auth::AuthMethod::Password,
         }
     }
 

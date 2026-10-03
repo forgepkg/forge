@@ -24,6 +24,7 @@ import {
   Legend,
 } from '~/components/catalyst/fieldset'
 import { Input } from '~/components/catalyst/input'
+import { Textarea } from '~/components/catalyst/textarea'
 import { Select } from '~/components/catalyst/select'
 
 /**
@@ -71,6 +72,8 @@ export interface RealmFormValues {
   admin_groups: string
   admin_claim: string
   login_domains: string
+  /** One `claim = value, value` per line (parsed to a map on submit). */
+  required_claims: string
   button_label: string
   // credential_forwarding
   url: string
@@ -81,6 +84,9 @@ export interface RealmFormValues {
   request_timeout_ms: string
   required_groups: string
   groups_path: string
+  identity_path: string
+  /** Credential forwarding: accept a plain-http, non-loopback URL. */
+  allow_http: boolean
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -92,6 +98,8 @@ export interface RealmFormValues {
   allowed_audiences: string
   /** Optional exact `azp` values for issuers that emit authorized-party claims. */
   allowed_authorized_parties: string
+  /** Comma-separated extra identity claims (custom issuers). */
+  identity_claims: string
   /** Maximum accepted token age and declared token lifetime. */
   max_token_age_seconds: string
   /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
@@ -120,6 +128,26 @@ export interface RealmFormProps {
 
 function joinList(list?: (string | number)[]): string {
   return (list ?? []).join(', ')
+}
+
+/** `{ tid: ['a', 'b'] }` -> `tid = a, b` (one claim per line). */
+export function formatClaimRules(rules?: Record<string, string[]>): string {
+  return Object.entries(rules ?? {})
+    .map(([claim, values]) => `${claim} = ${values.join(', ')}`)
+    .join('\n')
+}
+
+/** Parse `claim = value, value` lines into the `required_claims` map. */
+export function parseClaimRules(raw: string): Record<string, string[]> {
+  const rules: Record<string, string[]> = {}
+  for (const line of raw.split('\n')) {
+    const eq = line.indexOf('=')
+    if (eq < 0) continue
+    const claim = line.slice(0, eq).trim()
+    const values = parseList(line.slice(eq + 1))
+    if (claim !== '' && values.length > 0) rules[claim] = values
+  }
+  return rules
 }
 
 function seed(existing?: RealmView): RealmFormValues {
@@ -160,6 +188,7 @@ function seed(existing?: RealmView): RealmFormValues {
     admin_groups: joinList(oidc.admin_groups),
     admin_claim: oidc.admin_claim ?? '',
     login_domains: joinList(oidc.login_domains),
+    required_claims: formatClaimRules(oidc.required_claims),
     button_label: oidc.button_label ?? '',
     url: fwd.url ?? '',
     method: fwd.method ?? '',
@@ -169,12 +198,15 @@ function seed(existing?: RealmView): RealmFormValues {
     request_timeout_ms: fwd.request_timeout_ms != null ? String(fwd.request_timeout_ms) : '',
     required_groups: joinList(fwd.required_groups),
     groups_path: fwd.groups_path ?? '',
+    identity_path: fwd.identity_path ?? '',
+    allow_http: fwd.allow_http ?? false,
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
     key_pepper: '',
     allowed_audiences: joinList(wif.allowed_audiences),
     allowed_authorized_parties: joinList(wif.allowed_authorized_parties),
+    identity_claims: joinList(wif.identity_claims),
     max_token_age_seconds:
       wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
     positive_cache_seconds:
@@ -529,6 +561,23 @@ export function RealmForm({
               </Description>
             </Field>
 
+            <Field>
+              <Label>Required claims</Label>
+              <Textarea
+                rows={2}
+                value={values.required_claims}
+                onChange={(e) => set('required_claims', e.target.value)}
+                placeholder="tid = 00000000-0000-0000-0000-000000000000"
+              />
+              <Description>
+                Only tokens carrying one of the listed values may sign in, one
+                claim per line (<span className="font-mono">claim = value, value</span>).
+                Use it to restrict a multi-tenant app to your tenant
+                (<span className="font-mono">tid</span>) or a Google Workspace
+                domain (<span className="font-mono">hd</span>).
+              </Description>
+            </Field>
+
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>
                 <Label>Admin groups</Label>
@@ -703,6 +752,23 @@ export function RealmForm({
               </Field>
             </div>
 
+            <Field>
+              <Label>Identity path</Label>
+              <Input
+                type="text"
+                value={values.identity_path}
+                onChange={(e) => set('identity_path', e.target.value)}
+                placeholder="login"
+              />
+              <Description>
+                Where the upstream&apos;s success response names the account it
+                authenticated. When set, that name must equal the username
+                entered. Required when the upstream accepts a secret with any
+                username (personal access tokens); leave empty only if the
+                upstream itself binds the username to the password.
+              </Description>
+            </Field>
+
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>
                 <Label>Positive cache TTL (seconds)</Label>
@@ -752,6 +818,18 @@ export function RealmForm({
                 onChange={(c) => set('auto_provision', c)}
               />
               <Label>Auto-provision users on first successful check</Label>
+            </CheckboxField>
+            <CheckboxField>
+              <Checkbox
+                checked={values.allow_http}
+                onChange={(c) => set('allow_http', c)}
+              />
+              <Label>Allow a plain-http upstream</Label>
+              <Description>
+                Every login sends the user&apos;s password to the upstream URL,
+                so it must be https (or a loopback address) unless this is
+                checked.
+              </Description>
             </CheckboxField>
           </FieldGroup>
         </Fieldset>
@@ -846,6 +924,23 @@ export function RealmForm({
               <Description>
                 Optional exact <code>azp</code> allowlist for issuers that emit
                 it. Leave blank for GitHub Actions and GitLab CI.
+              </Description>
+            </Field>
+
+            <Field>
+              <Label>Identity claims</Label>
+              <Input
+                type="text"
+                value={values.identity_claims}
+                onChange={(e) => set('identity_claims', e.target.value)}
+                placeholder="Optional, e.g. pipeline_id"
+              />
+              <Description>
+                Claims a custom CI issuer uses as a stable workload identity.
+                Each rule must pin one of them or a built-in identity claim
+                (<code>sub</code>, <code>repository_id</code>,{' '}
+                <code>job_project_id</code>, …). Leave blank for GitHub Actions
+                and GitLab.
               </Description>
             </Field>
 
@@ -1218,6 +1313,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.admin_claim.trim() !== '') config.admin_claim = values.admin_claim.trim()
     const loginDomains = parseList(values.login_domains)
     if (loginDomains.length > 0) config.login_domains = loginDomains
+    const requiredClaims = parseClaimRules(values.required_claims)
+    if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()
     return config
   }
@@ -1238,6 +1335,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     const requiredGroups = parseList(values.required_groups)
     if (requiredGroups.length > 0) config.required_groups = requiredGroups
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
+    if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
+    if (values.allow_http) config.allow_http = true
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive
@@ -1269,6 +1368,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     }
     const positiveCache = parseNumber(values.positive_cache_seconds)
     if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
+    const identityClaims = parseList(values.identity_claims)
+    if (identityClaims.length > 0) config.identity_claims = identityClaims
     return config
   }
   // local (and reserved kinds): no config.

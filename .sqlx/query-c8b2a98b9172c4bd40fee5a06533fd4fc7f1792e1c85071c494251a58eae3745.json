@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version\n        SET upstream_missing = NOT (version = ANY($3::text[]))\n        WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed\n          AND upstream_missing IS DISTINCT FROM NOT (version = ANY($3::text[]))\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c8b2a98b9172c4bd40fee5a06533fd4fc7f1792e1c85071c494251a58eae3745"
+}

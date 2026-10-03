@@ -51,6 +51,7 @@ pub fn parse_nupkg(
         ));
     }
 
+    version::NugetVersion::validate_publishable(&raw.version)?;
     let version_normalized = version::normalize(&raw.version)?;
     let id_lower = lower_id(&raw.id);
 
@@ -112,7 +113,8 @@ pub fn lower_id(id: &str) -> String {
 
 /// Display metadata of a `.nuspec`, for registration catalog entries and
 /// search results. Absent elements are `None` / empty.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NuspecMetadata {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -133,7 +135,9 @@ pub struct NuspecMetadata {
     pub package_types: Vec<String>,
     /// `<minClientVersion>` from the `metadata` element attribute.
     pub min_client_version: Option<String>,
+    #[serde(skip)]
     raw_tags: Option<String>,
+    #[serde(skip)]
     raw_require_license_acceptance: Option<String>,
 }
 
@@ -175,6 +179,39 @@ impl NuspecMetadata {
 /// Extract the display metadata from raw `.nuspec` bytes.
 pub fn metadata_from_nuspec(bytes: &[u8]) -> Result<NuspecMetadata, FormatError> {
     Ok(parse_nuspec(bytes).map_err(FormatError::from)?.metadata)
+}
+
+/// What the feed renders from a `.nuspec`: its display metadata and
+/// dependency groups. Computed once at publish and stored with the version
+/// (`component.manifest_summary`), so registration pages and search results
+/// do not fetch and re-parse every manifest on every request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ManifestSummary {
+    pub metadata: NuspecMetadata,
+    pub dependency_groups: Vec<DependencyGroup>,
+}
+
+/// Parse raw `.nuspec` bytes into a [`ManifestSummary`].
+pub fn manifest_summary(bytes: &[u8]) -> Result<ManifestSummary, FormatError> {
+    let parsed = parse_nuspec(bytes).map_err(FormatError::from)?;
+    Ok(ManifestSummary {
+        metadata: parsed.metadata,
+        dependency_groups: parsed.deps,
+    })
+}
+
+/// The [`ManifestSummary`] of a version: the stored one when present (and
+/// readable), else parsed from the manifest bytes; empty when neither works.
+pub fn summary_of(stored: Option<&serde_json::Value>, manifest: Option<&[u8]>) -> ManifestSummary {
+    if let Some(summary) =
+        stored.and_then(|v| serde_json::from_value::<ManifestSummary>(v.clone()).ok())
+    {
+        return summary;
+    }
+    manifest
+        .and_then(|b| manifest_summary(b).ok())
+        .unwrap_or_default()
 }
 
 /// Extract just the dependency groups from raw `.nuspec` bytes.
@@ -259,7 +296,13 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         inner: file,
         budget: budget.clone(),
     };
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+    // Archive offset 0: a .nupkg has no prepended data, and the reader must
+    // not go looking for directory records elsewhere than where the vetted
+    // ones say (an unvetted record's entry count sizes an allocation).
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(|e| {
         if budget.get() == Some(0) {
             NupkgError::LimitExceeded(format!(
                 "zip central directory exceeds max {} bytes",
@@ -280,11 +323,11 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         )));
     }
 
-    // First pass: find the index of the top-level .nuspec without decompressing.
-    // NuGet places exactly one .nuspec at the package root; pick the shallowest
-    // *.nuspec to avoid being fooled by a nested decoy.
+    // First pass: find the manifest without decompressing. NuGet reads the
+    // one `*.nuspec` at the package root (and refuses a package with several),
+    // ignoring nested ones; anything else would let Forge and the client
+    // disagree about which manifest — and so which identity — the package has.
     let mut nuspec_index: Option<usize> = None;
-    let mut best_depth = usize::MAX;
     let mut total_uncompressed: u64 = 0;
 
     for i in 0..archive.len() {
@@ -311,12 +354,13 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         }
 
         let name = entry.name();
-        if is_nuspec_name(name) {
-            let depth = name.bytes().filter(|&b| b == b'/').count();
-            if depth < best_depth {
-                best_depth = depth;
-                nuspec_index = Some(i);
+        if is_nuspec_name(name) && !name.contains('/') {
+            if nuspec_index.is_some() {
+                return Err(NupkgError::MalformedNuspec(
+                    "the package root holds more than one .nuspec".into(),
+                ));
             }
+            nuspec_index = Some(i);
         }
     }
 
@@ -447,7 +491,10 @@ fn check_eocd_candidate(
     let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
     let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
 
-    // A ZIP64 locator sits immediately before the EOCD.
+    // A ZIP64 locator sits immediately before the EOCD. The record it names
+    // must be exactly there: the zip reader is opened at archive offset 0
+    // (see `extract_nuspec`), so it reads that record and no other — and one
+    // that is not there cannot be vetted, so the archive is refused.
     if zip64_marker && pos >= ZIP64_LOCATOR_LEN {
         let loc = read_at(file, pos - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR_LEN as usize)?;
         if loc[..4] == ZIP64_LOCATOR_SIG {
@@ -455,7 +502,10 @@ fn check_eocd_candidate(
             if record < pos && read_at(file, record, 4)? == ZIP64_EOCD_SIG {
                 return check_zip64_record(file, record, len, limits);
             }
-            return Ok(0);
+            return Err(NupkgError::InvalidZip(
+                "the ZIP64 locator does not point at a ZIP64 end-of-central-directory record"
+                    .into(),
+            ));
         }
     }
     check_directory_limits(u64::from(on_disk.max(total)), u64::from(directory), limits)?;
@@ -602,6 +652,11 @@ struct RawNuspec {
     metadata: NuspecMetadata,
 }
 
+/// Deepest element nesting a `.nuspec` may use. Real manifests nest about
+/// five levels (`package/metadata/dependencies/group/dependency`); the cap
+/// bounds the parser's path bookkeeping on hostile input.
+pub const MAX_NUSPEC_DEPTH: usize = 32;
+
 /// Parse the `.nuspec` XML namespace-insensitively (by local name).
 fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
     let mut reader = Reader::from_reader(bytes);
@@ -612,6 +667,8 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
 
     // Path of local element names, so we know our context (e.g. metadata/id).
     let mut path: Vec<Vec<u8>> = Vec::new();
+    // Singular manifest elements seen so far ([`check_element`]).
+    let mut seen = Seen::default();
     let mut id: Option<String> = None;
     let mut ver: Option<String> = None;
     let mut groups: Vec<DependencyGroup> = Vec::new();
@@ -632,9 +689,15 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
         {
             Event::Start(e) => {
+                if path.len() >= MAX_NUSPEC_DEPTH {
+                    return Err(NupkgError::MalformedNuspec(format!(
+                        "elements nested deeper than {MAX_NUSPEC_DEPTH} levels"
+                    )));
+                }
                 let local = e.local_name().as_ref().as_bytes().to_vec();
+                check_element(&path, &local, &mut seen)?;
                 match local.as_slice() {
-                    b"metadata" => {
+                    b"metadata" if path.len() == 1 => {
                         metadata.min_client_version = attr_local(&e, b"minClientVersion")?;
                     }
                     b"license" if path.last().map(Vec::as_slice) == Some(b"metadata") => {
@@ -651,7 +714,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                             metadata.package_types.push(name);
                         }
                     }
-                    b"dependencies" if under_metadata(&path) => {
+                    b"dependencies" if in_metadata(&path) => {
                         in_dependencies = true;
                         flat_group = None;
                     }
@@ -668,6 +731,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             }
             Event::Empty(e) => {
                 let local = e.local_name().as_ref().as_bytes().to_vec();
+                check_element(&path, &local, &mut seen)?;
                 match local.as_slice() {
                     b"dependency" if in_dependencies => {
                         let dep = parse_dependency(&e)?;
@@ -839,16 +903,68 @@ fn push_dependency(
     }
 }
 
-/// True if the element path is currently inside `<metadata>` (any ancestor).
-fn under_metadata(path: &[Vec<u8>]) -> bool {
-    path.iter().any(|p| p.as_slice() == b"metadata")
+/// True if the *parent* of the current text node is the manifest's
+/// `<metadata>` — i.e. the path is `[package, metadata, id|version|…]`.
+/// Guards against e.g. an `<id>` nested in a dependency or a decoy
+/// `<metadata>` deeper in the document.
+fn under_metadata_parent(path: &[Vec<u8>]) -> bool {
+    path.len() == 3 && path[1].as_slice() == b"metadata"
 }
 
-/// True if the *parent* of the current text node is `<metadata>` — i.e. the
-/// path is `[.., metadata, id|version]`. Guards against e.g. a `<id>` nested in
-/// a dependency.
-fn under_metadata_parent(path: &[Vec<u8>]) -> bool {
-    path.len() >= 2 && path[path.len() - 2].as_slice() == b"metadata"
+/// Whether `path` is exactly the manifest's `<metadata>` (`[package,
+/// metadata]`), i.e. a child started now is a direct child of it.
+fn in_metadata(path: &[Vec<u8>]) -> bool {
+    path.len() == 2 && path[1].as_slice() == b"metadata"
+}
+
+/// Singular manifest elements already seen.
+#[derive(Default)]
+struct Seen {
+    metadata: bool,
+    id: bool,
+    version: bool,
+    dependencies: bool,
+}
+
+/// Hold the manifest to the one shape NuGet reads: a root `<package>` whose
+/// single `<metadata>` child has one text-only `<id>` and `<version>` and at
+/// most one `<dependencies>`. NuGet takes the *first* `<id>` (and ignores a
+/// `<metadata>` or `<dependencies>` anywhere else), while a lenient reading
+/// would join repeated ones or pick up a nested decoy — a package whose
+/// identity Forge and the client disagree on, published past an id-scoped
+/// grant. Such manifests are refused.
+fn check_element(path: &[Vec<u8>], local: &[u8], seen: &mut Seen) -> Result<(), NupkgError> {
+    let malformed = |what: &str| Err(NupkgError::MalformedNuspec(what.to_string()));
+    match path.len() {
+        0 if local != b"package" => malformed("the root element must be <package>"),
+        1 if local == b"metadata" => {
+            if std::mem::replace(&mut seen.metadata, true) {
+                return malformed("more than one <metadata>");
+            }
+            Ok(())
+        }
+        2 if in_metadata(path) => {
+            let slot = match local {
+                b"id" => &mut seen.id,
+                b"version" => &mut seen.version,
+                b"dependencies" => &mut seen.dependencies,
+                _ => return Ok(()),
+            };
+            if std::mem::replace(slot, true) {
+                return malformed(&format!(
+                    "more than one <{}>",
+                    String::from_utf8_lossy(local)
+                ));
+            }
+            Ok(())
+        }
+        3 if path[1].as_slice() == b"metadata"
+            && matches!(path[2].as_slice(), b"id" | b"version") =>
+        {
+            malformed("<id> and <version> hold text only")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Read an attribute by its *local* name (namespace-insensitive).
@@ -880,6 +996,42 @@ fn attr_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_manifests_are_rejected_quickly() {
+        let depth = 200_000;
+        let xml = format!(
+            "<package><metadata><id>a</id><version>1.0.0</version>{}{}</metadata></package>",
+            "<x>".repeat(depth),
+            "</x>".repeat(depth)
+        );
+        let started = std::time::Instant::now();
+        let err = parse_nuspec(xml.as_bytes()).expect_err("too deep");
+        assert!(err.to_string().contains("nested deeper"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Realistic nesting still parses.
+        let ok = "<package><metadata><id>a</id><version>1.0.0</version><dependencies>\
+                  <group targetFramework=\"net8.0\"><dependency id=\"b\" version=\"1.0\"/>\
+                  </group></dependencies></metadata></package>";
+        let parsed = parse_nuspec(ok.as_bytes()).unwrap();
+        assert_eq!(parsed.deps[0].dependencies[0].id, "b");
+    }
+
+    #[test]
+    fn manifest_summary_round_trips_through_json() {
+        let xml = "<package><metadata><id>A</id><version>1.0.0</version><description>d</description>\
+                   <tags>x y</tags><dependencies><dependency id=\"b\" version=\"1.0\"/></dependencies>\
+                   </metadata></package>";
+        let summary = manifest_summary(xml.as_bytes()).unwrap();
+        let stored = serde_json::to_value(&summary).unwrap();
+        assert_eq!(summary_of(Some(&stored), None), summary);
+        assert_eq!(summary_of(None, Some(xml.as_bytes())), summary);
+        assert_eq!(
+            summary.metadata.tags,
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert_eq!(summary_of(None, None), ManifestSummary::default());
+    }
 
     #[test]
     fn parses_id_version_and_grouped_deps_namespace_insensitive() {
@@ -949,6 +1101,82 @@ mod tests {
         assert_eq!(raw.id, "Prefixed.Pkg");
         assert_eq!(raw.version, "3.0.0");
         assert!(raw.deps.is_empty());
+    }
+
+    #[test]
+    fn manifests_with_an_ambiguous_identity_are_refused() {
+        let wrap = |metadata: &str| format!("<package><metadata>{metadata}</metadata></package>");
+        for (xml, why) in [
+            (
+                wrap("<id>Foo</id><id>Bar</id><version>1.0.0</version>"),
+                "repeated <id>",
+            ),
+            (
+                wrap("<id>Foo</id><version>1.0.0</version><version>2.0.0</version>"),
+                "repeated <version>",
+            ),
+            (
+                wrap("<id>Foo<x/>Bar</id><version>1.0.0</version>"),
+                "element inside <id>",
+            ),
+            (
+                wrap("<id/><id>Foo</id><version>1.0.0</version>"),
+                "empty then real <id>",
+            ),
+            (
+                wrap(
+                    "<id>Foo</id><version>1.0.0</version><dependencies/><dependencies>\
+                      <dependency id=\"X\"/></dependencies>",
+                ),
+                "repeated <dependencies>",
+            ),
+            (
+                "<package><metadata><id>Foo</id><version>1.0.0</version></metadata>\
+                 <metadata><id>Bar</id></metadata></package>"
+                    .to_string(),
+                "repeated <metadata>",
+            ),
+            (
+                "<other><metadata><id>Foo</id><version>1.0.0</version></metadata></other>"
+                    .to_string(),
+                "root is not <package>",
+            ),
+        ] {
+            assert!(parse_nuspec(xml.as_bytes()).is_err(), "{why}: {xml}");
+        }
+        // A `<metadata>` nested elsewhere is not the manifest's (NuGet ignores
+        // it), and neither are dependencies outside the real one.
+        let xml = "<package><files><metadata><id>Decoy</id></metadata></files>\
+                   <metadata><id>Real</id><version>1.0.0</version></metadata>\
+                   <x><dependencies><dependency id=\"Y\"/></dependencies></x></package>";
+        let raw = parse_nuspec(xml.as_bytes()).unwrap();
+        assert_eq!(raw.id, "Real");
+        assert!(raw.deps.is_empty());
+    }
+
+    #[test]
+    fn only_a_single_root_level_nuspec_is_the_manifest() {
+        let nuspec = |id: &str| {
+            format!("<package><metadata><id>{id}</id><version>1.0.0</version></metadata></package>")
+        };
+        let limits = NupkgLimits::default();
+        let extract = |zip: Vec<u8>| extract_nuspec(&mut std::io::Cursor::new(zip), &limits);
+        // Two at the root: NuGet refuses the package, so must Forge.
+        let zip = zip_of(&[
+            ("A.nuspec", nuspec("A").as_bytes()),
+            ("B.nuspec", nuspec("B").as_bytes()),
+        ]);
+        assert!(extract(zip).is_err());
+        // Only a nested one: NuGet finds no manifest.
+        let zip = zip_of(&[("lib/Decoy.nuspec", nuspec("Decoy").as_bytes())]);
+        assert!(matches!(extract(zip), Err(NupkgError::MissingNuspec)));
+        // A nested decoy beside the root manifest is ignored.
+        let zip = zip_of(&[
+            ("content/Decoy.nuspec", nuspec("Decoy").as_bytes()),
+            ("Real.nuspec", nuspec("Real").as_bytes()),
+        ]);
+        let bytes = extract(zip).unwrap();
+        assert_eq!(parse_nuspec(&bytes).unwrap().id, "Real");
     }
 
     #[test]
@@ -1166,6 +1394,36 @@ mod tests {
     }
 
     #[test]
+    fn a_zip64_locator_must_name_its_record() {
+        // The ZIP64 trailer of the test above, shifted by 16 bytes of junk
+        // while the locator still says offset 0: a reader that looked for the
+        // record elsewhere would trust a million unvetted entries.
+        let mut zip = vec![0u8; 16];
+        zip.extend_from_slice(&ZIP64_EOCD_SIG);
+        zip.extend_from_slice(&44u64.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes());
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes());
+        zip.extend_from_slice(&ZIP64_LOCATOR_SIG);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes()); // names offset 0: junk
+        zip.extend_from_slice(&1u32.to_le_bytes());
+        zip.extend_from_slice(&EOCD_SIG);
+        zip.extend_from_slice(&[0, 0, 0, 0]);
+        zip.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        zip.extend_from_slice(&[0xFF; 8]);
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        let err = check_archive_directory(&mut std::io::Cursor::new(zip), &NupkgLimits::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("ZIP64 locator"), "{err}");
+    }
+
+    #[test]
     fn signature_lookalikes_in_entry_data_are_not_vetted() {
         // Stored (uncompressed) payload bytes that happen to contain EOCD and
         // ZIP64-record signatures with absurd counts, inside the trailing
@@ -1253,5 +1511,18 @@ mod tests {
 
         let ok = r#"<package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
         assert_eq!(parse_nupkg(&mut nupkg_with(ok), &limits).unwrap().id, "a.b");
+
+        // Versions NuGet clients cannot read as the package's own.
+        for version in ["2147483648.0.0", "1.0.0-rc.01", "1.0.0+bad_meta", "1.0.0+"] {
+            let xml = format!(
+                "<package><metadata><id>A.B</id><version>{version}</version></metadata></package>"
+            );
+            assert!(
+                parse_nupkg(&mut nupkg_with(&xml), &limits).is_err(),
+                "{version}"
+            );
+        }
+        let edge = r#"<package><metadata><id>A.B</id><version>2147483647.0.0-rc.0.10+build.5-x</version></metadata></package>"#;
+        assert!(parse_nupkg(&mut nupkg_with(edge), &limits).is_ok());
     }
 }

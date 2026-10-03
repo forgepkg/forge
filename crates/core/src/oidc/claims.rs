@@ -32,6 +32,11 @@ pub struct ClaimMapping {
     /// Values that grant `is_admin`. **Empty ⇒ OIDC never grants admin** (admins
     /// stay locally managed) — the safe default.
     pub admin_groups: Vec<String>,
+    /// Allow-gate: every listed claim must carry (one of) its allowed values,
+    /// or the login is refused — e.g. `tid` (Entra tenant), `hd` (Google
+    /// Workspace domain) or `groups`. Empty ⇒ any token the issuer signs for
+    /// this client may sign in.
+    pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for ClaimMapping {
@@ -42,8 +47,34 @@ impl Default for ClaimMapping {
             display_name_claim: "name".into(),
             admin_claim: "roles".into(),
             admin_groups: Vec::new(),
+            required_claims: Default::default(),
         }
     }
+}
+
+/// Whether the verified claims pass the realm's allow-gate
+/// ([`ClaimMapping::required_claims`]): each required claim must be present
+/// and carry one of its allowed values (a string claim, or any element of an
+/// array claim). Booleans and numbers compare by their JSON text.
+pub fn claims_allowed(claims: &IdTokenClaims, mapping: &ClaimMapping) -> bool {
+    mapping.required_claims.iter().all(|(name, allowed)| {
+        let value = match name.as_str() {
+            "sub" => Some(serde_json::Value::String(claims.sub.clone())),
+            "iss" => Some(serde_json::Value::String(claims.iss.clone())),
+            _ => claims.additional.get(name).cloned(),
+        };
+        let text = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => Some(v.to_string()),
+            _ => None,
+        };
+        let present: Vec<String> = match value {
+            Some(serde_json::Value::Array(items)) => items.iter().filter_map(text).collect(),
+            Some(other) => text(&other).into_iter().collect(),
+            None => Vec::new(),
+        };
+        present.iter().any(|p| allowed.iter().any(|a| a == p))
+    })
 }
 
 /// The user-facing facts extracted from a verified ID token.
@@ -74,10 +105,25 @@ pub struct MappedClaims {
 pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaims {
     let email = string_claim(claims, &mapping.email_claim);
     // An unverified email is attacker-chosen at many IdPs: never let it become
-    // the username (which can drive account linking); fall back to `sub`.
+    // the username (which can drive account linking) — neither as the
+    // fallback nor when the username claim *is* the email claim (a common
+    // `username_claim = "email"` setup); fall back to `sub`.
+    // The username is stored canonical (trimmed, NFC, lowercased) like every
+    // other account name; a claim with no canonical form falls through.
+    let canonical = |raw: String| forge_db::username::canonical_username(&raw).ok();
+    let username_is_email =
+        mapping.username_claim == mapping.email_claim || mapping.username_claim == "email";
     let username = string_claim(claims, &mapping.username_claim)
-        .or_else(|| email.clone().filter(|_| email_verified(claims)))
-        .unwrap_or_else(|| claims.sub.clone());
+        .filter(|_| !username_is_email || email_verified(claims))
+        .and_then(canonical)
+        .or_else(|| {
+            email
+                .clone()
+                .filter(|_| email_verified(claims))
+                .and_then(canonical)
+        })
+        .or_else(|| canonical(claims.sub.clone()))
+        .unwrap_or_else(|| "oidc-user".to_string());
     let display_name = string_claim(claims, &mapping.display_name_claim);
     let is_admin = derive_is_admin(claims, mapping);
     MappedClaims {
@@ -178,7 +224,37 @@ mod tests {
             display_name_claim: "name".into(),
             admin_claim: "roles".into(),
             admin_groups: vec!["forge-admins".into()],
+            required_claims: Default::default(),
         }
+    }
+
+    #[test]
+    fn required_claims_gate_logins() {
+        let mut m = mapping();
+        let c = claims_with(
+            "sub-1",
+            json!({ "tid": "tenant-a", "groups": ["dev", "ops"], "email_verified": true }),
+        );
+        assert!(claims_allowed(&c, &m), "no gate configured");
+        m.required_claims
+            .insert("tid".into(), vec!["tenant-a".into()]);
+        assert!(claims_allowed(&c, &m));
+        m.required_claims
+            .insert("groups".into(), vec!["ops".into()]);
+        assert!(claims_allowed(&c, &m), "array claims match any element");
+        m.required_claims
+            .insert("email_verified".into(), vec!["true".into()]);
+        assert!(claims_allowed(&c, &m), "booleans compare as text");
+        m.required_claims
+            .insert("tid".into(), vec!["tenant-b".into()]);
+        assert!(
+            !claims_allowed(&c, &m),
+            "a guest from another tenant is refused"
+        );
+        let mut m = mapping();
+        m.required_claims
+            .insert("hd".into(), vec!["corp.example".into()]);
+        assert!(!claims_allowed(&c, &m), "a missing claim is refused");
     }
 
     #[test]
@@ -212,6 +288,24 @@ mod tests {
             json!({ "preferred_username": "  ", "email": "c@corp", "email_verified": "true" }),
         );
         assert_eq!(map_claims(&c, &mapping()).username, "c@corp");
+    }
+
+    #[test]
+    fn unverified_email_is_not_the_username_even_as_the_username_claim() {
+        let mut m = mapping();
+        m.username_claim = "email".into();
+        let unverified = claims_with("sub-7", json!({ "email": "Boss@Corp" }));
+        assert_eq!(map_claims(&unverified, &m).username, "sub-7");
+        let verified = claims_with(
+            "sub-7",
+            json!({ "email": "Boss@Corp", "email_verified": true }),
+        );
+        assert_eq!(map_claims(&verified, &m).username, "boss@corp");
+        // Same when a custom email claim doubles as the username claim.
+        m.email_claim = "mail".into();
+        m.username_claim = "mail".into();
+        let unverified = claims_with("sub-8", json!({ "mail": "boss@corp" }));
+        assert_eq!(map_claims(&unverified, &m).username, "sub-8");
     }
 
     #[test]

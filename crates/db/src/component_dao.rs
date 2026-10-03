@@ -176,13 +176,16 @@ pub async fn names_present_in_repositories(
 
 /// Set the `listed` flag on a specific component version. Returns whether a row
 /// was updated.
-pub async fn set_listed(
-    pool: &PgPool,
+pub async fn set_listed<'e, E>(
+    executor: E,
     repository_id: i64,
     name: &str,
     version: &str,
     listed: bool,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     let res = sqlx::query!(
         r#"
         UPDATE component
@@ -194,7 +197,7 @@ pub async fn set_listed(
         version,
         listed,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
 }
@@ -343,5 +346,120 @@ async fn delete_locked_components(
     sqlx::query!(r#"DELETE FROM component WHERE id = ANY($1)"#, ids)
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+/// One version's registration data in a single row: listing state, publish
+/// time, the stored manifest summary and the `.nupkg` hash.
+#[derive(Debug, Clone)]
+pub struct RegistrationRow {
+    pub id: i64,
+    pub original_id: String,
+    pub version: String,
+    pub listed: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub manifest_summary: Option<serde_json::Value>,
+    pub package_hash_sha512_base64: Option<String>,
+}
+
+/// Every version of `name` with its registration data, in one query (the
+/// `.nupkg` asset at `nupkg_path` supplies the hash).
+pub async fn list_registration_rows(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    nupkg_path: &str,
+) -> sqlx::Result<Vec<RegistrationRow>> {
+    sqlx::query_as!(
+        RegistrationRow,
+        r#"
+        SELECT
+            c.id, c.original_id, c.version, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
+        WHERE c.repository_id = $1 AND c.name = $2
+        ORDER BY c.id
+        "#,
+        repository_id,
+        name,
+        nupkg_path,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// One version's registration data (see [`list_registration_rows`]).
+pub async fn find_registration_row(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    version: &str,
+    nupkg_path: &str,
+) -> sqlx::Result<Option<RegistrationRow>> {
+    sqlx::query_as!(
+        RegistrationRow,
+        r#"
+        SELECT
+            c.id, c.original_id, c.version, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
+        WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3
+        "#,
+        repository_id,
+        name,
+        version,
+        nupkg_path,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// The stored manifest summaries of `(names[i], versions[i])` in one query;
+/// pairs without a stored summary are absent from the result.
+pub async fn manifest_summaries(
+    pool: &PgPool,
+    repository_id: i64,
+    names: &[String],
+    versions: &[String],
+) -> sqlx::Result<Vec<(String, String, serde_json::Value)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT c.name, c.version, c.manifest_summary AS "manifest_summary!"
+        FROM component c
+        JOIN UNNEST($2::text[], $3::text[]) AS w(name, version)
+          ON w.name = c.name AND w.version = c.version
+        WHERE c.repository_id = $1 AND c.manifest_summary IS NOT NULL
+        "#,
+        repository_id,
+        names,
+        versions,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.name, r.version, r.manifest_summary))
+        .collect())
+}
+
+/// Store the manifest summary of a component (at publish, or when an older
+/// version without one is first read).
+pub async fn set_manifest_summary<'e, E>(
+    executor: E,
+    component_id: i64,
+    summary: &serde_json::Value,
+) -> sqlx::Result<()>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query!(
+        r#"UPDATE component SET manifest_summary = $2 WHERE id = $1"#,
+        component_id,
+        summary,
+    )
+    .execute(executor)
+    .await?;
     Ok(())
 }

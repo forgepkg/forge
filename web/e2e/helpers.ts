@@ -27,9 +27,13 @@ export function facts(): HarnessFacts {
   return cached
 }
 
+/**
+ * Basic credentials for the admin API: the admin's username and its
+ * admin-scoped token (the admin API refuses a password sent over Basic).
+ */
 export function adminBasic(): string {
   const f = facts()
-  return 'Basic ' + Buffer.from(`${f.adminUser}:${f.adminPass}`).toString('base64')
+  return 'Basic ' + Buffer.from(`${f.adminUser}:${f.adminToken}`).toString('base64')
 }
 
 /**

@@ -2,10 +2,15 @@
 //!
 //! See the module docs ([`super`]) for the multi-instance / no-advisory-lock
 //! rationale. Everything here is parameterised over an injected
-//! [`reqwest::Client`] (so callers pass the SSRF-guarded client from
-//! [`crate::net::ssrf::guarded_client`]) and a [`forge_cache::Cache`], which is
+//! [`reqwest::Client`] (so callers pass the no-redirect, https-only client from
+//! [`crate::net::ssrf::outbound_metadata_client`]) and a [`forge_cache::Cache`], which is
 //! what makes the whole module unit-testable with a [`wiremock`] HTTP server and
 //! a self-signed token — no real IdP, no real network.
+//!
+//! Discovery documents and key sets decide which tokens verify, so they are
+//! cached **in-process only** ([`Cache::get_or_try_insert_local`]): never read
+//! from Redis, where anyone with access to it could plant their own signing
+//! key. Each instance fetches them itself; Redis only relays invalidations.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -193,8 +198,8 @@ pub struct OidcMetadataClient {
     /// `{issuer}/.well-known/openid-configuration` and the document's own
     /// `issuer` must match this exactly.
     issuer: String,
-    /// SSRF-guarded HTTP client (built by the caller via
-    /// [`crate::net::ssrf::guarded_client`]).
+    /// Outbound HTTP client (no redirects, https only; built by the caller via
+    /// [`crate::net::ssrf::outbound_metadata_client`]).
     http: reqwest::Client,
     /// Slice-1 hybrid cache for discovery + JWKS.
     cache: Cache,
@@ -229,7 +234,7 @@ impl OidcMetadataClient {
         &self.issuer
     }
 
-    /// The SSRF-guarded HTTP client, for the flow's token-endpoint exchange
+    /// The outbound HTTP client, for the flow's token-endpoint exchange
     /// (`flow.rs`). Sharing the same client keeps the SSRF/timeout posture
     /// consistent across discovery, JWKS, and token calls.
     pub fn http_client(&self) -> &reqwest::Client {
@@ -250,7 +255,7 @@ impl OidcMetadataClient {
 
         let doc: DiscoveryDocument = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_DISCOVERY,
                 &self.issuer,
                 self.discovery_ttl,
@@ -275,7 +280,7 @@ impl OidcMetadataClient {
 
         let doc: WorkloadDiscoveryDocument = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_WORKLOAD_DISCOVERY,
                 &self.issuer,
                 self.discovery_ttl,
@@ -301,7 +306,7 @@ impl OidcMetadataClient {
         let http = self.http.clone();
         let url = jwks_uri.to_string();
         self.cache
-            .get_or_try_insert_with(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
+            .get_or_try_insert_local(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
                 fetch_json::<JwkSet>(&http, &url, "jwks").await
             })
             .await
@@ -309,7 +314,7 @@ impl OidcMetadataClient {
 
     /// Force a cache-bypassing JWKS refetch: drop the cached entry (which also
     /// broadcasts an invalidation to peer instances via the cache backplane,
-    /// when Redis L2 is configured), then repopulate it.
+    /// when Redis is configured), then repopulate it.
     ///
     /// Per-instance coalescing means a rotation storm refetches at most once per
     /// instance; we deliberately use **no** advisory lock — an occasional
@@ -321,13 +326,13 @@ impl OidcMetadataClient {
 
     /// Claim the issuer's single unknown-`kid` refresh slot for the cooldown
     /// window. The cache's per-key coalescing means concurrent misses share one
-    /// winner; a Redis-backed cache also bounds normal multi-instance traffic.
+    /// winner per instance.
     async fn acquire_unknown_kid_refresh(&self) -> bool {
         let candidate = uuid::Uuid::new_v4().to_string();
         let produced = candidate.clone();
         let cached = self
             .cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_JWKS_KID_REFRESH,
                 &self.issuer,
                 DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN,
@@ -715,6 +720,39 @@ fn validate_discovery_identity_and_endpoints(
 }
 
 /// GET `url` and parse the (bounded) body as JSON into `T`.
+/// Why [`read_capped`] gave up.
+#[derive(Debug)]
+pub(crate) enum ReadCappedError {
+    /// The body exceeds the cap.
+    TooLarge,
+    /// The body could not be read.
+    Read(reqwest::Error),
+}
+
+/// Read a response body into memory, refusing more than `max` bytes (checked
+/// against `Content-Length` up front and while streaming).
+pub(crate) async fn read_capped(
+    resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, ReadCappedError> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > max as u64)
+    {
+        return Err(ReadCappedError::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0).min(max as u64) as usize);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ReadCappedError::Read)?;
+        if chunk.len() > max.saturating_sub(bytes.len()) {
+            return Err(ReadCappedError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 async fn fetch_json<T: DeserializeOwned>(
     http: &reqwest::Client,
     url: &str,
@@ -739,22 +777,21 @@ async fn fetch_json<T: DeserializeOwned>(
             reason: "document too large".into(),
         });
     }
-    let mut bytes =
-        Vec::with_capacity(resp.content_length().unwrap_or(0).min(MAX_DOC_BYTES as u64) as usize);
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| OidcError::Http {
-            url: url.to_string(),
-            reason: format!("read body: {e}"),
-        })?;
-        if chunk.len() > MAX_DOC_BYTES.saturating_sub(bytes.len()) {
+    let bytes = match read_capped(resp, MAX_DOC_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(ReadCappedError::TooLarge) => {
             return Err(OidcError::Parse {
                 what: what.to_string(),
                 reason: "document too large".into(),
-            });
+            })
         }
-        bytes.extend_from_slice(&chunk);
-    }
+        Err(ReadCappedError::Read(e)) => {
+            return Err(OidcError::Http {
+                url: url.to_string(),
+                reason: format!("read body: {e}"),
+            })
+        }
+    };
     serde_json::from_slice(&bytes).map_err(|e| OidcError::Parse {
         what: what.to_string(),
         reason: e.to_string(),
@@ -775,6 +812,38 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+    /// Bodies over the cap are refused whether or not the server announces a
+    /// `Content-Length` (a token or discovery response is never buffered
+    /// whole when oversized).
+    #[tokio::test]
+    async fn read_capped_refuses_oversized_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 4096]))
+            .mount(&server)
+            .await;
+        Mock::given(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 16]))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let big = http
+            .get(format!("{}/big", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_capped(big, 1024).await,
+            Err(ReadCappedError::TooLarge)
+        ));
+        let small = http
+            .get(format!("{}/small", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(small, 1024).await.unwrap().len(), 16);
+    }
 
     /// A throwaway RSA signer: holds the private key (to sign tokens) and can
     /// emit its public half as a JWK (to publish in the mock JWKS).

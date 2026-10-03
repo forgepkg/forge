@@ -329,6 +329,99 @@ async fn stale_realm_policy_snapshot_cannot_publish_after_config_change() {
 }
 
 #[tokio::test]
+async fn workload_unlist_and_relist_are_audited_and_fenced() {
+    let idp = MockOidc::start("unused-wif-client").await;
+    let srv = start_stack().await;
+    setup(&srv, &idp).await;
+    let role_id: i64 = sqlx::query_scalar("SELECT id FROM role WHERE name = 'ci-pub'")
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.add_grant(role_id, Some("ci-hosted"), "delete", None)
+            .await
+            .status(),
+        201
+    );
+
+    let token = idp
+        .sign_token(idp.wif_claims(
+            "ci-job-1",
+            AUD,
+            json!({"job_project_id": "1001", "ref_protected": true}),
+        ))
+        .await;
+    for version in ["1.0.0", "2.0.0"] {
+        assert_eq!(
+            push(
+                &srv,
+                "ci-hosted",
+                Transport::Bearer,
+                &token,
+                make_nupkg("Acme.Mutations", version),
+            )
+            .await,
+            StatusCode::CREATED
+        );
+    }
+    let mutate = |method: reqwest::Method, version: &'static str| {
+        let url = format!(
+            "{}/v3/ci-hosted/package/Acme.Mutations/{version}",
+            srv.base_url
+        );
+        let req = srv.client().request(method, url).bearer_auth(&token);
+        async move { req.send().await.unwrap().status() }
+    };
+    let actions = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT action || ':' || package_version FROM trusted_publish_audit \
+             WHERE package_name = 'acme.mutations' ORDER BY id",
+        )
+        .fetch_all(&srv.pool)
+        .await
+        .unwrap()
+    };
+
+    // Unlist and relist by a workload land in the same ledger as its publish.
+    assert_eq!(
+        mutate(reqwest::Method::DELETE, "1.0.0").await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(mutate(reqwest::Method::POST, "1.0.0").await, StatusCode::OK);
+    assert_eq!(
+        actions().await,
+        [
+            "publish:1.0.0",
+            "publish:2.0.0",
+            "unlist:1.0.0",
+            "relist:1.0.0"
+        ]
+    );
+
+    // A stale realm snapshot is fenced at the mutation's commit, exactly as
+    // for a publish: no unlist, no ledger row.
+    sqlx::query(
+        "UPDATE auth_realm SET config = jsonb_set(config, '{rules,0,conditions,0,any_of}', \
+         '[\"9999\"]') WHERE name = 'gitlab-ci'",
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mutate(reqwest::Method::DELETE, "2.0.0").await,
+        StatusCode::FORBIDDEN
+    );
+    let listed: bool = sqlx::query_scalar(
+        "SELECT listed FROM component WHERE name = 'acme.mutations' AND version = '2.0.0'",
+    )
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(listed, "a fenced unlist must not change the version");
+    assert_eq!(actions().await.len(), 4, "a fenced unlist is not audited");
+}
+
+#[tokio::test]
 async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding() {
     let issuer = "https://malformed-wif.example";
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -366,7 +459,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let malformed_patch = srv
         .client()
         .patch(format!("{}/admin/realms/{broken_id}", srv.base_url))
-        .basic_auth("root", Some("rootpw"))
+        .basic_auth("root", srv.admin_scoped_token.as_deref())
         .json(&json!({"name": "still-broken-wif"}))
         .send()
         .await
@@ -387,7 +480,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let invalidate = srv
         .client()
         .patch(format!("{}/admin/realms/{local_id}", srv.base_url))
-        .basic_auth("root", Some("rootpw"))
+        .basic_auth("root", srv.admin_scoped_token.as_deref())
         .json(&json!({"enabled": true}))
         .send()
         .await

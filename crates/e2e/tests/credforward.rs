@@ -684,3 +684,136 @@ async fn delete_user_purges_cached_verdicts() {
     assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
     assert_eq!(mock.hits(), 2, "the deleted user's verdict was not reused");
 }
+
+// ── 14. a realm edit retires the verdicts cached under the old config ────────
+
+#[tokio::test]
+async fn realm_edit_retires_cached_verdicts() {
+    let mock = MockBasicUpstream::start(vec![(UP_USER, UP_PASS, vec!["dev"])]).await;
+    let srv = start_credforward_stack(&mock, 300, 30, &[], "").await;
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 200);
+    assert_eq!(mock.hits(), 1);
+
+    // Tighten the realm: only `nuget-users` may sign in.
+    let (admin_u, admin_p) = srv.admin_basic();
+    let realms: Vec<Value> = srv
+        .client()
+        .get(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin_u, Some(&admin_p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let realm = realms
+        .iter()
+        .find(|r| r["kind"] == "credential_forwarding")
+        .expect("the imported credential-forwarding realm");
+    let mut config = realm["config"].clone();
+    config["groups_path"] = serde_json::json!("roles");
+    config["required_groups"] = serde_json::json!(["nuget-users"]);
+    let resp = srv
+        .client()
+        .patch(format!("{}/admin/realms/{}", srv.base_url, realm["id"]))
+        .basic_auth(&admin_u, Some(&admin_p))
+        .json(&serde_json::json!({ "config": config }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    // The verdict cached under the old policy (300 s left) no longer counts:
+    // the credential is re-checked under the new one and refused.
+    assert_eq!(me_basic(&srv, UP_USER, UP_PASS).await.status(), 401);
+    assert_eq!(mock.hits(), 2, "re-forwarded under the edited realm");
+}
+
+// ── 15. an upstream demotion takes effect at once ───────────────────────────
+
+#[tokio::test]
+async fn upstream_demotion_drops_admin_and_ends_sessions_at_once() {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    let mock = MockBasicUpstream::start(vec![("up-admin", "apw", vec!["nx-admin"])]).await;
+    let block = mock.upstream_basic_block(
+        &["local-password", "upstream-basic"],
+        TTL.as_secs(),
+        1,
+        &[],
+        "nx-admin",
+    );
+    // A long authorization-cache TTL: only an explicit invalidation can make
+    // the demotion visible within this test.
+    let srv = StackBuilder::default()
+        .bootstrap_admin("root", "rootpw")
+        .with_upstream_basic(block)
+        .cache_ttl_seconds(300)
+        .start()
+        .await;
+    assert_eq!(
+        srv.create_repo(serde_json::json!({
+            "name": "locked", "kind": "hosted", "anonymous_read": false
+        }))
+        .await
+        .status(),
+        201
+    );
+    let read_locked = || async {
+        srv.client()
+            .get(format!("{}/v3/locked/index.json", srv.base_url))
+            .basic_auth("up-admin", Some("apw"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+
+    // An upstream admin: a browser session, and the feed via Basic (warming
+    // the cached authorization set with admin).
+    let login = srv
+        .client()
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&serde_json::json!({ "username": "up-admin", "password": "apw" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(read_locked().await, 200, "an admin reads every repository");
+    let session_alive = || async {
+        srv.client()
+            .get(format!("{}/auth/me", srv.base_url))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            == 200
+    };
+    assert!(session_alive().await);
+
+    // The upstream drops the admin group; once the verdict expires the next
+    // request re-forwards and sees it.
+    mock.set_groups("up-admin", &["dev"]);
+    tokio::time::sleep(TTL + std::time::Duration::from_millis(500)).await;
+    let status = read_locked().await;
+    assert!(
+        status.is_client_error(),
+        "the demoting request itself is no longer an admin's ({status})"
+    );
+    let (_src, _ph, is_admin) = user_row(&srv.pool, "up-admin").await.unwrap();
+    assert!(!is_admin);
+    assert!(
+        !session_alive().await,
+        "the session opened as an admin is ended"
+    );
+}

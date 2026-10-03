@@ -139,6 +139,7 @@ async fn user(pool: &PgPool) -> Principal {
         user_id: u.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     }
 }
 
@@ -718,6 +719,7 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
         user_id: account.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
     let g = group_repo(&pool, blobs.clone(), principal);
 
@@ -1098,6 +1100,7 @@ impl RepoReadOps for FakeProxy {
                 listed: true,
                 package_hash_sha512_base64: None,
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: None,
             })
             .collect())
@@ -1497,6 +1500,7 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
         user_id: account.id,
         token_id: None,
         is_admin: false,
+        method: forge_core::auth::AuthMethod::Password,
     };
 
     let g = mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));
@@ -1580,6 +1584,68 @@ async fn prefer_hosted_ownership_includes_unlisted_and_respects_opt_out() {
         g.list_versions(&group.name, "sample").await.unwrap().len(),
         1,
         "without prefer_hosted the proxy serves the id"
+    );
+}
+
+/// Reserved prefixes: an internal name no hosted member has yet (before its
+/// first publish, or after its last version was deleted) is still never served
+/// from a proxy member, which prefer_hosted alone cannot ensure.
+#[tokio::test]
+async fn reserved_prefixes_keep_unpublished_internal_ids_off_proxies() {
+    let pool = common::pool().await;
+    let blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 10)
+        .await
+        .unwrap();
+    let set_prefixes = |prefixes: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE repository SET config = jsonb_build_object(\
+                 'prefer_hosted', true, 'reserved_prefixes', $2::jsonb) WHERE id = $1",
+            )
+            .bind(group.id)
+            .bind(prefixes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // No hosted copy and no reservation: the public package is served.
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        1
+    );
+
+    // `Samp` is reserved: nothing under it comes from the proxy.
+    set_prefixes(serde_json::json!(["samp"])).await;
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_internal_id_not_served(&g, &group.name, "reserved prefix").await;
+
+    // Another organization's prefix leaves the id alone.
+    set_prefixes(serde_json::json!(["acme."])).await;
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, shadowing_proxy(&proxy));
+    assert_eq!(
+        g.list_versions(&group.name, "sample").await.unwrap().len(),
+        1
     );
 }
 

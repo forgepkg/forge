@@ -181,9 +181,10 @@ pub struct NupkgLocation {
 
 /// One package's data for a registration page / search hit, format-neutral.
 ///
-/// Dependency groups are intentionally **not** included: the format layer
-/// re-parses [`Self::nuspec_bytes`] to produce them, keeping NuGet manifest
-/// parsing out of `forge-core`.
+/// Dependency groups are intentionally **not** included as typed data: the
+/// format layer renders them from [`Self::manifest_summary`] (stored at
+/// publish) or, failing that, re-parses [`Self::nuspec_bytes`], keeping NuGet
+/// manifest parsing out of `forge-core`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistrationEntry {
     /// Package id exactly as published.
@@ -194,8 +195,13 @@ pub struct RegistrationEntry {
     pub listed: bool,
     /// SHA-512 of the `.nupkg`, base64-encoded (from `asset.sha512_base64`).
     pub package_hash_sha512_base64: Option<String>,
-    /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored.
+    /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored and
+    /// no [`Self::manifest_summary`] is (older versions).
     pub nuspec_bytes: Option<Vec<u8>>,
+    /// The format's summary of the manifest, computed once at publish
+    /// ([`crate::format::Format::manifest_summary`]); preferred over
+    /// [`Self::nuspec_bytes`].
+    pub manifest_summary: Option<serde_json::Value>,
     /// When this version was published into the repository (`None` when
     /// unknown, e.g. a proxied version not cached yet).
     pub published: Option<chrono::DateTime<chrono::Utc>>,
@@ -210,9 +216,13 @@ pub struct SearchHit {
     pub latest_version: String,
     /// All matching versions, ascending by precedence.
     pub versions: Vec<VersionEntry>,
-    /// Manifest of [`Self::latest_version`], when available, so the format
-    /// layer can render description / authors / tags / icon.
+    /// Manifest of [`Self::latest_version`], when available and no
+    /// [`Self::manifest_summary`] is, so the format layer can render
+    /// description / authors / tags / icon.
     pub nuspec_bytes: Option<Vec<u8>>,
+    /// The stored manifest summary of [`Self::latest_version`] (see
+    /// [`RegistrationEntry::manifest_summary`]).
+    pub manifest_summary: Option<serde_json::Value>,
     /// Download count across all versions, when tracked.
     pub total_downloads: Option<i64>,
 }
@@ -234,9 +244,33 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
-    /// Parse a raw `q` value.
+    /// Longest `q` honored, in bytes; the rest is ignored. Real queries are a
+    /// few words; an unbounded one made every candidate id pay one substring
+    /// scan per term.
+    pub const MAX_QUERY_BYTES: usize = 256;
+    /// Most distinct terms, and most `packageid:` values, a query keeps.
+    pub const MAX_TERMS: usize = 8;
+
+    /// Parse a raw `q` value (bounded by [`Self::MAX_QUERY_BYTES`] and
+    /// [`Self::MAX_TERMS`]; repeated terms count once).
     pub fn parse(q: &str) -> Self {
+        let q = if q.len() > Self::MAX_QUERY_BYTES {
+            let mut end = Self::MAX_QUERY_BYTES;
+            while !q.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Drop the token the cut split, unless it is the only one.
+            let cut = &q[..end];
+            cut.rfind(char::is_whitespace).map_or(cut, |at| &cut[..at])
+        } else {
+            q
+        };
         let mut out = SearchQuery::default();
+        let keep = |list: &mut Vec<String>, value: String| {
+            if list.len() < Self::MAX_TERMS && !list.contains(&value) {
+                list.push(value);
+            }
+        };
         for token in q.split_whitespace() {
             // Lowered like stored ids (the format's `lower_id`), so `Ünicode`
             // finds `ünicode.lib`.
@@ -246,11 +280,11 @@ impl SearchQuery {
             }
             match token.split_once(':') {
                 Some(("packageid", value)) if !value.is_empty() => {
-                    out.exact_ids.push(value.to_string())
+                    keep(&mut out.exact_ids, value.to_string())
                 }
-                Some((_, value)) if !value.is_empty() => out.terms.push(value.to_string()),
+                Some((_, value)) if !value.is_empty() => keep(&mut out.terms, value.to_string()),
                 Some(_) => {}
-                None => out.terms.push(token),
+                None => keep(&mut out.terms, token),
             }
         }
         out
@@ -361,6 +395,23 @@ pub trait RepoReadOps: Send + Sync {
     /// version precedence. Empty when the id is unknown.
     async fn registration(&self, repo: &str, id: &str)
         -> Result<Vec<RegistrationEntry>, RepoError>;
+
+    /// The registration entry of one `(id, version)` — what a registration
+    /// leaf or catalog document needs. The default scans
+    /// [`Self::registration`]; backends that can look one version up directly
+    /// override it, so a leaf request does not load every version.
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .find(|e| e.version.eq_ignore_ascii_case(version)))
+    }
 
     /// Search packages in `repo` honoring listed/prerelease filtering and
     /// `skip`/`take` paging.
@@ -521,6 +572,18 @@ impl RepoReadOps for PackageFilteredReadOps {
         self.inner.registration(repo, id).await
     }
 
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.registration_entry(repo, id, version).await
+    }
+
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
         self.inner
             .search_with_package_filter(repo, params, &self.filter)
@@ -575,17 +638,46 @@ pub type UploadReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 pub struct PublishAuthorizationContext {
     /// Authenticated request actor (user or workload provenance).
     pub principal: Principal,
+    /// Which package mutation is being performed.
+    pub action: PackageMutation,
     /// Canonical package id extracted by the format parser.
     pub package_id: String,
     /// Canonical normalized package version extracted by the format parser.
     pub package_version: String,
 }
 
+/// A package mutation a [`PublishPolicy`] is consulted about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageMutation {
+    /// Publish or redeploy a version.
+    Publish,
+    /// Unlist (soft-delete) a version.
+    Unlist,
+    /// Relist a version.
+    Relist,
+    /// Hard-delete a version.
+    Delete,
+}
+
+impl PackageMutation {
+    /// The audit-ledger spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageMutation::Publish => "publish",
+            PackageMutation::Unlist => "unlist",
+            PackageMutation::Relist => "relist",
+            PackageMutation::Delete => "delete",
+        }
+    }
+}
+
 /// Request-specific policy and provenance hook for package publication.
 ///
 /// `authorize` runs after local staging and format parsing but before the staged
 /// bytes are promoted into CAS. `record_in_transaction` runs after component and
-/// asset changes on their still-open transaction, immediately before commit.
+/// asset changes on their still-open transaction, immediately before commit —
+/// for publishes and, with the matching [`PackageMutation`], for unlist,
+/// relist and hard delete too, so the same fence and ledger cover them.
 #[async_trait]
 pub trait PublishPolicy: Send + Sync {
     /// Authorize this canonical package identity. A denial must be explicit and
@@ -658,6 +750,16 @@ mod search_query_tests {
         assert_eq!(q.terms, ["json", "serializer"]);
 
         assert!(SearchQuery::parse("   ").is_empty());
+
+        // Bounded: a huge or repetitive `q` keeps a few distinct terms.
+        let q = SearchQuery::parse(&"a b c d e f g h i j k l ".repeat(5_000));
+        assert_eq!(q.terms.len(), SearchQuery::MAX_TERMS);
+        let q = SearchQuery::parse(&"same ".repeat(1_000));
+        assert_eq!(q.terms, ["same"]);
+        let q = SearchQuery::parse(&"ü".repeat(10_000));
+        assert!(q.terms[0].len() <= SearchQuery::MAX_QUERY_BYTES);
+        let q = SearchQuery::parse(&"packageid:x ".repeat(100));
+        assert_eq!(q.exact_ids, ["x"]);
         assert!(SearchQuery::parse("").matches("anything"));
         assert_eq!(SearchQuery::parse("a bcd").prefilter(), Some("bcd"));
         assert_eq!(SearchQuery::parse("packageid:x.y").prefilter(), Some("x.y"));

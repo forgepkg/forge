@@ -397,6 +397,87 @@ async fn flat_nuspec_serves_xml() {
     assert!(String::from_utf8(body).unwrap().contains("<package/>"));
 }
 
+/// A `.nuspec` is publisher-controlled XML served on the admin origin. An
+/// XHTML `<script>` in it must never run there: every feed response is
+/// sandboxed, script-free and a download, whatever the route or status.
+#[tokio::test]
+async fn feed_responses_are_sandboxed_downloads() {
+    let mut ops = MockOps::default();
+    ops.nuspecs.insert(
+        ("evil.pkg".into(), "1.0.0".into()),
+        br#"<?xml version="1.0"?><package><html:script xmlns:html="http://www.w3.org/1999/xhtml">fetch('/admin/users')</html:script></package>"#.to_vec(),
+    );
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+    for uri in [
+        "/flat/evil.pkg/1.0.0/evil.pkg.nuspec",
+        "/flat/evil.pkg/9.9.9/evil.pkg.nuspec",
+        "/index.json",
+        "/query?q=evil",
+        "/no/such/route",
+    ] {
+        let (_status, headers, _body) = get(&router, uri).await;
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("default-src 'none'; sandbox"),
+            "{uri}"
+        );
+        assert_eq!(
+            headers
+                .get("content-disposition")
+                .map(|v| v.to_str().unwrap()),
+            Some("attachment"),
+            "{uri}"
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "{uri}"
+        );
+    }
+}
+
+/// Ids that are not well-formed never reach the read backend (a proxy would
+/// paste them into credentialed upstream URLs): every id-addressed route
+/// answers 404 first, however the id is percent-encoded.
+#[tokio::test]
+async fn malformed_ids_are_404_before_the_backend() {
+    let traversal = "x/../sample.lib".to_string();
+    let mut ops = MockOps::default();
+    let entry = VersionEntry {
+        original_id: traversal.clone(),
+        version: "1.0.0".into(),
+        version_original: "1.0.0".into(),
+        listed: true,
+    };
+    // A backend that would answer for the malformed id if asked.
+    ops.versions.insert(traversal.clone(), vec![entry]);
+    ops.nuspecs
+        .insert((traversal.clone(), "1.0.0".into()), b"<package/>".to_vec());
+    let router = nuget_router(
+        RepoKind::Proxy,
+        ctx(RepoKind::Proxy, ops, MockBytes::default()),
+    );
+    for uri in [
+        "/flat/x%2F..%2Fsample.lib/index.json",
+        "/flat/X%2F..%2Fsample.lib/1.0.0/x.nuspec",
+        "/flat/sample.lib%3Fq%3D1/index.json",
+        "/flat/sample.lib%23frag/index.json",
+        "/registration/x%2F..%2Fsample.lib/index.json",
+        "/registration/x%2F..%2Fsample.lib/1.0.0.json",
+        "/catalog/x%2F..%2Fsample.lib/1.0.0.json",
+    ] {
+        let (status, _h, _b) = get(&router, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn flat_version_normalized_on_path() {
     // Request version "1.0" should resolve the stored normalized "1.0.0".
@@ -449,6 +530,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH512".into()),
                 nuspec_bytes: Some(nuspec_with_dep()),
+                manifest_summary: None,
                 published: None,
             },
             RegistrationEntry {
@@ -457,6 +539,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH2".into()),
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: None,
             },
         ],
@@ -504,6 +587,65 @@ async fn registration_inlined_page_shape() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+/// Up to 128 versions the index inlines every page (of 64); beyond that the
+/// index only lists the pages and each page is served on its own URL.
+#[tokio::test]
+async fn registration_pages_large_packages() {
+    let entry = |i: usize| RegistrationEntry {
+        original_id: "Big.Lib".into(),
+        version: format!("1.0.{i}"),
+        listed: true,
+        package_hash_sha512_base64: None,
+        nuspec_bytes: None,
+        manifest_summary: None,
+        published: None,
+    };
+    let mut ops = MockOps::default();
+    ops.registration
+        .insert("big.lib".into(), (0..200).map(entry).collect());
+    ops.registration
+        .insert("small.lib".into(), (0..100).map(entry).collect());
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+
+    let (status, _h, body) = get(&router, "/registration/small.lib/index.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["count"], 2);
+    assert_eq!(doc["items"][0]["count"], 64);
+    assert_eq!(doc["items"][0]["items"].as_array().unwrap().len(), 64);
+    assert_eq!(doc["items"][1]["items"].as_array().unwrap().len(), 36);
+
+    let (status, _h, body) = get(&router, "/registration/big.lib/index.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["count"], 4);
+    let pages = doc["items"].as_array().unwrap();
+    assert!(
+        pages.iter().all(|p| p.get("items").is_none()),
+        "pages are not inlined"
+    );
+    assert_eq!(pages[3]["count"], 8);
+    let page_url = pages[1]["@id"].as_str().unwrap();
+    assert_eq!(
+        page_url,
+        format!("{BASE}/v3/main/registration/big.lib/page/1.0.64/1.0.127.json")
+    );
+    let (status, _h, body) = get(&router, &page_url[format!("{BASE}/v3/main").len()..]).await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 64);
+    assert_eq!(page["lower"], "1.0.64");
+    let (status, _h, _b) = get(&router, "/registration/big.lib/page/1.0.1/1.0.2.json").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "only real page bounds resolve"
     );
 }
 
@@ -762,6 +904,7 @@ async fn search_hits_carry_manifest_metadata_and_downloads() {
             listed: true,
         }],
         nuspec_bytes: Some(nuspec_with_metadata()),
+        manifest_summary: None,
         total_downloads: Some(42),
     }];
     let router = nuget_router(
@@ -797,6 +940,7 @@ async fn registration_leaf_and_catalog_documents_resolve() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH".into()),
                 nuspec_bytes: Some(nuspec_with_metadata()),
+                manifest_summary: None,
                 published: Some(published),
             },
             RegistrationEntry {
@@ -805,6 +949,7 @@ async fn registration_leaf_and_catalog_documents_resolve() {
                 listed: false,
                 package_hash_sha512_base64: None,
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: Some(published),
             },
         ],
@@ -1001,6 +1146,41 @@ async fn put_multipart(
         .to_bytes()
         .to_vec();
     (status, out)
+}
+
+/// The multipart parser buffers everything before the first part in memory:
+/// a body that does not reach its first part's headers within 64 KiB is
+/// refused (it used to be buffered up to the whole upload limit).
+#[tokio::test]
+async fn push_with_an_oversized_multipart_preamble_is_refused() {
+    let w = MockWrite::found();
+    let last = w.last_upload.clone();
+    let router = nuget_router(RepoKind::Hosted, ctx_with_write(RepoKind::Hosted, w));
+    let boundary = "TESTBOUNDARY1234";
+    let mut body = vec![b'x'; 1024 * 1024];
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"package\"; filename=\"p.nupkg\"\r\n\r\n",
+    );
+    body.extend_from_slice(b"PK\x03\x04-nupkg-bytes");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/package")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .header("X-NuGet-ApiKey", "key")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(last.lock().unwrap().as_ref().is_none_or(Vec::is_empty));
+
+    // A short preamble is still fine.
+    let (status, _) = put_multipart(&router, "/package", Some("key"), b"PK\x03\x04").await;
+    assert_eq!(status, StatusCode::CREATED);
 }
 
 #[tokio::test]

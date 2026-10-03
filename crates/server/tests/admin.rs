@@ -69,6 +69,176 @@ async fn non_admin_forbidden() {
     assert_eq!(resp.status(), 403, "non-admin must be 403");
 }
 
+/// Proxy timings are bounded: a negative TTL made every unconfirmed row
+/// prunable at once, and an unbounded not-found TTL let one request hide a
+/// package for years.
+/// A group's reserved prefixes are validated, normalized (lowercase, a
+/// trailing `*` dropped, deduplicated) and only accepted on groups.
+#[tokio::test]
+async fn group_reserved_prefixes_are_validated() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let create = |body: Value| {
+        let req = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let group = format!("grp{}", common::unique());
+    let resp = create(json!({"name": group, "kind": "group",
+                             "reserved_prefixes": ["Acme.*", " Contoso.", "acme."]}))
+    .await;
+    assert_eq!(resp.status(), 201);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["reserved_prefixes"], json!(["acme.", "contoso."]));
+
+    for bad in [json!([""]), json!(["acme/"]), json!(["a b"]), json!(["*"])] {
+        let resp = create(json!({"name": format!("grp{}", common::unique()),
+                                 "kind": "group", "reserved_prefixes": bad}))
+        .await;
+        assert_eq!(resp.status(), 400, "{bad}");
+    }
+    let resp = create(
+        json!({"name": format!("h{}", common::unique()), "kind": "hosted",
+                             "reserved_prefixes": ["acme."]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 400, "only groups reserve prefixes");
+
+    // Update replaces the list; `[]` clears it.
+    let update = |body: Value| {
+        let req = client
+            .put(format!("{}/admin/repositories/{group}", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body);
+        async move { req.send().await.unwrap() }
+    };
+    let view: Value = update(json!({"reserved_prefixes": ["Fabrikam."]}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["reserved_prefixes"], json!(["fabrikam."]));
+    assert_eq!(view["prefer_hosted"], json!(true));
+    let view: Value = update(json!({"reserved_prefixes": []}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["reserved_prefixes"], json!([]));
+}
+
+#[tokio::test]
+async fn proxy_timings_are_validated() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    for (field, value) in [
+        ("not_found_ttl_seconds", -1),
+        ("not_found_ttl_seconds", 31_536_000),
+        ("metadata_ttl_seconds", -5),
+        ("package_delay_seconds", -1),
+    ] {
+        let mut body = json!({
+            "name": format!("px{}", common::unique()),
+            "kind": "proxy",
+            "remote_url": "https://api.nuget.org/v3/index.json",
+        });
+        body[field] = json!(value);
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{field} = {value}");
+    }
+    let name = format!("px{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://api.nuget.org/v3/index.json",
+                      "not_found_ttl_seconds": 600}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .put(format!("{}/admin/repositories/{name}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"not_found_ttl_seconds": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "updates are validated too");
+}
+
+/// Usernames are stored canonical (trimmed, NFC, lowercased): a case or
+/// spacing variant of an existing name is the same account (409 on create),
+/// and every spelling signs in to it. Names without a canonical form are 400.
+#[tokio::test]
+async fn usernames_are_canonical() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let lower = format!("carol{}", common::unique());
+    let typed = format!("  {} ", lower.to_uppercase());
+
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": typed, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    assert_eq!(created["username"], json!(lower), "stored canonical");
+
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": lower, "password": "other-pw", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "a case variant is the same account");
+
+    for bad in ["", "   ", r"bad\nname", r"nul\u0000name"] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"username": "{bad}", "password": "pw123456"}}"#
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+    }
+
+    for spelling in [lower.to_uppercase(), format!(" {lower}")] {
+        let resp = client
+            .post(format!("{}/auth/login", srv.base_url))
+            .json(&json!({"username": spelling, "password": "pw123456"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{spelling:?} signs in");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["user_id"], created["id"],
+            "{spelling:?} is the same account"
+        );
+        assert_eq!(body["username"], json!(lower));
+    }
+}
+
 /// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
 /// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
 /// for a non-admin caller.

@@ -26,6 +26,11 @@
 //!    rejection: the local store could not tell whether the username is a
 //!    local password account (user lookup failed, or no argon2 slot freed up
 //!    under load), so the password must not be forwarded upstream either.
+//! 0. The username is **canonicalized** first
+//!    ([`forge_db::username::canonical_username`]: trimmed, NFC, lowercased),
+//!    so every provider — including an upstream that receives it — sees the
+//!    one spelling Forge maps to an account. An invalid username (empty,
+//!    control characters) is rejected without consulting any provider.
 //! 5. No provider authenticated and none rejected/was-unavailable (all
 //!    [`AuthOutcome::Skip`] or an empty chain) → [`ChainOutcome::NoCredentials`]:
 //!    the password path simply had nothing to say, and the caller falls back to
@@ -92,6 +97,14 @@ impl Chain {
     /// See the module-level docs for the exact ordering / fail-closed
     /// semantics.
     pub async fn authenticate(&self, cred: &PasswordCredential<'_>) -> ChainOutcome {
+        let Ok(username) = forge_db::username::canonical_username(cred.username) else {
+            return ChainOutcome::Rejected;
+        };
+        let cred = &PasswordCredential {
+            username: &username,
+            password: cred.password,
+            client_ip: cred.client_ip,
+        };
         let mut saw_rejected = false;
         let mut saw_unavailable = false;
 
@@ -226,8 +239,8 @@ pub async fn map_identity_to_principal(
 ///   built-in `admin` role membership follow the upstream verdict, so an upstream
 ///   demotion takes effect here. Without an authoritative reading (no admin
 ///   mapping, or a validated-credential cache hit) nothing is changed for an
-///   existing user. A role change is picked up by the authz cache within its TTL
-///   (callers holding the cache may invalidate sooner).
+///   existing user. A demotion also ends the user's browser sessions; callers
+///   holding the authorization cache drop the user's effective set.
 /// * [`AuthSource::UpstreamBasic`] without `auto_provision` → behave like
 ///   [`map_identity_to_principal`]: an existing, active upstream-basic user of
 ///   that name, else `Ok(None)` (caller denies).
@@ -255,7 +268,9 @@ pub async fn provision_and_map(
             // realm's user): never map or take it over.
             tracing::warn!(
                 username = %identity.username,
-                "upstream login denied: username is owned by a non-upstream account"
+                realm_id = ?identity.realm_id,
+                "upstream login denied: username is owned by a non-upstream account, \
+                 another realm's account, or an orphan of a deleted realm"
             );
             return Ok(None);
         };
@@ -275,7 +290,11 @@ pub async fn provision_and_map(
         if identity.admin_authoritative {
             // Keep the RBAC admin role in step with the (authoritative) upstream
             // verdict so a demotion does not leave a stale role behind.
-            forge_db::authz_dao::sync_admin_role(pool, user.id, user.is_admin).await?;
+            let changed =
+                forge_db::authz_dao::sync_admin_role(pool, user.id, user.is_admin).await?;
+            if changed && !user.is_admin {
+                revoke_sessions_on_demotion(pool, user.id).await?;
+            }
         }
         return Ok(Some(UserPrincipal {
             user_id: user.id,
@@ -285,6 +304,19 @@ pub async fn provision_and_map(
     }
 
     map_identity_to_principal(pool, identity).await
+}
+
+/// End every browser session of a user an authoritative source (upstream
+/// groups, IdP claims) just demoted from admin: those sessions were opened —
+/// and their CSRF tokens handed out — while the user was an admin.
+pub async fn revoke_sessions_on_demotion(pool: &PgPool, user_id: i64) -> sqlx::Result<()> {
+    let revoked = forge_db::session_dao::revoke_all_for_user(pool, user_id).await?;
+    tracing::info!(
+        user_id,
+        revoked,
+        "admin revoked by the identity source; sessions ended"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

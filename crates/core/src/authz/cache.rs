@@ -5,8 +5,12 @@
 //! [`EffectiveSet`](super::EffectiveSet). Computing that set is a DB round trip
 //! (`user_role → repository_privilege`), far too costly to run on every
 //! download/restore request. This module sits in front of that load with the
-//! slice-1 [`forge_cache::Cache`] (L1 moka + optional Redis L2 + a pub/sub
-//! invalidation backplane).
+//! slice-1 [`forge_cache::Cache`] — **in-process only**
+//! ([`forge_cache::Cache::get_or_try_insert_local`]): an effective set is an
+//! authorization decision, so it is never read from or written to Redis,
+//! where anyone with access to Redis could plant an admin set. Redis carries
+//! only the invalidations (the pub/sub backplane), so a grant change still
+//! evicts every instance's copy.
 //!
 //! ## What is cached, and the key
 //!
@@ -38,7 +42,7 @@
 //! * **Blanket** — a change to a *role*'s grants/selectors (which can affect many
 //!   principals) invalidates the whole `authz` namespace via
 //!   [`invalidate_all`]. This is the "epoch roll" of the plan, realized with the
-//!   cache crate's `invalidate_ns` (drop all `authz:*` from L1+L2 and broadcast);
+//!   cache crate's `invalidate_ns` (drop all `authz:*` and broadcast);
 //!   it is O(1) to publish and always correct. Enumerating affected users is a
 //!   future optimization, not a correctness requirement.
 //!
@@ -109,7 +113,7 @@ pub async fn load_user_effective(
     dual_read_is_admin: bool,
 ) -> Result<EffectiveSet, LoadError> {
     let raw = cache
-        .get_or_try_insert_with(NS_AUTHZ, &user_key(user_id), DEFAULT_TTL, || async {
+        .get_or_try_insert_local(NS_AUTHZ, &user_key(user_id), DEFAULT_TTL, || async {
             let rows = authz_dao::load_user_effective(pool, user_id).await?;
             Ok::<RawEffectiveSet, LoadError>(to_raw_set(rows))
         })
@@ -125,7 +129,7 @@ pub async fn load_anonymous_effective(
     cache: &Cache,
 ) -> Result<EffectiveSet, LoadError> {
     let raw = cache
-        .get_or_try_insert_with(NS_AUTHZ, ANON_KEY, DEFAULT_TTL, || async {
+        .get_or_try_insert_local(NS_AUTHZ, ANON_KEY, DEFAULT_TTL, || async {
             let rows = authz_dao::load_anonymous_effective(pool).await?;
             Ok::<RawEffectiveSet, LoadError>(to_raw_set(rows))
         })
@@ -147,7 +151,7 @@ pub async fn load_role_effective(
     role_id: i64,
 ) -> Result<EffectiveSet, LoadError> {
     let raw = cache
-        .get_or_try_insert_with(NS_AUTHZ, &role_key(role_id), DEFAULT_TTL, || async {
+        .get_or_try_insert_local(NS_AUTHZ, &role_key(role_id), DEFAULT_TTL, || async {
             let rows = authz_dao::load_role_effective(pool, role_id).await?;
             Ok::<RawEffectiveSet, LoadError>(to_raw_set(rows))
         })
@@ -220,7 +224,7 @@ pub async fn invalidate_anonymous(cache: &Cache) {
 
 /// Blanket-invalidate **all** cached effective sets (the "epoch roll"): a change
 /// to any role's grants/selectors that may affect many principals. Drops the
-/// whole `authz` namespace from L1+L2 and broadcasts.
+/// whole `authz` namespace and broadcasts.
 pub async fn invalidate_all(cache: &Cache) {
     cache.invalidate_ns(NS_AUTHZ).await;
 }

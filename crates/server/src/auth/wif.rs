@@ -67,6 +67,9 @@ fn default_positive_cache() -> u64 {
 const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_POSITIVE_CACHE_SECONDS: u64 = 5 * 60;
+/// Cache namespace for positive workload-token verdicts. In-process only
+/// ([`forge_cache::Cache::get_or_try_insert_local`]): a verdict stored in Redis
+/// could be planted by anyone with access to it.
 const NS_WIF_VERIFIED: &str = "wif_verified";
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const GITLAB_COM_ISSUER: &str = "https://gitlab.com";
@@ -106,7 +109,34 @@ pub struct WorkloadIdentityRealmConfig {
     /// granted. No rule matches ⇒ **default deny** (the token is rejected).
     #[serde(default)]
     pub rules: Vec<ClaimRule>,
+    /// Extra claims this issuer uses as a **stable workload identity**, on top
+    /// of the built-in [`STABLE_IDENTITY_CLAIMS`]. For issuers other than
+    /// GitHub Actions and GitLab.com every rule must pin at least one identity
+    /// claim; a custom CI system declares its own (e.g. `pipeline_id`) here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_claims: Vec<String>,
 }
+
+/// Claims that identify a workload (a repository/project, its owner, or a
+/// specific workflow) across the CI systems Forge knows. For issuers other
+/// than GitHub Actions and GitLab.com, every rule must pin at least one of
+/// these or of the realm's own `identity_claims`; anything else (`actor`,
+/// `event_name`, `workflow`, …) can be shared by unrelated workloads.
+pub const STABLE_IDENTITY_CLAIMS: &[&str] = &[
+    "sub",
+    "repository_id",
+    "repository_owner_id",
+    "repository",
+    "repository_owner",
+    "job_workflow_ref",
+    "workflow_ref",
+    "project_id",
+    "job_project_id",
+    "namespace_id",
+    "job_namespace_id",
+    "project_path",
+    "namespace_path",
+];
 
 /// One authorization rule: when **all** `conditions` match the token's claims,
 /// grant the forge `role`. At least one condition is mandatory: accepting every
@@ -195,7 +225,19 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
                 .into(),
         );
     }
+    cfg.identity_claims =
+        normalize_nonempty_values(std::mem::take(&mut cfg.identity_claims), "identity_claims")?;
+    if let Some(claim) = cfg
+        .identity_claims
+        .iter()
+        .find(|claim| is_context_only_claim(claim))
+    {
+        return Err(format!(
+            "identity_claims: {claim:?} is execution context, not a workload identity"
+        ));
+    }
     let issuer = cfg.issuer.clone();
+    let identity_claims = cfg.identity_claims.clone();
     for (i, rule) in cfg.rules.iter_mut().enumerate() {
         rule.role = rule.role.trim().to_string();
         if rule.role.is_empty() {
@@ -226,7 +268,7 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
                 ));
             }
         }
-        if !rule_has_identity_scope(&issuer, rule) {
+        if !rule_has_identity_scope(&issuer, &identity_claims, rule) {
             if normalize_issuer(&issuer) == GITHUB_ACTIONS_ISSUER {
                 return Err(format!(
                     "rule {i}: GitHub Actions trust must include both repository_id and repository_owner_id; mutable names/sub/ref/environment are optional extra boundaries, not identity anchors"
@@ -238,7 +280,8 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
                 ));
             }
             return Err(format!(
-                "rule {i}: at least one workload identity claim is required (for example sub, repository_id, job_project_id, project_path, or a provider-specific workload identifier); issuer/audience/time/ref/environment-only rules are unsafe"
+                "rule {i}: at least one stable workload identity claim is required ({}; or a claim listed in identity_claims for a custom issuer); rules on context such as ref, environment, actor or event_name alone are unsafe",
+                STABLE_IDENTITY_CLAIMS.join(", ")
             ));
         }
     }
@@ -292,7 +335,7 @@ pub struct WorkloadIdentityRealm {
 
 impl WorkloadIdentityRealm {
     /// Build the runtime from a realm row, reusing the shared cache for
-    /// discovery/JWKS and the SSRF-guarded outbound client (12.7 §3.6).
+    /// discovery/JWKS and the no-redirect, https-only metadata client.
     pub fn build(realm: &AuthRealm, cache: &Cache) -> anyhow::Result<Self> {
         let normalized = validate_workload_identity_config(&realm.config)
             .map_err(|e| anyhow::anyhow!("config: {e}"))?;
@@ -302,7 +345,7 @@ impl WorkloadIdentityRealm {
         .into();
         let config: WorkloadIdentityRealmConfig =
             serde_json::from_value(normalized).map_err(|e| anyhow::anyhow!("config: {e}"))?;
-        let http = ssrf::outbound_metadata_client()
+        let http = ssrf::outbound_metadata_client(config.allow_http_issuer)
             .map_err(|e| anyhow::anyhow!("build outbound metadata client: {e}"))?;
         let meta = OidcMetadataClient::new(config.issuer.clone(), http, cache.clone());
         let verification_policy_hash = verification_policy_hash(&config);
@@ -348,7 +391,7 @@ impl WorkloadIdentityRealm {
         };
 
         self.cache
-            .get_or_try_insert_with(NS_WIF_VERIFIED, &key, ttl, verify)
+            .get_or_try_insert_local(NS_WIF_VERIFIED, &key, ttl, verify)
             .await
     }
 }
@@ -439,7 +482,11 @@ impl WorkloadIdentitySource {
             }
         };
 
-        let Some(role_name) = matched_role(&verified.claims, &realm.config.rules) else {
+        let Some(role_name) = matched_role(
+            &verified.claims,
+            &realm.config.rules,
+            &realm.config.identity_claims,
+        ) else {
             tracing::warn!(
                 realm = %realm.realm_name,
                 subject = %verified.subject,
@@ -654,10 +701,14 @@ fn normalize_issuer(issuer: &str) -> &str {
 
 /// The forge role granted by the **first** rule whose every condition matches
 /// `claims`, or `None` (default deny).
-pub fn matched_role<'a>(claims: &IdTokenClaims, rules: &'a [ClaimRule]) -> Option<&'a str> {
+pub fn matched_role<'a>(
+    claims: &IdTokenClaims,
+    rules: &'a [ClaimRule],
+    identity_claims: &[String],
+) -> Option<&'a str> {
     let matched = rules
         .iter()
-        .find(|rule| rule_matches(claims, rule))
+        .find(|rule| rule_matches(claims, rule, identity_claims))
         .map(|r| r.role.as_str())?;
     (matched != authz_dao::ADMIN_ROLE).then_some(matched)
 }
@@ -665,9 +716,9 @@ pub fn matched_role<'a>(claims: &IdTokenClaims, rules: &'a [ClaimRule]) -> Optio
 /// Whether every condition of `rule` matches `claims`. Empty and semantically
 /// context-only rule sets fail closed even if a malformed row bypassed config
 /// validation.
-fn rule_matches(claims: &IdTokenClaims, rule: &ClaimRule) -> bool {
+fn rule_matches(claims: &IdTokenClaims, rule: &ClaimRule, identity_claims: &[String]) -> bool {
     !rule.conditions.is_empty()
-        && rule_has_identity_scope(&claims.iss, rule)
+        && rule_has_identity_scope(&claims.iss, identity_claims, rule)
         && rule.conditions.iter().all(|cond| {
             let values = claim_values(claims, &cond.claim);
             values.iter().any(|v| cond.any_of.iter().any(|a| a == v))
@@ -681,7 +732,7 @@ fn rule_matches(claims: &IdTokenClaims, rule: &ClaimRule) -> bool {
 /// repository/project plus owner/namespace identity explicitly. For other/custom
 /// issuers, stay extensible by accepting provider-specific claims while rejecting
 /// protocol, temporal, ref, and environment fields shared by many workloads.
-fn rule_has_identity_scope(issuer: &str, rule: &ClaimRule) -> bool {
+fn rule_has_identity_scope(issuer: &str, identity_claims: &[String], rule: &ClaimRule) -> bool {
     if normalize_issuer(issuer) == GITHUB_ACTIONS_ISSUER {
         let has_repository_id = rule
             .conditions
@@ -707,14 +758,14 @@ fn rule_has_identity_scope(issuer: &str, rule: &ClaimRule) -> bool {
         return has_project_id && has_namespace_id;
     }
 
-    rule.conditions
-        .iter()
-        .any(|condition| !is_context_only_claim(&condition.claim))
+    rule.conditions.iter().any(|condition| {
+        STABLE_IDENTITY_CLAIMS.contains(&condition.claim.as_str())
+            || identity_claims.contains(&condition.claim)
+    })
 }
 
-/// Claims that cannot, on their own, identify which workload is trusted.
-/// This is deliberately a denylist so custom OIDC issuers can use their own
-/// stable workload-id claim without a Forge release adding it to an allowlist.
+/// Claims that cannot identify which workload is trusted; never accepted as
+/// a realm's `identity_claims`.
 fn is_context_only_claim(claim: &str) -> bool {
     matches!(
         claim,
@@ -864,16 +915,35 @@ mod tests {
         }))
         .is_err());
 
-        // The generic policy remains extensible for custom provider identity
-        // claims rather than imposing a Forge-maintained allowlist.
-        assert!(validate_workload_identity_config(&json!({
-            "issuer": "https://custom.example", "allowed_audiences": ["a"],
-            "rules": [{"role": "ci", "conditions": [
-                {"claim": "custom_workload_id", "any_of": ["build-system-42"]},
-                {"claim": "environment", "any_of": ["production"]}
-            ]}],
-        }))
+        // A custom issuer's own identity claim counts only once the realm
+        // declares it; an arbitrary claim (here: one any workload can carry)
+        // is not an identity anchor.
+        let custom = |identity_claims: serde_json::Value, claim: &str| {
+            json!({
+                "issuer": "https://custom.example", "allowed_audiences": ["a"],
+                "identity_claims": identity_claims,
+                "rules": [{"role": "ci", "conditions": [
+                    {"claim": claim, "any_of": ["build-system-42"]},
+                    {"claim": "environment", "any_of": ["production"]}
+                ]}],
+            })
+        };
+        assert!(
+            validate_workload_identity_config(&custom(json!([]), "custom_workload_id")).is_err()
+        );
+        assert!(validate_workload_identity_config(&custom(json!([]), "event_name")).is_err());
+        assert!(validate_workload_identity_config(&custom(json!([]), "actor")).is_err());
+        assert!(validate_workload_identity_config(&custom(
+            json!(["custom_workload_id"]),
+            "custom_workload_id"
+        ))
         .is_ok());
+        assert!(
+            validate_workload_identity_config(&custom(json!(["ref"]), "ref")).is_err(),
+            "context claims cannot be declared identities"
+        );
+        // Built-in stable claims work for any issuer (self-managed GitLab, GHES).
+        assert!(validate_workload_identity_config(&custom(json!([]), "job_project_id")).is_ok());
 
         // GitHub's public issuer requires repository/workload identity. Owner,
         // branch, and environment context alone can cover unrelated repos.
@@ -1030,7 +1100,7 @@ mod tests {
                 ],
             },
         ];
-        assert_eq!(matched_role(&claims, &rules), Some("publisher"));
+        assert_eq!(matched_role(&claims, &rules, &[]), Some("publisher"));
     }
 
     #[test]
@@ -1052,7 +1122,7 @@ mod tests {
                 },
             ],
         }];
-        assert_eq!(matched_role(&claims, &rules), None);
+        assert_eq!(matched_role(&claims, &rules, &[]), None);
     }
 
     #[test]
@@ -1062,7 +1132,7 @@ mod tests {
             role: "reader".into(),
             conditions: vec![],
         }];
-        assert_eq!(matched_role(&claims, &rules), None);
+        assert_eq!(matched_role(&claims, &rules, &[]), None);
     }
 
     #[test]
@@ -1083,7 +1153,7 @@ mod tests {
                 },
             ],
         }];
-        assert_eq!(matched_role(&claims, &rules), None);
+        assert_eq!(matched_role(&claims, &rules, &[]), None);
     }
 
     #[test]
@@ -1096,7 +1166,7 @@ mod tests {
                 any_of: vec!["subject-1".into()],
             }],
         }];
-        assert_eq!(matched_role(&claims, &rules), None);
+        assert_eq!(matched_role(&claims, &rules, &[]), None);
     }
 
     #[test]

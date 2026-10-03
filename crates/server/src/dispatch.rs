@@ -113,7 +113,17 @@ fn principal_allows_protocol_mutations(principal: &Principal) -> bool {
 }
 
 /// Axum fallback handler mounted at `/v3/{repo}` (and everything under it).
+///
+/// Every response — including the unknown-repository and authorization
+/// answers produced here — gets the feed's browser-hardening headers
+/// ([`forge_nuget::routes::harden_response_headers`]).
 pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let mut response = dispatch_request(state, req).await;
+    forge_nuget::routes::harden_response_headers(response.headers_mut());
+    response
+}
+
+async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let principal = principal_of(&req);
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -125,7 +135,13 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        // Answer an unknown name exactly like a repository the caller may
+        // not read, so repository names cannot be enumerated; only a global
+        // admin (who can list them anyway) learns that it does not exist.
+        Ok(None) if state.authz.is_global_admin(&principal).await => {
+            return (StatusCode::NOT_FOUND, "repository not found").into_response();
+        }
+        Ok(None) => return authz_denied(&principal),
         Err(e) => {
             tracing::error!(error = %e, repo = %repo_name, "repo lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -352,6 +368,7 @@ impl PublishPolicy for SelectorPublishPolicy {
                 subject_sha256: &subject_sha256,
                 jti_sha256: jti_sha256.as_ref(),
                 token_issued_at,
+                action: context.action.as_str(),
             },
         )
         .await
@@ -437,6 +454,7 @@ mod tests {
             user_id: 1,
             token_id: Some(7),
             is_admin: false,
+            method: forge_core::auth::AuthMethod::Token
         }));
         assert!(principal_allows_protocol_mutations(&Principal::Workload {
             realm_id: 1,
@@ -451,6 +469,7 @@ mod tests {
             user_id: 1,
             token_id: None,
             is_admin: true,
+            method: forge_core::auth::AuthMethod::Password
         }));
         assert!(!principal_allows_protocol_mutations(
             &Principal::Unauthenticated

@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 bytes = "1"
 # Bridge the multipart upload field stream into the CAS's AsyncRead.
 tokio-util = { workspace = true }
+# `spawn_blocking` for rendering large registration documents.
+tokio = { workspace = true, features = ["rt"] }
 futures-util = { workspace = true }
 # Owned async stream so the multipart body can outlive the borrow as a 'static
 # reader handed to the CAS.

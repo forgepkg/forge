@@ -27,10 +27,11 @@ use std::time::Duration;
 use forge_cache::Cache;
 use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential};
 use forge_core::auth::{
-    CredKeyPepper, UpstreamBasicConfig, UpstreamBasicProvider, ValidatedCredentialCache,
+    provision_and_map, Chain, ChainOutcome, CredKeyPepper, UpstreamBasicConfig,
+    UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf::credential_forward_client;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{pool, unique};
@@ -80,6 +81,7 @@ fn config_for(url: String) -> UpstreamBasicConfig {
         request_timeout: Duration::from_secs(5),
         required_groups: Vec::new(),
         groups_path: String::new(),
+        identity_path: String::new(),
         admin_group: String::new(),
         provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
         auto_provision: true,
@@ -238,6 +240,32 @@ async fn required_group_unmet_is_rejected_despite_200() {
     );
 }
 
+/// A success body is read for groups/identity up to 1 MiB only: an upstream
+/// cannot make every login buffer an arbitrary amount. Past the cap the gate
+/// cannot be evaluated, so the login fails closed.
+#[tokio::test]
+async fn oversized_success_body_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "user": { "roles": ["nuget-users"] },
+            "padding": "x".repeat(2 * 1024 * 1024),
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(format!("{}/whoami", server.uri()));
+    config.groups_path = "user.roles".to_string();
+    config.required_groups = vec!["nuget-users".to_string()];
+    let provider = make_provider(config, Duration::from_secs(300)).await;
+    let user = unique_user("up-big");
+    assert_eq!(
+        provider.authenticate(&cred(&user, "pw")).await,
+        AuthOutcome::Unavailable
+    );
+}
+
 #[tokio::test]
 async fn required_group_met_authenticates() {
     let server = MockServer::start().await;
@@ -393,4 +421,136 @@ async fn stalled_upstream_hits_the_request_timeout() {
         "the forward was cut off by request_timeout, took {:?}",
         started.elapsed()
     );
+}
+
+fn basic(username: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    )
+}
+
+/// The chain canonicalizes the typed username (trim, NFC, lowercase) and the
+/// upstream is asked about exactly that name, so `Alice `, `ALICE` and
+/// `alice` are one identity — one forward, one account.
+#[tokio::test]
+async fn chain_forwards_and_maps_the_canonical_username() {
+    let server = MockServer::start().await;
+    let user = unique_user("canon");
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .and(header("authorization", basic(&user, "pw").as_str()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let pool = pool().await;
+    let provider = make_provider(
+        config_for(format!("{}/status", server.uri())),
+        Duration::from_secs(60),
+    )
+    .await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+
+    let mut ids = Vec::new();
+    for typed in [format!("  {} ", user.to_uppercase()), user.clone()] {
+        let ChainOutcome::Authenticated { identity, .. } =
+            chain.authenticate(&cred(&typed, "pw")).await
+        else {
+            panic!("{typed:?} must authenticate");
+        };
+        assert_eq!(identity.username, user, "identity is the canonical name");
+        let principal = provision_and_map(&pool, &identity)
+            .await
+            .unwrap()
+            .expect("provisioned");
+        ids.push(principal.user_id);
+    }
+    assert_eq!(ids[0], ids[1], "one account for every spelling");
+    // The second spelling was a cache hit (the mock expects exactly one call).
+}
+
+/// A username with no canonical form never reaches the upstream.
+#[tokio::test]
+async fn chain_rejects_empty_and_control_character_usernames_without_forwarding() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = make_provider(
+        config_for(format!("{}/status", server.uri())),
+        Duration::from_secs(60),
+    )
+    .await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+    for typed in ["", "   ", "alice\nadmin", "al\u{0}ice"] {
+        assert_eq!(
+            chain.authenticate(&cred(typed, "pw")).await,
+            ChainOutcome::Rejected,
+            "{typed:?}"
+        );
+    }
+}
+
+/// An upstream that accepts a secret with any username (a personal access
+/// token) must not let one user's secret sign in as another: with
+/// `identity_path`, the account the upstream reports must be the one Forge
+/// maps to.
+#[tokio::test]
+async fn identity_path_binds_the_username_to_the_secret() {
+    let server = MockServer::start().await;
+    // Answers 200 for ANY username, as PAT-based upstreams do, and reports
+    // whose token it was.
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "Mallory" })),
+        )
+        .mount(&server)
+        .await;
+    let mut config = config_for(format!("{}/user", server.uri()));
+    config.identity_path = "login".to_string();
+    let provider = make_provider(config, Duration::from_secs(60)).await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+
+    // Mallory's token sent with the victim's username is rejected.
+    let victim = unique_user("victim");
+    assert_eq!(
+        chain.authenticate(&cred(&victim, "mallorys-pat")).await,
+        ChainOutcome::Rejected
+    );
+    // With her own name (any case) it authenticates — as her.
+    match chain.authenticate(&cred("MALLORY", "mallorys-pat")).await {
+        ChainOutcome::Authenticated { identity, .. } => assert_eq!(identity.username, "mallory"),
+        other => panic!("expected Authenticated, got {other:?}"),
+    }
+}
+
+/// A configured identity path the upstream does not answer is an outage, not
+/// a grant.
+#[tokio::test]
+async fn identity_path_missing_from_the_response_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 7 })))
+        .mount(&server)
+        .await;
+    let mut config = config_for(format!("{}/user", server.uri()));
+    config.identity_path = "login".to_string();
+    let provider = make_provider(config, Duration::from_secs(60)).await;
+    let user = unique_user("noident");
+    assert!(matches!(
+        provider.authenticate(&cred(&user, "pw")).await,
+        AuthOutcome::Unavailable
+    ));
 }

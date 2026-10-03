@@ -38,21 +38,43 @@ use super::principal::Principal;
 use super::token::{PrincipalSource, SourceOutcome};
 use crate::session::SessionService;
 
-/// The cookie name carrying the opaque session secret.
+/// The cookie name carrying the opaque session secret on a plain-http
+/// (development) deployment.
 pub const SESSION_COOKIE: &str = "forge_session";
 
-/// Resolves the `forge_session` cookie into a [`Principal::User`] via the
+/// The session cookie's name on an https deployment. Browsers accept a
+/// `__Host-` cookie only when it is `Secure`, host-only (no `Domain`) and
+/// `Path=/`, so a sibling subdomain or a plain-http response cannot plant
+/// one (cookie tossing / session fixation).
+pub const SECURE_SESSION_COOKIE: &str = "__Host-forge_session";
+
+/// The session cookie's name for a deployment (`secure`: served over https).
+pub fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+/// Resolves the session cookie into a [`Principal::User`] via the
 /// [`SessionService`] over the shared Postgres.
 pub struct SessionCookieSource {
     sessions: SessionService,
     pool: PgPool,
+    cookie_name: &'static str,
 }
 
 impl SessionCookieSource {
     /// Build a source over the session service + pool (the pool is used to read
     /// the live `app_user` row for the current `is_admin`/`active` flags).
-    pub fn new(sessions: SessionService, pool: PgPool) -> Self {
-        Self { sessions, pool }
+    /// `secure` selects the cookie name ([`session_cookie_name`]).
+    pub fn new(sessions: SessionService, pool: PgPool, secure: bool) -> Self {
+        Self {
+            sessions,
+            pool,
+            cookie_name: session_cookie_name(secure),
+        }
     }
 }
 
@@ -64,9 +86,21 @@ impl PrincipalSource for SessionCookieSource {
     }
 
     async fn resolve(&self, headers: &HeaderMap, _peer_ip: IpAddr) -> SourceOutcome {
-        // No `Cookie` header, or no `forge_session` within it → not our turn.
-        let Some(secret) = cookie_value(headers, SESSION_COOKIE) else {
-            return SourceOutcome::NoCredentials;
+        // No `Cookie` header, or no session cookie within it → not our turn.
+        // Two session cookies are ambiguous (one may have been planted for a
+        // narrower path or a parent domain): use neither, and do not clear
+        // either — clearing would drop the browser's own and keep the planted
+        // one.
+        let secret = match unique_cookie_value(headers, self.cookie_name) {
+            Ok(Some(secret)) => secret,
+            Ok(None) => return SourceOutcome::NoCredentials,
+            Err(DuplicateCookie) => {
+                tracing::warn!(
+                    cookie = self.cookie_name,
+                    "request carries more than one session cookie; ignoring them"
+                );
+                return SourceOutcome::NoCredentials;
+            }
         };
         if secret.is_empty() {
             return SourceOutcome::NoCredentials;
@@ -94,6 +128,7 @@ impl PrincipalSource for SessionCookieSource {
                 user_id: user.id,
                 token_id: None,
                 is_admin: user.is_admin,
+                method: crate::auth::AuthMethod::Session,
             }),
             // The session points at a vanished or deactivated user: it grants
             // nothing, so clear it like an expired one.
@@ -127,6 +162,35 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// More than one cookie of the same name in a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateCookie;
+
+/// The value of the only cookie called `name`, `Ok(None)` when absent, or
+/// [`DuplicateCookie`] when the request carries it more than once — which a
+/// browser does when another site on a parent domain, or a response for a
+/// narrower path, set a cookie of the same name. Credentials must not pick
+/// one of them.
+pub fn unique_cookie_value(
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<Option<String>, DuplicateCookie> {
+    let mut found = None;
+    for header in headers.get_all(http::header::COOKIE) {
+        let Ok(text) = header.to_str() else {
+            continue;
+        };
+        for pair in text.split(';') {
+            if let Some((k, v)) = pair.trim().split_once('=') {
+                if k.trim() == name && found.replace(v.trim().to_string()).is_some() {
+                    return Err(DuplicateCookie);
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -178,5 +242,36 @@ mod tests {
     fn first_match_wins_on_duplicate() {
         let h = headers_with_cookie("forge_session=first; forge_session=second");
         assert_eq!(cookie_value(&h, SESSION_COOKIE).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn unique_cookie_value_refuses_duplicates() {
+        let h = headers_with_cookie("a=1; forge_session=only");
+        assert_eq!(
+            unique_cookie_value(&h, SESSION_COOKIE),
+            Ok(Some("only".into()))
+        );
+        assert_eq!(
+            unique_cookie_value(&headers_with_cookie("a=1"), SESSION_COOKIE),
+            Ok(None)
+        );
+        let h = headers_with_cookie("forge_session=mine; forge_session=planted");
+        assert_eq!(
+            unique_cookie_value(&h, SESSION_COOKIE),
+            Err(DuplicateCookie)
+        );
+        // Across several `Cookie` headers too.
+        let mut h = headers_with_cookie("forge_session=mine");
+        h.append(COOKIE, "forge_session=planted".parse().unwrap());
+        assert_eq!(
+            unique_cookie_value(&h, SESSION_COOKIE),
+            Err(DuplicateCookie)
+        );
+        // The prefixed name is a different cookie.
+        let h = headers_with_cookie("forge_session=x; __Host-forge_session=y");
+        assert_eq!(
+            unique_cookie_value(&h, session_cookie_name(true)),
+            Ok(Some("y".into()))
+        );
     }
 }

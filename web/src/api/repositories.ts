@@ -54,6 +54,11 @@ export interface RepoView {
    * non-groups.
    */
   prefer_hosted: boolean
+  /**
+   * Group: package id prefixes (lowercase, e.g. `acme.`) never served from a
+   * proxy member, even before a hosted member has the id. Empty otherwise.
+   */
+  reserved_prefixes: string[]
 }
 
 /** `POST /admin/repositories` request body (`CreateRepo`). */
@@ -72,8 +77,9 @@ export interface CreateRepo {
   not_found_ttl_seconds?: number | null
   // Hosted field:
   allow_redeploy?: boolean
-  // Group field:
+  // Group fields:
   prefer_hosted?: boolean
+  reserved_prefixes?: string[]
 }
 
 /**
@@ -97,6 +103,8 @@ export interface UpdateRepo {
   not_found_ttl_seconds?: number | null
   allow_redeploy?: boolean
   prefer_hosted?: boolean
+  /** Replaces the whole list; `[]` clears it. */
+  reserved_prefixes?: string[]
 }
 
 /** A group member view (`MemberView`). */

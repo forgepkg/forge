@@ -9,14 +9,20 @@
 //! * `DELETE /package/{id}/{version}` — **unlist** (soft delete): 204 / 404.
 //! * `POST /package/{id}/{version}` — relist: 200 / 404.
 //!
-//! Hard delete is an admin operation, exposed via [`admin_hard_delete`] and
-//! wired by the server under `/admin/...` (Phase 10), not advertised here.
+//! Hard delete is an admin operation of the server's admin API
+//! (`DELETE /admin/repositories/{repo}/packages/{id}/{version}`), not part of
+//! the feed surface.
 
-use axum::extract::{Multipart, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{FromRequest, Multipart, Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::{DeleteOutcome, PublishOutcome};
+use futures_util::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 
 use crate::routes::{write_error_response, RouteContext};
@@ -54,21 +60,97 @@ fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<
     None
 }
 
+/// Most bytes a push body may carry before the headers of its first part are
+/// complete (any preamble, the first boundary and the part headers). The
+/// multipart parser buffers everything up to the first boundary in memory, so
+/// without this bound one request could make it hold `max_upload_bytes`.
+pub const MAX_MULTIPART_PREAMBLE_BYTES: usize = 64 * 1024;
+
+/// The `boundary` parameter of a `multipart/form-data` content type.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("boundary")
+            .then(|| value.trim().trim_matches('"').to_string())
+            .filter(|b| !b.is_empty())
+    })
+}
+
+/// Pass `body` through unchanged, but fail it (setting `overrun`) once
+/// [`MAX_MULTIPART_PREAMBLE_BYTES`] have gone by without the first part's
+/// headers being complete.
+fn preamble_guard(
+    body: impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+    boundary: &str,
+    overrun: Arc<AtomicBool>,
+) -> impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static {
+    let delimiter = format!("--{boundary}").into_bytes();
+    async_stream::try_stream! {
+        let mut head: Option<Vec<u8>> = Some(Vec::new());
+        futures_util::pin_mut!(body);
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            if let Some(seen) = head.as_mut() {
+                // Only the first MAX + 1 bytes matter: the first part's
+                // headers must end within them.
+                let room = (MAX_MULTIPART_PREAMBLE_BYTES + 1).saturating_sub(seen.len());
+                seen.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                let headers_end = find(seen, &delimiter).and_then(|at| {
+                    find(&seen[at..], b"\r\n\r\n").map(|end| at + end + 4)
+                });
+                if headers_end.is_some_and(|end| end <= MAX_MULTIPART_PREAMBLE_BYTES) {
+                    head = None;
+                } else if seen.len() > MAX_MULTIPART_PREAMBLE_BYTES {
+                    overrun.store(true, Ordering::Relaxed);
+                    Err(axum::Error::new(std::io::Error::other(
+                        "multipart preamble exceeds its limit",
+                    )))?;
+                }
+            }
+            yield chunk;
+        }
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Handler: `PUT /package` — publish (or redeploy) a `.nupkg`.
-pub async fn push(
-    State(ctx): State<RouteContext>,
-    headers: HeaderMap,
-    multipart: Multipart,
-) -> Response {
+pub async fn push(State(ctx): State<RouteContext>, req: Request) -> Response {
     let Some(write) = ctx.write.clone() else {
         // Should never be mounted for non-hosted repos; guard anyway.
         return (StatusCode::NOT_FOUND, "publish not supported").into_response();
     };
 
     // Push requires authentication: an API key must be present.
-    if let Some(resp) = require_write_credentials(&ctx, &headers) {
+    if let Some(resp) = require_write_credentials(&ctx, req.headers()) {
         return resp;
     }
+
+    // Bound what the multipart parser may buffer before the package bytes
+    // start (see [`MAX_MULTIPART_PREAMBLE_BYTES`]).
+    let preamble_overrun = Arc::new(AtomicBool::new(false));
+    let req = match req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(multipart_boundary)
+    {
+        Some(boundary) => {
+            let (parts, body) = req.into_parts();
+            let guarded =
+                preamble_guard(body.into_data_stream(), &boundary, preamble_overrun.clone());
+            Request::from_parts(parts, Body::from_stream(guarded))
+        }
+        // Not multipart: the extractor below refuses it.
+        None => req,
+    };
+    let multipart = match Multipart::from_request(req, &()).await {
+        Ok(multipart) => multipart,
+        Err(rejection) => return rejection.into_response(),
+    };
 
     // Build an **owned** byte stream over the first multipart part so it can be
     // handed to the CAS as a `'static` reader. The stream owns `multipart`,
@@ -120,6 +202,11 @@ pub async fn push(
                 limit: ctx.max_upload_bytes,
             })
         }
+        Err(_) if preamble_overrun.load(Ordering::Relaxed) => (
+            StatusCode::BAD_REQUEST,
+            "multipart body: no package part within the first 64 KiB",
+        )
+            .into_response(),
         Err(e) => write_error_response(e),
     }
 }
@@ -133,10 +220,10 @@ pub async fn unlist(
     if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
     }
-    if !ctx.package_filter.allows(&ctx.format.lower_id(&id)) {
+    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower)) {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
-    delete_version(&ctx, &id, &version, false).await
+    unlist_version(&ctx, &id, &version).await
 }
 
 /// Handler: `POST /package/{id}/{version}` — relist.
@@ -148,7 +235,7 @@ pub async fn relist(
     if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
     }
-    if !ctx.package_filter.allows(&ctx.format.lower_id(&id)) {
+    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower)) {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
     let Some(write) = ctx.write.clone() else {
@@ -162,24 +249,12 @@ pub async fn relist(
     }
 }
 
-/// Admin-only hard delete: `DELETE /admin/repositories/{repo}/packages/{id}/{ver}`.
-///
-/// Wired into the server under the admin router (Phase 10); admin authorization
-/// is enforced there. Removes the component + assets and dereferences the
-/// backing blobs (deferred S3 delete via the outbox). 204 / 404.
-pub async fn admin_hard_delete(
-    State(ctx): State<RouteContext>,
-    Path((id, version)): Path<(String, String)>,
-) -> Response {
-    delete_version(&ctx, &id, &version, true).await
-}
-
-/// Shared delete path for soft (unlist) and hard (admin) removal.
-async fn delete_version(ctx: &RouteContext, id: &str, version: &str, hard: bool) -> Response {
+/// Unlist (soft-delete) a version.
+async fn unlist_version(ctx: &RouteContext, id: &str, version: &str) -> Response {
     let Some(write) = ctx.write.clone() else {
         return (StatusCode::NOT_FOUND, "delete not supported").into_response();
     };
-    match write.delete_component(&ctx.repo, id, version, hard).await {
+    match write.delete_component(&ctx.repo, id, version, false).await {
         Ok(DeleteOutcome::Unlisted) | Ok(DeleteOutcome::Deleted) => {
             StatusCode::NO_CONTENT.into_response()
         }

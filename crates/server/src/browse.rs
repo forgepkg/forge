@@ -318,7 +318,12 @@ pub async fn package_detail(
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        // An unknown name answers like an unreadable repository (no name
+        // enumeration), except to a global admin.
+        Ok(None) if state.authz.is_global_admin(&principal).await => {
+            return (StatusCode::NOT_FOUND, "repository not found").into_response();
+        }
+        Ok(None) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
         Err(e) => return db_error(e),
     };
 
@@ -370,7 +375,8 @@ pub async fn package_detail(
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
 
-    // Registration entries carry the stored `.nuspec` bytes (hosted) for deps.
+    // Registration entries carry the stored manifest summary (or, for older
+    // versions, the `.nuspec` bytes) for deps.
     let registration = match ops.registration(&repo.name, &lower).await {
         Ok(r) => r,
         Err(e) => return read_err(e),
@@ -386,11 +392,11 @@ pub async fn package_detail(
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
     for entry in &registration {
-        let groups = entry
-            .nuspec_bytes
-            .as_deref()
-            .and_then(|b| forge_nuget::nuspec::dependency_groups_from_nuspec(b).ok())
-            .unwrap_or_default();
+        let groups = forge_nuget::nuspec::summary_of(
+            entry.manifest_summary.as_ref(),
+            entry.nuspec_bytes.as_deref(),
+        )
+        .dependency_groups;
         let mapped: Vec<DetailDependencyGroup> = groups
             .into_iter()
             .map(|g| DetailDependencyGroup {
@@ -474,7 +480,7 @@ async fn delayed_proxy_versions(
         SELECT version, listed, first_seen_at
         FROM proxy_cached_version
         WHERE repository_id = $1 AND name = $2 AND version <> '*' AND not_found = false
-          AND confirmed
+          AND confirmed AND NOT upstream_missing
         "#,
         repo.id,
         lower_id,

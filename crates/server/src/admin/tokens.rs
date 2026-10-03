@@ -139,6 +139,7 @@ pub async fn create(
         name: body.name.clone(),
         token_hash,
         expires_at: body.expires_at,
+        minted_with_forwarded_credential: false,
     };
     let t = match token_dao::insert_token(&state.pool, new).await {
         Ok(t) => t,

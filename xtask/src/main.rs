@@ -450,42 +450,66 @@ fn ensure_local_db() -> Result<(), String> {
 fn seed() -> Result<(), String> {
     let forge_url = env::var("FORGE_URL").unwrap_or_else(|_| DEFAULT_FORGE_URL.to_string());
     let admin = env::var("ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.to_string());
+    let (admin_user, admin_password) = admin
+        .split_once(':')
+        .ok_or_else(|| "ADMIN must be <user>:<password>".to_string())?;
+
+    // The admin API takes a browser session (or an admin-scoped token), never
+    // a password over Basic: sign in through /auth/login with a cookie jar.
+    let jar = env::temp_dir().join(format!("forge-seed-{}.cookies", std::process::id()));
+    let jar = jar.to_string_lossy().to_string();
+    let login = Cmd::new("curl")
+        .args([
+            "-fsS",
+            "-c",
+            &jar,
+            "-X",
+            "POST",
+            &format!("{forge_url}/auth/login"),
+            "-H",
+            "content-type: application/json",
+            "-d",
+            &format!(
+                r#"{{"username":"{}","password":"{}"}}"#,
+                json_escape(admin_user),
+                json_escape(admin_password)
+            ),
+        ])
+        .output_string()?;
+    let csrf = extract_json_string(&login, "csrf_token")
+        .ok_or_else(|| "could not parse csrf_token from /auth/login".to_string())?;
+    let session = |method: &'static str, path: &str, body: &'static str| {
+        Cmd::new("curl").args([
+            "-fsS".to_string(),
+            "-b".to_string(),
+            jar.clone(),
+            "-X".to_string(),
+            method.to_string(),
+            format!("{forge_url}{path}"),
+            "-H".to_string(),
+            format!("X-CSRF-Token: {csrf}"),
+            "-H".to_string(),
+            "content-type: application/json".to_string(),
+            "-d".to_string(),
+            body.to_string(),
+        ])
+    };
 
     println!("Creating hosted repo 'nuget' (anonymous_read=true)…");
     // Repo creation: ignore failure (likely already exists).
-    let _ = Cmd::new("curl")
-        .args([
-            "-fsS",
-            "-u",
-            &admin,
-            "-X",
-            "POST",
-            &format!("{forge_url}/admin/repositories"),
-            "-H",
-            "content-type: application/json",
-            "-d",
-            r#"{"name":"nuget","kind":"hosted","anonymous_read":true}"#,
-        ])
-        .run();
+    let _ = session(
+        "POST",
+        "/admin/repositories",
+        r#"{"name":"nuget","kind":"hosted","anonymous_read":true}"#,
+    )
+    .run();
 
-    // Mint a push token for admin (user id 1) and extract the secret.
-    let token_json = Cmd::new("curl")
-        .args([
-            "-fsS",
-            "-u",
-            &admin,
-            "-X",
-            "POST",
-            &format!("{forge_url}/admin/users/1/tokens"),
-            "-H",
-            "content-type: application/json",
-            "-d",
-            r#"{"name":"dev-seed"}"#,
-        ])
-        .output_string()?;
-    let token = extract_json_string(&token_json, "token").ok_or_else(|| {
-        "could not parse push token from /admin/users/1/tokens response".to_string()
-    })?;
+    // Mint a push token for the admin and extract the secret.
+    let token_json = session("POST", "/admin/me/tokens", r#"{"name":"dev-seed"}"#).output_string();
+    let _ = std::fs::remove_file(&jar);
+    let token_json = token_json?;
+    let token = extract_json_string(&token_json, "token")
+        .ok_or_else(|| "could not parse push token from /admin/me/tokens response".to_string())?;
     println!("  push token: {token}");
 
     // Push the bundled sample package.
@@ -516,6 +540,12 @@ fn seed() -> Result<(), String> {
         .unwrap_or_default();
     println!("  versions: {versions}");
     Ok(())
+}
+
+/// Escape `"` and `\\` for a JSON string literal (the runner has no JSON
+/// dependency).
+fn json_escape(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Minimal extractor for `"<key>":"<value>"` from a JSON blob (matches the old

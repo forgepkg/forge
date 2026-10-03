@@ -9,6 +9,11 @@
 //! only; proxy/group advertise read resources. The publish routes
 //! (`PUT/DELETE/POST /package`) are mounted for hosted repos via
 //! [`publish`].
+//!
+//! Every response carries [`harden_response_headers`]: the feed serves
+//! publisher-controlled bytes (`.nuspec` XML, package files, README-bearing
+//! metadata) on the same origin as the admin UI, so a browser must never
+//! render one as an active document.
 
 pub mod flat;
 pub mod index;
@@ -20,6 +25,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{header, HeaderMap, HeaderValue};
+use axum::response::Response;
 use axum::routing::{delete, get, put, MethodRouter};
 use axum::Router;
 use forge_core::authz::PackageFilter;
@@ -114,7 +121,9 @@ where
 /// * `/index.json` — service index
 /// * `/flat/{id}/index.json` — flat-container versions
 /// * `/flat/{id}/{version}/{filename}` — `.nupkg` bytes or `.nuspec` XML
-/// * `/registration/{id}/index.json` — inlined registration page
+/// * `/registration/{id}/index.json` — registration index (inlined pages up
+///   to 128 versions)
+/// * `/registration/{id}/page/{lower}/{upper}.json` — one registration page
 /// * `/registration/{id}/{version}.json` — registration leaf
 /// * `/catalog/{id}/{version}.json` — catalog entry
 /// * `/query` — search
@@ -132,6 +141,10 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
         .route(
             "/registration/{id}/{leaf}",
             get_head(registration::leaf_document),
+        )
+        .route(
+            "/registration/{id}/page/{lower}/{upper}",
+            get_head(registration::page),
         )
         .route(
             "/catalog/{id}/{leaf}",
@@ -162,7 +175,54 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
             );
     }
 
-    router.with_state(ctx)
+    router
+        .with_state(ctx)
+        .layer(axum::middleware::map_response(hardened))
+}
+
+/// `Content-Security-Policy` of every feed response: no subresources, no
+/// script, and an opaque-origin sandbox, so even a document a browser renders
+/// (e.g. a `.nuspec` opened as XML with an XHTML `<script>`) runs nothing and
+/// cannot reach the admin origin's cookies or API.
+pub const FEED_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; sandbox";
+
+/// Make a feed response inert in a browser: a sandboxing CSP (always, over any
+/// weaker policy), `Content-Disposition: attachment` (unless the handler named
+/// a file) and `X-Content-Type-Options: nosniff`.
+///
+/// NuGet clients ignore all three. The server applies this to every
+/// `/v3/{repo}` response, including the ones it answers before reaching this
+/// router (unknown repository, 401/403).
+pub fn harden_response_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(FEED_CONTENT_SECURITY_POLICY),
+    );
+    if !headers.contains_key(header::CONTENT_DISPOSITION) {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+}
+
+async fn hardened(mut response: Response) -> Response {
+    harden_response_headers(response.headers_mut());
+    response
+}
+
+/// The lowered package id of a request path, or `None` when it is not a
+/// well-formed id ([`Format::validate_id`]). Every id-addressed route answers
+/// such a request 404 before any backend sees it: a proxy pastes the id into
+/// credentialed upstream URLs, where `/`, `..`, `?` or `#` (all reachable
+/// through percent-encoding) would redirect the request.
+pub(crate) fn package_id(ctx: &RouteContext, raw: &str) -> Option<String> {
+    let lower = ctx.format.lower_id(raw);
+    ctx.format.validate_id(&lower).ok().map(|()| lower)
 }
 
 /// Map a [`RepoError`] to an HTTP response.

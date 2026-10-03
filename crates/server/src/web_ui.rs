@@ -20,6 +20,14 @@
 //! * `/assets/*` (content-hashed by Vite): `public, max-age=31536000,
 //!   immutable`; a miss there is `no-cache` so a 404 is never pinned.
 //!
+//! ## Content Security Policy
+//! Every SPA response carries [`spa_content_security_policy`]: scripts only
+//! from this origin plus the inline theme bootstrap in `index.html`, allowed
+//! by its SHA-256 hash (computed from the built `index.html` when the service
+//! is built, so it always matches the file actually served). No `eval`, no
+//! plugins, no `<base>` rewriting, no framing, and fetches only to this
+//! origin — so markup that ever reaches the DOM cannot run script.
+//!
 //! ## Route precedence (critical)
 //! This fallback is mounted **last** in [`crate::app::build_router`], after the
 //! `/admin`, `/browse`, and `/v3` routers. axum only routes to a `fallback`
@@ -39,6 +47,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -65,6 +75,8 @@ struct Spa {
     files: ServeDir,
     /// Real files, with `index.html` as the SPA history fallback.
     shell: ServeDir<ServeFile>,
+    /// `Content-Security-Policy` for every SPA response.
+    csp: HeaderValue,
 }
 
 /// Build the static SPA file service from [`WebConfig`].
@@ -92,9 +104,15 @@ struct Spa {
 pub fn spa_service(cfg: &WebConfig) -> Router {
     let assets_dir = PathBuf::from(&cfg.assets_dir);
     let index = assets_dir.join("index.html");
+    // A missing index.html (UI not built) only drops the inline-script hashes;
+    // the fallback then 404s anyway.
+    let index_html = std::fs::read_to_string(&index).unwrap_or_default();
+    let csp = HeaderValue::from_str(&spa_content_security_policy(&index_html))
+        .expect("CSP is built from ASCII only");
     let spa = Spa {
         files: ServeDir::new(&assets_dir),
         shell: ServeDir::new(&assets_dir).fallback(ServeFile::new(index)),
+        csp,
     };
     Router::new().fallback(serve_spa).with_state(spa)
 }
@@ -115,6 +133,8 @@ async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
             NO_CACHE
         };
         res.headers_mut().insert(header::CACHE_CONTROL, cache);
+        res.headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, spa.csp);
         res
     } else {
         let mut res = match spa.shell.oneshot(req).await {
@@ -122,8 +142,55 @@ async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
             Err(never) => match never {},
         };
         res.headers_mut().insert(header::CACHE_CONTROL, NO_CACHE);
+        res.headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, spa.csp);
         res
     }
+}
+
+/// The SPA's `Content-Security-Policy`, allowing the inline (`src`-less)
+/// scripts of `index_html` by their SHA-256 hashes and nothing else inline.
+///
+/// Styles keep `'unsafe-inline'`: the UI libraries set `style` attributes,
+/// and CSS cannot run script. Everything else is same-origin only.
+pub fn spa_content_security_policy(index_html: &str) -> String {
+    let mut script_src = String::from("'self'");
+    for script in inline_scripts(index_html) {
+        let digest = Sha256::digest(script.as_bytes());
+        script_src.push_str(" 'sha256-");
+        script_src.push_str(&base64::engine::general_purpose::STANDARD.encode(digest));
+        script_src.push('\'');
+    }
+    format!(
+        "default-src 'self'; script-src {script_src}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    )
+}
+
+/// The bodies of the inline `<script>` elements (those without a `src`
+/// attribute) of an HTML document, exactly as the browser hashes them.
+fn inline_scripts(html: &str) -> Vec<&str> {
+    let lower = html.to_ascii_lowercase();
+    let mut scripts = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find("<script").map(|i| from + i) {
+        let Some(open_end) = lower[start..].find('>').map(|i| start + i) else {
+            break;
+        };
+        let Some(close) = lower[open_end..].find("</script").map(|i| open_end + i) else {
+            break;
+        };
+        let attributes = &lower[start + "<script".len()..open_end];
+        let has_src = attributes
+            .split(|c: char| c.is_ascii_whitespace())
+            .any(|attr| attr == "src" || attr.starts_with("src="));
+        if !has_src {
+            scripts.push(&html[open_end + 1..close]);
+        }
+        from = close;
+    }
+    scripts
 }
 
 /// Middleware: 302-redirect a **browser navigation** to a former admin-UI path
@@ -307,6 +374,55 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "deep link status");
         assert_eq!(body, b"INDEX");
         assert_eq!(cache.as_deref(), Some("no-cache"));
+    }
+
+    #[tokio::test]
+    async fn spa_responses_carry_a_script_restricting_csp() {
+        let (_dir, svc) = fake_spa();
+        for uri in ["/", "/deep/link", "/assets/a.js"] {
+            let res = svc
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let csp = res
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("{uri}: no CSP"))
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(csp.contains("script-src 'self'"), "{uri}: {csp}");
+            assert!(!csp.contains("unsafe-eval"), "{uri}: {csp}");
+            assert!(csp.contains("object-src 'none'"), "{uri}: {csp}");
+            assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+        }
+    }
+
+    #[test]
+    fn csp_hashes_exactly_the_inline_theme_script_of_the_real_index_html() {
+        let html = include_str!("../../../web/index.html");
+        let scripts = inline_scripts(html);
+        assert_eq!(scripts.len(), 1, "one inline script (the theme bootstrap)");
+        assert!(scripts[0].contains("forge.theme"));
+        let expected =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(scripts[0].as_bytes()));
+        let csp = spa_content_security_policy(html);
+        assert!(csp.contains(&format!("'sha256-{expected}'")), "{csp}");
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src"))
+            .unwrap();
+        assert!(!script_src.contains("unsafe-inline"), "{script_src}");
+    }
+
+    #[test]
+    fn inline_script_extraction_skips_external_scripts() {
+        let html = "<head><SCRIPT>a()</SCRIPT><script type=\"module\" src=\"/x.js\"></script>\
+                    <script async src='/y.js'></script><script data-srcx=\"1\">b()</script></head>";
+        assert_eq!(inline_scripts(html), vec!["a()", "b()"]);
+        assert!(inline_scripts("<script>unterminated").is_empty());
     }
 
     #[tokio::test]

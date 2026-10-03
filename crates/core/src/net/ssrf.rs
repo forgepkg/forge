@@ -13,8 +13,9 @@
 //! What remains, and MUST stay:
 //! * [`validate_url`] — the **scheme check**: outbound URLs are `http`/`https`
 //!   only (never `file:`, `ftp:`, `gopher:`, …) and must have a host.
-//! * [`outbound_client`] — the shared client builder, which caps redirects so a
-//!   malicious upstream cannot bounce us through an unbounded redirect chain.
+//! * [`outbound_metadata_client`] — the OIDC discovery/JWKS/token client: no
+//!   redirects, https only (unless a realm allows a development http issuer),
+//!   hard deadlines. It is **not** an IP-range guard.
 //! * [`credential_forward_client`] — the credential-forwarding client, which
 //!   follows **no** redirects at all: a forwarded password must be judged by
 //!   the configured endpoint's own answer, never by wherever it bounces to.
@@ -29,7 +30,6 @@ use std::time::Duration;
 
 use url::Url;
 
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,27 +64,35 @@ pub fn validate_url(url: &str) -> Result<(), SsrfError> {
     Ok(())
 }
 
-/// Build the reqwest client used for outbound upstream traffic (proxy fetch,
-/// credential forwarding, OIDC discovery/JWKS/token).
-///
-/// The redirect policy caps the hop count so a redirect loop cannot run
-/// forever; scheme validation happens up front via [`validate_url`] (reqwest
-/// itself only follows http/https redirects).
-pub fn outbound_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
-        // Never let a blackholed peer pin a request forever. Callers add a
-        // per-request total deadline where they know one (the credential
-        // forwarder does); these bounds only cap connect + idle time.
-        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .read_timeout(DEFAULT_READ_TIMEOUT)
-        .build()
+/// Validate a credential-forwarding URL: like [`validate_url`], and it must
+/// be `https` — every login sends a user's password there — unless the host
+/// is loopback (a sidecar) or the realm explicitly sets `allow_http`.
+pub fn validate_credential_forward_url(url: &str, allow_http: bool) -> Result<(), String> {
+    validate_url(url).map_err(|e| e.to_string())?;
+    let parsed = Url::parse(url).map_err(|e| e.to_string())?;
+    if parsed.scheme() == "https" || allow_http {
+        return Ok(());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if loopback {
+        return Ok(());
+    }
+    Err(
+        "credential forwarding sends users' passwords to this url: it must be https \
+         (or a loopback address); set allow_http to accept plain http anyway"
+            .into(),
+    )
 }
 
 /// Build the client used for **credential forwarding** (the
 /// `credential_forwarding` realm / `upstream-basic` provider).
 ///
-/// Unlike [`outbound_client`] it never follows a redirect
+/// It never follows a redirect
 /// (`redirect::Policy::none()`): an upstream behind SSO commonly answers bad
 /// credentials with a 302 to a login page that itself returns 200, and judging
 /// the *final* status would turn every password into a valid one. The caller
@@ -92,23 +100,35 @@ pub fn outbound_client() -> Result<reqwest::Client, reqwest::Error> {
 /// following redirects also keeps the user's `Authorization` header from being
 /// replayed to a second URL. `connect_timeout` bounds connection setup; the
 /// caller adds a per-request total deadline.
+///
+/// It ignores `HTTP(S)_PROXY`: a user's password goes straight to the
+/// configured host, never through an egress proxy set up for package feeds.
 pub fn credential_forward_client(
     connect_timeout: Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .connect_timeout(connect_timeout)
         .read_timeout(DEFAULT_READ_TIMEOUT)
         .build()
 }
 
 /// Build the stricter client used for OIDC discovery, JWKS, and token-endpoint
-/// metadata traffic. A matching-issuer JWT can trigger these calls on a cold
-/// cache, so both connection establishment and the full response need hard
-/// deadlines rather than occupying an auth request indefinitely.
-pub fn outbound_metadata_client() -> Result<reqwest::Client, reqwest::Error> {
+/// traffic. A matching-issuer JWT can trigger these calls on a cold cache, so
+/// both connection establishment and the full response need hard deadlines
+/// rather than occupying an auth request indefinitely.
+///
+/// It never follows a redirect: the token request carries the client secret,
+/// the authorization code and the PKCE verifier in its body, which a 307/308
+/// would replay to wherever the redirect points, and key material must come
+/// from the issuer's own endpoints. Unless `allow_http` (a realm explicitly
+/// configured for a plain-http development IdP), every request — including
+/// the endpoints a discovery document names — must use https.
+pub fn outbound_metadata_client(allow_http: bool) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(!allow_http)
         .connect_timeout(METADATA_CONNECT_TIMEOUT)
         .timeout(METADATA_REQUEST_TIMEOUT)
         .build()
@@ -117,6 +137,25 @@ pub fn outbound_metadata_client() -> Result<reqwest::Client, reqwest::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_forwarding_needs_https_unless_loopback_or_allowed() {
+        assert!(validate_credential_forward_url("https://nexus.example/s", false).is_ok());
+        for local in [
+            "http://127.0.0.1:8081/s",
+            "http://localhost/s",
+            "http://[::1]:9/s",
+        ] {
+            assert!(
+                validate_credential_forward_url(local, false).is_ok(),
+                "{local}"
+            );
+        }
+        assert!(validate_credential_forward_url("http://nexus.example/s", false).is_err());
+        assert!(validate_credential_forward_url("http://10.0.0.5/s", false).is_err());
+        assert!(validate_credential_forward_url("http://nexus.example/s", true).is_ok());
+        assert!(validate_credential_forward_url("ftp://nexus.example/s", true).is_err());
+    }
 
     #[test]
     fn rejects_non_http_scheme() {
@@ -153,10 +192,46 @@ mod tests {
         assert!(validate_url("http://169.254.169.254/latest/meta-data").is_ok());
     }
 
+    #[tokio::test]
+    async fn metadata_client_follows_no_redirect_and_is_https_only() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/elsewhere", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // A development realm may use http, but a redirect is never followed
+        // (a token request's body carries the client secret).
+        let dev = outbound_metadata_client(true).unwrap();
+        let resp = dev
+            .post(format!("{}/token", server.uri()))
+            .form(&[("client_secret", "s3cret")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307);
+        // Any other realm refuses plain http outright.
+        let strict = outbound_metadata_client(false).unwrap();
+        assert!(strict
+            .get(format!("{}/token", server.uri()))
+            .send()
+            .await
+            .is_err());
+    }
+
     #[test]
     fn outbound_client_builds() {
-        assert!(outbound_client().is_ok());
-        assert!(outbound_metadata_client().is_ok());
+        assert!(outbound_metadata_client(false).is_ok());
+        assert!(outbound_metadata_client(true).is_ok());
         assert!(credential_forward_client(Duration::from_secs(2)).is_ok());
     }
 }

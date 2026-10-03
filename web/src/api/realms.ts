@@ -41,6 +41,8 @@ export interface OidcRealmConfig {
   admin_claim?: string
   /** Email domains routed to this IdP by identifier-first. */
   login_domains?: string[]
+  /** Allow-gate: claim name -> allowed values (e.g. `{ tid: ['<tenant>'] }`). */
+  required_claims?: Record<string, string[]>
   button_label?: string | null
 }
 
@@ -54,6 +56,10 @@ export interface CredentialForwardingConfig {
   request_timeout_ms?: number
   required_groups?: string[]
   groups_path?: string
+  /** JSON path naming the account the upstream authenticated (e.g. `login`). */
+  identity_path?: string
+  /** Accept a plain-http, non-loopback `url` (passwords travel in the clear). */
+  allow_http?: boolean
   admin_group?: string
   auto_provision?: boolean
   positive_ttl_secs?: number
@@ -96,6 +102,8 @@ export interface WorkloadIdentityConfig {
   allowed_authorized_parties?: string[]
   positive_cache_seconds?: number
   rules: WorkloadIdentityRule[]
+  /** Extra stable workload-identity claims of a custom issuer. */
+  identity_claims?: string[]
 }
 
 /** Kind-specific config; `local` has none. */

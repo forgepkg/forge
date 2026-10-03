@@ -258,6 +258,9 @@ pub struct BasicAuthSource {
     /// browser login endpoint. Disabled unless wired via
     /// [`BasicAuthSource::with_throttle`].
     throttle: Arc<LoginThrottle>,
+    /// The authorization cache: an authoritative upstream login may grant or
+    /// revoke admin, and the user's cached effective set must follow at once.
+    authz_cache: Option<forge_cache::Cache>,
 }
 
 impl BasicAuthSource {
@@ -295,6 +298,7 @@ impl BasicAuthSource {
             pool,
             chain,
             throttle: Arc::new(LoginThrottle::disabled()),
+            authz_cache: None,
         }
     }
 
@@ -302,6 +306,13 @@ impl BasicAuthSource {
     /// path is never throttled: token secrets are high-entropy).
     pub fn with_throttle(mut self, throttle: Arc<LoginThrottle>) -> Self {
         self.throttle = throttle;
+        self
+    }
+
+    /// Drop a user's cached effective set when an authoritative upstream
+    /// login re-synced their admin role (as the browser login does).
+    pub fn with_authz_cache(mut self, cache: forge_cache::Cache) -> Self {
+        self.authz_cache = Some(cache);
         self
     }
 }
@@ -356,6 +367,12 @@ impl PrincipalSource for BasicAuthSource {
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
         if let Some(chain) = self.chain.password_chain().await {
+            // The lockout, the chain and the account lookup all key on the
+            // canonical username, so `Alice`/`alice ` share one budget and
+            // one account. A name that cannot be canonical is a bad login.
+            let Ok(username) = forge_db::username::canonical_username(&username) else {
+                return SourceOutcome::Invalid;
+            };
             // Reserve the attempt against the (IP, username) lockout budget
             // before running the chain; a locked pair is refused without any
             // provider work (no argon2, nothing forwarded upstream).
@@ -387,6 +404,14 @@ impl PrincipalSource for BasicAuthSource {
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             attempt.succeeded();
+                            if identity.admin_authoritative {
+                                // The upstream may just have granted or
+                                // revoked admin: this very request must be
+                                // authorized against the new role set.
+                                if let Some(cache) = &self.authz_cache {
+                                    crate::authz::invalidate_user(cache, up.user_id).await;
+                                }
+                            }
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
                         // Vouched-for but no (active) app_user row, or a DB
@@ -643,6 +668,7 @@ mod tests {
             user_id: 1,
             token_id: Some(2),
             is_admin: false,
+            method: crate::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::Authenticated(authed))),
@@ -662,6 +688,7 @@ mod tests {
             user_id: 1,
             token_id: None,
             is_admin: true,
+            method: crate::auth::AuthMethod::Password,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::Reject)),
@@ -698,6 +725,7 @@ mod tests {
             user_id: 1,
             token_id: None,
             is_admin: false,
+            method: crate::auth::AuthMethod::Password,
         };
         // An explicit credential wins before the cookie source: not ambient.
         let sources: Vec<Box<dyn PrincipalSource>> = vec![

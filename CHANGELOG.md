@@ -11,6 +11,207 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Migration 0021 rewrites existing usernames into canonical form. Accounts
+  whose names differ only in case, surrounding spaces or Unicode composition
+  are not merged: the oldest keeps the name, the others are renamed
+  `<name>#<id>` and a warning names each one. Review and delete or rename
+  them; their tokens keep working.
+- A password sent over HTTP Basic no longer reaches the admin API or token
+  minting, even for an administrator (403). Scripts that ran
+  `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
+  (session cookie + `X-CSRF-Token`) or use an admin-scoped token
+  (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
+  `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
+- Migration 0023 flags existing credential-forwarding accounts that have no
+  realm (`realm_orphaned`): they can no longer be signed in by any realm.
+  Delete such an account to let its owner's next upstream login provision a
+  fresh one.
+- Workload-identity realms for an issuer other than GitHub Actions or
+  GitLab.com: every rule must now pin a stable identity claim (`sub`,
+  `repository_id`, `job_project_id`, `project_path`, … — see
+  docs/trusted-publishing.md) or a claim the realm lists in the new
+  `identity_claims`. A stored rule that pins neither stops matching (its
+  tokens are refused) until the realm is edited.
+- A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
+  is plain `http` to anything but a loopback address no longer loads until it
+  is switched to https or sets `allow_http = true` explicitly. Credential
+  forwarding no longer honours `HTTP(S)_PROXY`.
+- On an https deployment the session and OIDC flow cookies are renamed
+  `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
+  more after the upgrade.
+
+### Security
+
+- Feed responses (`/v3/...`) are inert in a browser: every one carries
+  `Content-Security-Policy: default-src 'none'; sandbox`,
+  `Content-Disposition: attachment` and `nosniff`. Before, a published
+  `.nuspec` was served as `application/xml` on the admin UI's origin, so an
+  XHTML `<script>` in it ran with the viewer's session (stored XSS).
+- The web UI is served with a real Content Security Policy: scripts only from
+  the server's own origin plus the inline theme bootstrap, allowed by its
+  SHA-256 hash (taken from the served `index.html` at startup); no `eval`,
+  plugins, `<base>` or framing, and fetches only to the same origin.
+- Usernames are canonical (trimmed, Unicode NFC, lowercased; empty names and
+  control characters are refused) in every login path, the lockout, the
+  credential cache, provisioning and admin user creation, with a unique
+  index on the canonical form. Credential forwarding sends the canonical name
+  upstream and signs in as exactly that account, so case or spacing variants
+  can no longer split one upstream identity into several Forge accounts
+  (or lockout budgets).
+- Credential-forwarding realms take an optional `identity_path`: the account
+  the upstream's JSON success response names must equal the username
+  entered. Set it for upstreams that accept a secret with any username
+  (GitHub, Azure DevOps or GitLab personal access tokens); without it such an
+  upstream lets any token holder sign in as any user. A success without the
+  field fails closed. The docs now state that the upstream must bind the
+  username to the secret.
+- Package ids in feed URLs are validated against the NuGet id grammar on
+  every read and unlist/relist route (404 otherwise), and again before a
+  proxy builds an upstream URL. A percent-encoded `..%2F`, `?` or `#` in an
+  id could steer the proxy's credentialed upstream requests to other paths
+  and queries of the upstream host, and planted bogus names in the proxy's
+  version table.
+- Redis is treated as a trust boundary: authorization sets, credential
+  verdicts, OIDC discovery documents and key sets, and workload-identity
+  verdicts are cached in each instance's memory only and never read from or
+  written to Redis (which still relays their invalidations). Before, anyone
+  able to write to Redis could plant an admin authorization set, mark a
+  password valid or substitute an IdP signing key for every instance.
+  `rediss://` (TLS) Redis URLs are now supported, and the deployment guide
+  documents how to isolate Redis.
+- The principal records how it authenticated (token, password over Basic,
+  or browser session). The admin API accepts a session or an admin-scoped
+  token, never a password replayed over Basic; minting tokens
+  (`/admin/me/tokens`) takes a session. Before, the password a NuGet client
+  stores and sends on every feed request — with credential forwarding, the
+  directory password — was a full admin credential that could mint tokens
+  outliving it. An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
+  also revokes the tokens a user minted from a credential-forwarding session.
+- Deleting a credential-forwarding realm no longer lets another realm adopt
+  its users: their missing realm was treated as a wildcard, so the next realm
+  whose directory knew the same username took over the account with its
+  roles and tokens. Such accounts are now flagged as orphans and never
+  matched again.
+- OIDC `link_existing_by_username` links only an account that no other
+  credential owns: never a credential-forwarding account or one already
+  linked to an IdP identity (before, a colliding `preferred_username` at the
+  same or another IdP took it over). An email claim is used as a username
+  only with `email_verified`, also when `username_claim` names it.
+- Registration and search no longer fetch and re-parse every version's
+  `.nuspec` per request (an unauthenticated CPU and storage amplifier on
+  public feeds): the manifest summary is stored at publish (migration 0024;
+  older versions are summarized once and backfilled), the registration index
+  is paged (64 versions per page, inlined up to 128 versions, beyond that
+  served from `/registration/{id}/page/{lower}/{upper}.json`), leaf and
+  catalog documents look up one version instead of all, rendering runs on
+  the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
+  rejects nesting deeper than 32 levels (it was quadratic in depth).
+- Proxy (completing the 0.1.0 "not found" marker fix): a version deleted
+  upstream leaves the listings at the next refresh (migration 0025) instead
+  of reappearing every `not_found_ttl`; the package-level not-found marker
+  is pruned once expired and cleared by a download of the package; a 404
+  never hides a version a listing confirmed after the request started; and
+  inside the package-delay window the proxy no longer downloads a version
+  at all, so a reader cannot prefetch a quarantined release that would later
+  be served from the cache. Proxy TTLs and the delay are validated
+  (0 to 7 days; delay up to a year).
+- The password lockout keys IPv6 clients by their /64 (one host owns a whole
+  /64, so per-address keys gave it unlimited fresh budgets), and a username
+  guessed from many networks is backed off: past three pair budgets of
+  failures in a window its attempts are spaced (1 s, doubling to 30 s)
+  instead of refused, so the owner can still sign in. A success clears it.
+- OIDC hardening: a realm's stored client secret is dropped when its
+  `issuer` or `client_id` changes (the update must supply a new one, so the
+  old IdP's secret is never sent to a new issuer); discovery, JWKS and token
+  requests follow no redirects (a 307 would replay the client secret) and
+  must use https unless the realm allows a development http issuer; token
+  responses are capped at 1 MiB; `redirect_to` is capped at 2 KiB; login
+  starts are rate-limited per client network
+  (`auth.oidc_login_starts_per_minute`, default 30); a callback's IdP error
+  is only surfaced after the browser binding is checked and is logged
+  bounded and escaped. Realms take an optional allow-gate,
+  `required_claims` (e.g. `{"tid": ["<tenant>"]}` or `{"hd": ["corp.example"]}`):
+  a token without an allowed value is refused.
+- Workload identity (trusted publishing): for a custom issuer, a rule's
+  identity anchor must be one of the known stable identity claims or one the
+  realm declares in `identity_claims` (before, any claim not on a short
+  denylist counted, so a rule on `actor` or `event_name` trusted every
+  workload that carried it). Unlist, relist and delete by a workload now run
+  the same commit-time realm fence as a publish and are recorded in
+  `trusted_publish_audit` with an `action` column (migration 0026); before,
+  a principal from a stale realm snapshot could still unlist, and those
+  changes left no record. The docs recommend pinning `job_workflow_ref` and
+  `event_name`.
+- Session and OIDC flow cookies carry the `__Host-` prefix when
+  `public_base_url` is https (the flow cookie moves to `Path=/`, which the
+  prefix requires), so a sibling subdomain or a plain-http response can no
+  longer plant one. A request carrying the session (or flow) cookie more than
+  once is not authenticated by it, and neither copy is cleared — before, the
+  first one won, which let a cookie planted for a narrower path or a parent
+  domain fix the browser's session.
+- Admin changes from an identity source take effect at once: a NuGet
+  client's Basic login that re-reads the upstream's groups now drops the
+  user's cached authorization set (as the browser login already did), so a
+  demoted admin is not served as an admin until the cache expires; and a
+  demotion by an upstream or an IdP ends the user's browser sessions. Editing
+  a credential-forwarding realm retires the credential verdicts cached under
+  its old config (they are keyed by it), so e.g. a newly required group
+  applies to the next request rather than after `positive_ttl_secs`.
+- A repository name that does not exist answers like one the caller may not
+  read (401 anonymously, 403 signed in) on the feed (`/v3/{repo}/…`) and in
+  the browse API, so repository names can no longer be enumerated; a global
+  admin still gets 404.
+- Groups take optional `reserved_prefixes` (API and UI, e.g. `["Acme."]`):
+  package ids under a reserved prefix are never served from a proxy member.
+  `prefer_hosted` only shields ids a hosted member already has, so an
+  internal name was open to a public look-alike until its first publish (or
+  after its last version was deleted).
+- HTTP hardening: API responses (`/admin`, `/auth`, `/browse`) and feed
+  responses to a request with credentials are `Cache-Control: private,
+  no-store`, and feed responses carry `Vary: Authorization, Cookie,
+  X-NuGet-ApiKey`, so a shared cache can neither store a private package nor
+  serve one caller's answer to another; an https deployment sends HSTS. The
+  server now enforces a header-read timeout (`server.header_read_timeout_seconds`,
+  default 30 s — `axum::serve` never armed hyper's, so a client trickling
+  headers held a connection forever), a request-body idle timeout
+  (`body_idle_timeout_seconds`, 60 s) and a response timeout
+  (`request_timeout_seconds`, 900 s, answered with 408).
+- The `Debug` output of the database, S3 and Redis configuration no longer
+  contains secrets: connection-URL passwords and query strings and the S3
+  secret key are redacted, so a logged config cannot leak them.
+- Release workflow: only version tags on the default branch decide whether a
+  release moves `:latest` / `:<major>.<minor>` (a stray tag pushed on another
+  branch — never released — kept every later release from moving them).
+- Package manifests must have the one shape NuGet reads: exactly one
+  `.nuspec` at the package root, a root `<package>` with a single
+  `<metadata>`, and in it one text-only `<id>` and `<version>` (and at most
+  one `<dependencies>`). Repeated `<id>` elements were joined, and a nested
+  `.nuspec` or `<metadata>` could be taken for the manifest, so Forge and a
+  NuGet client could see different identities for one package — enough to
+  publish past an id-scoped grant.
+- Request bounds on the feed: a search `q` is cut to 256 bytes and at most
+  8 distinct terms (each term costs a substring scan per candidate id, and
+  `q` was unbounded), and a push whose multipart body does not reach its
+  package part's headers within 64 KiB is refused with 400 (the parser
+  buffered everything before the first boundary in memory, up to the whole
+  upload limit).
+- Package archives: a ZIP64 locator that does not point at a ZIP64 record
+  is refused (the pre-parse limit check skipped such archives, and the zip
+  reader then went looking for an unvetted record whose entry count sizes an
+  allocation), and archives are read at offset 0. Versions NuGet clients
+  cannot read as a package's own are refused at publish: a component above
+  `int32`, a numeric prerelease identifier with a leading zero (stored
+  under a normalized URL no client requests) and malformed build metadata.
+- Credential forwarding: the upstream `url` must be https unless it is a
+  loopback address or the realm sets `allow_http` (before, a plain-http URL
+  was accepted with a log line, so every login sent a password in the clear
+  and a network attacker could also forge the groups that grant admin); the
+  forwarding client ignores `HTTP(S)_PROXY`; and at most 1 MiB of a success
+  body is read for `groups_path` / `identity_path` (larger answers fail
+  closed).
+
 ## [0.1.0]
 
 First production release.

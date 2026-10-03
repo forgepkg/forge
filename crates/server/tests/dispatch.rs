@@ -33,6 +33,113 @@ async fn unknown_repo_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// A repository name that does not exist answers exactly like one the caller
+/// may not read — 401 anonymously, 403 signed in, same body — on the feed and
+/// in the browse API, so names cannot be enumerated. (A global admin, who can
+/// list them anyway, still gets 404: [`unknown_repo_is_404`].)
+#[tokio::test]
+async fn unknown_repo_answers_like_a_denied_one() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let private = format!("private{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": private, "kind": "hosted", "anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user = forge_db::user_dao::insert_user(
+        &srv.pool,
+        forge_db::user_dao::NewUser::local(
+            format!("nogrants{}", common::unique()),
+            "$argon2id$unused".into(),
+            false,
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let session = srv.session_for(user.id).await;
+
+    let answer = |path: String, signed_in: bool| {
+        let mut req = client.get(format!("{}{path}", srv.base_url));
+        if signed_in {
+            req = session.apply(req);
+        }
+        async move {
+            let resp = req.send().await.unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let unknown = format!("absent{}", common::unique());
+    for (path, signed_in, status) in [
+        ("/v3/{}/index.json", false, 401),
+        ("/v3/{}/index.json", true, 403),
+        ("/browse/packages/{}/Foo", true, 403),
+    ] {
+        let denied = answer(path.replace("{}", &private), signed_in).await;
+        let missing = answer(path.replace("{}", &unknown), signed_in).await;
+        assert_eq!(denied.0, status, "{path} on a private repository");
+        assert_eq!(missing, denied, "{path}: unknown answers like denied");
+    }
+}
+
+/// Every `/v3` response — also the ones the dispatcher answers itself before
+/// the per-repository router runs — is a sandboxed, script-free download, so
+/// publisher-controlled feed content can never execute on the admin origin.
+#[tokio::test]
+async fn feed_responses_are_sandboxed_downloads() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("hosted{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    for (path, authenticated) in [
+        ("/v3/does-not-exist/index.json".to_string(), true),
+        (format!("/v3/{repo}/index.json"), false),
+        (format!("/v3/{repo}/index.json"), true),
+        (format!("/v3/{repo}/flat/x/1.0.0/x.nuspec"), true),
+    ] {
+        let mut req = client.get(format!("{}{path}", srv.base_url));
+        if authenticated {
+            req = req.basic_auth(&u, Some(&p));
+        }
+        let resp = req.send().await.unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header("content-security-policy").as_deref(),
+            Some("default-src 'none'; sandbox"),
+            "{path} ({})",
+            resp.status()
+        );
+        assert_eq!(
+            header("content-disposition").as_deref(),
+            Some("attachment"),
+            "{path}"
+        );
+        assert_eq!(
+            header("x-content-type-options").as_deref(),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+}
+
 /// With `anonymous_mode = off`, an unauthenticated read of a non-anon repo is
 /// 401; an admin (authenticated) read succeeds and the service index advertises
 /// `PackagePublish` for a hosted repo.
@@ -189,7 +296,9 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
 
     let login = client
         .post(format!("{}/auth/login", srv.base_url))
-        .json(&serde_json::json!({"username": admin, "password": password}))
+        .json(
+            &serde_json::json!({"username": admin, "password": srv.admin_pass.as_deref().unwrap()}),
+        )
         .send()
         .await
         .unwrap();

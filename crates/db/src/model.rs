@@ -174,10 +174,36 @@ impl Repository {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true)
     }
+
+    /// Group option (stored lowercased in `config.reserved_prefixes`): package
+    /// ids starting with one of these prefixes (e.g. `acme.`) are owned by
+    /// the organization, so proxy members are never consulted for them —
+    /// even before the first internal version is published, which
+    /// [`Self::prefer_hosted`] alone cannot cover. Empty for non-groups.
+    pub fn reserved_prefixes(&self) -> Vec<String> {
+        if self.kind() != RepoKind::Group {
+            return Vec::new();
+        }
+        self.config
+            .get(RESERVED_PREFIXES_KEY)
+            .and_then(|v| v.as_array())
+            .map(|prefixes| {
+                prefixes
+                    .iter()
+                    .filter_map(|p| p.as_str())
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// `repository.config` key of [`Repository::prefer_hosted`].
 pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
+
+/// `repository.config` key of [`Repository::reserved_prefixes`].
+pub const RESERVED_PREFIXES_KEY: &str = "reserved_prefixes";
 
 /// A row of `group_member`.
 #[derive(Debug, Clone, sqlx::FromRow)]

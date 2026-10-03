@@ -12,7 +12,7 @@ CI publishing without stored API keys see
 | PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. |
 | S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … The bucket is created if missing. |
 | TLS termination | A reverse proxy or load balancer in front of Forge (nginx, Traefik, an ingress, an ALB). Forge itself speaks plain HTTP. |
-| Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. |
+| Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. |
 
 Forge is a single stateless process. The API, the NuGet feed and the web UI
 share one port (`8421`), so one upstream on the reverse proxy is enough.
@@ -93,8 +93,14 @@ password path on by itself, because its users have no tokens until they first
 sign in — and that path runs the whole password chain, so **local** users'
 passwords are then accepted over Basic too, whatever this setting says. Set
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must send a local
-user's password over Basic without such a realm, for example
-`curl -u user:password` against `/admin`.
+user's password over Basic without such a realm.
+
+A password sent over Basic is a **feed** credential only: the admin API
+(`/admin/*`) and token minting refuse it with 403, even for an administrator,
+because NuGet clients store that password and replay it on every request.
+Administer through a browser session (the web UI, or `POST /auth/login` plus
+the returned CSRF token), or mint an admin-scoped token
+(`{"scope": {"actions": ["admin"]}}`) for automation.
 
 ## Secret encryption at rest
 
@@ -165,6 +171,15 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
 - Do not rewrite the `Origin` or `Sec-Fetch-Site` headers. Forge refuses
   state-changing browser requests that are cross-site, so a proxy that strips
   or fakes these headers breaks that protection.
+- With an `https://` `public_base_url` Forge sends
+  `Strict-Transport-Security: max-age=31536000`; serve it over https only.
+  API responses and every feed response to a request with credentials are
+  `Cache-Control: private, no-store`, and feed responses carry
+  `Vary: Authorization, Cookie, X-NuGet-ApiKey`: keep a caching proxy from
+  overriding either.
+- Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
+  `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
+  own timeouts at least as long for package pushes.
 
 Minimal nginx example:
 
@@ -231,6 +246,24 @@ Instances coordinate through PostgreSQL (row locks and leases), so any number
 can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
 password-failure lockout is kept in memory on each instance.
+
+### Redis is a trust boundary
+
+Anything that can write to Redis can write Forge's shared cache. Forge
+therefore keeps every value a security decision rests on **out of Redis**:
+authorization sets, credential-forwarding verdicts, OIDC discovery documents
+and signing keys, and workload-identity token verdicts are cached in each
+instance's memory only. Redis carries only their invalidations, so the worst
+a Redis writer can do to them is evict them early. Upstream package metadata
+(proxy listings, manifests, registrations) is still shared through Redis;
+proxied packages themselves are checked against the requested id and
+version before they are served.
+
+Still treat Redis like the database: a dedicated instance (or ACL user) for
+Forge, `requirepass`/ACL credentials in the URL, not reachable from outside
+the deployment, and TLS when it crosses a network you do not control
+(`FORGE_REDIS__URL=rediss://user:password@redis.internal:6380`; the server
+verifies the certificate against the system trust store).
 
 ## Backup and restore
 
