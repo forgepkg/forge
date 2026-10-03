@@ -106,6 +106,10 @@ pub struct CredForwardRealmConfig {
     /// tokens). Empty ⇒ the upstream must itself bind username to secret.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub identity_path: String,
+    /// Accept a plain-`http` `url` that is not loopback. Off: every login
+    /// sends a password there, so it must be https.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_http: bool,
     /// Auto-provision an `app_user` on first successful upstream login.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
@@ -270,7 +274,8 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
         KIND_CRED_FORWARD => {
             let cfg: CredForwardRealmConfig = serde_json::from_value(config.clone())
                 .map_err(|e| format!("invalid config: {e}"))?;
-            ssrf::validate_url(&cfg.url).map_err(|e| format!("invalid url: {e}"))?;
+            ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
+                .map_err(|e| format!("invalid url: {e}"))?;
             if cfg.key_pepper.trim().is_empty() {
                 return Err(
                     "key_pepper must not be empty (it keys the validated-credential cache HMAC)"
@@ -645,6 +650,10 @@ impl RealmAuth {
     ) -> anyhow::Result<Box<dyn AuthProvider>> {
         let cfg: CredForwardRealmConfig =
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
+        // Also for rows stored before the https rule: never forward passwords
+        // in the clear to a non-loopback host unless the realm says so.
+        ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
+            .map_err(|e| anyhow::anyhow!("url: {e}"))?;
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
         // Never follows redirects: a 3xx is judged (as unavailable) by the
@@ -841,6 +850,7 @@ pub async fn seed_auth_realms(
             required_groups: ub.required_groups.clone(),
             groups_path: ub.groups_path.clone(),
             identity_path: ub.identity_path.clone(),
+            allow_http: ub.allow_http,
             admin_group: ub.admin_group.clone(),
             auto_provision: ub.auto_provision,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
@@ -992,6 +1002,18 @@ mod tests {
             &json!({"url": "http://127.0.0.1:8081/s", "key_pepper": "p"}),
         )
         .is_ok());
+        // Passwords go there: plain http to another host needs allow_http.
+        assert!(validate_config(
+            KIND_CRED_FORWARD,
+            &json!({"url": "http://nexus.internal/s", "key_pepper": "p"}),
+        )
+        .is_err());
+        let allowed = validate_config(
+            KIND_CRED_FORWARD,
+            &json!({"url": "http://nexus.internal/s", "key_pepper": "p", "allow_http": true}),
+        )
+        .expect("explicitly allowed");
+        assert_eq!(allowed["allow_http"], true);
         assert!(validate_config(
             KIND_CRED_FORWARD,
             &json!({"url": "ftp://x/s", "key_pepper": "p"}),

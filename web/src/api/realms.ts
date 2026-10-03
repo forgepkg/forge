@@ -58,6 +58,8 @@ export interface CredentialForwardingConfig {
   groups_path?: string
   /** JSON path naming the account the upstream authenticated (e.g. `login`). */
   identity_path?: string
+  /** Accept a plain-http, non-loopback `url` (passwords travel in the clear). */
+  allow_http?: boolean
   admin_group?: string
   auto_provision?: boolean
   positive_ttl_secs?: number

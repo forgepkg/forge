@@ -438,6 +438,10 @@ pub struct UpstreamBasicAuthConfig {
     /// any username (personal access tokens). Empty ⇒ no identity check.
     #[serde(default)]
     pub identity_path: String,
+    /// Accept a plain-`http` `url` that is not loopback (passwords then travel
+    /// in the clear). Default `false`.
+    #[serde(default)]
+    pub allow_http: bool,
     /// Optional upstream group that maps to forge admin on provision (grant only).
     #[serde(default)]
     pub admin_group: String,
@@ -1865,8 +1869,10 @@ impl Config {
                     )))
                 }
             }
-            // Warn loudly about plaintext credential forwarding over http (plan
-            // §5): the user's password rides the outbound Basic header.
+            // Every login forwards the user's password there: plain http only
+            // for a loopback sidecar or when explicitly allowed.
+            forge_core::net::ssrf::validate_credential_forward_url(u.url.trim(), u.allow_http)
+                .map_err(|e| ConfigError::Invalid(format!("auth.upstream_basic.url: {e}")))?;
             if url.scheme() == "http" {
                 tracing::warn!(
                     "auth.upstream_basic.url is http://; the user's password is forwarded in cleartext — use https in production"

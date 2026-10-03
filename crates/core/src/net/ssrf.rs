@@ -64,6 +64,31 @@ pub fn validate_url(url: &str) -> Result<(), SsrfError> {
     Ok(())
 }
 
+/// Validate a credential-forwarding URL: like [`validate_url`], and it must
+/// be `https` — every login sends a user's password there — unless the host
+/// is loopback (a sidecar) or the realm explicitly sets `allow_http`.
+pub fn validate_credential_forward_url(url: &str, allow_http: bool) -> Result<(), String> {
+    validate_url(url).map_err(|e| e.to_string())?;
+    let parsed = Url::parse(url).map_err(|e| e.to_string())?;
+    if parsed.scheme() == "https" || allow_http {
+        return Ok(());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if loopback {
+        return Ok(());
+    }
+    Err(
+        "credential forwarding sends users' passwords to this url: it must be https \
+         (or a loopback address); set allow_http to accept plain http anyway"
+            .into(),
+    )
+}
+
 /// Build the client used for **credential forwarding** (the
 /// `credential_forwarding` realm / `upstream-basic` provider).
 ///
@@ -75,11 +100,15 @@ pub fn validate_url(url: &str) -> Result<(), SsrfError> {
 /// following redirects also keeps the user's `Authorization` header from being
 /// replayed to a second URL. `connect_timeout` bounds connection setup; the
 /// caller adds a per-request total deadline.
+///
+/// It ignores `HTTP(S)_PROXY`: a user's password goes straight to the
+/// configured host, never through an egress proxy set up for package feeds.
 pub fn credential_forward_client(
     connect_timeout: Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .connect_timeout(connect_timeout)
         .read_timeout(DEFAULT_READ_TIMEOUT)
         .build()
@@ -108,6 +137,25 @@ pub fn outbound_metadata_client(allow_http: bool) -> Result<reqwest::Client, req
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_forwarding_needs_https_unless_loopback_or_allowed() {
+        assert!(validate_credential_forward_url("https://nexus.example/s", false).is_ok());
+        for local in [
+            "http://127.0.0.1:8081/s",
+            "http://localhost/s",
+            "http://[::1]:9/s",
+        ] {
+            assert!(
+                validate_credential_forward_url(local, false).is_ok(),
+                "{local}"
+            );
+        }
+        assert!(validate_credential_forward_url("http://nexus.example/s", false).is_err());
+        assert!(validate_credential_forward_url("http://10.0.0.5/s", false).is_err());
+        assert!(validate_credential_forward_url("http://nexus.example/s", true).is_ok());
+        assert!(validate_credential_forward_url("ftp://nexus.example/s", true).is_err());
+    }
 
     #[test]
     fn rejects_non_http_scheme() {

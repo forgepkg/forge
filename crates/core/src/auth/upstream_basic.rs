@@ -70,6 +70,11 @@ use super::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential,
 /// `app_user.auth_source` value).
 pub const UPSTREAM_BASIC_ID: &str = "upstream-basic";
 
+/// Largest success body read for `groups_path` / `identity_path` (1 MiB): a
+/// whoami answer is small, and the upstream must not make each login buffer
+/// an arbitrary amount.
+pub const MAX_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
+
 /// How to read the user's groups/roles from the upstream JSON body.
 ///
 /// Kept deliberately small (plan §6 risk #4: avoid a JSONPath dependency for a
@@ -268,7 +273,13 @@ impl UpstreamBasicProvider {
             let body = if self.config.groups_path.is_empty() && !needs_identity {
                 None
             } else {
-                match resp.json::<serde_json::Value>().await {
+                let body = match crate::oidc::jwks::read_capped(resp, MAX_SUCCESS_BODY_BYTES).await
+                {
+                    Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(format!("{e:?}")),
+                };
+                match body {
                     Ok(body) => Some(body),
                     Err(e) => {
                         // A success status but an unparseable body: if a group

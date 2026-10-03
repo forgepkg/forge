@@ -292,6 +292,12 @@ authenticated account (e.g. `login` for GitHub's `/user`): that name, in
 canonical form, must equal the username entered, or the login is rejected; a
 success without it fails closed.
 
+Every login sends the user's password to the realm's `url`, so it must be
+`https` — plain `http` only for a loopback sidecar, or with `"allow_http":
+true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the
+password goes straight to the configured host), follows no redirects and reads
+at most 1 MiB of a success body for `groups_path` / `identity_path`.
+
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
 recorded in `forge_setting`); afterwards the database is the authority.

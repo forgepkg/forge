@@ -85,6 +85,8 @@ export interface RealmFormValues {
   required_groups: string
   groups_path: string
   identity_path: string
+  /** Credential forwarding: accept a plain-http, non-loopback URL. */
+  allow_http: boolean
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -197,6 +199,7 @@ function seed(existing?: RealmView): RealmFormValues {
     required_groups: joinList(fwd.required_groups),
     groups_path: fwd.groups_path ?? '',
     identity_path: fwd.identity_path ?? '',
+    allow_http: fwd.allow_http ?? false,
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
@@ -816,6 +819,18 @@ export function RealmForm({
               />
               <Label>Auto-provision users on first successful check</Label>
             </CheckboxField>
+            <CheckboxField>
+              <Checkbox
+                checked={values.allow_http}
+                onChange={(c) => set('allow_http', c)}
+              />
+              <Label>Allow a plain-http upstream</Label>
+              <Description>
+                Every login sends the user&apos;s password to the upstream URL,
+                so it must be https (or a loopback address) unless this is
+                checked.
+              </Description>
+            </CheckboxField>
           </FieldGroup>
         </Fieldset>
       )}
@@ -1321,6 +1336,7 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (requiredGroups.length > 0) config.required_groups = requiredGroups
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
     if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
+    if (values.allow_http) config.allow_http = true
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive

@@ -34,6 +34,10 @@ The release workflow publishes the section whose heading matches the tag
   docs/trusted-publishing.md) or a claim the realm lists in the new
   `identity_claims`. A stored rule that pins neither stops matching (its
   tokens are refused) until the realm is edited.
+- A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
+  is plain `http` to anything but a loopback address no longer loads until it
+  is switched to https or sets `allow_http = true` explicitly. Credential
+  forwarding no longer honours `HTTP(S)_PROXY`.
 - On an https deployment the session and OIDC flow cookies are renamed
   `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
   more after the upgrade.
@@ -200,6 +204,13 @@ The release workflow publishes the section whose heading matches the tag
   cannot read as a package's own are refused at publish: a component above
   `int32`, a numeric prerelease identifier with a leading zero (stored
   under a normalized URL no client requests) and malformed build metadata.
+- Credential forwarding: the upstream `url` must be https unless it is a
+  loopback address or the realm sets `allow_http` (before, a plain-http URL
+  was accepted with a log line, so every login sent a password in the clear
+  and a network attacker could also forge the groups that grant admin); the
+  forwarding client ignores `HTTP(S)_PROXY`; and at most 1 MiB of a success
+  body is read for `groups_path` / `identity_path` (larger answers fail
+  closed).
 
 ## [0.1.0]
 

@@ -240,6 +240,32 @@ async fn required_group_unmet_is_rejected_despite_200() {
     );
 }
 
+/// A success body is read for groups/identity up to 1 MiB only: an upstream
+/// cannot make every login buffer an arbitrary amount. Past the cap the gate
+/// cannot be evaluated, so the login fails closed.
+#[tokio::test]
+async fn oversized_success_body_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "user": { "roles": ["nuget-users"] },
+            "padding": "x".repeat(2 * 1024 * 1024),
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(format!("{}/whoami", server.uri()));
+    config.groups_path = "user.roles".to_string();
+    config.required_groups = vec!["nuget-users".to_string()];
+    let provider = make_provider(config, Duration::from_secs(300)).await;
+    let user = unique_user("up-big");
+    assert_eq!(
+        provider.authenticate(&cred(&user, "pw")).await,
+        AuthOutcome::Unavailable
+    );
+}
+
 #[tokio::test]
 async fn required_group_met_authenticates() {
     let server = MockServer::start().await;
