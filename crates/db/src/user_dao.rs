@@ -80,16 +80,18 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 ///   `password_hash = NULL` (no local password — the DB CHECK only requires one
 ///   for `'local'` users), `external_subject = username`, `active = true`,
 ///   `realm_id` = the vouching realm, and `is_admin = suggested_is_admin`.
-/// * **Existing `'upstream-basic'` username** (same realm, or no realm recorded
-///   on either side) → stamp `last_auth_source_at = now()`, record the realm if
-///   none was recorded yet, and — only when `admin_authoritative` (the realm
-///   maps an admin group and the groups were freshly fetched) — set `is_admin`
-///   to the upstream's current verdict, so revocation upstream demotes here too.
+/// * **Existing `'upstream-basic'` username of the same realm** (or, for the
+///   realm-less static wiring, of no realm) → stamp `last_auth_source_at =
+///   now()`, and — only when `admin_authoritative` (the realm maps an admin
+///   group and the groups were freshly fetched) — set `is_admin` to the
+///   upstream's current verdict, so revocation upstream demotes here too.
 ///   Without an authoritative reading the stored admin flag is left alone.
 /// * **Existing username owned by anything else** (a `'local'` or `'oidc'`
-///   account, or an upstream user of a different realm) → **no row** is
+///   account, an upstream user of a different realm, or an **orphan** whose
+///   realm was deleted — `realm_orphaned`, migration 0023) → **no row** is
 ///   returned: an upstream login must never be mapped onto (or take over) an
-///   account it did not create. The caller denies.
+///   account it did not create. A missing realm is never a wildcard. The
+///   caller denies.
 ///
 /// The unique constraint on `username` makes the `ON CONFLICT` path race-safe
 /// across instances. The username is canonicalized first; an invalid one
@@ -114,16 +116,14 @@ pub async fn provision_upstream_user(
         ON CONFLICT (username) DO UPDATE SET
             is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,
             last_auth_source_at = now(),
-            realm_id = COALESCE(app_user.realm_id, EXCLUDED.realm_id),
             -- Touch updated_at only when the admin flag actually changes.
             updated_at = CASE
                 WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()
                 ELSE app_user.updated_at
             END
         WHERE app_user.auth_source = 'upstream-basic'
-          AND (EXCLUDED.realm_id IS NULL
-               OR app_user.realm_id IS NULL
-               OR app_user.realm_id = EXCLUDED.realm_id)
+          AND NOT app_user.realm_orphaned
+          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id
         RETURNING
             id, username, password_hash, is_admin, active,
             auth_source, external_subject, created_at, updated_at
@@ -138,9 +138,10 @@ pub async fn provision_upstream_user(
 }
 
 /// Find the `'upstream-basic'` user an upstream realm vouched for: the username
-/// must belong to an upstream-provisioned account, and when both the vouching
-/// realm and the user's recorded realm are known they must match. Local and
-/// OIDC accounts of the same name are never returned (`None` ⇒ deny).
+/// must belong to an upstream-provisioned account of exactly that realm (no
+/// realm on either side only for the realm-less static wiring) that is not an
+/// orphan of a deleted realm. Local and OIDC accounts of the same name are
+/// never returned (`None` ⇒ deny).
 pub async fn find_upstream_user(
     pool: &PgPool,
     username: &str,
@@ -158,7 +159,8 @@ pub async fn find_upstream_user(
         FROM app_user
         WHERE username = $1
           AND auth_source = 'upstream-basic'
-          AND ($2::bigint IS NULL OR realm_id IS NULL OR realm_id = $2)
+          AND NOT realm_orphaned
+          AND realm_id IS NOT DISTINCT FROM $2::bigint
         "#,
         username,
         realm_id,
@@ -281,9 +283,10 @@ pub async fn delete_user(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// Record which auth realm last vouched for / provisioned this user (12.7
-/// provenance — informational, never an authorization input). A no-op write
-/// when the value is unchanged.
+/// Record which auth realm vouches for this user. For credential-forwarding
+/// accounts this is an authorization input: only that realm may sign the
+/// account in (see [`provision_upstream_user`]). A no-op write when the value
+/// is unchanged.
 pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx::Result<()> {
     sqlx::query!(
         r#"

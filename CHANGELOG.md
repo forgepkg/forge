@@ -24,6 +24,10 @@ The release workflow publishes the section whose heading matches the tag
   (session cookie + `X-CSRF-Token`) or use an admin-scoped token
   (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
   `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
+- Migration 0023 flags existing credential-forwarding accounts that have no
+  realm (`realm_orphaned`): they can no longer be signed in by any realm.
+  Delete such an account to let its owner's next upstream login provision a
+  fresh one.
 
 ### Security
 
@@ -72,6 +76,11 @@ The release workflow publishes the section whose heading matches the tag
   directory password — was a full admin credential that could mint tokens
   outliving it. An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
   also revokes the tokens a user minted from a credential-forwarding session.
+- Deleting a credential-forwarding realm no longer lets another realm adopt
+  its users: their missing realm was treated as a wildcard, so the next realm
+  whose directory knew the same username took over the account with its
+  roles and tokens. Such accounts are now flagged as orphans and never
+  matched again.
 
 ## [0.1.0]
 

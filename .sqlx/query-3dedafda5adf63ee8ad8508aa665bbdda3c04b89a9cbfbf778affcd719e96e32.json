@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'upstream-basic'\n          AND ($2::bigint IS NULL OR realm_id IS NULL OR realm_id = $2)\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'upstream-basic'\n          AND NOT realm_orphaned\n          AND realm_id IS NOT DISTINCT FROM $2::bigint\n        ",
   "describe": {
     "columns": [
       {
@@ -121,5 +121,5 @@
       false
     ]
   },
-  "hash": "7864bb230a740c95b93df0b19ea318768ad8a59bb8991c7cff7d692828c30cbb"
+  "hash": "3dedafda5adf63ee8ad8508aa665bbdda3c04b89a9cbfbf778affcd719e96e32"
 }

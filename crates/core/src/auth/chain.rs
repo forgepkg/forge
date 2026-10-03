@@ -268,7 +268,9 @@ pub async fn provision_and_map(
             // realm's user): never map or take it over.
             tracing::warn!(
                 username = %identity.username,
-                "upstream login denied: username is owned by a non-upstream account"
+                realm_id = ?identity.realm_id,
+                "upstream login denied: username is owned by a non-upstream account, \
+                 another realm's account, or an orphan of a deleted realm"
             );
             return Ok(None);
         };
