@@ -325,6 +325,26 @@ First production release.
   unusable and storing new secrets in plaintext.
 - On installs with `legacy_open_access`, removing a credential-forwarding
   user's `authenticated` role is no longer undone by the user's next login.
+- Encrypted secrets are bound to where they are sent: a proxy password to
+  the origin of the repository's `remote_url`, an OIDC client secret to the
+  realm's issuer and client id. Before, someone who could write to the
+  database but not read secrets could point `remote_url` at their own host,
+  and the proxy decrypted the password and sent it there.
+- The marker that records whether a realm imported from `[oidc]` /
+  `[auth.upstream_basic]` was edited no longer hashes the realm's secrets.
+  It was an unsalted SHA-256 next to the plaintext config, so a database
+  dump allowed offline guessing of an encrypted `client_secret` or
+  `key_pepper`.
+- The AES-GCM and XChaCha20-Poly1305 key schedules and the decoded root key
+  are wiped from memory after use.
+- With `auto_provision = false`, a credential-forwarding realm that maps an
+  admin group now applies an upstream admin demotion too (flag, `admin`
+  role, sessions ended). Before, a demoted user kept signing in as an admin.
+- A group can name the members that own its package ids
+  (`group_member.owner`). Once any member is flagged, only owners hide proxy
+  versions under `prefer_hosted` and serve ids under `reserved_prefixes`, so
+  a writer of a developer feed in the same group can no longer publish an
+  internal name or take a public id away from the proxy.
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
@@ -387,6 +407,32 @@ First production release.
 - The garbage-collection outbox decides which deletions are due on the
   database clock, so an instance whose clock runs ahead no longer deletes
   objects before the grace period.
+- Retention re-checks every decision when it applies it. A run stops when
+  its policy was edited, disabled or switched to `dry_run_only`, or when it
+  lost its lease. A decision the package's current versions no longer
+  produce is skipped: with `keep_last_n: 1`, unlisting 2.0.0 mid-run no
+  longer lets the run delete 1.0.0 and leave no listed version.
+- `retention_audit` is indexed for component deletes, which scanned the
+  whole table while holding locks, and rows older than
+  `retention.audit_retention_seconds` (default 90 days) are pruned.
+- Redis no longer takes an instance down with it:
+  - an instance starts while Redis is unreachable;
+  - an invalidation stalled on Redis no longer blocks every lookup in its
+    namespace;
+  - a subscription that goes silent without a reset is detected by a ping
+    within about 12 s, L1 is flushed, and the instance resubscribes.
+
+  Pushes, deletes and retention runs no longer pay for a Redis
+  invalidation of a cache nobody read.
+- Temp space for pushes and first-time proxy downloads is bounded per
+  instance (`server.max_staging_bytes`, answered `503` with `Retry-After`
+  when full), and files a killed process left in `server.staging_dir` are
+  removed at startup. Before, concurrent downloads of large packages could
+  fill the disk and get the pod evicted.
+- The networks a username signed in from, which exempt the owner from that
+  username's login backoff during a password spray, are stored in the
+  database. Before, they were lost on restart and known only to the
+  instance that saw the sign-in.
 ### Changed
 
 - The admin UI lives under `/manage/*`. Browser navigations to the former
@@ -405,9 +451,12 @@ First production release.
 - Repository updates: an absent field keeps its value, JSON `null` clears it.
 - New settings: `auth.password_verify_concurrency`,
   `auth.credential_forward_max_concurrent`, `server.allowed_hosts`,
-  `outbox.processed_retention_seconds`, and the `[nuget]` archive limits.
-  New endpoints: `PATCH /admin/users/{id}` and
-  `GET`/`PUT /admin/settings/legacy-open-access`.
+  `outbox.processed_retention_seconds`, `retention.audit_retention_seconds`,
+  `server.staging_dir`, `server.max_staging_bytes`, and the `[nuget]`
+  archive limits. New endpoints: `PATCH /admin/users/{id}`,
+  `PATCH /admin/repositories/{name}/members/{member}` (`owner`) and
+  `GET`/`PUT /admin/settings/legacy-open-access`. Group members have an
+  `owner` field.
 
 ### Upgrade notes
 
@@ -489,6 +538,20 @@ First production release.
 - Retention policies with `not_downloaded_for_days` select fewer versions
   on their first runs: a never-downloaded version only qualifies once it is
   that many days old.
+- Retention audit rows older than 90 days are deleted after the upgrade. To
+  keep them, set `retention.audit_retention_seconds = 0` (or a longer
+  window) before upgrading. Migration 0027 indexes `retention_audit` without
+  `CONCURRENTLY`, which briefly blocks writes to a large table.
+- Pre-release installs with secret encryption: at startup, secrets sealed
+  by earlier builds are re-sealed for their destination, which older
+  instances cannot read. Upgrade all instances at once. A secret whose row
+  was changed outside the admin API no longer decrypts; it is logged at
+  startup and must be entered again.
+- Staging is limited to 4 GiB per instance by default (four times the
+  larger of `server.max_upload_bytes` and `proxy.max_package_bytes`), in
+  `<temp dir>/forge-staging`. Set `server.max_staging_bytes` (`0` for no
+  limit) and `server.staging_dir` to match your volume; a budget below the
+  larger of those two limits is refused at startup.
 ### Known limitations
 
 - NuGet is the only package format.
@@ -519,24 +582,15 @@ First production release.
   go only to the upstream's own origin), and parses its metadata documents
   (up to `proxy.max_metadata_bytes`, 32 MiB) in memory. Point proxies only
   at upstreams you trust.
-- A group trusts all its hosted members equally: anyone who can push to
-  any hosted member can publish under the group's `reserved_prefixes`, and
-  with `prefer_hosted` can claim any public package id for the whole group
-  (its proxied versions then stop being served). Put only repositories with
-  trusted writers into such a group.
-- Redis is required at startup once configured (an instance cannot start
-  while it is unreachable), a Redis that stalls without refusing
-  connections can stall requests on a cache invalidation for a few
-  seconds, and a silently dropped pub/sub connection is not detected
-  (that instance then converges only by TTL, 60 s for authorization).
-- Retention applies a run's decisions without re-evaluating them: a policy
-  edited, disabled or a protection changed mid-run takes effect on the next
-  run.
-- The login throttle's per-instance state (lockouts and the networks a
-  username signed in from) is lost on restart.
-- Uploads and first-time proxy downloads are staged in the temp directory
-  without a global limit (up to `max_upload_bytes` /
-  `proxy.max_package_bytes` each); size it accordingly.
+- Unless a group flags owner members, it trusts all its hosted members
+  equally: anyone who can push to any hosted member can publish under the
+  group's `reserved_prefixes`, and with `prefer_hosted` can claim any
+  public package id for the whole group. Flag the trusted members as owners
+  when a group mixes feeds with different writers.
+- While Redis is unreachable, an instance hears no invalidations from the
+  others and converges by TTL (60 s for authorization).
+- Login lockouts and failure counts are per instance and lost on restart
+  (the networks a username signed in from are kept in the database).
 - A first download through a proxy runs inside the request, so
   `server.request_timeout_seconds` (900) caps it below
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far

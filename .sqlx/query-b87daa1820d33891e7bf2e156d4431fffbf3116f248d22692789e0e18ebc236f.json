@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, upstream_password_enc AS \"upstream_password_enc!\"\n        FROM repository\n        WHERE upstream_password_enc IS NOT NULL AND id > $1\n        ORDER BY id\n        LIMIT $2\n        ",
+  "query": "\n        SELECT id, upstream_password_enc AS \"upstream_password_enc!\", remote_url\n        FROM repository\n        WHERE upstream_password_enc IS NOT NULL AND id > $1\n        ORDER BY id\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,17 @@
             "name": "upstream_password_enc"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "remote_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "remote_url"
+          }
+        }
       }
     ],
     "parameters": {
@@ -34,8 +45,9 @@
     },
     "nullable": [
       false,
+      true,
       true
     ]
   },
-  "hash": "86bc4e1994fa8c985d2ee2c56a2084839d735ffa2b0fef7b3d6d934374e674c6"
+  "hash": "b87daa1820d33891e7bf2e156d4431fffbf3116f248d22692789e0e18ebc236f"
 }

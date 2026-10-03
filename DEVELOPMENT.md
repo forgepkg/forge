@@ -219,7 +219,13 @@ password supplied to NuGet should be a **token**.
   semantics. That guard only knows names a hosted member already has; list
   your organization's id prefixes in `"reserved_prefixes": ["Acme."]` so ids
   under them never come from a proxy member, also before their first
-  internal publish.
+  internal publish. Both guards trust every hosted member of the group; when
+  some of them accept pushes from a wider audience (a developer or scratch
+  feed), flag the trusted ones as owners — `"owner": true` when adding the
+  member, or `PATCH /admin/repositories/all/members/releases`
+  `{"owner": true}`. Once any member is flagged, only owners (and the hosted
+  repositories inside an owning nested group) hide proxy versions and serve
+  reserved ids.
 
 ## Configuration
 
@@ -238,6 +244,7 @@ Key knobs:
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
+| `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it. `server.staging_dir` picks the directory. |
 | `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
 | `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
 

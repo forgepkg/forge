@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE group_member SET owner = $3 WHERE group_id = $1 AND member_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c7172154f716ed4eb23bd84aa86afa245d8af0e87132db82c974b4f4eeb3a8c"
+}

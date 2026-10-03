@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id,\n               upstream_password AS \"upstream_password!\",\n               upstream_password_enc AS \"upstream_password_enc!\",\n               remote_url\n        FROM repository\n        WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL\n        ORDER BY id\n        LIMIT $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_password!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "upstream_password_enc!",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "remote_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "remote_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "e090e4100f80a0016375e8f1273bae2d4c1f67358376f6823123a5a85c3a1d9a"
+}

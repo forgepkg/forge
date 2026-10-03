@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH dek AS (\n                    SELECT 1 FROM encryption_key\n                    WHERE layer = 'dek' AND scope = $5 AND version = $6 AND state <> 'revoked'\n                    FOR SHARE\n                )\n                UPDATE repository\n                SET upstream_password_enc = $2, upstream_password = NULL\n                WHERE id = $1 AND upstream_password = $3 AND upstream_password_enc = $4\n                  AND remote_url IS NOT DISTINCT FROM $7\n                  AND EXISTS (SELECT 1 FROM dek)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea",
+        "Text",
+        "Bytea",
+        "Text",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cbc95a4a1663922c88bd6612174de57d34a186a2f018f369e0ff1247a26c2176"
+}

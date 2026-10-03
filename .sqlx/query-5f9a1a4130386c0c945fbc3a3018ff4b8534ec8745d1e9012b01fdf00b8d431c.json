@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 1 AS \"fenced!\"\n        FROM repository r\n        JOIN retention_run rr ON rr.repository_id = r.id\n        WHERE r.id = $1\n          AND rr.state = 'running'\n          AND rr.current_run_id = $2\n          AND rr.locked_until > now()\n          AND r.retention_policy = $3\n        FOR SHARE OF r, rr\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fenced!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5f9a1a4130386c0c945fbc3a3018ff4b8534ec8745d1e9012b01fdf00b8d431c"
+}
