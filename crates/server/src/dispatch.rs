@@ -72,14 +72,23 @@ async fn route_context(
     // Write ops only for hosted repos; the router mounts publish routes only for
     // hosted, so proxy/group never reach a write handler.
     let write: Option<std::sync::Arc<dyn forge_core::repo::RepoWriteOps>> = match kind {
-        RepoKind::Hosted => Some(std::sync::Arc::new(HostedWriteAdapter::new(
-            state,
-            format.clone(),
-            repo.id,
-            repo.name.clone(),
-            principal,
-            package_filter.clone(),
-        ))),
+        RepoKind::Hosted => {
+            // A redeploy replaces a version's bytes: it takes the delete
+            // permission (and its selectors) as well as write.
+            let replace_filter = state
+                .authz
+                .package_filter_for(&principal, repo, Action::Delete)
+                .await;
+            Some(std::sync::Arc::new(HostedWriteAdapter::new(
+                state,
+                format.clone(),
+                repo.id,
+                repo.name.clone(),
+                principal,
+                package_filter.clone(),
+                replace_filter,
+            )))
+        }
         _ => None,
     };
 
@@ -253,9 +262,11 @@ impl HostedWriteAdapter {
         repository_name: String,
         principal: Principal,
         package_filter: PackageFilter,
+        replace_filter: PackageFilter,
     ) -> Self {
         let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
             filter: package_filter.clone(),
+            replace_filter,
             repository_id,
             repository_name,
         });
@@ -277,6 +288,8 @@ impl HostedWriteAdapter {
 /// selector can be applied without trusting multipart metadata.
 struct SelectorPublishPolicy {
     filter: PackageFilter,
+    /// The caller's delete predicate, required to replace an existing version.
+    replace_filter: PackageFilter,
     repository_id: i64,
     repository_name: String,
 }
@@ -285,6 +298,19 @@ struct SelectorPublishPolicy {
 impl PublishPolicy for SelectorPublishPolicy {
     async fn authorize(&self, context: &PublishAuthorizationContext) -> Result<(), WriteError> {
         if self.filter.allows(&context.package_id) {
+            Ok(())
+        } else {
+            Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            })
+        }
+    }
+
+    async fn authorize_replace(
+        &self,
+        context: &PublishAuthorizationContext,
+    ) -> Result<(), WriteError> {
+        if self.replace_filter.allows(&context.package_id) {
             Ok(())
         } else {
             Err(WriteError::ForbiddenPackage {

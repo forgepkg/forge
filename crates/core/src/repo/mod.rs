@@ -684,6 +684,19 @@ pub trait PublishPolicy: Send + Sync {
     /// must not cause CAS/DB/S3 mutation.
     async fn authorize(&self, context: &PublishAuthorizationContext) -> Result<(), WriteError>;
 
+    /// Authorize replacing an existing version (a redeploy). It destroys the
+    /// version's current bytes, so it takes what deleting the version takes;
+    /// checked after [`Self::authorize`], once the version is known to exist.
+    /// The default refuses.
+    async fn authorize_replace(
+        &self,
+        context: &PublishAuthorizationContext,
+    ) -> Result<(), WriteError> {
+        Err(WriteError::ForbiddenPackage {
+            id: context.package_id.clone(),
+        })
+    }
+
     /// Append request provenance in the package transaction. The default is a
     /// no-op so non-audited callers keep their existing behavior.
     async fn record_in_transaction(

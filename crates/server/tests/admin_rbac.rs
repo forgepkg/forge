@@ -534,6 +534,73 @@ async fn content_selector_crud_and_invalid_glob() {
     assert_eq!(resp.status(), 204);
 }
 
+/// A redeploy replaces a version's bytes, so with `allow_redeploy` on it takes
+/// the delete permission as well as write: a push-only token can publish a new
+/// version but not overwrite a released one.
+#[tokio::test]
+async fn redeploy_needs_delete_as_well_as_write() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let (user_id, _username, _password) = make_user(&srv).await;
+    let repo = make_repo(&srv).await;
+    let resp = client
+        .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"allow_redeploy": true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": format!("push-{}", common::unique())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    let grant = |action: &'static str| {
+        client
+            .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"repository": repo, "action": action}))
+            .send()
+    };
+    for action in ["read", "write"] {
+        assert_eq!(grant(action).await.unwrap().status(), 201);
+    }
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role_id": role_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let created: Value = client
+        .post(format!("{}/admin/users/{user_id}/tokens", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = created["token"].as_str().unwrap().to_string();
+
+    let push = || publish_with_token(&srv, &repo, &token, "Acme.Core", "1.2.0");
+    assert_eq!(push().await, 201, "a new version needs write only");
+    assert_eq!(push().await, 403, "replacing it needs delete too");
+    assert_eq!(grant("delete").await.unwrap().status(), 201);
+    assert!(push().await.is_success(), "write + delete may redeploy");
+}
+
 /// A read-only scoped token cannot write even though its owner can.
 #[tokio::test]
 async fn token_scope_narrows_to_read_only() {

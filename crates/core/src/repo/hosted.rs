@@ -650,6 +650,14 @@ impl HostedWrite {
                         version: parsed.version.clone(),
                     });
                 }
+                // Replacing the bytes destroys the old ones: the caller must
+                // also be allowed to delete this version (refusal drops the
+                // tx like the 409 above).
+                if let (Some((_, policy)), Some(context)) =
+                    (self.publish_policy.as_ref(), publish_context.as_ref())
+                {
+                    policy.authorize_replace(context).await?;
+                }
                 // `false`: a concurrent hard delete removed the version
                 // before this push could lock it, so it is a fresh insert.
                 self.redeploy_in_tx(
