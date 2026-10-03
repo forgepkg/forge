@@ -22,7 +22,8 @@
 //!    then read the freshly-populated row/cache.
 //!
 //! 4. **Auth reaper** (slice 12.2) — periodically deletes expired/used
-//!    `oidc_flow` rows and revoked/expired `session` rows. Both are pure
+//!    `oidc_flow` rows, revoked/expired `session` rows and
+//!    `login_known_network` rows past the login throttle's 30-day memory. Both are pure
 //!    `DELETE`s (no advisory locks, no leases): the auth-code-flow rows are
 //!    single-use and short-lived, sessions carry their own validity predicate,
 //!    so running the reap on **every** instance is harmless (a row deleted by
@@ -303,6 +304,16 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
                 Err(e) => tracing::error!(error = %e, "session reap failed"),
+            }
+            // Networks no sign-in came from for longer than the login
+            // throttle remembers them.
+            let forgotten = chrono::Utc::now()
+                - chrono::Duration::from_std(forge_core::auth::login_throttle::KNOWN_NETWORK_TTL)
+                    .expect("a 30-day TTL fits");
+            match forge_db::login_network_dao::prune(&pool, forgotten, 1000).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted stale login networks"),
+                Err(e) => tracing::error!(error = %e, "login network reap failed"),
             }
         }
     })

@@ -143,10 +143,15 @@ impl AppState {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
         });
-        let login_throttle = Arc::new(forge_core::auth::LoginThrottle::new(
-            config.auth.login_max_failures,
-            std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
-        ));
+        let login_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::new(
+                config.auth.login_max_failures,
+                std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
+            )
+            .with_known_network_store(Arc::new(
+                forge_core::auth::PgKnownNetworks::new(pool.clone()),
+            )),
+        );
         let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),

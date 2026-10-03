@@ -32,6 +32,13 @@
 //! skips the backoff, and an attempt whose pair is already locked is refused
 //! without claiming a slot.
 //!
+//! With a [`KnownNetworkStore`] (the server uses [`PgKnownNetworks`]) those
+//! networks are also recorded in Postgres, at most once an hour per network,
+//! and read back while a username is being backed off (at most once every
+//! [`KNOWN_NETWORK_RELOAD`] per username): a sign-in seen by another instance,
+//! or before a restart, still exempts the owner. Lockouts and failure counts
+//! stay per instance.
+//!
 //! ## Reservation, not check-then-record
 //! An attempt is counted against the pair's budget atomically *before* the
 //! chain runs: at most `max_failures - failures` attempts of a pair are in
@@ -103,9 +110,94 @@ pub const KNOWN_NETWORK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Networks remembered per username (the most recent successes).
 const KNOWN_NETWORKS_PER_USER: usize = 8;
 
-/// Per username hash: the networks it signed in from, with the time of the
-/// last success from each, newest last.
-type KnownNetworks = HashMap<[u8; 32], Vec<(IpAddr, Instant)>>;
+/// How often a still-used network's success is written to the
+/// [`KnownNetworkStore`] again.
+const KNOWN_NETWORK_PERSIST_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How long the networks read from the [`KnownNetworkStore`] for a username
+/// under backoff are used before they are read again.
+pub const KNOWN_NETWORK_RELOAD: Duration = Duration::from_secs(5 * 60);
+
+/// A network a username signed in from.
+#[derive(Debug, Clone, Copy)]
+struct KnownNet {
+    net: IpAddr,
+    /// The last success from it.
+    seen: Instant,
+    /// When that was last written to the store (`None`: not yet).
+    persisted: Option<Instant>,
+}
+
+/// Per username hash: the networks it signed in from, newest last.
+type KnownNetworks = HashMap<[u8; 32], Vec<KnownNet>>;
+
+/// Where the networks a username signed in from are kept beyond this
+/// instance's memory (see the [module docs](self)). Failures are the
+/// store's to log; the throttle then works from memory alone.
+#[async_trait::async_trait]
+pub trait KnownNetworkStore: Send + Sync + std::fmt::Debug {
+    /// Record a successful sign-in of `user` (a username hash) from `net`.
+    async fn remember(&self, user: [u8; 32], net: IpAddr);
+    /// The networks `user` signed in from within `within`, with how long ago.
+    async fn recent(&self, user: [u8; 32], within: Duration) -> Vec<(IpAddr, Duration)>;
+}
+
+/// [`KnownNetworkStore`] over the `login_known_network` table.
+#[derive(Debug, Clone)]
+pub struct PgKnownNetworks {
+    pool: sqlx::PgPool,
+}
+
+impl PgKnownNetworks {
+    /// A store over `pool`.
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        PgKnownNetworks { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl KnownNetworkStore for PgKnownNetworks {
+    async fn remember(&self, user: [u8; 32], net: IpAddr) {
+        let result = forge_db::login_network_dao::remember(
+            &self.pool,
+            &user,
+            &net.to_string(),
+            chrono::Utc::now(),
+        )
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not record the network of a sign-in");
+        }
+    }
+
+    async fn recent(&self, user: [u8; 32], within: Duration) -> Vec<(IpAddr, Duration)> {
+        let now = chrono::Utc::now();
+        let since = chrono::Duration::from_std(within)
+            .ok()
+            .and_then(|within| now.checked_sub_signed(within))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        let rows = match forge_db::login_network_dao::recent(
+            &self.pool,
+            &user,
+            since,
+            KNOWN_NETWORKS_PER_USER as i64,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the networks a username signed in from");
+                return Vec::new();
+            }
+        };
+        rows.into_iter()
+            .filter_map(|(net, at)| {
+                let net = net.parse().ok()?;
+                Some((net, (now - at).to_std().unwrap_or_default()))
+            })
+            .collect()
+    }
+}
 
 /// The network a client address is accounted to: the address itself for
 /// IPv4 (IPv4-mapped IPv6 included), its /64 for IPv6.
@@ -226,6 +318,10 @@ pub struct LoginThrottle {
     /// Networks each username recently signed in from; exempt from its soft
     /// backoff.
     known_networks: Mutex<KnownNetworks>,
+    /// Shares those networks across instances and restarts.
+    known_store: Option<Arc<dyn KnownNetworkStore>>,
+    /// When each username's networks were last read from `known_store`.
+    known_loaded: Mutex<HashMap<[u8; 32], Instant>>,
 }
 
 impl LoginThrottle {
@@ -242,7 +338,16 @@ impl LoginThrottle {
             user_backoff_max: Duration::from_secs(30),
             users: Mutex::new(HashMap::new()),
             known_networks: Mutex::new(HashMap::new()),
+            known_store: None,
+            known_loaded: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep the networks usernames signed in from in `store` as well (see
+    /// the [module docs](self)).
+    pub fn with_known_network_store(mut self, store: Arc<dyn KnownNetworkStore>) -> Self {
+        self.known_store = Some(store);
+        self
     }
 
     /// Override the per-username soft backoff: after `threshold` failures of a
@@ -298,34 +403,107 @@ impl LoginThrottle {
             .expect("login throttle mutex poisoned")
             .get(&key.user)
             .is_some_and(|nets| {
-                nets.iter()
-                    .any(|(net, at)| *net == key.ip && now.duration_since(*at) < KNOWN_NETWORK_TTL)
+                nets.iter().any(|known| {
+                    known.net == key.ip && now.duration_since(known.seen) < KNOWN_NETWORK_TTL
+                })
             })
     }
 
-    /// Remember that the username behind `key` signed in from its network.
-    fn remember_network(&self, key: Key) {
+    /// Remember that `user` signed in from `net` at `seen`. Returns whether
+    /// the success is due to be written to the store.
+    fn remember_network(&self, user: [u8; 32], net: IpAddr, seen: Instant, stored: bool) -> bool {
         let now = Instant::now();
         let mut known = self
             .known_networks
             .lock()
             .expect("login throttle mutex poisoned");
-        if !known.contains_key(&key.user) && known.len() >= MAX_TRACKED {
+        if !known.contains_key(&user) && known.len() >= MAX_TRACKED {
             known.retain(|_, nets| {
-                nets.retain(|(_, at)| now.duration_since(*at) < KNOWN_NETWORK_TTL);
+                nets.retain(|known| now.duration_since(known.seen) < KNOWN_NETWORK_TTL);
                 !nets.is_empty()
             });
             if known.len() >= MAX_TRACKED {
                 // Full of live entries: stay bounded, remember no more.
-                return;
+                return false;
             }
         }
-        let nets = known.entry(key.user).or_default();
-        nets.retain(|(net, at)| *net != key.ip && now.duration_since(*at) < KNOWN_NETWORK_TTL);
+        let nets = known.entry(user).or_default();
+        let previous = nets
+            .iter()
+            .position(|known| known.net == net)
+            .map(|at| nets.remove(at));
+        nets.retain(|known| now.duration_since(known.seen) < KNOWN_NETWORK_TTL);
+        if previous.is_some_and(|known| known.seen > seen) {
+            // A newer success is already known; keep it.
+            nets.push(previous.expect("checked"));
+            return false;
+        }
+        let persisted = if stored {
+            Some(seen)
+        } else {
+            previous.and_then(|known| known.persisted)
+        };
+        let due = !stored
+            && persisted.is_none_or(|at| now.duration_since(at) >= KNOWN_NETWORK_PERSIST_EVERY);
         if nets.len() >= KNOWN_NETWORKS_PER_USER {
             nets.remove(0);
         }
-        nets.push((key.ip, now));
+        nets.push(KnownNet {
+            net,
+            seen,
+            persisted: if due { Some(now) } else { persisted },
+        });
+        nets.sort_by_key(|known| known.seen);
+        due
+    }
+
+    /// Whether `user` is past its soft-backoff threshold in this window.
+    fn user_backing_off(&self, user: [u8; 32]) -> bool {
+        if self.user_soft_threshold == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        self.users
+            .lock()
+            .expect("login throttle mutex poisoned")
+            .get(&user)
+            .is_some_and(|entry| {
+                now.duration_since(entry.window_start) < self.window
+                    && entry.failures >= self.user_soft_threshold
+            })
+    }
+
+    /// Merge the networks the store knows for `user` into memory, unless they
+    /// were read within [`KNOWN_NETWORK_RELOAD`].
+    async fn load_known_networks(&self, user: [u8; 32]) {
+        let Some(store) = &self.known_store else {
+            return;
+        };
+        let now = Instant::now();
+        {
+            let mut loaded = self
+                .known_loaded
+                .lock()
+                .expect("login throttle mutex poisoned");
+            if loaded
+                .get(&user)
+                .is_some_and(|at| now.duration_since(*at) < KNOWN_NETWORK_RELOAD)
+            {
+                return;
+            }
+            if loaded.len() >= MAX_TRACKED {
+                loaded.retain(|_, at| now.duration_since(*at) < KNOWN_NETWORK_RELOAD);
+                if loaded.len() >= MAX_TRACKED {
+                    return;
+                }
+            }
+            loaded.insert(user, now);
+        }
+        for (net, age) in store.recent(user, KNOWN_NETWORK_TTL).await {
+            if let Some(seen) = now.checked_sub(age) {
+                self.remember_network(user, net, seen, true);
+            }
+        }
     }
 
     /// Record a verdict for the username behind `user` (soft backoff).
@@ -407,8 +585,12 @@ impl LoginThrottle {
         let key = Self::key(ip, username);
         // Per-username soft backoff first: wait for this username's next slot,
         // unless the attempt comes from a network the username signed in from
-        // or its pair is locked anyway (refused below without taking a slot
-        // from the owner).
+        // (here, or as recorded in the store) or its pair is locked anyway
+        // (refused below without taking a slot from the owner).
+        if !self.is_known_network(key) && !self.pair_locked(key) && self.user_backing_off(key.user)
+        {
+            self.load_known_networks(key.user).await;
+        }
         if !self.is_known_network(key) && !self.pair_locked(key) {
             match self.user_slot(key.user) {
                 None => return Err(AttemptRefused::Busy),
@@ -474,8 +656,15 @@ impl LoginThrottle {
 
     fn complete(&self, key: Key, verdict: Verdict) {
         self.record_user(key.user, &verdict);
-        if matches!(verdict, Verdict::Succeeded) {
-            self.remember_network(key);
+        if matches!(verdict, Verdict::Succeeded)
+            && self.remember_network(key.user, key.ip, Instant::now(), false)
+        {
+            if let (Some(store), Ok(runtime)) =
+                (&self.known_store, tokio::runtime::Handle::try_current())
+            {
+                let store = store.clone();
+                runtime.spawn(async move { store.remember(key.user, key.ip).await });
+            }
         }
         let mut state = self.lock();
         let Some(entry) = state.entries.get_mut(&key) else {
@@ -733,6 +922,72 @@ mod tests {
         let started = Instant::now();
         t.begin(office, "alice").await.unwrap().released();
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    /// A [`KnownNetworkStore`] in memory, standing in for Postgres.
+    #[derive(Debug, Default)]
+    struct MemoryStore(Mutex<Vec<([u8; 32], IpAddr)>>);
+
+    #[async_trait::async_trait]
+    impl KnownNetworkStore for MemoryStore {
+        async fn remember(&self, user: [u8; 32], net: IpAddr) {
+            self.0.lock().unwrap().push((user, net));
+        }
+        async fn recent(&self, user: [u8; 32], _within: Duration) -> Vec<(IpAddr, Duration)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(u, _)| *u == user)
+                .map(|(_, net)| (*net, Duration::from_secs(60)))
+                .collect()
+        }
+    }
+
+    /// Review L4: the known-network exemption outlives the instance that saw
+    /// the sign-in (a restart, or another instance behind the load balancer).
+    #[tokio::test]
+    async fn a_known_network_survives_a_restart_through_the_store() {
+        let store = Arc::new(MemoryStore::default());
+        let throttle = || {
+            LoginThrottle::new(5, Duration::from_secs(60))
+                .with_user_backoff(2, Duration::from_millis(400), Duration::from_millis(400))
+                .with_max_wait(Duration::from_millis(100))
+                .with_known_network_store(store.clone())
+        };
+        let office = ip("192.0.2.10");
+
+        let before = throttle();
+        before.begin(office, "alice").await.unwrap().succeeded();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.0.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the success was not recorded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Further successes from the same network are not written again.
+        before.begin(office, "alice").await.unwrap().succeeded();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(store.0.lock().unwrap().len(), 1);
+        drop(before);
+
+        let after = throttle();
+        fail(&after, ip("203.0.113.1"), "alice").await;
+        fail(&after, ip("203.0.113.2"), "alice").await;
+        after
+            .begin(ip("203.0.113.3"), "alice")
+            .await
+            .unwrap()
+            .released();
+        assert_eq!(
+            after.begin(ip("203.0.113.4"), "alice").await.unwrap_err(),
+            AttemptRefused::Busy
+        );
+        let started = Instant::now();
+        after.begin(office, "alice").await.unwrap().released();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the owner's network was held back after the restart"
+        );
     }
 
     #[tokio::test]
