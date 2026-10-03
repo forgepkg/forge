@@ -9,8 +9,9 @@
 //! * `DELETE /package/{id}/{version}` — **unlist** (soft delete): 204 / 404.
 //! * `POST /package/{id}/{version}` — relist: 200 / 404.
 //!
-//! Hard delete is an admin operation, exposed via [`admin_hard_delete`] and
-//! wired by the server under `/admin/...` (Phase 10), not advertised here.
+//! Hard delete is an admin operation of the server's admin API
+//! (`DELETE /admin/repositories/{repo}/packages/{id}/{version}`), not part of
+//! the feed surface.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -222,7 +223,7 @@ pub async fn unlist(
     if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower)) {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
-    delete_version(&ctx, &id, &version, false).await
+    unlist_version(&ctx, &id, &version).await
 }
 
 /// Handler: `POST /package/{id}/{version}` — relist.
@@ -248,24 +249,12 @@ pub async fn relist(
     }
 }
 
-/// Admin-only hard delete: `DELETE /admin/repositories/{repo}/packages/{id}/{ver}`.
-///
-/// Wired into the server under the admin router (Phase 10); admin authorization
-/// is enforced there. Removes the component + assets and dereferences the
-/// backing blobs (deferred S3 delete via the outbox). 204 / 404.
-pub async fn admin_hard_delete(
-    State(ctx): State<RouteContext>,
-    Path((id, version)): Path<(String, String)>,
-) -> Response {
-    delete_version(&ctx, &id, &version, true).await
-}
-
-/// Shared delete path for soft (unlist) and hard (admin) removal.
-async fn delete_version(ctx: &RouteContext, id: &str, version: &str, hard: bool) -> Response {
+/// Unlist (soft-delete) a version.
+async fn unlist_version(ctx: &RouteContext, id: &str, version: &str) -> Response {
     let Some(write) = ctx.write.clone() else {
         return (StatusCode::NOT_FOUND, "delete not supported").into_response();
     };
-    match write.delete_component(&ctx.repo, id, version, hard).await {
+    match write.delete_component(&ctx.repo, id, version, false).await {
         Ok(DeleteOutcome::Unlisted) | Ok(DeleteOutcome::Deleted) => {
             StatusCode::NO_CONTENT.into_response()
         }
