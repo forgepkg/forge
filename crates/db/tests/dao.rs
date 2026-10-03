@@ -323,6 +323,93 @@ async fn blob_upsert_pending_returns_true_then_false() {
     assert_eq!(blob.size, 123);
 }
 
+/// The aftermath of the pre-0.1.0 concurrent hard-delete race: a blob left
+/// `deleting` with `ref_count` 0 that an asset still names. Neither the outbox
+/// nor a re-push of the same bytes may delete its object (a re-push used to
+/// take the stale reservation over and delete the object every 60 s); the
+/// reservation is cancelled and the blob is an ordinary committed blob again.
+#[tokio::test]
+async fn a_referenced_blob_left_deleting_is_restored_not_deleted() {
+    let pool = pool().await;
+    for via_outbox in [true, false] {
+        let n = unique();
+        let sha = format!("sha-left-deleting-{n}");
+        sqlx::query(
+            "INSERT INTO blob (sha256, size, s3_key, ref_count, state, delete_token, \
+             delete_previous_state, delete_started_at) VALUES ($1, 10, $2, 0, 'deleting', \
+             gen_random_uuid(), 'committed', now() - interval '1 hour')",
+        )
+        .bind(&sha)
+        .bind(format!("blobs/{sha}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo =
+            repository_dao::insert_repository(&pool, NewRepository::hosted(format!("left{n}")))
+                .await
+                .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let comp = component_dao::insert_component(
+            &mut *tx,
+            NewComponent {
+                repository_id: repo.id,
+                name: "left.lib".into(),
+                original_id: "Left.Lib".into(),
+                version: "1.0.0".into(),
+                version_original: "1.0.0".into(),
+                listed: true,
+            },
+        )
+        .await
+        .unwrap();
+        asset_dao::insert_asset(
+            &mut *tx,
+            NewAsset {
+                component_id: comp.id,
+                path: "left.lib.1.0.0.nupkg".into(),
+                content_type: "application/octet-stream".into(),
+                blob_sha256: sha.clone(),
+                size: 10,
+                sha512_base64: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let stale_before = Utc::now() - Duration::minutes(2);
+        if via_outbox {
+            let outcome = blob_dao::reserve_outbox_delete(&pool, &sha, stale_before)
+                .await
+                .unwrap();
+            assert_eq!(outcome, blob_dao::ReserveDeleteOutcome::Referenced);
+        } else {
+            let outcome = blob_dao::begin_ingest(
+                &pool,
+                &sha,
+                10,
+                &format!("blobs/{sha}"),
+                Utc::now() + Duration::minutes(5),
+                stale_before,
+            )
+            .await
+            .unwrap();
+            let token = match outcome {
+                blob_dao::BeginIngestOutcome::Ready { token, .. } => token,
+                other => panic!("the object must not be deleted: {other:?}"),
+            };
+            blob_dao::abort_ingest(&pool, token).await.unwrap();
+        }
+        let blob = blob_dao::get_blob(&pool, &sha).await.unwrap().unwrap();
+        assert_eq!(
+            blob.state(),
+            BlobState::Committed,
+            "via_outbox={via_outbox}"
+        );
+        assert_eq!(blob.ref_count, 1, "via_outbox={via_outbox}");
+    }
+}
+
 #[tokio::test]
 async fn refreshed_ingest_lease_still_fences_delete_after_original_expiry() {
     let pool = pool().await;
