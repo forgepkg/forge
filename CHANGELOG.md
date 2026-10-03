@@ -193,6 +193,13 @@ The release workflow publishes the section whose heading matches the tag
   package part's headers within 64 KiB is refused with 400 (the parser
   buffered everything before the first boundary in memory, up to the whole
   upload limit).
+- Package archives: a ZIP64 locator that does not point at a ZIP64 record
+  is refused (the pre-parse limit check skipped such archives, and the zip
+  reader then went looking for an unvetted record whose entry count sizes an
+  allocation), and archives are read at offset 0. Versions NuGet clients
+  cannot read as a package's own are refused at publish: a component above
+  `int32`, a numeric prerelease identifier with a leading zero (stored
+  under a normalized URL no client requests) and malformed build metadata.
 
 ## [0.1.0]
 

@@ -51,6 +51,7 @@ pub fn parse_nupkg(
         ));
     }
 
+    version::NugetVersion::validate_publishable(&raw.version)?;
     let version_normalized = version::normalize(&raw.version)?;
     let id_lower = lower_id(&raw.id);
 
@@ -295,7 +296,13 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         inner: file,
         budget: budget.clone(),
     };
-    let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+    // Archive offset 0: a .nupkg has no prepended data, and the reader must
+    // not go looking for directory records elsewhere than where the vetted
+    // ones say (an unvetted record's entry count sizes an allocation).
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(|e| {
         if budget.get() == Some(0) {
             NupkgError::LimitExceeded(format!(
                 "zip central directory exceeds max {} bytes",
@@ -484,7 +491,10 @@ fn check_eocd_candidate(
     let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
     let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
 
-    // A ZIP64 locator sits immediately before the EOCD.
+    // A ZIP64 locator sits immediately before the EOCD. The record it names
+    // must be exactly there: the zip reader is opened at archive offset 0
+    // (see `extract_nuspec`), so it reads that record and no other — and one
+    // that is not there cannot be vetted, so the archive is refused.
     if zip64_marker && pos >= ZIP64_LOCATOR_LEN {
         let loc = read_at(file, pos - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR_LEN as usize)?;
         if loc[..4] == ZIP64_LOCATOR_SIG {
@@ -492,7 +502,10 @@ fn check_eocd_candidate(
             if record < pos && read_at(file, record, 4)? == ZIP64_EOCD_SIG {
                 return check_zip64_record(file, record, len, limits);
             }
-            return Ok(0);
+            return Err(NupkgError::InvalidZip(
+                "the ZIP64 locator does not point at a ZIP64 end-of-central-directory record"
+                    .into(),
+            ));
         }
     }
     check_directory_limits(u64::from(on_disk.max(total)), u64::from(directory), limits)?;
@@ -1381,6 +1394,36 @@ mod tests {
     }
 
     #[test]
+    fn a_zip64_locator_must_name_its_record() {
+        // The ZIP64 trailer of the test above, shifted by 16 bytes of junk
+        // while the locator still says offset 0: a reader that looked for the
+        // record elsewhere would trust a million unvetted entries.
+        let mut zip = vec![0u8; 16];
+        zip.extend_from_slice(&ZIP64_EOCD_SIG);
+        zip.extend_from_slice(&44u64.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes());
+        zip.extend_from_slice(&1_000_000u64.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes());
+        zip.extend_from_slice(&ZIP64_LOCATOR_SIG);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&0u64.to_le_bytes()); // names offset 0: junk
+        zip.extend_from_slice(&1u32.to_le_bytes());
+        zip.extend_from_slice(&EOCD_SIG);
+        zip.extend_from_slice(&[0, 0, 0, 0]);
+        zip.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        zip.extend_from_slice(&[0xFF; 8]);
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        let err = check_archive_directory(&mut std::io::Cursor::new(zip), &NupkgLimits::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("ZIP64 locator"), "{err}");
+    }
+
+    #[test]
     fn signature_lookalikes_in_entry_data_are_not_vetted() {
         // Stored (uncompressed) payload bytes that happen to contain EOCD and
         // ZIP64-record signatures with absurd counts, inside the trailing
@@ -1468,5 +1511,18 @@ mod tests {
 
         let ok = r#"<package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
         assert_eq!(parse_nupkg(&mut nupkg_with(ok), &limits).unwrap().id, "a.b");
+
+        // Versions NuGet clients cannot read as the package's own.
+        for version in ["2147483648.0.0", "1.0.0-rc.01", "1.0.0+bad_meta", "1.0.0+"] {
+            let xml = format!(
+                "<package><metadata><id>A.B</id><version>{version}</version></metadata></package>"
+            );
+            assert!(
+                parse_nupkg(&mut nupkg_with(&xml), &limits).is_err(),
+                "{version}"
+            );
+        }
+        let edge = r#"<package><metadata><id>A.B</id><version>2147483647.0.0-rc.0.10+build.5-x</version></metadata></package>"#;
+        assert!(parse_nupkg(&mut nupkg_with(edge), &limits).is_ok());
     }
 }

@@ -151,6 +151,56 @@ impl NugetVersion {
         Ok(out)
     }
 
+    /// Check that NuGet clients can read `raw` as a package's own version,
+    /// beyond what [`Self::parse`] accepts (which stays lenient for versions
+    /// listed by upstream feeds): every numeric component fits NuGet's
+    /// `int32`, numeric prerelease identifiers have no leading zero (NuGet
+    /// keeps `rc.01` verbatim while Forge would normalize it to `rc.1`, so the
+    /// package would live at a URL no client asks for), and build metadata is
+    /// dot-separated `[0-9A-Za-z-]` identifiers.
+    pub fn validate_publishable(raw: &str) -> Result<(), FormatError> {
+        let invalid = |reason: String| FormatError::InvalidVersion {
+            value: raw.to_string(),
+            reason,
+        };
+        let parsed = Self::parse(raw)?;
+        let max = i32::MAX as u64;
+        if [parsed.major, parsed.minor, parsed.patch, parsed.revision]
+            .iter()
+            .any(|&n| n > max)
+        {
+            return Err(invalid(format!("a version component exceeds {max}")));
+        }
+        let trimmed = raw.trim();
+        let (without_build, build) = match trimmed.split_once('+') {
+            Some((v, b)) => (v, Some(b)),
+            None => (trimmed, None),
+        };
+        if let Some((_, prerelease)) = without_build.split_once('-') {
+            if prerelease.split('.').any(|ident| {
+                ident.len() > 1
+                    && ident.starts_with('0')
+                    && ident.bytes().all(|b| b.is_ascii_digit())
+            }) {
+                return Err(invalid(
+                    "a numeric prerelease identifier has a leading zero".into(),
+                ));
+            }
+        }
+        if let Some(build) = build {
+            let valid = build.split('.').all(|ident| {
+                !ident.is_empty()
+                    && ident
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+            if !valid {
+                return Err(invalid("invalid build metadata".into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Render the canonical normalized string.
     pub fn to_normalized_string(&self) -> String {
         let mut s = if self.has_revision {
