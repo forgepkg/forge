@@ -1587,12 +1587,18 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     .unwrap();
     let twin = raw(format!("fritz{n}\u{2003}")).await.unwrap();
 
-    let repairs = user_dao::canonicalize_stored_usernames(&pool).await.unwrap();
+    let repairs = user_dao::canonicalize_stored_usernames(&pool)
+        .await
+        .unwrap();
     let renamed = |id: i64| repairs.iter().find(|r| r.id == id).map(|r| r.to.clone());
     assert_eq!(renamed(spaced), Some(format!("erin{n}")));
     assert_eq!(renamed(upper), Some(format!("ünal{n}")));
     assert_eq!(renamed(twin), Some(format!("fritz{n}#{twin}")));
-    assert_eq!(renamed(holder.id), None, "the canonical holder keeps its name");
+    assert_eq!(
+        renamed(holder.id),
+        None,
+        "the canonical holder keeps its name"
+    );
 
     for (spelling, id) in [
         (format!(" ERIN{n} "), spaced),
@@ -1607,8 +1613,8 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     }
 
     // Idempotent: a second run has nothing left to do for these accounts.
-    let again = user_dao::canonicalize_stored_usernames(&pool).await.unwrap();
-    assert!(again
-        .iter()
-        .all(|r| ![spaced, upper, twin].contains(&r.id)));
+    let again = user_dao::canonicalize_stored_usernames(&pool)
+        .await
+        .unwrap();
+    assert!(again.iter().all(|r| ![spaced, upper, twin].contains(&r.id)));
 }

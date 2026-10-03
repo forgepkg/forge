@@ -103,6 +103,10 @@ pub const KNOWN_NETWORK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Networks remembered per username (the most recent successes).
 const KNOWN_NETWORKS_PER_USER: usize = 8;
 
+/// Per username hash: the networks it signed in from, with the time of the
+/// last success from each, newest last.
+type KnownNetworks = HashMap<[u8; 32], Vec<(IpAddr, Instant)>>;
+
 /// The network a client address is accounted to: the address itself for
 /// IPv4 (IPv4-mapped IPv6 included), its /64 for IPv6.
 pub fn client_network(ip: IpAddr) -> IpAddr {
@@ -219,9 +223,9 @@ pub struct LoginThrottle {
     /// Largest spacing.
     user_backoff_max: Duration,
     users: Mutex<HashMap<[u8; 32], UserEntry>>,
-    /// Networks each username recently signed in from, newest last; exempt
-    /// from its soft backoff.
-    known_networks: Mutex<HashMap<[u8; 32], Vec<(IpAddr, Instant)>>>,
+    /// Networks each username recently signed in from; exempt from its soft
+    /// backoff.
+    known_networks: Mutex<KnownNetworks>,
 }
 
 impl LoginThrottle {

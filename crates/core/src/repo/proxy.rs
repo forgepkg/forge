@@ -1655,10 +1655,13 @@ impl ProxyRepo {
         )
         .fetch_all(&self.pool)
         .await?;
-        let names: Vec<String> = names
+        let mut names: Vec<String> = names
             .into_iter()
             .filter(|name| filter.allows(name) && query.matches(name))
             .collect();
+        // Byte order, as hosted and group results are ordered (SQL orders by
+        // the database collation, which may weigh punctuation differently).
+        names.sort_unstable();
         let total_hits = names.len();
         let page: Vec<String> = names
             .into_iter()
@@ -1942,11 +1945,16 @@ impl RepoReadOps for ProxyRepo {
         // stored at download. A version cached before summaries were stored
         // has its manifest read once (bounded concurrency) and backfilled.
         let mut cached: HashMap<String, component_dao::RegistrationRow> =
-            component_dao::list_registration_rows(&self.pool, repo_row.id, &lower, NUPKG_ASSET_PATH)
-                .await?
-                .into_iter()
-                .map(|row| (row.version.clone(), row))
-                .collect();
+            component_dao::list_registration_rows(
+                &self.pool,
+                repo_row.id,
+                &lower,
+                NUPKG_ASSET_PATH,
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.version.clone(), row))
+            .collect();
         let unsummarized: Vec<(i64, String)> = visible
             .iter()
             .filter(|r| r.downloaded)
@@ -1959,7 +1967,9 @@ impl RepoReadOps for ProxyRepo {
             let (repo_id, name) = (repo_row.id, lower.as_str());
             futures_util::stream::iter(unsummarized)
                 .map(|(component_id, version)| async move {
-                    let manifest = self.summarize_cached(repo_id, name, component_id, &version).await;
+                    let manifest = self
+                        .summarize_cached(repo_id, name, component_id, &version)
+                        .await;
                     (version, manifest)
                 })
                 .buffered(8)
