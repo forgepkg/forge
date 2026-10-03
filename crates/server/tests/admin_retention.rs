@@ -16,8 +16,8 @@ use forge_db::retention_dao;
 use serde_json::{json, Value};
 
 /// A minimal valid hosted policy: keep newest 1, hard-delete the rest. The
-/// trigger is `not_downloaded_for_days` (seeded components are never downloaded,
-/// which always matches), so it fires without backdating `created_at`.
+/// trigger is `not_downloaded_for_days`; seeded components are never
+/// downloaded and published two days ago, so it fires.
 fn keep_one_policy() -> Value {
     json!({
         "version": 1,
@@ -84,6 +84,14 @@ async fn seed_hosted_with_versions(
         .unwrap();
         tx.commit().await.unwrap();
     }
+    // Never downloaded counts from publication: make them two days old.
+    sqlx::query(
+        "UPDATE component SET created_at = now() - interval '2 days' WHERE repository_id = $1",
+    )
+    .bind(repo.id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
 
     repo.id
 }

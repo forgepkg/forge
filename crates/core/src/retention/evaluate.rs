@@ -24,7 +24,8 @@
 //! 4. For each version, a rule *selects* it iff the rule's filters match **and**
 //!    all of the rule's present triggers are satisfied (ANDed):
 //!    `older_than_days` (age since `created_at`) and `not_downloaded_for_days`
-//!    (never-downloaded always matches).
+//!    (days since the last download or, for a version never downloaded, since
+//!    it was published — so a fresh push is not cold on its first run).
 //! 5. Protection overrides selection. Otherwise the highest-severity action
 //!    wins (`hard_delete` > `unlist`).
 //!
@@ -189,11 +190,11 @@ fn triggers_match(
 
     if let Some(days) = c.not_downloaded_for_days {
         any_trigger = true;
-        let cold = match cand.last_downloaded_at {
-            // Never downloaded ⇒ always a prime eviction target (Nexus parity).
-            None => true,
-            Some(ts) => days_since(now, ts) >= days as i64,
-        };
+        // Never downloaded counts from publication (as Nexus does, and as the
+        // proxy rules count from `first_seen_at`): treating it as always cold
+        // hard-deleted a version pushed minutes before the run.
+        let reference = cand.last_downloaded_at.unwrap_or(cand.created_at);
+        let cold = days_since(now, reference) >= days as i64;
         if !cold {
             return None;
         }
@@ -576,11 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn not_downloaded_for_days_treats_never_downloaded_as_cold() {
+    fn not_downloaded_for_days_counts_never_downloaded_from_publication() {
         let cands = vec![
-            comp(1, "lib", "1.0.0", 100, None),     // never downloaded → cold
+            comp(1, "lib", "1.0.0", 100, None),     // never downloaded, old → cold
             comp(2, "lib", "2.0.0", 100, Some(5)),  // downloaded 5d ago → warm
             comp(3, "lib", "3.0.0", 100, Some(60)), // downloaded 60d ago → cold
+            comp(4, "lib", "4.0.0", 0, None),       // pushed today, never downloaded → warm
         ];
         let p = policy_with(vec![rule(
             "r",
