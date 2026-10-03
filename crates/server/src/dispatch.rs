@@ -58,11 +58,14 @@ fn subpath(uri: &Uri, repo: &str) -> String {
 }
 
 /// Build a [`RouteContext`] for a resolved repository + principal.
+/// `replace_filter` is the caller's delete predicate, which a redeploy needs
+/// (only computed for writes).
 async fn route_context(
     state: &AppState,
     repo: &Repository,
     principal: Principal,
     package_filter: PackageFilter,
+    replace_filter: PackageFilter,
 ) -> Option<RouteContext> {
     let kind = repo.kind();
     let format = state.formats.for_repository(repo);
@@ -72,23 +75,15 @@ async fn route_context(
     // Write ops only for hosted repos; the router mounts publish routes only for
     // hosted, so proxy/group never reach a write handler.
     let write: Option<std::sync::Arc<dyn forge_core::repo::RepoWriteOps>> = match kind {
-        RepoKind::Hosted => {
-            // A redeploy replaces a version's bytes: it takes the delete
-            // permission (and its selectors) as well as write.
-            let replace_filter = state
-                .authz
-                .package_filter_for(&principal, repo, Action::Delete)
-                .await;
-            Some(std::sync::Arc::new(HostedWriteAdapter::new(
-                state,
-                format.clone(),
-                repo.id,
-                repo.name.clone(),
-                principal,
-                package_filter.clone(),
-                replace_filter,
-            )))
-        }
+        RepoKind::Hosted => Some(std::sync::Arc::new(HostedWriteAdapter::new(
+            state,
+            format.clone(),
+            repo.id,
+            repo.name.clone(),
+            principal,
+            package_filter.clone(),
+            replace_filter,
+        ))),
         _ => None,
     };
 
@@ -174,7 +169,19 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         .package_filter_for(&principal, &repo, action)
         .await;
 
-    let Some(ctx) = route_context(&state, &repo, principal, package_filter).await else {
+    // A redeploy replaces a version's bytes: it takes the delete permission
+    // (and its selectors) as well as write. Only writes need it, and for a
+    // token it costs a scope lookup.
+    let replace_filter = if action == Action::Write && repo.kind() == RepoKind::Hosted {
+        state
+            .authz
+            .package_filter_for(&principal, &repo, Action::Delete)
+            .await
+    } else {
+        PackageFilter::DenyAll
+    };
+    let Some(ctx) = route_context(&state, &repo, principal, package_filter, replace_filter).await
+    else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     };
 
@@ -204,9 +211,11 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Err(infallible) => match infallible {},
     };
     if action != Action::Read {
-        // Every package mutation (push, unlist, relist), allowed or not,
-        // with who sent it: the trail a leaked credential's writes are
-        // traced by (workload publishes are also in trusted_publish_audit).
+        // Every package mutation (push, unlist, relist) that reached its
+        // handler, whatever its outcome, with who sent it: the trail a leaked
+        // credential's writes are traced by (workload publishes are also in
+        // trusted_publish_audit). Requests the repository gate refuses are
+        // not logged.
         tracing::info!(
             target: "forge::audit",
             %method,

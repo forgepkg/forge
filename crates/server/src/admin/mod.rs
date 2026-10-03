@@ -107,7 +107,14 @@ pub async fn require_admin(
     }
     if state.authz.is_global_admin(&principal).await {
         let method = req.method().clone();
-        let path = req.uri().path().to_string();
+        // The nested router strips `/admin`; log the path as requested.
+        let path = req
+            .extensions()
+            .get::<axum::extract::OriginalUri>()
+            .map_or_else(
+                || req.uri().path().to_string(),
+                |uri| uri.path().to_string(),
+            );
         let response = next.run(req).await;
         if !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD) {
             // The administration audit trail: every change (users, roles,

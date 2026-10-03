@@ -507,10 +507,11 @@ impl ProxyRepo {
     // ── Upstream service-index discovery (Task 8.1) ──────────────────────────
 
     /// Resolve the upstream resource `@id`s for `repo`, reading through the
-    /// cache (L1/L2) and persisting to `proxy_upstream_index`.
+    /// per-instance cache (never Redis) and persisting to
+    /// `proxy_upstream_index`.
     ///
     /// Layering:
-    /// 1. **Cache** (`get_or_try_insert_with`, TTL = metadata_ttl) — per-instance
+    /// 1. **Cache** (`get_or_try_insert_local`, TTL = metadata_ttl) — per-instance
     ///    coalescing + short-circuit; a 2nd call within TTL never touches DB or
     ///    upstream.
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`

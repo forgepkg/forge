@@ -264,10 +264,11 @@ metadata according to the configured anonymous policy.
   itself. Forge does not require one: a rule that pins only the repository or
   project lets **any** branch and any workflow of it publish (bypassing branch
   protection), including `pull_request_target` runs and, on GitLab, a
-  pipeline for a fork's merge request run in the parent project. Add
-  `job_workflow_ref` plus `ref_protected` or an `environment` to every
-  publishing rule. On GitLab prefer the `job_*` ids: `project_id` and
-  `namespace_id` name a merge request's *source* project.
+  pipeline for a fork's merge request run in the parent project. On GitHub
+  add `job_workflow_ref` plus a protected ref or an `environment` to every
+  publishing rule; GitLab tokens have no `job_workflow_ref`, so there add
+  `ref_protected = true` or an `environment`, and prefer the `job_*` ids:
+  `project_id` and `namespace_id` name a merge request's *source* project.
 - Use a dedicated, exact audience for Forge; never reuse a broad cloud audience.
 - Set `positive_cache_seconds = 0` to disable the per-token positive verdict
   cache. Discovery and JWKS have their own caches (JWKS defaults to one hour),
