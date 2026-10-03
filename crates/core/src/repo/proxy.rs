@@ -671,22 +671,31 @@ impl ProxyRepo {
         let url = format!("{base}{lower_id}/index.json");
         match self.fetch_json(repo, &url).await? {
             Some(doc) => {
-                let versions: Vec<String> = doc
-                    .get("versions")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .filter_map(|raw| self.format.normalize_version(raw).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // A document without a `versions` array is not a listing:
+                // treat it as an upstream failure (what is cached is served)
+                // rather than as "no versions", which would retire them all.
+                let Some(listed) = doc.get("versions").and_then(|v| v.as_array()) else {
+                    return Err(RepoError::Storage(format!(
+                        "upstream listing {url} has no versions array"
+                    )));
+                };
+                let versions: Vec<String> = listed
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|raw| self.format.normalize_version(raw).ok())
+                    .collect();
 
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
                 // upstream) and drop a stale package-level not-found marker.
+                // An empty listing retires nothing: a feed answers 404 for a
+                // package without versions, so an empty 200 is a degraded
+                // upstream (an offline or partially synced mirror), not a
+                // deletion of every version, downloaded ones included.
                 proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
-                proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                if !versions.is_empty() {
+                    proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                }
                 Ok(true)
             }
             None => {

@@ -74,6 +74,9 @@ struct MockState {
     registrations: Mutex<HashMap<String, serde_json::Value>>,
     /// `"{lower_id}/{file}" -> registration page document`.
     registration_pages: Mutex<HashMap<String, serde_json::Value>>,
+    /// `lower_id -> flat-container listing document` served instead of the
+    /// corpus's.
+    flat_index_override: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 impl MockState {
@@ -207,6 +210,9 @@ async fn serve_flat_index(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     st.flat_index_hits.fetch_add(1, Ordering::SeqCst);
+    if let Some(doc) = st.flat_index_override.lock().unwrap().get(&id) {
+        return (StatusCode::OK, axum::Json(doc.clone())).into_response();
+    }
     let versions = st
         .packages
         .lock()
@@ -334,6 +340,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         nuspec_override: Mutex::default(),
         registrations: Mutex::default(),
         registration_pages: Mutex::default(),
+        flat_index_override: Mutex::default(),
     });
 
     let app = Router::new()
@@ -1049,6 +1056,53 @@ async fn versions_deleted_upstream_leave_the_listings() {
         ["1.0.0", "2.1.0"],
         "listed again, visible again"
     );
+}
+
+/// A degraded upstream answering a package's listing with an empty
+/// `versions` array, or a document without one, retires nothing: what is
+/// cached stays listed and downloadable (before, every version, downloaded
+/// ones included, was flagged deleted upstream until the next good listing).
+#[tokio::test]
+async fn an_empty_or_malformed_listing_retires_nothing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.1.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.1.0"]
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "2.1.0")
+        .await
+        .unwrap()
+        .is_some());
+
+    for doc in [
+        serde_json::json!({ "versions": [] }),
+        serde_json::json!({ "error": "mirror offline" }),
+    ] {
+        mock.state
+            .flat_index_override
+            .lock()
+            .unwrap()
+            .insert("contoso.lib".into(), doc.clone());
+        // A fresh cache stands in for an expired metadata TTL.
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+        assert_eq!(
+            versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+            ["1.0.0", "2.1.0"],
+            "{doc}"
+        );
+        assert!(
+            px.resolve_nupkg(&repo, "Contoso.Lib", "2.1.0")
+                .await
+                .unwrap()
+                .is_some(),
+            "{doc}"
+        );
+    }
 }
 
 /// H3 follow-up: the package-level not-found marker (`*`) is cleared as soon
