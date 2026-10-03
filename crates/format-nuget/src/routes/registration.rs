@@ -20,7 +20,7 @@ use forge_core::repo::RegistrationEntry;
 use serde_json::{json, Value};
 
 use crate::nuspec;
-use crate::routes::{repo_error_response, RouteContext};
+use crate::routes::{package_id, repo_error_response, RouteContext};
 
 /// Build the absolute `packageContent` URL for a `(lower_id, version)`.
 fn package_content_url(base: &str, lower_id: &str, version: &str) -> String {
@@ -209,7 +209,9 @@ pub fn registration_json(
 
 /// Handler: `GET`/`HEAD` `/registration/{id}/index.json`.
 pub async fn index(State(ctx): State<RouteContext>, Path(id): Path<String>) -> Response {
-    let lower = ctx.format.lower_id(&id);
+    let Some(lower) = package_id(&ctx, &id) else {
+        return (StatusCode::NOT_FOUND, "registration not found").into_response();
+    };
     let entries = match ctx.ops.registration(&ctx.repo, &lower).await {
         Ok(e) => e,
         Err(e) => return repo_error_response(e),
@@ -228,7 +230,7 @@ async fn find_entry(
     file: &str,
 ) -> Result<(String, RegistrationEntry), Response> {
     let not_found = || (StatusCode::NOT_FOUND, "registration leaf not found").into_response();
-    let lower = ctx.format.lower_id(id);
+    let lower = package_id(ctx, id).ok_or_else(not_found)?;
     let raw_version = file.strip_suffix(".json").ok_or_else(not_found)?;
     let version = ctx
         .format

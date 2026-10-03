@@ -57,6 +57,29 @@ pub trait Format: Send + Sync {
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
 
+    /// Whether `id` is a well-formed package id of this format. Read routes
+    /// answer 404 for anything else, and a proxy never puts such an id into
+    /// an upstream URL: an id is pasted into URL paths, so `/`, `..`, `?`,
+    /// `#` or `%` in it would let a reader steer a credentialed upstream
+    /// request to another path or query.
+    ///
+    /// The default accepts only letters, digits, `_`, `.` and `-` (no empty
+    /// id, no `..`); formats with a stricter grammar override it.
+    fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        let ok = !id.is_empty()
+            && !id.contains("..")
+            && id
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        if ok {
+            Ok(())
+        } else {
+            Err(FormatError::InvalidPackage(format!(
+                "invalid package id {id:?}"
+            )))
+        }
+    }
+
     /// The identity a standalone manifest (e.g. a `.nuspec`) declares, as
     /// `(lower_id, normalized version)`. A proxy verifies a manifest fetched
     /// from its upstream with this before serving or caching it. The default

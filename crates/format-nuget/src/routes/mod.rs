@@ -209,6 +209,16 @@ async fn hardened(mut response: Response) -> Response {
     response
 }
 
+/// The lowered package id of a request path, or `None` when it is not a
+/// well-formed id ([`Format::validate_id`]). Every id-addressed route answers
+/// such a request 404 before any backend sees it: a proxy pastes the id into
+/// credentialed upstream URLs, where `/`, `..`, `?` or `#` (all reachable
+/// through percent-encoding) would redirect the request.
+pub(crate) fn package_id(ctx: &RouteContext, raw: &str) -> Option<String> {
+    let lower = ctx.format.lower_id(raw);
+    ctx.format.validate_id(&lower).ok().map(|()| lower)
+}
+
 /// Map a [`RepoError`] to an HTTP response.
 pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
     use axum::http::StatusCode;

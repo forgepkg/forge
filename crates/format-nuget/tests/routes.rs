@@ -443,6 +443,41 @@ async fn feed_responses_are_sandboxed_downloads() {
     }
 }
 
+/// Ids that are not well-formed never reach the read backend (a proxy would
+/// paste them into credentialed upstream URLs): every id-addressed route
+/// answers 404 first, however the id is percent-encoded.
+#[tokio::test]
+async fn malformed_ids_are_404_before_the_backend() {
+    let traversal = "x/../sample.lib".to_string();
+    let mut ops = MockOps::default();
+    let entry = VersionEntry {
+        original_id: traversal.clone(),
+        version: "1.0.0".into(),
+        version_original: "1.0.0".into(),
+        listed: true,
+    };
+    // A backend that would answer for the malformed id if asked.
+    ops.versions.insert(traversal.clone(), vec![entry]);
+    ops.nuspecs
+        .insert((traversal.clone(), "1.0.0".into()), b"<package/>".to_vec());
+    let router = nuget_router(
+        RepoKind::Proxy,
+        ctx(RepoKind::Proxy, ops, MockBytes::default()),
+    );
+    for uri in [
+        "/flat/x%2F..%2Fsample.lib/index.json",
+        "/flat/X%2F..%2Fsample.lib/1.0.0/x.nuspec",
+        "/flat/sample.lib%3Fq%3D1/index.json",
+        "/flat/sample.lib%23frag/index.json",
+        "/registration/x%2F..%2Fsample.lib/index.json",
+        "/registration/x%2F..%2Fsample.lib/1.0.0.json",
+        "/catalog/x%2F..%2Fsample.lib/1.0.0.json",
+    ] {
+        let (status, _h, _b) = get(&router, uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn flat_version_normalized_on_path() {
     // Request version "1.0" should resolve the stored normalized "1.0.0".

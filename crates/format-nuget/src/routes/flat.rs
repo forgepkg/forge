@@ -13,11 +13,13 @@ use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::{json, Value};
 
-use crate::routes::{repo_error_response, RouteContext};
+use crate::routes::{package_id, repo_error_response, RouteContext};
 
 /// Handler: `GET`/`HEAD` `/flat/{id}/index.json`.
 pub async fn versions(State(ctx): State<RouteContext>, Path(id): Path<String>) -> Response {
-    let lower = ctx.format.lower_id(&id);
+    let Some(lower) = package_id(&ctx, &id) else {
+        return (StatusCode::NOT_FOUND, "package not found").into_response();
+    };
     let versions = match ctx.ops.list_versions(&ctx.repo, &lower).await {
         Ok(v) => v,
         Err(e) => return repo_error_response(e),
@@ -41,7 +43,9 @@ pub async fn content(
     method: Method,
     Path((id, version, filename)): Path<(String, String, String)>,
 ) -> Response {
-    let lower = ctx.format.lower_id(&id);
+    let Some(lower) = package_id(&ctx, &id) else {
+        return (StatusCode::NOT_FOUND, "package not found").into_response();
+    };
     let norm_ver = match ctx.format.normalize_version(&version) {
         Ok(v) => v,
         Err(_) => return (StatusCode::NOT_FOUND, "invalid version").into_response(),

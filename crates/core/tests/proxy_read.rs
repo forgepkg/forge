@@ -393,6 +393,79 @@ fn proxy_repo(pool: &PgPool, cas: forge_storage::Cas, cache: Cache) -> ProxyRepo
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+/// A package id is pasted into credentialed upstream URLs. Ids that are not
+/// well-formed (`/`, `..`, `?`, `#` — reachable through percent-encoding on
+/// the feed routes) never reach the upstream and are never recorded, whatever
+/// read operation (or group fan-out) carries them.
+#[tokio::test]
+async fn malformed_ids_never_reach_the_upstream() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let cache = Cache::l1_only(128);
+    let mut corpus = HashMap::new();
+    let mut vers = HashMap::new();
+    vers.insert("1.2.3".to_string(), sample_nupkg());
+    corpus.insert("sample.lib".to_string(), vers);
+    let mock = start_mock(corpus).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, cache);
+
+    for id in [
+        "x/../sample.lib",
+        "../flat/sample.lib",
+        "sample.lib/index.json?",
+        "sample.lib#",
+        "sample%2elib",
+        "",
+    ] {
+        assert!(
+            px.list_versions(&repo, id).await.unwrap().is_empty(),
+            "{id:?}"
+        );
+        assert!(
+            px.registration(&repo, id).await.unwrap().is_empty(),
+            "{id:?}"
+        );
+        assert!(
+            px.resolve_nupkg(&repo, id, "1.2.3")
+                .await
+                .unwrap()
+                .is_none(),
+            "{id:?}"
+        );
+        assert!(
+            px.resolve_nuspec(&repo, id, "1.2.3")
+                .await
+                .unwrap()
+                .is_none(),
+            "{id:?}"
+        );
+    }
+    assert_eq!(
+        mock.flat_index_hits(),
+        0,
+        "no listing request for a malformed id"
+    );
+    assert_eq!(mock.nupkg_hits(), 0);
+    assert_eq!(mock.nuspec_hits(), 0);
+    assert_eq!(mock.registration_hits(), 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM proxy_cached_version v JOIN repository r ON r.id = v.repository_id \
+         WHERE r.name = $1",
+    )
+    .bind(&repo)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0, "nothing recorded under a malformed id");
+
+    // The well-formed id still works.
+    assert_eq!(
+        px.list_versions(&repo, "Sample.Lib").await.unwrap().len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn cache_on_demand_fetches_upstream_once() {
     let pool = common::pool().await;

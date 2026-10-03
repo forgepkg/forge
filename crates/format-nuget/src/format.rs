@@ -60,6 +60,10 @@ impl Format for NugetFormat {
         nuspec::lower_id(id)
     }
 
+    fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        nuspec::validate_package_id(id)
+    }
+
     fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
         nuspec::manifest_identity(manifest, &self.limits)
     }

@@ -336,6 +336,16 @@ pub struct ProxyRepo {
 }
 
 impl ProxyRepo {
+    /// The lowered id to use in upstream URLs and cache rows, or `None` when
+    /// `id` is not a well-formed package id ([`Format::validate_id`]). Every
+    /// read entry point checks this first: the id is pasted into URLs sent
+    /// with the repository's upstream credentials, so `x/../../admin?q=` must
+    /// never get that far (and must never be recorded as a package).
+    fn upstream_id(&self, id: &str) -> Option<String> {
+        let lower = self.format.lower_id(id);
+        self.format.validate_id(&lower).ok().map(|()| lower)
+    }
+
     /// Build a proxy read facade over the process-wide default upstream client.
     pub fn new(pool: PgPool, format: Arc<dyn Format>, cas: Cas, cache: Cache) -> Self {
         ProxyRepo {
@@ -1622,7 +1632,9 @@ fn is_prerelease(version: &str) -> bool {
 impl RepoReadOps for ProxyRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let lower = self.format.lower_id(id);
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(Vec::new());
+        };
 
         // Honor a still-valid genuine-404 negative cache for the whole id.
         if self.negative_cached(&repo_row, &lower, "*").await? {
@@ -1652,7 +1664,9 @@ impl RepoReadOps for ProxyRepo {
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let lower = self.format.lower_id(id);
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
         let norm = self
             .format
             .normalize_version(version)
@@ -1680,7 +1694,9 @@ impl RepoReadOps for ProxyRepo {
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let lower = self.format.lower_id(id);
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
         let Ok(norm) = self.format.normalize_version(version) else {
             return Ok(None);
         };
@@ -1737,7 +1753,9 @@ impl RepoReadOps for ProxyRepo {
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let lower = self.format.lower_id(id);
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(Vec::new());
+        };
 
         if self.negative_cached(&repo_row, &lower, "*").await? {
             return Ok(Vec::new());

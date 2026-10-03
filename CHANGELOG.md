@@ -44,6 +44,12 @@ The release workflow publishes the section whose heading matches the tag
   upstream lets any token holder sign in as any user. A success without the
   field fails closed. The docs now state that the upstream must bind the
   username to the secret.
+- Package ids in feed URLs are validated against the NuGet id grammar on
+  every read and unlist/relist route (404 otherwise), and again before a
+  proxy builds an upstream URL. A percent-encoded `..%2F`, `?` or `#` in an
+  id could steer the proxy's credentialed upstream requests to other paths
+  and queries of the upstream host, and planted bogus names in the proxy's
+  version table.
 
 ## [0.1.0]
 
