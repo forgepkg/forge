@@ -868,10 +868,29 @@ async fn nuspec_served_before_and_after_download() {
         "downloaded manifest is served locally"
     );
 
-    // Registration now carries the manifest (dependency groups).
+    // Registration now carries the manifest (dependency groups), as the
+    // summary stored at download: no manifest read per request.
     let reg = px.registration(&repo, "Sample.Lib").await.unwrap();
-    assert!(reg[0].nuspec_bytes.is_some());
+    assert!(reg[0].manifest_summary.is_some());
+    assert!(reg[0].nuspec_bytes.is_none());
     assert!(reg[0].package_hash_sha512_base64.is_some());
+
+    // A version cached before summaries were stored is summarized from its
+    // local manifest once, and the summary is backfilled.
+    let cleared = sqlx::query(
+        "UPDATE component SET manifest_summary = NULL \
+         WHERE name = 'sample.lib' AND version = '1.2.3' \
+           AND repository_id = (SELECT id FROM repository WHERE name = $1)",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cleared.rows_affected(), 1);
+    let reg = px.registration(&repo, "Sample.Lib").await.unwrap();
+    assert_eq!(reg[0].manifest_summary, reg_summary(&pool, &repo).await);
+    assert!(reg[0].manifest_summary.is_some(), "backfilled");
+    assert_eq!(mock.nuspec_hits(), 1, "from the local copy, not upstream");
 
     // Unknown versions stay 404 without touching the manifest endpoint.
     assert!(px
@@ -880,6 +899,19 @@ async fn nuspec_served_before_and_after_download() {
         .unwrap()
         .is_none());
     assert_eq!(mock.nuspec_hits(), 1);
+}
+
+/// The stored manifest summary of `sample.lib` 1.2.3 in proxy `repo`.
+async fn reg_summary(pool: &sqlx::PgPool, repo: &str) -> Option<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT manifest_summary FROM component \
+         WHERE name = 'sample.lib' AND version = '1.2.3' \
+           AND repository_id = (SELECT id FROM repository WHERE name = $1)",
+    )
+    .bind(repo)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// `BlobFetch` over the shared test bucket.
@@ -1056,6 +1088,99 @@ async fn versions_deleted_upstream_leave_the_listings() {
         ["1.0.0", "2.1.0"],
         "listed again, visible again"
     );
+}
+
+/// Search applies every listing condition (prerelease, the package delay, a
+/// live not-found marker) in SQL and pages over ids, loading versions for the
+/// returned page only.
+#[tokio::test]
+async fn search_applies_listing_conditions_and_pages_over_ids() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = corpus_of("Contoso.A", &["1.0.0", "2.0.0-beta"]);
+    corpus.extend(corpus_of("Contoso.B", &["1.0.0"]));
+    corpus.extend(corpus_of("Contoso.C", &["3.0.0-rc.1"]));
+    corpus.extend(corpus_of("Contoso.D", &["1.0.0"]));
+    let mock = start_mock(corpus).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    for id in ["Contoso.A", "Contoso.B", "Contoso.C", "Contoso.D"] {
+        px.list_versions(&repo, id).await.unwrap();
+    }
+    let search = |q: &str, prerelease: bool, skip: usize, take: usize| {
+        let params = forge_core::repo::SearchParams {
+            q: q.to_string(),
+            skip,
+            take,
+            prerelease,
+        };
+        let px = &px;
+        let repo = repo.clone();
+        async move {
+            let result = px.search(&repo, &params).await.unwrap();
+            let hits: Vec<(String, Vec<String>)> = result
+                .hits
+                .iter()
+                .map(|h| (h.original_id.clone(), versions_of(&h.versions)))
+                .collect();
+            (result.total_hits, hits)
+        }
+    };
+
+    // Everything was first seen just now: inside the one-hour delay.
+    assert_eq!(search("contoso", true, 0, 20).await.0, 0);
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+           AND name <> 'contoso.d'",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Prerelease versions only when asked for; an id with nothing else drops.
+    let (total, hits) = search("contoso", false, 0, 20).await;
+    assert_eq!(total, 2);
+    assert_eq!(
+        hits,
+        [
+            ("contoso.a".to_string(), vec!["1.0.0".to_string()]),
+            ("contoso.b".to_string(), vec!["1.0.0".to_string()]),
+        ]
+    );
+    let (total, hits) = search("contoso", true, 0, 20).await;
+    assert_eq!(total, 3, "contoso.d is still inside its delay");
+    assert_eq!(hits[0].1, ["1.0.0", "2.0.0-beta"]);
+
+    // Paging counts every hit and returns only the page.
+    let (total, hits) = search("", true, 1, 1).await;
+    assert_eq!(total, 3);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "contoso.b");
+
+    // A live not-found marker hides a version; an expired one does not.
+    let mark = |age: &'static str| {
+        let pool = pool.clone();
+        let repo = repo.clone();
+        async move {
+            sqlx::query(
+                "UPDATE proxy_cached_version \
+                 SET not_found = true, not_found_at = now() - $2::text::interval \
+                 WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+                   AND name = 'contoso.b'",
+            )
+            .bind(&repo)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    mark("1 second").await;
+    assert_eq!(search("contoso.b", true, 0, 20).await.0, 0);
+    mark("30 days").await;
+    assert_eq!(search("contoso.b", true, 0, 20).await.0, 1);
 }
 
 /// A degraded upstream answering a package's listing with an empty

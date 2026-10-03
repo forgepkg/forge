@@ -106,13 +106,17 @@ The release workflow publishes the section whose heading matches the tag
   only with `email_verified`, also when `username_claim` names it.
 - Registration and search no longer fetch and re-parse every version's
   `.nuspec` per request (an unauthenticated CPU and storage amplifier on
-  public feeds): the manifest summary is stored at publish (migration 0024;
-  older versions are summarized once and backfilled), the registration index
+  public feeds): the manifest summary is stored at publish and when a proxy
+  caches a package (migration 0024; older versions are summarized once and
+  backfilled), a proxy reads every cached version's registration data in
+  one query, proxy search pages over package ids in SQL and loads versions
+  for the returned page only (an empty query used to load every cached
+  version of every package), the registration index
   is paged (64 versions per page, inlined up to 128 versions, beyond that
   served from `/registration/{id}/page/{lower}/{upper}.json`, which answers
   with the versions in that range, so a page URL from a cached index keeps
-  working after a push or delete), leaf and
-  catalog documents look up one version instead of all, rendering runs on
+  working after a push or delete), hosted leaf and catalog documents look up
+  one version instead of all, rendering runs on
   the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
   rejects nesting deeper than 32 levels (it was quadratic in depth).
 - Proxy (completing the 0.1.0 "not found" marker fix): a version deleted
