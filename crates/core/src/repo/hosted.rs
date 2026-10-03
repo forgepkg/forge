@@ -81,12 +81,15 @@ impl HostedRepo {
     /// Build one exact search result while applying package authorization
     /// before paging. Hosted search currently loads its small Slice-1 corpus in
     /// one query, so doing this here avoids reloading that corpus once per
-    /// selector page.
+    /// selector page. With `enrich`, the returned page carries manifests and
+    /// download totals ([`Self::enrich_hits`]); a group searches its members
+    /// without and enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
         params: &SearchParams,
         filter: &PackageFilter,
+        enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let query = SearchQuery::parse(&params.q);
@@ -133,9 +136,8 @@ impl HostedRepo {
         }
 
         hits.sort_by(|a, b| {
-            a.original_id
-                .to_lowercase()
-                .cmp(&b.original_id.to_lowercase())
+            crate::format::lower_invariant(&a.original_id)
+                .cmp(&crate::format::lower_invariant(&b.original_id))
         });
         let total_hits = hits.len();
         let mut hits: Vec<SearchHit> = hits
@@ -143,7 +145,9 @@ impl HostedRepo {
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
-        self.enrich_hits(repo_id, &mut hits).await?;
+        if enrich {
+            self.enrich_hits(repo_id, &mut hits).await?;
+        }
         Ok(SearchResult { total_hits, hits })
     }
 
@@ -343,7 +347,7 @@ impl RepoReadOps for HostedRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, &PackageFilter::AllowAll)
+        self.search_filtered(repo, params, &PackageFilter::AllowAll, true)
             .await
     }
 
@@ -353,7 +357,28 @@ impl RepoReadOps for HostedRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, filter).await
+        self.search_filtered(repo, params, filter, true).await
+    }
+
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_filtered(repo, params, filter, false).await
+    }
+
+    async fn enrich_search_hits(
+        &self,
+        repo: &str,
+        hits: &mut [SearchHit],
+    ) -> Result<(), RepoError> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let repo_id = self.repo_id(repo).await?;
+        self.enrich_hits(repo_id, hits).await
     }
 }
 
@@ -536,28 +561,36 @@ impl HostedWrite {
 
         let nupkg_hash512 = nupkg.sha512_base64.clone();
 
-        let outcome = if let Some(comp) = existing {
-            if !repo_row.allow_redeploy {
-                // Duplicate and redeploy disabled → 409. Drop the tx; the
-                // pending blobs become orphans the reconciler cleans up.
-                return Err(WriteError::Conflict {
-                    id: parsed.original_id.clone(),
-                    version: parsed.version.clone(),
-                });
+        let replaced = match existing {
+            Some(comp) => {
+                if !repo_row.allow_redeploy {
+                    // Duplicate and redeploy disabled → 409. Drop the tx; the
+                    // pending blobs become orphans the reconciler cleans up.
+                    return Err(WriteError::Conflict {
+                        id: parsed.original_id.clone(),
+                        version: parsed.version.clone(),
+                    });
+                }
+                // `false`: a concurrent hard delete removed the version
+                // before this push could lock it, so it is a fresh insert.
+                self.redeploy_in_tx(
+                    &mut tx,
+                    &comp,
+                    &nupkg_sha,
+                    nupkg.ingest_token,
+                    nupkg_size,
+                    &nupkg_hash512,
+                    &nuspec_sha,
+                    nuspec.ingest_token,
+                    nuspec_size,
+                    &parsed,
+                )
+                .await?
             }
-            self.redeploy_in_tx(
-                &mut tx,
-                &comp,
-                &nupkg_sha,
-                nupkg.ingest_token,
-                nupkg_size,
-                &nupkg_hash512,
-                &nuspec_sha,
-                nuspec.ingest_token,
-                nuspec_size,
-                &parsed,
-            )
-            .await?;
+            None => false,
+        };
+
+        let outcome = if replaced {
             PublishOutcome::Replaced
         } else {
             let inserted = self
@@ -675,16 +708,21 @@ impl HostedWrite {
         nuspec_ingest_token: uuid::Uuid,
         nuspec_size: i64,
         parsed: &crate::ParsedUpload,
-    ) -> Result<(), WriteError> {
+    ) -> Result<bool, WriteError> {
         // Lock the component row so concurrent redeploys serialize (NO advisory
-        // locks — a plain row-level FOR UPDATE).
-        sqlx::query!(
+        // locks — a plain row-level FOR UPDATE). A concurrent hard delete that
+        // won the lock has removed the row: report that (`false`) before
+        // touching any reference, so the caller inserts the version afresh.
+        let locked = sqlx::query!(
             r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
             comp.id
         )
-        .fetch_one(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(RepoError::from)?;
+        if locked.is_none() {
+            return Ok(false);
+        }
 
         // Incref the new blobs first.
         blob_dao::commit_ingest_and_incref(tx, nupkg_sha, nupkg_ingest_token)
@@ -736,7 +774,8 @@ impl HostedWrite {
             nuspec_sha,
             nuspec_size,
         )
-        .await
+        .await?;
+        Ok(true)
     }
 
     /// Insert the canonical `.nupkg` and `.nuspec` asset rows for a component.
@@ -838,13 +877,18 @@ impl HostedWrite {
 
         // Lock the component row so any concurrent redeploy serializes behind
         // this hard delete (NO advisory locks — a plain row-level FOR UPDATE).
-        sqlx::query!(
+        // A concurrent delete that won the lock has already removed the row:
+        // that is a plain not-found for this caller, not an internal error.
+        let locked = sqlx::query!(
             r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
             comp.id
         )
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(RepoError::from)?;
+        if locked.is_none() {
+            return Ok(DeleteOutcome::NotFound);
+        }
 
         let assets = asset_dao::assets_for_component(&mut *tx, comp.id)
             .await

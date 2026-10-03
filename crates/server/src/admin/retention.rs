@@ -99,7 +99,8 @@ pub struct PutBody {
 ///
 /// The policy is parsed (serde) and validated against the repo kind
 /// (`validate_policy` rejects e.g. `scope: proxy_cached` on a non-proxy repo,
-/// negative counts, empty rules). On success the ledger row is upserted (by the
+/// a hosted-scope rule — the default when `scope` is omitted — on a proxy
+/// repo, zero counts, empty rules). On success the ledger row is upserted (by the
 /// DAO) so the worker can claim it, and the repo's package cache is invalidated.
 pub async fn put(
     State(state): State<AppState>,
@@ -229,22 +230,26 @@ pub async fn preview(
     let now = body.and_then(|b| b.0.at).unwrap_or_else(Utc::now);
     let kind = repo.kind();
 
-    // Snapshot hosted candidates.
-    let hosted_rows = match retention_dao::load_candidate_components(&state.pool, repo.id).await {
-        Ok(r) => r,
-        Err(e) => return db_error(e),
+    // Snapshot hosted candidates (never on a proxy: its components are cache
+    // entries evicted only through `proxy_cached_version`, as in the worker).
+    let hosted: Vec<CandidateComponent> = if kind == RepoKind::Proxy {
+        Vec::new()
+    } else {
+        match retention_dao::load_candidate_components(&state.pool, repo.id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(r, _sha)| CandidateComponent {
+                    component_id: r.component_id,
+                    package_name: r.name,
+                    version: r.version,
+                    listed: r.listed,
+                    created_at: r.created_at,
+                    last_downloaded_at: r.last_downloaded_at,
+                })
+                .collect(),
+            Err(e) => return db_error(e),
+        }
     };
-    let hosted: Vec<CandidateComponent> = hosted_rows
-        .into_iter()
-        .map(|(r, _sha)| CandidateComponent {
-            component_id: r.component_id,
-            package_name: r.name,
-            version: r.version,
-            listed: r.listed,
-            created_at: r.created_at,
-            last_downloaded_at: r.last_downloaded_at,
-        })
-        .collect();
 
     // Snapshot proxy candidates (only meaningful for proxy repos).
     let proxy: Vec<ProxyCandidate> = if kind == RepoKind::Proxy {

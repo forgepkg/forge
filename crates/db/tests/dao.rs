@@ -477,6 +477,163 @@ async fn blob_decref_above_zero_returns_false_and_enqueues_nothing() {
     assert_eq!(blob.ref_count, 1);
 }
 
+/// Wait until at least `n` backends are blocked — directly or through another
+/// blocked backend — behind the locks held by `holder_pid`.
+async fn wait_blocked_behind(pool: &sqlx::PgPool, holder_pid: i32, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE waiter(pid) AS (
+                SELECT pid FROM pg_stat_activity
+                WHERE $1 = ANY(pg_blocking_pids(pid))
+                UNION
+                SELECT a.pid FROM pg_stat_activity a
+                JOIN waiter w ON w.pid = ANY(pg_blocking_pids(a.pid))
+            )
+            SELECT count(*) FROM waiter
+            "#,
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .expect("blocked count");
+        if blocked >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {blocked} of {n} backends ever blocked behind pid {holder_pid}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// L4: a deletion that finalizes (deletes the blob row) after `begin_ingest`'s
+/// `INSERT … ON CONFLICT DO NOTHING` saw the old row but before its row lock is
+/// granted must not surface as `RowNotFound` (a 500 on publish). The ingest
+/// retries and creates a fresh pending incarnation.
+///
+/// Deterministic interleaving: a reader holds `FOR SHARE` on the row, so the
+/// finalize `DELETE` queues behind it; the ingest's insert still sees a live
+/// (merely share-locked) row and inserts nothing, and its `FOR UPDATE` queues
+/// behind the finalize. Releasing the reader lets the finalize delete the row
+/// before the ingest's lock is granted.
+#[tokio::test]
+async fn begin_ingest_retries_when_deletion_finalizes_mid_ingest() {
+    let pool = pool().await;
+    let sha = format!("sha-vanish-{}", unique());
+    let stale_before = Utc::now() - Duration::minutes(2);
+    blob_dao::upsert_pending(&pool, &sha, 10, "k/vanish/old")
+        .await
+        .expect("upsert");
+    let reservation = match blob_dao::reserve_outbox_delete(&pool, &sha, stale_before)
+        .await
+        .expect("reserve")
+    {
+        blob_dao::ReserveDeleteOutcome::Reserved(r) => r,
+        other => panic!("unexpected reserve outcome: {other:?}"),
+    };
+
+    let mut reader = pool.begin().await.expect("begin reader");
+    let reader_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *reader)
+        .await
+        .expect("pid");
+    sqlx::query("SELECT 1 FROM blob WHERE sha256 = $1 FOR SHARE")
+        .bind(&sha)
+        .execute(&mut *reader)
+        .await
+        .expect("share lock");
+
+    let finalize = {
+        let (pool, reservation) = (pool.clone(), reservation.clone());
+        tokio::spawn(
+            async move { blob_dao::finalize_delete_reservation(&pool, &reservation).await },
+        )
+    };
+    wait_blocked_behind(&pool, reader_pid, 1).await;
+
+    let ingest = {
+        let (pool, sha) = (pool.clone(), sha.clone());
+        tokio::spawn(async move {
+            blob_dao::begin_ingest(
+                &pool,
+                &sha,
+                10,
+                "k/vanish/new",
+                Utc::now() + Duration::hours(1),
+                stale_before,
+            )
+            .await
+        })
+    };
+    wait_blocked_behind(&pool, reader_pid, 2).await;
+    reader.commit().await.expect("release reader");
+
+    assert!(
+        finalize.await.unwrap().expect("finalize"),
+        "the deletion owner finalizes its reservation"
+    );
+    let outcome = ingest
+        .await
+        .unwrap()
+        .expect("begin_ingest must retry instead of failing with RowNotFound");
+    match outcome {
+        blob_dao::BeginIngestOutcome::Ready {
+            token,
+            inserted,
+            s3_key,
+        } => {
+            assert!(inserted, "the retry creates a fresh incarnation");
+            assert_eq!(s3_key, "k/vanish/new");
+            blob_dao::abort_ingest(&pool, token).await.expect("abort");
+        }
+        other => panic!("unexpected begin outcome: {other:?}"),
+    }
+    let blob = blob_dao::get_blob(&pool, &sha)
+        .await
+        .expect("get")
+        .expect("fresh row present");
+    assert_eq!(blob.state(), BlobState::Pending);
+}
+
+/// B1 defence in depth: a decrement below zero (reference-count drift) aborts
+/// instead of enqueueing a delete (`blob_ref_count_nonnegative`, 0017).
+#[tokio::test]
+async fn blob_decref_below_zero_is_rejected() {
+    let pool = pool().await;
+    let sha = format!("sha-negative-{}", unique());
+    blob_dao::upsert_pending(&pool, &sha, 10, "k/negative")
+        .await
+        .expect("upsert");
+
+    let mut tx = pool.begin().await.expect("begin");
+    let err = blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &sha, Duration::seconds(0))
+        .await
+        .expect_err("decrement of a zero-ref blob must fail");
+    match &err {
+        sqlx::Error::Database(db) => {
+            assert_eq!(db.code().as_deref(), Some("23514"), "check_violation");
+            assert_eq!(db.constraint(), Some("blob_ref_count_nonnegative"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    tx.rollback().await.expect("rollback");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM blob_outbox WHERE sha256 = $1")
+        .bind(&sha)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "nothing enqueued");
+    let blob = blob_dao::get_blob(&pool, &sha)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(blob.ref_count, 0);
+}
+
 // ── outbox ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -566,6 +723,75 @@ async fn outbox_mark_processed_and_bump_attempt() {
             .await
             .expect("processed_at");
     assert!(processed_at.is_some());
+}
+
+/// M19: pruning removes processed rows older than the cutoff (in batches)
+/// and never touches recent processed rows or unprocessed rows of any age.
+/// (The unprocessed row is scheduled in the future so sibling claim tests
+/// never pick it up.)
+#[tokio::test]
+async fn outbox_prune_processed_drops_only_old_processed_rows() {
+    let pool = pool().await;
+    let pool = &pool;
+    let tag = format!("prune-{}", unique());
+
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at, created_at) \
+         SELECT 'delete_object', $1 || '-old-' || g, 'k', now() - interval '30 days', \
+                now() - interval '20 days', now() - interval '30 days' \
+         FROM generate_series(1, 5) g",
+    )
+    .bind(&tag)
+    .execute(pool)
+    .await
+    .expect("seed old processed");
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at) \
+         VALUES ('delete_object', $1 || '-recent', 'k', now(), now() - interval '1 day')",
+    )
+    .bind(&tag)
+    .execute(pool)
+    .await
+    .expect("seed recent processed");
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, created_at) \
+         VALUES ('delete_object', $1 || '-pending', 'k', now() + interval '30 days', \
+                 now() - interval '30 days')",
+    )
+    .bind(&tag)
+    .execute(pool)
+    .await
+    .expect("seed old unprocessed");
+
+    let cutoff = Utc::now() - Duration::days(7);
+    let mut pruned = 0;
+    loop {
+        let n = outbox_dao::prune_processed(pool, cutoff, 2)
+            .await
+            .expect("prune");
+        assert!(n <= 2, "a batch never exceeds its limit");
+        pruned += n;
+        if n < 2 {
+            break;
+        }
+    }
+    assert!(
+        pruned >= 5,
+        "all five old processed rows pruned (got {pruned})"
+    );
+
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT sha256 FROM blob_outbox WHERE sha256 LIKE $1 || '-%' ORDER BY sha256",
+    )
+    .bind(&tag)
+    .fetch_all(pool)
+    .await
+    .expect("remaining");
+    assert_eq!(
+        left,
+        vec![format!("{tag}-pending"), format!("{tag}-recent")],
+        "recent processed and unprocessed rows survive"
+    );
 }
 
 // ── component / asset ─────────────────────────────────────────────────────────
@@ -698,6 +924,117 @@ async fn asset_insert_find_and_list() {
     // Ordered by path.
     assert_eq!(all[0].path, "pkg.1.0.0.nupkg");
     assert_eq!(all[1].path, "pkg.nuspec");
+}
+
+/// B1: `hard_delete_component` decrements one reference per asset row it
+/// actually deleted — both assets of a component may share one blob — and a
+/// repeated delete of the same version is a no-op that decrements nothing.
+/// `hard_delete_all_components` does the same for a whole repository.
+#[tokio::test]
+async fn hard_delete_component_decrements_only_deleted_refs() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(pool, NewRepository::hosted(format!("hdrepo-{n}")))
+            .await
+            .expect("repo");
+    let sha = format!("hdsha-{n}");
+    blob_dao::upsert_pending(pool, &sha, 10, &format!("k/{sha}"))
+        .await
+        .expect("blob");
+
+    // Three versions; each has two assets referencing the same blob (6 refs).
+    let mut tx = pool.begin().await.expect("begin");
+    for version in ["1.0.0", "2.0.0", "3.0.0"] {
+        let comp = component_dao::insert_component(
+            &mut *tx,
+            NewComponent {
+                repository_id: repo.id,
+                name: "pkg".to_string(),
+                original_id: "Pkg".to_string(),
+                version: version.to_string(),
+                version_original: version.to_string(),
+                listed: true,
+            },
+        )
+        .await
+        .expect("component");
+        for path in ["pkg.nupkg", "pkg.nuspec"] {
+            asset_dao::insert_asset(
+                &mut *tx,
+                NewAsset {
+                    component_id: comp.id,
+                    path: path.to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    blob_sha256: sha.clone(),
+                    size: 10,
+                    sha512_base64: None,
+                },
+            )
+            .await
+            .expect("asset");
+            blob_dao::commit_and_incref(&mut tx, &sha)
+                .await
+                .expect("incref");
+        }
+    }
+    tx.commit().await.expect("commit");
+
+    let grace = Duration::seconds(0);
+    let mut tx = pool.begin().await.expect("begin");
+    assert!(
+        component_dao::hard_delete_component(&mut tx, repo.id, "pkg", "1.0.0", grace)
+            .await
+            .expect("hard delete")
+    );
+    tx.commit().await.expect("commit");
+    let blob = blob_dao::get_blob(pool, &sha)
+        .await
+        .expect("get")
+        .expect("blob");
+    assert_eq!(blob.ref_count, 4, "both asset references released");
+
+    let mut tx = pool.begin().await.expect("begin");
+    assert!(
+        !component_dao::hard_delete_component(&mut tx, repo.id, "pkg", "1.0.0", grace)
+            .await
+            .expect("repeat hard delete"),
+        "a repeated delete finds nothing"
+    );
+    tx.commit().await.expect("commit");
+    let blob = blob_dao::get_blob(pool, &sha)
+        .await
+        .expect("get")
+        .expect("blob");
+    assert_eq!(blob.ref_count, 4, "a repeated delete decrements nothing");
+
+    let mut tx = pool.begin().await.expect("begin");
+    assert!(component_dao::repository_has_components(&mut *tx, repo.id)
+        .await
+        .expect("has components"));
+    assert_eq!(
+        component_dao::hard_delete_all_components(&mut tx, repo.id, grace)
+            .await
+            .expect("purge"),
+        2
+    );
+    assert!(!component_dao::repository_has_components(&mut *tx, repo.id)
+        .await
+        .expect("has components"));
+    tx.commit().await.expect("commit");
+
+    let blob = blob_dao::get_blob(pool, &sha)
+        .await
+        .expect("get")
+        .expect("blob");
+    assert_eq!(blob.ref_count, 0);
+    let enqueued: i64 = sqlx::query_scalar("SELECT count(*) FROM blob_outbox WHERE sha256 = $1")
+        .bind(&sha)
+        .fetch_one(pool)
+        .await
+        .expect("count");
+    assert_eq!(enqueued, 1, "exactly one deferred delete, at zero refs");
 }
 
 // ── user / token ──────────────────────────────────────────────────────────────
@@ -893,6 +1230,51 @@ async fn proxy_repo(pool: &sqlx::PgPool, suffix: u64) -> i64 {
         .id
 }
 
+/// Rows only a download attempt created (never listed or served upstream)
+/// are pruned once the repository's negative-cache window lapsed; confirmed
+/// and recent rows are kept.
+#[tokio::test]
+async fn proxy_prune_unconfirmed_drops_only_expired_unconfirmed_rows() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo_id = proxy_repo(pool, n).await;
+    let name = format!("pkg-{n}");
+
+    for v in ["9.0.0", "9.0.1"] {
+        proxy_dao::insert_unconfirmed_cached_version(pool, repo_id, &name, v)
+            .await
+            .unwrap();
+    }
+    proxy_dao::upsert_cached_versions(pool, repo_id, &name, &["1.0.0".to_string()])
+        .await
+        .unwrap();
+    // 9.0.0 and the confirmed 1.0.0 were first seen long ago; 9.0.1 just now.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '1 day' \
+         WHERE repository_id = $1 AND version IN ('9.0.0', '1.0.0')",
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // A large batch so rows of other tests in the shared database cannot
+    // crowd this repository's row out of the batch.
+    proxy_dao::prune_unconfirmed(pool, 600, 1_000_000)
+        .await
+        .unwrap();
+
+    let mut left: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM proxy_cached_version WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    left.sort();
+    assert_eq!(left, ["1.0.0", "9.0.1"]);
+}
+
 #[tokio::test]
 async fn proxy_upsert_cached_version_insert_then_conflict_is_noop() {
     let pool = pool().await;
@@ -1076,4 +1458,60 @@ async fn proxy_lock_cached_version_for_update_blocks_concurrent_tx() {
         .expect("row present c");
     assert_eq!(re_locked.version, version);
     tx_c.commit().await.expect("commit c");
+}
+
+/// L6: the nesting-depth guard counts the longest path *above* the group too,
+/// not only the depth below the new member.
+#[tokio::test]
+async fn add_group_member_checked_counts_depth_above_the_group() {
+    use forge_db::repository_dao::{self, AddMemberOutcome, NewRepository};
+
+    let pool = common::pool().await;
+    let n = common::unique();
+    let make = |kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let name = format!("depthup-{kind}-{n}-{}", common::unique());
+            let new = if kind == "leaf" {
+                NewRepository::hosted(name)
+            } else {
+                NewRepository::group(name)
+            };
+            repository_dao::insert_repository(&pool, new)
+                .await
+                .expect("insert repo")
+        }
+    };
+    let a = make("a").await;
+    let b = make("b").await;
+    let c = make("c").await;
+    let mid = make("mid").await;
+    let leaf = make("leaf").await;
+
+    // Two ancestor chains above `mid`: a -> b -> mid (2 edges) and c -> mid.
+    for (group, member) in [(&a, &b), (&b, &mid), (&c, &mid)] {
+        assert_eq!(
+            repository_dao::add_group_member_checked(&pool, group.id, member.id, 10, 20)
+                .await
+                .expect("add"),
+            AddMemberOutcome::Added
+        );
+    }
+
+    // mid -> leaf creates a -> b -> mid -> leaf (3 edges): too deep for 2,
+    // although only one edge lies below `mid`.
+    assert_eq!(
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 2)
+            .await
+            .expect("add"),
+        AddMemberOutcome::TooDeep,
+        "the path above the group counts"
+    );
+    assert_eq!(
+        repository_dao::add_group_member_checked(&pool, mid.id, leaf.id, 10, 3)
+            .await
+            .expect("add"),
+        AddMemberOutcome::Added,
+        "3 edges fit a limit of 3"
+    );
 }

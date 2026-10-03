@@ -15,7 +15,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
 use chrono::Utc;
 use http::HeaderMap;
@@ -25,8 +24,8 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
 use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
-use super::local_password::LocalPasswordProvider;
-use super::login_throttle::LoginThrottle;
+use super::local_password::{LocalPasswordProvider, PasswordHashLimiter};
+use super::login_throttle::{username_for_log, AttemptRefused, LoginThrottle, MAX_USERNAME_BYTES};
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
 
@@ -104,7 +103,9 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> 
 /// Verify a username/password pair against the stored argon2 PHC hash.
 ///
 /// Returns `Some(UserPrincipal)` only for an active user whose password
-/// verifies. argon2 verification (CPU-bound) runs on a blocking thread.
+/// verifies. argon2 verification (CPU-bound) runs on a blocking thread behind
+/// the process-wide [`PasswordHashLimiter::shared_default`]; a verification
+/// that finds no free slot in time returns `None`.
 pub async fn verify_password(
     pool: &PgPool,
     username: &str,
@@ -121,18 +122,10 @@ pub async fn verify_password(
     // Users with no local password (auth_source upstream-basic / oidc) can never
     // authenticate via password-basic against the local store.
     let stored = user.password_hash.clone()?;
-    let candidate = password.to_string();
-    let verified = tokio::task::spawn_blocking(move || {
-        let parsed = match PasswordHash::new(&stored) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        Argon2::default()
-            .verify_password(candidate.as_bytes(), &parsed)
-            .is_ok()
-    })
-    .await
-    .unwrap_or(false);
+    let verified = PasswordHashLimiter::shared_default()
+        .verify(stored, password.to_string())
+        .await
+        .unwrap_or(false);
 
     if !verified {
         return None;
@@ -314,6 +307,9 @@ impl BasicAuthSource {
 }
 
 /// Decode a `Basic <base64>` header value into `(username, secret)`.
+///
+/// A username over [`MAX_USERNAME_BYTES`] is refused (`None` → invalid
+/// credentials) before it reaches any lookup or the login throttle.
 fn parse_basic(value: &str) -> Option<(String, String)> {
     let rest = value
         .strip_prefix("Basic ")
@@ -325,6 +321,9 @@ fn parse_basic(value: &str) -> Option<(String, String)> {
     // NuGet sends `username:apikey`; the colon splits user from secret. A secret
     // may itself contain colons, so split only on the first.
     let (user, secret) = text.split_once(':')?;
+    if user.len() > MAX_USERNAME_BYTES {
+        return None;
+    }
     Some((user.to_string(), secret.to_string()))
 }
 
@@ -357,12 +356,24 @@ impl PrincipalSource for BasicAuthSource {
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
         if let Some(chain) = self.chain.password_chain().await {
-            // Too many recent failures for this (IP, username): refuse without
-            // running the chain (no argon2 work, nothing forwarded upstream).
-            if self.throttle.is_locked(peer_ip, &username) {
-                tracing::warn!(%username, ip = %peer_ip, "basic password auth throttled");
-                return SourceOutcome::Invalid;
-            }
+            // Reserve the attempt against the (IP, username) lockout budget
+            // before running the chain; a locked pair is refused without any
+            // provider work (no argon2, nothing forwarded upstream).
+            let attempt = match self.throttle.begin(peer_ip, &username).await {
+                Ok(attempt) => attempt,
+                Err(refused) => {
+                    let username = username_for_log(&username);
+                    match refused {
+                        AttemptRefused::Locked => {
+                            tracing::warn!(%username, ip = %peer_ip, "basic password auth throttled");
+                        }
+                        AttemptRefused::Busy => {
+                            tracing::warn!(%username, ip = %peer_ip, "basic password auth: too many concurrent attempts");
+                        }
+                    }
+                    return SourceOutcome::Invalid;
+                }
+            };
             let cred = PasswordCredential {
                 username: &username,
                 password: &secret,
@@ -375,7 +386,7 @@ impl PrincipalSource for BasicAuthSource {
                     // when configured (phase 5).
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
-                            self.throttle.record_success(peer_ip, &username);
+                            attempt.succeeded();
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
                         // Vouched-for but no (active) app_user row, or a DB
@@ -383,11 +394,12 @@ impl PrincipalSource for BasicAuthSource {
                         // presented, so this is an attempted-but-failed login
                         // (Invalid → 401), never a downgrade to anonymous.
                         Ok(None) => {
-                            self.throttle.record_failure(peer_ip, &username);
+                            attempt.failed();
                             return SourceOutcome::Invalid;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
+                            attempt.released();
                             return SourceOutcome::Invalid;
                         }
                     }
@@ -396,19 +408,23 @@ impl PrincipalSource for BasicAuthSource {
                 // credentials were presented and not accepted. Slice 1 mapped a
                 // failed password verify to Invalid (→ 401); we preserve that.
                 ChainOutcome::Rejected => {
-                    self.throttle.record_failure(peer_ip, &username);
+                    attempt.failed();
                     return SourceOutcome::Invalid;
                 }
-                // A fail-closed outage also denies, but is not the caller's
-                // fault, so it does not count towards the lockout.
-                ChainOutcome::Unavailable => return SourceOutcome::Invalid,
+                // A fail-closed outage (or an argon2 overload) also denies, but
+                // is not the caller's fault, so it does not count towards the
+                // lockout.
+                ChainOutcome::Unavailable => {
+                    attempt.released();
+                    return SourceOutcome::Invalid;
+                }
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still
                 // an attempted-but-invalid login — exactly slice 1, where an
                 // unknown username made `verify_password` return `None` and the
                 // basic source fell through to `Invalid`.
                 ChainOutcome::NoCredentials => {
-                    self.throttle.record_failure(peer_ip, &username);
+                    attempt.failed();
                     return SourceOutcome::Invalid;
                 }
             }
@@ -531,6 +547,18 @@ mod tests {
         let (u, s) = parse_basic(&format!("Basic {enc}")).unwrap();
         assert_eq!(u, "alice");
         assert_eq!(s, "s3cr3t");
+    }
+
+    #[test]
+    fn parse_basic_refuses_oversized_usernames() {
+        let at_limit = "u".repeat(MAX_USERNAME_BYTES);
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{at_limit}:pw"));
+        assert_eq!(
+            parse_basic(&format!("Basic {enc}")).map(|(u, _)| u),
+            Some(at_limit.clone())
+        );
+        let enc = base64::engine::general_purpose::STANDARD.encode(format!("{at_limit}x:pw"));
+        assert_eq!(parse_basic(&format!("Basic {enc}")), None);
     }
 
     #[test]

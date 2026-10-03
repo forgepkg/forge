@@ -15,7 +15,13 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages + search)
  *       /packages/...   -> PackageDetail.tsx    (versions + dependencies)
  *       /tokens         -> Tokens.tsx           (self-service registry tokens)
- *       /admin          -> AdminLayout.tsx      (beforeLoad: require is_admin)
+ *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin)
+ *
+ * The admin screens live under `/manage/*`, NOT `/admin/*`: `/admin/*` is the
+ * admin REST API, which the server routes before the SPA fallback, so a UI
+ * route there would answer a refresh / bookmark / deep link with raw JSON
+ * (or a 404/405). The server 302-redirects a browser navigation to a former
+ * `/admin/...` UI path to its `/manage/...` equivalent (`web_ui.rs`).
  */
 export const routes = rootRoute('root.tsx', [
   route('/login', 'Login.tsx'),
@@ -24,7 +30,7 @@ export const routes = rootRoute('root.tsx', [
     route('/repos/$repo', 'RepoBrowse.tsx'),
     route('/packages/$repo/$id', 'PackageDetail.tsx'),
     route('/tokens', 'Tokens.tsx'),
-    route('/admin', 'AdminLayout.tsx', [
+    route('/manage', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),
       route('/repositories', 'admin/repositories/List.tsx'),
       route('/repositories/new', 'admin/repositories/Create.tsx'),

@@ -14,15 +14,45 @@
 //! dropping trusted hops, and take the first untrusted address. A malformed XFF
 //! (any unparsable entry we reach) collapses to the peer. We never trust XFF
 //! from an untrusted peer.
+//!
+//! A request may carry several `X-Forwarded-For` header lines (a proxy may add
+//! its hop as a new line rather than extending the one the client sent);
+//! [`forwarded_for`] joins them in order so the walk sees every hop. Reading
+//! only the first line would hand the client-written line to the walk and let
+//! it pick its own address.
+//!
+//! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, as a dual-stack listener
+//! reports IPv4 peers) are canonicalized to plain IPv4 before every CIDR check
+//! — the peer, each parsed hop, and the anonymous allowlist — so they match
+//! IPv4 CIDRs.
 
 use std::net::IpAddr;
 
+use http::HeaderMap;
 use ipnet::IpNet;
+
+/// Every `X-Forwarded-For` header line of `headers`, in order, joined with
+/// `,` — the input [`resolve_client_ip`] expects. `None` when there is none.
+///
+/// A line that is not visible ASCII is kept as an unparsable hop, so the walk
+/// treats the header as malformed if it gets that far (and ignores it if an
+/// untrusted hop to its right already decided).
+pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
+    let mut lines = headers.get_all("x-forwarded-for").iter().peekable();
+    lines.peek()?;
+    Some(
+        lines
+            .map(|v| v.to_str().unwrap_or("_"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
 
 /// Resolve the effective client IP.
 ///
 /// * `peer` — the socket peer address (always trustworthy as *a* hop).
-/// * `xff` — the raw `X-Forwarded-For` header value, if present.
+/// * `xff` — the combined `X-Forwarded-For` value ([`forwarded_for`]), if
+///   present.
 /// * `trusted` — CIDRs of proxies we operate / trust to prepend XFF.
 ///
 /// Rules (spec §5):
@@ -34,7 +64,11 @@ use ipnet::IpNet;
 /// * If we exhaust XFF (all hops trusted, or it is empty/absent) → `peer`.
 /// * If we encounter a non-empty but **unparseable** hop before finding an
 ///   untrusted address → treat as malformed → `peer`.
+///
+/// The peer and every hop are canonicalized (IPv4-mapped IPv6 → IPv4) before
+/// the CIDR checks, and the returned address is canonical too.
 pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
+    let peer = peer.to_canonical();
     if !ip_in_any(peer, trusted) {
         return peer;
     }
@@ -50,7 +84,7 @@ pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> 
             // An empty segment is malformed; stop and fall back to peer.
             return peer;
         }
-        match entry.parse::<IpAddr>() {
+        match entry.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
             Ok(ip) => {
                 if ip_in_any(ip, trusted) {
                     // Another trusted hop; keep walking left.
@@ -71,6 +105,7 @@ pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> 
 }
 
 fn ip_in_any(ip: IpAddr, nets: &[IpNet]) -> bool {
+    let ip = ip.to_canonical();
     nets.iter().any(|n| n.contains(&ip))
 }
 
@@ -139,9 +174,25 @@ pub struct AllowlistParseError {
     pub entry: String,
 }
 
+/// An IPv4-mapped IPv6 network (`::ffff:a.b.c.d/(96+n)`) as the IPv4 network
+/// `a.b.c.d/n`; any other network unchanged. Peer and forwarded addresses are
+/// canonicalized (`to_canonical`) before they are matched, so a configured
+/// entry in the mapped form — as older logs printed peers on a `[::]` bind —
+/// would otherwise never match anything.
+pub fn canonical_net(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net {
+        if let (Some(v4), true) = (v6.addr().to_ipv4_mapped(), v6.prefix_len() >= 96) {
+            if let Ok(mapped) = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96) {
+                return IpNet::V4(mapped.trunc());
+            }
+        }
+    }
+    net
+}
+
 fn parse_cidr_or_host(tok: &str) -> Result<IpNet, AllowlistParseError> {
     if let Ok(net) = tok.parse::<IpNet>() {
-        return Ok(net);
+        return Ok(canonical_net(net));
     }
     if let Ok(ip) = tok.parse::<IpAddr>() {
         // Single host: full-length prefix.
@@ -150,9 +201,11 @@ fn parse_cidr_or_host(tok: &str) -> Result<IpNet, AllowlistParseError> {
             IpAddr::V6(_) => 128,
         };
         // `new` only fails on an out-of-range prefix, which 32/128 never are.
-        return IpNet::new(ip, prefix).map_err(|_| AllowlistParseError {
-            entry: tok.to_string(),
-        });
+        return IpNet::new(ip, prefix)
+            .map(canonical_net)
+            .map_err(|_| AllowlistParseError {
+                entry: tok.to_string(),
+            });
     }
     Err(AllowlistParseError {
         entry: tok.to_string(),
@@ -242,6 +295,91 @@ mod tests {
         let trusted = nets(&["fd00::/8"]);
         let got = resolve_client_ip(ip("fd00::1"), Some("2001:db8::1, fd00::2"), &trusted);
         assert_eq!(got, ip("2001:db8::1"));
+    }
+
+    #[test]
+    fn every_xff_line_is_walked_in_order() {
+        // M12: the client sends its own (spoofed) line; the trusted proxy adds
+        // the real client as a second line. Reading only the first line would
+        // let the client pick its address.
+        let trusted = nets(&["10.0.0.0/8"]);
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "203.0.113.50".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.5, 10.0.0.9".parse().unwrap());
+        let xff = forwarded_for(&headers);
+        assert_eq!(xff.as_deref(), Some("203.0.113.50,198.51.100.5, 10.0.0.9"));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), xff.as_deref(), &trusted),
+            ip("198.51.100.5")
+        );
+        assert_eq!(forwarded_for(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn unreadable_xff_line_is_malformed_only_when_reached() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        let opaque = http::HeaderValue::from_bytes(b"\xff\xfe").unwrap();
+        // The unreadable line sits left of the decisive untrusted hop: ignored.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", opaque.clone());
+        headers.append("x-forwarded-for", "198.51.100.5".parse().unwrap());
+        let xff = forwarded_for(&headers);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), xff.as_deref(), &trusted),
+            ip("198.51.100.5")
+        );
+        // Reached by the walk: malformed → the peer.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "198.51.100.5".parse().unwrap());
+        headers.append("x-forwarded-for", opaque);
+        let xff = forwarded_for(&headers);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), xff.as_deref(), &trusted),
+            ip("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_addresses_match_ipv4_cidrs() {
+        // M12: a dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d.
+        let trusted = nets(&["10.0.0.0/8"]);
+        // A mapped trusted peer still walks XFF; a mapped hop is canonical.
+        assert_eq!(
+            resolve_client_ip(
+                ip("::ffff:10.0.0.1"),
+                Some("::ffff:198.51.100.5, ::ffff:10.0.0.9"),
+                &trusted
+            ),
+            ip("198.51.100.5")
+        );
+        // A mapped untrusted peer is returned canonical.
+        assert_eq!(
+            resolve_client_ip(ip("::ffff:203.0.113.9"), Some("1.2.3.4"), &trusted),
+            ip("203.0.113.9")
+        );
+        // The anonymous allowlist matches mapped addresses too.
+        let p = AnonPolicy::allowlist_from_tokens(["loopback", "192.168.0.0/16"]).unwrap();
+        assert!(p.allows(ip("::ffff:127.0.0.1")));
+        assert!(p.allows(ip("::ffff:192.168.1.1")));
+        assert!(!p.allows(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_are_configured_as_ipv4() {
+        // An entry written in the mapped form still matches once peers are
+        // canonicalized.
+        assert_eq!(
+            canonical_net("::ffff:172.17.0.0/112".parse().unwrap()),
+            "172.17.0.0/16".parse::<IpNet>().unwrap()
+        );
+        assert_eq!(
+            canonical_net("2001:db8::/32".parse().unwrap()),
+            "2001:db8::/32".parse::<IpNet>().unwrap()
+        );
+        let p = AnonPolicy::allowlist_from_tokens(["::ffff:172.17.0.1"]).unwrap();
+        assert!(p.allows(ip("172.17.0.1")));
+        assert!(p.allows(ip("::ffff:172.17.0.1")));
+        assert!(!p.allows(ip("172.17.0.2")));
     }
 
     // ── AnonPolicy ───────────────────────────────────────────────────────

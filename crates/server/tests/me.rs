@@ -170,7 +170,10 @@ async fn me_anonymous_is_401() {
     );
 }
 
-/// A token authenticates `/admin/me` (X-NuGet-ApiKey path).
+/// A token authenticates `/admin/me` (X-NuGet-ApiKey path). The reported
+/// capabilities are the *token's*: an admin's unscoped token is not an admin
+/// credential (B4), so `is_admin` is `false` for it and `true` only for a token
+/// whose scope names `admin`.
 #[tokio::test]
 async fn me_with_token() {
     let srv = common::start().await;
@@ -184,5 +187,35 @@ async fn me_with_token() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["is_admin"], json!(true));
+    assert_eq!(body["user"]["username"], json!(srv.admin_basic().0));
+    assert_eq!(
+        body["is_admin"],
+        json!(false),
+        "unscoped token is not admin"
+    );
+
+    // An explicitly admin-scoped token reports admin.
+    let (u, p) = srv.admin_basic();
+    let admin_id = body["user"]["id"].as_i64().expect("user id");
+    let created: Value = srv
+        .client()
+        .post(format!("{}/admin/users/{admin_id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "automation", "scope": {"actions": ["admin"]}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = srv
+        .client()
+        .get(format!("{}/admin/me", srv.base_url))
+        .header("X-NuGet-ApiKey", created["token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["is_admin"], json!(true), "admin-scoped token is admin");
 }

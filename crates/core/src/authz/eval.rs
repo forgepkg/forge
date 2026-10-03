@@ -24,7 +24,8 @@
 //! to allow-all.
 //!
 //! Per-token scoping is applied here by [`EffectiveSet::intersect_scope`]: a
-//! token may only ever *narrow* its owner's set, never widen it. The DB loads
+//! token may only ever *narrow* its owner's set, never widen it, and it holds
+//! `admin` only when its scope names that action explicitly. The DB loads
 //! the owner's set (cached); the token scope is intersected **after** the cache
 //! lookup so the owner set stays shared across that user's tokens.
 //!
@@ -139,9 +140,11 @@ impl SelectorPatterns {
 fn build_globset(patterns: &[String]) -> Result<GlobSet, SelectorCompileError> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
-        let glob = Glob::new(&p.to_lowercase()).map_err(|source| SelectorCompileError {
-            pattern: p.clone(),
-            source,
+        let glob = Glob::new(&crate::format::lower_invariant(p)).map_err(|source| {
+            SelectorCompileError {
+                pattern: p.clone(),
+                source,
+            }
         })?;
         builder.add(glob);
     }
@@ -167,7 +170,7 @@ impl CompiledSelector {
     /// Does this selector match `package_name`? The name is lowercased before
     /// matching. Excludes win over includes; an empty include list matches all.
     pub fn matches(&self, package_name: &str) -> bool {
-        let name = package_name.to_lowercase();
+        let name = crate::format::lower_invariant(package_name);
         if self.excludes.is_match(&name) {
             return false;
         }
@@ -345,31 +348,45 @@ impl EffectiveSet {
 
     /// Apply a token scope, returning a **narrowed** set (never widened).
     ///
-    /// Each grant is kept only if the scope permits its action AND its repo.
-    /// A `None` scope (no scoping) returns the set unchanged.
+    /// Every API token goes through here — an unscoped token (NULL `scope`)
+    /// is evaluated as [`TokenScope::default()`] — so the rules below are the
+    /// whole token policy:
     ///
-    /// **Admin** (the allow-all short-circuit) survives only when the scope
-    /// neither restricts repositories nor excludes the `admin` action: a token
-    /// scoped to some repositories must never keep server-wide admin (it would
-    /// reach every repo and the privilege-management API). When admin is dropped,
-    /// the owner's allow-all is replaced by explicit `read` / `write` / `delete`
-    /// grants — filtered by the scope's allowed actions — on the scoped repos
-    /// (or on ANY repo for an action-only scope), so an admin's repo-scoped CI
-    /// token can still push to exactly those repos.
+    /// * Each grant is kept only if the scope permits its action AND its repo.
+    /// * **`admin` is opt-in.** `actions: None` (or no scope at all) permits
+    ///   the owner's `read` / `write` / `delete` but **not** `admin`: a token
+    ///   carries `admin` — a per-repo `admin` grant or the server-wide
+    ///   short-circuit — only when its scope lists `"admin"` explicitly. A
+    ///   leaked feed token therefore never reaches `/admin/*` (privilege
+    ///   management, user creation, minting further tokens).
+    /// * **Admin** (the allow-all short-circuit) survives only when the scope
+    ///   explicitly allows `admin` and does not restrict repositories: a token
+    ///   scoped to some repositories must never keep server-wide admin (it
+    ///   would reach every repo and the privilege-management API). When admin is
+    ///   dropped, the owner's allow-all is replaced by explicit `read` / `write`
+    ///   / `delete` grants — filtered by the scope's allowed actions — on the
+    ///   scoped repos (or on ANY repo when repos are unrestricted), so an
+    ///   admin's ordinary CI token can still push everywhere (or to exactly its
+    ///   scoped repos) without being an admin credential.
+    ///
+    /// The automation scope for a token that must call the admin API is
+    /// `{"actions": ["admin"]}` (optionally listing `read` / `write` / `delete`
+    /// too, which the admin short-circuit already implies), with **no**
+    /// `repositories`. Issued to an admin account, such a token is a full
+    /// admin credential (it can create users and mint tokens), so give it an
+    /// `expires_at` and keep it out of `NuGet.config`.
     ///
     /// Note: a grant for `repo == ANY` (None) is narrowed to the scope's repo
     /// allowlist when the scope restricts repos — the ANY grant is expanded into
     /// one grant per allowed repo id so the token can never reach a repo outside
     /// its scope. When the scope does not restrict repos, ANY is preserved.
     pub fn intersect_scope(&self, scope: &TokenScope) -> EffectiveSet {
-        if scope.actions.is_none() && scope.repositories.is_none() {
-            return self.clone();
-        }
         let action_ok = |a: Action| match &scope.actions {
-            None => true,
+            // Unrestricted actions still exclude `admin`: it must be named.
+            None => a != Action::Admin,
             Some(allowed) => allowed.contains(&a),
         };
-        // Allow-all survives only an unrestricted-repo scope that allows admin.
+        // Allow-all survives only an unrestricted-repo scope that names admin.
         let keep_admin = self.is_admin && scope.repositories.is_none() && action_ok(Action::Admin);
 
         let mut grants = Vec::new();
@@ -426,6 +443,39 @@ impl EffectiveSet {
             is_admin: keep_admin,
             grants,
         }
+    }
+
+    /// Add the **public read** reach to this set: every `read` grant of
+    /// `public` (the built-in `anonymous` role's effective set) plus, when
+    /// `anonymous_read_repo` is `Some(id)`, an unscoped `read` grant on that
+    /// repository (its `anonymous_read` flag).
+    ///
+    /// This is how a signed-in principal reads at least what an anonymous
+    /// caller can. Only `read` grants are ever added and `public`'s admin flag
+    /// is ignored, so it can never add `write` / `delete` / `admin`. For a
+    /// token the seam applies it **before** [`Self::intersect_scope`], so the
+    /// public reach is still cut down to the token's scope (a token scoped to
+    /// other repositories, or to `write` only, gains nothing from it).
+    pub fn with_public_read(
+        mut self,
+        public: &EffectiveSet,
+        anonymous_read_repo: Option<i64>,
+    ) -> EffectiveSet {
+        self.grants.extend(
+            public
+                .grants
+                .iter()
+                .filter(|g| g.action == Action::Read)
+                .cloned(),
+        );
+        if let Some(repo_id) = anonymous_read_repo {
+            self.grants.push(Grant {
+                action: Action::Read,
+                repo: Some(repo_id),
+                selector: None,
+            });
+        }
+        self
     }
 }
 
@@ -501,11 +551,21 @@ impl PackageFilter {
 /// An optional per-token privilege scope (from `token.scope` jsonb).
 ///
 /// A token's effective set is `owner_set ∩ scope`. `None` on a field means that
-/// dimension is not restricted (the token inherits all of the owner's actions /
-/// repos). A scope can only ever **narrow**; see [`EffectiveSet::intersect_scope`].
+/// dimension is not restricted (the token inherits the owner's repos, and all
+/// of the owner's actions **except `admin`**, which a scope must name
+/// explicitly). A scope can only ever **narrow**; see
+/// [`EffectiveSet::intersect_scope`].
+///
+/// Unknown fields are **rejected** (`deny_unknown_fields`): a mistyped key such
+/// as `{"repos": [3]}` must fail to parse (a 400 at the admin API, fail-closed
+/// deny-all at evaluation) rather than silently produce an unscoped token.
+/// Stored scopes are always the canonical serialization of this struct (the
+/// admin API re-serializes what it validated), so they keep parsing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenScope {
-    /// Allowed actions; `None` ⇒ all of the owner's actions.
+    /// Allowed actions; `None` ⇒ the owner's `read` / `write` / `delete`
+    /// (never `admin`, which must be listed explicitly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<Action>>,
     /// Allowed repository ids; `None` ⇒ all repos the owner can touch.
@@ -516,8 +576,8 @@ pub struct TokenScope {
 /// Parse a token's raw `scope` jsonb (`Option<serde_json::Value>` as loaded from
 /// the DB) into a [`TokenScope`].
 ///
-/// * `None` (NULL column) ⇒ `None`: the token is **unscoped** and inherits the
-///   owner's full effective set.
+/// * `None` (NULL column) ⇒ `None`: the token is **unscoped**. The seam
+///   evaluates it as [`TokenScope::default()`]: the owner's set minus `admin`.
 /// * `Some(value)` that fails to deserialize into a [`TokenScope`] ⇒ a
 ///   [`TokenScopeParseError`]. The caller treats this **fail-closed**: a token
 ///   carrying a malformed scope must not fall back to the owner's full set (that
@@ -782,17 +842,60 @@ mod tests {
     // --- token scoping ------------------------------------------------------
 
     #[test]
-    fn scope_none_is_identity() {
+    fn default_scope_keeps_package_actions() {
         let s = set(
             false,
             &[
                 (Action::Read, Some(1), None),
                 (Action::Write, Some(1), None),
+                (Action::Delete, None, None),
             ],
         );
         let scoped = s.intersect_scope(&TokenScope::default());
         assert!(scoped.allows_repo(Action::Read, 1));
         assert!(scoped.allows_repo(Action::Write, 1));
+        assert!(scoped.allows_repo(Action::Delete, 7), "ANY preserved");
+    }
+
+    /// B4: an unscoped token (evaluated as the default scope) never carries
+    /// `admin` — neither an admin owner's short-circuit nor a per-repo grant.
+    #[test]
+    fn default_scope_drops_admin() {
+        let admin = set(true, &[]);
+        let scoped = admin.intersect_scope(&TokenScope::default());
+        assert!(!scoped.is_admin(), "unscoped admin token is not an admin");
+        assert!(!scoped.allows_repo(Action::Admin, 1));
+        // …but keeps the admin's package-level reach everywhere.
+        for a in [Action::Read, Action::Write, Action::Delete] {
+            assert!(scoped.allows_repo(a, 1), "{a:?} kept");
+            assert!(scoped.allows_repo(a, 99), "{a:?} kept on ANY repo");
+        }
+
+        let repo_admin = set(
+            false,
+            &[
+                (Action::Admin, Some(1), None),
+                (Action::Read, Some(1), None),
+            ],
+        );
+        let scoped = repo_admin.intersect_scope(&TokenScope::default());
+        assert!(!scoped.allows_repo(Action::Admin, 1), "repo admin dropped");
+        assert!(scoped.allows_repo(Action::Read, 1));
+
+        // An actions-unrestricted but repo-restricted scope drops it too.
+        let scoped = repo_admin.intersect_scope(&TokenScope {
+            actions: None,
+            repositories: Some(vec![1]),
+        });
+        assert!(!scoped.allows_repo(Action::Admin, 1));
+
+        // Naming `admin` keeps the per-repo grant.
+        let scoped = repo_admin.intersect_scope(&TokenScope {
+            actions: Some(vec![Action::Admin]),
+            repositories: None,
+        });
+        assert!(scoped.allows_repo(Action::Admin, 1));
+        assert!(!scoped.allows_repo(Action::Read, 1), "read not named");
     }
 
     #[test]
@@ -978,6 +1081,102 @@ mod tests {
         let json = serde_json::to_string(&raw).unwrap();
         let back: RawEffectiveSet = serde_json::from_str(&json).unwrap();
         assert_eq!(raw, back);
+    }
+
+    /// L6: a mistyped key must not parse into an unscoped token.
+    #[test]
+    fn token_scope_rejects_unknown_fields() {
+        assert!(parse_token_scope(Some(serde_json::json!({"repos": [3]}))).is_err());
+        assert!(parse_token_scope(Some(serde_json::json!({
+            "actions": ["read"],
+            "repository": [3]
+        })))
+        .is_err());
+        // Every canonical (serialized) form still parses.
+        for scope in [
+            TokenScope::default(),
+            TokenScope {
+                actions: Some(vec![Action::Read, Action::Admin]),
+                repositories: None,
+            },
+            TokenScope {
+                actions: None,
+                repositories: Some(vec![1, 2]),
+            },
+            TokenScope {
+                actions: Some(vec![]),
+                repositories: Some(vec![]),
+            },
+        ] {
+            let stored = serde_json::to_value(&scope).unwrap();
+            assert_eq!(parse_token_scope(Some(stored)).unwrap(), Some(scope));
+        }
+        // Explicit nulls are the same as absent fields.
+        assert_eq!(
+            parse_token_scope(Some(serde_json::json!({"actions": null}))).unwrap(),
+            Some(TokenScope::default())
+        );
+    }
+
+    // --- public read (anonymous reach for signed-in principals) ------------
+
+    #[test]
+    fn public_read_adds_only_read_grants() {
+        let owner = set(false, &[(Action::Write, Some(1), None)]);
+        let public = set(
+            false,
+            &[
+                (Action::Read, Some(2), Some(sel(&["pub.*"], &[]))),
+                (Action::Write, Some(2), None),
+                (Action::Admin, Some(2), None),
+            ],
+        );
+        let s = owner.with_public_read(&public, Some(3));
+        assert!(s.allows_repo(Action::Write, 1), "own grants kept");
+        assert!(s.allows_repo(Action::Read, 2), "anonymous-role read added");
+        assert!(
+            !s.allows_repo(Action::Write, 2),
+            "anonymous write not added"
+        );
+        assert!(
+            !s.allows_repo(Action::Admin, 2),
+            "anonymous admin not added"
+        );
+        assert!(s.allows_repo(Action::Read, 3), "anonymous_read flag added");
+        assert!(matches!(s.package_filter(3), PackageFilter::AllowAll));
+        let f = s.package_filter(2);
+        assert!(f.allows("Pub.Lib"), "selector preserved");
+        assert!(!f.allows("Priv.Lib"));
+        assert!(!s.is_admin());
+    }
+
+    #[test]
+    fn public_read_never_widens_a_token_scope() {
+        let owner = set(false, &[]);
+        let public = set(false, &[(Action::Read, None, None)]);
+        let with_public = owner.with_public_read(&public, Some(5));
+        assert!(with_public.allows_repo(Action::Read, 5));
+        assert!(with_public.allows_repo(Action::Read, 6));
+
+        // A token scoped to repo 7 reaches only repo 7 (via the ANY grant).
+        let scoped = with_public.intersect_scope(&TokenScope {
+            actions: None,
+            repositories: Some(vec![7]),
+        });
+        assert!(
+            !scoped.allows_repo(Action::Read, 5),
+            "flag repo out of scope"
+        );
+        assert!(!scoped.allows_repo(Action::Read, 6), "ANY narrowed");
+        assert!(scoped.allows_repo(Action::Read, 7));
+
+        // A write-only token gains no read at all.
+        let scoped = with_public.intersect_scope(&TokenScope {
+            actions: Some(vec![Action::Write]),
+            repositories: None,
+        });
+        assert!(!scoped.allows_repo(Action::Read, 5));
+        assert!(!scoped.allows_repo(Action::Read, 6));
     }
 
     #[test]

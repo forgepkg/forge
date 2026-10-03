@@ -550,3 +550,171 @@ async fn token_scope_narrows_to_read_only() {
     let status = publish_with_token(&srv, &repo, &token, "ScopeTest", "1.0.0").await;
     assert_eq!(status, 201, "unscoped token may write; got {status}");
 }
+
+/// M1: `PATCH /admin/content-selectors/{id}` is a true PATCH — an omitted
+/// `includes` / `excludes` / `description` keeps the stored value (an omitted
+/// `includes` reset to `[]` would mean match-all and widen every grant).
+#[tokio::test]
+async fn content_selector_patch_keeps_omitted_fields() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+
+    let created: Value = client
+        .post(format!("{}/admin/content-selectors", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({
+            "name": format!("patch-{}", common::unique()),
+            "description": "public packages",
+            "includes": ["company.*"],
+            "excludes": ["company.secret*"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sel_id = created["id"].as_i64().unwrap();
+    let url = format!("{}/admin/content-selectors/{sel_id}", srv.base_url);
+    let patch = |body: Value| {
+        let client = client.clone();
+        let (url, au, ap) = (url.clone(), au.clone(), ap.clone());
+        async move {
+            let resp = client
+                .patch(url)
+                .basic_auth(&au, Some(&ap))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{body}");
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+
+    let s = patch(json!({"description": "renamed"})).await;
+    assert_eq!(s["description"], json!("renamed"));
+    assert_eq!(s["includes"], json!(["company.*"]), "includes kept");
+    assert_eq!(s["excludes"], json!(["company.secret*"]), "excludes kept");
+
+    let s = patch(json!({"excludes": ["company.internal*"]})).await;
+    assert_eq!(s["description"], json!("renamed"), "description kept");
+    assert_eq!(s["includes"], json!(["company.*"]), "includes kept");
+    assert_eq!(s["excludes"], json!(["company.internal*"]));
+
+    let s = patch(json!({"includes": null})).await;
+    assert_eq!(s["includes"], json!(["company.*"]), "null keeps too");
+
+    // An explicit `[]` is honored (the only way to make it match-all).
+    let s = patch(json!({"includes": []})).await;
+    assert_eq!(s["includes"], json!([]));
+
+    // An invalid glob in a supplied list is still a 400.
+    let resp = client
+        .patch(&url)
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"excludes": ["[unterminated"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let stored: Value = client
+        .get(&url)
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stored["excludes"],
+        json!(["company.internal*"]),
+        "not persisted"
+    );
+}
+
+/// L6: with `anonymous_mode = "all"` a signed-in user without grants can read
+/// a repository anonymous callers can read (`anonymous_read`), but cannot
+/// write it; a token scoped to another repository gains nothing from it.
+#[tokio::test]
+async fn signed_in_user_reads_anonymous_read_repo() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            anonymous_mode: "all".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let (user_id, username, password) = make_user(&srv).await;
+
+    let public = format!("pub{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": public, "kind": "hosted", "anonymous_read": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let private = make_repo(&srv).await;
+    let private_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, &private)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let resp = client
+        .get(format!("{}/v3/{public}/index.json", srv.base_url))
+        .basic_auth(&username, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "roleless user reads the public repo");
+    let resp = client
+        .get(format!("{}/v3/{private}/index.json", srv.base_url))
+        .basic_auth(&username, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "but not a private one");
+
+    // Writing still needs a grant.
+    let created: Value = client
+        .post(format!("{}/admin/users/{user_id}/tokens", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = created["token"].as_str().unwrap().to_string();
+    let status = publish_with_token(&srv, &public, &token, "PubTest", "1.0.0").await;
+    assert_eq!(status, 403, "public read is read-only");
+
+    // A token scoped to the private repository cannot read the public one.
+    let scoped: Value = client
+        .post(format!("{}/admin/users/{user_id}/tokens", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": "scoped", "scope": {"repositories": [private_id]}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = client
+        .get(format!("{}/v3/{public}/index.json", srv.base_url))
+        .header("X-NuGet-ApiKey", scoped["token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "scope still bounds the public reach");
+}

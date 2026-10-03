@@ -121,7 +121,10 @@ impl AppState {
         config: Config,
     ) -> Self {
         let cas = Cas::new(blob_store.clone(), pool.clone());
-        let authz = Authz::new(pool.clone(), cache.clone());
+        // Signed-in callers share the public read reach only where everyone
+        // may read anonymously (see `Authz::with_public_read_for_signed_in`).
+        let authz = Authz::new(pool.clone(), cache.clone())
+            .with_public_read_for_signed_in(config.auth.anonymous_mode.eq_ignore_ascii_case("all"));
         let config = Arc::new(config);
 
         let (idle, absolute) = config.session_ttls();

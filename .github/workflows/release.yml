@@ -1,10 +1,19 @@
 name: Release
 
 # Publishes the production image for a version tag (`v0.1.0`, `v0.1.1`, …):
-#   ghcr.io/<owner>/<repo>:<version>, :<major>.<minor>, :sha-<short>, :latest
+#   ghcr.io/<owner>/<repo>:<version> and :sha-<short>, plus
+#   :<major>.<minor> only for the newest release of that line and :latest only
+#   for the newest non-prerelease version overall (an older-line patch or a
+#   prerelease never moves them),
 # with a BuildKit SBOM + max-mode provenance attestation, a keyless cosign
-# signature over the pushed digest, and a GitHub release whose notes come from
-# the matching CHANGELOG.md section.
+# signature, and a GitHub release whose notes come from the matching
+# CHANGELOG.md section.
+#
+# Order of operations: the image is pushed BY DIGEST (untagged), the digest is
+# signed and the signature verified, and only then are the tags attached
+# (`docker buildx imagetools create`), so no tag ever points at an unsigned
+# image. Every third-party action is pinned to a full commit SHA (the tag it
+# was resolved from is in the trailing comment); Dependabot keeps them current.
 #
 # Guard rails: the tag must equal the workspace version in Cargo.toml and the
 # web/package.json version, and must point at a commit on the default branch.
@@ -32,7 +41,7 @@ jobs:
       id-token: write # keyless cosign signing + provenance
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -51,6 +60,33 @@ jobs:
             || { echo "::error::tag is not on the default branch"; exit 1; }
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
+      # Which floating tags this release may move. `latest` goes only to the
+      # highest non-prerelease version among all release tags, and
+      # `<major>.<minor>` only to the highest non-prerelease version of its
+      # line — so a prerelease, or a patch to an older line, never moves them.
+      - name: Decide floating tags
+        id: channels
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          stable_tags() { git tag --list 'v*.*.*' | sed 's/^v//' | grep -Ev -- '-' | sort -V; }
+          latest=false
+          line_latest=false
+          case "$VERSION" in
+            *-*) echo "prerelease: neither :latest nor :<major>.<minor> moves" ;;
+            *)
+              highest=$(stable_tags | tail -n 1)
+              line="${VERSION%.*}"
+              highest_in_line=$(stable_tags | grep -E "^${line//./\\.}\.[0-9]+$" | tail -n 1)
+              [ "$VERSION" = "$highest" ] && latest=true
+              [ "$VERSION" = "$highest_in_line" ] && line_latest=true
+              echo "highest=$highest highest_in_line=$highest_in_line"
+              ;;
+          esac
+          echo "latest=$latest line_latest=$line_latest"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "line_latest=$line_latest" >> "$GITHUB_OUTPUT"
+
       - name: Extract release notes from CHANGELOG.md
         run: |
           awk -v v="${{ steps.version.outputs.version }}" '
@@ -64,9 +100,9 @@ jobs:
             exit 1
           fi
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -74,25 +110,29 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
+          # `latest` is decided explicitly above, never automatically.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.channels.outputs.line_latest }}
             type=sha,format=short
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.channels.outputs.latest }}
           labels: |
             org.opencontainers.image.title=envisia-forge
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
-      - name: Build and push
+      # Push the image untagged (by digest only); the tags are attached after
+      # the digest is signed.
+      - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
@@ -102,12 +142,38 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
-      - name: Sign the image digest (keyless)
+      - name: Sign the image digest (keyless) and verify the signature
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          # The exact command published in the release notes must succeed.
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "${IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+
+      - name: Attach the tags to the signed digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(--tag "$tag")
+          done <<< "$TAGS"
+          echo "tags: ${args[*]}"
+          docker buildx imagetools create "${args[@]}" "${IMAGE}@${DIGEST}"
+          # A single-index source is copied as-is; make sure the tag really
+          # resolves to the signed digest.
+          tagged=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}')
+          if [ "$tagged" != "$DIGEST" ]; then
+            echo "::error::${IMAGE}:${VERSION} resolves to $tagged, not the signed $DIGEST"
+            exit 1
+          fi
 
       - name: Create the GitHub release
         env:
@@ -123,7 +189,7 @@ jobs:
             echo "docker pull ${IMAGE}:${{ steps.version.outputs.version }}"
             echo "# digest: ${DIGEST}"
             echo "cosign verify ${IMAGE}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \\"
+            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
           } > release-body.md

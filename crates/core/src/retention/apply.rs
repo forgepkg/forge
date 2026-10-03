@@ -16,7 +16,10 @@
 //!    zero, enqueues a `blob_outbox` `delete_object` in the *same* transaction.
 //!    A blob still referenced elsewhere (`ref_count > 0`) gets **no** outbox row
 //!    and its S3 object survives. We never delete an S3 object directly.
-//! 3. For an unlist: flip `component.listed = false`.
+//! 3. For an unlist: flip `component.listed = false`. For a proxy eviction:
+//!    delete the cached component like a hard delete, but **keep** the
+//!    `proxy_cached_version` row, flipping it back to `downloaded = false`
+//!    (see `apply_proxy`).
 //! 4. Insert the `retention_audit` row in the **same** transaction, so the
 //!    effect and its audit commit atomically (capturing the observed
 //!    `ref_count_after` and whether a delete was enqueued).
@@ -284,8 +287,16 @@ async fn apply_hosted(
 }
 
 /// Apply one proxy eviction in its own transaction. Eviction deletes the cached
-/// version's `component` (assets + blob decref, driving the outbox) and the
-/// `proxy_cached_version` row.
+/// version's `component` (assets + blob decref, driving the outbox) and resets
+/// its `proxy_cached_version` row to metadata-only (`downloaded = false`).
+///
+/// The row itself is **kept**: it is the version's upstream listing entry and
+/// its `first_seen_at` anchors `package_delay_seconds`. Deleting it would make
+/// the next listing refresh re-insert the version with `first_seen_at = now()`,
+/// hiding a long-established version for a whole delay window after every
+/// eviction. With `downloaded = false` the proxy treats the version exactly
+/// like one it has listed but never pulled: listings keep showing it, and the
+/// next pull re-fetches the bytes from upstream and serves them at once.
 async fn apply_proxy(
     ctx: &ApplyContext<'_>,
     d: &ProxyDecision,
@@ -321,10 +332,12 @@ async fn apply_proxy(
 
     let mut tx = ctx.pool.begin().await?;
 
-    // Lock the cached-version row by id; skip if it's gone.
+    // Lock the cached-version row by id (the proxy's download finalize locks
+    // the same row first, so the two serialize). Skip if it is gone, or if it
+    // no longer holds cached bytes (a concurrent run already evicted it).
     let cached = sqlx::query!(
         r#"
-        SELECT id, name, version, last_downloaded_at
+        SELECT id, name, version, last_downloaded_at, downloaded
         FROM proxy_cached_version
         WHERE id = $1 AND repository_id = $2
         FOR UPDATE
@@ -335,7 +348,7 @@ async fn apply_proxy(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let Some(cached) = cached else {
+    let Some(cached) = cached.filter(|c| c.downloaded) else {
         audit_skipped_proxy(&mut tx, ctx, d).await?;
         tx.commit().await?;
         summary.skipped += 1;
@@ -402,9 +415,10 @@ async fn apply_proxy(
             .await?;
     }
 
-    // Delete the cached-version marker itself (re-caches on the next pull).
+    // Keep the row (and its `first_seen_at`) as a metadata-only entry; the
+    // next pull re-fetches the bytes from upstream.
     sqlx::query!(
-        r#"DELETE FROM proxy_cached_version WHERE id = $1"#,
+        r#"UPDATE proxy_cached_version SET downloaded = false WHERE id = $1"#,
         cached.id,
     )
     .execute(&mut *tx)

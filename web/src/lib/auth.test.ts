@@ -68,4 +68,23 @@ describe('auth', () => {
     setSession('two')
     expect(listener).toHaveBeenCalledTimes(2) // no calls after unsubscribe
   })
+
+  it('does not notify when clearing a session that was never stored (H4)', () => {
+    // Every 401 calls clearSession; a notification makes the app shell
+    // refetch its identity, so notifying for an already-cleared session fed
+    // an endless 401 -> notify -> refetch -> 401 loop.
+    const listener = vi.fn()
+    const unsubscribe = onAuthChange(listener)
+
+    clearSession()
+    clearSession()
+    expect(listener).not.toHaveBeenCalled()
+
+    setSession('one')
+    clearSession()
+    clearSession()
+    expect(listener).toHaveBeenCalledTimes(2) // the set + the first clear only
+
+    unsubscribe()
+  })
 })

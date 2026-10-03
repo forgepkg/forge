@@ -38,7 +38,8 @@ use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
 use forge_cache::Cache;
 use forge_core::auth::chain::{provision_and_map, ChainOutcome};
-use forge_core::auth::client_ip::resolve_client_ip;
+use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip};
+use forge_core::auth::login_throttle::{username_for_log, AttemptRefused, MAX_USERNAME_BYTES};
 use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
@@ -48,7 +49,7 @@ use forge_core::oidc::{
     ClaimMapping, ClientParams, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
-use forge_db::model::Session;
+use forge_db::model::{AppUser, Session};
 use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
@@ -422,11 +423,13 @@ impl IntoResponse for SessionAuthError {
     }
 }
 
-/// What the session-authenticated endpoints need: the shared session service
-/// plus the cookie-security bit. OIDC-independent since 12.7 (local password
-/// logins mint sessions too).
+/// What the session-authenticated endpoints need: the shared session service,
+/// the pool (to read the session user's live account state) and the
+/// cookie-security bit. OIDC-independent since 12.7 (local password logins
+/// mint sessions too).
 struct SessionAuthCtx {
     sessions: SessionService,
+    pool: sqlx::PgPool,
     cookie_secure: bool,
 }
 
@@ -434,25 +437,43 @@ impl SessionAuthCtx {
     fn of(state: &AppState) -> Self {
         SessionAuthCtx {
             sessions: state.sessions.clone(),
+            pool: state.pool.clone(),
             cookie_secure: state.cookie_secure,
         }
     }
 }
 
-/// Validate the `forge_session` cookie and return the live session row. `None`
-/// of the error variants leaks whether the cookie was malformed vs unknown.
+/// A live session whose user still exists and is active.
+struct ActiveSession {
+    session: Session,
+    user: AppUser,
+}
+
+/// Validate the `forge_session` cookie and return the live session row plus
+/// its user's **current** row. A session of a deactivated (or deleted) user is
+/// refused like an unknown cookie: deactivation must cut off a signed-in
+/// browser immediately, not when the session expires. None of the error
+/// variants leaks whether the cookie was malformed vs unknown vs inactive.
 async fn require_session(
     rt: &SessionAuthCtx,
     headers: &HeaderMap,
-) -> Result<Session, SessionAuthError> {
+) -> Result<ActiveSession, SessionAuthError> {
     let Some(secret) = cookie_value(headers, SESSION_COOKIE).filter(|s| !s.is_empty()) else {
         return Err(SessionAuthError::Unauthorized);
     };
-    match rt.sessions.validate(&secret).await {
-        Ok(Some(s)) => Ok(s),
-        Ok(None) => Err(SessionAuthError::Unauthorized),
+    let session = match rt.sessions.validate(&secret).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(SessionAuthError::Unauthorized),
         Err(e) => {
             tracing::warn!(error = %e, "session validate failed");
+            return Err(SessionAuthError::Internal);
+        }
+    };
+    match user_dao::find_user_by_id(&rt.pool, session.user_id).await {
+        Ok(Some(user)) if user.active => Ok(ActiveSession { session, user }),
+        Ok(_) => Err(SessionAuthError::Unauthorized),
+        Err(e) => {
+            tracing::warn!(error = %e, "session user lookup failed");
             Err(SessionAuthError::Internal)
         }
     }
@@ -464,16 +485,16 @@ async fn require_session(
 async fn require_session_csrf(
     rt: &SessionAuthCtx,
     headers: &HeaderMap,
-) -> Result<Session, SessionAuthError> {
-    let session = require_session(rt, headers).await?;
+) -> Result<ActiveSession, SessionAuthError> {
+    let active = require_session(rt, headers).await?;
     let presented = headers
         .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !csrf_token_matches(presented, &session.csrf_secret) {
+    if !csrf_token_matches(presented, &active.session.csrf_secret) {
         return Err(SessionAuthError::CsrfFailed);
     }
-    Ok(session)
+    Ok(active)
 }
 
 /// `GET /auth/me` who-am-I body for the SPA. Carries the per-session
@@ -493,36 +514,28 @@ struct AuthMe {
 /// CSRF token, so the SPA can bootstrap its mutating-request defense.
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let rt = SessionAuthCtx::of(&state);
-    let session = match require_session(&rt, &headers).await {
+    // `require_session` reflects the live user row (deactivation); report the
+    // effective RBAC admin verdict (admin role or legacy flag), not the raw
+    // column.
+    let ActiveSession { session, user: u } = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    // Reflect the live user row (deactivation) and the effective RBAC admin
-    // verdict (admin role or legacy flag), not the raw column.
-    match user_dao::find_user_by_id(&state.pool, session.user_id).await {
-        Ok(Some(u)) if u.active => {
-            let is_admin = state
-                .authz
-                .is_global_admin(&forge_core::auth::Principal::User {
-                    user_id: u.id,
-                    token_id: None,
-                    is_admin: u.is_admin,
-                })
-                .await;
-            Json(AuthMe {
-                user_id: u.id,
-                username: u.username,
-                is_admin,
-                csrf_token: session.csrf_secret,
-            })
-            .into_response()
-        }
-        Ok(_) => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "auth/me user lookup failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
-        }
-    }
+    let is_admin = state
+        .authz
+        .is_global_admin(&forge_core::auth::Principal::User {
+            user_id: u.id,
+            token_id: None,
+            is_admin: u.is_admin,
+        })
+        .await;
+    Json(AuthMe {
+        user_id: u.id,
+        username: u.username,
+        is_admin,
+        csrf_token: session.csrf_secret,
+    })
+    .into_response()
 }
 
 /// Token metadata view (never includes the secret or its hash).
@@ -566,14 +579,15 @@ struct CreatedToken {
     token: String,
 }
 
-/// `GET /auth/tokens` — list the logged-in user's repository tokens (no secret).
+/// `GET /auth/tokens` — list the logged-in (active) user's repository tokens
+/// (no secret).
 async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let rt = SessionAuthCtx::of(&state);
-    let session = match require_session(&rt, &headers).await {
+    let ActiveSession { user, .. } = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    match token_dao::list_tokens_for_user(&state.pool, session.user_id).await {
+    match token_dao::list_tokens_for_user(&state.pool, user.id).await {
         Ok(tokens) => {
             let views: Vec<TokenView> = tokens.iter().map(TokenView::from).collect();
             Json(views).into_response()
@@ -586,15 +600,16 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 /// `POST /auth/tokens` — mint a slice-1 repository token for the **session's**
-/// user (CSRF-protected). Delegates to the same hash-only token model the admin
-/// API uses; the plaintext is returned once.
+/// user (CSRF-protected; refused for a deactivated user). Delegates to the
+/// same hash-only token model the admin API uses; the plaintext is returned
+/// once.
 async fn create_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateTokenBody>,
 ) -> Response {
     let rt = SessionAuthCtx::of(&state);
-    let session = match require_session_csrf(&rt, &headers).await {
+    let ActiveSession { user, .. } = match require_session_csrf(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -602,7 +617,7 @@ async fn create_token(
     let secret = generate_token_secret();
     let token_hash = hash_token(&secret);
     let new = NewToken {
-        user_id: session.user_id,
+        user_id: user.id,
         name: body.name,
         token_hash,
         expires_at: body.expires_at,
@@ -632,14 +647,14 @@ async fn revoke_token(
     Path(id): Path<i64>,
 ) -> Response {
     let rt = SessionAuthCtx::of(&state);
-    let session = match require_session_csrf(&rt, &headers).await {
+    let ActiveSession { user, .. } = match require_session_csrf(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
 
     // Enforce ownership: the token must exist AND belong to the session's user.
     match token_dao::find_token_by_id(&state.pool, id).await {
-        Ok(Some(t)) if t.user_id == session.user_id => {}
+        Ok(Some(t)) if t.user_id == user.id => {}
         Ok(_) => return (StatusCode::NOT_FOUND, "token not found").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth/tokens lookup failed");
@@ -674,7 +689,9 @@ struct LoginBody {
 /// chain with the same fail-closed semantics, but is **not** gated by
 /// `auth.allow_password_basic` (that flag governs API Basic auth only). The
 /// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
-/// are a uniform 401 (no username-exists oracle).
+/// are a uniform 401 (no username-exists oracle). A username over
+/// [`MAX_USERNAME_BYTES`] is refused the same way before any lookup or lockout
+/// bookkeeping (it is never counted, so it cannot grow the lockout map).
 async fn password_login(
     State(state): State<AppState>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -690,21 +707,42 @@ async fn password_login(
         // whether to even offer the form from /auth/login-options).
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     };
-    if body.username.trim().is_empty() || body.password.is_empty() {
+    if body.username.trim().is_empty()
+        || body.username.len() > MAX_USERNAME_BYTES
+        || body.password.is_empty()
+    {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
 
     let client_ip = login_client_ip(&state, connect, &headers);
-    // Too many recent failures for this (IP, username): refuse before running
-    // the chain (no argon2 work, nothing forwarded upstream).
-    if state.login_throttle.is_locked(client_ip, &body.username) {
-        tracing::warn!(username = %body.username, ip = %client_ip, "password login throttled");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-in attempts; try again later",
-        )
-            .into_response();
-    }
+    // Reserve the attempt against the (IP, username) lockout budget before
+    // running the chain; a locked pair is refused without any provider work
+    // (no argon2, nothing forwarded upstream).
+    let attempt = match state.login_throttle.begin(client_ip, &body.username).await {
+        Ok(attempt) => attempt,
+        Err(refused) => {
+            let username = username_for_log(&body.username);
+            // `Retry-After` (seconds) lets the UI say how long to wait: a
+            // locked pair clears within one failure window (an upper bound),
+            // a pair saturated by in-flight attempts within moments.
+            let retry_after = match refused {
+                AttemptRefused::Locked => {
+                    tracing::warn!(%username, ip = %client_ip, "password login throttled");
+                    state.config.auth.login_failure_window_seconds.max(1)
+                }
+                AttemptRefused::Busy => {
+                    tracing::warn!(%username, ip = %client_ip, "password login: too many concurrent attempts");
+                    1
+                }
+            };
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                "too many failed sign-in attempts; try again later",
+            )
+                .into_response();
+        }
+    };
     let cred = PasswordCredential {
         username: &body.username,
         password: &body.password,
@@ -713,15 +751,15 @@ async fn password_login(
     let identity = match chain.authenticate(&cred).await {
         ChainOutcome::Authenticated { identity, .. } => identity,
         // Uniform wire response for rejected / outage / unknown (fail-closed;
-        // upstream health goes to logs, not to the caller). An outage is not
-        // the caller's fault and does not count towards the lockout.
+        // upstream health goes to logs, not to the caller). An outage (or an
+        // argon2 overload) is not the caller's fault and does not count
+        // towards the lockout.
         ChainOutcome::Unavailable => {
+            attempt.released();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
-            state
-                .login_throttle
-                .record_failure(client_ip, &body.username);
+            attempt.failed();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
     };
@@ -729,19 +767,16 @@ async fn password_login(
     let principal = match provision_and_map(&state.pool, &identity).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            state
-                .login_throttle
-                .record_failure(client_ip, &body.username);
+            attempt.failed();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
+            attempt.released();
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
-    state
-        .login_throttle
-        .record_success(client_ip, &body.username);
+    attempt.succeeded();
     if identity.admin_authoritative {
         // The upstream may just have granted/revoked admin: drop the cached
         // effective set so the new session sees it immediately.
@@ -780,8 +815,9 @@ async fn password_login(
         .into_response()
 }
 
-/// Resolve the client IP for the login audit trail: honors `X-Forwarded-For`
-/// behind the configured trusted proxies, mirroring the principal middleware.
+/// Resolve the client IP for the lockout key and the login audit trail: honors
+/// every `X-Forwarded-For` line behind the configured trusted proxies and
+/// canonicalizes IPv4-mapped addresses, mirroring the principal middleware.
 /// Loopback when no connect info is available (in-process router tests).
 fn login_client_ip(
     state: &AppState,
@@ -791,9 +827,9 @@ fn login_client_ip(
     let peer = connect
         .map(|Extension(ci)| ci.0.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let xff = forwarded_for(headers);
     let trusted = state.config.trusted_proxy_cidrs().unwrap_or_default();
-    resolve_client_ip(peer, xff, &trusted)
+    resolve_client_ip(peer, xff.as_deref(), &trusted)
 }
 
 /// `POST /auth/identify` request body.

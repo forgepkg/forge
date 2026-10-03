@@ -5,32 +5,48 @@ use thiserror::Error;
 
 /// Zip-bomb / resource-exhaustion defenses applied while reading a `.nupkg`.
 ///
-/// A `.nupkg` is an OPC (Open Packaging Conventions) zip. We only ever read a
-/// single small XML manifest out of it, so these caps are generous for real
-/// packages yet reject pathological archives.
-#[derive(Debug, Clone, Copy)]
+/// A `.nupkg` is an OPC (Open Packaging Conventions) zip. Forge only ever
+/// decompresses the single `.nuspec` manifest out of it; every other entry is
+/// stored and served as opaque archive bytes, so its size or compression ratio
+/// cannot exhaust Forge's memory or disk. The caps therefore split into:
+///
+/// * **archive shape** — the entry count and the central-directory size, read
+///   from the end-of-central-directory records *before* the zip reader parses
+///   the central directory, plus a sanity bound on the total declared
+///   uncompressed size (large native packages — CUDA, libtorch, … — routinely
+///   hold single entries of hundreds of MiB and must pass);
+/// * **manifest** — size and compression ratio of the `.nuspec`, the only
+///   entry that is ever decompressed.
+///
+/// Configurable through the server's `[nuget]` section; [`Default`] carries
+/// the documented defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NupkgLimits {
     /// Maximum number of entries in the archive.
     pub max_entries: usize,
-    /// Maximum uncompressed size of any single entry we decompress.
-    pub max_entry_uncompressed: u64,
-    /// Maximum total uncompressed size across all entries we decompress.
+    /// Maximum size of the zip central directory (the per-entry metadata the
+    /// zip reader loads into memory), as declared by the end-of-central-
+    /// directory record.
+    pub max_central_directory_bytes: u64,
+    /// Maximum total declared uncompressed size across all entries. Nothing
+    /// but the `.nuspec` is decompressed, so this only rejects absurd archives.
     pub max_total_uncompressed: u64,
-    /// Maximum allowed compression ratio (uncompressed / compressed) for any
-    /// single entry we decompress. Guards against highly compressible bombs.
-    pub max_compression_ratio: u64,
-    /// Maximum size of the `.nuspec` manifest we will read into memory.
+    /// Maximum size of the `.nuspec` manifest, the only entry read into memory
+    /// (also the bound on an upstream `.nuspec` a proxy verifies).
     pub max_nuspec_bytes: u64,
+    /// Maximum compression ratio (uncompressed / compressed) of the `.nuspec`
+    /// entry. Guards against a highly compressible manifest bomb.
+    pub max_nuspec_compression_ratio: u64,
 }
 
 impl Default for NupkgLimits {
     fn default() -> Self {
         NupkgLimits {
             max_entries: 10_000,
-            max_entry_uncompressed: 64 * 1024 * 1024, // 64 MiB
-            max_total_uncompressed: 512 * 1024 * 1024, // 512 MiB
-            max_compression_ratio: 200,
-            max_nuspec_bytes: 16 * 1024 * 1024, // 16 MiB
+            max_central_directory_bytes: 16 * 1024 * 1024, // 16 MiB
+            max_total_uncompressed: 16 * 1024 * 1024 * 1024, // 16 GiB
+            max_nuspec_bytes: 1024 * 1024,                 // 1 MiB
+            max_nuspec_compression_ratio: 200,
         }
     }
 }

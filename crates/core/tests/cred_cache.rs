@@ -9,8 +9,14 @@
 //!     re-forwards;
 //!   * TTL expiry forces a re-forward;
 //!   * `revoke_user` deletes the authoritative rows so the next check re-forwards;
+//!   * a revocation landing mid-forward fences that forward's verdict;
 //!   * the stored `validated_credential` rows never contain the plaintext
-//!     password — only the HMAC.
+//!     password — only the HMAC;
+//!   * a slow upstream holds **no** pooled connection (review H1): many slow
+//!     forwards on a 2-connection pool leave room for unrelated queries;
+//!   * identical misses on two instances forward once (lease singleflight), a
+//!     lapsed lease is taken over, and the per-provider forward limit fails
+//!     excess misses closed.
 //!
 //! Each test drives the cache with an **L1-only** [`forge_cache::Cache`] (so the
 //! Postgres factory is reached deterministically) and a counting `forward`
@@ -26,11 +32,12 @@ use std::time::Duration;
 
 use forge_cache::Cache;
 use forge_core::auth::{
-    revoke_credentials_for_user, CredCacheError, CredKeyPepper, UpstreamVerdict,
+    cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, UpstreamVerdict,
     ValidatedCredentialCache,
 };
+use forge_db::validated_credential_dao::{self as vc_dao, Claim};
 
-use common::{pool, unique};
+use common::{pool, small_pool, unique};
 
 const PROVIDER: &str = "upstream-basic";
 
@@ -336,9 +343,25 @@ async fn standalone_revoke_invalidates_realm_scoped_provider() {
     );
 }
 
+/// A revocation that lands while a forward is in flight neither waits for it
+/// at the database (no lock is held across the forward) nor lets its
+/// now-stale answer through: the claim row is deleted with the verdicts, the
+/// fill's conditional verdict write finds nothing to update, and that request
+/// fails closed. The next request re-forwards.
+///
+/// (Before the lease redesign the fill held a share lock across the forward
+/// and the revocation queued behind it — the very connection-pinning H1 is
+/// about.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn revoke_fences_an_inflight_forward_before_deleting_its_verdict() {
-    let cache = make_cache(Duration::from_secs(300), Duration::from_secs(30)).await;
+async fn revoke_during_an_inflight_forward_fences_its_verdict() {
+    let pool = pool().await;
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
     let user = format!("revoke-race-{}", unique());
     let password = "still-valid-upstream";
     let forward_started = Arc::new(tokio::sync::Notify::new());
@@ -357,29 +380,34 @@ async fn revoke_fences_an_inflight_forward_before_deleting_its_verdict() {
                     UpstreamVerdict::Valid
                 })
                 .await
-                .unwrap()
         })
     };
     forward_started.notified().await;
 
-    let revoke = {
-        let cache = cache.clone();
-        let user = user.clone();
-        tokio::spawn(async move { cache.revoke_user(&user, Some(PROVIDER)).await.unwrap() })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !revoke.is_finished(),
-        "revocation must wait on the durable user-tag lock held by the fill"
-    );
+    // The admin revocation (issued on another instance: its own cache layer)
+    // completes promptly — nothing it needs is held by the in-flight fill.
+    let deleted = tokio::time::timeout(
+        Duration::from_secs(5),
+        revoke_credentials_for_user(&Cache::l1_only(16), &pool, &user),
+    )
+    .await
+    .expect("revocation must not wait on the in-flight forward")
+    .unwrap();
+    assert_eq!(deleted, 1, "the in-flight claim row is revoked");
 
     release_forward.notify_one();
-    assert!(fill.await.unwrap());
     assert_eq!(
-        revoke.await.unwrap(),
-        1,
-        "revocation deletes the verdict committed by the older fill"
+        fill.await.unwrap(),
+        Err(CredCacheError::Unavailable),
+        "a verdict obtained across a revocation is discarded (fail closed)"
     );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential WHERE username = $1")
+            .bind(&user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "the fenced fill wrote no verdict");
 
     let forwards_after_revoke = Arc::new(AtomicU32::new(0));
     let valid = cache
@@ -397,6 +425,260 @@ async fn revoke_fences_an_inflight_forward_before_deleting_its_verdict() {
         1,
         "the first request after revocation must forward upstream again"
     );
+}
+
+/// Review H1: a slow upstream must not pin pooled connections. Five
+/// concurrent slow forwards for different users run against a pool of only
+/// two connections, and an unrelated query still gets a connection while all
+/// five are in flight. (Under the old design each forward held a transaction,
+/// so only two could even start and the pool was exhausted.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_forwards_do_not_hold_db_connections() {
+    let pool = small_pool(2, Duration::from_secs(3)).await;
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
+    let n = unique();
+    let started = Arc::new(AtomicU32::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let mut fills = Vec::new();
+    for i in 0..5 {
+        let cache = cache.clone();
+        let user = format!("slow-upstream-{n}-{i}");
+        let started = started.clone();
+        let release = release.clone();
+        fills.push(tokio::spawn(async move {
+            cache
+                .check(PROVIDER, &user, "pw", || async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    // A stalled upstream: blocks until the test releases it.
+                    release.acquire().await.expect("gate open").forget();
+                    UpstreamVerdict::Valid
+                })
+                .await
+        }));
+    }
+
+    // Every one of the five forwards gets going at once ...
+    let all_started = tokio::time::timeout(Duration::from_secs(10), async {
+        while started.load(Ordering::SeqCst) < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        all_started.is_ok(),
+        "all five slow forwards must start on a 2-connection pool (started {})",
+        started.load(Ordering::SeqCst)
+    );
+
+    // ... and while they are all stalled, the pool still serves other work.
+    let one: i32 = tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::query_scalar("SELECT 1").fetch_one(&pool),
+    )
+    .await
+    .expect("an unrelated query must not wait behind stalled forwards")
+    .expect("an unrelated query gets a pooled connection");
+    assert_eq!(one, 1);
+
+    release.add_permits(5);
+    for fill in fills {
+        assert_eq!(fill.await.unwrap(), Ok(true));
+    }
+}
+
+/// Cross-instance singleflight: two instances (separate L1 caches, one
+/// Postgres) missing on the same credential at the same time forward once.
+/// The loser polls the winner's row instead of forwarding, and gets its
+/// verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_misses_on_two_instances_forward_once() {
+    let pool = pool().await;
+    let instance = || {
+        ValidatedCredentialCache::new(
+            Cache::l1_only(256),
+            pool.clone(),
+            pepper(),
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        )
+    };
+    let (a, b) = (instance(), instance());
+    let user = format!("sf-cross-{}", unique());
+    let forwards = Arc::new(AtomicU32::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let winner = {
+        let user = user.clone();
+        let (forwards, started, release) = (forwards.clone(), started.clone(), release.clone());
+        tokio::spawn(async move {
+            a.check(PROVIDER, &user, "pw", || async move {
+                forwards.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                UpstreamVerdict::Valid
+            })
+            .await
+        })
+    };
+    started.notified().await;
+
+    let loser = {
+        let user = user.clone();
+        let forwards = forwards.clone();
+        tokio::spawn(async move {
+            b.check(
+                PROVIDER,
+                &user,
+                "pw",
+                counting_forward(forwards, UpstreamVerdict::Valid),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !loser.is_finished(),
+        "the second instance waits for the in-flight forward"
+    );
+
+    release.notify_one();
+    assert_eq!(winner.await.unwrap(), Ok(true));
+    assert_eq!(
+        loser.await.unwrap(),
+        Ok(true),
+        "the loser reads the winner's verdict"
+    );
+    assert_eq!(
+        forwards.load(Ordering::SeqCst),
+        1,
+        "identical misses across instances forward exactly once"
+    );
+}
+
+/// A winner that vanished mid-forward (crash, cancelled request) leaves a
+/// claim behind; peers wait for its lease to lapse, then take over instead of
+/// failing forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lapsed_lease_is_taken_over() {
+    let pool = pool().await;
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
+    let user = format!("sf-lapsed-{}", unique());
+    let hmac = cred_key(&pepper(), PROVIDER, &user, "pw");
+
+    // A "crashed" peer's claim with a short lease that is never finalized.
+    let claim = vc_dao::claim_singleflight(&pool, PROVIDER, &user, &hmac, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(matches!(claim, Claim::Won { .. }));
+
+    let forwards = Arc::new(AtomicU32::new(0));
+    let valid = tokio::time::timeout(
+        Duration::from_secs(10),
+        cache.check(
+            PROVIDER,
+            &user,
+            "pw",
+            counting_forward(forwards.clone(), UpstreamVerdict::Valid),
+        ),
+    )
+    .await
+    .expect("the lapsed lease is taken over well before the loser's deadline")
+    .unwrap();
+    assert!(valid);
+    assert_eq!(
+        forwards.load(Ordering::SeqCst),
+        1,
+        "the taker-over forwards"
+    );
+}
+
+/// The per-provider forward limit: with one permit, a second concurrent miss
+/// (another user) fails closed at once — it neither forwards nor writes a
+/// row — while the first completes normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forward_limit_fails_excess_misses_closed() {
+    let pool = pool().await;
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool.clone(),
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    )
+    .with_forward_limit(Arc::new(tokio::sync::Semaphore::new(1)));
+    let n = unique();
+    let (first, second) = (format!("limit-a-{n}"), format!("limit-b-{n}"));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let busy = {
+        let cache = cache.clone();
+        let first = first.clone();
+        let (started, release) = (started.clone(), release.clone());
+        tokio::spawn(async move {
+            cache
+                .check(PROVIDER, &first, "pw", || async move {
+                    started.notify_one();
+                    release.notified().await;
+                    UpstreamVerdict::Valid
+                })
+                .await
+        })
+    };
+    started.notified().await;
+
+    let excess_forwards = Arc::new(AtomicU32::new(0));
+    let err = cache
+        .check(
+            PROVIDER,
+            &second,
+            "pw",
+            counting_forward(excess_forwards.clone(), UpstreamVerdict::Valid),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, CredCacheError::Unavailable, "excess miss fails closed");
+    assert_eq!(
+        excess_forwards.load(Ordering::SeqCst),
+        0,
+        "and never forwards"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential WHERE username = $1")
+            .bind(&second)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "a refused miss writes nothing");
+
+    release.notify_one();
+    assert_eq!(busy.await.unwrap(), Ok(true));
+
+    // With the permit back, the refused user validates normally.
+    assert!(cache
+        .check(
+            PROVIDER,
+            &second,
+            "pw",
+            counting_forward(excess_forwards.clone(), UpstreamVerdict::Valid),
+        )
+        .await
+        .unwrap());
+    assert_eq!(excess_forwards.load(Ordering::SeqCst), 1);
 }
 
 /// A definitive ACCEPT records a `(username, auth method)` row in the

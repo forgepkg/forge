@@ -6,6 +6,8 @@ import type { RepoView } from '~/api/repositories'
 import {
   RepositoryForm,
   toCreateBody,
+  toUpdateBody,
+  validateRepoName,
   type RepoFormValues,
 } from './RepositoryForm'
 
@@ -181,5 +183,203 @@ describe('RepositoryForm', () => {
     const body = toCreateBody(lastValues(onSubmit))
     expect(body.upstream_password).toBe('s3cret')
     expect(body.remote_url).toBe('https://example.test/v3/index.json')
+  })
+})
+
+/** A stored proxy with credentials and explicit TTLs. */
+const storedProxy: RepoView = {
+  id: 7,
+  name: 'private-feed',
+  format: 'nuget',
+  kind: 'proxy',
+  anonymous_read: false,
+  online: true,
+  remote_url: 'https://pkgs.example.com/feed/v3/index.json',
+  package_delay_seconds: 0,
+  upstream_username: 'svc',
+  has_upstream_password: true,
+  metadata_ttl_seconds: 600,
+  not_found_ttl_seconds: 120,
+  allow_redeploy: false,
+  prefer_hosted: false,
+}
+
+function renderEdit(existing: RepoView = storedProxy) {
+  const onSubmit = vi.fn()
+  render(
+    <RepositoryForm
+      mode="edit"
+      existing={existing}
+      submitting={false}
+      onSubmit={onSubmit}
+      onCancel={() => {}}
+    />,
+  )
+  return onSubmit
+}
+
+async function save(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+}
+
+describe('repository names (M18)', () => {
+  it('accepts the server rule and rejects everything else', () => {
+    for (const ok of ['nuget', 'my.repo_1-x', 'A', 'a'.repeat(64), '0day']) {
+      expect(validateRepoName(ok)).toBeNull()
+    }
+    expect(validateRepoName('')).toMatch(/required/)
+    expect(validateRepoName('Team Packages')).toMatch(/letters, digits/)
+    expect(validateRepoName('-leading')).toMatch(/starting with a letter or digit/)
+    expect(validateRepoName('.hidden')).toMatch(/starting with a letter or digit/)
+    expect(validateRepoName('a/b')).toMatch(/letters, digits/)
+    expect(validateRepoName('a'.repeat(65))).toMatch(/at most 64/)
+    for (const reserved of ['new', 'NEW', 'New']) {
+      expect(validateRepoName(reserved)).toMatch(/"new" is reserved/)
+    }
+  })
+
+  it('blocks an invalid name inline on create', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+
+    await user.type(screen.getByLabelText('Name'), 'Team Packages')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent(/no spaces/)
+    expect(screen.getByLabelText('Name')).toHaveAttribute('data-invalid')
+
+    await user.clear(screen.getByLabelText('Name'))
+    await user.type(screen.getByLabelText('Name'), 'new')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent(/"new" is reserved/)
+
+    await user.clear(screen.getByLabelText('Name'))
+    await user.type(screen.getByLabelText('Name'), 'team-packages')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+  })
+
+  it('on edit, keeps a legacy name editable but validates a rename', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit({ ...storedProxy, name: 'Team Packages' })
+
+    await save(user)
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    await user.clear(screen.getByLabelText('Name'))
+    await user.type(screen.getByLabelText('Name'), 'still bad')
+    await save(user)
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('alert')).toHaveTextContent(/no spaces/)
+  })
+})
+
+describe('repository update body (M2)', () => {
+  it('omits every untouched field — no nulls that would clear stored values', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit()
+    await save(user)
+
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({})
+  })
+
+  it('sends null for an explicitly emptied TTL and the value for a changed one', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit()
+
+    await user.clear(screen.getByLabelText('Metadata TTL (seconds)'))
+    const nf = screen.getByLabelText('Not-found TTL (seconds)')
+    await user.clear(nf)
+    await user.type(nf, '30')
+    await save(user)
+
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({
+      metadata_ttl_seconds: null,
+      not_found_ttl_seconds: 30,
+    })
+  })
+
+  it('"Remove stored credentials" sends both username and password as null', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit()
+
+    await user.click(screen.getByRole('button', { name: 'Remove stored credentials' }))
+    expect(screen.getByLabelText('Upstream username')).toBeDisabled()
+    expect(screen.getByLabelText('Upstream password')).toBeDisabled()
+    expect(screen.getByText(/will be removed when you save/)).toBeInTheDocument()
+    await save(user)
+
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({
+      upstream_username: null,
+      upstream_password: null,
+    })
+
+    // Undo: the username is back and nothing about the credentials is sent.
+    await user.click(screen.getByRole('button', { name: 'Keep them' }))
+    expect(screen.getByLabelText('Upstream username')).toHaveValue('svc')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({})
+  })
+
+  it('does not offer to remove credentials when none are stored', () => {
+    renderEdit({ ...storedProxy, upstream_username: null, has_upstream_password: false })
+    expect(
+      screen.queryByRole('button', { name: 'Remove stored credentials' }),
+    ).toBeNull()
+  })
+
+  it('sends a changed username, null for an emptied one, and a typed password', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit()
+
+    const username = screen.getByLabelText('Upstream username')
+    await user.clear(username)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({
+      upstream_username: null,
+    })
+
+    await user.type(username, 'svc2')
+    await user.type(screen.getByLabelText('Upstream password'), 'pat-2')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({
+      upstream_username: 'svc2',
+      upstream_password: 'pat-2',
+    })
+  })
+
+  it('warns that credentials are dropped when the remote URL moves to another origin', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit()
+    const remote = screen.getByLabelText('Remote URL')
+
+    // Same origin, different path: credentials stay, no warning.
+    await user.clear(remote)
+    await user.type(remote, 'https://pkgs.example.com/other/v3/index.json')
+    expect(screen.queryByText(/credentials will be dropped/)).toBeNull()
+
+    // Different origin without a new password: warn.
+    await user.clear(remote)
+    await user.type(remote, 'https://api.nuget.org/v3/index.json')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      /stored upstream credentials will be dropped/,
+    )
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedProxy)).toEqual({
+      remote_url: 'https://api.nuget.org/v3/index.json',
+    })
+
+    // A new password for the new host keeps (replaces) the credentials.
+    await user.type(screen.getByLabelText('Upstream password'), 'new-pat')
+    expect(screen.queryByText(/credentials will be dropped/)).toBeNull()
   })
 })

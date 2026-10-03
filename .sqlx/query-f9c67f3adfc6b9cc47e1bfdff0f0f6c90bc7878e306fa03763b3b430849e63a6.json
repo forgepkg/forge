@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id,\n               upstream_password AS \"upstream_password!\",\n               upstream_password_enc AS \"upstream_password_enc!\"\n        FROM repository\n        WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL\n        ORDER BY id\n        LIMIT $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_password!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "upstream_password_enc!",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "f9c67f3adfc6b9cc47e1bfdff0f0f6c90bc7878e306fa03763b3b430849e63a6"
+}

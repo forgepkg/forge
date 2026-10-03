@@ -8,6 +8,10 @@
 //! * status ∈ `success_status` (default `[200]`) ⇒ **valid** — optionally gated
 //!   by a `required_groups` check parsed from the JSON body;
 //! * status ∈ `reject_status` (default `[401, 403]`) ⇒ **rejected**;
+//! * any **3xx** ⇒ **unavailable**, whatever the status lists say: redirects
+//!   are never followed (an SSO front that 302s bad credentials to a login page
+//!   answering 200 would otherwise make every password valid), and a redirect
+//!   proves nothing about the credential;
 //! * any other status / a network error / a timeout ⇒ **unavailable**
 //!   ([`AuthOutcome::Unavailable`]) — **fail-closed**, never granting and never
 //!   cached.
@@ -18,15 +22,17 @@
 //! forwards unconditionally: it goes through the [`ValidatedCredentialCache`]
 //! ([`super::cred_cache`]), so the steady state of a repeated credential is a
 //! cache hit (L1 → L2 → Postgres) and the upstream is hit at most once per
-//! credential per TTL window per cluster (the cache's ROW-lock singleflight —
-//! **no `pg_advisory_*`**). The plaintext password leaves the process only here,
-//! over the outbound `Authorization: Basic` header; it is never persisted.
+//! credential per TTL window per cluster (the cache's lease singleflight —
+//! **no `pg_advisory_*`**, and no database connection held while the upstream
+//! answers). The plaintext password leaves the process only here, over the
+//! outbound `Authorization: Basic` header; it is never persisted.
 //!
 //! ## Outbound guard
 //!
-//! The outbound request uses [`crate::net::ssrf::outbound_client`]: the scheme
-//! is restricted to http/https (pre-validated at config time via
-//! [`crate::net::ssrf::validate_url`]) and redirects are capped. Private /
+//! The outbound request uses [`crate::net::ssrf::credential_forward_client`]:
+//! the scheme is restricted to http/https (pre-validated at config time via
+//! [`crate::net::ssrf::validate_url`]), redirects are **not followed**, and
+//! every forward carries the configured total `request_timeout`. Private /
 //! loopback upstreams are permitted — the upstream URL is admin-only config
 //! (12.7 §3.6), and an internal Nexus on RFC1918 is the common case.
 //!
@@ -96,9 +102,11 @@ pub struct UpstreamBasicConfig {
     /// Status codes meaning "definitively rejected" (→ `Rejected`, cached
     /// negative — *not* `Unavailable`).
     pub reject_status: Vec<u16>,
-    /// Connect timeout.
+    /// Connect timeout (applied by the caller when it builds the client via
+    /// [`crate::net::ssrf::credential_forward_client`]).
     pub connect_timeout: Duration,
-    /// Total request timeout.
+    /// Total request timeout (connect + response + body), applied to every
+    /// forward.
     pub request_timeout: Duration,
     /// Optional coarse allow-gate: a 200 is only accepted when the user has at
     /// least one of these groups. Empty ⇒ any success is accepted. Requires
@@ -128,7 +136,7 @@ pub struct UpstreamBasicConfig {
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
 ///
-/// Holds a redirect-capped [`reqwest::Client`] (built once) and the
+/// Holds a non-redirecting [`reqwest::Client`] (built once) and the
 /// [`ValidatedCredentialCache`] so the hot path is a cache hit.
 pub struct UpstreamBasicProvider {
     config: UpstreamBasicConfig,
@@ -138,9 +146,10 @@ pub struct UpstreamBasicProvider {
 
 impl UpstreamBasicProvider {
     /// Build the provider from its config, a pre-built outbound client
-    /// ([`crate::net::ssrf::outbound_client`]), and the validated-credential
-    /// cache. Keeping client construction out of here lets tests inject a
-    /// client pointed at an in-process mock upstream.
+    /// ([`crate::net::ssrf::credential_forward_client`] — it must not follow
+    /// redirects), and the validated-credential cache. Keeping client
+    /// construction out of here lets tests inject a client pointed at an
+    /// in-process mock upstream.
     pub fn new(
         config: UpstreamBasicConfig,
         client: Client,
@@ -183,6 +192,7 @@ impl UpstreamBasicProvider {
             .request(method, &self.config.url)
             .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
             .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(self.config.request_timeout)
             .send()
             .await;
 
@@ -200,6 +210,26 @@ impl UpstreamBasicProvider {
         };
 
         let status = resp.status().as_u16();
+
+        // A redirect is never a verdict, even if an operator listed a 3xx as a
+        // success/reject status: the client does not follow it, and the page
+        // it points at (typically an SSO login form answering 200) says
+        // nothing about the credential. Fail closed.
+        if resp.status().is_redirection() {
+            tracing::warn!(
+                status,
+                location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(""),
+                "upstream-basic: upstream answered with a redirect (not followed; treated as unavailable)"
+            );
+            return ForwardResult {
+                verdict: UpstreamVerdict::Unavailable,
+                groups: Vec::new(),
+            };
+        }
 
         if self.config.success_status.contains(&status) {
             // Parse groups only if a path is configured (cheap no-op otherwise).
@@ -254,7 +284,7 @@ impl UpstreamBasicProvider {
             };
         }
 
-        // Any other status (5xx, unexpected 2xx/3xx, etc.) is an outage from our
+        // Any other status (5xx, unexpected 2xx, etc.) is an outage from our
         // point of view: fail closed, cache nothing.
         tracing::warn!(
             status,

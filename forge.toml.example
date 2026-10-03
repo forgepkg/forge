@@ -1,7 +1,8 @@
 # envisia-forge configuration (TOML form).
 #
 # Copy this to `forge.toml` (loaded automatically if present in the working
-# directory) or point $FORGE_CONFIG at it. This file is the base layer; any
+# directory) or point $FORGE_CONFIG at it (the file must then exist: a missing
+# $FORGE_CONFIG file fails startup). This file is the base layer; any
 # `FORGE_*` environment variable overrides the matching key (see .env.example).
 # Nested keys map section-by-section: `[auth].bootstrap_admin.username` is set
 # via `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME`.
@@ -19,6 +20,11 @@ allow_insecure_defaults = true  # (default: false)
 # Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
 # (never buffered in memory); larger pushes get HTTP 413.
 max_upload_bytes = 536870912    # (default: 512 MiB)
+# Host names (port ignored) clients reach this server under besides the host of
+# public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
+# anonymous_mode = "allowlist": a request naming any other host is not served
+# anonymously by IP (DNS-rebinding guard).
+allowed_hosts = []              # (default: [])
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
@@ -50,6 +56,10 @@ allow_password_basic = false    # (default: false)
 # password auth; 0 disables.
 login_max_failures = 10             # (default: 10)
 login_failure_window_seconds = 300  # (default: 300)
+# Most argon2 password verifications running at once (~19 MiB and a core each);
+# more queue for a few seconds, then fail as unavailable (not counted as a
+# failed password). 0 = the number of available CPUs.
+password_verify_concurrency = 0     # (default: 0)
 # 12.7 login UX: "identifier_first" (ask username, then route to a password
 # prompt or an OIDC redirect) or "combined" (always show username+password +
 # a button per enabled OIDC realm).
@@ -60,15 +70,21 @@ login_mode = "identifier_first" # (default: "identifier_first")
 # session_absolute_ttl_seconds = 604800
 # How long an instance trusts its cached snapshot of the auth_realm table.
 realm_cache_ttl_seconds = 10    # (default: 10)
+# Concurrent upstream credential forwards (verdict-cache misses) allowed per
+# credential-forwarding realm, per instance; excess logins fail closed (401).
+credential_forward_max_concurrent = 32  # (default: 32)
 
-# Optional: bootstrap admin created on first run if no admin users exist.
-# Omit the whole section to skip.
+# Optional: bootstrap admin, created once on the first start with a password.
+# Omit the section, or leave the password empty/unset, for no bootstrap admin
+# (remove the password once real admins exist). "changeme" is refused unless
+# server.allow_insecure_defaults = true.
 [auth.bootstrap_admin]
-username = "admin"
+username = "admin"              # (default: "admin")
 password = "changeme"
 
 [redis]
-# Optional shared L2 cache + invalidation backplane. Omit for L1-only caching.
+# Optional shared L2 cache + invalidation backplane. Omit (or leave the url
+# blank) for L1-only caching.
 # url = "redis://localhost:6379"
 # A slower/partitioned Redis is treated as a cache miss instead of hanging reads.
 # connect_timeout_ms  = 2000    # (default: 2000)
@@ -90,6 +106,17 @@ max_package_bytes        = 1073741824  # (default: 1 GiB)
 # to a temp file.
 spool_memory_bytes       = 2097152     # (default: 2 MiB)
 
+[nuget]
+# .nupkg archive safety limits for published and proxied packages. Only the
+# .nuspec manifest is ever decompressed, so it alone is capped by size and
+# compression ratio; other entries (large native binaries included) are only
+# bounded by the archive-shape limits below.
+max_entries                  = 10000        # (default: 10000)
+max_central_directory_bytes  = 16777216     # (default: 16 MiB) zip directory loaded to open a package
+max_total_uncompressed_bytes = 17179869184  # (default: 16 GiB) total declared size of all entries
+max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upstream .nuspec a proxy verifies
+max_nuspec_compression_ratio = 200          # (default: 200)
+
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
 default_ttl_seconds = 30        # (default: 30)
@@ -98,6 +125,7 @@ default_ttl_seconds = 30        # (default: 30)
 batch_size = 100                # (default: 100)
 grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted
 poll_interval_seconds = 10      # (default: 10)
+processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processed outbox rows this long; 0 = never prune
 
 # Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
 # 12.7: this block is a one-shot SEED — on first boot it is imported into an

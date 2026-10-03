@@ -30,16 +30,34 @@ test.describe('single-origin serving', () => {
     await expect(page.getByLabel(/^username$/i)).toBeVisible()
   })
 
-  test('the /admin landing deep link bounces an anonymous user to login', async ({
+  test('an admin UI deep link bounces an anonymous user to login', async ({
     page,
   }) => {
-    // `/admin` (exactly) has no API route, so the server serves index.html
-    // (200); the client-side admin guard then redirects an anonymous user to
-    // login. (Deeper /admin/* paths collide with the API — see
-    // admin-deeplink.spec.ts.)
-    const res = await page.goto('/admin')
+    // The server serves index.html (200) for /manage/*; the client-side guard
+    // then redirects an anonymous user to login, remembering the target.
+    const res = await page.goto('/manage/users')
     expect(res?.status()).toBe(200)
-    await expect(page).toHaveURL(/\/login/)
+    await expect(page).toHaveURL(/\/login\?.*redirect=%2Fmanage%2Fusers/)
+  })
+
+  test('index.html is revalidated; hashed assets are immutable; a stale chunk is a 404', async ({
+    request,
+  }) => {
+    const f = facts()
+    const index = await request.get(`${f.baseUrl}/`)
+    expect(index.headers()['cache-control']).toBe('no-cache')
+    // Pick a real hashed asset out of the built index.html.
+    const html = await index.text()
+    const asset = html.match(/\/assets\/[^"']+\.js/)?.[0]
+    expect(asset, 'index.html references a hashed asset').toBeTruthy()
+    const hit = await request.get(`${f.baseUrl}${asset}`)
+    expect(hit.status()).toBe(200)
+    expect(hit.headers()['cache-control']).toBe(
+      'public, max-age=31536000, immutable',
+    )
+    const miss = await request.get(`${f.baseUrl}/assets/Gone-0ld0ld0l.js`)
+    expect(miss.status()).toBe(404)
+    expect(await miss.text()).not.toContain('<div id="root"')
   })
 
   test('API routes are not shadowed by the SPA fallback', async ({ request }) => {

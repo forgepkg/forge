@@ -9,13 +9,18 @@
 # be supplied at runtime via env:
 #   FORGE_DATABASE__URL   FORGE_S3__ENDPOINT   FORGE_S3__BUCKET
 #   FORGE_S3__ACCESS_KEY  FORGE_S3__SECRET_KEY
-#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 # and you should set:
 #   FORGE_SERVER__PUBLIC_BASE_URL
 #
-# FAIL-CLOSED: the placeholder S3 keys (minioadmin) and bootstrap password
-# (changeme) below are refused at startup unless they are overridden or the
-# deployment explicitly opts in with FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true
+# The first-run bootstrap admin is configured ONLY through env and exists only
+# while a password is set:
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   (FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME, default "admin")
+# No password configured = no bootstrap admin, so removing the variable after
+# the first start (docs/deployment.md) is safe and the image keeps starting.
+#
+# FAIL-CLOSED: the placeholder S3 keys (minioadmin) below, and a bootstrap
+# password of "changeme", are refused at startup unless they are overridden or
+# the deployment explicitly opts in with FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true
 # (local compose/dev only — see docker-compose.app.yml).
 
 [server]
@@ -46,14 +51,16 @@ force_path_style = true
 # For public/anonymous reads set FORGE_AUTH__ANONYMOUS_MODE=all (or allowlist)
 # AND create the repo with anonymous_read=true.
 anonymous_mode = "off"
-# Allow HTTP Basic password auth so the bootstrap admin can reach the admin API.
-allow_password_basic = true
+# HTTP Basic with a USER PASSWORD on the API/feed (tokens in Basic are always
+# accepted). Off: the web UI signs in through /auth/login (not affected by this
+# flag), NuGet clients and scripts use API tokens, and an enabled
+# credential-forwarding realm turns the wire password path on by itself (for
+# the whole chain, so local users' passwords then work over Basic as well).
+# Set FORGE_AUTH__ALLOW_PASSWORD_BASIC=true only if a client must send a local
+# user's password over Basic (e.g. `curl -u user:password` against /admin).
+allow_password_basic = false
 
-# First-run admin, created only if no admin exists yet. The placeholder password
-# is refused at startup: set FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD.
-[auth.bootstrap_admin]
-username = "admin"
-password = "changeme"
+# No [auth.bootstrap_admin] block: see the header (env only).
 
 [web]
 # The server serves the built SPA from here (also set via FORGE_WEB__ASSETS_DIR

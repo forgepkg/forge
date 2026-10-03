@@ -1,0 +1,232 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository SET\n            name = $2,\n            anonymous_read = $3,\n            online = $4,\n            config = $5,\n            remote_url = $6,\n            package_delay_seconds = $7,\n            upstream_username = $8,\n            upstream_password = $9,\n            metadata_ttl_seconds = $10,\n            not_found_ttl_seconds = $11,\n            allow_redeploy = $12,\n            upstream_password_enc = CASE WHEN $13 THEN NULL ELSE upstream_password_enc END,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "format"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "anonymous_read",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "anonymous_read"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "online",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "online"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "config",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "config"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "remote_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "remote_url"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "package_delay_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "package_delay_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "upstream_username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_username"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "upstream_password",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "metadata_ttl_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "metadata_ttl_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "not_found_ttl_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "not_found_ttl_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "allow_redeploy",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "allow_redeploy"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Bool",
+        "Bool",
+        "Jsonb",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b41bba3312f6bd998090d0e355916204e8373b625899b6754ab2e89d1991c1a0"
+}

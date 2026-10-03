@@ -22,10 +22,12 @@
 //! never mutates.
 
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{Duration, Utc};
+use futures_util::FutureExt;
 use sqlx::PgPool;
 
 use forge_db::model::RepoKind;
@@ -98,9 +100,10 @@ impl RetentionWorker {
     /// Run one tick: claim at most one due repository and evaluate it.
     ///
     /// Returns `Ok(Some(summary))` if a repo was claimed + processed, `Ok(None)`
-    /// when nothing is due. On a processing error the lease is released with the
-    /// error recorded and the repo rescheduled, then the error is returned (the
-    /// loop logs + continues).
+    /// when nothing is due. On a processing error — including a panic while
+    /// processing, which is caught ([`WorkerError::Panicked`]) — the lease is
+    /// released with the error recorded and the repo rescheduled, then the
+    /// error is returned (the loop logs + continues).
     pub async fn tick(&self) -> Result<Option<RunSummary>, WorkerError> {
         self.tick_inner(None).await
     }
@@ -139,18 +142,30 @@ impl RetentionWorker {
 
         // Keep the lease alive while this (possibly long) run works, so a
         // large repository is never re-claimed by another instance mid-run.
-        let heartbeat = spawn_lease_heartbeat(
+        // The guard aborts the heartbeat however this scope is left — normal
+        // return, a caught panic, or the tick future being dropped — so a run
+        // that dies can never keep renewing its lease.
+        let heartbeat = AbortOnDrop(spawn_lease_heartbeat(
             self.pool.clone(),
             repo.repository_id,
             run_id,
             self.config.lease,
-        );
-        let result = self.process(&repo, run_id).await;
-        heartbeat.abort();
+        ));
+        // A panic in `process` (a bug, or a panicking `Format`) is recorded
+        // like any other failed run instead of unwinding past `fail_run` and
+        // leaving the ledger row `running` until its lease expires. Nothing is
+        // shared mutably across the unwind: every applied decision committed
+        // in its own transaction, and the in-flight one rolled back on drop.
+        let result = AssertUnwindSafe(self.process(&repo, run_id))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| Err(WorkerError::Panicked(panic_message(&*panic))));
+        drop(heartbeat);
 
         match result {
             Ok(summary) => Ok(Some(summary)),
             Err(e) => {
+                tracing::error!(error = %e, repo = %repo.name, %run_id, "retention run failed");
                 // Release the lease, record the error, reschedule.
                 let next = Utc::now() + self.config.default_run_interval;
                 if let Err(e2) = retention_dao::fail_run(
@@ -181,6 +196,10 @@ impl RetentionWorker {
 
         // Parse + validate the policy. A malformed or repo-kind-incoherent policy
         // is a configuration error: record it and reschedule (do not mutate).
+        // This is also what refuses a policy stored before validation rejected
+        // hosted-scope rules on proxy repos: such a rule would delete cached
+        // components while `proxy_cached_version` still claims them, so the
+        // whole run fails until the operator switches it to `proxy_cached`.
         let policy: RetentionPolicy = serde_json::from_value(repo.policy.clone())
             .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
         validate_policy(&policy, kind)
@@ -203,19 +222,25 @@ impl RetentionWorker {
         }
 
         // ── Snapshot candidates (no tx held across apply; apply re-locks rows). ──
-        let hosted_rows =
-            retention_dao::load_candidate_components(&self.pool, repo.repository_id).await?;
-        let hosted: Vec<CandidateComponent> = hosted_rows
-            .into_iter()
-            .map(|(r, _sha)| CandidateComponent {
-                component_id: r.component_id,
-                package_name: r.name,
-                version: r.version,
-                listed: r.listed,
-                created_at: r.created_at,
-                last_downloaded_at: r.last_downloaded_at,
-            })
-            .collect();
+        // A proxy's components are cache entries owned by its
+        // `proxy_cached_version` rows, never hosted content, so they are only
+        // ever evicted through the proxy path below.
+        let hosted: Vec<CandidateComponent> = if kind == RepoKind::Proxy {
+            Vec::new()
+        } else {
+            retention_dao::load_candidate_components(&self.pool, repo.repository_id)
+                .await?
+                .into_iter()
+                .map(|(r, _sha)| CandidateComponent {
+                    component_id: r.component_id,
+                    package_name: r.name,
+                    version: r.version,
+                    listed: r.listed,
+                    created_at: r.created_at,
+                    last_downloaded_at: r.last_downloaded_at,
+                })
+                .collect()
+        };
 
         let proxy: Vec<ProxyCandidate> = if kind == RepoKind::Proxy {
             retention_dao::load_proxy_candidates(&self.pool, repo.repository_id)
@@ -329,6 +354,26 @@ impl RetentionWorker {
     }
 }
 
+/// Aborts the wrapped task when dropped (a [`tokio::task::JoinHandle`] only
+/// detaches on drop).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Best-effort text of a caught panic payload (`panic!` with a literal yields
+/// `&str`, with format arguments `String`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 /// Renew the run's lease every third of its length until aborted; stops on
 /// its own once the lease is lost.
 fn spawn_lease_heartbeat(
@@ -371,4 +416,8 @@ pub enum WorkerError {
     /// The repository's stored policy failed to parse or validate.
     #[error("policy error: {0}")]
     Policy(String),
+    /// Processing the claimed repository panicked; the panic was caught and the
+    /// run recorded as failed.
+    #[error("retention run panicked: {0}")]
+    Panicked(String),
 }

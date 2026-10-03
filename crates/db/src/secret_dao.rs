@@ -16,6 +16,19 @@
 //! one JSON object into `auth_realm.secrets_enc`, AAD-bound to
 //! `('auth_realm', 'secrets_enc', <row id>)`, and stripped from the plaintext
 //! `config` (see [`insert_realm_with_secrets`] / [`realm_config`]).
+//!
+//! ## DEK revocation vs. concurrent writers
+//!
+//! A retiring DEK is revoked only when no stored ciphertext references it **at
+//! commit time** ([`revoke_unreferenced_deks`]): the revoker locks the retiring
+//! DEK rows `FOR UPDATE`, then scans the secret columns in later statements
+//! (fresh READ COMMITTED snapshots), then flips the state. Every ciphertext
+//! write in this module holds a `FOR SHARE` lock on the DEK row its blob was
+//! sealed under, in the same statement/transaction as the write, and refuses
+//! to write if that DEK is revoked. A writer that started first therefore
+//! makes the revoker wait and then see its blob; a writer that comes second
+//! waits for the revoker and then finds the DEK revoked (error, nothing
+//! written) — ciphertext can never reference a revoked DEK.
 
 use forge_crypto::envelope::AeadBinding;
 use forge_crypto::service::EnvelopeService;
@@ -63,12 +76,13 @@ pub enum SecretDbError {
 /// Store (or clear) a repository's upstream password, **encrypted** under the
 /// active DEK with the row-bound AAD. The plaintext `upstream_password` column
 /// is cleared in the same statement: once a secret is written through the
-/// envelope, plaintext never reappears for that row (the column itself is
-/// dropped by a later migration once every deployment has backfilled).
+/// envelope, plaintext never reappears for that row.
 ///
 /// Accepts any executor so the admin API can commit it atomically with the
 /// repository metadata it belongs to (a new `remote_url` must never become
-/// visible with the previous host's credentials).
+/// visible with the previous host's credentials). The write holds a
+/// `FOR SHARE` lock on the sealing DEK (see the module docs) and fails with
+/// [`CryptoError::KeyRevoked`] if that DEK was revoked concurrently.
 pub async fn set_upstream_password<'e, E>(
     executor: E,
     envelope: &EnvelopeService,
@@ -82,29 +96,86 @@ where
         Some(pt) => Some(envelope.seal(pt, binding(repo_id)).await?),
         None => None,
     };
-    let res = sqlx::query!(
+    let dek_version = blob
+        .as_deref()
+        .map(EnvelopeService::blob_dek_version)
+        .transpose()?;
+    // One statement (the executor may be a bare pool): lock the sealing DEK
+    // row, write only while it is usable, and report which guard failed.
+    let row = sqlx::query!(
         r#"
-        UPDATE repository
-        SET upstream_password_enc = $2, upstream_password = NULL
-        WHERE id = $1
+        WITH dek AS (
+            SELECT 1 AS usable FROM encryption_key
+            WHERE layer = 'dek' AND scope = $3 AND version = $4 AND state <> 'revoked'
+            FOR SHARE
+        ), upd AS (
+            UPDATE repository
+            SET upstream_password_enc = $2, upstream_password = NULL
+            WHERE id = $1 AND ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek))
+            RETURNING id
+        )
+        SELECT
+            EXISTS (SELECT 1 FROM upd) AS "updated!",
+            ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek)) AS "dek_usable!"
         "#,
         repo_id,
         blob.as_deref(),
+        envelope.scope(),
+        dek_version,
     )
-    .execute(executor)
+    .fetch_one(executor)
     .await?;
-    if res.rows_affected() == 0 {
+    if !row.dek_usable {
+        return Err(revoked_dek(dek_version));
+    }
+    if !row.updated {
         return Err(SecretDbError::RepoNotFound(repo_id));
     }
     Ok(())
 }
 
+/// The error for a write whose sealing DEK was revoked concurrently.
+fn revoked_dek(version: Option<i32>) -> SecretDbError {
+    SecretDbError::Crypto(CryptoError::KeyRevoked {
+        layer: "dek",
+        version: version.unwrap_or_default(),
+    })
+}
+
+/// Inside a writer's transaction: take a `FOR SHARE` lock on the DEK row
+/// `blob` was sealed under, failing if that DEK is revoked (see the module
+/// docs). The lock is held until the transaction ends, i.e. until the write
+/// is committed and visible to the revocation scan.
+async fn lock_sealing_dek(
+    conn: &mut sqlx::PgConnection,
+    envelope: &EnvelopeService,
+    blob: &[u8],
+) -> Result<(), SecretDbError> {
+    let version = EnvelopeService::blob_dek_version(blob)?;
+    let usable = sqlx::query_scalar!(
+        r#"
+        SELECT 1 AS "one!" FROM encryption_key
+        WHERE layer = 'dek' AND scope = $1 AND version = $2 AND state <> 'revoked'
+        FOR SHARE
+        "#,
+        envelope.scope(),
+        version,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    match usable {
+        Some(_) => Ok(()),
+        None => Err(revoked_dek(Some(version))),
+    }
+}
+
 /// Read a repository's upstream password, decrypting the envelope blob.
 ///
-/// Pre-cutover compatibility: a row that has not been backfilled yet (plaintext
-/// column set, `_enc` still NULL) falls back to the plaintext value so the
-/// proxy keeps authenticating while the backfill job catches up. Returns
-/// `None` when the repository stores no password at all.
+/// Backfill compatibility: a row that has not been backfilled yet (plaintext
+/// column set, `_enc` still NULL — e.g. written before encryption was enabled)
+/// falls back to the plaintext value so the proxy keeps authenticating until
+/// the backfill pass moves it. Returns `None` when the repository stores no
+/// password at all.
 pub async fn get_upstream_password(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -128,18 +199,100 @@ pub async fn get_upstream_password(
     }
 }
 
-/// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3):
-/// wrap up to `batch` rows whose plaintext column is set and whose `_enc`
-/// column is still NULL. Returns how many rows were encrypted; `0` means the
-/// backfill is complete. Idempotent and resumable — processed rows leave the
-/// predicate, and the guarded UPDATE makes a concurrent/repeated run a no-op
-/// per row. The plaintext column is intentionally NOT cleared here: the
-/// verified cutover migration drops it later (two-step column rewrite).
+/// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3).
+///
+/// 1. Rows that already carry `_enc` **and** a leftover plaintext copy (rows
+///    backfilled by 0.1.0, which kept the plaintext) lose the plaintext: the
+///    envelope is the authoritative value on every read path.
+/// 2. Up to `batch` rows whose plaintext column is set and whose `_enc` column
+///    is still NULL are sealed; the plaintext is NULLed **in the same guarded
+///    UPDATE** (guarded on the exact plaintext read and `_enc IS NULL`, and on
+///    the sealing DEK still being usable), so a row is never left with both
+///    values and a concurrent admin write is never overwritten.
+///
+/// Returns how many rows were changed; `0` means no plaintext is left.
+/// Idempotent and resumable — processed rows leave both predicates.
 pub async fn backfill_upstream_passwords(
     pool: &PgPool,
     envelope: &EnvelopeService,
     batch: i64,
 ) -> Result<usize, SecretDbError> {
+    // Rows that carry both copies (left by builds that kept the plaintext
+    // after sealing it). The plaintext is dropped only once the ciphertext is
+    // known to hold the same password; when it holds another one, or does
+    // not decrypt at all, the plaintext is the newer (or the only
+    // recoverable) copy, so it is sealed afresh and replaces the ciphertext.
+    let both = sqlx::query!(
+        r#"
+        SELECT id,
+               upstream_password AS "upstream_password!",
+               upstream_password_enc AS "upstream_password_enc!"
+        FROM repository
+        WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL
+        ORDER BY id
+        LIMIT $1
+        "#,
+        batch,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut cleared: u64 = 0;
+    for row in both {
+        let matches = match envelope
+            .open(&row.upstream_password_enc, binding(row.id))
+            .await
+        {
+            Ok(opened) => opened.expose_secret() == row.upstream_password.as_str(),
+            Err(err) => {
+                tracing::warn!(
+                    repository_id = row.id,
+                    error = %err,
+                    "stored upstream password ciphertext does not decrypt; re-sealing it from the plaintext copy"
+                );
+                false
+            }
+        };
+        let res = if matches {
+            sqlx::query!(
+                r#"
+                UPDATE repository SET upstream_password = NULL
+                WHERE id = $1 AND upstream_password = $2 AND upstream_password_enc = $3
+                "#,
+                row.id,
+                row.upstream_password,
+                row.upstream_password_enc,
+            )
+            .execute(pool)
+            .await?
+        } else {
+            let secret = PlaintextSecret::from(row.upstream_password.clone());
+            let blob = envelope.seal(&secret, binding(row.id)).await?;
+            let dek_version = EnvelopeService::blob_dek_version(&blob)?;
+            sqlx::query!(
+                r#"
+                WITH dek AS (
+                    SELECT 1 FROM encryption_key
+                    WHERE layer = 'dek' AND scope = $5 AND version = $6 AND state <> 'revoked'
+                    FOR SHARE
+                )
+                UPDATE repository
+                SET upstream_password_enc = $2, upstream_password = NULL
+                WHERE id = $1 AND upstream_password = $3 AND upstream_password_enc = $4
+                  AND EXISTS (SELECT 1 FROM dek)
+                "#,
+                row.id,
+                &blob,
+                row.upstream_password,
+                row.upstream_password_enc,
+                envelope.scope(),
+                dek_version,
+            )
+            .execute(pool)
+            .await?
+        };
+        cleared += res.rows_affected();
+    }
+
     let rows = sqlx::query!(
         r#"
         SELECT id, upstream_password AS "upstream_password!"
@@ -153,19 +306,29 @@ pub async fn backfill_upstream_passwords(
     .fetch_all(pool)
     .await?;
 
-    let mut done = 0;
+    let mut done = usize::try_from(cleared).unwrap_or(0);
     for row in rows {
-        let secret = PlaintextSecret::from(row.upstream_password);
+        let secret = PlaintextSecret::from(row.upstream_password.clone());
         let blob = envelope.seal(&secret, binding(row.id)).await?;
+        let dek_version = EnvelopeService::blob_dek_version(&blob)?;
         let res = sqlx::query!(
             r#"
+            WITH dek AS (
+                SELECT 1 FROM encryption_key
+                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
+                FOR SHARE
+            )
             UPDATE repository
-            SET upstream_password_enc = $2
-            WHERE id = $1 AND upstream_password IS NOT NULL
+            SET upstream_password_enc = $2, upstream_password = NULL
+            WHERE id = $1 AND upstream_password = $3
               AND upstream_password_enc IS NULL
+              AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
             &blob,
+            row.upstream_password,
+            envelope.scope(),
+            dek_version,
         )
         .execute(pool)
         .await?;
@@ -224,16 +387,25 @@ pub async fn reseal_upstream_passwords_batch(
             .reseal(&row.upstream_password_enc, binding(row.id))
             .await?;
         // Guarded on the old blob value so a racing password change (or a
-        // racing sweep on another instance) is never overwritten.
+        // racing sweep on another instance) is never overwritten, and on the
+        // sealing DEK still being usable (module docs).
         let res = sqlx::query!(
             r#"
+            WITH dek AS (
+                SELECT 1 FROM encryption_key
+                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
+                FOR SHARE
+            )
             UPDATE repository
             SET upstream_password_enc = $2
             WHERE id = $1 AND upstream_password_enc = $3
+              AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
             &new_blob,
             &row.upstream_password_enc,
+            envelope.scope(),
+            EnvelopeService::blob_dek_version(&new_blob)?,
         )
         .execute(pool)
         .await?;
@@ -252,6 +424,15 @@ pub async fn reseal_upstream_passwords_batch(
 pub async fn referenced_dek_versions(
     pool: &PgPool,
 ) -> Result<std::collections::HashSet<i32>, SecretDbError> {
+    let mut conn = pool.acquire().await?;
+    scan_referenced_dek_versions(&mut conn).await
+}
+
+/// [`referenced_dek_versions`] on one connection (inside the revocation
+/// transaction, each statement sees everything committed before it).
+async fn scan_referenced_dek_versions(
+    conn: &mut sqlx::PgConnection,
+) -> Result<std::collections::HashSet<i32>, SecretDbError> {
     let mut versions = std::collections::HashSet::new();
     let mut after_id = 0i64;
     loop {
@@ -265,7 +446,7 @@ pub async fn referenced_dek_versions(
             "#,
             after_id,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         let Some(last) = rows.last() else { break };
         after_id = last.id;
@@ -281,7 +462,7 @@ pub async fn referenced_dek_versions(
     let realm_blobs = sqlx::query_scalar!(
         r#"SELECT secrets_enc AS "secrets_enc!" FROM auth_realm WHERE secrets_enc IS NOT NULL"#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     for blob in &realm_blobs {
         versions.insert(EnvelopeService::blob_dek_version(blob)?);
@@ -289,14 +470,15 @@ pub async fn referenced_dek_versions(
     Ok(versions)
 }
 
-/// Whether any repository row still carries a plaintext password that has not
-/// been backfilled (operator visibility before the cutover migration ships).
+/// Whether any repository row still carries a plaintext upstream password —
+/// not yet backfilled, or a leftover copy next to its envelope (operator
+/// visibility: with encryption enabled this must reach `false` once the
+/// backfill pass has run).
 pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
     let row = sqlx::query!(
         r#"
         SELECT EXISTS (
-            SELECT 1 FROM repository
-            WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NULL
+            SELECT 1 FROM repository WHERE upstream_password IS NOT NULL
         ) AS "pending!"
         "#,
     )
@@ -305,23 +487,75 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
     Ok(row.pending)
 }
 
+/// Whether any auth realm still carries one of its secret keys
+/// (`secret_keys_for(kind)`) in its plaintext `config` (the realm half of the
+/// operator's "plaintext backfill pending" signal).
+pub async fn plaintext_realm_secrets_pending(
+    pool: &PgPool,
+    secret_keys_for: impl Fn(&str) -> &'static [&'static str],
+) -> Result<bool, SecretDbError> {
+    Ok(auth_realm_dao::list_realms(pool)
+        .await?
+        .iter()
+        .any(|realm| {
+            !split_realm_secrets(&realm.config, secret_keys_for(&realm.kind))
+                .1
+                .is_empty()
+        }))
+}
+
 /// Revoke every `retiring` DEK that no stored ciphertext references anymore
 /// (the tail of the DEK-rotation sweep). Returns how many DEKs were revoked.
+///
+/// The reference check holds **at commit time** (module docs): one
+/// transaction locks the retiring DEK rows `FOR UPDATE` — waiting for every
+/// in-flight ciphertext writer holding one of them `FOR SHARE` — then scans the
+/// secret columns and flips only the unreferenced rows. Writers that arrive
+/// after the lock wait for this transaction and then refuse the revoked DEK.
 pub async fn revoke_unreferenced_deks(
     pool: &PgPool,
     envelope: &EnvelopeService,
 ) -> Result<usize, SecretDbError> {
-    let referenced = referenced_dek_versions(pool).await?;
-    let mut revoked = 0;
-    for dek in envelope.list_keys(KeyLayer::Dek).await? {
-        if dek.state == forge_crypto::store::KeyState::Retiring
-            && !referenced.contains(&dek.version)
-        {
-            envelope.revoke_key(KeyLayer::Dek, dek.version).await?;
-            revoked += 1;
-        }
+    let mut tx = pool.begin().await?;
+    let retiring = sqlx::query!(
+        r#"
+        SELECT id, version
+        FROM encryption_key
+        WHERE layer = 'dek' AND scope = $1 AND state = 'retiring'
+        ORDER BY version
+        FOR UPDATE
+        "#,
+        envelope.scope(),
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if retiring.is_empty() {
+        tx.commit().await?;
+        return Ok(0);
     }
-    Ok(revoked)
+    let referenced = scan_referenced_dek_versions(&mut tx).await?;
+    let (ids, versions): (Vec<i64>, Vec<i32>) = retiring
+        .iter()
+        .filter(|dek| !referenced.contains(&dek.version))
+        .map(|dek| (dek.id, dek.version))
+        .unzip();
+    if !ids.is_empty() {
+        sqlx::query!(
+            r#"
+            UPDATE encryption_key
+            SET state = 'revoked', rotated_at = COALESCE(rotated_at, now())
+            WHERE id = ANY($1) AND state = 'retiring'
+            "#,
+            &ids,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    for version in &versions {
+        envelope.forget_unwrapped(KeyLayer::Dek, *version).await;
+    }
+    Ok(versions.len())
 }
 
 // ── auth realm secrets (review P1.5) ─────────────────────────────────────────
@@ -419,6 +653,7 @@ pub async fn insert_realm_with_secrets(
     let mut tx = pool.begin().await?;
     let row = auth_realm_dao::insert_realm(&mut *tx, new).await?;
     let blob = seal_realm_secrets(envelope, row.id, &secrets).await?;
+    lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row = auth_realm_dao::update_realm_and_secrets(
         &mut *tx,
         row.id,
@@ -463,7 +698,15 @@ pub async fn update_realm_with_secrets(
             }
         }
     };
-    Ok(auth_realm_dao::update_realm_and_secrets(pool, id, upd, blob.as_deref()).await?)
+    let (Some(envelope), Some(sealed)) = (envelope, blob.as_deref()) else {
+        return Ok(auth_realm_dao::update_realm_and_secrets(pool, id, upd, blob.as_deref()).await?);
+    };
+    // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
+    let mut tx = pool.begin().await?;
+    lock_sealing_dek(&mut tx, envelope, sealed).await?;
+    let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(sealed)).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Plaintext → encrypted **backfill** for realm secrets: every realm whose
@@ -499,8 +742,8 @@ pub async fn backfill_realm_secrets(
 }
 
 /// DEK-rotation re-encrypt sweep over `auth_realm.secrets_enc` (the table is
-/// small, so no pagination). Guarded on the old blob like the repository
-/// sweep. Returns how many rows were resealed.
+/// small, so no pagination). Guarded on the old blob and the sealing DEK like
+/// the repository sweep. Returns how many rows were resealed.
 pub async fn reseal_realm_secrets(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -525,13 +768,21 @@ pub async fn reseal_realm_secrets(
             .await?;
         let res = sqlx::query!(
             r#"
+            WITH dek AS (
+                SELECT 1 FROM encryption_key
+                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
+                FOR SHARE
+            )
             UPDATE auth_realm
             SET secrets_enc = $2
             WHERE id = $1 AND secrets_enc = $3
+              AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
             &new_blob,
             &row.secrets_enc,
+            envelope.scope(),
+            EnvelopeService::blob_dek_version(&new_blob)?,
         )
         .execute(pool)
         .await?;

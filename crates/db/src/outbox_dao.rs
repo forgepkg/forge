@@ -96,3 +96,36 @@ pub async fn bump_attempt(
     .await?;
     Ok(())
 }
+
+/// Delete up to `limit` processed rows whose `processed_at` is before
+/// `processed_before`, oldest first. Returns the number of rows deleted.
+///
+/// Processed rows are terminal: every outbox and reconciler decision only
+/// consults *unprocessed* rows (`processed_at IS NULL`), so pruning them never
+/// changes GC behaviour — it only bounds the table. Unprocessed rows are never
+/// touched, whatever their age. Callers loop in bounded batches so a large
+/// backlog never becomes one long-running delete.
+pub async fn prune_processed(
+    pool: &PgPool,
+    processed_before: DateTime<Utc>,
+    limit: i64,
+) -> sqlx::Result<u64> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM blob_outbox
+        WHERE id = ANY(ARRAY(
+            SELECT id
+            FROM blob_outbox
+            WHERE processed_at IS NOT NULL
+              AND processed_at < $1
+            ORDER BY processed_at
+            LIMIT $2
+        ))
+        "#,
+        processed_before,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}

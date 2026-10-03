@@ -466,3 +466,226 @@ async fn package_filter_denies_when_no_read_grant() {
     let f = az.package_filter(&p, &repo).await;
     assert!(!f.allows("Anything"), "no read grant ⇒ DenyAll");
 }
+
+/// Insert a token for `uid` with the given raw `scope` jsonb (`None` = NULL).
+async fn make_token(pool: &sqlx::PgPool, uid: i64, scope: Option<serde_json::Value>) -> i64 {
+    let token = token_dao::insert_token(
+        pool,
+        NewToken {
+            user_id: uid,
+            name: format!("tok-{}", unique()),
+            token_hash: format!("hash-{}", unique()),
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("token");
+    sqlx::query!(
+        r#"UPDATE token SET scope = $2 WHERE id = $1"#,
+        token.id,
+        scope,
+    )
+    .execute(pool)
+    .await
+    .expect("set scope");
+    token.id
+}
+
+fn token_of(uid: i64, token_id: i64, is_admin: bool) -> Principal {
+    Principal::User {
+        user_id: uid,
+        token_id: Some(token_id),
+        is_admin,
+    }
+}
+
+/// B4: an admin's API token is not an admin credential unless its scope names
+/// `admin`. The unscoped token keeps the admin's read/write/delete reach on the
+/// feed; the password/session principal stays a global admin.
+#[tokio::test]
+async fn unscoped_admin_token_is_not_global_admin() {
+    let pool = pool().await;
+    let az = Authz::new(pool.clone(), Cache::l1_only(64));
+    let repo = make_repo(&pool, unique()).await;
+    // Admin through the built-in role (no legacy flag) and through the flag.
+    let role_admin = make_user(&pool, unique(), false).await;
+    let admin_role = forge_db::authz_dao::role_id_by_name(&pool, "admin")
+        .await
+        .expect("query")
+        .expect("admin role seeded");
+    assign_role(&pool, role_admin, admin_role)
+        .await
+        .expect("assign");
+    let flag_admin = make_user(&pool, unique(), true).await;
+
+    for (uid, is_admin) in [(role_admin, false), (flag_admin, true)] {
+        assert!(
+            az.is_global_admin(&user(uid, is_admin)).await,
+            "password/session admin stays admin"
+        );
+
+        let unscoped = token_of(uid, make_token(&pool, uid, None).await, is_admin);
+        assert!(
+            !az.is_global_admin(&unscoped).await,
+            "an unscoped token must not be a global admin"
+        );
+        assert!(!az.can_admin(&unscoped, &repo).await);
+        assert!(az.can_read(&unscoped, &repo).await, "feed reach kept");
+        assert!(az.can_write(&unscoped, &repo).await, "feed reach kept");
+        assert!(az.can_delete(&unscoped, &repo).await, "feed reach kept");
+
+        // `{}` is the same as no scope.
+        let empty = token_of(
+            uid,
+            make_token(&pool, uid, Some(serde_json::json!({}))).await,
+            is_admin,
+        );
+        assert!(!az.is_global_admin(&empty).await);
+
+        let admin_scoped = token_of(
+            uid,
+            make_token(&pool, uid, Some(serde_json::json!({"actions": ["admin"]}))).await,
+            is_admin,
+        );
+        assert!(
+            az.is_global_admin(&admin_scoped).await,
+            "an explicitly admin-scoped token is a global admin"
+        );
+
+        let repo_scoped_admin = token_of(
+            uid,
+            make_token(
+                &pool,
+                uid,
+                Some(serde_json::json!({"actions": ["admin"], "repositories": [repo.id]})),
+            )
+            .await,
+            is_admin,
+        );
+        assert!(
+            !az.is_global_admin(&repo_scoped_admin).await,
+            "a repo-restricted scope never keeps global admin"
+        );
+    }
+}
+
+/// L6: a stored scope with an unknown key (a typo for `repositories`) is
+/// fail-closed instead of an unscoped token.
+#[tokio::test]
+async fn mistyped_token_scope_denies_everything() {
+    let pool = pool().await;
+    let az = Authz::new(pool.clone(), Cache::l1_only(64));
+    let repo = make_repo(&pool, unique()).await;
+    let other = make_repo(&pool, unique()).await;
+    let role = make_role(&pool, unique()).await;
+    let uid = make_user(&pool, unique(), false).await;
+    add_grant(&pool, role, None, "read", None)
+        .await
+        .expect("grant");
+    assign_role(&pool, uid, role).await.expect("assign");
+
+    let tid = make_token(&pool, uid, Some(serde_json::json!({"repos": [repo.id]}))).await;
+    let p = token_of(uid, tid, false);
+    assert!(!az.can_read(&p, &repo).await, "typo scope grants nothing");
+    assert!(!az.can_read(&p, &other).await, "and is not unscoped");
+}
+
+/// L6: under `anonymous_mode = "all"` a signed-in principal without grants
+/// may read what an anonymous caller may (the `anonymous_read` flag and the
+/// anonymous role's read grants), still cut down to any token scope and never
+/// extended to writes. Without that switch it holds only its own grants.
+#[tokio::test]
+async fn signed_in_user_reads_what_anonymous_reads() {
+    let pool = pool().await;
+    let cache = Cache::l1_only(64);
+    let az = Authz::new(pool.clone(), cache.clone()).with_public_read_for_signed_in(true);
+    let az_default = Authz::new(pool.clone(), cache.clone());
+
+    let flagged = repository_dao::insert_repository(
+        &pool,
+        NewRepository {
+            anonymous_read: true,
+            ..NewRepository::hosted(format!("seamrepo-{}", unique()))
+        },
+    )
+    .await
+    .expect("insert repo");
+    let granted = make_repo(&pool, unique()).await;
+    let private = make_repo(&pool, unique()).await;
+    let anon_role = forge_db::authz_dao::role_id_by_name(&pool, ANONYMOUS_ROLE)
+        .await
+        .expect("query")
+        .expect("anonymous role seeded");
+    let sel = insert_content_selector(
+        &pool,
+        &format!("sel-{}", unique()),
+        &["pub.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("selector");
+    add_grant(&pool, anon_role, Some(granted.id), "read", Some(sel))
+        .await
+        .expect("grant");
+    core_authz::invalidate_anonymous(&cache).await;
+
+    let uid = make_user(&pool, unique(), false).await;
+    let p = user(uid, false);
+    assert!(
+        !az_default.can_read(&p, &flagged).await,
+        "no public reach for signed-in callers unless anonymous_mode = all"
+    );
+    assert!(!az_default.can_read(&p, &granted).await);
+    assert!(az.can_read(&p, &flagged).await, "anonymous_read flag");
+    assert!(
+        az.package_filter(&p, &flagged).await.allows("Any.Package"),
+        "the flag exposes every package"
+    );
+    assert!(az.can_read(&p, &granted).await, "anonymous role grant");
+    let f = az.package_filter(&p, &granted).await;
+    assert!(f.allows("Pub.Lib"), "the grant's selector applies");
+    assert!(!f.allows("Priv.Lib"));
+    assert!(!az.can_read(&p, &private).await, "no public reach");
+    assert!(
+        !az.can_write(&p, &flagged).await,
+        "public reach is read-only"
+    );
+
+    // An unscoped token of that user reads the same public repos.
+    let unscoped = token_of(uid, make_token(&pool, uid, None).await, false);
+    assert!(az.can_read(&unscoped, &flagged).await);
+    assert!(az.can_read(&unscoped, &granted).await);
+
+    // A token scoped to another repository gains nothing from it.
+    let scoped = token_of(
+        uid,
+        make_token(
+            &pool,
+            uid,
+            Some(serde_json::json!({"repositories": [private.id]})),
+        )
+        .await,
+        false,
+    );
+    assert!(!az.can_read(&scoped, &flagged).await, "outside the scope");
+    assert!(!az.can_read(&scoped, &granted).await, "outside the scope");
+    assert!(
+        !az.package_filter(&scoped, &flagged)
+            .await
+            .allows("Any.Package"),
+        "the package filter is scoped as well"
+    );
+
+    // A write-only token gains no read at all.
+    let write_only = token_of(
+        uid,
+        make_token(&pool, uid, Some(serde_json::json!({"actions": ["write"]}))).await,
+        false,
+    );
+    assert!(!az.can_read(&write_only, &flagged).await);
+
+    // Anonymous callers keep the same reach (the flag fast path).
+    assert!(az.can_read(&anon(), &flagged).await);
+    assert!(az.can_read(&anon(), &granted).await);
+    assert!(!az.can_read(&anon(), &private).await);
+}

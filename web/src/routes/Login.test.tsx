@@ -104,8 +104,10 @@ function mockAuthApi(h: AuthHandlers) {
   )
 }
 
-async function renderLogin(initialPath = '/login') {
-  const queryClient = makeQueryClient()
+async function renderLogin(
+  initialPath = '/login',
+  queryClient = makeQueryClient(),
+) {
   const router = createRouter({
     routeTree,
     context: { queryClient },
@@ -212,18 +214,137 @@ describe('Login', () => {
           }),
       })
 
-      await renderLogin('/login?redirect=%2Fadmin')
+      await renderLogin('/login?redirect=%2Fmanage%2Frepositories')
 
       await user.type(await screen.findByLabelText('Username'), 'bob@example.com')
       await user.click(screen.getByRole('button', { name: 'Continue' }))
 
       await waitFor(() =>
         expect(assignLocation).toHaveBeenCalledWith(
-          '/auth/oidc/login?realm=corp&redirect_to=%2Fadmin',
+          '/auth/oidc/login?realm=corp&redirect_to=%2Fmanage%2Frepositories',
         ),
       )
       // No password step was revealed.
       expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('lockout and return-to', () => {
+    it('shows a lockout message (not "server unreachable") on a 429', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () => json({ mode: 'password', realm: 'local' }),
+        onLogin: () =>
+          new Response('too many failed sign-in attempts; try again later', {
+            status: 429,
+            headers: { 'retry-after': '300' },
+          }),
+      })
+
+      const router = await renderLogin()
+
+      await user.type(await screen.findByLabelText('Username'), 'alice')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+      await user.type(await screen.findByLabelText('Password'), 'guess')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      const alert = await screen.findByRole('alert')
+      expect(alert).toHaveTextContent(/too many failed sign-in attempts/i)
+      expect(alert).toHaveTextContent(/try again in 5 minutes/i)
+      expect(alert).not.toHaveTextContent(/reachable/i)
+      expect(router.state.location.pathname).toBe('/login')
+      // The form can be used again once the lockout is over.
+      expect(screen.getByRole('button', { name: 'Sign in' })).toBeEnabled()
+    })
+
+    it('says "in a few minutes" when the server gives no Retry-After', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: combined,
+        onLogin: () => new Response('too many', { status: 429 }),
+      })
+      await renderLogin()
+      await user.type(await screen.findByLabelText('Username'), 'alice')
+      await user.type(screen.getByLabelText('Password'), 'guess')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        /try again in a few minutes/i,
+      )
+    })
+
+    it('maps a legacy /admin return-to onto the /manage admin UI', async () => {
+      const user = userEvent.setup()
+      const adminMe: Me = {
+        user: { id: 1, username: 'root', is_admin: true, active: true },
+        is_admin: true,
+        capabilities: ['repo.admin'],
+      }
+      mockAuthApi({
+        options: combined,
+        onLogin: () =>
+          json({ user_id: 1, username: 'root', is_admin: true, csrf_token: 'c' }),
+        onMe: () => json(adminMe),
+      })
+
+      const router = await renderLogin('/login?redirect=%2Fadmin%2Frealms%3Fx%3D1')
+
+      await user.type(await screen.findByLabelText('Username'), 'root')
+      await user.type(screen.getByLabelText('Password'), 'pw')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(router.state.location.pathname).toBe('/manage/realms'),
+      )
+      expect(router.state.location.search).toMatchObject({ x: 1 })
+    })
+
+    it('ignores an off-site return-to', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: combined,
+        onLogin: () =>
+          json({ user_id: 2, username: 'alice', is_admin: false, csrf_token: 'c' }),
+      })
+
+      const router = await renderLogin('/login?redirect=%2F%2Fevil.example%2Fx')
+
+      await user.type(await screen.findByLabelText('Username'), 'alice')
+      await user.type(screen.getByLabelText('Password'), 'pw')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(assignLocation).not.toHaveBeenCalled()
+    })
+
+    it('drops every cached query before entering the app (no previous user data)', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: combined,
+        onLogin: () =>
+          json({ user_id: 2, username: 'reader', is_admin: false, csrf_token: 'c' }),
+      })
+      const queryClient = makeQueryClient()
+      // Left behind by whoever used this browser before.
+      queryClient.setQueryData(['repositories', 'list'], [{ name: 'secret' }])
+      queryClient.setQueryData(['me'], {
+        user: { id: 1, username: 'previous', is_admin: true, active: true },
+        is_admin: true,
+        capabilities: [],
+      })
+
+      const router = await renderLogin('/login', queryClient)
+
+      await user.type(await screen.findByLabelText('Username'), 'reader')
+      await user.type(screen.getByLabelText('Password'), 'pw')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(queryClient.getQueryData(['repositories', 'list'])).toBeUndefined()
+      // The identity was fetched fresh for the new user.
+      await waitFor(() =>
+        expect(queryClient.getQueryData<Me>(['me'])?.user.username).toBe('reader'),
+      )
     })
   })
 

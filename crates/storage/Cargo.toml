@@ -23,6 +23,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
+# In-process fake S3 endpoint for the multipart-abort tests (fault injection
+# versitygw cannot do).
+axum = { workspace = true }
 sqlx = { workspace = true }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }

@@ -7,12 +7,15 @@
 //! genuine-404 negative caching).
 //!
 //! The corpus is `lower_id -> { version -> nupkg bytes }`. Unknown ids return
-//! `404` (a genuine upstream miss).
+//! `404` (a genuine upstream miss). `.nuspec` requests serve the manifest
+//! inside the package, and the registration index inlines every version with
+//! the dependency groups of its manifest, like nuget.org does for small
+//! packages. [`MockUpstream::publish`] adds versions while the feed runs.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -46,11 +49,40 @@ impl UpstreamPackage {
 struct MockState {
     base: String,
     /// `lower_id -> { version -> bytes }`.
-    packages: HashMap<String, HashMap<String, Vec<u8>>>,
+    packages: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
+    /// `lower_id -> id as published`.
+    ids: Mutex<HashMap<String, String>>,
     index_hits: AtomicUsize,
     flat_index_hits: AtomicUsize,
     nupkg_hits: AtomicUsize,
+    nuspec_hits: AtomicUsize,
     registration_hits: AtomicUsize,
+}
+
+impl MockState {
+    fn package(&self, lower_id: &str, version: &str) -> Option<Vec<u8>> {
+        self.packages
+            .lock()
+            .unwrap()
+            .get(lower_id)
+            .and_then(|v| v.get(version))
+            .cloned()
+    }
+}
+
+/// The `.nuspec` entry of a `.nupkg`, if it has one at its root.
+fn nuspec_of(nupkg: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(nupkg)).ok()?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).ok()?;
+        if entry.name().to_ascii_lowercase().ends_with(".nuspec") && !entry.name().contains('/') {
+            let mut out = Vec::new();
+            entry.read_to_end(&mut out).ok()?;
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// A running mock upstream feed; holds the server task and exposes its base URL.
@@ -64,7 +96,9 @@ impl MockUpstream {
     /// Boot the mock feed on an ephemeral loopback port with the given corpus.
     pub async fn start(packages: Vec<UpstreamPackage>) -> MockUpstream {
         let mut corpus: HashMap<String, HashMap<String, Vec<u8>>> = HashMap::new();
+        let mut ids = HashMap::new();
         for p in packages {
+            ids.insert(p.id.to_lowercase(), p.id.clone());
             corpus.insert(p.id.to_lowercase(), p.versions);
         }
 
@@ -76,10 +110,12 @@ impl MockUpstream {
 
         let state = Arc::new(MockState {
             base: base.clone(),
-            packages: corpus,
+            packages: Mutex::new(corpus),
+            ids: Mutex::new(ids),
             index_hits: AtomicUsize::new(0),
             flat_index_hits: AtomicUsize::new(0),
             nupkg_hits: AtomicUsize::new(0),
+            nuspec_hits: AtomicUsize::new(0),
             registration_hits: AtomicUsize::new(0),
         });
 
@@ -128,9 +164,32 @@ impl MockUpstream {
         self.state.nupkg_hits.load(Ordering::SeqCst)
     }
 
+    /// Number of times a `.nuspec` was fetched from upstream.
+    pub fn nuspec_hits(&self) -> usize {
+        self.state.nuspec_hits.load(Ordering::SeqCst)
+    }
+
     /// Number of times the registration index was fetched.
     pub fn registration_hits(&self) -> usize {
         self.state.registration_hits.load(Ordering::SeqCst)
+    }
+
+    /// Publish (or replace) `version` of `id` while the feed is running.
+    pub fn publish(&self, id: &str, version: &str, bytes: Vec<u8>) {
+        let lower = id.to_lowercase();
+        self.state
+            .ids
+            .lock()
+            .unwrap()
+            .entry(lower.clone())
+            .or_insert_with(|| id.to_string());
+        self.state
+            .packages
+            .lock()
+            .unwrap()
+            .entry(lower)
+            .or_default()
+            .insert(version.to_string(), bytes);
     }
 }
 
@@ -152,9 +211,14 @@ async fn serve_flat_index(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     st.flat_index_hits.fetch_add(1, Ordering::SeqCst);
-    match st.packages.get(&id.to_lowercase()) {
-        Some(vers) => {
-            let mut versions: Vec<String> = vers.keys().cloned().collect();
+    let versions = st
+        .packages
+        .lock()
+        .unwrap()
+        .get(&id.to_lowercase())
+        .map(|vers| vers.keys().cloned().collect::<Vec<_>>());
+    match versions {
+        Some(mut versions) => {
             versions.sort();
             (
                 StatusCode::OK,
@@ -168,22 +232,55 @@ async fn serve_flat_index(
 
 async fn serve_nupkg(
     State(st): State<Arc<MockState>>,
-    Path((id, version, _file)): Path<(String, String, String)>,
+    Path((id, version, file)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
+    let bytes = st.package(&id.to_lowercase(), &version);
+    if file.to_ascii_lowercase().ends_with(".nuspec") {
+        st.nuspec_hits.fetch_add(1, Ordering::SeqCst);
+        return match bytes.as_deref().and_then(nuspec_of) {
+            Some(nuspec) => (
+                StatusCode::OK,
+                [("content-type", "application/xml")],
+                nuspec,
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     st.nupkg_hits.fetch_add(1, Ordering::SeqCst);
-    match st
-        .packages
-        .get(&id.to_lowercase())
-        .and_then(|v| v.get(&version))
-    {
+    match bytes {
         Some(bytes) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
-            bytes.clone(),
+            bytes,
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The registration `dependencyGroups` of a package's manifest.
+fn dependency_groups_json(nupkg: &[u8]) -> serde_json::Value {
+    let groups = nuspec_of(nupkg)
+        .and_then(|n| forge_nuget::nuspec::dependency_groups_from_nuspec(&n).ok())
+        .unwrap_or_default();
+    serde_json::Value::Array(
+        groups
+            .into_iter()
+            .map(|g| {
+                let deps: Vec<_> = g
+                    .dependencies
+                    .into_iter()
+                    .map(|d| serde_json::json!({ "id": d.id, "range": d.range }))
+                    .collect();
+                let mut group = serde_json::json!({ "dependencies": deps });
+                if let Some(tfm) = g.target_framework {
+                    group["targetFramework"] = serde_json::Value::String(tfm);
+                }
+                group
+            })
+            .collect(),
+    )
 }
 
 async fn serve_registration(
@@ -192,16 +289,26 @@ async fn serve_registration(
 ) -> impl IntoResponse {
     st.registration_hits.fetch_add(1, Ordering::SeqCst);
     let lower = id.to_lowercase();
-    match st.packages.get(&lower) {
+    let original = st
+        .ids
+        .lock()
+        .unwrap()
+        .get(&lower)
+        .cloned()
+        .unwrap_or_else(|| id.clone());
+    let packages = st.packages.lock().unwrap().get(&lower).cloned();
+    match packages {
         Some(vers) => {
             let items: Vec<_> = vers
-                .keys()
-                .map(|v| {
+                .iter()
+                .map(|(v, bytes)| {
                     serde_json::json!({
                         "catalogEntry": {
-                            "id": id,
+                            "id": original,
                             "version": v,
                             "listed": true,
+                            "published": "2026-01-01T00:00:00+00:00",
+                            "dependencyGroups": dependency_groups_json(bytes),
                         },
                         "packageContent":
                             format!("{}/flat/{lower}/{v}/{lower}.{v}.nupkg", st.base),

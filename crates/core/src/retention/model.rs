@@ -4,6 +4,8 @@
 //! a policy is a list of **rules**; a component is acted on if **any** rule
 //! selects it (union), but `keep_last_n` / `keep_n_most_downloaded` protections
 //! always win (a protected version is never deleted — see [`crate::retention::evaluate`]).
+//! Each rule's protections are computed over the versions that rule's own
+//! filters admit (see [`Criteria`]); the protected sets are then unioned.
 //!
 //! Parity subset of Nexus cleanup policies + Artifactory retention:
 //!   * protections: `keep_last_n`, `keep_n_most_downloaded`
@@ -60,7 +62,9 @@ pub struct RetentionRule {
     pub id: String,
     /// What to do with a selected component.
     pub action: Action,
-    /// Which targets this rule operates on. Defaults to hosted components.
+    /// Which targets this rule operates on. Defaults to hosted components,
+    /// which is only valid on hosted repositories: a proxy repository's rules
+    /// must all say `scope: proxy_cached` ([`PolicyError::HostedScopeOnProxy`]).
     #[serde(default)]
     pub scope: Scope,
     /// Restrict the rule to release / prerelease versions. Defaults to `Any`.
@@ -99,11 +103,17 @@ impl Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
-    /// Hosted components (the default scope).
+    /// Hosted components (the default scope); only valid on hosted repos. A
+    /// proxy's components are a cache of upstream bytes tracked by
+    /// `proxy_cached_version`, so deleting them as if they were hosted would
+    /// leave that row claiming the bytes are cached (see
+    /// [`PolicyError::HostedScopeOnProxy`]).
     #[default]
     Hosted,
     /// Proxy cached versions (`proxy_cached_version` rows); only valid on proxy
-    /// repos. Eviction = delete; proxy entries are never "unlisted".
+    /// repos. Eviction deletes the locally cached bytes and leaves the version
+    /// listed (re-fetched from upstream on the next pull); proxy entries are
+    /// never "unlisted".
     ProxyCached,
 }
 
@@ -122,12 +132,26 @@ pub enum ReleaseType {
 
 /// Protections + triggers for a rule. All fields optional; an empty `Criteria`
 /// is rejected by [`validate_policy`] (a rule must do *something*).
+///
+/// **Protections** (`keep_last_n`, `keep_n_most_downloaded`) are computed per
+/// rule and per package id, over that rule's *pool*: the package's versions
+/// that the rule's own `release_type` and `package_name_prefix` filters admit.
+/// A `releases`-only rule with `keep_last_n: 3` therefore protects the three
+/// newest stable releases, never prereleases. The protected sets of all rules
+/// are then **unioned**: a version protected by any rule is never unlisted or
+/// deleted by any rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Criteria {
-    /// Protect the newest N versions (by format version order) per package id.
+    /// Protection: the newest N **listed** versions (by format version order)
+    /// of each package id in this rule's pool. Unlisted versions neither count
+    /// toward N nor are protected by it, so after unlisting a broken newest
+    /// release the N newest *resolvable* versions are still kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_last_n: Option<u32>,
-    /// Protect the N most-recently-downloaded versions per package id.
+    /// Protection: the N most-recently-downloaded versions of each package id
+    /// in this rule's pool, listed or not (download recency, not listing, is
+    /// what marks a version as in use, and unlisted versions stay restorable by
+    /// exact version). Never-downloaded versions rank last, newest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_n_most_downloaded: Option<u32>,
     /// Trigger: component age since `created_at` is at least this many days.
@@ -204,6 +228,16 @@ pub enum PolicyError {
     /// A `scope: proxy_cached` rule was attached to a non-proxy repository.
     #[error("rule {0:?} uses scope=proxy_cached but the repository is not a proxy")]
     ProxyScopeOnNonProxy(String),
+    /// A hosted-scope rule (the default when `scope` is omitted) was attached
+    /// to a proxy repository. Deleting a proxy's components as hosted content
+    /// would leave `proxy_cached_version.downloaded` set with no local copy,
+    /// so the version could never be restored again.
+    #[error(
+        "rule {0:?} has scope=hosted (the default when \"scope\" is omitted), which is not \
+         valid on a proxy repository; set \"scope\": \"proxy_cached\" and use \
+         not_pulled_for_days to evict cached versions"
+    )]
+    HostedScopeOnProxy(String),
     /// A hosted-scope rule used the proxy-only `not_pulled_for_days` criterion.
     #[error("rule {0:?} uses not_pulled_for_days but scope is not proxy_cached")]
     NotPulledOnHostedScope(String),
@@ -233,8 +267,9 @@ pub const MAX_MIN_RUN_INTERVAL_SECONDS: u64 = 366 * 24 * 60 * 60;
 /// Validate a policy against the repository kind it will attach to.
 ///
 /// Rejects: wrong version, empty / duplicate rule ids, rules with no trigger,
-/// zero counts/days, proxy-scope rules on non-proxy repos (and vice-versa for
-/// proxy-only criteria), and any policy on a group repo. A disabled policy is
+/// zero counts/days, proxy-scope rules on non-proxy repos, hosted-scope rules
+/// on proxy repos, proxy-only criteria on hosted-scope rules (and vice-versa),
+/// and any policy on a group repo. A disabled policy is
 /// still validated so a re-enable can't smuggle in a broken rule.
 pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<(), PolicyError> {
     if policy.version != POLICY_VERSION {
@@ -299,6 +334,9 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
                     field: "keep_last_n/keep_n_most_downloaded",
                 });
             }
+        }
+        Scope::Hosted if repo_kind == RepoKind::Proxy => {
+            return Err(PolicyError::HostedScopeOnProxy(rule.id.clone()));
         }
         Scope::Hosted => {
             if c.not_pulled_for_days.is_some() {
@@ -522,6 +560,46 @@ mod tests {
             ..minimal_valid()
         };
         validate_policy(&p, RepoKind::Proxy).unwrap();
+    }
+
+    #[test]
+    fn rejects_hosted_scope_on_proxy_repo() {
+        // Regression (H2): the natural `{action: hard_delete, criteria:
+        // {older_than_days: 30}}` omits `scope`, which defaults to `hosted`. On
+        // a proxy that would delete cached components behind
+        // `proxy_cached_version`'s back, so it must be rejected with a message
+        // pointing the operator at `scope: "proxy_cached"`.
+        let json = r#"{
+            "version": 1,
+            "rules": [
+                { "id": "sweep", "action": "hard_delete", "criteria": { "older_than_days": 30 } }
+            ]
+        }"#;
+        let p: RetentionPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.rules[0].scope, Scope::Hosted, "scope defaults to hosted");
+        let err = validate_policy(&p, RepoKind::Proxy).unwrap_err();
+        assert_eq!(err, PolicyError::HostedScopeOnProxy("sweep".into()));
+        assert!(
+            err.to_string().contains(r#""scope": "proxy_cached""#),
+            "error must tell the operator what to use instead: {err}"
+        );
+        // The same rule is fine on a hosted repo.
+        validate_policy(&p, RepoKind::Hosted).unwrap();
+    }
+
+    #[test]
+    fn rejects_hosted_rule_mixed_into_proxy_policy() {
+        // A valid proxy rule does not excuse a hosted-scope sibling.
+        let p = RetentionPolicy {
+            rules: vec![example_proxy_rule(), example_hosted_rule()],
+            ..minimal_valid()
+        };
+        assert_eq!(
+            validate_policy(&p, RepoKind::Proxy),
+            Err(PolicyError::HostedScopeOnProxy(
+                "keep-recent-releases".into()
+            ))
+        );
     }
 
     #[test]

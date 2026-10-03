@@ -10,8 +10,11 @@
 //!   * `sweep_expired` reaps only expired rows;
 //!   * the **stored bytes are never the plaintext password** — the column holds
 //!     only the caller-supplied hmac;
-//!   * the singleflight ROW-lock anchor serializes concurrent identical checks
-//!     so the upstream is consulted once (no advisory locks).
+//!   * the singleflight lease admits exactly one winner per lease, fences a
+//!     stale verdict write (revocation / lapsed lease), and is released on an
+//!     outage — all without a transaction held across the forward (no
+//!     advisory locks);
+//!   * the sweeper keeps rows that carry a live lease.
 //!
 //! Requires Docker on the host. All tests share one container/pool (see
 //! `common`) and isolate themselves with unique provider/username values.
@@ -349,64 +352,181 @@ async fn sweep_orphaned_tags_reaps_only_tagless_usernames() {
     fill.rollback().await.unwrap();
 }
 
-/// The singleflight ROW lock (no advisory locks) serializes concurrent identical
-/// checks: a winner holds the lock, "forwards" (simulated), writes the verdict,
-/// and commits; a peer that called `begin_singleflight` concurrently blocks on
-/// the row lock and, on release, observes the fresh verdict instead of
-/// forwarding again.
+/// The singleflight lease (no advisory locks, no transaction held across the
+/// forward): one winner per lease; a peer sees `Busy`/`Claimed` and then the
+/// winner's verdict; a verdict write without the current token is fenced.
 #[tokio::test]
-async fn singleflight_row_lock_serializes_concurrent_checks() {
+async fn singleflight_lease_admits_one_winner_and_fences_stale_writes() {
     let pool = pool().await;
+    let pool = &pool;
     let n = unique();
     let user = format!("vc-sf-{n}");
     let hmac = format!("sf-hmac-{n}");
+    let lease = std::time::Duration::from_secs(300);
 
-    // Winner: open a tx, take the anchor lock, but DON'T commit yet.
-    let mut winner_tx = pool.begin().await.unwrap();
-    let winner = vc::begin_singleflight(&mut winner_tx, PROVIDER, &user, &hmac)
+    // The first caller wins; a concurrent identical caller is told to wait.
+    let vc::Claim::Won { token } = vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("first caller wins the lease");
+    };
+    assert_eq!(
+        vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+            .await
+            .unwrap(),
+        vc::Claim::Busy
+    );
+    assert_eq!(
+        vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap(),
+        vc::ClaimState::Claimed
+    );
+    // A claim is never served as a verdict.
+    assert!(vc::get_verdict(pool, PROVIDER, &user, &hmac)
+        .await
+        .unwrap()
+        .is_none());
+
+    // A write under a foreign token is fenced; the winner's write lands.
+    assert!(!vc::finalize_claim(
+        pool,
+        new_verdict(&user, &hmac, true, 300),
+        uuid::Uuid::new_v4()
+    )
+    .await
+    .unwrap());
     assert!(
-        winner.is_none(),
-        "first caller is the singleflight winner (no fresh verdict yet)"
+        vc::finalize_claim(pool, new_verdict(&user, &hmac, true, 300), token)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap(),
+        vc::ClaimState::Fresh(true)
+    );
+    assert_eq!(
+        vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+            .await
+            .unwrap(),
+        vc::Claim::Verdict(true),
+        "a fresh verdict is returned instead of a new lease"
+    );
+    assert_eq!(
+        vc::list_auth_successes(pool, &user).await.unwrap().len(),
+        1,
+        "an accepted verdict records the auth success"
+    );
+}
+
+/// A revocation that lands between claim and verdict write deletes the claim,
+/// so the (stale) write is fenced; a lapsed lease can be taken over, fencing
+/// the original winner; a released claim leaves no row behind.
+#[tokio::test]
+async fn singleflight_lease_revocation_lapse_and_release() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let lease = std::time::Duration::from_secs(300);
+
+    // Revocation mid-forward fences the winner.
+    let user = format!("vc-sf-rev-{n}");
+    let hmac = format!("sf-rev-{n}");
+    let vc::Claim::Won { token } = vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("winner");
+    };
+    assert_eq!(vc::revoke_by_username(pool, &user, None).await.unwrap(), 1);
+    assert!(
+        !vc::finalize_claim(pool, new_verdict(&user, &hmac, true, 300), token)
+            .await
+            .unwrap(),
+        "a verdict obtained across a revocation must not be written"
+    );
+    assert!(vc::get_verdict(pool, PROVIDER, &user, &hmac)
+        .await
+        .unwrap()
+        .is_none());
+
+    // A lapsed lease is taken over; the original winner is fenced.
+    let user = format!("vc-sf-lapse-{n}");
+    let hmac = format!("sf-lapse-{n}");
+    let vc::Claim::Won { token: stale } =
+        vc::claim_singleflight(pool, PROVIDER, &user, &hmac, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+    else {
+        panic!("winner");
+    };
+    let vc::Claim::Won { token: fresh } =
+        vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+            .await
+            .unwrap()
+    else {
+        panic!("a lapsed lease is claimable");
+    };
+    assert_ne!(stale, fresh);
+    assert!(
+        !vc::finalize_claim(pool, new_verdict(&user, &hmac, true, 300), stale)
+            .await
+            .unwrap()
+    );
+    assert!(
+        vc::finalize_claim(pool, new_verdict(&user, &hmac, false, 300), fresh)
+            .await
+            .unwrap()
     );
 
-    // Peer: try to begin singleflight on a separate connection with a short
-    // statement timeout — it must BLOCK on the row lock the winner holds.
-    let peer_pool = pool.clone();
-    let peer_user = user.clone();
-    let peer_hmac = hmac.clone();
-    let peer = tokio::spawn(async move {
-        let mut tx = peer_pool.begin().await.unwrap();
-        // Bound the wait so a regression (no lock) is observable as a fast
-        // return rather than a hang; the winner releases well within this.
-        sqlx::query("SET LOCAL lock_timeout = '5s'")
-            .execute(&mut *tx)
+    // Releasing (outage) deletes the claim row: nothing cached, claimable again.
+    let user = format!("vc-sf-release-{n}");
+    let hmac = format!("sf-release-{n}");
+    let vc::Claim::Won { token } = vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("winner");
+    };
+    vc::release_claim(pool, PROVIDER, &user, &hmac, token)
+        .await
+        .unwrap();
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM validated_credential WHERE username = $1")
+            .bind(&user)
+            .fetch_one(pool)
             .await
             .unwrap();
-        let res = vc::begin_singleflight(&mut tx, PROVIDER, &peer_user, &peer_hmac).await;
-        tx.commit().await.ok();
-        res
-    });
-
-    // Give the peer a moment to reach the blocking SELECT ... FOR UPDATE.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !peer.is_finished(),
-        "peer must block on the winner's row lock"
+    assert_eq!(rows, 0, "a released claim leaves no row");
+    assert_eq!(
+        vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap(),
+        vc::ClaimState::Open
     );
+}
 
-    // Winner forwards (simulated) and writes a positive verdict, then commits.
-    vc::finalize_singleflight(&mut winner_tx, new_verdict(&user, &hmac, true, 300))
-        .await
-        .unwrap();
-    winner_tx.commit().await.unwrap();
+/// The sweeper must not delete a row whose lease is live (that would fence
+/// the in-flight winner and invite a duplicate forward).
+#[tokio::test]
+async fn sweep_expired_keeps_live_claims() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let user = format!("vc-sf-sweep-{n}");
+    let hmac = format!("sf-sweep-{n}");
 
-    // Peer unblocks and sees the fresh verdict → it would NOT forward upstream.
-    let peer_result = peer.await.unwrap().unwrap();
-    let peer_row = peer_result.expect("peer observes the winner's fresh verdict");
-    assert!(
-        peer_row.verdict,
-        "peer reads the positive verdict, not a sentinel"
+    let claim = vc::claim_singleflight(
+        pool,
+        PROVIDER,
+        &user,
+        &hmac,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(claim, vc::Claim::Won { .. }));
+    vc::sweep_expired(pool).await.unwrap();
+    assert_eq!(
+        vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap(),
+        vc::ClaimState::Claimed,
+        "a live claim survives the sweep"
     );
 }

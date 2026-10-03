@@ -19,7 +19,9 @@
 # ── Stage 1: build the web SPA ───────────────────────────────────────────────
 # Node 22 (matches the dev/CI toolchain). corepack pins pnpm to the version in
 # web/package.json ("packageManager"), so the lockfile install is reproducible.
-FROM node:22-bookworm-slim AS web
+# Base images are pinned by digest (tag kept for readability); Dependabot
+# (.github/dependabot.yml) proposes tag + digest bumps.
+FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS web
 WORKDIR /web
 
 # Enable the pinned pnpm via corepack before any install.
@@ -38,7 +40,7 @@ RUN pnpm run build
 # ── Stage 2a: cargo-chef base ─────────────────────────────────────────────────
 # Pin the Rust toolchain to match rust-toolchain.toml (1.95.0). cargo-chef lets
 # us cache the dependency compile separately from the workspace sources.
-FROM rust:1.95.0-bookworm AS chef
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS chef
 # Use the image's preinstalled 1.95.0 as-is; the copied rust-toolchain.toml
 # would otherwise make rustup download its dev components (rustfmt, clippy).
 ENV RUSTUP_TOOLCHAIN=1.95.0
@@ -47,7 +49,8 @@ ENV RUSTUP_TOOLCHAIN=1.95.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang perl \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked --version ^0.1
+# Exact version: the dependency-layer recipe format is cargo-chef specific.
+RUN cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /app
 
 # ── Stage 2b: plan the dependency graph ───────────────────────────────────────
@@ -82,7 +85,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── Stage 3: slim runtime ─────────────────────────────────────────────────────
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 ARG FORGE_VERSION=0.1.0
 ARG FORGE_GIT_SHA=unknown
 LABEL org.opencontainers.image.title="envisia-forge" \
@@ -106,16 +109,19 @@ COPY --from=web /web/dist /app/web/dist
 COPY migrations /app/migrations
 # A baked, secret-free base config. Real secrets come from FORGE_* env at runtime
 # and override these values (FORGE_DATABASE__URL, FORGE_S3__*). Its placeholder
-# credentials (minioadmin, bootstrap admin/changeme) are REFUSED at startup
-# unless overridden (or FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true for local dev).
+# S3 keys (minioadmin) are REFUSED at startup unless overridden (or
+# FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true for local dev). It bakes NO
+# bootstrap admin: that comes only from FORGE_AUTH__BOOTSTRAP_ADMIN__* env.
 COPY docker/forge.docker.toml /app/forge.toml
 
-USER forge
+# Numeric UID:GID (the `forge` user above) so Kubernetes `runAsNonRoot` can
+# verify the image runs unprivileged without resolving a user name.
+USER 10001:10001
 
 # ── Runtime configuration (FORGE_* override the baked forge.toml) ─────────────
 # Baked defaults (see docker/forge.docker.toml): bind 0.0.0.0:8421, SPA at
-# /app/web/dist, anonymous_mode=off, allow_password_basic, bootstrap admin
-# (placeholder password — must be overridden).
+# /app/web/dist, anonymous_mode=off, allow_password_basic=false, no bootstrap
+# admin (set FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD for the first start).
 ENV FORGE_CONFIG=/app/forge.toml \
     FORGE_WEB__ASSETS_DIR=/app/web/dist \
     RUST_LOG=info
@@ -126,6 +132,7 @@ ENV FORGE_CONFIG=/app/forge.toml \
 #   FORGE_S3__BUCKET             forge
 #   FORGE_S3__ACCESS_KEY         <s3 access key>
 #   FORGE_S3__SECRET_KEY         <s3 secret key>
+# First start only (creates the bootstrap admin; remove it afterwards):
 #   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   <a real password>
 # Strongly recommended:
 #   FORGE_SERVER__PUBLIC_BASE_URL   https://forge.example.com (for absolute @id URLs)

@@ -1,7 +1,8 @@
 //! E2E: proxy repository — cache-on-demand, singleflight (row lock),
-//! package-delay hidden→visible, and genuine upstream-404 negative caching,
-//! driven through the full HTTP stack against an in-process mock upstream feed
-//! (spec §9). Gated behind `forge-e2e`.
+//! package-delay hidden→visible, genuine upstream-404 negative caching (and a
+//! planted marker not hiding a later release), verified upstream manifests and
+//! upstream registration metadata, driven through the full HTTP stack against
+//! an in-process mock upstream feed (spec §9). Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -13,17 +14,38 @@ use serde_json::Value;
 /// Create a proxy repo over `remote_url`, allowing the private (loopback) mock
 /// upstream and the given package delay.
 async fn create_proxy(srv: &TestServer, name: &str, remote_url: &str, delay_seconds: i32) {
+    create_proxy_with_ttl(srv, name, remote_url, delay_seconds, 600).await;
+}
+
+async fn create_proxy_with_ttl(
+    srv: &TestServer,
+    name: &str,
+    remote_url: &str,
+    delay_seconds: i32,
+    metadata_ttl_seconds: i32,
+) {
     let resp = srv
         .create_repo(serde_json::json!({
             "name": name,
             "kind": "proxy",
             "remote_url": remote_url,
             "package_delay_seconds": delay_seconds,
-            "metadata_ttl_seconds": 600,
+            "metadata_ttl_seconds": metadata_ttl_seconds,
             "not_found_ttl_seconds": 600,
         }))
         .await;
     assert_eq!(resp.status(), 201, "create proxy repo");
+}
+
+/// GET `path` (below `/v3/{repo}`) as the admin.
+async fn get_v3(srv: &TestServer, repo: &str, path: &str) -> reqwest::Response {
+    let (u, p) = srv.admin_basic();
+    srv.client()
+        .get(format!("{}/v3/{repo}/{path}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
 }
 
 async fn download(srv: &TestServer, repo: &str, lower: &str, version: &str) -> reqwest::StatusCode {
@@ -209,4 +231,83 @@ async fn genuine_404_is_negatively_cached() {
         after_first,
         "genuine 404 negatively cached — no upstream re-fetch within TTL"
     );
+}
+
+/// H3: a reader requesting a version before it is released plants a
+/// not-found marker; once the upstream publishes the version, the next
+/// listing refresh must offer it (and it downloads) although the marker's
+/// not-found TTL (600 s) has not elapsed.
+#[tokio::test]
+async fn planted_not_found_marker_does_not_hide_a_later_release() {
+    let srv = start_stack().await;
+    let mock = MockUpstream::start(vec![UpstreamPackage::single(
+        "Future.Lib",
+        "1.0.0",
+        make_nupkg("Future.Lib", "1.0.0"),
+    )])
+    .await;
+    // 1 s metadata TTL so the listing refreshes after the release.
+    create_proxy_with_ttl(&srv, "px-future", &mock.index_url(), 0, 1).await;
+
+    assert_eq!(
+        download(&srv, "px-future", "future.lib", "2.0.0").await,
+        404
+    );
+    assert_eq!(
+        list_versions(&srv, "px-future", "future.lib").await,
+        vec!["1.0.0".to_string()],
+        "the 404'd version is not listed"
+    );
+
+    mock.publish("Future.Lib", "2.0.0", make_nupkg("Future.Lib", "2.0.0"));
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(
+        list_versions(&srv, "px-future", "future.lib").await,
+        vec!["1.0.0".to_string(), "2.0.0".to_string()],
+        "the release surfaces on the next listing refresh"
+    );
+    assert_eq!(
+        download(&srv, "px-future", "future.lib", "2.0.0").await,
+        200
+    );
+}
+
+/// M10: the upstream `.nuspec` is served (verified) without downloading the
+/// package; M11: the registration of a version not downloaded yet carries the
+/// upstream's dependency groups.
+#[tokio::test]
+async fn upstream_metadata_is_served_before_download() {
+    let srv = start_stack().await;
+    let mock = MockUpstream::start(vec![UpstreamPackage::single(
+        "Meta.Lib",
+        "1.0.0",
+        make_nupkg("Meta.Lib", "1.0.0"),
+    )])
+    .await;
+    create_proxy(&srv, "px-meta", &mock.index_url(), 0).await;
+
+    let resp = get_v3(&srv, "px-meta", "flat/meta.lib/1.0.0/meta.lib.nuspec").await;
+    assert_eq!(resp.status(), 200);
+    let nuspec = resp.text().await.unwrap();
+    assert!(nuspec.contains("<id>Meta.Lib</id>"), "{nuspec}");
+    assert_eq!(mock.nuspec_hits(), 1);
+
+    let resp = get_v3(&srv, "px-meta", "registration/meta.lib/index.json").await;
+    assert_eq!(resp.status(), 200);
+    let reg: Value = resp.json().await.unwrap();
+    let entry = &reg["items"][0]["items"][0]["catalogEntry"];
+    assert_eq!(entry["id"], "Meta.Lib");
+    assert_eq!(entry["listed"], true);
+    assert_eq!(
+        entry["dependencyGroups"][0]["targetFramework"], "net8.0",
+        "{entry}"
+    );
+    assert_eq!(
+        entry["dependencyGroups"][0]["dependencies"][0]["id"],
+        "Newtonsoft.Json"
+    );
+    assert!(entry["published"]
+        .as_str()
+        .is_some_and(|p| p.starts_with("2026-01-01")));
+    assert_eq!(mock.nupkg_hits(), 0, "metadata needs no package download");
 }

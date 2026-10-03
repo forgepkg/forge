@@ -222,6 +222,33 @@ pub async fn update_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> sqlx::Re
     .await
 }
 
+/// Set a user's `active` flag (bumping `updated_at` only when it changes) and
+/// return the resulting row, or `None` when no such user exists.
+///
+/// The admin deactivate/activate path. `active = false` is honored by every
+/// authentication path (tokens, passwords, sessions, OIDC and upstream
+/// logins), and no provisioning path ever flips it back: the upstream-basic
+/// upsert ([`provision_upstream_user`]) and OIDC resolution leave an existing
+/// row's `active` alone.
+pub async fn set_active(pool: &PgPool, id: i64, active: bool) -> sqlx::Result<Option<AppUser>> {
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        UPDATE app_user
+        SET active = $2,
+            updated_at = CASE WHEN active <> $2 THEN now() ELSE updated_at END
+        WHERE id = $1
+        RETURNING
+            id, username, password_hash, is_admin, active,
+            auth_source, external_subject, created_at, updated_at
+        "#,
+        id,
+        active,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Delete a user by id (cascading their tokens). Returns whether a row went.
 pub async fn delete_user(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     let res = sqlx::query!(r#"DELETE FROM app_user WHERE id = $1"#, id)

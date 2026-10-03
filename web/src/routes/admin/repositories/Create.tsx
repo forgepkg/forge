@@ -8,7 +8,7 @@ import {
   type RepoFormValues,
 } from '~/components/RepositoryForm'
 
-export const Route = createFileRoute('/_app/admin/repositories/new')({
+export const Route = createFileRoute('/_app/manage/repositories/new')({
   component: CreateRepository,
 })
 
@@ -26,7 +26,7 @@ function CreateRepository() {
     create.mutate(toCreateBody(values), {
       onSuccess: (repo) => {
         void navigate({
-          to: '/admin/repositories/$repo',
+          to: '/manage/repositories/$repo',
           params: { repo: repo.name },
         })
       },
@@ -43,7 +43,7 @@ function CreateRepository() {
           create.isError ? create.error.body || create.error.message : null
         }
         onSubmit={handleSubmit}
-        onCancel={() => void navigate({ to: '/admin/repositories' })}
+        onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
     </section>
   )

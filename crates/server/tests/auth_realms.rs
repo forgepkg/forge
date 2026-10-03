@@ -195,6 +195,85 @@ async fn password_login_session_round_trip() {
     );
 }
 
+/// B3: an oversized username is a uniform 401 that never reaches the chain or
+/// the lockout map (which used to pin every presented username in memory).
+#[tokio::test]
+async fn oversized_login_username_is_refused_without_growing_the_lockout_map() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let login = format!("{}/auth/login", srv.base_url);
+
+    let huge = "x".repeat(64 * 1024);
+    for _ in 0..3 {
+        let resp = client
+            .post(&login)
+            .json(&json!({ "username": huge, "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.text().await.unwrap(), "invalid credentials");
+    }
+    assert_eq!(
+        srv.state.login_throttle.tracked(),
+        0,
+        "oversized usernames never enter the lockout map"
+    );
+
+    // A normal-sized failed attempt is tracked (the measurement is live).
+    let resp = client
+        .post(&login)
+        .json(&json!({ "username": format!("ghost{}", common::unique()), "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(srv.state.login_throttle.tracked(), 1);
+}
+
+/// A locked (IP, username) pair is a 429 whose `Retry-After` is the failure
+/// window, so the sign-in page can say how long to wait.
+#[tokio::test]
+async fn login_lockout_is_429_with_retry_after() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let login = format!("{}/auth/login", srv.base_url);
+    let username = format!("ghost{}", common::unique());
+
+    let max = srv.state.config.auth.login_max_failures;
+    for _ in 0..max {
+        let resp = client
+            .post(&login)
+            .json(&json!({ "username": username, "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    let resp = client
+        .post(&login)
+        .json(&json!({ "username": username, "password": "pw" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After on a lockout")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        retry_after,
+        srv.state
+            .config
+            .auth
+            .login_failure_window_seconds
+            .to_string()
+    );
+}
+
 /// `/admin/realms` CRUD: the seeded local realm is listed and protected,
 /// secrets are write-only (redacted to `<key>_set` markers), invalid configs
 /// are 400, and reorder demands the complete id set.

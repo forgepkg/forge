@@ -22,6 +22,10 @@
 //!    provider authenticates and an `Unavailable` was seen, the chain reports
 //!    [`ChainOutcome::Unavailable`] (distinct from [`ChainOutcome::Rejected`])
 //!    so the caller denies and can log/metric the upstream health separately.
+//!    An `Unavailable` from a **local** provider is terminal like its
+//!    rejection: the local store could not tell whether the username is a
+//!    local password account (user lookup failed, or no argon2 slot freed up
+//!    under load), so the password must not be forwarded upstream either.
 //! 5. No provider authenticated and none rejected/was-unavailable (all
 //!    [`AuthOutcome::Skip`] or an empty chain) → [`ChainOutcome::NoCredentials`]:
 //!    the password path simply had nothing to say, and the caller falls back to
@@ -104,6 +108,11 @@ impl Chain {
                 // (never forwarded upstream, see module docs rule 3).
                 AuthOutcome::Rejected if provider.source() == AuthSource::Local => {
                     return ChainOutcome::Rejected;
+                }
+                // The local store could not decide (DB error, argon2 overload):
+                // it may still own this username, so do not forward (rule 4).
+                AuthOutcome::Unavailable if provider.source() == AuthSource::Local => {
+                    return ChainOutcome::Unavailable;
                 }
                 AuthOutcome::Rejected => saw_rejected = true,
                 AuthOutcome::Unavailable => saw_unavailable = true,
@@ -477,6 +486,31 @@ mod tests {
         assert_eq!(
             chain.authenticate(&cred("alice", "pw")).await,
             ChainOutcome::Rejected
+        );
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 0, "upstream never consulted");
+    }
+
+    #[tokio::test]
+    async fn local_unavailable_is_terminal_and_never_forwarded() {
+        // The local store could not decide (lookup failed, argon2 overloaded):
+        // the username may be a local password account, so the password must
+        // not reach the upstream.
+        let (p1, c1) = StubProvider::new(
+            "local-password",
+            AuthSource::Local,
+            AuthOutcome::Unavailable,
+        );
+        let (p2, c2) = StubProvider::new(
+            "upstream-basic",
+            AuthSource::UpstreamBasic,
+            authed("alice", AuthSource::UpstreamBasic),
+        );
+        let chain = Chain::new(vec![Box::new(p1), Box::new(p2)]);
+
+        assert_eq!(
+            chain.authenticate(&cred("alice", "pw")).await,
+            ChainOutcome::Unavailable
         );
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 0, "upstream never consulted");

@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT upstream_username, upstream_password, upstream_password_enc,\n               metadata_ttl_seconds, not_found_ttl_seconds\n        FROM repository WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "upstream_username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_username"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_password",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "upstream_password_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "upstream_password_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "metadata_ttl_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "metadata_ttl_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "not_found_ttl_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "not_found_ttl_seconds"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "6019fdcdaba14d760058e7eb9f95e62317748f6ad9988d45024630220c640205"
+}

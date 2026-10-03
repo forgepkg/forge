@@ -22,7 +22,7 @@ import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
-export const Route = createFileRoute('/_app/admin/repositories')({
+export const Route = createFileRoute('/_app/manage/repositories')({
   component: RepositoriesList,
 })
 
@@ -52,7 +52,7 @@ function RepositoriesList() {
             Create and manage hosted, proxy, and group repositories.
           </Text>
         </div>
-        <Button href="/admin/repositories/new">New repository</Button>
+        <Button href="/manage/repositories/new">New repository</Button>
       </div>
 
       {del.isError && (
@@ -128,7 +128,7 @@ function RepoRow({
           type="button"
           onClick={() =>
             void navigate({
-              to: '/admin/repositories/$repo',
+              to: '/manage/repositories/$repo',
               params: { repo: repo.name },
             })
           }
@@ -155,7 +155,7 @@ function RepoRow({
       <TableCell>
         <span className="flex items-center gap-3">
           <Link
-            to="/admin/repositories/$repo"
+            to="/manage/repositories/$repo"
             params={{ repo: repo.name }}
             className="text-sky-600 hover:underline dark:text-sky-400"
           >
@@ -163,7 +163,7 @@ function RepoRow({
           </Link>
           {repo.kind === 'group' && (
             <Link
-              to="/admin/repositories/$repo/members"
+              to="/manage/repositories/$repo/members"
               params={{ repo: repo.name }}
               className="text-sky-600 hover:underline dark:text-sky-400"
             >

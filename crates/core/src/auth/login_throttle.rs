@@ -1,9 +1,9 @@
 //! Password-login failure throttling (per client IP + username).
 //!
 //! Both password entry points — the browser `POST /auth/login` and the wire
-//! HTTP Basic password path ([`super::token::BasicAuthSource`]) — record a
-//! failure here for every rejected password attempt and consult
-//! [`LoginThrottle::is_locked`] before running the provider chain. Once a
+//! HTTP Basic password path ([`super::token::BasicAuthSource`]) — reserve an
+//! attempt here with [`LoginThrottle::begin`] before running the provider
+//! chain and report its verdict on the returned [`LoginAttempt`]. Once a
 //! `(client IP, username)` pair has accumulated `max_failures` failures inside
 //! a fixed `window`, further attempts for that pair are refused without
 //! touching the chain (no argon2 work, nothing forwarded upstream) until the
@@ -12,30 +12,159 @@
 //! Keying on the pair (not the username alone) means an attacker cannot lock a
 //! victim out from another address, while a single address still cannot brute
 //! force a username. The state is **per instance and in memory** — a cheap
-//! first line of defense, not a cluster-wide guarantee; the map is bounded and
-//! stale entries are pruned opportunistically.
+//! first line of defense, not a cluster-wide guarantee.
+//!
+//! ## Reservation, not check-then-record
+//! An attempt is counted against the pair's budget atomically *before* the
+//! chain runs: at most `max_failures - failures` attempts of a pair are in
+//! flight at once. A separate "is it locked?" check followed by a later
+//! "record the failure" would let N concurrent guesses all pass the check
+//! before any of them recorded its failure. An attempt beyond the in-flight
+//! budget **waits** (bounded by [`DEFAULT_MAX_WAIT`]) for a slot instead of
+//! being refused, so a client that legitimately sends many parallel requests
+//! with the right password (a NuGet restore over Basic) is serialized, never
+//! locked out. Verdicts: [`LoginAttempt::failed`] counts the failure,
+//! [`LoginAttempt::succeeded`] clears the pair, and
+//! [`LoginAttempt::released`] — an outage, which is not the caller's fault —
+//! or a dropped attempt (the client went away before any verdict was sent)
+//! gives the slot back uncounted.
+//!
+//! ## Bounded memory
+//! The key is the canonical client IP plus a SHA-256 of the normalized
+//! username, so an entry has a fixed size whatever username is presented, and
+//! both entry points refuse usernames over [`MAX_USERNAME_BYTES`] before they
+//! get here. Only pairs with recorded failures or attempts in flight are kept.
+//! Expired windows are swept on insert, amortized (one full sweep per
+//! `max(len, 1024)` insertions); a map still full of live windows evicts its
+//! oldest eighth at once, so no insert pays an O(n) scan on every call.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Upper bound on tracked pairs; beyond it expired entries are pruned first,
-/// and if still full the oldest window is evicted.
-const MAX_TRACKED: usize = 100_000;
+use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
-#[derive(Debug, Clone, Copy)]
-struct Entry {
-    failures: u32,
-    window_start: Instant,
+/// Longest username (in bytes) either password entry point accepts. Longer
+/// ones are refused as plain invalid credentials before any lookup, throttle
+/// bookkeeping or provider work, and are never counted as a failure.
+pub const MAX_USERNAME_BYTES: usize = 256;
+
+/// How many characters of a presented username are written to logs.
+const LOG_USERNAME_CHARS: usize = 64;
+
+/// The presented `username`, cut to a log-safe length (the caller picks it).
+pub fn username_for_log(username: &str) -> Cow<'_, str> {
+    match username.char_indices().nth(LOG_USERNAME_CHARS) {
+        Some((cut, _)) => Cow::Owned(format!("{}…", &username[..cut])),
+        None => Cow::Borrowed(username),
+    }
 }
 
-/// Fixed-window failure counter keyed by `(client IP, lowercased username)`.
+/// How long an attempt waits for an in-flight slot of its pair before giving
+/// up with [`AttemptRefused::Busy`].
+pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Upper bound on tracked pairs. A map this full of live windows evicts its
+/// oldest [`EVICT_BATCH`] entries at once (pairs with attempts in flight are
+/// kept).
+const MAX_TRACKED: usize = 100_000;
+
+/// Entries evicted together when the map is full of live windows.
+const EVICT_BATCH: usize = MAX_TRACKED / 8;
+
+/// Minimum number of insertions between two sweeps of expired windows.
+const SWEEP_MIN_INSERTS: usize = 1024;
+
+/// A tracked pair: the canonical client IP and a SHA-256 of the normalized
+/// (trimmed, lowercased) username. Fixed size, whatever the username.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Key {
+    ip: IpAddr,
+    user: [u8; 32],
+}
+
+#[derive(Debug)]
+struct Entry {
+    /// Failures recorded in the current window.
+    failures: u32,
+    /// Reserved attempts that have not reported a verdict yet.
+    in_flight: u32,
+    window_start: Instant,
+    /// Wakes attempts waiting for one of this pair's in-flight slots; created
+    /// on the first wait.
+    waiters: Option<Arc<Notify>>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    entries: HashMap<Key, Entry>,
+    /// New pairs inserted since the last sweep of expired windows.
+    inserts_since_sweep: usize,
+}
+
+impl State {
+    /// Called before inserting a new pair: sweep expired windows (amortized)
+    /// and, if the map is still full, evict the oldest batch.
+    fn make_room(&mut self, now: Instant, window: Duration) {
+        self.inserts_since_sweep += 1;
+        let len = self.entries.len();
+        if len < MAX_TRACKED && self.inserts_since_sweep < len.max(SWEEP_MIN_INSERTS) {
+            return;
+        }
+        self.inserts_since_sweep = 0;
+        self.entries
+            .retain(|_, e| e.in_flight > 0 || now.duration_since(e.window_start) < window);
+        if self.entries.len() < MAX_TRACKED {
+            return;
+        }
+        let mut starts: Vec<Instant> = self
+            .entries
+            .values()
+            .filter(|e| e.in_flight == 0)
+            .map(|e| e.window_start)
+            .collect();
+        if starts.is_empty() {
+            return;
+        }
+        let nth = EVICT_BATCH.min(starts.len()) - 1;
+        let cutoff = *starts.select_nth_unstable(nth).1;
+        self.entries
+            .retain(|_, e| e.in_flight > 0 || e.window_start > cutoff);
+    }
+}
+
+/// Why [`LoginThrottle::begin`] refused an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptRefused {
+    /// The pair used up its failures for the current window.
+    Locked,
+    /// Every remaining attempt of the pair stayed in flight for the whole
+    /// wait. Not counted; callers answer as for an outage.
+    Busy,
+}
+
+enum Reserve {
+    Granted,
+    Locked,
+    Busy(Arc<Notify>),
+}
+
+enum Verdict {
+    Failed,
+    Succeeded,
+    Released,
+}
+
+/// Fixed-window failure counter keyed by `(client IP, username)`.
 #[derive(Debug)]
 pub struct LoginThrottle {
     max_failures: u32,
     window: Duration,
-    entries: Mutex<HashMap<(IpAddr, String), Entry>>,
+    max_wait: Duration,
+    state: Mutex<State>,
 }
 
 impl LoginThrottle {
@@ -45,7 +174,8 @@ impl LoginThrottle {
         Self {
             max_failures,
             window,
-            entries: Mutex::new(HashMap::new()),
+            max_wait: DEFAULT_MAX_WAIT,
+            state: Mutex::new(State::default()),
         }
     }
 
@@ -54,8 +184,112 @@ impl LoginThrottle {
         Self::new(0, Duration::ZERO)
     }
 
-    fn key(ip: IpAddr, username: &str) -> (IpAddr, String) {
-        (ip, username.trim().to_lowercase())
+    /// Override how long an attempt waits for an in-flight slot of its pair
+    /// (default [`DEFAULT_MAX_WAIT`]).
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
+        self
+    }
+
+    fn key(ip: IpAddr, username: &str) -> Key {
+        Key {
+            ip: ip.to_canonical(),
+            user: Sha256::digest(username.trim().to_lowercase().as_bytes()).into(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("login throttle mutex poisoned")
+    }
+
+    /// Reserve one password attempt for the pair, waiting (bounded) while the
+    /// pair's remaining budget is all in flight. Run the provider chain only on
+    /// `Ok`, and report the verdict on the returned attempt.
+    pub async fn begin(
+        &self,
+        ip: IpAddr,
+        username: &str,
+    ) -> Result<LoginAttempt<'_>, AttemptRefused> {
+        if self.max_failures == 0 {
+            return Ok(LoginAttempt {
+                throttle: self,
+                key: None,
+            });
+        }
+        let key = Self::key(ip, username);
+        let granted = || LoginAttempt {
+            throttle: self,
+            key: Some(key),
+        };
+        let deadline = Instant::now() + self.max_wait;
+        loop {
+            let waiters = match self.try_reserve(key) {
+                Reserve::Granted => return Ok(granted()),
+                Reserve::Locked => return Err(AttemptRefused::Locked),
+                Reserve::Busy(waiters) => waiters,
+            };
+            let mut notified = std::pin::pin!(waiters.notified());
+            notified.as_mut().enable();
+            // Re-check once registered: a slot freed between the two lookups
+            // would otherwise be a lost wakeup.
+            match self.try_reserve(key) {
+                Reserve::Granted => return Ok(granted()),
+                Reserve::Locked => return Err(AttemptRefused::Locked),
+                // The entry was dropped and re-created in between: register on
+                // its new notifier instead.
+                Reserve::Busy(current) if !Arc::ptr_eq(&current, &waiters) => continue,
+                Reserve::Busy(_) => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(AttemptRefused::Busy);
+            }
+        }
+    }
+
+    fn try_reserve(&self, key: Key) -> Reserve {
+        let now = Instant::now();
+        let mut state = self.lock();
+        if !state.entries.contains_key(&key) {
+            state.make_room(now, self.window);
+        }
+        let entry = state.entries.entry(key).or_insert_with(|| Entry {
+            failures: 0,
+            in_flight: 0,
+            window_start: now,
+            waiters: None,
+        });
+        if now.duration_since(entry.window_start) >= self.window {
+            entry.failures = 0;
+            entry.window_start = now;
+        }
+        if entry.failures >= self.max_failures {
+            return Reserve::Locked;
+        }
+        if entry.failures.saturating_add(entry.in_flight) >= self.max_failures {
+            return Reserve::Busy(entry.waiters.get_or_insert_with(Default::default).clone());
+        }
+        entry.in_flight += 1;
+        Reserve::Granted
+    }
+
+    fn complete(&self, key: Key, verdict: Verdict) {
+        let mut state = self.lock();
+        let Some(entry) = state.entries.get_mut(&key) else {
+            return;
+        };
+        entry.in_flight = entry.in_flight.saturating_sub(1);
+        match verdict {
+            Verdict::Failed => entry.failures = entry.failures.saturating_add(1),
+            Verdict::Succeeded => entry.failures = 0,
+            Verdict::Released => {}
+        }
+        if let Some(waiters) = &entry.waiters {
+            waiters.notify_waiters();
+        }
+        if entry.failures == 0 && entry.in_flight == 0 {
+            state.entries.remove(&key);
+        }
     }
 
     /// Whether the pair is currently locked out (too many recent failures).
@@ -64,54 +298,17 @@ impl LoginThrottle {
             return false;
         }
         let now = Instant::now();
-        let entries = self.entries.lock().expect("login throttle mutex poisoned");
-        entries.get(&Self::key(ip, username)).is_some_and(|e| {
-            now.duration_since(e.window_start) < self.window && e.failures >= self.max_failures
-        })
+        self.lock()
+            .entries
+            .get(&Self::key(ip, username))
+            .is_some_and(|e| {
+                now.duration_since(e.window_start) < self.window && e.failures >= self.max_failures
+            })
     }
 
-    /// Record one failed password attempt for the pair.
-    pub fn record_failure(&self, ip: IpAddr, username: &str) {
-        if self.max_failures == 0 {
-            return;
-        }
-        let now = Instant::now();
-        let mut entries = self.entries.lock().expect("login throttle mutex poisoned");
-        if entries.len() >= MAX_TRACKED {
-            let window = self.window;
-            entries.retain(|_, e| now.duration_since(e.window_start) < window);
-            if entries.len() >= MAX_TRACKED {
-                if let Some(oldest) = entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.window_start)
-                    .map(|(k, _)| k.clone())
-                {
-                    entries.remove(&oldest);
-                }
-            }
-        }
-        let entry = entries.entry(Self::key(ip, username)).or_insert(Entry {
-            failures: 0,
-            window_start: now,
-        });
-        if now.duration_since(entry.window_start) >= self.window {
-            *entry = Entry {
-                failures: 0,
-                window_start: now,
-            };
-        }
-        entry.failures = entry.failures.saturating_add(1);
-    }
-
-    /// Clear the pair after a successful login.
-    pub fn record_success(&self, ip: IpAddr, username: &str) {
-        if self.max_failures == 0 {
-            return;
-        }
-        self.entries
-            .lock()
-            .expect("login throttle mutex poisoned")
-            .remove(&Self::key(ip, username));
+    /// How many pairs are currently tracked (diagnostics and tests).
+    pub fn tracked(&self) -> usize {
+        self.lock().entries.len()
     }
 }
 
@@ -119,6 +316,46 @@ impl Default for LoginThrottle {
     /// 10 failures per 5 minutes.
     fn default() -> Self {
         Self::new(10, Duration::from_secs(300))
+    }
+}
+
+/// A reserved password attempt (see [`LoginThrottle::begin`]). Report its
+/// verdict; one dropped without a verdict is released uncounted.
+#[must_use = "report the attempt's verdict"]
+#[derive(Debug)]
+pub struct LoginAttempt<'a> {
+    throttle: &'a LoginThrottle,
+    /// `None` when throttling is disabled or the verdict was reported.
+    key: Option<Key>,
+}
+
+impl LoginAttempt<'_> {
+    /// The credential was refused: count one failure for the pair.
+    pub fn failed(mut self) {
+        self.finish(Verdict::Failed);
+    }
+
+    /// The credential was accepted: clear the pair's failures.
+    pub fn succeeded(mut self) {
+        self.finish(Verdict::Succeeded);
+    }
+
+    /// No verdict on the credential (an outage, not the caller's fault): give
+    /// the slot back without counting a failure.
+    pub fn released(mut self) {
+        self.finish(Verdict::Released);
+    }
+
+    fn finish(&mut self, verdict: Verdict) {
+        if let Some(key) = self.key.take() {
+            self.throttle.complete(key, verdict);
+        }
+    }
+}
+
+impl Drop for LoginAttempt<'_> {
+    fn drop(&mut self) {
+        self.finish(Verdict::Released);
     }
 }
 
@@ -130,51 +367,166 @@ mod tests {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn locks_after_max_failures_per_ip_and_username() {
+    async fn fail(t: &LoginThrottle, ip: IpAddr, username: &str) {
+        t.begin(ip, username).await.expect("not refused").failed();
+    }
+
+    #[tokio::test]
+    async fn locks_after_max_failures_per_ip_and_username() {
         let t = LoginThrottle::new(3, Duration::from_secs(60));
         let a = ip("203.0.113.1");
         for _ in 0..2 {
-            t.record_failure(a, "alice");
+            fail(&t, a, "alice").await;
             assert!(!t.is_locked(a, "alice"));
         }
-        t.record_failure(a, "Alice");
+        fail(&t, a, "Alice").await;
         assert!(t.is_locked(a, "alice"), "username is case-insensitive");
+        assert_eq!(
+            t.begin(a, " alice ").await.unwrap_err(),
+            AttemptRefused::Locked
+        );
         // Other pairs are unaffected: another IP, another username.
         assert!(!t.is_locked(ip("203.0.113.2"), "alice"));
         assert!(!t.is_locked(a, "bob"));
     }
 
-    #[test]
-    fn success_clears_the_pair() {
+    #[tokio::test]
+    async fn success_clears_the_pair() {
         let t = LoginThrottle::new(2, Duration::from_secs(60));
         let a = ip("203.0.113.1");
-        t.record_failure(a, "alice");
-        t.record_success(a, "alice");
-        t.record_failure(a, "alice");
+        fail(&t, a, "alice").await;
+        t.begin(a, "alice").await.unwrap().succeeded();
+        assert_eq!(t.tracked(), 0, "a cleared pair is not kept");
+        fail(&t, a, "alice").await;
         assert!(!t.is_locked(a, "alice"));
     }
 
-    #[test]
-    fn window_expiry_unlocks() {
+    #[tokio::test]
+    async fn window_expiry_unlocks() {
         let t = LoginThrottle::new(1, Duration::from_millis(20));
         let a = ip("203.0.113.1");
-        t.record_failure(a, "alice");
+        fail(&t, a, "alice").await;
         assert!(t.is_locked(a, "alice"));
-        std::thread::sleep(Duration::from_millis(30));
+        tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!t.is_locked(a, "alice"));
         // A new failure starts a fresh window rather than stacking.
-        t.record_failure(a, "alice");
+        fail(&t, a, "alice").await;
         assert!(t.is_locked(a, "alice"));
     }
 
-    #[test]
-    fn zero_max_disables() {
+    #[tokio::test]
+    async fn zero_max_disables() {
         let t = LoginThrottle::disabled();
         let a = ip("203.0.113.1");
         for _ in 0..100 {
-            t.record_failure(a, "alice");
+            fail(&t, a, "alice").await;
         }
         assert!(!t.is_locked(a, "alice"));
+        assert_eq!(t.tracked(), 0);
+    }
+
+    #[test]
+    fn key_is_fixed_size_whatever_the_username() {
+        // B3: the map key never embeds the presented username.
+        assert!(std::mem::size_of::<Key>() <= 64);
+        let huge = "A".repeat(2 * 1024 * 1024);
+        let a = ip("203.0.113.1");
+        let k = LoginThrottle::key(a, &huge);
+        // Pairing semantics survive the hashing: normalized usernames meet,
+        // distinct ones (and other IPs) do not.
+        assert_eq!(
+            k,
+            LoginThrottle::key(a, &format!("  {} ", huge.to_lowercase()))
+        );
+        assert_ne!(k, LoginThrottle::key(a, &format!("{huge}B")));
+        assert_ne!(k, LoginThrottle::key(ip("203.0.113.2"), &huge));
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_peer_shares_the_ipv4_pair() {
+        let t = LoginThrottle::new(1, Duration::from_secs(60));
+        fail(&t, ip("::ffff:203.0.113.1"), "alice").await;
+        assert!(t.is_locked(ip("203.0.113.1"), "alice"));
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_pruned_on_insert() {
+        let t = LoginThrottle::new(5, Duration::from_millis(500));
+        let a = ip("203.0.113.1");
+        for i in 0..5 {
+            fail(&t, a, &format!("old-{i}")).await;
+        }
+        assert_eq!(t.tracked(), 5);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // New pairs trigger the amortized sweep, which drops the lapsed ones.
+        for i in 0..SWEEP_MIN_INSERTS {
+            fail(&t, a, &format!("new-{i}")).await;
+        }
+        assert_eq!(t.tracked(), SWEEP_MIN_INSERTS, "expired windows swept");
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempts_cannot_exceed_the_budget() {
+        // M4: attempts are reserved before any verdict, so a burst cannot all
+        // pass the lockout check before the first failure is recorded.
+        let t =
+            LoginThrottle::new(3, Duration::from_secs(60)).with_max_wait(Duration::from_millis(50));
+        let a = ip("203.0.113.1");
+        let in_flight = [
+            t.begin(a, "alice").await.unwrap(),
+            t.begin(a, "alice").await.unwrap(),
+            t.begin(a, "alice").await.unwrap(),
+        ];
+        assert_eq!(
+            t.begin(a, "alice").await.unwrap_err(),
+            AttemptRefused::Busy,
+            "the whole budget is in flight"
+        );
+        for attempt in in_flight {
+            attempt.failed();
+        }
+        assert_eq!(
+            t.begin(a, "alice").await.unwrap_err(),
+            AttemptRefused::Locked
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_attempt_proceeds_when_a_slot_frees() {
+        let t = Arc::new(LoginThrottle::new(2, Duration::from_secs(60)));
+        let a = ip("203.0.113.1");
+        let first = t.begin(a, "alice").await.unwrap();
+        let second = t.begin(a, "alice").await.unwrap();
+        let waiter = {
+            let t = t.clone();
+            tokio::spawn(async move { t.begin(a, "alice").await.map(LoginAttempt::succeeded) })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "waits while the budget is in flight");
+        first.succeeded();
+        assert_eq!(waiter.await.unwrap(), Ok(()));
+        second.succeeded();
+        assert_eq!(t.tracked(), 0);
+    }
+
+    #[tokio::test]
+    async fn released_and_dropped_attempts_are_not_counted() {
+        let t = LoginThrottle::new(1, Duration::from_secs(60));
+        let a = ip("203.0.113.1");
+        for _ in 0..5 {
+            t.begin(a, "alice").await.unwrap().released();
+            drop(t.begin(a, "alice").await.unwrap());
+        }
+        assert!(!t.is_locked(a, "alice"));
+        assert_eq!(t.tracked(), 0);
+    }
+
+    #[test]
+    fn username_for_log_truncates() {
+        assert_eq!(username_for_log("alice"), "alice");
+        let long = "é".repeat(1000);
+        let logged = username_for_log(&long);
+        assert_eq!(logged.chars().count(), LOG_USERNAME_CHARS + 1);
+        assert!(logged.ends_with('…'));
     }
 }

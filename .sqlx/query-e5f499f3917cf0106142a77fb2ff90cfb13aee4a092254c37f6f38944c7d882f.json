@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM encryption_key\n            WHERE layer = 'kek' AND scope = $1 AND version = $2 AND state <> 'revoked'\n        ) AS \"usable!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "usable!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e5f499f3917cf0106142a77fb2ff90cfb13aee4a092254c37f6f38944c7d882f"
+}

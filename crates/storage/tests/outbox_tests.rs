@@ -217,6 +217,79 @@ async fn worker_skips_revived_blob() {
     store.delete(&key).await.unwrap();
 }
 
+/// Counter drift (the pre-0.1.0 double decrement could leave `ref_count = 0`
+/// on a blob an asset still names) must never let the worker delete it: the
+/// reservation sees the asset, repairs the counter, and keeps the object.
+#[tokio::test]
+async fn worker_never_deletes_a_blob_an_asset_still_names() {
+    let _test_guard = OUTBOX_TEST_LOCK.lock().await;
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+
+    let n = common::unique();
+    let (sha, key) = ingest_and_commit(&cas, &pool, format!("outbox-drift-{n}").into_bytes()).await;
+
+    // One live asset reference.
+    let repo_id: i64 = sqlx::query_scalar(
+        "INSERT INTO repository (name, kind) VALUES ($1, 'hosted') RETURNING id",
+    )
+    .bind(format!("drift-{n}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let component_id: i64 = sqlx::query_scalar(
+        "INSERT INTO component (repository_id, name, original_id, version, version_original) \
+         VALUES ($1, 'drift.pkg', 'Drift.Pkg', '1.0.0', '1.0.0') RETURNING id",
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset (component_id, path, content_type, blob_sha256, size) \
+         VALUES ($1, 'drift.pkg.1.0.0.nupkg', 'application/octet-stream', $2, 1)",
+    )
+    .bind(component_id)
+    .bind(&sha)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Drift: the counter says nobody references it, and a delete is due.
+    sqlx::query("UPDATE blob SET ref_count = 0 WHERE sha256 = $1")
+        .bind(&sha)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at) \
+         VALUES ('delete_object', $1, $2, now())",
+    )
+    .bind(&sha)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    drain_outbox_for(&pool, &store, &sha).await;
+
+    assert!(store.head(&key).await.unwrap(), "referenced object kept");
+    let blob = forge_db::blob_dao::get_blob(&pool, &sha)
+        .await
+        .unwrap()
+        .expect("blob row kept");
+    assert_eq!(blob.ref_count, 1, "counter repaired to the asset count");
+
+    // Cleanup.
+    sqlx::query("DELETE FROM repository WHERE id = $1")
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.delete(&key).await.unwrap();
+}
+
 /// The hard interleaving: an ingest registers, observes the old deduplicated S3
 /// object, and only later attaches its DB reference. A deleter must be unable to
 /// reserve in that gap; otherwise it could remove the object before incref.
@@ -467,4 +540,63 @@ async fn superseded_outbox_row_does_not_cut_the_newer_grace_short() {
         .await
         .unwrap();
     store.delete(&stored.s3_key).await.unwrap();
+}
+
+/// M19: `prune_processed` drains processed rows past the retention window in
+/// batches (more rows than one batch here) and leaves recent processed rows
+/// and unprocessed rows of any age alone. (The unprocessed row is scheduled in
+/// the future so sibling tests' worker runs never claim it.)
+#[tokio::test]
+async fn prune_processed_drops_only_expired_processed_rows() {
+    let _test_guard = OUTBOX_TEST_LOCK.lock().await;
+    let pool = common::pool().await;
+    let tag = format!("prune-{}", common::unique());
+
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at, created_at) \
+         SELECT 'delete_object', $1 || '-old-' || g, 'k', now() - interval '30 days', \
+                now() - interval '20 days', now() - interval '30 days' \
+         FROM generate_series(1, 1005) g",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, processed_at) \
+         VALUES ('delete_object', $1 || '-recent', 'k', now(), now() - interval '1 day')",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO blob_outbox (op, sha256, s3_key, available_at, created_at) \
+         VALUES ('delete_object', $1 || '-pending', 'k', now() + interval '30 days', \
+                 now() - interval '30 days')",
+    )
+    .bind(&tag)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pruned = outbox_worker::prune_processed(&pool, Duration::days(7))
+        .await
+        .unwrap();
+    assert!(
+        pruned >= 1005,
+        "every expired processed row pruned (got {pruned})"
+    );
+
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT sha256 FROM blob_outbox WHERE sha256 LIKE $1 || '-%' ORDER BY sha256",
+    )
+    .bind(&tag)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        left,
+        vec![format!("{tag}-pending"), format!("{tag}-recent")]
+    );
 }

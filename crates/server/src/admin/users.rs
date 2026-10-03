@@ -1,5 +1,12 @@
 //! Admin user CRUD (plan 10.4). Passwords are hashed with argon2id; the hash is
 //! never returned.
+//!
+//! Cutting a user off (review M5) works the same for every account kind,
+//! federated ones included: `PATCH /admin/users/{id}` with `{"active": false}`
+//! deactivates the account, revokes its sessions and purges its cached
+//! upstream verdicts. Deleting is *not* a block for federated users — an
+//! auto-provisioning realm re-creates a deleted account on its next valid
+//! upstream login — so deactivate instead.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -45,6 +52,17 @@ pub struct CreateUser {
 
 fn default_true() -> bool {
     true
+}
+
+/// Update-user request (`PATCH /admin/users/{id}`). Only the account state is
+/// settable; unknown fields (e.g. an attempted `is_admin`) are rejected rather
+/// than silently ignored.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateUser {
+    /// `false` deactivates (and cuts off) the user, `true` reactivates it.
+    #[serde(default)]
+    pub active: Option<bool>,
 }
 
 /// `GET /admin/users`
@@ -113,13 +131,75 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
     (StatusCode::CREATED, Json(UserView::from(&u))).into_response()
 }
 
-/// `DELETE /admin/users/{id}`
-pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    match user_dao::delete_user(&state.pool, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "user not found").into_response(),
-        Err(e) => db_error(e),
+/// `PATCH /admin/users/{id}` — deactivate (`{"active": false}`) or reactivate
+/// (`{"active": true}`) a user. Returns the updated [`UserView`]; idempotent.
+///
+/// Deactivation is the cut-off for every account kind, federated
+/// (credential-forwarding / OIDC) users included:
+/// 1. `active = false` — every authentication path (API tokens, password
+///    Basic, the browser session, OIDC and credential-forwarding logins)
+///    refuses an inactive user, and no auto-provisioning path reactivates it;
+/// 2. all of the user's sessions are revoked;
+/// 3. the user's validated-credential verdicts are purged (all providers,
+///    cluster-wide cache invalidation), so a later reactivation re-validates
+///    against the upstream instead of trusting a pre-deactivation verdict.
+///
+/// API tokens are refused while the user is inactive but not revoked, so a
+/// reactivated user's tokens work again; revoke them individually
+/// (`DELETE /admin/tokens/{id}`) to kill them for good. Reactivation changes
+/// only the flag.
+pub async fn update(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateUser>,
+) -> Response {
+    let Some(active) = body.active else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "nothing to update (expected {\"active\": true|false})",
+        )
+            .into_response();
+    };
+    let user = match user_dao::set_active(&state.pool, id, active).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    if !active {
+        if let Err(resp) = revoke_sessions_and_verdicts(&state, &user).await {
+            return resp;
+        }
+        tracing::info!(user_id = user.id, username = %user.username, "user deactivated");
     }
+    forge_core::authz::cache::invalidate_user(&state.cache, user.id).await;
+    Json(UserView::from(&user)).into_response()
+}
+
+/// `DELETE /admin/users/{id}` — delete the user (sessions, tokens, role
+/// assignments and identity links cascade) and purge the username's cached
+/// validated-credential verdicts, so no pre-deletion upstream verdict
+/// outlives the account.
+pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let user = match user_dao::find_user_by_id(&state.pool, id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    match user_dao::delete_user(&state.pool, id).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return db_error(e),
+    }
+    // After the delete, so a verdict cached by a login racing the delete is
+    // purged too (a forward still in flight is fenced by the revocation).
+    if let Err(e) =
+        forge_core::auth::revoke_credentials_for_user(&state.cache, &state.pool, &user.username)
+            .await
+    {
+        tracing::error!(error = %e, user_id = id, "deleted user's credential verdicts could not be purged");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `POST /admin/users/{id}/reauth` — force re-validation of a user's forwarded
@@ -128,9 +208,12 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 /// Purges every cached `validated_credential` verdict for the user (across all
 /// providers) and broadcasts a cache-layer invalidation, so the **next**
 /// password-Basic request for that user re-forwards to the upstream instead of
-/// serving a possibly-stale cached positive. Use after disabling the user
-/// upstream, after a password change, or to shrink the trust window. `204` on
-/// success (idempotent — a user with no cached verdicts still returns `204`).
+/// serving a possibly-stale cached positive, and revokes all of the user's
+/// browser sessions, so a signed-in browser must log in (and thus
+/// re-validate) again. Use after disabling the user upstream, after a password
+/// change, or to shrink the trust window. API tokens are untouched (they never
+/// depended on the upstream verdict). `204` on success (idempotent — a user
+/// with no cached verdicts or sessions still returns `204`).
 pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let user = match user_dao::find_user_by_id(&state.pool, id).await {
         Ok(Some(u)) => u,
@@ -138,15 +221,28 @@ pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         Err(e) => return db_error(e),
     };
 
-    match forge_core::auth::revoke_credentials_for_user(&state.cache, &state.pool, &user.username)
-        .await
-    {
-        Ok(_deleted) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, user_id = id, "reauth credential revoke failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-        }
+    match revoke_sessions_and_verdicts(&state, &user).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(resp) => resp,
     }
+}
+
+/// Revoke what lets an already-authenticated `user` keep going without
+/// proving themselves again: every browser session, then every cached
+/// validated-credential verdict (all providers, broadcast to peer caches).
+async fn revoke_sessions_and_verdicts(state: &AppState, user: &AppUser) -> Result<(), Response> {
+    if let Err(e) = state.sessions.revoke_all_for_user(user.id).await {
+        tracing::error!(error = %e, user_id = user.id, "session revoke failed");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
+    }
+    if let Err(e) =
+        forge_core::auth::revoke_credentials_for_user(&state.cache, &state.pool, &user.username)
+            .await
+    {
+        tracing::error!(error = %e, user_id = user.id, "credential verdict revoke failed");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
+    }
+    Ok(())
 }
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {

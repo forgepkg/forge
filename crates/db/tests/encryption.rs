@@ -184,17 +184,17 @@ async fn pg_key_store_lifecycle_and_single_active_invariant() {
         "partial unique index must reject a 2nd active DEK"
     );
 
-    // update_wrapped + set_state round-trip.
-    store
+    // update_wrapped (compare-and-swap) + set_state round-trip.
+    assert!(store
         .update_wrapped(
-            kek1.id,
+            &kek1,
             &[0xCD; 60],
             Some("env"),
             Some("sha256:8899aabbccddeeff"),
             None,
         )
         .await
-        .unwrap();
+        .unwrap());
     let rewrapped = store
         .get_version(KeyLayer::Kek, &scope, 1)
         .await
@@ -205,6 +205,17 @@ async fn pg_key_store_lifecycle_and_single_active_invariant() {
         rewrapped.root_key_version.as_deref(),
         Some("sha256:8899aabbccddeeff")
     );
+    // A second writer still holding the pre-swap record loses: nothing written.
+    assert!(!store
+        .update_wrapped(&kek1, &[0xEE; 60], Some("env"), Some("sha256:stale"), None)
+        .await
+        .unwrap());
+    let unchanged = store
+        .get_version(KeyLayer::Kek, &scope, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.wrapped_key, vec![0xCD; 60]);
     store.set_state(kek1.id, KeyState::Revoked).await.unwrap();
     let revoked = store
         .get_version(KeyLayer::Kek, &scope, 1)
@@ -228,6 +239,383 @@ async fn pg_key_store_lifecycle_and_single_active_invariant() {
         bad.is_err(),
         "check constraint must reject a DEK with root refs"
     );
+}
+
+/// One "instance" of the envelope service over the shared Postgres key store,
+/// with a fixed root (several instances built from the same `root` bytes model
+/// a multi-instance deployment).
+fn instance(pool: &PgPool, scope: &str, root: &KeyBytes) -> EnvelopeService {
+    EnvelopeService::new(
+        Arc::new(PgKeyStore::new(pool.clone())),
+        Arc::new(StaticRootProvider::new(
+            "env",
+            Algorithm::Aes256Gcm,
+            KeyBytes::from_slice(root.expose()).unwrap(),
+            vec![],
+        )),
+        EnvelopeServiceConfig {
+            scope: scope.to_string(),
+            ..Default::default()
+        },
+    )
+}
+
+/// Assert the hierarchy invariant of review M13: every non-revoked DEK names
+/// a KEK that exists and is not revoked.
+async fn assert_no_dek_under_revoked_kek(store: &PgKeyStore, scope: &str) {
+    let keks = store.list(KeyLayer::Kek, scope).await.unwrap();
+    for dek in store.list(KeyLayer::Dek, scope).await.unwrap() {
+        if dek.state == KeyState::Revoked {
+            continue;
+        }
+        let parent = dek.wrapping_kek_version.expect("DEK parent");
+        assert!(
+            keks.iter()
+                .any(|k| k.version == parent && k.state != KeyState::Revoked),
+            "DEK v{} is wrapped under revoked/missing KEK v{parent}: {keks:?}",
+            dek.version
+        );
+    }
+}
+
+/// Review M13: a re-wrap computed from a stale read can never land, a DEK can
+/// never be (re-)wrapped under or inserted beneath a revoked KEK, and a KEK
+/// that a DEK still references is not revoked — checked by the store at commit
+/// time, not by the caller's earlier listing.
+#[tokio::test]
+async fn kek_rewrap_is_compare_and_swap_and_never_targets_a_revoked_kek() {
+    let pool = pool().await;
+    let store = PgKeyStore::new(pool.clone());
+    let scope = format!("cas-{}", uuid::Uuid::new_v4());
+    let root = KeyBytes::generate();
+    let a = instance(&pool, &scope, &root);
+    let blob = a.seal(&secret("cas-secret"), realm_like(1)).await.unwrap();
+
+    // Instance A reads DEK v1 (under KEK v1) to re-wrap it under KEK v2 ...
+    let stale = store.list(KeyLayer::Dek, &scope).await.unwrap().remove(0);
+    assert_eq!(stale.wrapping_kek_version, Some(1));
+    // ... while "instance B" completes two KEK rotations: the DEK moves to
+    // KEK v3 and KEK v1 + v2 end up revoked.
+    a.rotate_kek().await.unwrap();
+    a.rotate_kek().await.unwrap();
+    let keks = store.list(KeyLayer::Kek, &scope).await.unwrap();
+    assert_eq!(keks[0].state, KeyState::Revoked);
+    assert_eq!(keks[1].state, KeyState::Revoked);
+    assert_eq!(keks[2].state, KeyState::Active);
+
+    // A's late write (stale row, revoked target) is refused, nothing written.
+    assert!(!store
+        .update_wrapped(&stale, &[0xAB; 60], None, None, Some(2))
+        .await
+        .unwrap());
+    // Even against the current row, a revoked target parent is refused.
+    let current = store.list(KeyLayer::Dek, &scope).await.unwrap().remove(0);
+    assert_eq!(current.wrapping_kek_version, Some(3));
+    assert!(!store
+        .update_wrapped(&current, &[0xAB; 60], None, None, Some(2))
+        .await
+        .unwrap());
+    let after = store.list(KeyLayer::Dek, &scope).await.unwrap().remove(0);
+    assert_eq!(after.wrapped_key, current.wrapped_key);
+    assert_eq!(after.wrapping_kek_version, Some(3));
+    // A brand-new DEK cannot be inserted beneath a revoked KEK either.
+    let err = store
+        .insert_active(NewKeyRecord {
+            layer: KeyLayer::Dek,
+            algorithm: Algorithm::Aes256Gcm,
+            wrapped_key: vec![0xAB; 60],
+            root_key_id: None,
+            root_key_version: None,
+            wrapping_kek_version: Some(2),
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            forge_crypto::CryptoError::KeyRevoked {
+                layer: "kek",
+                version: 2
+            }
+        ),
+        "{err:?}"
+    );
+
+    // Commit-time reference check: KEK v4 becomes active while the DEK still
+    // references v3 (now retiring) — v3 must survive a revoke attempt.
+    let provider = StaticRootProvider::new(
+        "env",
+        Algorithm::Aes256Gcm,
+        KeyBytes::from_slice(root.expose()).unwrap(),
+        vec![],
+    );
+    use forge_crypto::KmsProvider as _;
+    store
+        .insert_active(NewKeyRecord {
+            layer: KeyLayer::Kek,
+            algorithm: Algorithm::Aes256Gcm,
+            wrapped_key: provider
+                .wrap_kek(KeyBytes::generate().expose())
+                .await
+                .unwrap(),
+            root_key_id: Some("env".into()),
+            root_key_version: Some(provider.current_root_version().await.unwrap()),
+            wrapping_kek_version: None,
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    let kek3 = store
+        .get_version(KeyLayer::Kek, &scope, 3)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kek3.state, KeyState::Retiring);
+    assert!(!store.revoke_kek_if_unreferenced(&kek3).await.unwrap());
+    assert_eq!(
+        store
+            .get_version(KeyLayer::Kek, &scope, 3)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        KeyState::Retiring
+    );
+    // Once the sweep moved the DEK, v3 is revoked; the secret still opens on
+    // a cold instance.
+    assert_eq!(a.rewrap_deks().await.unwrap(), 1);
+    assert_eq!(a.revoke_unreferenced_keks().await.unwrap(), 1);
+    assert_no_dek_under_revoked_kek(&store, &scope).await;
+    let cold = instance(&pool, &scope, &root);
+    assert_eq!(
+        cold.open(&blob, realm_like(1))
+            .await
+            .unwrap()
+            .expose_secret(),
+        "cas-secret"
+    );
+}
+
+/// Review M13 under real concurrency: several instances rotating the KEK at
+/// once (as an admin request racing the worker on another node would) may
+/// fail or skip rows, but never leave a DEK wrapped under a revoked KEK; one
+/// converging pass afterwards moves everything under the active KEK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_kek_rotations_keep_every_dek_unwrappable() {
+    let pool = pool().await;
+    let store = PgKeyStore::new(pool.clone());
+    let scope = format!("race-{}", uuid::Uuid::new_v4());
+    let root = KeyBytes::generate();
+    let first = instance(&pool, &scope, &root);
+    let blob = first
+        .seal(&secret("race-secret"), realm_like(2))
+        .await
+        .unwrap();
+    // A second DEK so the re-wrap sweeps have more than one row to race on.
+    first.rotate_dek().await.unwrap();
+    let blob2 = first
+        .seal(&secret("race-secret-2"), realm_like(3))
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let svc = Arc::new(instance(&pool, &scope, &root));
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..3 {
+                // Errors are acceptable here (a racing rotation revoked a KEK
+                // this one was about to read); corruption is not.
+                let _ = svc.rotate_kek().await;
+                let _ = svc.rewrap_deks().await;
+                let _ = svc.revoke_unreferenced_keks().await;
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_no_dek_under_revoked_kek(&store, &scope).await;
+
+    let converge = instance(&pool, &scope, &root);
+    converge.rewrap_deks().await.expect("converging re-wrap");
+    converge
+        .revoke_unreferenced_keks()
+        .await
+        .expect("converging revoke");
+    assert_no_dek_under_revoked_kek(&store, &scope).await;
+    let active = store
+        .get_active(KeyLayer::Kek, &scope)
+        .await
+        .unwrap()
+        .expect("active KEK");
+    for dek in store.list(KeyLayer::Dek, &scope).await.unwrap() {
+        assert_eq!(dek.wrapping_kek_version, Some(active.version));
+    }
+    let cold = instance(&pool, &scope, &root);
+    assert_eq!(
+        cold.open(&blob, realm_like(2))
+            .await
+            .unwrap()
+            .expose_secret(),
+        "race-secret"
+    );
+    assert_eq!(
+        cold.open(&blob2, realm_like(3))
+            .await
+            .unwrap()
+            .expose_secret(),
+        "race-secret-2"
+    );
+}
+
+/// A test-only AEAD binding (the key-hierarchy tests never store the blob).
+fn realm_like(row_pk: i64) -> forge_crypto::envelope::AeadBinding<'static> {
+    forge_crypto::envelope::AeadBinding {
+        table: "test",
+        column: "secret",
+        row_pk,
+    }
+}
+
+/// Review M13, DEK layer: a retiring DEK is revoked only if no ciphertext
+/// references it **at commit time**. The revoker waits for an in-flight writer
+/// that still seals under that DEK (and then keeps it), and a writer whose DEK
+/// is revoked while it waits writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dek_revocation_is_checked_at_commit_time_against_writers() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    // The reference scan is table-wide; start from no stored ciphertext.
+    sqlx::query("DELETE FROM group_member")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM repository")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let scope = format!("dek-revoke-{}", uuid::Uuid::new_v4());
+    let envelope = Arc::new(envelope_with_scope(&pool, &scope));
+    envelope.ensure_active_keys().await.unwrap();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy("crypt-inflight"))
+        .await
+        .unwrap();
+    let repo_binding = forge_crypto::envelope::AeadBinding {
+        table: secret_dao::UPSTREAM_PASSWORD_TABLE,
+        column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
+        row_pk: repo.id,
+    };
+
+    // A writer sealed under DEK v1, then DEK v2 became active (v1 retiring).
+    let blob_v1 = envelope
+        .seal(&secret("in-flight"), repo_binding)
+        .await
+        .unwrap();
+    assert_eq!(EnvelopeService::blob_dek_version(&blob_v1).unwrap(), 1);
+    envelope.rotate_dek().await.unwrap();
+
+    // The writer's transaction (the protocol every secret_dao write follows):
+    // FOR SHARE on its DEK, then the ciphertext write — not committed yet.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT 1 FROM encryption_key WHERE layer = 'dek' AND scope = $1 AND version = 1 \
+         AND state <> 'revoked' FOR SHARE",
+    )
+    .bind(&scope)
+    .fetch_one(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE repository SET upstream_password_enc = $2 WHERE id = $1")
+        .bind(repo.id)
+        .bind(&blob_v1)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+    // The sweep's revocation must wait for the writer instead of revoking v1
+    // from a snapshot that cannot see the uncommitted blob.
+    let revoker = {
+        let pool = pool.clone();
+        let envelope = envelope.clone();
+        tokio::spawn(async move { secret_dao::revoke_unreferenced_deks(&pool, &envelope).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !revoker.is_finished(),
+        "revocation must wait for the in-flight ciphertext writer"
+    );
+    writer.commit().await.unwrap();
+    let revoked = revoker.await.unwrap().expect("revoke sweep");
+    assert_eq!(revoked, 0, "DEK v1 is referenced at commit time: kept");
+    let deks = envelope.list_keys(KeyLayer::Dek).await.unwrap();
+    assert_eq!(deks[0].state, KeyState::Retiring);
+    assert_eq!(
+        secret_dao::get_upstream_password(&pool, &envelope, repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .expose_secret(),
+        "in-flight"
+    );
+
+    // Writer side: set_upstream_password seals under the active DEK v2; if v2
+    // is revoked while the write waits for its row lock, nothing is written.
+    let mut revoker_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT 1 FROM encryption_key WHERE layer = 'dek' AND scope = $1 AND version = 2 \
+         FOR UPDATE",
+    )
+    .bind(&scope)
+    .fetch_one(&mut *revoker_tx)
+    .await
+    .unwrap();
+    let write = {
+        let pool = pool.clone();
+        let envelope = envelope.clone();
+        let id = repo.id;
+        tokio::spawn(async move {
+            secret_dao::set_upstream_password(&pool, &envelope, id, Some(&secret("late"))).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !write.is_finished(),
+        "the write must wait for the DEK row lock"
+    );
+    sqlx::query(
+        "UPDATE encryption_key SET state = 'revoked' WHERE layer = 'dek' AND scope = $1 \
+         AND version = 2",
+    )
+    .bind(&scope)
+    .execute(&mut *revoker_tx)
+    .await
+    .unwrap();
+    revoker_tx.commit().await.unwrap();
+    let err = write.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            secret_dao::SecretDbError::Crypto(forge_crypto::CryptoError::KeyRevoked {
+                layer: "dek",
+                version: 2
+            })
+        ),
+        "{err:?}"
+    );
+    let stored = sqlx::query!(
+        r#"SELECT upstream_password_enc AS "b!" FROM repository WHERE id = $1"#,
+        repo.id
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .b;
+    assert_eq!(stored, blob_v1, "no ciphertext under the revoked DEK");
+
+    repository_dao::delete_repository(&pool, repo.id)
+        .await
+        .unwrap();
 }
 
 /// The full §12.5 data path against real Postgres: encrypted set/get, envelope
@@ -351,17 +739,92 @@ async fn upstream_password_end_to_end() {
     let legacy = repository_dao::insert_repository(&pool, legacy)
         .await
         .unwrap();
+    // A row 0.1.0's backfill left behind: envelope written, plaintext kept.
+    let mut leftover = NewRepository::proxy("crypt-leftover");
+    leftover.upstream_password = Some("leftover-pw".to_string());
+    let leftover = repository_dao::insert_repository(&pool, leftover)
+        .await
+        .unwrap();
+    let leftover_blob = envelope
+        .seal(
+            &secret("leftover-pw"),
+            forge_crypto::envelope::AeadBinding {
+                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
+                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
+                row_pk: leftover.id,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query!(
+        r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
+        leftover.id,
+        &leftover_blob
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A row whose envelope is stale (the password was changed while
+    // encryption was off) and one whose envelope does not decrypt: in both
+    // the plaintext is the copy to keep, so it is sealed afresh.
+    let mut stale = NewRepository::proxy("crypt-stale");
+    stale.upstream_password = Some("new-pw".to_string());
+    let stale = repository_dao::insert_repository(&pool, stale)
+        .await
+        .unwrap();
+    let stale_blob = envelope
+        .seal(
+            &secret("old-pw"),
+            forge_crypto::envelope::AeadBinding {
+                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
+                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
+                row_pk: stale.id,
+            },
+        )
+        .await
+        .unwrap();
+    let mut broken = NewRepository::proxy("crypt-broken");
+    broken.upstream_password = Some("broken-pw".to_string());
+    let broken = repository_dao::insert_repository(&pool, broken)
+        .await
+        .unwrap();
+    for (id, blob) in [
+        (stale.id, stale_blob),
+        (broken.id, b"not an envelope".to_vec()),
+    ] {
+        sqlx::query!(
+            r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
+            id,
+            &blob
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
     assert!(secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
 
+    // One pass seals the plaintext-only row, clears the verified leftover
+    // copy and re-seals the stale and the undecryptable rows.
     let done = secret_dao::backfill_upstream_passwords(&pool, &envelope, 100)
         .await
         .expect("backfill");
-    assert_eq!(done, 1);
+    assert_eq!(done, 4);
+    // Every plaintext copy is gone, not just the un-sealed ones.
     assert!(!secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
+    let plaintext_rows = sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM repository WHERE upstream_password IS NOT NULL"#
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        plaintext_rows, 0,
+        "no plaintext password may remain at rest"
+    );
     // Re-run is a no-op (idempotent).
     assert_eq!(
         secret_dao::backfill_upstream_passwords(&pool, &envelope, 100)
@@ -369,21 +832,28 @@ async fn upstream_password_end_to_end() {
             .unwrap(),
         0
     );
-    // The original plaintext survives the round trip; the plaintext column is
-    // still present pre-cutover (dropped by a later migration).
-    let got = secret_dao::get_upstream_password(&pool, &envelope, legacy.id)
+    // The original plaintexts survive the round trip, now only as envelopes.
+    for (id, expected) in [
+        (legacy.id, "legacy-pw"),
+        (leftover.id, "leftover-pw"),
+        (stale.id, "new-pw"),
+        (broken.id, "broken-pw"),
+    ] {
+        let got = secret_dao::get_upstream_password(&pool, &envelope, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.expose_secret(), expected);
+        let row = sqlx::query!(
+            r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
+            id
+        )
+        .fetch_one(&pool)
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(got.expose_secret(), "legacy-pw");
-    let row = sqlx::query!(
-        r#"SELECT upstream_password FROM repository WHERE id = $1"#,
-        legacy.id
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(row.upstream_password.as_deref(), Some("legacy-pw"));
+        assert!(row.upstream_password.is_none(), "plaintext cleared");
+        assert!(row.upstream_password_enc.is_some());
+    }
 
     // ── DEK rotation + lazy re-encrypt sweep ─────────────────────────────────
     let old_dek = EnvelopeService::blob_dek_version(&blob).unwrap();
@@ -401,7 +871,10 @@ async fn upstream_password_end_to_end() {
             None => break,
         }
     }
-    assert_eq!(resealed, 2, "repo1 + legacy re-encrypted under the new DEK");
+    assert_eq!(
+        resealed, 5,
+        "repo1 + legacy + leftover + stale + broken re-encrypted under the new DEK"
+    );
 
     // Everything still decrypts and now references the active DEK.
     for (id, expected) in [(repo1.id, "hunter2"), (legacy.id, "legacy-pw")] {
@@ -526,16 +999,28 @@ async fn realm_secrets_end_to_end() {
         .await
         .is_err());
 
-    let backfilled = secret_dao::backfill_realm_secrets(&pool, &envelope, |kind| {
+    let realm_keys = |kind: &str| -> &'static [&'static str] {
         if kind == "credential_forwarding" {
             &["key_pepper"]
         } else {
             &[]
         }
-    })
-    .await
-    .expect("backfill");
+    };
+    assert!(
+        secret_dao::plaintext_realm_secrets_pending(&pool, realm_keys)
+            .await
+            .unwrap(),
+        "the legacy realm's plaintext pepper is reported pending"
+    );
+    let backfilled = secret_dao::backfill_realm_secrets(&pool, &envelope, realm_keys)
+        .await
+        .expect("backfill");
     assert!(backfilled >= 1);
+    assert!(
+        !secret_dao::plaintext_realm_secrets_pending(&pool, realm_keys)
+            .await
+            .unwrap()
+    );
     let legacy = auth_realm_dao::find_realm_by_id(&pool, legacy.id)
         .await
         .unwrap()

@@ -14,16 +14,18 @@
 
 mod common;
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use forge_core::repo::NoopCacheInvalidator;
-use forge_core::retention::worker::{RetentionConfig, RetentionWorker};
+use forge_core::retention::worker::{RetentionConfig, RetentionWorker, WorkerError};
+use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
-use forge_db::{blob_dao, retention_dao};
+use forge_db::{blob_dao, proxy_dao, retention_dao};
 use forge_nuget::NugetFormat;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -345,4 +347,335 @@ async fn shared_blob_not_enqueued_until_last_reference_removed() {
     assert_eq!(summary.blobs_enqueued, 1);
     assert_eq!(ref_count(&pool, &sha).await, Some(0));
     assert_eq!(outbox_count(&pool, &sha).await, 1);
+}
+
+/// The ledger's `locked_until` for a repo.
+async fn locked_until(pool: &PgPool, repo_id: i64) -> Option<DateTime<Utc>> {
+    retention_dao::get_run(pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .locked_until
+}
+
+/// Insert a proxy cached-version row with backdated timestamps.
+async fn seed_cached_version(
+    pool: &PgPool,
+    repo_id: i64,
+    version: &str,
+    downloaded: bool,
+    last_pulled_days_ago: Option<i32>,
+) {
+    proxy_dao::upsert_cached_version(
+        pool,
+        proxy_dao::NewProxyCachedVersion {
+            repository_id: repo_id,
+            name: "lib".into(),
+            version: version.into(),
+            listed: true,
+            downloaded,
+            not_found: false,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE proxy_cached_version \
+         SET first_seen_at = now() - interval '90 days', \
+             last_downloaded_at = now() - make_interval(days => $3) \
+         WHERE repository_id = $1 AND version = $2",
+    )
+    .bind(repo_id)
+    .bind(version)
+    .bind(last_pulled_days_ago)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn cached_row(
+    pool: &PgPool,
+    repo_id: i64,
+    version: &str,
+) -> Option<forge_db::model::ProxyCachedVersion> {
+    proxy_dao::get_cached_version(pool, repo_id, "lib", version)
+        .await
+        .unwrap()
+}
+
+async fn audit_total(pool: &PgPool, repo_id: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM retention_audit WHERE repository_id = $1")
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stored_hosted_scope_rule_on_proxy_fails_the_run_without_mutating() {
+    // Regression (H2): a policy stored before validation rejected hosted-scope
+    // rules on proxies (scope omitted ⇒ hosted) must not run its hosted-style
+    // deletes against the proxy's cached components — that left
+    // `proxy_cached_version.downloaded = true` with no local copy, so restores
+    // 404ed forever. The worker refuses the policy and records a failed run.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("rwp-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    seed_cached_version(&pool, repo.id, "1.0.0", true, Some(90)).await;
+
+    // Written straight through the DAO, bypassing the admin API's validation,
+    // like a policy stored by an older release.
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [
+                { "id": "sweep", "action": "hard_delete", "criteria": { "older_than_days": 30 } },
+                { "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                  "criteria": { "not_pulled_for_days": 30 } }
+            ]
+        }),
+    )
+    .await;
+
+    let w = worker(&pool, config());
+    let err = w
+        .tick_repo(repo.id)
+        .await
+        .expect_err("a hosted-scope rule on a proxy must fail the run");
+    assert!(
+        matches!(&err, WorkerError::Policy(m) if m.contains("proxy_cached")),
+        "error must name the fix: {err}"
+    );
+
+    // Nothing was deleted or evicted.
+    assert!(component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert_eq!(ref_count(&pool, &sha).await, Some(1));
+    assert!(
+        cached_row(&pool, repo.id, "1.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert_eq!(audit_total(&pool, repo.id).await, 0);
+
+    // The failure is on the ledger and the lease is released.
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, "idle");
+    assert!(run.locked_until.is_none());
+    let last_error = run.last_error.expect("failed run records last_error");
+    assert!(
+        last_error.contains("\"sweep\"") && last_error.contains("proxy_cached"),
+        "{last_error}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_eviction_keeps_rows_and_ignores_metadata_only_versions() {
+    // Regression (M7): eviction used to delete the `proxy_cached_version` row
+    // (resetting `first_seen_at`, the package-delay anchor, on the next
+    // listing), and metadata-only rows (`downloaded = false`, never pulled)
+    // were candidates too, so every run "evicted" them again with an audit row
+    // per version. Now only cached bytes are evicted, the row is kept as
+    // metadata-only, and a second run finds nothing to do.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("rwm-{n}")))
+        .await
+        .unwrap();
+    // 1.0.0: cached bytes, cold. 2.0.0: listed upstream, never pulled.
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    seed_cached_version(&pool, repo.id, "1.0.0", true, Some(90)).await;
+    seed_cached_version(&pool, repo.id, "2.0.0", false, None).await;
+    let cold_before = cached_row(&pool, repo.id, "1.0.0").await.unwrap();
+    let meta_before = cached_row(&pool, repo.id, "2.0.0").await.unwrap();
+
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                        "criteria": { "not_pulled_for_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let w = worker(&pool, config());
+    let s1 = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(
+        s1.evaluated, 1,
+        "only the downloaded version is a candidate"
+    );
+    assert_eq!(s1.deleted, 1);
+    assert_eq!(audit_total(&pool, repo.id).await, 1);
+
+    // The evicted version: bytes gone, row kept as metadata-only.
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert_eq!(ref_count(&pool, &sha).await, Some(0));
+    assert_eq!(outbox_count(&pool, &sha).await, 1);
+    let cold_after = cached_row(&pool, repo.id, "1.0.0").await.unwrap();
+    assert!(!cold_after.downloaded);
+    assert_eq!(cold_after.id, cold_before.id);
+    assert_eq!(cold_after.first_seen_at, cold_before.first_seen_at);
+    // The metadata-only version is untouched.
+    let meta_after = cached_row(&pool, repo.id, "2.0.0").await.unwrap();
+    assert_eq!(meta_after.id, meta_before.id);
+    assert_eq!(meta_after.first_seen_at, meta_before.first_seen_at);
+
+    // A second run has nothing to evict and writes no audit rows.
+    retention_dao::schedule_now(&pool, repo.id).await.unwrap();
+    let s2 = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(s2.evaluated, 0);
+    assert_eq!(s2.deleted, 0);
+    assert_eq!(audit_total(&pool, repo.id).await, 1);
+}
+
+/// A [`Format`] whose version ordering panics, to make `process` panic in the
+/// evaluator (which orders each package's versions through the seam).
+struct PanickingFormat;
+
+impl Format for PanickingFormat {
+    fn id(&self) -> &'static str {
+        "nuget"
+    }
+    fn parse_upload(&self, _file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+        unreachable!("retention never parses")
+    }
+    fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+        Ok(raw.to_string())
+    }
+    fn compare_versions(&self, _a: &str, _b: &str) -> Ordering {
+        panic!("compare_versions exploded")
+    }
+    fn lower_id(&self, id: &str) -> String {
+        id.to_lowercase()
+    }
+}
+
+/// Short lease ⇒ the heartbeat renews every second.
+fn short_lease_config() -> RetentionConfig {
+    RetentionConfig {
+        lease: Duration::seconds(3),
+        ..config()
+    }
+}
+
+#[tokio::test]
+async fn panicking_run_is_recorded_as_failed_and_its_heartbeat_stops() {
+    // Regression (L10): a panic in `process` used to unwind past `fail_run`,
+    // leaving the ledger row `running` while the detached heartbeat renewed
+    // its lease forever, so the repository was never retried.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw6-{n}")))
+        .await
+        .unwrap();
+    for i in 0..2u64 {
+        let sha = seed_blob(&pool, n * 100 + i, 1).await;
+        seed_component(&pool, repo.id, "lib", &format!("1.0.{i}"), &sha, 100).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "sweep", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let w = RetentionWorker::new(
+        pool.clone(),
+        Arc::new(PanickingFormat),
+        Arc::new(NoopCacheInvalidator),
+        short_lease_config(),
+    );
+    let err = w
+        .tick_repo(repo.id)
+        .await
+        .expect_err("a panicking run surfaces as an error");
+    assert!(
+        matches!(&err, WorkerError::Panicked(m) if m.contains("compare_versions exploded")),
+        "{err}"
+    );
+
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, "idle", "the failed run must be recorded");
+    assert!(run.locked_until.is_none(), "the lease must be released");
+    assert!(run.last_error.unwrap().contains("panicked"));
+
+    // Past several heartbeat periods, nothing renews the lease.
+    tokio::time::sleep(StdDuration::from_millis(2500)).await;
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.state, "idle");
+    assert!(run.locked_until.is_none());
+    assert!(component_exists(&pool, repo.id, "lib", "1.0.0").await);
+}
+
+#[tokio::test]
+async fn dropped_tick_aborts_its_lease_heartbeat() {
+    // Regression (L10): the heartbeat was a detached task, so a run whose
+    // future was dropped mid-flight (e.g. a shutdown select or timeout) kept
+    // renewing its lease forever. Block the run on a row lock, drop it, and
+    // check the lease stops advancing.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw7-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    let comp_id = seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "sweep", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    // Hold the component's row lock so the apply step blocks.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM component WHERE id = $1 FOR UPDATE")
+        .bind(comp_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let w = worker(&pool, short_lease_config());
+    let timed_out = tokio::time::timeout(StdDuration::from_millis(2500), w.tick_repo(repo.id))
+        .await
+        .is_err();
+    assert!(timed_out, "the run must have been blocked on the row lock");
+
+    // The run was claimed and its lease renewed while it ran ...
+    let before = locked_until(&pool, repo.id)
+        .await
+        .expect("the abandoned run still holds its lease");
+    // ... but once the tick future is gone, nobody renews it.
+    tokio::time::sleep(StdDuration::from_millis(2500)).await;
+    assert_eq!(
+        locked_until(&pool, repo.id).await,
+        Some(before),
+        "a dropped run's heartbeat must stop renewing the lease"
+    );
+
+    blocker.rollback().await.unwrap();
 }

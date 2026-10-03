@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   createFileRoute,
@@ -10,7 +10,7 @@ import {
 
 import { meKeys, meQueryOptions } from '~/api/me'
 import { authKeys, authSessionQueryOptions, logout } from '~/api/auth'
-import { ApiError } from '~/lib/httpClient'
+import { ApiError, onUnauthorized } from '~/lib/httpClient'
 import { clearSession, onAuthChange } from '~/lib/auth'
 import { useMe } from '~/queries/useMe'
 import { Badge } from '~/components/catalyst/badge'
@@ -62,7 +62,7 @@ export const Route = createFileRoute('/_app')({
 const NAV_ITEMS = [
   { label: 'Browse', to: '/', adminOnly: false },
   { label: 'Tokens', to: '/tokens', adminOnly: false },
-  { label: 'Admin', to: '/admin', adminOnly: true },
+  { label: 'Admin', to: '/manage', adminOnly: true },
 ] as const
 
 /** Whether a nav target is the current location (Browse only matches exactly). */
@@ -84,15 +84,47 @@ function AppLayout() {
   const router = useRouter()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
 
+  // Set while a deliberate sign-out runs: its own 401s (an already-expired
+  // session) must not be reported as "session expired".
+  const signingOut = useRef(false)
+  // Set once a 401 has sent us to login, so a burst of failing requests
+  // navigates once.
+  const expiredHandled = useRef(false)
+
   // Keep the `me` query in sync with same-tab and cross-tab credential changes.
   // This is a genuine external-system subscription (localStorage + the auth
   // module's in-tab notifier), so an effect is the right tool; it returns a
   // cleanup and invalidates the cached identity whenever the credential moves.
+  // (`clearSession` only notifies when a token was stored, so a 401 reaches
+  // this at most once.)
   useEffect(() => {
     return onAuthChange(() => {
       void queryClient.invalidateQueries({ queryKey: meKeys.self() })
     })
   }, [queryClient])
+
+  // A 401 from any API call means the session is gone (idle timeout, revoked,
+  // signed out in another tab). *Remove* the cached identity and session sync
+  // — invalidating would keep the stale `me`, which the route guards'
+  // `ensureQueryData` keeps resolving, so the user would never reach login —
+  // and route to /login with a return-to and the "expired" notice. The
+  // return-to is the latest location, i.e. the attempted one when the 401
+  // came from a route guard mid-navigation.
+  useEffect(() => {
+    return onUnauthorized(() => {
+      if (signingOut.current || expiredHandled.current) return
+      queryClient.removeQueries({ queryKey: meKeys.self() })
+      queryClient.removeQueries({ queryKey: authKeys.session() })
+      const location = router.latestLocation
+      if (location.pathname === '/login') return
+      expiredHandled.current = true
+      void router.navigate({
+        to: '/login',
+        search: { redirect: location.href, expired: true },
+        replace: true,
+      })
+    })
+  }, [queryClient, router])
 
   // `is_admin` is the server's effective RBAC verdict (admin role or legacy
   // flag), not the raw column.
@@ -106,6 +138,7 @@ function AppLayout() {
     // login screen: the server session may still be alive, and silently
     // pretending otherwise would leave it usable. Local state is cleared and
     // the user is sent to login either way.
+    signingOut.current = true
     let logoutFailed = false
     try {
       await logout()
@@ -113,9 +146,11 @@ function AppLayout() {
       // A 401 means the session is already gone — that is a successful logout.
       logoutFailed = !(error instanceof ApiError && error.status === 401)
     }
+    // Drop *every* cached query, not just the identity: the next person to
+    // sign in on this browser must never see the previous user's data. Done
+    // before `clearSession` so its notification finds nothing to refetch.
+    queryClient.clear()
     clearSession()
-    queryClient.removeQueries({ queryKey: authKeys.session() })
-    queryClient.removeQueries({ queryKey: meKeys.self() })
     void router.navigate({
       to: '/login',
       search: logoutFailed ? { logout_failed: true } : {},

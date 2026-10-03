@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE encryption_key AS e\n            SET wrapped_key = $2, root_key_id = $3, root_key_version = $4,\n                wrapping_kek_version = $5\n            WHERE e.id = $1\n              AND e.state <> 'revoked'\n              AND e.wrapped_key = $6\n              AND e.root_key_version IS NOT DISTINCT FROM $7\n              AND e.wrapping_kek_version IS NOT DISTINCT FROM $8\n              AND ($5::int4 IS NULL OR EXISTS (\n                    SELECT 1 FROM encryption_key k\n                    WHERE k.layer = 'kek' AND k.scope = e.scope\n                      AND k.version = $5 AND k.state <> 'revoked'))\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea",
+        "Text",
+        "Text",
+        "Int4",
+        "Bytea",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "78878b8524585048a388e11102b23ce63f1ed667599901202bf8641dd5548aa9"
+}

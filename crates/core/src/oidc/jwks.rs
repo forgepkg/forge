@@ -125,7 +125,8 @@ pub struct WorkloadDiscoveryDocument {
 pub struct Verified {
     /// `sub` — the stable, issuer-scoped subject identifier.
     pub subject: String,
-    /// `iss` — the issuer (already validated to equal the configured issuer).
+    /// `iss` — the issuer, exactly as the token (and the discovery document)
+    /// spell it; equal to the configured issuer up to a trailing slash.
     pub issuer: String,
     /// All decoded claims, for downstream claim → user / admin mapping.
     pub claims: IdTokenClaims,
@@ -444,10 +445,17 @@ impl OidcMetadataClient {
         }
 
         // 2. Locate the key in the cached JWKS; on a kid miss force exactly one
-        //    refetch (early IdP rotation) and look again.
-        let jwks_uri = match discovery_kind {
-            DiscoveryKind::Interactive => self.discovery().await?.jwks_uri,
-            DiscoveryKind::Workload => self.workload_discovery().await?.jwks_uri,
+        //    refetch (early IdP rotation) and look again. The discovery
+        //    document also supplies the issuer string tokens must carry.
+        let (jwks_uri, discovered_issuer) = match discovery_kind {
+            DiscoveryKind::Interactive => {
+                let doc = self.discovery().await?;
+                (doc.jwks_uri, doc.issuer)
+            }
+            DiscoveryKind::Workload => {
+                let doc = self.workload_discovery().await?;
+                (doc.jwks_uri, doc.issuer)
+            }
         };
         let mut jwks = self.fetch_jwks_cached(&jwks_uri).await?;
         let mut jwk = find_key(&jwks, kid.as_deref());
@@ -490,11 +498,18 @@ impl OidcMetadataClient {
         let decoding_key =
             DecodingKey::from_jwk(jwk).map_err(|e| OidcError::InvalidToken(e.to_string()))?;
 
-        // 4. Build a strict validation: RSA family only, issuer = configured
-        //    issuer, audience = client_id, exp/nbf with leeway.
+        // 4. Build a strict validation: RSA family only, issuer = the issuer
+        //    string *exactly as the discovery document states it*, audience =
+        //    client_id, exp/nbf with leeway. Not the normalized configured
+        //    issuer: OIDC requires `iss` to be byte-identical to the discovered
+        //    issuer, and issuers such as Auth0's end in `/`, which the
+        //    normalized (cache-key / routing) form has stripped — validating
+        //    against that would reject every token. The discovery document's
+        //    issuer was already checked to equal the configured one up to that
+        //    trailing slash.
         let mut validation = Validation::new(header.alg);
         validation.algorithms = vec![header.alg];
-        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_issuer(&[discovered_issuer.as_str()]);
         validation.set_audience(audiences);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.leeway = leeway_seconds;
@@ -611,9 +626,11 @@ fn find_key<'a>(jwks: &'a JwkSet, kid: Option<&str>) -> Option<&'a jsonwebtoken:
     }
 }
 
-/// Normalize an issuer for use as a cache key + well-known base: trim a single
-/// trailing slash (the spec says the issuer has no trailing slash, but be lenient
-/// on config).
+/// Normalize an issuer for use as a cache key + well-known base (and for
+/// comparing a discovery document's issuer with the configured one): trim
+/// trailing slashes, so `https://idp/` and `https://idp` share one cache entry
+/// and one discovery URL. **Never** used for `iss` validation — tokens must
+/// carry the discovered issuer verbatim (Auth0-style issuers end in `/`).
 fn normalize_issuer(issuer: String) -> String {
     issuer.trim_end_matches('/').to_string()
 }
@@ -1160,6 +1177,87 @@ mod tests {
         };
         let err = client.verify_id_token(&token, &params).await.unwrap_err();
         assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+    }
+
+    /// Review L7(b): issuers that end in `/` (Auth0: `https://tenant.auth0.com/`)
+    /// put that exact string in discovery and in every token's `iss`. They must
+    /// validate whether the operator configured the issuer with or without the
+    /// slash; the normalized form is only a cache key.
+    #[tokio::test]
+    async fn trailing_slash_issuer_validates_id_tokens() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let idp_issuer = format!("{base}/");
+        let signer = TestSigner::new("k1");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_json(&idp_issuer, &base)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [signer.jwk] })))
+            .mount(&server)
+            .await;
+
+        let token = signer.sign(&good_claims(&idp_issuer, "client-abc", "n"));
+        let params = VerifyParams {
+            audience: "client-abc".into(),
+            nonce: Some("n".into()),
+            leeway_seconds: 60,
+        };
+        for configured in [idp_issuer.clone(), base.clone()] {
+            let verified = client_for(&configured, &server)
+                .verify_id_token(&token, &params)
+                .await
+                .unwrap_or_else(|e| panic!("configured {configured:?}: {e}"));
+            assert_eq!(
+                verified.issuer, idp_issuer,
+                "the token's exact issuer is reported"
+            );
+        }
+
+        // `iss` must still match the discovered issuer exactly: the slash-less
+        // spelling is a different string.
+        let wrong = signer.sign(&good_claims(&base, "client-abc", "n"));
+        let err = client_for(&idp_issuer, &server)
+            .verify_id_token(&wrong, &params)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+    }
+
+    /// Review L7(b), WIF side: the workload verifier shares the same `iss`
+    /// check, so a trailing-slash workload issuer validates too.
+    #[tokio::test]
+    async fn trailing_slash_issuer_validates_workload_tokens() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        let idp_issuer = format!("{base}/");
+        let signer = TestSigner::new("wif-key");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": idp_issuer,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [signer.jwk] })))
+            .mount(&server)
+            .await;
+
+        let token = signer.sign(&workload_claims(&idp_issuer, "forge-ci"));
+        // WIF realms store the issuer normalized (slash trimmed).
+        let verified = client_for(&base, &server)
+            .verify_workload_jwt(&token, &["forge-ci"], &[], 60, 3600)
+            .await
+            .expect("trailing-slash workload issuer validates");
+        assert_eq!(verified.issuer, idp_issuer);
     }
 
     #[tokio::test]

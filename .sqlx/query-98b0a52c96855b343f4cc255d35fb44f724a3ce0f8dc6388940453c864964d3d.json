@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE validated_credential\n        SET verdict       = $4,\n            expires_at    = $5,\n            created_at    = now(),\n            claim_token   = NULL,\n            claimed_until = NULL\n        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3\n          AND claim_token = $6\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98b0a52c96855b343f4cc255d35fb44f724a3ce0f8dc6388940453c864964d3d"
+}

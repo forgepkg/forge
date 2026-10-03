@@ -112,6 +112,13 @@ impl Default for ResolvePolicy {
 /// In every path the resolved user's `active` flag is enforced
 /// ([`ResolveError::Inactive`]) — an IdP login can't bypass a locally disabled
 /// account.
+///
+/// **Concurrent first logins.** Two callbacks for the same new `(issuer,
+/// subject)` can both miss step 1 and both provision. The `(issuer, subject)`
+/// link is unique and never re-pointed, so exactly one account wins it; the
+/// loser adopts the account the link actually names (the `user_id` the link
+/// upsert returns) and deletes the orphan it just provisioned — a session is
+/// never minted for an account the identity is not linked to.
 pub async fn resolve_user(
     pool: &PgPool,
     login: &ValidatedLogin,
@@ -130,7 +137,7 @@ pub async fn resolve_user(
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?
     {
-        return finalize(pool, user, login, &identity_claims, mapped).await;
+        return finalize(pool, user, login, &identity_claims, mapped, false).await;
     }
 
     // 2. No link, but an existing user owns this username → link it, unless
@@ -144,7 +151,7 @@ pub async fn resolve_user(
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
             if user.password_hash.is_none() && !user.is_admin && !is_admin_role {
-                return finalize(pool, user, login, &identity_claims, mapped).await;
+                return finalize(pool, user, login, &identity_claims, mapped, false).await;
             }
             tracing::warn!(
                 username = %mapped.username,
@@ -155,8 +162,62 @@ pub async fn resolve_user(
 
     // 3. Auto-provision a fresh, password-less user, then link.
     if policy.auto_provision {
+        let user = match provision_oidc_user(pool, login, mapped).await? {
+            Provisioned::New(user) => {
+                finalize(pool, user, login, &identity_claims, mapped, true).await?
+            }
+            // A concurrent first login provisioned and linked the identity
+            // while this one was still looking for a free username.
+            Provisioned::AlreadyLinked(user) => {
+                finalize(pool, user, login, &identity_claims, mapped, false).await?
+            }
+        };
+        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
+        // freshly auto-provisioned OIDC user must inherit the `authenticated` role
+        // immediately so it has the slice-1 "read/write everywhere" reach —
+        // `ensure_legacy_rbac` runs only once per install. The
+        // assignment is idempotent and gated on the install-wide flag, so a fresh
+        // (fail-closed) install leaves the user with no automatic grants. (When
+        // a concurrent login won the link, this is the winner's account, for
+        // which the assignment is equally due — and idempotent.)
+        authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
+            .await
+            .map_err(|e| ResolveError::Db(e.to_string()))?;
+        return Ok(user);
+    }
+
+    // 4. No link, no match, no provisioning → reject.
+    Err(ResolveError::NotProvisioned)
+}
+
+/// Outcome of [`provision_oidc_user`].
+enum Provisioned {
+    /// This call inserted the account; [`finalize`] must still link it.
+    New(AppUser),
+    /// A concurrent first login already provisioned and linked the identity.
+    AlreadyLinked(AppUser),
+}
+
+/// Upper bound on username-collision retries while provisioning. Each
+/// collision means a concurrent insert won that name, so the bound only needs
+/// to exceed the number of first logins for one identity racing at once.
+const PROVISION_ATTEMPTS: u32 = 16;
+
+/// Insert the auto-provisioned, password-less OIDC user. A username collision
+/// with a concurrent insert (several first logins picking the same free name
+/// at once) is retried: if a concurrent login has meanwhile linked this very
+/// identity, its account is adopted instead of provisioning another one;
+/// otherwise the retry allocates the next free suffix, and the link step in
+/// [`finalize`] settles which account the identity belongs to.
+async fn provision_oidc_user(
+    pool: &PgPool,
+    login: &ValidatedLogin,
+    mapped: &MappedClaims,
+) -> Result<Provisioned, ResolveError> {
+    let mut attempt = 0;
+    loop {
         let username = unique_username(pool, &mapped.username).await?;
-        let user = user_dao::insert_user(
+        let inserted = user_dao::insert_user(
             pool,
             NewUser {
                 username,
@@ -172,38 +233,83 @@ pub async fn resolve_user(
                 external_subject: Some(login.subject.clone()),
             },
         )
-        .await
-        .map_err(|e| ResolveError::Db(e.to_string()))?;
-        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
-        // freshly auto-provisioned OIDC user must inherit the `authenticated` role
-        // immediately so it has the slice-1 "read/write everywhere" reach —
-        // `ensure_legacy_rbac` runs only once per install. The
-        // assignment is idempotent and gated on the install-wide flag, so a fresh
-        // (fail-closed) install leaves the user with no automatic grants.
-        authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
-            .await
-            .map_err(|e| ResolveError::Db(e.to_string()))?;
-        return finalize(pool, user, login, &identity_claims, mapped).await;
+        .await;
+        match inserted {
+            Ok(user) => return Ok(Provisioned::New(user)),
+            Err(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some("23505") && attempt < PROVISION_ATTEMPTS =>
+            {
+                attempt += 1;
+                if let Some(user) =
+                    external_identity_dao::find_user_by_subject(pool, &login.issuer, &login.subject)
+                        .await
+                        .map_err(|e| ResolveError::Db(e.to_string()))?
+                {
+                    return Ok(Provisioned::AlreadyLinked(user));
+                }
+            }
+            Err(e) => return Err(ResolveError::Db(e.to_string())),
+        }
     }
-
-    // 4. No link, no match, no provisioning → reject.
-    Err(ResolveError::NotProvisioned)
 }
 
-/// Common tail for every resolution branch: enforce `active`, recompute
-/// admin from the current claims (when the IdP is authoritative for it),
-/// refresh the `external_identity` link (insert or update denormalized claims +
-/// `last_login_at`).
+/// Common tail for every resolution branch: enforce `active`, upsert the
+/// `external_identity` link (insert, or refresh denormalized claims +
+/// `last_login_at`), then recompute admin from the current claims (when the IdP
+/// is authoritative for it) on the account the link **actually** names.
+///
+/// The link is unique on `(issuer, subject)` and never re-pointed, so when a
+/// concurrent first login linked the identity to another account first, the
+/// upsert returns that account's id: it is adopted (its own `active` flag
+/// enforced), and — when `provisioned` says `user` was created by this very
+/// call — the now-orphaned `user` is deleted.
 async fn finalize(
     pool: &PgPool,
     user: AppUser,
     login: &ValidatedLogin,
     identity_claims: &IdentityClaims,
     mapped: &MappedClaims,
+    provisioned: bool,
 ) -> Result<AppUser, ResolveError> {
     if !user.active {
         return Err(ResolveError::Inactive);
     }
+
+    // Never re-points an existing link at a different user (the DAO only sets
+    // user_id on insert).
+    let link = external_identity_dao::link(
+        pool,
+        user.id,
+        &login.issuer,
+        &login.subject,
+        identity_claims.clone(),
+    )
+    .await
+    .map_err(|e| ResolveError::Db(e.to_string()))?;
+
+    let user = if link.user_id == user.id {
+        user
+    } else {
+        // Lost the race for the link: the identity belongs to `link.user_id`.
+        if provisioned {
+            tracing::info!(
+                orphan_user_id = user.id,
+                linked_user_id = link.user_id,
+                "concurrent first oidc login: dropping the duplicate provisioned account"
+            );
+            user_dao::delete_user(pool, user.id)
+                .await
+                .map_err(|e| ResolveError::Db(e.to_string()))?;
+        }
+        let linked = user_dao::find_user_by_id(pool, link.user_id)
+            .await
+            .map_err(|e| ResolveError::Db(e.to_string()))?
+            .ok_or_else(|| ResolveError::Db("linked oidc user vanished".into()))?;
+        if !linked.active {
+            return Err(ResolveError::Inactive);
+        }
+        linked
+    };
 
     // Recompute admin on every login so IdP grant/revoke takes effect — but
     // only when the realm maps admin groups; otherwise admins are managed
@@ -226,19 +332,6 @@ async fn finalize(
     } else {
         user
     };
-
-    // Upsert the (issuer, subject) link — inserts on first login, refreshes
-    // denormalized claims + last_login_at thereafter. Never re-points an existing
-    // link at a different user (the DAO only sets user_id on insert).
-    external_identity_dao::link(
-        pool,
-        user.id,
-        &login.issuer,
-        &login.subject,
-        identity_claims.clone(),
-    )
-    .await
-    .map_err(|e| ResolveError::Db(e.to_string()))?;
 
     Ok(user)
 }

@@ -238,7 +238,9 @@ impl SearchQuery {
     pub fn parse(q: &str) -> Self {
         let mut out = SearchQuery::default();
         for token in q.split_whitespace() {
-            let token = token.trim_matches('"').to_ascii_lowercase();
+            // Lowered like stored ids (the format's `lower_id`), so `Ünicode`
+            // finds `ünicode.lib`.
+            let token = crate::format::lower_invariant(token.trim_matches('"'));
             if token.is_empty() {
                 continue;
             }
@@ -416,6 +418,39 @@ pub trait RepoReadOps: Send + Sync {
             .collect();
         Ok(SearchResult { total_hits, hits })
     }
+
+    /// [`Self::search_with_package_filter`] without the per-hit enrichment:
+    /// the hits carry ids and versions, but [`SearchHit::nuspec_bytes`] and
+    /// [`SearchHit::total_downloads`] may be left unset.
+    ///
+    /// A group asks every member for a full (up to [`SearchParams::MAX_TAKE`])
+    /// result to merge, dedup and count, but renders only the client's page.
+    /// It therefore searches its members through this method and enriches just
+    /// the final page via [`Self::enrich_search_hits`], so manifest reads (S3)
+    /// are bounded by the client's `take` rather than by every member's corpus.
+    ///
+    /// The default returns the enriched result (and [`Self::enrich_search_hits`]
+    /// defaults to a no-op): correct for any implementation, merely not cheaper.
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        self.search_with_package_filter(repo, params, filter).await
+    }
+
+    /// Attach the enrichment [`Self::search_unenriched`] skipped (latest
+    /// manifest, download total) to `hits`, which this backend returned for
+    /// `repo`. The order and number of `hits` are preserved. The default does
+    /// nothing, matching the default [`Self::search_unenriched`].
+    async fn enrich_search_hits(
+        &self,
+        _repo: &str,
+        _hits: &mut [SearchHit],
+    ) -> Result<(), RepoError> {
+        Ok(())
+    }
 }
 
 /// A package-filtering decorator around any repository read implementation.
@@ -502,6 +537,26 @@ impl RepoReadOps for PackageFilteredReadOps {
         self.inner
             .search_with_package_filter(repo, params, &combined)
             .await
+    }
+
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<SearchResult, RepoError> {
+        let combined = self.filter.clone().intersect(filter.clone());
+        self.inner.search_unenriched(repo, params, &combined).await
+    }
+
+    async fn enrich_search_hits(
+        &self,
+        repo: &str,
+        hits: &mut [SearchHit],
+    ) -> Result<(), RepoError> {
+        // The hits came out of the filtered search above, so they already pass
+        // the predicate; enrichment adds no package identities.
+        self.inner.enrich_search_hits(repo, hits).await
     }
 }
 
@@ -606,5 +661,11 @@ mod search_query_tests {
         assert!(SearchQuery::parse("").matches("anything"));
         assert_eq!(SearchQuery::parse("a bcd").prefilter(), Some("bcd"));
         assert_eq!(SearchQuery::parse("packageid:x.y").prefilter(), Some("x.y"));
+    }
+
+    #[test]
+    fn lowercases_non_ascii_terms_like_stored_ids() {
+        assert!(SearchQuery::parse("Ünicode").matches("ünicode.lib"));
+        assert!(SearchQuery::parse("PackageId:Ünicode.Lib").matches("ünicode.lib"));
     }
 }

@@ -74,6 +74,11 @@ async fn self_token_lifecycle() {
         .expect("minted token listed");
     assert!(entry.get("token").is_none(), "plaintext never re-listed");
     assert!(entry.get("token_hash").is_none(), "hash never listed");
+    assert_eq!(
+        entry["scope"],
+        Value::Null,
+        "unscoped token lists scope null"
+    );
 
     // Revoke own token: 204, then a second revoke is 404.
     let resp = client
@@ -185,4 +190,97 @@ async fn cannot_revoke_foreign_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+}
+
+/// L6: a self-service token's scope is echoed and listed, and a mistyped scope
+/// key is a 400 rather than an unscoped token.
+#[tokio::test]
+async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let (u, p) = make_user(&srv).await;
+
+    for body in [
+        json!({"name": "typo", "scope": {"repos": [1]}}),
+        json!({"name": "typo", "scope": {"actions": ["read"], "repository": [1]}}),
+        json!({"name": "typo", "scop": {"actions": ["read"]}}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/me/tokens", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+    }
+    let listed: Value = client
+        .get(format!("{}/admin/me/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listed.as_array().unwrap().is_empty(),
+        "no token was issued for a rejected scope"
+    );
+
+    let resp = client
+        .post(format!("{}/admin/me/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "ro", "scope": {"actions": ["read"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    assert_eq!(created["scope"], json!({"actions": ["read"]}));
+    let listed: Value = client
+        .get(format!("{}/admin/me/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed[0]["scope"], json!({"actions": ["read"]}));
+}
+
+/// B4 leaves `/admin/me/tokens` as it was: an admin-scoped token still cannot
+/// manage tokens there (session/password principals only).
+#[tokio::test]
+async fn admin_scoped_token_cannot_manage_own_tokens() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let (u, p) = srv.admin_basic();
+    let created: Value = client
+        .post(format!("{}/admin/me/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "automation", "scope": {"actions": ["admin"]}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = created["token"].as_str().unwrap();
+    let resp = client
+        .post(format!("{}/admin/me/tokens", srv.base_url))
+        .header("X-NuGet-ApiKey", token)
+        .json(&json!({"name": "sneaky"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = client
+        .get(format!("{}/admin/me/tokens", srv.base_url))
+        .header("X-NuGet-ApiKey", token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 }

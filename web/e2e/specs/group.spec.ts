@@ -24,9 +24,8 @@ import {
  *   - loser   → `sample.lib.1.0.0.nupkg`         (dep `Newtonsoft.Json`)
  * Both are `Sample.Lib` @ `1.2.3`.
  *
- * Admin UI sub-routes under `/admin/*` collide with the admin API namespace, so
- * (as the other admin specs do) we reach the UI only via in-app navigation,
- * never a hard load of an `/admin/...` deep link.
+ * The admin UI is reached via in-app navigation (Browse -> Admin nav); hard
+ * loads of `/manage/...` deep links are covered in admin-deeplink.spec.ts.
  */
 
 test.beforeEach(async ({ page }) => {
@@ -62,19 +61,19 @@ test('a group resolves the highest-priority member for an overlapping id+version
   await page.goto('/')
   await page.getByRole('link', { name: /^admin$/i }).click()
   await page.getByRole('link', { name: /repositor/i }).first().click()
-  await expect(page).toHaveURL(/\/admin\/repositories$/)
+  await expect(page).toHaveURL(/\/manage\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
   await page.getByLabel(/^name$/i).fill(group)
   await page.getByLabel(/^kind$/i).selectOption('group')
   await page.getByLabel(/allow anonymous read/i).check()
   await page.getByRole('button', { name: /create repository/i }).click()
-  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${group}`))
+  await expect(page).toHaveURL(new RegExp(`/manage/repositories/${group}`))
 
   // 3. Open the group's Members screen and add both members with priorities via
   //    the PriorityList add form: winner HIGH (200), loser LOW (100).
   await page.getByRole('link', { name: /members/i }).first().click()
   await expect(page).toHaveURL(
-    new RegExp(`/admin/repositories/${group}/members`),
+    new RegExp(`/manage/repositories/${group}/members`),
   )
 
   await page.getByLabel(/^repository$/i).selectOption(winner)

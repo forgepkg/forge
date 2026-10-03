@@ -24,7 +24,7 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
-export const Route = createFileRoute('/_app/admin/realms')({
+export const Route = createFileRoute('/_app/manage/realms')({
   component: RealmsList,
 })
 
@@ -68,7 +68,7 @@ function RealmsList() {
             routing sign-ins.
           </Text>
         </div>
-        <Button href="/admin/realms/new">New realm</Button>
+        <Button href="/manage/realms/new">New realm</Button>
       </div>
 
       {mutationError && (
@@ -180,7 +180,7 @@ function RealmRow({
       </TableCell>
       <TableCell>
         <Link
-          to="/admin/realms/$realmId"
+          to="/manage/realms/$realmId"
           params={{ realmId: String(realm.id) }}
           className="font-medium text-sky-600 hover:underline dark:text-sky-400"
         >
@@ -200,11 +200,23 @@ function RealmRow({
           />
           {realm.enabled ? 'enabled' : 'disabled'}
         </span>
+        {/* The server can refuse a toggle (e.g. disabling the last realm an
+            admin can sign in with); the checkbox stays at the stored state,
+            so say why instead of silently snapping back. */}
+        {update.isError && (
+          <p
+            role="alert"
+            className="mt-1 max-w-xs text-sm/6 whitespace-normal text-red-600 dark:text-red-400"
+          >
+            Could not {update.variables?.enabled ? 'enable' : 'disable'}{' '}
+            {realm.name}: {update.error.body || update.error.message}
+          </p>
+        )}
       </TableCell>
       <TableCell>
         <span className="flex items-center gap-3">
           <Link
-            to="/admin/realms/$realmId"
+            to="/manage/realms/$realmId"
             params={{ realmId: String(realm.id) }}
             className="text-sky-600 hover:underline dark:text-sky-400"
           >

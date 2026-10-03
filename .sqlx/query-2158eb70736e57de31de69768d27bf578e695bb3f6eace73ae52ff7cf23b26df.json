@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version AS p\n        SET listed = c.listed, metadata_refreshed_at = now()\n        FROM unnest($3::text[], $4::bool[]) AS c(version, listed)\n        WHERE p.repository_id = $1 AND p.name = $2 AND p.version = c.version\n          AND p.listed IS DISTINCT FROM c.listed\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "TextArray",
+        "BoolArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2158eb70736e57de31de69768d27bf578e695bb3f6eace73ae52ff7cf23b26df"
+}

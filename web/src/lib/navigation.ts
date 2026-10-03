@@ -7,3 +7,8 @@
 export function assignLocation(url: string): void {
   window.location.assign(url)
 }
+
+/** Reload the current document (same indirection, for the stale-chunk reload). */
+export function reloadDocument(): void {
+  window.location.reload()
+}

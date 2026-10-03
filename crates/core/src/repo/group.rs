@@ -19,10 +19,18 @@
 //!   Merged versions are ordered by the format's version precedence (so
 //!   `1.10.0` sorts after `1.9.0`).
 //! * **Prefer hosted** (group `config.prefer_hosted`, default on): once a
-//!   package id exists in a visible hosted member, proxy members are not
-//!   consulted for that id at all. An attacker publishing a same-named,
-//!   higher-versioned package on a public feed therefore cannot shadow an
-//!   internal package (dependency confusion).
+//!   package id exists (listed or not) in **any** hosted leaf reachable from
+//!   the group, proxy members are not consulted for that id at all — for
+//!   every caller. Ownership is decided over the whole membership DAG,
+//!   independent of the caller's repo grants and package selectors: a caller
+//!   who cannot see the hosted copy (an anonymous caller on a mixed-anonymity
+//!   group, a selector-scoped token) gets the ordinary not-found answer, never
+//!   the public substitute. Search drops proxy hits for owned ids the same
+//!   way. An attacker publishing a same-named, higher-versioned package on a
+//!   public feed therefore cannot shadow an internal package (dependency
+//!   confusion). The check is one batched existence query over the hosted
+//!   leaves; a failure of it fails the request (fail closed), and it reveals
+//!   no more than the resulting 404 does.
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
 //!   remaining members. Only when *every* consulted member fails does the
@@ -42,7 +50,9 @@
 //!
 //! Identity-aware filtering is applied at **every** level: a member (group or
 //! leaf) is descended-into / included only if the principal [`can_read`] it
-//! ([`Authz::can_read`]). Being able to read an outer group grants **no**
+//! ([`Authz::can_read`]). The prefer-hosted ownership check above is the one
+//! deliberate exception: it only ever *removes* proxy candidates, so it
+//! consults every hosted leaf. Being able to read an outer group grants **no**
 //! transitive read on an inner member — only a `read` grant on the actual leaf
 //! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
 //! stable pre-order walk. For a concrete package id, selectors are evaluated
@@ -50,6 +60,10 @@
 //! strictly shallower depth. A repeated leaf is queried once at its first
 //! package-visible sighting. Search also queries each unique leaf once and uses
 //! the same package-specific walk to select the highest-priority winner.
+//! Members answer search **unenriched** ([`RepoReadOps::search_unenriched`]);
+//! the group merges, counts and pages their hits, then enriches only the final
+//! page through the member that won each hit, so per-hit manifest reads are
+//! bounded by the client's `take`, not by every member's result.
 //!
 //! ## Decoupling from concrete member kinds
 //! `forge-core` must not hard-wire how a hosted vs. proxy member is constructed
@@ -64,8 +78,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use forge_db::model::Repository;
-use forge_db::repository_dao;
+use forge_db::model::{RepoKind, Repository};
+use forge_db::{component_dao, repository_dao};
 use sqlx::PgPool;
 
 use crate::auth::authz::Authz;
@@ -139,6 +153,10 @@ struct GroupGraph {
     max_depth: u32,
     groups: HashMap<i64, Vec<GraphMember>>,
     leaves: Vec<Repository>,
+    /// Every hosted leaf reachable from the root within the depth bound,
+    /// **regardless of the principal** — the owners the prefer-hosted guard
+    /// consults ([`GroupRepo::hosted_owned_ids`]).
+    hosted_leaf_ids: Vec<i64>,
     visible_leaf_cache: Mutex<HashMap<String, Arc<VisibleLeaves>>>,
     cycle_logged: AtomicBool,
 }
@@ -153,7 +171,7 @@ impl GroupGraph {
     /// Visible leaf ids for `package_id`, in the same package-specific stable
     /// pre-order as the former path-expanding traversal.
     fn visible_leaves(&self, package_id: &str) -> Arc<VisibleLeaves> {
-        let key = package_id.to_lowercase();
+        let key = crate::format::lower_invariant(package_id);
         if let Some(cached) = self
             .visible_leaf_cache
             .lock()
@@ -219,7 +237,7 @@ impl GroupGraph {
                 continue;
             }
 
-            if member.repo.kind() == forge_db::model::RepoKind::Group {
+            if member.repo.kind() == RepoKind::Group {
                 if path.contains(&member.repo.id) {
                     if !self.cycle_logged.swap(true, Ordering::Relaxed) {
                         tracing::error!(
@@ -311,7 +329,7 @@ impl GroupRepo {
         let row = repository_dao::find_repository_by_name(&self.pool, repo)
             .await?
             .ok_or_else(|| RepoError::RepoNotFound(repo.to_string()))?;
-        if row.kind() != forge_db::model::RepoKind::Group {
+        if row.kind() != RepoKind::Group {
             return Err(RepoError::WrongKind {
                 name: repo.to_string(),
                 kind: row.kind.clone(),
@@ -322,21 +340,59 @@ impl GroupRepo {
 
     /// Build the compact readable group graph for this principal.
     ///
-    /// Breadth-first discovery reaches every group at its minimum depth, so its
-    /// adjacency list is fetched once while still respecting the configured
-    /// depth bound. Edges remain in DAO priority order. A global discovery set
-    /// bounds raw-DB cycles without discarding diamond edges; package-specific
-    /// evaluation applies the current-path cycle guard later.
+    /// Two breadth-first passes over the membership DAG below `group`. Both
+    /// reach every group at its minimum depth and respect the configured depth
+    /// bound; a global discovery set bounds raw-DB cycles without discarding
+    /// diamond edges (package-specific evaluation applies the current-path
+    /// cycle guard later). Edges remain in DAO priority order.
+    ///
+    /// 1. **Structure**, independent of the principal: every group's adjacency
+    ///    list is fetched once, following *every* edge, which also yields the
+    ///    hosted leaves the prefer-hosted guard consults. A caller's grants
+    ///    must not decide whether an internal id is shielded from the proxies.
+    /// 2. **Visibility**: the same walk over the loaded adjacency lists, keeping
+    ///    only edges whose member the principal may read.
     async fn group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
         let group_row = self.group_row(group).await?;
+
+        // Pass 1. A group past the depth bound is not expanded: no caller can
+        // be served from below it, so its leaves own nothing here either.
+        let mut adjacency: HashMap<i64, Vec<Repository>> = HashMap::new();
+        let mut hosted_leaf_ids = Vec::new();
+        let mut seen_hosted = HashSet::new();
+        let mut discovered_groups = HashSet::from([group_row.id]);
+        let mut queue = VecDeque::from([(group_row.id, 0_u32)]);
+        while let Some((group_id, depth)) = queue.pop_front() {
+            if depth >= self.max_depth {
+                continue;
+            }
+            let rows = repository_dao::group_members(&self.pool, group_id).await?;
+            let mut members = Vec::with_capacity(rows.len());
+            for (member, _priority) in rows {
+                match member.kind() {
+                    RepoKind::Group => {
+                        if discovered_groups.insert(member.id) {
+                            queue.push_back((member.id, depth + 1));
+                        }
+                    }
+                    RepoKind::Hosted => {
+                        if seen_hosted.insert(member.id) {
+                            hosted_leaf_ids.push(member.id);
+                        }
+                    }
+                    RepoKind::Proxy => {}
+                }
+                members.push(member);
+            }
+            adjacency.insert(group_id, members);
+        }
+
+        // Pass 2.
         let mut groups = HashMap::new();
         let mut leaves = Vec::new();
         let mut seen_leaves = HashSet::new();
-        let mut discovered_groups = HashSet::new();
-        let mut queue = VecDeque::new();
-        discovered_groups.insert(group_row.id);
-        queue.push_back((group_row.id, 0_u32));
-
+        let mut discovered_groups = HashSet::from([group_row.id]);
+        let mut queue = VecDeque::from([(group_row.id, 0_u32)]);
         while let Some((group_id, depth)) = queue.pop_front() {
             if depth >= self.max_depth {
                 tracing::error!(
@@ -349,18 +405,23 @@ impl GroupRepo {
                 continue;
             }
 
-            let rows = repository_dao::group_members(&self.pool, group_id).await?;
+            // Pass 1 reached this group no deeper than this pass does, so its
+            // adjacency is loaded; a missing entry is treated as empty.
+            let rows = adjacency
+                .get(&group_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let mut members = Vec::with_capacity(rows.len());
-            for (member, _priority) in rows {
+            for member in rows {
                 // Reading an outer group grants no transitive read. An edge is
                 // absent from this principal's graph unless the member itself
                 // passes the repo-level gate.
-                if !self.authz.can_read(&self.principal, &member).await {
+                if !self.authz.can_read(&self.principal, member).await {
                     continue;
                 }
-                let filter = self.authz.package_filter(&self.principal, &member).await;
+                let filter = self.authz.package_filter(&self.principal, member).await;
 
-                if member.kind() == forge_db::model::RepoKind::Group {
+                if member.kind() == RepoKind::Group {
                     if discovered_groups.insert(member.id) {
                         queue.push_back((member.id, depth + 1));
                     }
@@ -368,7 +429,7 @@ impl GroupRepo {
                     leaves.push(member.clone());
                 }
                 members.push(GraphMember {
-                    repo: member,
+                    repo: member.clone(),
                     filter,
                 });
             }
@@ -381,9 +442,45 @@ impl GroupRepo {
             max_depth: self.max_depth,
             groups,
             leaves,
+            hosted_leaf_ids,
             visible_leaf_cache: Mutex::new(HashMap::new()),
             cycle_logged: AtomicBool::new(false),
         }))
+    }
+
+    /// The format's canonical (stored) form of a package id — what
+    /// `component.name` holds.
+    fn lower_id(&self, id: &str) -> String {
+        match &self.format {
+            Some(format) => format.lower_id(id),
+            None => crate::format::lower_invariant(id),
+        }
+    }
+
+    /// The subset of `lower_ids` (canonical ids) owned by a hosted leaf of the
+    /// group: present there in any version, listed or not.
+    ///
+    /// Decided over **every** hosted leaf reachable from the group
+    /// ([`GroupGraph::hosted_leaf_ids`]), independent of the principal's repo
+    /// grants and package selectors, in one batched existence query. An error
+    /// propagates: deciding without it could expose an internal id to a
+    /// public-feed shadow (fail closed).
+    async fn hosted_owned_ids(
+        &self,
+        graph: &GroupGraph,
+        lower_ids: &[String],
+    ) -> Result<HashSet<String>, RepoError> {
+        if graph.hosted_leaf_ids.is_empty() || lower_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        Ok(component_dao::names_present_in_repositories(
+            &self.pool,
+            &graph.hosted_leaf_ids,
+            lower_ids,
+        )
+        .await?
+        .into_iter()
+        .collect())
     }
 
     /// Construct each package-visible leaf once, in package-specific priority
@@ -408,10 +505,11 @@ impl GroupRepo {
     }
 
     /// The members allowed to serve `package_id`: the visible members, minus
-    /// every proxy member when the group prefers hosted packages and a visible
-    /// hosted member already has the id (listed or not). A hosted lookup
-    /// failure propagates — deciding without it could expose the id to a
-    /// public-feed shadow (fail closed).
+    /// every proxy member when the group prefers hosted packages and **any**
+    /// hosted leaf of the group owns the id ([`Self::hosted_owned_ids`]) —
+    /// whether or not this principal can see that leaf. A caller who cannot is
+    /// then left with no serving member and gets the ordinary not-found
+    /// answer. A lookup failure propagates (fail closed).
     async fn serving_members_for_id(
         &self,
         graph: &GroupGraph,
@@ -421,23 +519,22 @@ impl GroupRepo {
         if !graph.prefer_hosted || !members.iter().any(|m| is_proxy(&m.repo)) {
             return Ok(members);
         }
-        for m in members.iter().filter(|m| is_hosted(&m.repo)) {
-            if !m
-                .ops
-                .list_versions(&m.repo.name, package_id)
-                .await?
-                .is_empty()
-            {
-                return Ok(members.into_iter().filter(|m| !is_proxy(&m.repo)).collect());
-            }
+        let owned = self
+            .hosted_owned_ids(graph, &[self.lower_id(package_id)])
+            .await?;
+        if owned.is_empty() {
+            return Ok(members);
         }
-        Ok(members)
+        Ok(members.into_iter().filter(|m| !is_proxy(&m.repo)).collect())
     }
 
     /// Merge member search results with the caller's package predicate pushed
     /// through every member wrapper. This keeps selector filtering inside each
     /// production backend's single corpus scan rather than repeatedly
     /// re-running the whole group search for successive filtered pages.
+    ///
+    /// Members answer unenriched; only the merged, paged result is enriched
+    /// ([`Self::enrich_page`]).
     async fn search_filtered(
         &self,
         repo: &str,
@@ -449,15 +546,17 @@ impl GroupRepo {
         member_params.skip = 0;
         member_params.take = SearchParams::MAX_TAKE;
 
-        let mut by_id: BTreeMap<String, (usize, SearchHit)> = BTreeMap::new();
-        let mut hosted_ids: HashSet<String> = HashSet::new();
-        let mut proxy_hits: Vec<(usize, SearchHit)> = Vec::new();
+        // `member_ops[i]` reads `graph.leaves[i]`.
+        let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
+        let mut by_id: BTreeMap<String, RankedHit> = BTreeMap::new();
+        let mut proxy_hits: Vec<RankedHit> = Vec::new();
         let mut failures = MemberFailures::default();
-        for leaf in &graph.leaves {
+        for (member, leaf) in graph.leaves.iter().enumerate() {
             let ops = self.factory.ops_for(leaf)?;
+            member_ops.push(ops.clone());
             let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let result = match ops
-                .search_with_package_filter(&leaf.name, &member_params, &leaf_filter)
+                .search_unenriched(&leaf.name, &member_params, &leaf_filter)
                 .await
             {
                 Ok(result) => {
@@ -473,38 +572,82 @@ impl GroupRepo {
                 let Some(rank) = graph.leaf_rank(&hit.original_id, leaf.id) else {
                     continue;
                 };
-                if graph.prefer_hosted {
-                    if is_hosted(leaf) {
-                        hosted_ids.insert(hit.original_id.to_lowercase());
-                    } else if is_proxy(leaf) {
-                        // Decided once every hosted leaf has answered.
-                        proxy_hits.push((rank, hit));
-                        continue;
-                    }
+                let ranked = RankedHit { rank, member, hit };
+                if graph.prefer_hosted && is_proxy(leaf) {
+                    // Decided below against every hosted leaf of the group.
+                    proxy_hits.push(ranked);
+                    continue;
                 }
-                insert_ranked(&mut by_id, rank, hit);
+                insert_ranked(&mut by_id, ranked);
             }
         }
         failures.into_result()?;
-        for (rank, hit) in proxy_hits {
-            if !hosted_ids.contains(&hit.original_id.to_lowercase()) {
-                insert_ranked(&mut by_id, rank, hit);
+        if !proxy_hits.is_empty() {
+            let candidates: Vec<String> = proxy_hits
+                .iter()
+                .map(|ranked| self.lower_id(&ranked.hit.original_id))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let owned = self.hosted_owned_ids(&graph, &candidates).await?;
+            for ranked in proxy_hits {
+                if !owned.contains(&self.lower_id(&ranked.hit.original_id)) {
+                    insert_ranked(&mut by_id, ranked);
+                }
             }
         }
 
-        let mut hits: Vec<SearchHit> = by_id.into_values().map(|(_, hit)| hit).collect();
-        hits.sort_by(|a, b| {
-            a.original_id
-                .to_lowercase()
-                .cmp(&b.original_id.to_lowercase())
+        let mut ranked: Vec<RankedHit> = by_id.into_values().collect();
+        ranked.sort_by(|a, b| {
+            crate::format::lower_invariant(&a.hit.original_id)
+                .cmp(&crate::format::lower_invariant(&b.hit.original_id))
         });
-        let total_hits = hits.len();
-        let hits = hits
+        let total_hits = ranked.len();
+        let page: Vec<RankedHit> = ranked
             .into_iter()
             .skip(params.skip.min(total_hits))
             .take(params.effective_take())
             .collect();
+        let hits = self.enrich_page(&graph, &member_ops, page).await;
         Ok(SearchResult { total_hits, hits })
+    }
+
+    /// Enrich the final search page: each hit through the member that won it,
+    /// one batch per member. Members run one after another, each bounding its
+    /// own concurrency. A member whose enrichment fails leaves its hits without
+    /// metadata rather than failing the search — the same degraded answer as a
+    /// failed manifest read; which packages are listed never depends on it.
+    async fn enrich_page(
+        &self,
+        graph: &GroupGraph,
+        member_ops: &[Arc<dyn RepoReadOps>],
+        page: Vec<RankedHit>,
+    ) -> Vec<SearchHit> {
+        let mut positions_by_member: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (position, ranked) in page.iter().enumerate() {
+            positions_by_member
+                .entry(ranked.member)
+                .or_default()
+                .push(position);
+        }
+        let mut hits: Vec<SearchHit> = page.into_iter().map(|ranked| ranked.hit).collect();
+        for (member, positions) in positions_by_member {
+            let leaf = &graph.leaves[member];
+            let mut batch: Vec<SearchHit> = positions
+                .iter()
+                .map(|&position| std::mem::take(&mut hits[position]))
+                .collect();
+            if let Err(e) = member_ops[member]
+                .enrich_search_hits(&leaf.name, &mut batch)
+                .await
+            {
+                tracing::warn!(member = %leaf.name, error = %e, "group search: enriching member hits failed; serving them without metadata");
+            }
+            for (position, hit) in positions.into_iter().zip(batch) {
+                hits[position] = hit;
+            }
+        }
+        hits
     }
 }
 
@@ -626,22 +769,29 @@ impl RepoReadOps for GroupRepo {
     }
 }
 
-fn is_hosted(repo: &Repository) -> bool {
-    repo.kind() == forge_db::model::RepoKind::Hosted
+fn is_proxy(repo: &Repository) -> bool {
+    repo.kind() == RepoKind::Proxy
 }
 
-fn is_proxy(repo: &Repository) -> bool {
-    repo.kind() == forge_db::model::RepoKind::Proxy
+/// A merged search hit: its package-specific priority `rank` (lower wins) and
+/// the index into [`GroupGraph::leaves`] of the `member` that produced it,
+/// which later enriches it.
+struct RankedHit {
+    rank: usize,
+    member: usize,
+    hit: SearchHit,
 }
 
 /// Keep the highest-priority (lowest rank) hit per package id.
-fn insert_ranked(by_id: &mut BTreeMap<String, (usize, SearchHit)>, rank: usize, hit: SearchHit) {
-    match by_id.entry(hit.original_id.to_lowercase()) {
+fn insert_ranked(by_id: &mut BTreeMap<String, RankedHit>, ranked: RankedHit) {
+    match by_id.entry(crate::format::lower_invariant(&ranked.hit.original_id)) {
         std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert((rank, hit));
+            entry.insert(ranked);
         }
-        std::collections::btree_map::Entry::Occupied(mut entry) if rank < entry.get().0 => {
-            entry.insert((rank, hit));
+        std::collections::btree_map::Entry::Occupied(mut entry)
+            if ranked.rank < entry.get().rank =>
+        {
+            entry.insert(ranked);
         }
         std::collections::btree_map::Entry::Occupied(_) => {}
     }

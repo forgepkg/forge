@@ -801,11 +801,18 @@ async fn preview_then_run_then_audit_endpoints() {
 
 // ── 7. proxy evict-not-pulled: cold cached versions evicted, warm retained ────
 
-/// Two versions are cached on a proxy by downloading them through the full HTTP
-/// stack. The older one is backdated to look "cold" (not pulled in > 30 days);
-/// a `scope: proxy_cached` rule with `not_pulled_for_days = 30` evicts only the
-/// cold one — its `proxy_cached_version` row is gone, its downloaded blob is
-/// dereferenced + removed via the outbox worker — while the warm one is retained.
+/// Two long-established versions are cached on a proxy with a package delay by
+/// downloading them through the full HTTP stack. The older one is backdated to
+/// look "cold" (not pulled in > 30 days); a `scope: proxy_cached` rule with
+/// `not_pulled_for_days = 30` evicts only the cold one: its downloaded blob is
+/// dereferenced + removed via the outbox worker while the warm one is retained.
+///
+/// The evicted version's `proxy_cached_version` row is **kept** as
+/// metadata-only (`downloaded = false`, `first_seen_at` untouched), so it
+/// stays listed and its next pull re-fetches it from upstream and serves it at
+/// once. Regression for M7: the row used to be deleted, so the version
+/// vanished from `index.json` and, re-discovered with `first_seen_at = now()`,
+/// was hidden by the package delay for a whole window after every eviction.
 #[tokio::test]
 async fn proxy_evicts_cold_cached_versions_only() {
     let srv = worker_stack().await;
@@ -831,30 +838,42 @@ async fn proxy_evicts_cold_cached_versions_only() {
             "remote_url": mock.index_url(),
             "metadata_ttl_seconds": 600,
             "not_found_ttl_seconds": 600,
+            "package_delay_seconds": 3600,
         }))
         .await
         .status(),
         201
     );
-
-    // Cache both versions on demand (creates proxy_cached_version + component +
-    // asset + blob for each).
-    let (u, p) = srv.admin_basic();
-    for v in ["1.0.0", "2.0.0"] {
-        let st = srv
-            .client()
-            .get(format!(
-                "{}/v3/{repo}/flat/{lower}/{v}/{lower}.{v}.nupkg",
-                srv.base_url
-            ))
-            .basic_auth(&u, Some(&p))
-            .send()
-            .await
-            .unwrap()
-            .status();
-        assert_eq!(st, 200, "cache {v}");
-    }
     let rid = repo_id(&srv.pool, repo).await;
+
+    // Discover both versions; the package delay hides them at first ...
+    assert!(
+        listed_versions(&srv, repo, &lower).await.is_empty(),
+        "fresh versions are delay-gated"
+    );
+    // ... so make them long-established (first seen 90 days ago).
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '90 days' \
+         WHERE repository_id = $1",
+    )
+    .bind(rid)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    // Cache both versions on demand (creates component + asset + blob each).
+    let (u, p) = srv.admin_basic();
+    let pull = |v: &'static str| {
+        let url = format!(
+            "{}/v3/{repo}/flat/{lower}/{v}/{lower}.{v}.nupkg",
+            srv.base_url
+        );
+        let req = srv.client().get(url).basic_auth(&u, Some(&p));
+        async move { req.send().await.unwrap().status() }
+    };
+    for v in ["1.0.0", "2.0.0"] {
+        assert_eq!(pull(v).await, 200, "cache {v}");
+    }
 
     // Both cached + downloaded.
     let cached: i64 = sqlx::query_scalar(
@@ -865,12 +884,18 @@ async fn proxy_evicts_cold_cached_versions_only() {
     .await
     .unwrap();
     assert_eq!(cached, 2, "both versions cached + downloaded");
+    let first_seen_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT first_seen_at FROM proxy_cached_version \
+         WHERE repository_id = $1 AND version = '1.0.0'",
+    )
+    .bind(rid)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
 
-    // Make 1.0.0 cold: backdate first_seen_at and last_downloaded_at > 30 days.
+    // Make 1.0.0 cold: not pulled for 90 days.
     sqlx::query(
-        "UPDATE proxy_cached_version \
-         SET first_seen_at = now() - interval '90 days', \
-             last_downloaded_at = now() - interval '90 days' \
+        "UPDATE proxy_cached_version SET last_downloaded_at = now() - interval '90 days' \
          WHERE repository_id = $1 AND version = '1.0.0'",
     )
     .bind(rid)
@@ -920,17 +945,26 @@ async fn proxy_evicts_cold_cached_versions_only() {
     )
     .await;
 
-    // 1.0.0's cached row is gone; 2.0.0 remains.
-    let remaining: Vec<String> =
-        sqlx::query_scalar("SELECT version FROM proxy_cached_version WHERE repository_id = $1")
-            .bind(rid)
-            .fetch_all(&srv.pool)
-            .await
-            .unwrap();
+    // Both rows remain; only the warm version still has its bytes, and the
+    // evicted one kept its first sighting.
+    let rows: Vec<(String, bool, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT version, downloaded, first_seen_at FROM proxy_cached_version \
+         WHERE repository_id = $1 ORDER BY version",
+    )
+    .bind(rid)
+    .fetch_all(&srv.pool)
+    .await
+    .unwrap();
+    let state: Vec<(&str, bool)> = rows.iter().map(|(v, d, _)| (v.as_str(), *d)).collect();
     assert_eq!(
-        remaining,
-        vec!["2.0.0".to_string()],
-        "only warm version cached"
+        state,
+        vec![("1.0.0", false), ("2.0.0", true)],
+        "evicted row kept as metadata-only"
+    );
+    assert_eq!(rows[0].2, first_seen_before, "first_seen_at preserved");
+    assert!(
+        !component_exists(&srv.pool, rid, &lower, "1.0.0").await,
+        "evicted bytes' component removed"
     );
 
     // The evicted version's blob is dereferenced and removed via the outbox.
@@ -948,6 +982,37 @@ async fn proxy_evicts_cold_cached_versions_only() {
         "proxy-eviction outbox drained",
     )
     .await;
+
+    // The evicted version is still listed (not delay-gated) ...
+    let mut listed = listed_versions(&srv, repo, &lower).await;
+    listed.sort();
+    assert_eq!(listed, vec!["1.0.0".to_string(), "2.0.0".to_string()]);
+    // ... and its next pull re-fetches it from upstream and serves it at once.
+    let upstream_pulls = mock.nupkg_hits();
+    assert_eq!(pull("1.0.0").await, 200, "evicted version restores");
+    assert_eq!(mock.nupkg_hits(), upstream_pulls + 1, "re-fetched upstream");
+    let downloaded: bool = sqlx::query_scalar(
+        "SELECT downloaded FROM proxy_cached_version \
+         WHERE repository_id = $1 AND version = '1.0.0'",
+    )
+    .bind(rid)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(downloaded, "re-cached on the pull");
+}
+
+async fn component_exists(pool: &PgPool, repo_id: i64, name: &str, version: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM component WHERE repository_id = $1 AND name = $2 AND version = $3",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+        > 0
 }
 
 /// A `run` against a repo with no policy is a 409 (nothing to schedule).

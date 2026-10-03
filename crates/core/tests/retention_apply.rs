@@ -399,20 +399,51 @@ async fn decision_for_vanished_component_is_skipped() {
     assert_eq!(rows[0].0, "skipped");
 }
 
+/// `(downloaded, first_seen_at)` of a proxy cached-version row.
+async fn cached_state(
+    pool: &PgPool,
+    repo_id: i64,
+    name: &str,
+    version: &str,
+) -> Option<(bool, chrono::DateTime<chrono::Utc>)> {
+    proxy_dao::get_cached_version(pool, repo_id, name, version)
+        .await
+        .unwrap()
+        .map(|r| (r.downloaded, r.first_seen_at))
+}
+
+fn evict(cached_version_id: i64) -> ProxyDecision {
+    ProxyDecision {
+        cached_version_id,
+        package_name: "lib".into(),
+        version: "1.0.0".into(),
+        rule_id: "evict".into(),
+        reason: DecisionReason {
+            older_than_days: None,
+            not_downloaded_for_days: None,
+            not_pulled_for_days: Some(30),
+        },
+    }
+}
+
 #[tokio::test]
-async fn proxy_eviction_deletes_component_and_cached_row_driving_outbox() {
-    // A downloaded proxy cached version has a parallel component+asset. Evicting
-    // it deletes both, decrefs the blob to 0, enqueues the outbox, and removes
-    // the proxy_cached_version row.
+async fn proxy_eviction_deletes_component_keeps_cached_row_driving_outbox() {
+    // A downloaded proxy cached version has a parallel component+asset.
+    // Evicting it deletes the component + asset, decrefs the blob to 0 and
+    // enqueues the outbox — but KEEPS the proxy_cached_version row, reset to
+    // metadata-only (`downloaded = false`) with its `first_seen_at` intact, so
+    // the version stays listed and past its package delay (regression M7: the
+    // row used to be deleted, resetting `first_seen_at` on the next listing).
     let pool = common::pool().await;
     let n = common::unique();
     let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("p-{n}")))
         .await
         .unwrap();
     let sha = seed_blob(&pool, n, 1).await;
-    let comp_id = seed_component(&pool, repo.id, "lib", "1.0.0", &sha).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha).await;
 
-    // The proxy cached marker for the same (repo, name, version).
+    // The proxy cached marker for the same (repo, name, version), first seen
+    // long ago.
     proxy_dao::upsert_cached_version(
         &pool,
         proxy_dao::NewProxyCachedVersion {
@@ -426,6 +457,14 @@ async fn proxy_eviction_deletes_component_and_cached_row_driving_outbox() {
     )
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '90 days' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
     let cached = proxy_dao::get_cached_version(&pool, repo.id, "lib", "1.0.0")
         .await
         .unwrap()
@@ -435,17 +474,7 @@ async fn proxy_eviction_deletes_component_and_cached_row_driving_outbox() {
     let summary = apply(
         &ctx(&pool, repo.id, &repo.name, run),
         &[],
-        &[ProxyDecision {
-            cached_version_id: cached.id,
-            package_name: "lib".into(),
-            version: "1.0.0".into(),
-            rule_id: "evict".into(),
-            reason: DecisionReason {
-                older_than_days: None,
-                not_downloaded_for_days: None,
-                not_pulled_for_days: Some(30),
-            },
-        }],
+        &[evict(cached.id)],
     )
     .await
     .unwrap();
@@ -455,22 +484,77 @@ async fn proxy_eviction_deletes_component_and_cached_row_driving_outbox() {
     assert_eq!(ref_count(&pool, &sha).await, Some(0));
     assert_eq!(outbox_count(&pool, &sha).await, 1);
 
-    // Both the cached marker and the component are gone.
-    assert!(
-        proxy_dao::get_cached_version(&pool, repo.id, "lib", "1.0.0")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    // The component is gone; the cached row survives as metadata-only with
+    // the same id and first sighting.
     assert!(
         component_dao::find_component(&pool, repo.id, "lib", "1.0.0")
             .await
             .unwrap()
             .is_none()
     );
-    let _ = comp_id;
+    let after = proxy_dao::get_cached_version(&pool, repo.id, "lib", "1.0.0")
+        .await
+        .unwrap()
+        .expect("cached-version row must be kept on eviction");
+    assert_eq!(after.id, cached.id);
+    assert!(
+        !after.downloaded,
+        "evicted row must be marked not downloaded"
+    );
+    assert!(after.listed && !after.not_found);
+    assert_eq!(
+        after.first_seen_at, cached.first_seen_at,
+        "first_seen_at (the package-delay anchor) must be preserved"
+    );
 
     let rows = audit_rows(&pool, run).await;
+    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "hard_delete");
     assert!(rows[0].1);
+}
+
+#[tokio::test]
+async fn proxy_eviction_of_a_row_without_cached_bytes_is_skipped() {
+    // A decision whose row no longer holds cached bytes (a concurrent run
+    // already evicted it) mutates nothing and is audited as skipped, not as a
+    // second hard delete.
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("p-{n}")))
+        .await
+        .unwrap();
+    proxy_dao::upsert_cached_version(
+        &pool,
+        proxy_dao::NewProxyCachedVersion {
+            repository_id: repo.id,
+            name: "lib".into(),
+            version: "1.0.0".into(),
+            listed: true,
+            downloaded: false,
+            not_found: false,
+        },
+    )
+    .await
+    .unwrap();
+    let cached = proxy_dao::get_cached_version(&pool, repo.id, "lib", "1.0.0")
+        .await
+        .unwrap()
+        .unwrap();
+    let before = cached_state(&pool, repo.id, "lib", "1.0.0").await;
+
+    let run = uuid::Uuid::new_v4();
+    let summary = apply(
+        &ctx(&pool, repo.id, &repo.name, run),
+        &[],
+        &[evict(cached.id)],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.deleted, 0);
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(cached_state(&pool, repo.id, "lib", "1.0.0").await, before);
+    let rows = audit_rows(&pool, run).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "skipped");
 }

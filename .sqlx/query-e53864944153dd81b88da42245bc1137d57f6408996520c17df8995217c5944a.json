@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO validated_credential\n            (provider_id, username, cred_hmac, verdict, expires_at)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (provider_id, username, cred_hmac)\n        DO UPDATE SET verdict       = EXCLUDED.verdict,\n                      expires_at    = EXCLUDED.expires_at,\n                      created_at    = now(),\n                      claim_token   = NULL,\n                      claimed_until = NULL\n        RETURNING id, provider_id, username, cred_hmac, verdict, expires_at, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "provider_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "provider_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cred_hmac",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "cred_hmac"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "verdict",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "verdict"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e53864944153dd81b88da42245bc1137d57f6408996520c17df8995217c5944a"
+}

@@ -12,6 +12,7 @@ use forge_db::asset_dao::{self, NewAsset};
 use forge_db::blob_dao;
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
+use forge_db::retention_dao;
 use serde_json::{json, Value};
 
 /// A minimal valid hosted policy: keep newest 1, hard-delete the rest. The
@@ -212,6 +213,80 @@ async fn put_validates_then_get_round_trips() {
         "arming a policy must create a ledger run row"
     );
     assert_eq!(body["last_run"]["state"], json!("idle"));
+}
+
+/// A hosted-scope rule (scope omitted ⇒ hosted) on a proxy repo is rejected
+/// with a 400 naming `scope: "proxy_cached"`, both on PUT and when such a
+/// policy is already stored (preview). Regression for H2: it used to validate
+/// and then delete the proxy's cached components behind `proxy_cached_version`.
+#[tokio::test]
+async fn hosted_scope_rule_on_proxy_is_rejected() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retp{s}");
+    let repo = repository_dao::insert_repository(&srv.pool, NewRepository::proxy(name.clone()))
+        .await
+        .unwrap();
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+
+    let hosted_on_proxy = json!({
+        "version": 1,
+        "rules": [{ "id": "sweep", "action": "hard_delete",
+                    "criteria": { "older_than_days": 30 } }]
+    });
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": hosted_on_proxy}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "hosted-scope rule on a proxy must be rejected"
+    );
+    let msg = resp.text().await.unwrap();
+    assert!(
+        msg.contains(r#""scope": "proxy_cached""#),
+        "the 400 must tell the operator to use proxy_cached: {msg}"
+    );
+
+    // The proxy-scoped equivalent is accepted.
+    let proxy_rule = json!({
+        "version": 1,
+        "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                    "criteria": { "not_pulled_for_days": 30 } }]
+    });
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": proxy_rule}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A hosted-scope policy stored before this validation existed is refused
+    // by preview (the worker refuses it the same way) instead of evaluated.
+    retention_dao::write_policy(&srv.pool, repo.id, Some(&hosted_on_proxy))
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{url}/preview"))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(
+        msg.contains("stored policy is invalid") && msg.contains("proxy_cached"),
+        "{msg}"
+    );
 }
 
 /// DELETE clears the policy; a subsequent GET shows a null policy.

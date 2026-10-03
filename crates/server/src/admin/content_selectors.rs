@@ -6,7 +6,8 @@
 //! * `GET    /admin/content-selectors`        — list.
 //! * `POST   /admin/content-selectors`        — create.
 //! * `GET    /admin/content-selectors/{id}`   — fetch one.
-//! * `PATCH  /admin/content-selectors/{id}`   — update description/includes/excludes.
+//! * `PATCH  /admin/content-selectors/{id}`   — update description/includes/excludes
+//!   (true PATCH: an omitted field keeps its stored value).
 //! * `DELETE /admin/content-selectors/{id}`   — delete (cascades scoped grants).
 //!
 //! Globs are validated at write time by compiling them: an invalid pattern is a
@@ -59,15 +60,21 @@ pub struct CreateSelector {
     pub excludes: Vec<String>,
 }
 
-/// Update-selector request (name is immutable).
+/// Update-selector request (name is immutable) with **PATCH semantics**: an
+/// absent (or `null`) field keeps the stored value; a present one replaces it.
+///
+/// This matters for safety, not just convenience: an empty `includes` list
+/// means *match-all*, so defaulting an omitted `includes` to `[]` would turn a
+/// scoped selector into "every package" for every grant that uses it. To
+/// really make a selector match all packages, send `"includes": []`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateSelector {
     #[serde(default)]
-    pub description: String,
+    pub description: Option<String>,
     #[serde(default)]
-    pub includes: Vec<String>,
+    pub includes: Option<Vec<String>>,
     #[serde(default)]
-    pub excludes: Vec<String>,
+    pub excludes: Option<Vec<String>>,
 }
 
 /// Validate that every include/exclude glob compiles, returning a ready 400
@@ -148,15 +155,20 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(body): Json<UpdateSelector>,
 ) -> Response {
-    if let Some(resp) = glob_error(&body.includes, &body.excludes) {
+    // Each list compiles independently, so validating only the supplied ones
+    // is enough (the stored ones were validated when they were written).
+    if let Some(resp) = glob_error(
+        body.includes.as_deref().unwrap_or_default(),
+        body.excludes.as_deref().unwrap_or_default(),
+    ) {
         return resp;
     }
     match authz_dao::update_content_selector(
         &state.pool,
         id,
-        &body.description,
-        &body.includes,
-        &body.excludes,
+        body.description.as_deref(),
+        body.includes.as_deref(),
+        body.excludes.as_deref(),
     )
     .await
     {

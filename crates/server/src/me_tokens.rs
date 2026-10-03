@@ -14,8 +14,10 @@
 //! * Cookie-authenticated mutations are CSRF-checked by the principal
 //!   middleware (`X-CSRF-Token`); `POST` also requires a JSON content type.
 //! * Reuses the admin token DTOs: the plaintext secret is returned exactly once
-//!   from `POST`, listing returns metadata only, and an optional scope can only
-//!   narrow the owner's privileges.
+//!   from `POST`, listing returns metadata (including each token's `scope`)
+//!   only, and an optional scope can only narrow the owner's privileges. An
+//!   unknown scope key (e.g. a mistyped `repos`) is a 400, never an unscoped
+//!   token. Without a scope the token carries no `admin` reach.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -27,7 +29,7 @@ use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_db::token_dao::{self, NewToken};
 
 use crate::admin::db_error;
-use crate::admin::tokens::{CreateToken, CreatedToken, TokenView};
+use crate::admin::tokens::{store_scope, CreateToken, CreatedToken, TokenView};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -114,22 +116,15 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
 
     // Optional per-token scope (§12.4): evaluated as an intersection with the
     // owner's effective set, so it can only narrow — safe for self-service.
-    if let Some(scope) = &body.scope {
-        match serde_json::to_value(scope) {
-            Ok(v) => {
-                if let Err(e) = token_dao::set_token_scope(&state.pool, t.id, Some(&v)).await {
-                    return db_error(e);
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "serializing token scope failed");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-            }
-        }
-    }
+    let scope = match store_scope(&state, t.id, body.scope.as_ref()).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
 
+    let mut view = TokenView::from(&t);
+    view.scope = scope;
     let resp = CreatedToken {
-        view: TokenView::from(&t),
+        view,
         token: secret,
     };
     (StatusCode::CREATED, Json(resp)).into_response()

@@ -170,7 +170,7 @@ describe('admin realms list', () => {
   it('renders realms in priority order with kind badges; local has no delete', async () => {
     mockApi({ realms: threeRealms })
 
-    await renderAt('/admin/realms')
+    await renderAt('/manage/realms')
 
     expect(await screen.findByText('corp-sso')).toBeInTheDocument()
     const rows = screen.getAllByRole('row').slice(1) // skip the header row
@@ -199,7 +199,7 @@ describe('admin realms list', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms')
+    await renderAt('/manage/realms')
 
     await u.click(await screen.findByRole('button', { name: 'Move corp-sso up' }))
 
@@ -218,7 +218,7 @@ describe('admin realms list', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms')
+    await renderAt('/manage/realms')
 
     await u.click(
       await screen.findByRole('checkbox', { name: 'legacy-auth enabled' }),
@@ -227,6 +227,29 @@ describe('admin realms list', () => {
     await waitFor(() =>
       expect(patched).toEqual({ id: 3, body: { enabled: true } }),
     )
+  })
+
+  it('shows the server error when the enabled toggle is refused', async () => {
+    mockApi({
+      realms: threeRealms,
+      onPatch: () =>
+        new Response('cannot disable the last enabled password realm', {
+          status: 409,
+        }),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    await u.click(toggle)
+
+    const row = toggle.closest('tr')!
+    expect(await within(row).findByRole('alert')).toHaveTextContent(
+      'Could not disable local: cannot disable the last enabled password realm',
+    )
+    // The checkbox still shows the stored state.
+    expect(toggle).toBeChecked()
   })
 
   it('delete asks for confirmation then DELETEs', async () => {
@@ -240,7 +263,7 @@ describe('admin realms list', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms')
+    await renderAt('/manage/realms')
 
     const row = (await screen.findByText('legacy-auth')).closest('tr')!
     await u.click(within(row).getByRole('button', { name: 'Delete' }))
@@ -272,7 +295,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
 
     // kind defaults to oidc; submit the empty form.
     await u.click(await screen.findByRole('button', { name: 'Create realm' }))
@@ -295,7 +318,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    const router = await renderAt('/admin/realms/new')
+    const router = await renderAt('/manage/realms/new')
 
     await u.type(await screen.findByLabelText('Name'), 'corp')
     await u.type(screen.getByLabelText('Issuer URL'), 'https://idp.example.com')
@@ -320,7 +343,7 @@ describe('admin realms create', () => {
       },
     })
     await waitFor(() =>
-      expect(router.state.location.pathname).toBe('/admin/realms'),
+      expect(router.state.location.pathname).toBe('/manage/realms'),
     )
   })
 
@@ -335,7 +358,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
 
     await u.selectOptions(await screen.findByLabelText('Kind'), 'credential_forwarding')
     expect(screen.queryByLabelText('Issuer URL')).not.toBeInTheDocument()
@@ -371,7 +394,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
 
     await u.selectOptions(
       await screen.findByLabelText('Kind'),
@@ -433,7 +456,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
 
     await u.selectOptions(
       await screen.findByLabelText('Kind'),
@@ -461,7 +484,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
     await u.selectOptions(
       await screen.findByLabelText('Kind'),
       'workload_identity',
@@ -496,7 +519,7 @@ describe('admin realms create', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/realms/new')
+    await renderAt('/manage/realms/new')
 
     await u.type(await screen.findByLabelText('Name'), 'corp')
     await u.type(screen.getByLabelText('Issuer URL'), 'https://idp.example.com')

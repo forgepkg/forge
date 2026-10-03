@@ -273,9 +273,13 @@ pub enum AddMemberOutcome {
 /// The guard is a recursive CTE over `group_member`: starting from `member_id`
 /// it walks `member -> member` edges (i.e. descends into nested groups). Adding
 /// `(group_id -> member_id)` closes a cycle **iff `group_id` is reachable from
-/// `member_id`**. The same walk bounds depth: if the deepest reachable path from
-/// `member_id` plus the new edge would exceed `max_depth`, the edge is rejected.
-/// `max_depth` counts edges on a path (a direct hosted/proxy member is depth 1).
+/// `member_id`**. Depth is bounded over the *whole* path through the new edge:
+/// a second walk climbs from `group_id` to the groups that (transitively)
+/// contain it, and the edge is rejected when the longest path above
+/// `group_id`, plus the new edge, plus the deepest path below `member_id`
+/// exceeds `max_depth`. Checking only below the member would let a chain grow
+/// past the limit by nesting groups *under* an already-deep group. `max_depth`
+/// counts edges on a path (a direct hosted/proxy member is depth 1).
 ///
 /// Returns the [`AddMemberOutcome`]; a unique-constraint violation surfaces as
 /// [`AddMemberOutcome::Duplicate`] rather than a raw `sqlx::Error`.
@@ -302,9 +306,12 @@ pub async fn add_group_member_checked(
     .fetch_one(&mut *conn)
     .await?;
 
-    // Reachability + depth walk from the prospective member. `depth` counts the
-    // edges already below `member_id`; the new `(group -> member)` edge adds one
-    // more, so the new path length through `member_id` is `MAX(depth) + 1`.
+    // Reachability + depth walks. `reach` descends from the prospective member:
+    // its `depth` counts the edges already below `member_id`. `up` climbs from
+    // the group to every group that (transitively) contains it: its `depth`
+    // counts the edges already above `group_id`. The longest path through the
+    // new `(group -> member)` edge is `MAX(up.depth) + 1 + MAX(reach.depth)`.
+    // Both walks stop one step past `max_depth` (enough to prove "too deep").
     // `path` only breaks an already-existing cycle defensively (a cycle should
     // not exist, but a raw DB write could have created one); cycle *creation* is
     // detected by `group_id` being reachable.
@@ -318,11 +325,21 @@ pub async fn add_group_member_checked(
             JOIN reach ON gm.group_id = reach.id
             WHERE NOT gm.member_id = ANY(reach.path)
               AND reach.depth < $3
+        ),
+        up(id, depth, path) AS (
+            SELECT $2::bigint, 0, ARRAY[$2::bigint]
+          UNION ALL
+            SELECT gm.group_id, up.depth + 1, up.path || gm.group_id
+            FROM group_member gm
+            JOIN up ON gm.member_id = up.id
+            WHERE NOT gm.group_id = ANY(up.path)
+              AND up.depth < $3
         )
         SELECT
             EXISTS (SELECT 1 FROM reach WHERE id = $2)        AS "would_cycle!",
-            COALESCE(MAX(depth), 0) + 1 > $3                  AS "too_deep!"
-        FROM reach
+            (SELECT COALESCE(MAX(depth), 0) FROM up)
+              + 1
+              + (SELECT COALESCE(MAX(depth), 0) FROM reach) > $3 AS "too_deep!"
         "#,
         member_id,
         group_id,
@@ -400,11 +417,14 @@ pub struct RepositoryUpdate {
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
     /// **Plaintext** upstream password column value (legacy path). With
-    /// encryption at rest enabled, callers pass the existing value through
-    /// unchanged (preserving a not-yet-backfilled plaintext) and store a *new*
-    /// password via [`crate::secret_dao::set_upstream_password`] instead;
-    /// `upstream_password_enc` is never touched by this update.
+    /// encryption at rest enabled, callers pass `None` (the plaintext column
+    /// must stay empty) and store the password via
+    /// [`crate::secret_dao::set_upstream_password`] instead.
     pub upstream_password: Option<String>,
+    /// Also set `upstream_password_enc` to NULL. Used when the stored password
+    /// is cleared or replaced without the envelope service (a stale sealed blob
+    /// would otherwise outlive it). When `false` the column is left unchanged.
+    pub clear_upstream_password_enc: bool,
     pub metadata_ttl_seconds: Option<i32>,
     pub not_found_ttl_seconds: Option<i32>,
     pub allow_redeploy: bool,
@@ -436,6 +456,7 @@ where
             metadata_ttl_seconds = $10,
             not_found_ttl_seconds = $11,
             allow_redeploy = $12,
+            upstream_password_enc = CASE WHEN $13 THEN NULL ELSE upstream_password_enc END,
             updated_at = now()
         WHERE id = $1
         RETURNING
@@ -456,19 +477,47 @@ where
         upd.metadata_ttl_seconds,
         upd.not_found_ttl_seconds,
         upd.allow_redeploy,
+        upd.clear_upstream_password_enc,
     )
     .fetch_optional(executor)
     .await
 }
 
+/// Lock a repository row `FOR UPDATE` inside the caller's transaction.
+/// Returns `false` when the row does not exist (or a concurrent delete removed
+/// it first).
+///
+/// Taken before a repository delete inspects or purges its components: the
+/// lock conflicts with the `FOR KEY SHARE` lock every `component` insert's
+/// foreign-key check takes on the repository row, so no publish or proxy
+/// cache fill can commit a new component between the check/purge and the
+/// delete (an in-flight one is waited for and then seen by the check).
+pub async fn lock_repository<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query_scalar!(r#"SELECT id FROM repository WHERE id = $1 FOR UPDATE"#, id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Delete a repository by id. Returns whether a row was deleted.
 ///
-/// FK constraints cascade `group_member` rows that reference it (as group or
-/// member); component/asset rows must already be gone (the admin layer hard-
-/// deletes packages first) or the FK will reject the delete.
-pub async fn delete_repository(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+/// Every dependent row cascades via `ON DELETE CASCADE` — `group_member` rows
+/// naming it as group or member, proxy caches, retention state, grants, **and
+/// its `component`/`asset` rows**. The cascade does not touch `blob` reference
+/// counts, so callers must first remove components through
+/// `component_dao::hard_delete_all_components` (or refuse when any remain),
+/// in the same transaction and after [`lock_repository`]; otherwise the
+/// cascaded assets' blobs keep their references forever and their S3 objects
+/// are never reclaimed.
+pub async fn delete_repository<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let res = sqlx::query!(r#"DELETE FROM repository WHERE id = $1"#, id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected() > 0)
 }

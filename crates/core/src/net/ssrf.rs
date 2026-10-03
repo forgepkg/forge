@@ -15,6 +15,9 @@
 //!   only (never `file:`, `ftp:`, `gopher:`, …) and must have a host.
 //! * [`outbound_client`] — the shared client builder, which caps redirects so a
 //!   malicious upstream cannot bounce us through an unbounded redirect chain.
+//! * [`credential_forward_client`] — the credential-forwarding client, which
+//!   follows **no** redirects at all: a forwarded password must be judged by
+//!   the configured endpoint's own answer, never by wherever it bounces to.
 //!
 //! Operators should know: an admin-configured upstream URL can point anywhere,
 //! including cloud-metadata or other internal addresses, and the
@@ -78,6 +81,27 @@ pub fn outbound_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
+/// Build the client used for **credential forwarding** (the
+/// `credential_forwarding` realm / `upstream-basic` provider).
+///
+/// Unlike [`outbound_client`] it never follows a redirect
+/// (`redirect::Policy::none()`): an upstream behind SSO commonly answers bad
+/// credentials with a 302 to a login page that itself returns 200, and judging
+/// the *final* status would turn every password into a valid one. The caller
+/// sees the 3xx itself and must treat it as unavailable (fail closed). Not
+/// following redirects also keeps the user's `Authorization` header from being
+/// replayed to a second URL. `connect_timeout` bounds connection setup; the
+/// caller adds a per-request total deadline.
+pub fn credential_forward_client(
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout)
+        .read_timeout(DEFAULT_READ_TIMEOUT)
+        .build()
+}
+
 /// Build the stricter client used for OIDC discovery, JWKS, and token-endpoint
 /// metadata traffic. A matching-issuer JWT can trigger these calls on a cold
 /// cache, so both connection establishment and the full response need hard
@@ -133,5 +157,6 @@ mod tests {
     fn outbound_client_builds() {
         assert!(outbound_client().is_ok());
         assert!(outbound_metadata_client().is_ok());
+        assert!(credential_forward_client(Duration::from_secs(2)).is_ok());
     }
 }

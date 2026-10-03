@@ -59,15 +59,32 @@ function RepoBrowse() {
   // Local input mirrors the URL `q` but updates on every keystroke; a debounce
   // pushes it into the URL (and thus the query key) so we don't fetch per char.
   const [input, setInput] = useState(q)
+  // The URL `q` the input was last synchronized with (or that we pushed).
+  const [syncedQ, setSyncedQ] = useState(q)
+
+  // The URL changed underneath the input — Back/Forward, a link, a reload of
+  // another query: show that query. (Adjusting state while rendering, the
+  // React-recommended way to reset state on a prop change.) Our own debounced
+  // push records its value first, so it never clobbers newer keystrokes.
+  // Without this the stale input re-pushed itself and Back got stuck.
+  if (q !== syncedQ) {
+    setSyncedQ(q)
+    setInput(q)
+  }
 
   // Debounce the text input into the URL search param. This synchronizes a
   // controlled input with router URL state (an external system), resets paging
   // to the first page on a new query, and cleans up its timer — a legitimate
-  // effect rather than render-derived state.
+  // effect rather than render-derived state. It *replaces* the history entry:
+  // typing is one step, not one per pause, so Back leaves the search.
   useEffect(() => {
     if (input === q) return
     const t = setTimeout(() => {
-      void navigate({ search: { q: input, prerelease, skip: 0 } })
+      setSyncedQ(input)
+      void navigate({
+        search: { q: input, prerelease, skip: 0 },
+        replace: true,
+      })
     }, 300)
     return () => clearTimeout(t)
   }, [input, q, prerelease, navigate])

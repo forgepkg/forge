@@ -26,7 +26,7 @@ import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 
-export const Route = createFileRoute('/_app/admin/users/$userId')({
+export const Route = createFileRoute('/_app/manage/users/$userId')({
   component: UserTokens,
 })
 
@@ -76,7 +76,7 @@ function UserTokens() {
     <section className="space-y-6">
       <div>
         <Link
-          to="/admin/users"
+          to="/manage/users"
           className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
         >
           ← Users

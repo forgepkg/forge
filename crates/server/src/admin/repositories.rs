@@ -1,22 +1,26 @@
 //! Admin repository CRUD + package hard-delete (plan 10.4, A12).
 //!
 //! `upstream_password` is **write-only**: accepted on create/update, never
-//! returned (responses carry a [`RepoView`] with no password field). On update
-//! a `null`/absent password leaves the stored secret unchanged; a present value
-//! replaces it.
+//! returned (responses carry a [`RepoView`] with no password field). The update
+//! body's field semantics (absent = keep, `null` = clear, value = set) and the
+//! credential drop on an origin change are documented on [`UpdateRepo`].
 //!
 //! `remote_url` on a proxy is **scheme-validated** at create/update time
 //! (http/https only — 12.7 §3.6 dropped the private-range restriction) so a bad
 //! upstream is rejected before any fetch. The configured host is logged on save
 //! for operator visibility (the URL may point at internal addresses).
+//!
+//! Repository **names** are URL path segments (`/v3/{name}/…`, the SPA's
+//! `/repositories/{name}`), so they are validated on create and rename (see
+//! [`validate_repo_name`]).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
+use forge_db::component_dao;
 use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
-use forge_db::{asset_dao, blob_dao, component_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -99,9 +103,30 @@ pub struct CreateRepo {
     pub prefer_hosted: Option<bool>,
 }
 
-/// Update-repository request body. Identity columns (`kind`, `format`) are not
-/// updatable. A present `upstream_password` replaces the stored one; an absent
-/// one leaves it unchanged.
+/// Update-repository request body (`PUT /admin/repositories/{name}`).
+/// Identity columns (`kind`, `format`) are not updatable.
+///
+/// Field semantics:
+///
+/// * `name`, `anonymous_read`, `online`, `remote_url`, `package_delay_seconds`,
+///   `allow_redeploy`, `prefer_hosted`: absent (or `null`) = keep, value = set.
+///   A new `name` is validated like on create.
+/// * `upstream_username`, `upstream_password`, `metadata_ttl_seconds`,
+///   `not_found_ttl_seconds`: **absent = keep, JSON `null` = clear, value =
+///   set.** A cleared TTL falls back to the server default. Clearing the
+///   password removes both the plaintext column and the encrypted blob.
+/// * **Origin change.** When `remote_url` moves to a different origin (scheme,
+///   host and port) and the request does not set a new `upstream_password`,
+///   the stored `upstream_username` and password are dropped, so a private
+///   feed's credentials are never sent to the new host. (A username sent in
+///   the same request is still applied.) The response then carries
+///   `"upstream_credentials_dropped": true` and a warning is logged.
+/// * With secret encryption enabled the plaintext `upstream_password` column
+///   is always left `NULL` by an update: a new password is sealed, and a kept
+///   legacy plaintext value is sealed in the same transaction.
+/// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
+///   `read` grant on the repository (the grant migration 0007 synthesized from
+///   the flag), so anonymous access really ends.
 #[derive(Debug, Deserialize)]
 pub struct UpdateRepo {
     pub name: Option<String>,
@@ -109,13 +134,84 @@ pub struct UpdateRepo {
     pub online: Option<bool>,
     pub remote_url: Option<String>,
     pub package_delay_seconds: Option<i32>,
-    pub upstream_username: Option<String>,
-    pub upstream_password: Option<String>,
-    pub metadata_ttl_seconds: Option<i32>,
-    pub not_found_ttl_seconds: Option<i32>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub upstream_username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub upstream_password: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub metadata_ttl_seconds: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub not_found_ttl_seconds: Option<Option<i32>>,
     pub allow_redeploy: Option<bool>,
     /// Group only.
     pub prefer_hosted: Option<bool>,
+}
+
+/// Update response: the [`RepoView`] plus whether this update dropped the
+/// stored upstream credentials (see [`UpdateRepo`], "Origin change").
+#[derive(Debug, Serialize)]
+pub struct UpdatedRepoView {
+    #[serde(flatten)]
+    pub repo: RepoView,
+    /// `true` iff `remote_url` moved to another origin without a new
+    /// `upstream_password`, and stored credentials were removed.
+    pub upstream_credentials_dropped: bool,
+}
+
+/// Deserialize a field that distinguishes *absent* (`None`, through
+/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
+/// (`Some(Some(v))`).
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+/// The longest accepted repository name.
+const MAX_REPO_NAME_LEN: usize = 64;
+
+/// Validate a repository name: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and not
+/// `new` (any case), which the SPA uses as its "create repository" route.
+///
+/// The name is a URL path segment (`/v3/{name}/…`); a name with a space, `%`
+/// or `/` is stored fine but can never be reached as a feed.
+fn validate_repo_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let valid = name.len() <= MAX_REPO_NAME_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Err(format!(
+            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from              A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit              (the name is part of the feed URL)"
+        ));
+    }
+    if name.eq_ignore_ascii_case("new") {
+        return Err("repository name \"new\" is reserved".into());
+    }
+    Ok(())
+}
+
+/// Whether `new` points at a different origin (scheme, host, port — default
+/// ports normalized) than `old`. A missing or unparsable URL on either side
+/// counts as a change: stored credentials are only kept when the origin is
+/// provably the same.
+fn origin_changed(old: Option<&str>, new: &str) -> bool {
+    match (
+        old.and_then(|u| url::Url::parse(u).ok()),
+        url::Url::parse(new),
+    ) {
+        (Some(old), Ok(new)) => old.origin() != new.origin(),
+        _ => true,
+    }
+}
+
+/// What an update does to the stored upstream password.
+enum PasswordChange {
+    Keep,
+    Clear,
+    Set(String),
 }
 
 fn default_format() -> String {
@@ -175,6 +271,9 @@ pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Res
 
 /// `POST /admin/repositories`
 pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>) -> Response {
+    if let Err(msg) = validate_repo_name(&body.name) {
+        return bad_request(msg);
+    }
     let kind = match body.kind.as_str() {
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
@@ -293,6 +392,9 @@ async fn store_encrypted_password(
 }
 
 /// `PUT /admin/repositories/{name}`
+///
+/// The body and its keep / clear / set rules are documented on [`UpdateRepo`];
+/// the response is an [`UpdatedRepoView`].
 pub async fn update(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -304,8 +406,17 @@ pub async fn update(
         Err(e) => return db_error(e),
     };
 
-    // Merge: each absent field keeps the existing value. `upstream_password`
-    // absent ⇒ keep stored secret; present ⇒ replace.
+    // A rename must yield a reachable name; an unchanged (possibly legacy)
+    // name is left alone.
+    if let Some(new_name) = body.name.as_deref() {
+        if new_name != existing.name {
+            if let Err(msg) = validate_repo_name(new_name) {
+                return bad_request(msg);
+            }
+        }
+    }
+
+    // Merge: each absent field keeps the existing value.
     let remote_url = match &body.remote_url {
         Some(u) => Some(u.clone()),
         None => existing.remote_url.clone(),
@@ -333,6 +444,39 @@ pub async fn update(
         config[PREFER_HOSTED_KEY] = json!(prefer_hosted);
     }
 
+    // Stored credentials belong to the upstream origin they were entered for:
+    // repointing the proxy elsewhere without a new password drops them.
+    let drop_credentials = body
+        .remote_url
+        .as_deref()
+        .is_some_and(|url| origin_changed(existing.remote_url.as_deref(), url))
+        && !matches!(body.upstream_password, Some(Some(_)));
+    let credentials_dropped = drop_credentials
+        && (existing.upstream_username.is_some() || existing.has_upstream_password());
+    let upstream_username = match &body.upstream_username {
+        Some(value) => value.clone(),
+        None if drop_credentials => None,
+        None => existing.upstream_username.clone(),
+    };
+    let password = match &body.upstream_password {
+        Some(Some(pw)) => PasswordChange::Set(pw.clone()),
+        Some(None) => PasswordChange::Clear,
+        None if drop_credentials => PasswordChange::Clear,
+        None => PasswordChange::Keep,
+    };
+    // The plaintext column value, and whether the sealed blob is cleared too.
+    // §12.5: with encryption enabled the plaintext column is always NULL after
+    // an update — a new password is sealed below, and a kept legacy plaintext
+    // value is sealed as well (it is not carried forward).
+    let (upstream_password, clear_upstream_password_enc) = match (&state.envelope, &password) {
+        (Some(_), PasswordChange::Clear) => (None, true),
+        (Some(_), _) => (None, false),
+        (None, PasswordChange::Keep) => (existing.upstream_password.clone(), false),
+        (None, PasswordChange::Clear) => (None, true),
+        // A stale sealed blob would shadow the new plaintext password.
+        (None, PasswordChange::Set(pw)) => (Some(pw.clone()), true),
+    };
+
     let upd = RepositoryUpdate {
         name: body.name.clone().unwrap_or(existing.name.clone()),
         anonymous_read: body.anonymous_read.unwrap_or(existing.anonymous_read),
@@ -342,25 +486,15 @@ pub async fn update(
         package_delay_seconds: body
             .package_delay_seconds
             .unwrap_or(existing.package_delay_seconds),
-        upstream_username: match &body.upstream_username {
-            Some(u) => Some(u.clone()),
-            None => existing.upstream_username.clone(),
-        },
-        // §12.5: with encryption enabled the plaintext column is only ever
-        // carried through unchanged (preserving a not-yet-backfilled value); a
-        // *new* password is sealed via secret_dao below, never stored here.
-        upstream_password: if state.envelope.is_some() {
-            existing.upstream_password.clone()
-        } else {
-            match &body.upstream_password {
-                Some(p) => Some(p.clone()),
-                None => existing.upstream_password.clone(),
-            }
-        },
-        metadata_ttl_seconds: body.metadata_ttl_seconds.or(existing.metadata_ttl_seconds),
+        upstream_username,
+        upstream_password,
+        clear_upstream_password_enc,
+        metadata_ttl_seconds: body
+            .metadata_ttl_seconds
+            .unwrap_or(existing.metadata_ttl_seconds),
         not_found_ttl_seconds: body
             .not_found_ttl_seconds
-            .or(existing.not_found_ttl_seconds),
+            .unwrap_or(existing.not_found_ttl_seconds),
         allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
     };
 
@@ -380,27 +514,59 @@ pub async fn update(
         Err(e) => return db_error(e),
     };
 
-    // §12.5: a present password replaces the stored secret through the
-    // envelope (clearing any legacy plaintext for this row); absent keeps it.
-    let sealed = match (&state.envelope, &body.upstream_password) {
-        (Some(envelope), Some(pw)) => {
-            if let Err(resp) =
-                store_encrypted_password(&mut tx, envelope, updated.id, pw.clone()).await
-            {
-                return resp;
-            }
-            true
+    // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
+    // so switching the flag off must also remove the grant migration 0007
+    // synthesized from it, or the repository stays anonymously readable.
+    let anonymous_revoked = if existing.anonymous_read && !updated.anonymous_read {
+        match forge_db::authz_dao::delete_anonymous_read_grant(&mut *tx, updated.id).await {
+            Ok(removed) => removed,
+            Err(e) => return db_error(e),
         }
-        _ => false,
+    } else {
+        false
     };
+
+    // §12.5: seal a new password through the envelope, or re-seal a kept
+    // legacy plaintext one (the update above nulled its column).
+    let to_seal = match (&state.envelope, password) {
+        (Some(envelope), PasswordChange::Set(pw)) => Some((envelope, pw)),
+        (Some(envelope), PasswordChange::Keep) if existing.upstream_password_enc.is_none() => {
+            existing.upstream_password.clone().map(|pw| (envelope, pw))
+        }
+        _ => None,
+    };
+    let sealed = to_seal.is_some();
+    if let Some((envelope, pw)) = to_seal {
+        if let Err(resp) = store_encrypted_password(&mut tx, envelope, updated.id, pw).await {
+            return resp;
+        }
+    }
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
+    if anonymous_revoked {
+        forge_core::authz::invalidate_anonymous(&state.cache).await;
+    }
+    if credentials_dropped {
+        tracing::warn!(
+            repository = %updated.name,
+            "remote_url moved to a different origin; the stored upstream username and \
+             password were dropped (send a new upstream_password to keep credentials)"
+        );
+    }
+
+    let respond = |r: &Repository| {
+        Json(UpdatedRepoView {
+            repo: RepoView::from(r),
+            upstream_credentials_dropped: credentials_dropped,
+        })
+        .into_response()
+    };
     if !sealed {
-        return Json(RepoView::from(&updated)).into_response();
+        return respond(&updated);
     }
     match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
-        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(Some(r)) => respond(&r),
         Ok(None) => db_error(sqlx::Error::RowNotFound),
         Err(e) => db_error(e),
     }
@@ -422,69 +588,99 @@ pub async fn update(
 /// - **Proxy** repos hold only a reconstructible upstream cache, so deletion
 ///   transactionally decrefs every referenced blob (enqueuing outbox deletes at
 ///   zero refs) and removes the components before dropping the repository.
+///
+/// The emptiness check (hosted) or purge (proxy) and the delete run in **one**
+/// transaction that first locks the repository row `FOR UPDATE`
+/// ([`repository_dao::lock_repository`]). That lock conflicts with the
+/// `FOR KEY SHARE` lock a concurrent component insert takes for its foreign
+/// key, so a publish or cache fill cannot commit in between and be
+/// cascade-deleted without its blob decrement; an overlapping delete of the
+/// same repository waits and then answers 404 without decrementing again.
 pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let existing = match repository_dao::find_repository_by_name(&state.pool, &name).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return db_error(e),
     };
-
-    // Hosted repos may still own (non-reproducible) components; require them
-    // gone first so the deletion is an explicit admin action.
-    if existing.kind() == RepoKind::Hosted {
-        match component_dao::list_components_for_repo(&state.pool, existing.id).await {
-            Ok(comps) if !comps.is_empty() => {
-                return (
-                    StatusCode::CONFLICT,
-                    "repository still has packages; hard-delete them first",
-                )
-                    .into_response();
-            }
-            Ok(_) => {}
-            Err(e) => return db_error(e),
-        }
-    } else {
-        // Proxy (and any non-hosted) repos: decref every blob referenced by the
-        // repo's cached components so blob GC stays correct, then the cascade
-        // can safely drop the now-zero-ref component/asset rows.
-        let grace = state.config.outbox.grace();
-        if let Err(e) = purge_repo_blob_refs(&state, existing.id, grace).await {
-            return db_error(e);
-        }
-    }
-
-    match repository_dao::delete_repository(&state.pool, existing.id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+    let grace = state.config.outbox.grace();
+    match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
+        Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
+        Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(RepoDelete::HasPackages) => (
+            StatusCode::CONFLICT,
+            "repository still has packages; hard-delete them first",
+        )
+            .into_response(),
         Err(e) => db_error(e),
     }
 }
 
-/// Transactionally decrement the ref-count of every blob referenced by any asset
-/// of any component in `repo_id`, enqueuing an outbox delete when a blob reaches
-/// zero refs, then delete the components (assets cascade via FK). Mirrors the
-/// per-package [`hard_delete`] path so blob GC stays correct when a whole
-/// repository is removed.
-async fn purge_repo_blob_refs(
+/// Outcome of [`delete_repository_locked`].
+enum RepoDelete {
+    Deleted,
+    NotFound,
+    /// A hosted repository still owns components.
+    HasPackages,
+}
+
+/// Lock, check/purge and delete a repository in one transaction (see
+/// [`delete`]).
+async fn delete_repository_locked(
     state: &AppState,
     repo_id: i64,
+    kind: RepoKind,
     grace: chrono::Duration,
-) -> sqlx::Result<()> {
-    let components = component_dao::list_components_for_repo(&state.pool, repo_id).await?;
-    if components.is_empty() {
-        return Ok(());
+) -> sqlx::Result<RepoDelete> {
+    // A proxy delete locks the repository row before its cached versions,
+    // while a concurrent cache fill or retention eviction holds a cached
+    // version and then needs the repository row: Postgres resolves that
+    // deadlock by aborting one side. The whole transaction rolled back, so
+    // retrying the delete is safe.
+    let mut attempt = 0;
+    loop {
+        match delete_repository_once(state, repo_id, kind, grace).await {
+            Err(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some("40P01") && attempt < 3 =>
+            {
+                attempt += 1;
+                tracing::warn!(repo_id, attempt, "repository delete deadlocked; retrying");
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn delete_repository_once(
+    state: &AppState,
+    repo_id: i64,
+    kind: RepoKind,
+    grace: chrono::Duration,
+) -> sqlx::Result<RepoDelete> {
+    let mut tx = state.pool.begin().await?;
+    if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
+        return Ok(RepoDelete::NotFound);
     }
 
-    let mut tx = state.pool.begin().await?;
-    for comp in &components {
-        let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
-        for asset in &assets {
-            blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
+    if kind == RepoKind::Hosted {
+        // Hosted repos may still own (non-reproducible) components; require them
+        // gone first so the deletion is an explicit admin action.
+        if component_dao::repository_has_components(&mut *tx, repo_id).await? {
+            return Ok(RepoDelete::HasPackages);
         }
-        component_dao::delete_component(&mut *tx, repo_id, &comp.name, &comp.version).await?;
+    } else {
+        // Proxy (and any non-hosted) repos: decref every blob referenced by the
+        // repo's cached components so blob GC stays correct, and remove them
+        // before the cascade could drop them unaccounted.
+        component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
+
+    let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(if deleted {
+        RepoDelete::Deleted
+    } else {
+        RepoDelete::NotFound
+    })
 }
 
 /// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
@@ -529,8 +725,11 @@ pub async fn hard_delete_package(
 }
 
 /// Transactionally remove a component, its assets, and decref each referenced
-/// blob (enqueuing an outbox delete when a blob reaches zero refs). Mirrors the
-/// hosted write path's hard-delete so blob GC stays correct.
+/// blob (enqueuing an outbox delete when a blob reaches zero refs) through
+/// [`component_dao::hard_delete_component`], which locks the component row
+/// first and decrements only the references it actually deleted — so two
+/// overlapping hard deletes of one version decrement once (the loser gets
+/// `false` → 404).
 async fn hard_delete(
     state: &AppState,
     repo_id: i64,
@@ -539,23 +738,10 @@ async fn hard_delete(
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
     let mut tx = state.pool.begin().await?;
-
-    let Some(comp) = component_dao::find_component(&mut *tx, repo_id, lower_id, version).await?
-    else {
-        return Ok(false);
-    };
-
-    // Decref every blob this component's assets reference.
-    let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
-    for asset in &assets {
-        blob_dao::decref_and_maybe_enqueue_delete(&mut tx, &asset.blob_sha256, grace).await?;
-    }
-
-    // Remove the component (assets cascade via FK).
-    component_dao::delete_component(&mut *tx, repo_id, lower_id, version).await?;
-
+    let deleted =
+        component_dao::hard_delete_component(&mut tx, repo_id, lower_id, version, grace).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(deleted)
 }
 
 /// Whether a `sqlx::Error` is a Postgres unique-violation (23505).

@@ -331,6 +331,14 @@ impl BlobStore {
     }
 
     /// Multipart upload of `path` (already known to be `size` bytes).
+    ///
+    /// Every exit except a successful `complete` aborts the upload so its parts
+    /// do not linger (and bill) on the backend: a failed part upload or a
+    /// failed `complete` aborts before the error is returned, and dropping the
+    /// future mid-upload (client disconnect, request cancellation) aborts from
+    /// a spawned task via [`MultipartAbortGuard`]. A process kill can still
+    /// leave an incomplete upload behind; that is what the bucket's
+    /// `AbortIncompleteMultipartUpload` lifecycle rule is for.
     async fn put_multipart(&self, key: &str, path: &Path, size: u64) -> Result<(), S3Error> {
         let create = self
             .client
@@ -343,6 +351,12 @@ impl BlobStore {
             .upload_id()
             .ok_or_else(|| S3Error::S3("create_multipart_upload returned no upload_id".into()))?
             .to_string();
+        let guard = MultipartAbortGuard {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            upload_id: Some(upload_id.clone()),
+        };
 
         let mut completed_parts: Vec<CompletedPart> = Vec::new();
         let mut part_number: i32 = 1;
@@ -380,35 +394,33 @@ impl BlobStore {
                 offset += len;
                 part_number += 1;
             }
+
+            let completed = CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build();
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(completed)
+                .send()
+                .await?;
             Ok(())
         }
         .await;
 
         match result {
             Ok(()) => {
-                let completed = CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed_parts))
-                    .build();
-                self.client
-                    .complete_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .multipart_upload(completed)
-                    .send()
-                    .await?;
+                guard.disarm();
                 Ok(())
             }
             Err(e) => {
-                // Best-effort abort so we don't leak parts on the backend.
-                let _ = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await;
+                // A failed `complete` can be ambiguous (the backend may have
+                // completed before the response was lost). Aborting is still
+                // safe: aborting an already-completed upload is a no-op
+                // (`NoSuchUpload`) that never removes the object.
+                guard.abort().await;
                 Err(e)
             }
         }
@@ -445,6 +457,82 @@ impl BlobStore {
                 }
             }
         }
+    }
+}
+
+/// Aborts an in-progress multipart upload unless [disarmed](Self::disarm).
+///
+/// [`BlobStore::put_multipart`] awaits [`abort`](Self::abort) on its error
+/// paths. If the upload future is instead dropped mid-flight (the request was
+/// cancelled), `Drop` spawns the abort on the current Tokio runtime so the
+/// parts uploaded so far are released promptly rather than waiting for the
+/// bucket lifecycle rule.
+struct MultipartAbortGuard {
+    client: Client,
+    bucket: String,
+    key: String,
+    /// `None` once the upload completed or was aborted.
+    upload_id: Option<String>,
+}
+
+impl MultipartAbortGuard {
+    /// The upload completed; nothing to abort.
+    fn disarm(mut self) {
+        self.upload_id = None;
+    }
+
+    /// Abort now (best-effort). Should this future itself be dropped before
+    /// the request finishes, `Drop` still spawns the abort.
+    async fn abort(mut self) {
+        if let Some(upload_id) = self.upload_id.clone() {
+            abort_multipart(&self.client, &self.bucket, &self.key, &upload_id).await;
+            self.upload_id = None;
+        }
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        let Some(upload_id) = self.upload_id.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let client = self.client.clone();
+                let bucket = std::mem::take(&mut self.bucket);
+                let key = std::mem::take(&mut self.key);
+                runtime.spawn(async move {
+                    abort_multipart(&client, &bucket, &key, &upload_id).await;
+                });
+            }
+            Err(_) => tracing::warn!(
+                key = %self.key,
+                upload_id = %upload_id,
+                "multipart upload dropped outside a Tokio runtime; leaving it to the \
+                 bucket's AbortIncompleteMultipartUpload lifecycle rule"
+            ),
+        }
+    }
+}
+
+/// Best-effort `AbortMultipartUpload`; failures are logged, never returned (the
+/// caller is already on an error or cancellation path).
+async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &str) {
+    if let Err(error) = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+    {
+        tracing::warn!(
+            key,
+            upload_id,
+            error = ?error,
+            "failed to abort multipart upload; its parts stay on the backend until \
+             the bucket's AbortIncompleteMultipartUpload lifecycle rule reclaims them"
+        );
     }
 }
 

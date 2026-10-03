@@ -94,11 +94,13 @@ pub struct Repository {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
-    /// Legacy plaintext upstream password. Slice 12.5 supersedes it with
-    /// [`Self::upstream_password_enc`]: new writes go through the envelope
-    /// service (which clears this column), existing values are backfilled by
-    /// the startup job, and a later migration drops the column entirely. Until
-    /// then it remains the read fallback for not-yet-backfilled rows.
+    /// Plaintext upstream password: the storage of deployments **without**
+    /// secret encryption at rest. With `[crypto]` enabled (slice 12.5) it is
+    /// superseded by [`Self::upstream_password_enc`]: new writes go through
+    /// the envelope service (which clears this column), and the backfill pass
+    /// moves existing values into the envelope and NULLs this column in the
+    /// same guarded UPDATE. Until a row is backfilled it remains that row's
+    /// read fallback.
     pub upstream_password: Option<String>,
     /// Envelope-encrypted upstream password (slice 12.5): an opaque AEAD blob
     /// bound to this row. Decrypted **only** via
@@ -299,6 +301,9 @@ pub struct Token {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// The per-token privilege scope jsonb (§12.4), exactly as stored; `None`
+    /// for an unscoped token. Evaluated by `forge-core`'s `parse_token_scope`.
+    pub scope: Option<JsonValue>,
 }
 
 /// A row of `external_identity` (slice 12.2).

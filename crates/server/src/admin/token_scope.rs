@@ -23,9 +23,12 @@ use super::db_error;
 use crate::state::AppState;
 
 /// Set-scope request. `scope = null` (or omitted) **clears** the scope (the
-/// token then inherits its owner's full effective set); a present object is
-/// validated against [`TokenScope`] before persisting.
+/// token then inherits its owner's effective set **without `admin`**); a
+/// present object is validated against [`TokenScope`] (which rejects unknown
+/// keys) before persisting. Unknown top-level keys are rejected too, so a
+/// mistyped `"scop"` cannot clear the scope by accident.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetScope {
     #[serde(default)]
     pub scope: Option<TokenScope>,

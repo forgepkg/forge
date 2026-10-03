@@ -170,7 +170,7 @@ describe('admin users', () => {
       ],
     })
 
-    await renderAt('/admin/users')
+    await renderAt('/manage/users')
 
     expect(await screen.findByText('alice')).toBeInTheDocument()
     expect(screen.getByText('bob')).toBeInTheDocument()
@@ -191,7 +191,7 @@ describe('admin users', () => {
     })
 
     const user_ = userEvent.setup()
-    await renderAt('/admin/users')
+    await renderAt('/manage/users')
 
     await user_.type(await screen.findByLabelText('Username'), 'carol')
     await user_.type(screen.getByLabelText('Password'), 'hunter2')
@@ -221,7 +221,7 @@ describe('admin users', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/users')
+    await renderAt('/manage/users')
 
     expect(await screen.findByText('doomed')).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Delete' }))
@@ -258,9 +258,9 @@ describe('admin tokens', () => {
 
     const u = userEvent.setup()
     // Seed the users cache by visiting the list first so the username renders.
-    const router = await renderAt('/admin/users')
+    const router = await renderAt('/manage/users')
     await screen.findByText('alice')
-    await router.navigate({ to: '/admin/users/$userId', params: { userId: '2' } })
+    await router.navigate({ to: '/manage/users/$userId', params: { userId: '2' } })
     await waitFor(() => expect(router.state.status).toBe('idle'))
 
     await u.type(await screen.findByLabelText('Token name'), 'ci-pipeline')
@@ -287,7 +287,7 @@ describe('admin tokens', () => {
     })
 
     const u = userEvent.setup()
-    await renderAt('/admin/users/2')
+    await renderAt('/manage/users/2')
 
     expect(await screen.findByText('ci')).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Revoke' }))

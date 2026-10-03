@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository SET upstream_password = 'legacy-pat', upstream_password_enc = NULL WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8701b95845787fb63fbfb516586bce92fdc9742f74e51392fb65869cc6692630"
+}

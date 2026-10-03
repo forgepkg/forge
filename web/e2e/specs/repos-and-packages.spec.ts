@@ -22,15 +22,14 @@ test.beforeEach(async ({ page }) => {
 })
 
 /**
- * Navigate (client-side) from Browse to the admin repositories list. Hard
- * navigation to /admin/repositories hits the same-named API route, so the UI is
- * always reached via in-app links (see admin-deeplink.spec.ts).
+ * Navigate (client-side) from Browse to the admin repositories list, the way a
+ * user does (hard loads of /manage/* are covered in admin-deeplink.spec.ts).
  */
 async function gotoRepositoriesList(page: import('@playwright/test').Page) {
   await page.goto('/')
   await page.getByRole('link', { name: /^admin$/i }).click()
   await page.getByRole('link', { name: /repositor/i }).first().click()
-  await expect(page).toHaveURL(/\/admin\/repositories$/)
+  await expect(page).toHaveURL(/\/manage\/repositories$/)
 }
 
 /** Create a hosted, anon-readable repo through the real UI form. */
@@ -40,7 +39,7 @@ async function createHostedViaUi(
 ) {
   await gotoRepositoriesList(page)
   await page.getByRole('link', { name: /new repository/i }).click()
-  await expect(page).toHaveURL(/\/admin\/repositories\/new/)
+  await expect(page).toHaveURL(/\/manage\/repositories\/new/)
 
   await page.getByLabel(/^name$/i).fill(name)
   await page.getByLabel(/^kind$/i).selectOption('hosted')
@@ -48,7 +47,7 @@ async function createHostedViaUi(
   await page.getByRole('button', { name: /create repository/i }).click()
 
   // On success we navigate (client-side) to the new repo's edit page.
-  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${name}`))
+  await expect(page).toHaveURL(new RegExp(`/manage/repositories/${name}`))
 }
 
 test('admin creates a hosted repo via the UI and it appears in the list', async ({

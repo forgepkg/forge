@@ -10,7 +10,9 @@
 //! 2. **Orphan reconciler** — a periodic safety net reclaiming never-committed
 //!    `pending` blobs older than the grace window. Idempotent: it deletes the S3
 //!    object first, then drops the row only if it is *still* stale, so two
-//!    instances racing are harmless.
+//!    instances racing are harmless. Each tick also prunes processed
+//!    `blob_outbox` rows past `outbox.processed_retention_seconds` (bounded
+//!    batched `DELETE`s, safe on every instance).
 //! 3. **Proxy metadata refresh** — periodically re-resolves each proxy
 //!    repository's upstream service index. The cross-instance singleflight is a
 //!    **row lock**: [`forge_core::repo::proxy::ProxyRepo::resolve_upstream_index`]
@@ -111,8 +113,15 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         let (pool, store) = (state.pool.clone(), state.blob_store.clone());
         // Reconcile less often than the outbox polls; it is only a safety net.
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        let outbox_retention = state.config.outbox.processed_retention();
         supervise("reconciler", move || {
-            spawn_reconciler(pool.clone(), store.clone(), grace, interval)
+            spawn_reconciler(
+                pool.clone(),
+                store.clone(),
+                grace,
+                outbox_retention,
+                interval,
+            )
         })
     };
 
@@ -301,11 +310,13 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
     })
 }
 
-/// Spawn the orphan-reconciler loop.
+/// Spawn the orphan-reconciler loop. Each tick also prunes processed
+/// `blob_outbox` rows older than `outbox_retention` (`None` = keep them).
 fn spawn_reconciler(
     pool: PgPool,
     store: BlobStore,
     grace: chrono::Duration,
+    outbox_retention: Option<chrono::Duration>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -316,6 +327,26 @@ fn spawn_reconciler(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(reclaimed = n, "reconciler reclaimed orphan blobs"),
                 Err(e) => tracing::error!(error = %e, "reconciler pass failed"),
+            }
+            if let Some(retention) = outbox_retention {
+                match outbox_worker::prune_processed(&pool, retention).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(pruned = n, "pruned processed blob_outbox rows"),
+                    Err(e) => tracing::error!(error = %e, "blob_outbox prune failed"),
+                }
+            }
+            // Proxy versions only ever requested, never listed or served
+            // upstream, once their negative-cache window has lapsed.
+            match forge_db::proxy_dao::prune_unconfirmed(
+                &pool,
+                forge_core::repo::proxy::DEFAULT_NOT_FOUND_TTL_SECONDS,
+                1000,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(pruned = n, "pruned unconfirmed proxy versions"),
+                Err(e) => tracing::error!(error = %e, "proxy version prune failed"),
             }
         }
     })

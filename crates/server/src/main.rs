@@ -104,7 +104,8 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
+    let nuget: Arc<dyn forge_core::format::Format> =
+        Arc::new(NugetFormat::with_limits(config.nuget.limits()));
     let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
     let layer = principal_layer(&state)?;
 

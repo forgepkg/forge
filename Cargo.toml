@@ -45,8 +45,17 @@ sqlx = { version = "0.9", features = [
 # UUIDs (retention run grouping)
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# S3
-aws-sdk-s3 = { version = "1.85" }
+# S3. `default-features = false` drops the SDK's `rustls` feature, which only
+# compiles in the legacy hyper 0.14 / rustls 0.21 / h2 0.3 connector (never
+# used: the default HTTPS client is hyper 1 / rustls 0.23) and with it
+# RUSTSEC-2026-0258 (h2 0.3) and RUSTSEC-2026-0098/0099/0104 (rustls-webpki
+# 0.101). The list below is the SDK's default set minus `rustls`.
+aws-sdk-s3 = { version = "1.85", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-config = { version = "1.8" }
 
 # HTTP client

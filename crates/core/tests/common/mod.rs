@@ -62,17 +62,36 @@ async fn endpoint() -> &'static str {
     ENDPOINT.get().unwrap()
 }
 
-/// A fresh, migrated pool for the calling test, backed by the shared container
-/// — or by an external Postgres when `FORGE_TEST_DATABASE_URL` is set (for
-/// environments without Docker).
-pub async fn pool() -> PgPool {
-    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+/// The test database URL: the shared container, or `FORGE_TEST_DATABASE_URL`.
+async fn database_url() -> String {
+    match std::env::var("FORGE_TEST_DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
             let endpoint = endpoint().await;
             format!("postgres://forge:forge@{endpoint}/forge")
         }
-    };
+    }
+}
+
+/// A migrated pool capped at `max_connections`, whose `acquire` gives up after
+/// `acquire_timeout` — for tests asserting that work does not hold pooled
+/// connections (an exhausted pool then fails fast instead of hanging).
+pub async fn small_pool(max_connections: u32, acquire_timeout: Duration) -> PgPool {
+    // Make sure the schema exists before handing out the constrained pool.
+    pool().await.close().await;
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .connect(&database_url().await)
+        .await
+        .expect("connect")
+}
+
+/// A fresh, migrated pool for the calling test, backed by the shared container
+/// — or by an external Postgres when `FORGE_TEST_DATABASE_URL` is set (for
+/// environments without Docker).
+pub async fn pool() -> PgPool {
+    let url = database_url().await;
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)

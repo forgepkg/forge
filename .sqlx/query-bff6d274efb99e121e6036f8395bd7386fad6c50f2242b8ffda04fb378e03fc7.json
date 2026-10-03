@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE encryption_key AS k\n            SET state = 'revoked', rotated_at = COALESCE(k.rotated_at, now())\n            WHERE k.id = $1 AND k.layer = 'kek' AND k.state = 'retiring'\n              AND NOT EXISTS (\n                    SELECT 1 FROM encryption_key d\n                    WHERE d.layer = 'dek' AND d.scope = k.scope\n                      AND d.state <> 'revoked'\n                      AND d.wrapping_kek_version = k.version)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bff6d274efb99e121e6036f8395bd7386fad6c50f2242b8ffda04fb378e03fc7"
+}

@@ -8,7 +8,7 @@ import { adminBasic, facts, signInSession } from '../helpers'
  * The UI signs in with username+password (or a realm); registry-token sign-in
  * does not exist. A wrong password stays on Login with the uniform error; an
  * admin session reveals the Admin nav; a non-admin session cannot reach
- * /admin/* (the route guard redirects to Browse); signing out invalidates the
+ * /manage/* (the route guard redirects to Browse); signing out invalidates the
  * cookie session and clears the stored CSRF token.
  */
 
@@ -71,13 +71,13 @@ test('password sign-in lands on Browse and reveals the Admin nav', async ({
 test('admin can navigate to the repositories admin screen', async ({ page }) => {
   await signInSession(page)
   // Drive via in-app (client-side) navigation: land on Browse, then use the
-  // Admin nav. (Hard-navigating to /admin/repositories hits the same-named API
-  // route — see admin-deeplink.spec.ts for that documented collision.)
+  // Admin nav. (Hard loads of /manage/* deep links are covered in
+  // admin-deeplink.spec.ts.)
   await page.goto('/')
   await page.getByRole('link', { name: /^admin$/i }).click()
-  await expect(page).toHaveURL(/\/admin$/)
+  await expect(page).toHaveURL(/\/manage$/)
   await page.getByRole('link', { name: /repositor/i }).first().click()
-  await expect(page).toHaveURL(/\/admin\/repositories/)
+  await expect(page).toHaveURL(/\/manage\/repositories/)
   await expect(
     page.getByRole('heading', { name: /^repositories$/i }),
   ).toBeVisible()
@@ -96,15 +96,15 @@ test('a non-admin reader never sees the Admin nav (gating)', async ({
   await expect(page.getByRole('link', { name: /^admin$/i })).toHaveCount(0)
 })
 
-test('the admin route guard redirects a non-admin away from /admin (hard nav)', async ({
+test('the admin route guard redirects a non-admin away from /manage (hard nav)', async ({
   page,
   request,
 }) => {
   const reader = await createReader(request)
   await signInSession(page, reader.username, reader.password)
-  // `/admin` (exactly) has no API route, so the SPA serves it; the client-side
-  // guard then redirects an authenticated non-admin to Browse.
-  await page.goto('/admin')
+  // The SPA serves /manage/*; the client-side guard then redirects an
+  // authenticated non-admin to Browse.
+  await page.goto('/manage/repositories')
   await expect(page).toHaveURL(/\/$|\/\?/)
   await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
 })

@@ -62,6 +62,7 @@ interface ApiHandlers {
   repositories?: RepoView[]
   members?: MemberView[]
   onCreate?: (body: unknown) => Response
+  onUpdate?: (name: string, body: unknown) => Response
   onAddMember?: (body: unknown) => Response
 }
 
@@ -100,6 +101,14 @@ function mockApi(h: ApiHandlers) {
         const name = decodeURIComponent(m[1])
         const found = (h.repositories ?? []).find((r) => r.name === name)
         return Promise.resolve(found ? json(found) : json('nope', 404))
+      }
+      if (m && method === 'PUT') {
+        const name = decodeURIComponent(m[1])
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        const found = (h.repositories ?? []).find((r) => r.name === name)
+        return Promise.resolve(
+          h.onUpdate ? h.onUpdate(name, body) : json({ ...found, ...body }),
+        )
       }
       return Promise.resolve(new Response('not found', { status: 404 }))
     },
@@ -141,7 +150,7 @@ describe('admin repositories', () => {
       ],
     })
 
-    await renderAt('/admin/repositories')
+    await renderAt('/manage/repositories')
 
     expect(await screen.findByText('hosted-1')).toBeInTheDocument()
     expect(screen.getByText('proxy-1')).toBeInTheDocument()
@@ -159,7 +168,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/new')
+    await renderAt('/manage/repositories/new')
 
     await user.type(await screen.findByLabelText('Name'), 'brand-new')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
@@ -167,6 +176,75 @@ describe('admin repositories', () => {
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toMatchObject({ name: 'brand-new', kind: 'hosted' })
     expect(posted).not.toHaveProperty('remote_url')
+  })
+
+  it('create blocks an invalid repository name before requesting', async () => {
+    let posted = false
+    mockApi({
+      repositories: [],
+      onCreate: () => {
+        posted = true
+        return json(repo({}), 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/new')
+
+    await user.type(await screen.findByLabelText('Name'), 'Team Packages')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/no spaces/)
+    expect(posted).toBe(false)
+  })
+
+  it('edit PUTs only what changed; "Remove stored credentials" sends explicit nulls', async () => {
+    const stored = repo({
+      id: 7,
+      name: 'private-feed',
+      kind: 'proxy',
+      remote_url: 'https://pkgs.example.com/v3/index.json',
+      upstream_username: 'svc',
+      has_upstream_password: true,
+      metadata_ttl_seconds: 600,
+    })
+    const puts: unknown[] = []
+    mockApi({
+      repositories: [stored],
+      onUpdate: (_name, body) => {
+        puts.push(body)
+        const b = body as Record<string, unknown>
+        const cleared = b.upstream_password === null
+        return json({
+          ...stored,
+          upstream_username: cleared ? null : stored.upstream_username,
+          has_upstream_password: !cleared && stored.has_upstream_password,
+        })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/private-feed')
+
+    // An untouched save sends nothing that could clear stored values.
+    await user.click(await screen.findByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({})
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Remove stored credentials' }),
+    )
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(puts).toHaveLength(2))
+    expect(puts[1]).toEqual({ upstream_username: null, upstream_password: null })
+
+    // The form is re-seeded from the saved view: nothing left to remove.
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('button', { name: 'Remove stored credentials' }),
+      ).toBeNull(),
+    )
+    expect(screen.getByLabelText('Upstream username')).toBeEnabled()
   })
 
   it('group members editor blocks a duplicate priority before requesting', async () => {
@@ -184,7 +262,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/grp/members')
+    await renderAt('/manage/repositories/grp/members')
 
     // The existing member is shown with its priority.
     expect(await screen.findByText('existing')).toBeInTheDocument()
@@ -217,7 +295,7 @@ describe('admin repositories', () => {
     })
 
     const user = userEvent.setup()
-    await renderAt('/admin/repositories/grp/members')
+    await renderAt('/manage/repositories/grp/members')
 
     await user.selectOptions(
       await screen.findByLabelText('Repository'),

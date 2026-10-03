@@ -12,6 +12,9 @@
 //!   2. for each row: reserve the zero-ref blob in a short transaction (which
 //!      fails while an ingest lease is live), do the S3 delete outside any tx,
 //!      then token-conditionally delete the row + mark processed.
+//!
+//! Processed rows are terminal; [`prune_processed`] deletes them once they are
+//! older than the configured retention so the queue does not grow forever.
 
 use std::time::Duration as StdDuration;
 
@@ -126,6 +129,36 @@ async fn process_row(
             Ok(true)
         }
     }
+}
+
+/// Rows deleted per statement by [`prune_processed`].
+const PRUNE_BATCH: i64 = 1_000;
+
+/// Upper bound on batches per [`prune_processed`] call, so one maintenance
+/// tick never turns into an unbounded delete; a larger backlog drains over
+/// subsequent ticks.
+const PRUNE_MAX_BATCHES: usize = 50;
+
+/// Delete processed outbox rows whose `processed_at` is older than
+/// `retention`, in batches of [`PRUNE_BATCH`] (at most [`PRUNE_MAX_BATCHES`]
+/// per call). Returns the number of rows deleted.
+///
+/// Processed rows are terminal and never consulted by the worker or the
+/// reconciler, so this only bounds `blob_outbox` growth; unprocessed rows are
+/// never touched. Each batch is its own short statement (no long-running
+/// transaction, no lock on live rows), and the delete is idempotent, so every
+/// instance can run it concurrently.
+pub async fn prune_processed(pool: &PgPool, retention: chrono::Duration) -> anyhow::Result<u64> {
+    let cutoff = Utc::now() - retention;
+    let mut total = 0u64;
+    for _ in 0..PRUNE_MAX_BATCHES {
+        let deleted = forge_db::outbox_dao::prune_processed(pool, cutoff, PRUNE_BATCH).await?;
+        total += deleted;
+        if deleted < PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Exponential backoff (capped) for a row that has failed `attempts` times.

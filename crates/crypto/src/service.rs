@@ -36,6 +36,17 @@
 //! All sweeps are idempotent and resumable: a crash mid-sweep leaves a mix of
 //! old/new parent references that the next run finishes, and both parents
 //! remain usable (`active`/`retiring`) during the window.
+//!
+//! ## Concurrent rotations
+//!
+//! The server serializes rotation passes cluster-wide (an advisory lock taken
+//! by the worker *and* the admin endpoints), but the key store does not rely
+//! on it: every re-wrap is a compare-and-swap against the row as read
+//! ([`KeyStore::update_wrapped`]) that also refuses a revoked target parent,
+//! and a KEK is revoked only if no DEK references it at commit time
+//! ([`KeyStore::revoke_kek_if_unreferenced`]). Racing rotations can therefore
+//! skip rows (picked up by the next pass) or fail, but never leave a DEK
+//! wrapped under a revoked KEK.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -316,10 +327,22 @@ impl EnvelopeService {
                 dek_bytes.expose(),
                 &aad,
             )?;
-            self.store
-                .update_wrapped(dek.id, &new_wrapped, None, None, Some(active_kek.version))
-                .await?;
-            rewrapped += 1;
+            // Compare-and-swap: a concurrent rotation that already moved this
+            // row (or revoked the KEK we are wrapping under) wins; the next
+            // pass re-reads the row.
+            if self
+                .store
+                .update_wrapped(&dek, &new_wrapped, None, None, Some(active_kek.version))
+                .await?
+            {
+                rewrapped += 1;
+            } else {
+                tracing::debug!(
+                    dek = dek.version,
+                    kek = active_kek.version,
+                    "DEK re-wrap lost a race with a concurrent rotation; skipped"
+                );
+            }
         }
         if rewrapped > 0 {
             tracing::info!(rewrapped, "re-wrapped DEK rows under the active KEK");
@@ -343,16 +366,25 @@ impl EnvelopeService {
             })?;
             let kek_bytes = self.root.unwrap_kek(&kek.wrapped_key, old_version).await?;
             let new_wrapped = self.root.wrap_kek(kek_bytes.expose()).await?;
-            self.store
+            // Compare-and-swap, as in `rewrap_deks`.
+            if self
+                .store
                 .update_wrapped(
-                    kek.id,
+                    &kek,
                     &new_wrapped,
                     Some(self.root.root_key_id()),
                     Some(&current),
                     None,
                 )
-                .await?;
-            rewrapped += 1;
+                .await?
+            {
+                rewrapped += 1;
+            } else {
+                tracing::debug!(
+                    kek = kek.version,
+                    "KEK re-wrap lost a race with a concurrent rotation; skipped"
+                );
+            }
         }
         if rewrapped > 0 {
             tracing::info!(rewrapped, "re-wrapped KEK rows under the current root");
@@ -363,6 +395,10 @@ impl EnvelopeService {
     /// Revoke `retiring` KEKs that no non-revoked DEK references anymore
     /// (post-KEK-rotation cleanup) and evict them from the unwrapped-key cache.
     /// Returns the number of KEKs revoked.
+    ///
+    /// The listing below is only a pre-filter: the store re-checks the
+    /// reference **at commit time** ([`KeyStore::revoke_kek_if_unreferenced`]),
+    /// so a DEK re-wrapped onto a KEK after this listing keeps that KEK alive.
     pub async fn revoke_unreferenced_keks(&self) -> Result<usize, CryptoError> {
         let referenced: std::collections::HashSet<i32> = self
             .store
@@ -374,16 +410,30 @@ impl EnvelopeService {
             .collect();
         let mut revoked = 0;
         for kek in self.store.list(KeyLayer::Kek, self.scope()).await? {
-            if kek.state == KeyState::Retiring && !referenced.contains(&kek.version) {
-                self.revoke(&kek).await?;
+            if kek.state == KeyState::Retiring
+                && !referenced.contains(&kek.version)
+                && self.store.revoke_kek_if_unreferenced(&kek).await?
+            {
+                self.forget_unwrapped(KeyLayer::Kek, kek.version).await;
+                tracing::info!(layer = %kek.layer, version = kek.version, "revoked encryption key");
                 revoked += 1;
             }
         }
         Ok(revoked)
     }
 
-    /// Revoke a specific key version and evict its unwrapped bytes from the
-    /// cache (used by the DEK sweep once no ciphertext references the DEK).
+    /// Evict a key's unwrapped bytes from this instance's cache (after the key
+    /// was revoked elsewhere, e.g. by the DEK sweep in `forge-db`, which flips
+    /// the state under its own commit-time reference check).
+    pub async fn forget_unwrapped(&self, layer: KeyLayer, version: i32) {
+        self.keys.invalidate(&(layer, version)).await;
+    }
+
+    /// Revoke a specific key version **unconditionally** and evict its
+    /// unwrapped bytes from the cache. The caller must guarantee nothing
+    /// references the key; the rotation paths use the commit-time checked
+    /// [`Self::revoke_unreferenced_keks`] and `forge-db`'s
+    /// `secret_dao::revoke_unreferenced_deks` instead.
     pub async fn revoke_key(&self, layer: KeyLayer, version: i32) -> Result<(), CryptoError> {
         let rec = self
             .store
@@ -725,6 +775,75 @@ mod tests {
 
         // Idempotent: a second sweep has nothing to do.
         assert_eq!(svc.rewrap_deks().await.unwrap(), 0);
+    }
+
+    /// Review M13: rotations racing on several "instances" (shared store and
+    /// root) must never leave a DEK wrapped under a revoked KEK, and the next
+    /// converging pass re-wraps everything under the active KEK.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_kek_rotations_never_strand_a_dek() {
+        let store: Arc<dyn KeyStore> = Arc::new(InMemoryKeyStore::new());
+        let root_bytes = KeyBytes::generate();
+        let instance = || {
+            Arc::new(service_with(
+                store.clone(),
+                Arc::new(StaticRootProvider::new(
+                    "test",
+                    Algorithm::Aes256Gcm,
+                    KeyBytes::from_slice(root_bytes.expose()).unwrap(),
+                    vec![],
+                )),
+                Duration::from_secs(300),
+            ))
+        };
+        let first = instance();
+        let blob = first.seal(&secret("pw"), binding(8)).await.unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let svc = instance();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..5 {
+                    // A losing racer may error (its KEK was revoked under it);
+                    // it must never corrupt the hierarchy.
+                    let _ = svc.rotate_kek().await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let check = |keks: &[KeyRecord], deks: &[KeyRecord]| {
+            for dek in deks.iter().filter(|d| d.state != KeyState::Revoked) {
+                let parent = dek.wrapping_kek_version.unwrap();
+                assert!(
+                    keks.iter()
+                        .any(|k| k.version == parent && k.state != KeyState::Revoked),
+                    "DEK v{} under revoked KEK v{parent}",
+                    dek.version
+                );
+            }
+        };
+        let svc = instance();
+        check(
+            &svc.list_keys(KeyLayer::Kek).await.unwrap(),
+            &svc.list_keys(KeyLayer::Dek).await.unwrap(),
+        );
+        svc.rewrap_deks().await.unwrap();
+        svc.revoke_unreferenced_keks().await.unwrap();
+        let keks = svc.list_keys(KeyLayer::Kek).await.unwrap();
+        let deks = svc.list_keys(KeyLayer::Dek).await.unwrap();
+        check(&keks, &deks);
+        let active = keks.iter().find(|k| k.state == KeyState::Active).unwrap();
+        assert!(deks
+            .iter()
+            .all(|d| d.wrapping_kek_version == Some(active.version)));
+        assert_eq!(
+            svc.open(&blob, binding(8)).await.unwrap().expose_secret(),
+            "pw"
+        );
     }
 
     #[tokio::test]

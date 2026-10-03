@@ -18,8 +18,7 @@ import { adminBasic, facts, fetchPackageDetail, signInSession } from '../helpers
  * (`facts().upstreamIndexUrl`); a loopback remote requires `allow_private_upstream`
  * to clear the SSRF guard, which the form exposes as a checkbox.
  *
- * Admin UI sub-routes collide with the admin API namespace, so the proxy is
- * created via in-app navigation (never a hard `/admin/...` load).
+ * The proxy is created via in-app navigation (Browse -> Admin nav).
  */
 
 test.beforeEach(async ({ page }) => {
@@ -37,7 +36,7 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await page.goto('/')
   await page.getByRole('link', { name: /^admin$/i }).click()
   await page.getByRole('link', { name: /repositor/i }).first().click()
-  await expect(page).toHaveURL(/\/admin\/repositories$/)
+  await expect(page).toHaveURL(/\/manage\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
 
   // (The 12.7 SSRF guard is scheme-only, so the loopback upstream needs no
@@ -48,7 +47,7 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await page.getByLabel(/remote url/i).fill(f.upstreamIndexUrl)
   await page.getByLabel(/package delay/i).fill('3600')
   await page.getByRole('button', { name: /create repository/i }).click()
-  await expect(page).toHaveURL(new RegExp(`/admin/repositories/${proxy}`))
+  await expect(page).toHaveURL(new RegExp(`/manage/repositories/${proxy}`))
 
   // 2. Trigger upstream discovery: hitting the detail read path runs the proxy
   //    read ops, which stamp `first_seen_at` and (because the delay has not

@@ -419,6 +419,165 @@ async fn unlist_hides_from_search_but_keeps_downloadable_and_relist_restores() {
     assert_eq!(res.total_hits, 1);
 }
 
+/// A redeploy that loses the component row lock to a concurrent hard delete
+/// publishes the version afresh instead of failing with an internal error.
+#[tokio::test]
+async fn redeploy_losing_the_row_lock_to_a_delete_creates_the_version() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let comp = forge_db::component_dao::find_component(&pool, repo_id, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The "delete": hold the component row lock.
+    let mut deleter = pool.begin().await.unwrap();
+    let deleter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *deleter)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM component WHERE id = $1 FOR UPDATE")
+        .bind(comp.id)
+        .execute(&mut *deleter)
+        .await
+        .unwrap();
+
+    // The redeploy blocks on that lock.
+    let pusher = {
+        let (repo, id) = (repo.clone(), id.clone());
+        tokio::spawn(async move {
+            w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+                .await
+        })
+    };
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(deleter_pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The delete removes the version and commits.
+    sqlx::query("DELETE FROM component WHERE id = $1")
+        .bind(comp.id)
+        .execute(&mut *deleter)
+        .await
+        .unwrap();
+    deleter.commit().await.unwrap();
+
+    let outcome = pusher
+        .await
+        .unwrap()
+        .expect("redeploy after a delete succeeds");
+    assert_eq!(outcome, PublishOutcome::Created);
+    assert!(
+        forge_db::component_dao::find_component(&pool, repo_id, &lower, "1.0.0")
+            .await
+            .unwrap()
+            .is_some(),
+        "the version exists again"
+    );
+}
+
+/// A hard delete that loses the component row lock to a concurrent delete is a
+/// plain `NotFound` (404 on the wire), not an internal error, and it touches
+/// no blob reference counts.
+#[tokio::test]
+async fn hard_delete_losing_the_row_lock_is_not_found() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, false).await;
+
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let comp = forge_db::component_dao::find_component(&pool, repo_id, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .unwrap();
+    let nupkg = forge_db::asset_dao::find_asset(&pool, comp.id, NUPKG_ASSET_PATH)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // The "winner": hold the component row lock.
+    let mut winner = pool.begin().await.unwrap();
+    let winner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *winner)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM component WHERE id = $1 FOR UPDATE")
+        .bind(comp.id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+
+    // The "loser" blocks on that lock.
+    let loser = {
+        let (repo, id) = (repo.clone(), id.clone());
+        tokio::spawn(async move { w.delete_component(&repo, &id, "1.0.0", true).await })
+    };
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(winner_pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The winner removes the component and commits.
+    sqlx::query("DELETE FROM component WHERE id = $1")
+        .bind(comp.id)
+        .execute(&mut *winner)
+        .await
+        .unwrap();
+    winner.commit().await.unwrap();
+
+    let out = loser.await.unwrap().expect("losing delete is not an error");
+    assert_eq!(out, DeleteOutcome::NotFound);
+    assert_eq!(
+        blob_ref_count(&pool, &nupkg.blob_sha256).await,
+        Some(1),
+        "the losing delete must not decrement anything"
+    );
+}
+
 #[tokio::test]
 async fn hard_delete_removes_rows_and_decrefs_blobs() {
     let pool = common::pool().await;

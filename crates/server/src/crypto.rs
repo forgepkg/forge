@@ -21,13 +21,18 @@
 //!
 //! ## Cluster coordination
 //!
-//! The worker pass runs under a Postgres **session advisory lock**
-//! ([`ROTATION_LOCK_KEY`]) held on a dedicated connection, so exactly one
-//! instance performs a given pass cluster-wide (the plan §2.7 pattern —
-//! deliberately different from the slice-1 lease-based workers because a
-//! rotation pass spans several tables and the lock is purely an efficiency
-//! gate: every step inside is idempotent and resumable, so a crashed pass is
-//! simply finished by the next holder).
+//! The worker pass **and** the admin `POST /admin/crypto/rotate/*` endpoints
+//! run under one Postgres **session advisory lock** ([`ROTATION_LOCK_KEY`],
+//! [`try_rotation_lock`]) held on a dedicated connection, so exactly one
+//! rotation runs cluster-wide at a time (the plan §2.7 pattern — deliberately
+//! different from the slice-1 lease-based workers because a rotation pass
+//! spans several tables). A worker tick that finds the lock taken skips its
+//! pass; an admin request gets 409. Every step inside is idempotent and
+//! resumable, so a crashed pass is simply finished by the next holder. The
+//! lock is the first line of defence only: the key store's compare-and-swap
+//! re-wraps and commit-time-checked revocations (`forge-crypto` /
+//! `forge-db`) keep the hierarchy consistent even when rotations do overlap
+//! (e.g. a mixed-version rolling deploy, or the unlocked startup bootstrap).
 
 use std::sync::Arc;
 
@@ -43,10 +48,78 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Config, CryptoConfig};
 
-/// Advisory-lock key of the rotation/backfill worker (`pg_try_advisory_lock`).
-/// The value is arbitrary but fixed: ASCII `"forge125"` as a big-endian i64,
-/// namespacing it away from other forge advisory-lock users.
-const ROTATION_LOCK_KEY: i64 = 0x666f_7267_6531_3235;
+/// Advisory-lock key serializing rotation passes (worker + admin endpoints,
+/// `pg_try_advisory_lock`). The value is arbitrary but fixed: ASCII
+/// `"forge125"` as a big-endian i64, namespacing it away from other forge
+/// advisory-lock users.
+pub const ROTATION_LOCK_KEY: i64 = 0x666f_7267_6531_3235;
+
+/// The cluster-wide rotation lock, held: a session advisory lock on a
+/// dedicated pooled connection (session locks belong to a connection, so lock
+/// and unlock must run on the same one, never through the pool's round-robin).
+///
+/// Call [`RotationLock::release`] when done. If the guard is dropped without it
+/// (an error path, or an admin request whose client disconnected and whose
+/// handler future was cancelled), the connection is **closed** instead of
+/// returned to the pool, which releases the lock server-side — a pooled
+/// connection must never keep holding it.
+pub struct RotationLock {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    released: bool,
+}
+
+impl RotationLock {
+    /// Unlock and hand the connection back to the pool. On an unlock failure
+    /// the connection is closed instead (which also releases the lock).
+    pub async fn release(mut self) {
+        match sqlx::query(r#"SELECT pg_advisory_unlock($1)"#)
+            .bind(ROTATION_LOCK_KEY)
+            .execute(&mut *self.conn)
+            .await
+        {
+            Ok(_) => self.released = true,
+            Err(e) => {
+                tracing::warn!(error = %e, "crypto rotation advisory unlock failed (released on close)");
+            }
+        }
+    }
+}
+
+impl Drop for RotationLock {
+    fn drop(&mut self) {
+        if !self.released {
+            self.conn.close_on_drop();
+        }
+    }
+}
+
+/// Try to take the cluster-wide rotation lock without waiting. `Ok(None)` when
+/// another instance (or request) holds it.
+pub async fn try_rotation_lock(pool: &PgPool) -> anyhow::Result<Option<RotationLock>> {
+    let conn = pool
+        .acquire()
+        .await
+        .context("acquire advisory-lock connection")?;
+    // Guard the connection *before* asking for the lock: if this future is
+    // cancelled after the server granted it but before the reply was read,
+    // the guard's drop closes the connection (releasing the lock) rather
+    // than returning a lock-holding connection to the pool.
+    let mut guard = RotationLock {
+        conn,
+        released: false,
+    };
+    let got: bool = sqlx::query_scalar(r#"SELECT pg_try_advisory_lock($1)"#)
+        .bind(ROTATION_LOCK_KEY)
+        .fetch_one(&mut *guard.conn)
+        .await
+        .context("try advisory lock")?;
+    if !got {
+        // Not held: the connection goes straight back to the pool.
+        guard.released = true;
+        return Ok(None);
+    }
+    Ok(Some(guard))
+}
 
 /// Build the [`EnvelopeService`] from the `[crypto]` config, or `None` when
 /// the section is absent/disabled. Errors (unknown provider, missing or
@@ -110,8 +183,9 @@ pub fn build_envelope(
 }
 
 /// Startup bootstrap: ensure the active KEK + DEK exist and run a first
-/// backfill pass so pre-12.5 plaintext rows are wrapped right away (the worker
-/// keeps backfilling if this instance loses the race / more rows appear).
+/// backfill pass so plaintext rows (written before encryption was enabled) are
+/// wrapped — and their plaintext cleared — right away (the worker keeps
+/// backfilling if this instance loses the race / more rows appear).
 /// Also verifies every KEK is unwrappable under the configured root(s) so a
 /// botched root rotation surfaces at boot, not at the first secret read.
 pub async fn bootstrap(
@@ -147,7 +221,7 @@ pub async fn bootstrap(
     if total > 0 {
         tracing::info!(
             rows = total,
-            "backfilled plaintext upstream passwords into envelopes"
+            "moved plaintext upstream passwords into envelopes (plaintext cleared)"
         );
     }
     let realms = secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
@@ -184,41 +258,19 @@ pub fn spawn_worker(
     }))
 }
 
-/// Take the advisory lock (skip the pass when another instance holds it) and
-/// run [`rotation_pass`], releasing the lock on the same connection afterwards.
+/// Take the advisory lock (skip the pass when another instance or an admin
+/// rotation holds it) and run [`rotation_pass`], releasing the lock afterwards.
 async fn locked_rotation_pass(
     pool: &PgPool,
     envelope: &Arc<EnvelopeService>,
     cfg: &crate::config::CryptoRotationConfig,
 ) -> anyhow::Result<()> {
-    // Dedicated connection: session advisory locks belong to a connection, so
-    // lock and unlock must run on the same one (never through the pool's
-    // round-robin). Dropping the connection (even on a crash mid-pass)
-    // releases the lock server-side.
-    let mut conn = pool
-        .acquire()
-        .await
-        .context("acquire advisory-lock connection")?;
-    let got: bool = sqlx::query_scalar(r#"SELECT pg_try_advisory_lock($1)"#)
-        .bind(ROTATION_LOCK_KEY)
-        .fetch_one(&mut *conn)
-        .await
-        .context("try advisory lock")?;
-    if !got {
+    let Some(lock) = try_rotation_lock(pool).await? else {
         tracing::debug!("another instance holds the crypto rotation lock; skipping pass");
         return Ok(());
-    }
-
+    };
     let result = rotation_pass(pool, envelope, cfg).await;
-
-    // Best-effort unlock; dropping the connection would also release it.
-    if let Err(e) = sqlx::query(r#"SELECT pg_advisory_unlock($1)"#)
-        .bind(ROTATION_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-    {
-        tracing::warn!(error = %e, "crypto rotation advisory unlock failed (released on close)");
-    }
+    lock.release().await;
     result
 }
 
