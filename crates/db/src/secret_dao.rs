@@ -915,6 +915,39 @@ pub async fn update_realm_with_secrets(
     Ok(row)
 }
 
+/// [`update_realm_with_secrets`] as a compare-and-set in the caller's
+/// transaction: the row is written only while it is still `expected`
+/// ([`auth_realm_dao::update_realm_and_secrets_if_unchanged`]). `None` when it
+/// changed or is gone; nothing is written then.
+pub async fn update_realm_with_secrets_if_unchanged(
+    conn: &mut sqlx::PgConnection,
+    envelope: Option<&EnvelopeService>,
+    expected: &AuthRealm,
+    mut upd: AuthRealmUpdate,
+    secret_keys: &[&str],
+) -> Result<Option<AuthRealm>, SecretDbError> {
+    let mut blob = None;
+    if let Some(envelope) = envelope {
+        let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
+        upd.config = stripped;
+        if !secrets.is_empty() {
+            let sealed =
+                seal_realm_secrets(envelope, expected.id, &expected.kind, &upd.config, &secrets)
+                    .await?;
+            // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
+            lock_sealing_dek(conn, envelope, &sealed).await?;
+            blob = Some(sealed);
+        }
+    }
+    Ok(auth_realm_dao::update_realm_and_secrets_if_unchanged(
+        &mut *conn,
+        expected,
+        upd,
+        blob.as_deref(),
+    )
+    .await?)
+}
+
 /// Plaintext → encrypted **backfill** for realm secrets: every realm whose
 /// plaintext `config` still carries one of its `secret_keys_for(kind)` keys is
 /// re-stored through [`update_realm_with_secrets`] (keys move into

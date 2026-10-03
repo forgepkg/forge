@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE forge_setting SET value = $3, updated_at = now()\n        WHERE key = $1 AND value = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "96bf031c6483bd87913d65dbc08f7d91bbf667e63bab32c54e908d37b0edc92e"
+}

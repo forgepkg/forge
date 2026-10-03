@@ -337,7 +337,9 @@ First production release.
   `[auth.upstream_basic]` was edited no longer hashes the realm's secrets.
   It was an unsalted SHA-256 next to the plaintext config, so a database
   dump allowed offline guessing of an encrypted `client_secret` or
-  `key_pepper`.
+  `key_pepper`. A changed block is re-applied only while neither the row
+  nor the marker changed since startup read them, so a boot that races an
+  admin edit of the realm no longer overwrites it.
 - The AES-GCM and XChaCha20-Poly1305 key schedules and the decoded root key
   are wiped from memory after use.
 - With `auto_provision = false`, a credential-forwarding realm that maps an
@@ -561,6 +563,11 @@ First production release.
   their destination, which older instances cannot read. Then remove the
   setting and restart. A secret that is still logged as undecryptable (its
   row was changed outside the admin API) must be entered again.
+- Pre-release installs with a realm imported from `[oidc]` or
+  `[auth.upstream_basic]`: do not edit that realm through an instance of
+  the older build once a new instance has started. The older build does not
+  drop the import marker, so the next start would apply the TOML block over
+  a changed secret.
 - Staging is limited to 4 GiB per instance by default (four times the
   larger of `server.max_upload_bytes` and `proxy.max_package_bytes`), in
   `<temp dir>/forge-staging`. Set `server.max_staging_bytes` (`0` for no

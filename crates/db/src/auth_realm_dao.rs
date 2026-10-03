@@ -213,6 +213,49 @@ where
     .await
 }
 
+/// [`update_realm_and_secrets`] as a compare-and-set: the row is written only
+/// while it is still `expected` (same `updated_at`, `config` and
+/// `secrets_enc`, which also covers a re-seal sweep that leaves `updated_at`
+/// alone). `None` when it changed or is gone.
+pub async fn update_realm_and_secrets_if_unchanged<'e, E>(
+    executor: E,
+    expected: &AuthRealm,
+    upd: AuthRealmUpdate,
+    secrets_enc: Option<&[u8]>,
+) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        UPDATE auth_realm SET
+            name = $2,
+            enabled = $3,
+            priority = $4,
+            config = $5,
+            secrets_enc = $6,
+            updated_at = now()
+        WHERE id = $1
+          AND updated_at = $7
+          AND config = $8
+          AND secrets_enc IS NOT DISTINCT FROM $9
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
+        "#,
+        expected.id,
+        upd.name,
+        upd.enabled,
+        upd.priority,
+        upd.config,
+        secrets_enc,
+        expected.updated_at,
+        expected.config,
+        expected.secrets_enc.as_deref(),
+    )
+    .fetch_optional(executor)
+    .await
+}
+
 /// Delete a realm by id. Returns whether a row was deleted. (Refusing to
 /// delete the built-in `local` realm is an API-layer rule, not enforced here.)
 pub async fn delete_realm(pool: &PgPool, id: i64) -> sqlx::Result<bool> {

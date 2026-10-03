@@ -995,43 +995,58 @@ async fn apply_seed(
                 tracing::warn!(realm = %name, "seeded realm secrets unreadable; skipping re-apply");
                 return Ok(());
             };
-            let last_seed = authz_dao::get_setting(pool, &key).await?;
-            let legacy_marker = last_seed
-                .as_deref()
-                .is_some_and(|marker| !marker.starts_with(SEED_FINGERPRINT_V2));
-            let unmodified = match last_seed.as_deref() {
-                Some(marker) if legacy_marker => {
-                    marker == legacy_seed_fingerprint(&existing_config)
-                }
-                Some(marker) => marker == seed_fingerprint(kind, &existing_config),
-                None => false,
+            let Some(last_seed) = authz_dao::get_setting(pool, &key).await? else {
+                return Ok(());
             };
-            if legacy_marker {
-                // A pre-release marker hashes the secret as well: replace it
-                // whatever happens below, or drop it if the row was edited.
-                if unmodified {
-                    let current = seed_fingerprint(kind, &existing_config);
-                    authz_dao::set_setting(pool, &key, &current).await?;
-                } else {
-                    authz_dao::delete_setting(pool, &key).await?;
+            // The marker this boot may still re-apply under. An admin edit
+            // drops the marker before it writes ([`forget_seed`]), so every
+            // write below is a compare-and-set against it: a seed racing an
+            // edit backs off instead of re-creating the marker over it.
+            let marker = if last_seed.starts_with(SEED_FINGERPRINT_V2) {
+                if last_seed != seed_fingerprint(kind, &existing_config) {
+                    return Ok(());
                 }
+                last_seed
+            } else if last_seed == legacy_seed_fingerprint(&existing_config) {
+                // A pre-release marker hashes the secret as well: replace it
+                // whatever happens below.
+                let current = seed_fingerprint(kind, &existing_config);
+                if !authz_dao::replace_setting(pool, &key, &last_seed, &current).await? {
+                    return Ok(());
+                }
+                current
+            } else {
+                // A pre-release marker of an edited row.
+                authz_dao::delete_setting(pool, &key).await?;
+                return Ok(());
+            };
+            if existing_config == config {
+                return Ok(());
             }
-            if unmodified && existing_config != config {
-                secret_dao::update_realm_with_secrets(
-                    pool,
-                    envelope,
-                    existing.id,
-                    forge_db::auth_realm_dao::AuthRealmUpdate {
-                        name: existing.name.clone(),
-                        enabled: existing.enabled,
-                        priority: existing.priority,
-                        config,
-                    },
-                    secret_keys(kind),
-                )
-                .await?;
-                authz_dao::set_setting(pool, &key, &fingerprint).await?;
+            // The row is written only while it is still the one compared
+            // above, and the marker only while it is still `marker`.
+            let mut tx = pool.begin().await?;
+            let applied = secret_dao::update_realm_with_secrets_if_unchanged(
+                &mut tx,
+                envelope,
+                &existing,
+                forge_db::auth_realm_dao::AuthRealmUpdate {
+                    name: existing.name.clone(),
+                    enabled: existing.enabled,
+                    priority: existing.priority,
+                    config,
+                },
+                secret_keys(kind),
+            )
+            .await?
+            .is_some()
+                && authz_dao::replace_setting(&mut *tx, &key, &marker, &fingerprint).await?;
+            if applied {
+                tx.commit().await?;
                 tracing::info!(realm = %name, %kind, "re-applied changed legacy config (row unmodified since seed)");
+            } else {
+                tx.rollback().await?;
+                tracing::info!(realm = %name, %kind, "seeded realm changed while its legacy config was re-applied; left as is");
             }
         }
         Some(_) => {

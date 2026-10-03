@@ -844,6 +844,31 @@ pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<
     Ok(())
 }
 
+/// Replace a `forge_setting` value only while it is still `expected`.
+/// Returns whether it was replaced (`false` when it changed or is gone).
+pub async fn replace_setting<'e, E>(
+    executor: E,
+    key: &str,
+    expected: &str,
+    value: &str,
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query!(
+        r#"
+        UPDATE forge_setting SET value = $3, updated_at = now()
+        WHERE key = $1 AND value = $2
+        "#,
+        key,
+        expected,
+        value,
+    )
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Whether this install opted into legacy open access (slice-1 behavior). A
 /// missing key is treated as `false` (fail-closed): a corrupted/old DB without
 /// the setting defaults to the secure, closed behavior.

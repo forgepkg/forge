@@ -175,3 +175,85 @@ async fn reorder_swaps_priorities_transactionally() {
     // Priorities were renumbered to the (index+1)*10 scheme.
     assert!(all.windows(2).all(|w| w[0].priority < w[1].priority));
 }
+
+/// The compare-and-set writes the legacy config seed re-applies with: a row
+/// changed since it was read (an admin edit, or a re-seal sweep, which leaves
+/// `updated_at` alone) is not written, and neither is a marker that an admin
+/// edit dropped or replaced.
+#[tokio::test]
+async fn compare_and_set_writes_refuse_a_changed_row_or_marker() {
+    let pool = pool().await;
+    let n = unique();
+    let name = format!("cas-{n}");
+    let realm = auth_realm_dao::insert_realm(
+        &pool,
+        new_realm(&name, "credential_forwarding", 300_000 + n as i32),
+    )
+    .await
+    .expect("insert");
+    let upd = |pepper: &str| AuthRealmUpdate {
+        name: name.clone(),
+        enabled: true,
+        priority: realm.priority,
+        config: json!({"url": "https://example.test/status", "key_pepper": pepper}),
+    };
+
+    let written =
+        auth_realm_dao::update_realm_and_secrets_if_unchanged(&pool, &realm, upd("seed"), None)
+            .await
+            .expect("update")
+            .expect("an unchanged row is written");
+    assert!(
+        auth_realm_dao::update_realm_and_secrets_if_unchanged(&pool, &realm, upd("stale"), None)
+            .await
+            .expect("update")
+            .is_none(),
+        "the row changed since `realm` was read"
+    );
+    sqlx::query("UPDATE auth_realm SET secrets_enc = '\\x00'::bytea WHERE id = $1")
+        .bind(realm.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        auth_realm_dao::update_realm_and_secrets_if_unchanged(&pool, &written, upd("stale"), None)
+            .await
+            .expect("update")
+            .is_none(),
+        "a change that keeps updated_at is seen too"
+    );
+    let row = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .expect("find")
+        .expect("row");
+    assert_eq!(row.config["key_pepper"], "seed");
+
+    let key = format!("test_seed_marker_{n}");
+    forge_db::authz_dao::set_setting(&pool, &key, "v2:a")
+        .await
+        .unwrap();
+    assert!(
+        forge_db::authz_dao::replace_setting(&pool, &key, "v2:a", "v2:b")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !forge_db::authz_dao::replace_setting(&pool, &key, "v2:a", "v2:c")
+            .await
+            .unwrap()
+    );
+    forge_db::authz_dao::delete_setting(&pool, &key)
+        .await
+        .unwrap();
+    assert!(
+        !forge_db::authz_dao::replace_setting(&pool, &key, "v2:b", "v2:c")
+            .await
+            .unwrap(),
+        "a dropped marker is not re-created"
+    );
+    assert_eq!(
+        forge_db::authz_dao::get_setting(&pool, &key).await.unwrap(),
+        None
+    );
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
