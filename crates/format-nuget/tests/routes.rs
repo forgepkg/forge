@@ -397,6 +397,52 @@ async fn flat_nuspec_serves_xml() {
     assert!(String::from_utf8(body).unwrap().contains("<package/>"));
 }
 
+/// A `.nuspec` is publisher-controlled XML served on the admin origin. An
+/// XHTML `<script>` in it must never run there: every feed response is
+/// sandboxed, script-free and a download, whatever the route or status.
+#[tokio::test]
+async fn feed_responses_are_sandboxed_downloads() {
+    let mut ops = MockOps::default();
+    ops.nuspecs.insert(
+        ("evil.pkg".into(), "1.0.0".into()),
+        br#"<?xml version="1.0"?><package><html:script xmlns:html="http://www.w3.org/1999/xhtml">fetch('/admin/users')</html:script></package>"#.to_vec(),
+    );
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+    for uri in [
+        "/flat/evil.pkg/1.0.0/evil.pkg.nuspec",
+        "/flat/evil.pkg/9.9.9/evil.pkg.nuspec",
+        "/index.json",
+        "/query?q=evil",
+        "/no/such/route",
+    ] {
+        let (_status, headers, _body) = get(&router, uri).await;
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("default-src 'none'; sandbox"),
+            "{uri}"
+        );
+        assert_eq!(
+            headers
+                .get("content-disposition")
+                .map(|v| v.to_str().unwrap()),
+            Some("attachment"),
+            "{uri}"
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "{uri}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn flat_version_normalized_on_path() {
     // Request version "1.0" should resolve the stored normalized "1.0.0".

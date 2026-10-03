@@ -11,6 +11,18 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Security
+
+- Feed responses (`/v3/...`) are inert in a browser: every one carries
+  `Content-Security-Policy: default-src 'none'; sandbox`,
+  `Content-Disposition: attachment` and `nosniff`. Before, a published
+  `.nuspec` was served as `application/xml` on the admin UI's origin, so an
+  XHTML `<script>` in it ran with the viewer's session (stored XSS).
+- The web UI is served with a real Content Security Policy: scripts only from
+  the server's own origin plus the inline theme bootstrap, allowed by its
+  SHA-256 hash (taken from the served `index.html` at startup); no `eval`,
+  plugins, `<base>` or framing, and fetches only to the same origin.
+
 ## [0.1.0]
 
 First production release.

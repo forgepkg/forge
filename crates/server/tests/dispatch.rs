@@ -33,6 +33,59 @@ async fn unknown_repo_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// Every `/v3` response — also the ones the dispatcher answers itself before
+/// the per-repository router runs — is a sandboxed, script-free download, so
+/// publisher-controlled feed content can never execute on the admin origin.
+#[tokio::test]
+async fn feed_responses_are_sandboxed_downloads() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("hosted{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    for (path, authenticated) in [
+        ("/v3/does-not-exist/index.json".to_string(), true),
+        (format!("/v3/{repo}/index.json"), false),
+        (format!("/v3/{repo}/index.json"), true),
+        (format!("/v3/{repo}/flat/x/1.0.0/x.nuspec"), true),
+    ] {
+        let mut req = client.get(format!("{}{path}", srv.base_url));
+        if authenticated {
+            req = req.basic_auth(&u, Some(&p));
+        }
+        let resp = req.send().await.unwrap();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            header("content-security-policy").as_deref(),
+            Some("default-src 'none'; sandbox"),
+            "{path} ({})",
+            resp.status()
+        );
+        assert_eq!(
+            header("content-disposition").as_deref(),
+            Some("attachment"),
+            "{path}"
+        );
+        assert_eq!(
+            header("x-content-type-options").as_deref(),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+}
+
 /// With `anonymous_mode = off`, an unauthenticated read of a non-anon repo is
 /// 401; an admin (authenticated) read succeeds and the service index advertises
 /// `PackagePublish` for a hosted repo.

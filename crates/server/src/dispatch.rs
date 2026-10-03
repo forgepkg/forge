@@ -113,7 +113,17 @@ fn principal_allows_protocol_mutations(principal: &Principal) -> bool {
 }
 
 /// Axum fallback handler mounted at `/v3/{repo}` (and everything under it).
+///
+/// Every response — including the unknown-repository and authorization
+/// answers produced here — gets the feed's browser-hardening headers
+/// ([`forge_nuget::routes::harden_response_headers`]).
 pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let mut response = dispatch_request(state, req).await;
+    forge_nuget::routes::harden_response_headers(response.headers_mut());
+    response
+}
+
+async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let principal = principal_of(&req);
     let method = req.method().clone();
     let uri = req.uri().clone();
