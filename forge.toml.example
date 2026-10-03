@@ -29,8 +29,11 @@ allowed_hosts = []              # (default: [])
 # request headers, or whose request body stalls longer, is cut off; a handler
 # that has not answered within request_timeout_seconds gets 408 (an already
 # streaming download is not cut off). Keep request_timeout_seconds above the
-# slowest push of max_upload_bytes you expect. 0 disables a limit.
-header_read_timeout_seconds = 30 # (default: 30)
+# slowest push of max_upload_bytes you expect. header_read_timeout_seconds also
+# closes an idle keep-alive connection: keep it above your reverse proxy's
+# upstream keep-alive idle timeout, or the proxy may reuse a connection Forge is
+# closing and answer 502. 0 disables a limit.
+header_read_timeout_seconds = 150 # (default: 150)
 body_idle_timeout_seconds = 60   # (default: 60)
 request_timeout_seconds = 900    # (default: 900)
 

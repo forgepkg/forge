@@ -154,8 +154,12 @@ async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
 /// Styles keep `'unsafe-inline'`: the UI libraries set `style` attributes,
 /// and CSS cannot run script. Everything else is same-origin only.
 pub fn spa_content_security_policy(index_html: &str) -> String {
+    // The HTML parser turns CRLF and a lone CR into LF before a script's text
+    // is hashed, so an index.html with CRLF line endings (a Windows checkout)
+    // must be hashed the same way.
+    let index_html = index_html.replace("\r\n", "\n").replace('\r', "\n");
     let mut script_src = String::from("'self'");
-    for script in inline_scripts(index_html) {
+    for script in inline_scripts(&index_html) {
         let digest = Sha256::digest(script.as_bytes());
         script_src.push_str(" 'sha256-");
         script_src.push_str(&base64::engine::general_purpose::STANDARD.encode(digest));
@@ -415,6 +419,16 @@ mod tests {
             .find(|d| d.starts_with("script-src"))
             .unwrap();
         assert!(!script_src.contains("unsafe-inline"), "{script_src}");
+    }
+
+    #[test]
+    fn csp_hashes_scripts_with_the_line_endings_the_browser_sees() {
+        let lf = "<script>\nlet a = 1;\nlet b = 2;\n</script>";
+        let crlf = "<script>\r\nlet a = 1;\r\nlet b = 2;\r\n</script>";
+        let cr = "<script>\rlet a = 1;\rlet b = 2;\r</script>";
+        let expected = spa_content_security_policy(lf);
+        assert_eq!(spa_content_security_policy(crlf), expected);
+        assert_eq!(spa_content_security_policy(cr), expected);
     }
 
     #[test]

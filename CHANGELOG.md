@@ -174,8 +174,10 @@ The release workflow publishes the section whose heading matches the tag
   X-NuGet-ApiKey`, so a shared cache can neither store a private package nor
   serve one caller's answer to another; an https deployment sends HSTS. The
   server now enforces a header-read timeout (`server.header_read_timeout_seconds`,
-  default 30 s — `axum::serve` never armed hyper's, so a client trickling
-  headers held a connection forever), a request-body idle timeout
+  default 150 s, counted from accept — `axum::serve` never armed hyper's, so a
+  client trickling headers, or sending nothing at all, held a connection
+  forever; connections are HTTP/1 only, h2c is no longer accepted), a
+  request-body idle timeout
   (`body_idle_timeout_seconds`, 60 s) and a response timeout
   (`request_timeout_seconds`, 900 s, answered with 408).
 - The `Debug` output of the database, S3 and Redis configuration no longer
