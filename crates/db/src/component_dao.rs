@@ -444,8 +444,26 @@ pub async fn manifest_summaries(
         .collect())
 }
 
-/// Store the manifest summary of a component (at publish, or when an older
-/// version without one is first read).
+/// Store the manifest summary of a component published before summaries
+/// were stored, unless one has been set since: a reader that parsed the old
+/// manifest must not overwrite the summary a concurrent redeploy stored.
+pub async fn backfill_manifest_summary(
+    pool: &sqlx::PgPool,
+    component_id: i64,
+    summary: &serde_json::Value,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"UPDATE component SET manifest_summary = $2
+           WHERE id = $1 AND manifest_summary IS NULL"#,
+        component_id,
+        summary,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Store the manifest summary of a component (at publish).
 pub async fn set_manifest_summary<'e, E>(
     executor: E,
     component_id: i64,

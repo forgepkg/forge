@@ -109,7 +109,9 @@ The release workflow publishes the section whose heading matches the tag
   public feeds): the manifest summary is stored at publish (migration 0024;
   older versions are summarized once and backfilled), the registration index
   is paged (64 versions per page, inlined up to 128 versions, beyond that
-  served from `/registration/{id}/page/{lower}/{upper}.json`), leaf and
+  served from `/registration/{id}/page/{lower}/{upper}.json`, which answers
+  with the versions in that range, so a page URL from a cached index keeps
+  working after a push or delete), leaf and
   catalog documents look up one version instead of all, rendering runs on
   the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
   rejects nesting deeper than 32 levels (it was quadratic in depth).

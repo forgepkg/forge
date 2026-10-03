@@ -232,7 +232,8 @@ impl HostedRepo {
                 match summary {
                     Some(summary) => {
                         if let Err(e) =
-                            component_dao::set_manifest_summary(&self.pool, row.id, &summary).await
+                            component_dao::backfill_manifest_summary(&self.pool, row.id, &summary)
+                                .await
                         {
                             tracing::warn!(error = %e, component_id = row.id, "manifest summary backfill failed");
                         }
