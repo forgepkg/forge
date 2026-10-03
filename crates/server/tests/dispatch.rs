@@ -33,6 +33,60 @@ async fn unknown_repo_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
+/// A repository name that does not exist answers exactly like one the caller
+/// may not read — 401 anonymously, 403 signed in, same body — on the feed and
+/// in the browse API, so names cannot be enumerated. (A global admin, who can
+/// list them anyway, still gets 404: [`unknown_repo_is_404`].)
+#[tokio::test]
+async fn unknown_repo_answers_like_a_denied_one() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let private = format!("private{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": private, "kind": "hosted", "anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user = forge_db::user_dao::insert_user(
+        &srv.pool,
+        forge_db::user_dao::NewUser::local(
+            format!("nogrants{}", common::unique()),
+            "$argon2id$unused".into(),
+            false,
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let session = srv.session_for(user.id).await;
+
+    let answer = |path: String, signed_in: bool| {
+        let mut req = client.get(format!("{}{path}", srv.base_url));
+        if signed_in {
+            req = session.apply(req);
+        }
+        async move {
+            let resp = req.send().await.unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let unknown = format!("absent{}", common::unique());
+    for (path, signed_in, status) in [
+        ("/v3/{}/index.json", false, 401),
+        ("/v3/{}/index.json", true, 403),
+        ("/browse/packages/{}/Foo", true, 403),
+    ] {
+        let denied = answer(path.replace("{}", &private), signed_in).await;
+        let missing = answer(path.replace("{}", &unknown), signed_in).await;
+        assert_eq!(denied.0, status, "{path} on a private repository");
+        assert_eq!(missing, denied, "{path}: unknown answers like denied");
+    }
+}
+
 /// Every `/v3` response — also the ones the dispatcher answers itself before
 /// the per-repository router runs — is a sandboxed, script-free download, so
 /// publisher-controlled feed content can never execute on the admin origin.

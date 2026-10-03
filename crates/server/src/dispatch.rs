@@ -135,7 +135,13 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        // Answer an unknown name exactly like a repository the caller may
+        // not read, so repository names cannot be enumerated; only a global
+        // admin (who can list them anyway) learns that it does not exist.
+        Ok(None) if state.authz.is_global_admin(&principal).await => {
+            return (StatusCode::NOT_FOUND, "repository not found").into_response();
+        }
+        Ok(None) => return authz_denied(&principal),
         Err(e) => {
             tracing::error!(error = %e, repo = %repo_name, "repo lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();

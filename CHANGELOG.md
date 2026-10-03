@@ -155,6 +155,10 @@ The release workflow publishes the section whose heading matches the tag
   a credential-forwarding realm retires the credential verdicts cached under
   its old config (they are keyed by it), so e.g. a newly required group
   applies to the next request rather than after `positive_ttl_secs`.
+- A repository name that does not exist answers like one the caller may not
+  read (401 anonymously, 403 signed in) on the feed (`/v3/{repo}/…`) and in
+  the browse API, so repository names can no longer be enumerated; a global
+  admin still gets 404.
 
 ## [0.1.0]
 

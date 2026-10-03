@@ -318,7 +318,12 @@ pub async fn package_detail(
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        // An unknown name answers like an unreadable repository (no name
+        // enumeration), except to a global admin.
+        Ok(None) if state.authz.is_global_admin(&principal).await => {
+            return (StatusCode::NOT_FOUND, "repository not found").into_response();
+        }
+        Ok(None) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
         Err(e) => return db_error(e),
     };
 
