@@ -954,17 +954,31 @@ pub async fn assign_authenticated_if_legacy_open(
     pool: &PgPool,
     user_id: i64,
 ) -> sqlx::Result<bool> {
-    if !legacy_open_access(pool).await? {
+    let mut conn = pool.acquire().await?;
+    assign_authenticated_if_legacy_open_in(&mut conn, user_id).await
+}
+
+/// [`assign_authenticated_if_legacy_open`] on a given connection, so it can
+/// run in the transaction that creates the user.
+pub async fn assign_authenticated_if_legacy_open_in(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+) -> sqlx::Result<bool> {
+    if get_setting(&mut *conn, LEGACY_OPEN_ACCESS_KEY)
+        .await?
+        .as_deref()
+        != Some("true")
+    {
         return Ok(false);
     }
-    let role_id = role_id_by_name(pool, AUTHENTICATED_ROLE)
+    let role_id = role_id_by_name(&mut *conn, AUTHENTICATED_ROLE)
         .await?
         .ok_or_else(|| {
             sqlx::Error::Protocol(
                 "legacy_open_access is set but the built-in `authenticated` role is missing".into(),
             )
         })?;
-    assign_role(pool, user_id, role_id).await?;
+    assign_role(&mut *conn, user_id, role_id).await?;
     Ok(true)
 }
 

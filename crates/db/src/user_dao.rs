@@ -117,14 +117,19 @@ pub async fn provision_upstream_user(
 }
 
 /// [`provision_upstream_user`], also reporting whether this call created the
-/// account (`true`) rather than refreshing an existing one.
-pub async fn provision_upstream_user_tracked(
-    pool: &PgPool,
+/// account (`true`) rather than refreshing an existing one. Takes any
+/// executor so the caller can create the user and its initial roles in one
+/// transaction.
+pub async fn provision_upstream_user_tracked<'e, E>(
+    executor: E,
     username: &str,
     suggested_is_admin: bool,
     admin_authoritative: bool,
     realm_id: Option<i64>,
-) -> sqlx::Result<Option<(AppUser, bool)>> {
+) -> sqlx::Result<Option<(AppUser, bool)>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let Some(username) = lookup_key(username) else {
         return Ok(None);
     };
@@ -155,7 +160,7 @@ pub async fn provision_upstream_user_tracked(
         admin_authoritative,
         realm_id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| {
         (
