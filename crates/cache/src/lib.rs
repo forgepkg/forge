@@ -64,6 +64,24 @@
 //! on an L2 get/set/publish error we log and fall through (read → factory,
 //! write → skip). A **factory** error, by contrast, is propagated to the caller
 //! verbatim and is *not* cached — the next call retries.
+//!
+//! Redis is connected **lazily**: a cache built while Redis is unreachable
+//! works L1-only until it comes back (the backplane keeps resubscribing and
+//! flushes L1 once it is live), so an instance can start during a Redis
+//! outage. Every command is bounded by [`RedisTimeouts`], connections use TCP
+//! keepalive, and the subscriber pings its connection, so a Redis that
+//! vanishes without closing the socket is noticed, not waited on forever.
+//!
+//! ## No lock across Redis I/O
+//!
+//! Neither reads nor invalidations take a lock that is held across a Redis
+//! round-trip: a stalled Redis slows the requests that talk to it, never a
+//! whole namespace. An invalidation advances this instance's tag barrier
+//! **before** it bumps the generation in Redis and publishes it, so reads here
+//! hide older entries at once. A fill that raced it is dropped by the
+//! post-fill check, and a caller that arrived after the invalidation but was
+//! coalesced onto a fill that started before it loads again (see
+//! [`Cache::get_or_try_insert_with`]).
 
 mod backplane;
 mod l1;
@@ -103,9 +121,13 @@ struct Inner {
     l1: L1,
     l2: Option<RedisL2>,
     backplane: Option<Backplane>,
-    namespace_locks: NamespaceLocks,
     tag_versions: TagVersions,
 }
+
+/// How many times [`Cache::load`] re-runs a lookup that was coalesced onto a
+/// fill older than a barrier the caller had already observed. One re-run
+/// suffices (that fill starts after the caller), the bound is a safeguard.
+const MAX_LOAD_ATTEMPTS: usize = 3;
 
 const ENTRY_FORMAT_VERSION: u8 = 1;
 
@@ -157,11 +179,26 @@ impl Default for RedisTimeouts {
 }
 
 impl RedisTimeouts {
+    /// One reconnect attempt per failure: a command waiting on a reconnect
+    /// waits about two connect deadlines, not the default six with backoff.
     pub(crate) fn manager_config(&self) -> redis::aio::ConnectionManagerConfig {
         redis::aio::ConnectionManagerConfig::new()
             .set_connection_timeout(Some(self.connect))
             .set_response_timeout(Some(self.response))
+            .set_number_of_retries(1)
     }
+}
+
+/// TCP keepalive on every Redis connection, so a peer that disappears without
+/// closing the socket (node lost, NAT or load-balancer state dropped) is
+/// detected by the kernel too, not only by the backplane's pings.
+fn tcp_settings() -> redis::io::tcp::TcpSettings {
+    let keepalive = redis::io::tcp::socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let keepalive = keepalive.with_interval(Duration::from_secs(10));
+    redis::io::tcp::TcpSettings::default()
+        .set_nodelay(true)
+        .set_keepalive(keepalive)
 }
 
 /// Locally observed tag generations. Redis is authoritative when configured;
@@ -242,26 +279,6 @@ impl TagVersions {
     }
 }
 
-/// Per-namespace read/write fences. Cache fills take a shared guard while
-/// invalidations take an exclusive guard, so a fill that started before a
-/// revocation cannot publish a stale L1/L2 value after that revocation has
-/// completed. The same locks are used by the Redis backplane subscriber.
-#[derive(Clone, Default)]
-pub(crate) struct NamespaceLocks {
-    inner: Arc<Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>>,
-}
-
-impl NamespaceLocks {
-    pub(crate) fn get(&self, ns: &str) -> Arc<tokio::sync::RwLock<()>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(ns.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
-            .clone()
-    }
-}
-
 /// Make aws-lc-rs the process-wide rustls provider unless one is set: the
 /// Redis TLS connector builds its config from the process default, and with
 /// more than one provider compiled in rustls cannot choose by itself.
@@ -278,15 +295,12 @@ impl Cache {
     ///
     /// `l1_max_capacity` bounds the number of entries held in process.
     pub fn l1_only(l1_max_capacity: u64) -> Self {
-        let namespace_locks = NamespaceLocks::default();
-        let tag_versions = TagVersions::default();
         Cache {
             inner: Arc::new(Inner {
                 l1: L1::new(l1_max_capacity),
                 l2: None,
                 backplane: None,
-                namespace_locks,
-                tag_versions,
+                tag_versions: TagVersions::default(),
             }),
         }
     }
@@ -300,20 +314,25 @@ impl Cache {
     }
 
     /// Like [`Cache::with_redis`] with explicit Redis timeouts.
+    ///
+    /// Fails only on an invalid URL: connections are made lazily, so Redis
+    /// need not be reachable yet (see the [crate docs](crate)). Waits a few
+    /// seconds at most for the first backplane subscription.
     pub async fn with_redis_timeouts(
         l1_max_capacity: u64,
         redis_url: &str,
         timeouts: RedisTimeouts,
     ) -> Result<Self, CacheError> {
         let l1 = L1::new(l1_max_capacity);
-        let namespace_locks = NamespaceLocks::default();
         let tag_versions = TagVersions::default();
         if redis_url.starts_with("rediss://") {
             install_tls_crypto_provider();
         }
-        let client = redis::Client::open(redis_url)?;
+        let info = redis::IntoConnectionInfo::into_connection_info(redis_url)?
+            .set_tcp_settings(tcp_settings());
+        let client = redis::Client::open(info)?;
 
-        let l2 = RedisL2::connect(client.clone(), timeouts).await?;
+        let l2 = RedisL2::connect(client.clone(), timeouts)?;
         let backplane = Backplane::start(
             client,
             l2.clone(),
@@ -328,7 +347,6 @@ impl Cache {
                 l1,
                 l2: Some(l2),
                 backplane: Some(backplane),
-                namespace_locks,
                 tag_versions,
             }),
         })
@@ -339,7 +357,9 @@ impl Cache {
     /// Lookup order is **L1 → L2 (if present) → factory**. On a factory success
     /// the value is written to L1 (and L2, if present) with `ttl`. Concurrent
     /// callers for the same `(ns, key)` run the factory **once** (request
-    /// coalescing — see the crate docs).
+    /// coalescing — see the crate docs). A caller never gets a value computed
+    /// before an invalidation this instance had already applied when the
+    /// call started: coalesced onto such a fill, it loads again.
     ///
     /// A factory `Err(E)` is returned to the caller and **not** cached.
     pub async fn get_or_try_insert_with<T, F, Fut, E>(
@@ -438,10 +458,71 @@ impl Cache {
         Fut: Future<Output = Result<T, E>>,
         E: Clone + Send + Sync + 'static,
     {
-        let namespace_lock = self.inner.namespace_locks.get(ns);
-        let _fill_guard = namespace_lock.read().await;
         let full_key = make_key(ns, key);
         let entry_tags = Arc::new(entry_tags(ns, key, tags));
+        // The barriers this caller has already observed: a value stamped
+        // older than these predates an invalidation applied before the call.
+        let seen = self.inner.tag_versions.snapshot(&entry_tags);
+        let mut factory = Some(factory);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let unused_factory = &mut factory;
+            let entry = self
+                .fill(&full_key, &entry_tags, ttl, shared, move || {
+                    unused_factory.take()
+                })
+                .await?;
+
+            // A remote tag bump may have raced the completed factory. Never
+            // leave such a result resident in L1; the in-progress caller may
+            // still use the value it started computing before the invalidation
+            // linearized. Only the *resident* entry is checked before
+            // evicting: a concurrent task may already have refilled the key
+            // with a fresh post-bump entry, which must survive.
+            if !self.inner.tag_versions.is_current(&entry.tags) {
+                self.inner
+                    .l1
+                    .invalidate_if_stale(&full_key, &self.inner.tag_versions)
+                    .await;
+            }
+
+            // Coalesced onto another caller's fill that captured its stamps
+            // before an invalidation this caller had already seen: load again
+            // (this call's factory is still unused then).
+            let predates_call = entry
+                .tags
+                .iter()
+                .zip(&seen)
+                .any(|(stamp, seen)| stamp.generation < seen.generation);
+            if predates_call && factory.is_some() && attempt < MAX_LOAD_ATTEMPTS {
+                continue;
+            }
+
+            let value: T = serde_json::from_slice(&entry.value)
+                .expect("cached JSON bytes must deserialize back into T");
+            return Ok(value);
+        }
+    }
+
+    /// One coalesced lookup: L1 → (L2, when `shared` and configured) →
+    /// `factory`, run by whichever caller's init moka picks. `take_factory`
+    /// hands over this caller's factory when its init runs.
+    async fn fill<T, F, Fut, E>(
+        &self,
+        full_key: &str,
+        entry_tags: &Arc<Vec<String>>,
+        ttl: Duration,
+        shared: bool,
+        take_factory: impl FnOnce() -> Option<F>,
+    ) -> Result<Arc<StoredEntry>, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        let entry_tags = entry_tags.clone();
         let l2 = if shared { self.inner.l2.clone() } else { None };
         let tag_versions = self.inner.tag_versions.clone();
 
@@ -452,16 +533,17 @@ impl Cache {
         // The init future's error type is the *factory's* error `E` (wrapped by
         // moka in an `Arc`). L2 infrastructure errors never become `E`: they are
         // logged inside the future and we fall through to the factory.
-        let key_for_l2 = full_key.clone();
-        let entry = self
-            .inner
+        let key_for_l2 = full_key.to_string();
+        self.inner
             .l1
             .try_get_entry_with(
-                full_key.clone(),
+                full_key.to_string(),
                 ttl,
                 entry_tags.clone(),
                 tag_versions.clone(),
-                || async move {
+                move || async move {
+                let factory = take_factory()
+                    .expect("a caller's factory is taken only by its own, single init");
                 // L2 read (graceful degradation on infra error → None → factory).
                 if let Some(l2) = &l2 {
                     match l2.get(&key_for_l2).await {
@@ -592,24 +674,7 @@ impl Cache {
                 Ok(entry)
             },
             )
-            .await?;
-
-        // A remote tag bump may have raced the completed factory. Never leave
-        // such a result resident in L1; the in-progress caller may still use the
-        // value it started computing before the invalidation linearized. Only
-        // the *resident* entry is checked before evicting: a concurrent task may
-        // already have refilled the key with a fresh post-bump entry, which must
-        // survive.
-        if !self.inner.tag_versions.is_current(&entry.tags) {
-            self.inner
-                .l1
-                .invalidate_if_stale(&full_key, &self.inner.tag_versions)
-                .await;
-        }
-
-        let value: T = serde_json::from_slice(&entry.value)
-            .expect("cached JSON bytes must deserialize back into T");
-        Ok(value)
+            .await
     }
 
     /// Invalidate a single `(ns, key)` by advancing its synthetic key tag and
@@ -631,9 +696,13 @@ impl Cache {
     }
 
     async fn invalidate_internal_tag(&self, ns: &str, tag: &str) {
-        let namespace_lock = self.inner.namespace_locks.get(ns);
-        let _invalidation_guard = namespace_lock.write().await;
+        // Raise the local barrier first: from here on this instance hides
+        // every entry stamped before it, whatever Redis does next. No lock is
+        // held across the Redis round-trips below (see the crate docs).
         let current = self.inner.tag_versions.current(tag);
+        self.inner
+            .tag_versions
+            .observe_one(tag, current.saturating_add(1));
         let generation = if let Some(l2) = &self.inner.l2 {
             match l2.bump_tag(tag, current).await {
                 Ok(generation) => generation,

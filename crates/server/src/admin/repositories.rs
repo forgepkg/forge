@@ -825,13 +825,7 @@ pub async fn hard_delete_package(
 
     let grace = state.config.outbox.grace();
     match hard_delete(&state, repo.id, &lower, &norm_ver, grace).await {
-        Ok(true) => {
-            state
-                .cache
-                .invalidate(crate::state::NS_PACKAGE, &format!("{}/{lower}", repo.name))
-                .await;
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "package not found").into_response(),
         Err(e) => db_error(e),
     }

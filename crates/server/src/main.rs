@@ -58,12 +58,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure S3 bucket")?;
 
-    // Cache: L2 Redis when configured, else L1-only.
+    // Cache: L2 Redis when configured, else L1-only. Redis is connected
+    // lazily: an unreachable Redis delays startup by a few seconds (the first
+    // backplane subscription is awaited briefly) but does not prevent it.
     let cache = match &config.redis.url {
         Some(url) => {
             Cache::with_redis_timeouts(config.cache.l1_max_capacity, url, config.redis.timeouts())
                 .await
-                .context("connect redis cache")?
+                .context("configure redis cache")?
         }
         None => Cache::l1_only(config.cache.l1_max_capacity),
     };

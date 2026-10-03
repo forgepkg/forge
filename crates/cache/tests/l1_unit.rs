@@ -290,8 +290,12 @@ async fn invalidate_ns_drops_all_keys_in_namespace() {
     );
 }
 
+/// A namespace invalidation does not wait for a fill already in flight (no
+/// lock is held across a fill, so a slow factory or a stalled Redis cannot
+/// freeze invalidations), and that fill's result, computed before the
+/// invalidation, is not left in L1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn namespace_invalidation_fences_an_inflight_fill() {
+async fn namespace_invalidation_does_not_wait_for_and_drops_an_inflight_fill() {
     let cache = Cache::l1_only(1000);
     let calls = Arc::new(AtomicUsize::new(0));
     let factory_started = Arc::new(tokio::sync::Notify::new());
@@ -321,19 +325,13 @@ async fn namespace_invalidation_fences_an_inflight_fill() {
     };
     factory_started.notified().await;
 
-    let invalidation = {
-        let cache = cache.clone();
-        tokio::spawn(async move { cache.invalidate_ns("ns").await })
-    };
-    tokio::task::yield_now().await;
-    assert!(
-        !invalidation.is_finished(),
-        "invalidation waits until the older fill can no longer reinsert"
-    );
+    tokio::time::timeout(Duration::from_secs(5), cache.invalidate_ns("ns"))
+        .await
+        .expect("the invalidation does not wait for the fill");
 
     release_factory.notify_one();
+    // The fill's own caller started before the invalidation: it may use it.
     assert_eq!(fill.await.unwrap(), 1);
-    invalidation.await.unwrap();
 
     let calls_after_race = calls.clone();
     let value = cache
@@ -352,8 +350,78 @@ async fn namespace_invalidation_fences_an_inflight_fill() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
-        "the fill completed before the invalidation fence and was then removed"
+        "the fill that raced the invalidation was not kept"
     );
+}
+
+/// A caller that arrives after an invalidation is coalesced onto the fill
+/// already in flight for its key, which started before the invalidation. It
+/// must not get that fill's value: it loads again with its own factory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_after_an_invalidation_never_gets_an_older_fill() {
+    let cache = Cache::l1_only(1000);
+    let factory_started = Arc::new(tokio::sync::Notify::new());
+    let release_factory = Arc::new(tokio::sync::Notify::new());
+
+    let early = {
+        let cache = cache.clone();
+        let factory_started = factory_started.clone();
+        let release_factory = release_factory.clone();
+        tokio::spawn(async move {
+            cache
+                .get_or_try_insert_local::<String, _, _, TestError>(
+                    "authz",
+                    "user:1",
+                    Duration::from_secs(60),
+                    || async move {
+                        factory_started.notify_one();
+                        release_factory.notified().await;
+                        Ok("before-revocation".to_string())
+                    },
+                )
+                .await
+                .unwrap()
+        })
+    };
+    factory_started.notified().await;
+    cache.invalidate("authz", "user:1").await;
+
+    let late_calls = Arc::new(AtomicUsize::new(0));
+    let late = {
+        let cache = cache.clone();
+        let late_calls = late_calls.clone();
+        tokio::spawn(async move {
+            cache
+                .get_or_try_insert_local::<String, _, _, TestError>(
+                    "authz",
+                    "user:1",
+                    Duration::from_secs(60),
+                    || async move {
+                        late_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok("after-revocation".to_string())
+                    },
+                )
+                .await
+                .unwrap()
+        })
+    };
+    // Let the late caller join the in-flight fill before it completes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release_factory.notify_one();
+
+    assert_eq!(late.await.unwrap(), "after-revocation");
+    assert_eq!(late_calls.load(Ordering::SeqCst), 1);
+    let _ = early.await.unwrap();
+    let cached = cache
+        .get_or_try_insert_local::<String, _, _, TestError>(
+            "authz",
+            "user:1",
+            Duration::from_secs(60),
+            || async { Ok("refilled".to_string()) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached, "after-revocation");
 }
 
 #[tokio::test]

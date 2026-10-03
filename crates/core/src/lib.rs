@@ -21,6 +21,10 @@
 //!   (create/validate/rotate/revoke + CSRF), backed by the shared `session`
 //!   table so sessions are correct and revocable across instances.
 
+// The proxy's nested read futures (cache fill → envelope open → key cache)
+// exceed the default depth the trait solver walks to prove them `Send`.
+#![recursion_limit = "256"]
+
 pub mod auth;
 pub mod authz;
 pub mod domain;

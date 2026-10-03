@@ -592,24 +592,191 @@ async fn local_entries_are_invalidated_across_instances() {
     }
 }
 
-/// `rediss://` (TLS) URLs are supported: the client accepts them and only
-/// the connection itself fails against a closed port.
+/// `rediss://` (TLS) URLs are supported, and an unreachable Redis does not
+/// keep a cache from being built (an instance can start during a Redis
+/// outage): connections are lazy, and reads fall back to the factory.
 #[tokio::test]
-async fn rediss_urls_are_supported() {
-    let err = Cache::with_redis_timeouts(
-        10,
-        "rediss://127.0.0.1:9/",
+async fn an_unreachable_redis_does_not_block_startup_and_rediss_urls_work() {
+    for url in ["rediss://127.0.0.1:9/", "redis://127.0.0.1:9/"] {
+        let started = Instant::now();
+        let cache = Cache::with_redis_timeouts(
+            10,
+            url,
+            RedisTimeouts {
+                connect: Duration::from_millis(200),
+                response: Duration::from_millis(200),
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{url}: {err}"));
+        let value: u32 = cache
+            .get_or_try_insert_with("ns", "k", Duration::from_secs(5), || async {
+                Ok::<_, TestError>(7)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+        cache.invalidate("ns", "k").await;
+        assert!(started.elapsed() < Duration::from_secs(10), "{url}");
+    }
+}
+
+/// A TCP relay to the test Redis that can be told to go silent: from then on
+/// every byte in either direction is swallowed while both sockets stay open,
+/// like a Redis node lost behind a NAT or a failover without a reset.
+struct Relay {
+    url: String,
+    silent: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Relay {
+    async fn start(redis_url: &str) -> Relay {
+        use tokio::net::{TcpListener, TcpStream};
+        let upstream = redis_url
+            .trim_start_matches("redis://")
+            .trim_end_matches('/')
+            .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("redis://{}", listener.local_addr().unwrap());
+        let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = silent.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                tokio::spawn(Relay::pump(client_read, server_write, flag.clone()));
+                tokio::spawn(Relay::pump(server_read, client_write, flag.clone()));
+            }
+        });
+        Relay { url, silent }
+    }
+
+    async fn pump(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        silent: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            if silent.load(Ordering::SeqCst) {
+                break;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+        // Silent: keep both sockets open and never answer.
+        let _open = (from, to);
+        std::future::pending::<()>().await;
+    }
+
+    fn go_silent(&self) {
+        self.silent.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn connect_with(url: &str, timeout: Duration) -> Cache {
+    Cache::with_redis_timeouts(
+        1000,
+        url,
         RedisTimeouts {
-            connect: Duration::from_millis(200),
-            response: Duration::from_millis(200),
+            connect: timeout,
+            response: timeout,
         },
     )
     .await
-    .err()
-    .expect("nothing listens on port 9");
-    let message = err.to_string();
+    .expect("cache builds")
+}
+
+/// Review M1: an invalidation stalled on a Redis that stopped answering must
+/// not freeze lookups in its namespace; an L1 hit is answered at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_redis_does_not_block_reads_behind_an_invalidation() {
+    let relay = Relay::start(&redis_url().await).await;
+    let cache = connect_with(&relay.url, Duration::from_secs(2)).await;
+    let cached: u32 = cache
+        .get_or_try_insert_local("stall-ns", "hit", Duration::from_secs(60), || async {
+            Ok::<_, TestError>(1)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cached, 1);
+
+    relay.go_silent();
+    let invalidation = {
+        let cache = cache.clone();
+        tokio::spawn(async move { cache.invalidate("stall-ns", "other").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        !message.contains("feature is not enabled") && !message.contains("TLS"),
-        "{message}"
+        !invalidation.is_finished(),
+        "the invalidation waits on Redis"
     );
+
+    let started = Instant::now();
+    let hit: u32 = cache
+        .get_or_try_insert_local("stall-ns", "hit", Duration::from_secs(60), || async {
+            Ok::<_, TestError>(2)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit, 1);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "an L1 hit waited {:?} behind a stalled invalidation",
+        started.elapsed()
+    );
+    invalidation.await.unwrap();
+}
+
+/// Review M3: a subscription whose connection went silent (no reset) is
+/// detected by the backplane's ping; the instance flushes L1 instead of
+/// serving entries whose invalidations it can no longer hear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silently_dead_subscription_is_detected_and_l1_flushed() {
+    let url = redis_url().await;
+    let relay = Relay::start(&url).await;
+    let a = connect_with(&relay.url, Duration::from_secs(2)).await;
+    let b = connect(&url).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let read = |cache: &Cache| {
+        let cache = cache.clone();
+        let calls = calls.clone();
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    "dead-sub",
+                    "k",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(read(&a).await, 0);
+
+    relay.go_silent();
+    b.invalidate("dead-sub", "k").await;
+
+    // Ping every 10 s with a 2 s answer deadline: flushed well within 30 s.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if read(&a).await != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a dead subscription kept serving the invalidated entry"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
