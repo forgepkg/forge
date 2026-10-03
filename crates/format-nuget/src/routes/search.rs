@@ -90,12 +90,12 @@ pub fn search_json(
                 .collect();
             // The manifest describes the backend's latest version; only use
             // it when that version survived the SemVer filter.
-            let meta = hit
-                .nuspec_bytes
-                .as_deref()
-                .filter(|_| latest.version == hit.latest_version)
-                .and_then(|b| nuspec::metadata_from_nuspec(b).ok())
-                .unwrap_or_default();
+            let meta = if latest.version == hit.latest_version {
+                nuspec::summary_of(hit.manifest_summary.as_ref(), hit.nuspec_bytes.as_deref())
+                    .metadata
+            } else {
+                nuspec::NuspecMetadata::default()
+            };
             let authors: Vec<Value> = meta
                 .authors
                 .as_deref()

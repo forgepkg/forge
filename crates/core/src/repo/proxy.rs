@@ -1839,6 +1839,7 @@ impl RepoReadOps for ProxyRepo {
                 listed: leaf.map_or(r.listed, |l| l.listed),
                 package_hash_sha512_base64: hash,
                 nuspec_bytes,
+                manifest_summary: None,
                 // Only the upstream registration knows the publish time (the
                 // cache time would be misleading).
                 published: leaf.and_then(|l| l.published),

@@ -121,7 +121,9 @@ where
 /// * `/index.json` — service index
 /// * `/flat/{id}/index.json` — flat-container versions
 /// * `/flat/{id}/{version}/{filename}` — `.nupkg` bytes or `.nuspec` XML
-/// * `/registration/{id}/index.json` — inlined registration page
+/// * `/registration/{id}/index.json` — registration index (inlined pages up
+///   to 128 versions)
+/// * `/registration/{id}/page/{lower}/{upper}.json` — one registration page
 /// * `/registration/{id}/{version}.json` — registration leaf
 /// * `/catalog/{id}/{version}.json` — catalog entry
 /// * `/query` — search
@@ -139,6 +141,10 @@ pub fn nuget_router(kind: RepoKind, mut ctx: RouteContext) -> Router {
         .route(
             "/registration/{id}/{leaf}",
             get_head(registration::leaf_document),
+        )
+        .route(
+            "/registration/{id}/page/{lower}/{upper}",
+            get_head(registration::page),
         )
         .route(
             "/catalog/{id}/{leaf}",

@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT c.name, c.version, c.manifest_summary AS \"manifest_summary!\"\n        FROM component c\n        JOIN UNNEST($2::text[], $3::text[]) AS w(name, version)\n          ON w.name = c.name AND w.version = c.version\n        WHERE c.repository_id = $1 AND c.manifest_summary IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "manifest_summary!",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "manifest_summary"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "5e11f8ca66ef0df8a935690be020899cc380116fc1c40501a0ea0feb225c9327"
+}

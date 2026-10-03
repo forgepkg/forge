@@ -86,6 +86,15 @@ The release workflow publishes the section whose heading matches the tag
   linked to an IdP identity (before, a colliding `preferred_username` at the
   same or another IdP took it over). An email claim is used as a username
   only with `email_verified`, also when `username_claim` names it.
+- Registration and search no longer fetch and re-parse every version's
+  `.nuspec` per request (an unauthenticated CPU and storage amplifier on
+  public feeds): the manifest summary is stored at publish (migration 0024;
+  older versions are summarized once and backfilled), the registration index
+  is paged (64 versions per page, inlined up to 128 versions, beyond that
+  served from `/registration/{id}/page/{lower}/{upper}.json`), leaf and
+  catalog documents look up one version instead of all, rendering runs on
+  the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
+  rejects nesting deeper than 32 levels (it was quadratic in depth).
 
 ## [0.1.0]
 

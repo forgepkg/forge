@@ -370,7 +370,8 @@ pub async fn package_detail(
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
 
-    // Registration entries carry the stored `.nuspec` bytes (hosted) for deps.
+    // Registration entries carry the stored manifest summary (or, for older
+    // versions, the `.nuspec` bytes) for deps.
     let registration = match ops.registration(&repo.name, &lower).await {
         Ok(r) => r,
         Err(e) => return read_err(e),
@@ -386,11 +387,11 @@ pub async fn package_detail(
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
     for entry in &registration {
-        let groups = entry
-            .nuspec_bytes
-            .as_deref()
-            .and_then(|b| forge_nuget::nuspec::dependency_groups_from_nuspec(b).ok())
-            .unwrap_or_default();
+        let groups = forge_nuget::nuspec::summary_of(
+            entry.manifest_summary.as_ref(),
+            entry.nuspec_bytes.as_deref(),
+        )
+        .dependency_groups;
         let mapped: Vec<DetailDependencyGroup> = groups
             .into_iter()
             .map(|g| DetailDependencyGroup {

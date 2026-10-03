@@ -1100,6 +1100,7 @@ impl RepoReadOps for FakeProxy {
                 listed: true,
                 package_hash_sha512_base64: None,
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: None,
             })
             .collect())

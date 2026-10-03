@@ -181,9 +181,10 @@ pub struct NupkgLocation {
 
 /// One package's data for a registration page / search hit, format-neutral.
 ///
-/// Dependency groups are intentionally **not** included: the format layer
-/// re-parses [`Self::nuspec_bytes`] to produce them, keeping NuGet manifest
-/// parsing out of `forge-core`.
+/// Dependency groups are intentionally **not** included as typed data: the
+/// format layer renders them from [`Self::manifest_summary`] (stored at
+/// publish) or, failing that, re-parses [`Self::nuspec_bytes`], keeping NuGet
+/// manifest parsing out of `forge-core`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistrationEntry {
     /// Package id exactly as published.
@@ -194,8 +195,13 @@ pub struct RegistrationEntry {
     pub listed: bool,
     /// SHA-512 of the `.nupkg`, base64-encoded (from `asset.sha512_base64`).
     pub package_hash_sha512_base64: Option<String>,
-    /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored.
+    /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored and
+    /// no [`Self::manifest_summary`] is (older versions).
     pub nuspec_bytes: Option<Vec<u8>>,
+    /// The format's summary of the manifest, computed once at publish
+    /// ([`crate::format::Format::manifest_summary`]); preferred over
+    /// [`Self::nuspec_bytes`].
+    pub manifest_summary: Option<serde_json::Value>,
     /// When this version was published into the repository (`None` when
     /// unknown, e.g. a proxied version not cached yet).
     pub published: Option<chrono::DateTime<chrono::Utc>>,
@@ -210,9 +216,13 @@ pub struct SearchHit {
     pub latest_version: String,
     /// All matching versions, ascending by precedence.
     pub versions: Vec<VersionEntry>,
-    /// Manifest of [`Self::latest_version`], when available, so the format
-    /// layer can render description / authors / tags / icon.
+    /// Manifest of [`Self::latest_version`], when available and no
+    /// [`Self::manifest_summary`] is, so the format layer can render
+    /// description / authors / tags / icon.
     pub nuspec_bytes: Option<Vec<u8>>,
+    /// The stored manifest summary of [`Self::latest_version`] (see
+    /// [`RegistrationEntry::manifest_summary`]).
+    pub manifest_summary: Option<serde_json::Value>,
     /// Download count across all versions, when tracked.
     pub total_downloads: Option<i64>,
 }
@@ -361,6 +371,23 @@ pub trait RepoReadOps: Send + Sync {
     /// version precedence. Empty when the id is unknown.
     async fn registration(&self, repo: &str, id: &str)
         -> Result<Vec<RegistrationEntry>, RepoError>;
+
+    /// The registration entry of one `(id, version)` — what a registration
+    /// leaf or catalog document needs. The default scans
+    /// [`Self::registration`]; backends that can look one version up directly
+    /// override it, so a leaf request does not load every version.
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .find(|e| e.version.eq_ignore_ascii_case(version)))
+    }
 
     /// Search packages in `repo` honoring listed/prerelease filtering and
     /// `skip`/`take` paging.
@@ -519,6 +546,18 @@ impl RepoReadOps for PackageFilteredReadOps {
             return Ok(Vec::new());
         }
         self.inner.registration(repo, id).await
+    }
+
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.registration_entry(repo, id, version).await
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {

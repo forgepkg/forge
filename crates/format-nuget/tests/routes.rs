@@ -530,6 +530,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH512".into()),
                 nuspec_bytes: Some(nuspec_with_dep()),
+                manifest_summary: None,
                 published: None,
             },
             RegistrationEntry {
@@ -538,6 +539,7 @@ async fn registration_inlined_page_shape() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH2".into()),
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: None,
             },
         ],
@@ -585,6 +587,65 @@ async fn registration_inlined_page_shape() {
             .unwrap()
             .len(),
         0
+    );
+}
+
+/// Up to 128 versions the index inlines every page (of 64); beyond that the
+/// index only lists the pages and each page is served on its own URL.
+#[tokio::test]
+async fn registration_pages_large_packages() {
+    let entry = |i: usize| RegistrationEntry {
+        original_id: "Big.Lib".into(),
+        version: format!("1.0.{i}"),
+        listed: true,
+        package_hash_sha512_base64: None,
+        nuspec_bytes: None,
+        manifest_summary: None,
+        published: None,
+    };
+    let mut ops = MockOps::default();
+    ops.registration
+        .insert("big.lib".into(), (0..200).map(entry).collect());
+    ops.registration
+        .insert("small.lib".into(), (0..100).map(entry).collect());
+    let router = nuget_router(
+        RepoKind::Hosted,
+        ctx(RepoKind::Hosted, ops, MockBytes::default()),
+    );
+
+    let (status, _h, body) = get(&router, "/registration/small.lib/index.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["count"], 2);
+    assert_eq!(doc["items"][0]["count"], 64);
+    assert_eq!(doc["items"][0]["items"].as_array().unwrap().len(), 64);
+    assert_eq!(doc["items"][1]["items"].as_array().unwrap().len(), 36);
+
+    let (status, _h, body) = get(&router, "/registration/big.lib/index.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["count"], 4);
+    let pages = doc["items"].as_array().unwrap();
+    assert!(
+        pages.iter().all(|p| p.get("items").is_none()),
+        "pages are not inlined"
+    );
+    assert_eq!(pages[3]["count"], 8);
+    let page_url = pages[1]["@id"].as_str().unwrap();
+    assert_eq!(
+        page_url,
+        format!("{BASE}/v3/main/registration/big.lib/page/1.0.64/1.0.127.json")
+    );
+    let (status, _h, body) = get(&router, &page_url[format!("{BASE}/v3/main").len()..]).await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 64);
+    assert_eq!(page["lower"], "1.0.64");
+    let (status, _h, _b) = get(&router, "/registration/big.lib/page/1.0.1/1.0.2.json").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "only real page bounds resolve"
     );
 }
 
@@ -843,6 +904,7 @@ async fn search_hits_carry_manifest_metadata_and_downloads() {
             listed: true,
         }],
         nuspec_bytes: Some(nuspec_with_metadata()),
+        manifest_summary: None,
         total_downloads: Some(42),
     }];
     let router = nuget_router(
@@ -878,6 +940,7 @@ async fn registration_leaf_and_catalog_documents_resolve() {
                 listed: true,
                 package_hash_sha512_base64: Some("HASH".into()),
                 nuspec_bytes: Some(nuspec_with_metadata()),
+                manifest_summary: None,
                 published: Some(published),
             },
             RegistrationEntry {
@@ -886,6 +949,7 @@ async fn registration_leaf_and_catalog_documents_resolve() {
                 listed: false,
                 package_hash_sha512_base64: None,
                 nuspec_bytes: None,
+                manifest_summary: None,
                 published: Some(published),
             },
         ],

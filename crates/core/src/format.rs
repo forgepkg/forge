@@ -57,6 +57,15 @@ pub trait Format: Send + Sync {
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
 
+    /// A summary of `manifest` to store with the version at publish, so that
+    /// metadata endpoints render it without fetching and re-parsing the
+    /// manifest on every request. `None` when the format keeps none (the
+    /// default) or the manifest cannot be summarized.
+    fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
+        let _ = manifest;
+        None
+    }
+
     /// Whether `id` is a well-formed package id of this format. Read routes
     /// answer 404 for anything else, and a proxy never puts such an id into
     /// an upstream URL: an id is pasted into URL paths, so `/`, `..`, `?`,

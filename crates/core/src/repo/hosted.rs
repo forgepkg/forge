@@ -164,12 +164,22 @@ impl HostedRepo {
                 .await?
                 .into_iter()
                 .collect();
+        let versions: Vec<String> = hits.iter().map(|h| h.latest_version.clone()).collect();
+        // Stored summaries first (one query); only versions without one fall
+        // back to fetching their manifest.
+        let mut summaries: std::collections::HashMap<(String, String), serde_json::Value> =
+            component_dao::manifest_summaries(&self.pool, repo_id, &names, &versions)
+                .await?
+                .into_iter()
+                .map(|(name, version, summary)| ((name, version), summary))
+                .collect();
         let wanted: Vec<(String, String)> = names
             .iter()
             .cloned()
-            .zip(hits.iter().map(|h| h.latest_version.clone()))
+            .zip(versions.iter().cloned())
+            .filter(|key| !summaries.contains_key(key))
             .collect();
-        let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
+        let fetched: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted.clone())
             .map(|(name, version)| async move { self.nuspec_of(repo_id, &name, &version).await })
             .buffered(8)
             .collect::<Vec<_>>()
@@ -182,11 +192,65 @@ impl HostedRepo {
                 })
             })
             .collect();
-        for ((hit, name), manifest) in hits.iter_mut().zip(&names).zip(manifests) {
+        let mut manifests: std::collections::HashMap<(String, String), Vec<u8>> = wanted
+            .into_iter()
+            .zip(fetched)
+            .filter_map(|(key, bytes)| bytes.map(|b| (key, b)))
+            .collect();
+        for ((hit, name), version) in hits.iter_mut().zip(&names).zip(versions) {
             hit.total_downloads = Some(totals.get(name).copied().unwrap_or(0));
-            hit.nuspec_bytes = manifest;
+            let key = (name.clone(), version);
+            hit.manifest_summary = summaries.remove(&key);
+            hit.nuspec_bytes = manifests.remove(&key);
         }
         Ok(())
+    }
+
+    /// The registration entry of one version row. A version published before
+    /// manifest summaries were stored has its manifest fetched and summarized
+    /// once (off the async workers), and the summary is backfilled so later
+    /// reads skip that work; if it cannot be summarized the raw manifest is
+    /// handed to the format layer as before.
+    async fn entry_of_row(
+        &self,
+        row: component_dao::RegistrationRow,
+    ) -> Result<RegistrationEntry, RepoError> {
+        let (manifest_summary, nuspec_bytes) = match row.manifest_summary {
+            Some(summary) => (Some(summary), None),
+            None => {
+                let bytes = self.nuspec_of_component(row.id).await?;
+                let summary = match bytes.clone() {
+                    Some(bytes) => {
+                        let format = self.format.clone();
+                        tokio::task::spawn_blocking(move || format.manifest_summary(&bytes))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                };
+                match summary {
+                    Some(summary) => {
+                        if let Err(e) =
+                            component_dao::set_manifest_summary(&self.pool, row.id, &summary).await
+                        {
+                            tracing::warn!(error = %e, component_id = row.id, "manifest summary backfill failed");
+                        }
+                        (Some(summary), None)
+                    }
+                    None => (None, bytes),
+                }
+            }
+        };
+        Ok(RegistrationEntry {
+            original_id: row.original_id,
+            version: row.version,
+            listed: row.listed,
+            package_hash_sha512_base64: row.package_hash_sha512_base64,
+            nuspec_bytes,
+            manifest_summary,
+            published: Some(row.created_at),
+        })
     }
 
     /// The stored `.nuspec` of `(id, version)`, if any.
@@ -317,33 +381,41 @@ impl RepoReadOps for HostedRepo {
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
         let repo_id = self.repo_id(repo).await?;
-        let comps = component_dao::list_versions(&self.pool, repo_id, id).await?;
-        let comps = self.sort_versions(comps);
-
-        // Per-version lookups (packageHash + stored nuspec for dependency
-        // extraction by the format layer) run with bounded concurrency so a
-        // package with hundreds of versions does not serialize hundreds of
-        // S3 round-trips.
+        // One query for every version's listing state, hash and stored
+        // manifest summary; only versions published before summaries were
+        // stored need their manifest fetched (once — see `entry_of_row`).
+        let mut rows =
+            component_dao::list_registration_rows(&self.pool, repo_id, id, NUPKG_ASSET_PATH)
+                .await?;
+        rows.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
         use futures_util::StreamExt;
-        futures_util::stream::iter(comps.into_iter().map(|c| async move {
-            // The nupkg asset carries the SHA-512 used as packageHash.
-            let nupkg = asset_dao::find_asset(&self.pool, c.id, NUPKG_ASSET_PATH).await?;
-            let package_hash_sha512_base64 = nupkg.and_then(|a| a.sha512_base64);
-            let nuspec_bytes = self.nuspec_of_component(c.id).await?;
-            Ok::<_, RepoError>(RegistrationEntry {
-                original_id: c.original_id,
-                version: c.version,
-                listed: c.listed,
-                package_hash_sha512_base64,
-                nuspec_bytes,
-                published: Some(c.created_at),
-            })
-        }))
-        .buffered(16)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect()
+        futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        match component_dao::find_registration_row(
+            &self.pool,
+            repo_id,
+            id,
+            version,
+            NUPKG_ASSET_PATH,
+        )
+        .await?
+        {
+            Some(row) => Ok(Some(self.entry_of_row(row).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
@@ -493,14 +565,18 @@ impl HostedWrite {
 
         // 2. Parse the package from the temp file. parse_upload is sync and a
         //    package may be hundreds of MiB, so it runs on the blocking pool.
-        let parsed = {
+        //    The manifest summary stored with the version (so metadata reads
+        //    never re-parse the manifest) is computed here too.
+        let (parsed, manifest_summary) = {
             let format = self.format.clone();
             let path = staged_nupkg.temp_path.to_path_buf();
             tokio::task::spawn_blocking(move || {
                 let mut file = std::fs::File::open(&path).map_err(|e| {
                     WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
                 })?;
-                format.parse_upload(&mut file).map_err(WriteError::from)
+                let parsed = format.parse_upload(&mut file).map_err(WriteError::from)?;
+                let summary = format.manifest_summary(&parsed.nuspec_bytes);
+                Ok::<_, WriteError>((parsed, summary))
             })
             .await
             .map_err(|e| WriteError::Repo(RepoError::Storage(format!("parse upload: {e}"))))??
@@ -561,6 +637,7 @@ impl HostedWrite {
 
         let nupkg_hash512 = nupkg.sha512_base64.clone();
 
+        let mut component_id = existing.as_ref().map(|c| c.id);
         let replaced = match existing {
             Some(comp) => {
                 if !repo_row.allow_redeploy {
@@ -608,7 +685,7 @@ impl HostedWrite {
                 )
                 .await;
             match inserted {
-                Ok(()) => {}
+                Ok(id) => component_id = Some(id),
                 // A concurrent first push of the same (id, version) won the
                 // race: the duplicate check above could not lock a row that
                 // did not exist yet, so the unique index decides. Report it as
@@ -623,6 +700,12 @@ impl HostedWrite {
             }
             PublishOutcome::Created
         };
+
+        if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
+            component_dao::set_manifest_summary(&mut *tx, id, summary)
+                .await
+                .map_err(RepoError::from)?;
+        }
 
         if let (Some((_, policy)), Some(context)) =
             (self.publish_policy.as_ref(), publish_context.as_ref())
@@ -653,7 +736,7 @@ impl HostedWrite {
         nuspec_ingest_token: uuid::Uuid,
         nuspec_size: i64,
         parsed: &crate::ParsedUpload,
-    ) -> Result<(), WriteError> {
+    ) -> Result<i64, WriteError> {
         blob_dao::commit_ingest_and_incref(tx, nupkg_sha, nupkg_ingest_token)
             .await
             .map_err(RepoError::from)?;
@@ -686,7 +769,8 @@ impl HostedWrite {
             nuspec_sha,
             nuspec_size,
         )
-        .await
+        .await?;
+        Ok(comp.id)
     }
 
     /// Swap an existing component's `.nupkg`/`.nuspec` assets to new blobs:

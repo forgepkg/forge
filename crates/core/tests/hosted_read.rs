@@ -327,14 +327,74 @@ async fn registration_carries_hash_listed_and_nuspec_bytes() {
         entries[0].package_hash_sha512_base64.as_deref(),
         Some("HASH512")
     );
-    assert!(entries[0]
-        .nuspec_bytes
-        .as_ref()
-        .unwrap()
-        .starts_with(b"<?xml"));
+    // The manifest is summarized (and the summary handed on) instead of the
+    // raw bytes.
+    let summary = entries[0].manifest_summary.as_ref().expect("summary");
+    assert_eq!(
+        summary["dependency_groups"][0]["dependencies"][0]["id"],
+        serde_json::json!("Newtonsoft.Json")
+    );
+    assert!(entries[0].nuspec_bytes.is_none());
 
     assert_eq!(entries[1].version, "2.0.0-beta1");
     assert!(!entries[1].listed);
+}
+
+/// Registration reads a version's stored manifest summary: older versions
+/// (no summary yet) are summarized once and backfilled, after which neither
+/// the index nor a single-version lookup fetches or parses a manifest.
+#[tokio::test]
+async fn registration_backfills_and_then_uses_stored_manifest_summaries() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for v in ["1.0.0", "1.1.0"] {
+        seed_version(
+            &pool,
+            &mut blobs,
+            repo.id,
+            "Sample.Lib",
+            "sample.lib",
+            v,
+            true,
+            "H",
+        )
+        .await;
+    }
+    let first = hosted(&pool, blobs)
+        .registration(&repo.name, "sample.lib")
+        .await
+        .unwrap();
+    assert!(first.iter().all(|e| e.manifest_summary.is_some()));
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM component WHERE repository_id = $1 AND manifest_summary IS NOT NULL",
+    )
+    .bind(repo.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 2, "summaries backfilled");
+
+    // A blob store that has nothing: the stored summaries are enough.
+    let h = hosted(&pool, StubBlobs::default());
+    let entries = h.registration(&repo.name, "sample.lib").await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].manifest_summary.as_ref().unwrap()["metadata"]["description"],
+        serde_json::json!("desc")
+    );
+    let one = h
+        .registration_entry(&repo.name, "sample.lib", "1.1.0")
+        .await
+        .unwrap()
+        .expect("single version");
+    assert_eq!(one.version, "1.1.0");
+    assert_eq!(one.package_hash_sha512_base64.as_deref(), Some("H"));
+    assert!(h
+        .registration_entry(&repo.name, "sample.lib", "9.9.9")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

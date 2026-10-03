@@ -112,7 +112,8 @@ pub fn lower_id(id: &str) -> String {
 
 /// Display metadata of a `.nuspec`, for registration catalog entries and
 /// search results. Absent elements are `None` / empty.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NuspecMetadata {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -133,7 +134,9 @@ pub struct NuspecMetadata {
     pub package_types: Vec<String>,
     /// `<minClientVersion>` from the `metadata` element attribute.
     pub min_client_version: Option<String>,
+    #[serde(skip)]
     raw_tags: Option<String>,
+    #[serde(skip)]
     raw_require_license_acceptance: Option<String>,
 }
 
@@ -175,6 +178,39 @@ impl NuspecMetadata {
 /// Extract the display metadata from raw `.nuspec` bytes.
 pub fn metadata_from_nuspec(bytes: &[u8]) -> Result<NuspecMetadata, FormatError> {
     Ok(parse_nuspec(bytes).map_err(FormatError::from)?.metadata)
+}
+
+/// What the feed renders from a `.nuspec`: its display metadata and
+/// dependency groups. Computed once at publish and stored with the version
+/// (`component.manifest_summary`), so registration pages and search results
+/// do not fetch and re-parse every manifest on every request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ManifestSummary {
+    pub metadata: NuspecMetadata,
+    pub dependency_groups: Vec<DependencyGroup>,
+}
+
+/// Parse raw `.nuspec` bytes into a [`ManifestSummary`].
+pub fn manifest_summary(bytes: &[u8]) -> Result<ManifestSummary, FormatError> {
+    let parsed = parse_nuspec(bytes).map_err(FormatError::from)?;
+    Ok(ManifestSummary {
+        metadata: parsed.metadata,
+        dependency_groups: parsed.deps,
+    })
+}
+
+/// The [`ManifestSummary`] of a version: the stored one when present (and
+/// readable), else parsed from the manifest bytes; empty when neither works.
+pub fn summary_of(stored: Option<&serde_json::Value>, manifest: Option<&[u8]>) -> ManifestSummary {
+    if let Some(summary) =
+        stored.and_then(|v| serde_json::from_value::<ManifestSummary>(v.clone()).ok())
+    {
+        return summary;
+    }
+    manifest
+        .and_then(|b| manifest_summary(b).ok())
+        .unwrap_or_default()
 }
 
 /// Extract just the dependency groups from raw `.nuspec` bytes.
@@ -602,6 +638,11 @@ struct RawNuspec {
     metadata: NuspecMetadata,
 }
 
+/// Deepest element nesting a `.nuspec` may use. Real manifests nest about
+/// five levels (`package/metadata/dependencies/group/dependency`); the cap
+/// bounds the parser's path bookkeeping on hostile input.
+pub const MAX_NUSPEC_DEPTH: usize = 32;
+
 /// Parse the `.nuspec` XML namespace-insensitively (by local name).
 fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
     let mut reader = Reader::from_reader(bytes);
@@ -612,6 +653,10 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
 
     // Path of local element names, so we know our context (e.g. metadata/id).
     let mut path: Vec<Vec<u8>> = Vec::new();
+    // How many `<metadata>` elements are open on `path`: makes "inside
+    // metadata" O(1) per element instead of a scan of the whole path, which
+    // was quadratic on a deeply nested document.
+    let mut open_metadata = 0usize;
     let mut id: Option<String> = None;
     let mut ver: Option<String> = None;
     let mut groups: Vec<DependencyGroup> = Vec::new();
@@ -632,6 +677,11 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             .map_err(|e| NupkgError::MalformedNuspec(e.to_string()))?
         {
             Event::Start(e) => {
+                if path.len() >= MAX_NUSPEC_DEPTH {
+                    return Err(NupkgError::MalformedNuspec(format!(
+                        "elements nested deeper than {MAX_NUSPEC_DEPTH} levels"
+                    )));
+                }
                 let local = e.local_name().as_ref().as_bytes().to_vec();
                 match local.as_slice() {
                     b"metadata" => {
@@ -651,7 +701,7 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                             metadata.package_types.push(name);
                         }
                     }
-                    b"dependencies" if under_metadata(&path) => {
+                    b"dependencies" if open_metadata > 0 => {
                         in_dependencies = true;
                         flat_group = None;
                     }
@@ -663,6 +713,9 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                         });
                     }
                     _ => {}
+                }
+                if local.as_slice() == b"metadata" {
+                    open_metadata += 1;
                 }
                 path.push(local);
             }
@@ -745,7 +798,12 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                         groups.push(g);
                     }
                 }
-                path.pop();
+                if path
+                    .pop()
+                    .is_some_and(|open| open.as_slice() == b"metadata")
+                {
+                    open_metadata = open_metadata.saturating_sub(1);
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -839,11 +897,6 @@ fn push_dependency(
     }
 }
 
-/// True if the element path is currently inside `<metadata>` (any ancestor).
-fn under_metadata(path: &[Vec<u8>]) -> bool {
-    path.iter().any(|p| p.as_slice() == b"metadata")
-}
-
 /// True if the *parent* of the current text node is `<metadata>` — i.e. the
 /// path is `[.., metadata, id|version]`. Guards against e.g. a `<id>` nested in
 /// a dependency.
@@ -880,6 +933,42 @@ fn attr_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_manifests_are_rejected_quickly() {
+        let depth = 200_000;
+        let xml = format!(
+            "<package><metadata><id>a</id><version>1.0.0</version>{}{}</metadata></package>",
+            "<x>".repeat(depth),
+            "</x>".repeat(depth)
+        );
+        let started = std::time::Instant::now();
+        let err = parse_nuspec(xml.as_bytes()).expect_err("too deep");
+        assert!(err.to_string().contains("nested deeper"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Realistic nesting still parses.
+        let ok = "<package><metadata><id>a</id><version>1.0.0</version><dependencies>\
+                  <group targetFramework=\"net8.0\"><dependency id=\"b\" version=\"1.0\"/>\
+                  </group></dependencies></metadata></package>";
+        let parsed = parse_nuspec(ok.as_bytes()).unwrap();
+        assert_eq!(parsed.deps[0].dependencies[0].id, "b");
+    }
+
+    #[test]
+    fn manifest_summary_round_trips_through_json() {
+        let xml = "<package><metadata><id>A</id><version>1.0.0</version><description>d</description>\
+                   <tags>x y</tags><dependencies><dependency id=\"b\" version=\"1.0\"/></dependencies>\
+                   </metadata></package>";
+        let summary = manifest_summary(xml.as_bytes()).unwrap();
+        let stored = serde_json::to_value(&summary).unwrap();
+        assert_eq!(summary_of(Some(&stored), None), summary);
+        assert_eq!(summary_of(None, Some(xml.as_bytes())), summary);
+        assert_eq!(
+            summary.metadata.tags,
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert_eq!(summary_of(None, None), ManifestSummary::default());
+    }
 
     #[test]
     fn parses_id_version_and_grouped_deps_namespace_insensitive() {

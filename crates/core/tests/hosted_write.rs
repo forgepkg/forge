@@ -173,6 +173,19 @@ async fn publish_creates_component_assets_and_invalidates_cache() {
         .expect("publish");
     assert_eq!(outcome, PublishOutcome::Created);
 
+    // The manifest summary is stored with the version at publish, so metadata
+    // reads never fetch and re-parse the manifest.
+    let summary: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT c.manifest_summary FROM component c JOIN repository r ON r.id = c.repository_id \
+         WHERE r.name = $1 AND c.name = 'sample.lib'",
+    )
+    .bind(&repo)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let summary = summary.expect("summary stored at publish");
+    assert!(summary["metadata"].is_object(), "{summary}");
+
     // Cache invalidated for (repo, lowercased id).
     let calls = cache.0.lock().await.clone();
     assert_eq!(calls, vec![(repo.clone(), "sample.lib".to_string())]);

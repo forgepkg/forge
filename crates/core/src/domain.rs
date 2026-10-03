@@ -33,7 +33,7 @@ pub struct ParsedUpload {
 }
 
 /// A set of dependencies that apply to a single target framework.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DependencyGroup {
     /// The target framework moniker, or `None` for the framework-agnostic group.
     pub target_framework: Option<String>,
@@ -42,7 +42,7 @@ pub struct DependencyGroup {
 }
 
 /// A single dependency on another package.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Dependency {
     /// Dependency package id (as written; normalization is the consumer's job).
     pub id: String,
