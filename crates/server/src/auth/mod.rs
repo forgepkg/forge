@@ -707,21 +707,23 @@ async fn password_login(
         // whether to even offer the form from /auth/login-options).
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     };
-    if body.username.trim().is_empty()
-        || body.username.len() > MAX_USERNAME_BYTES
-        || body.password.is_empty()
-    {
+    if body.username.len() > MAX_USERNAME_BYTES || body.password.is_empty() {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
+    // The lockout, the chain and the account lookup all key on the canonical
+    // username (trimmed, NFC, lowercased).
+    let Ok(username) = forge_core::auth::canonical_username(&body.username) else {
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    };
 
     let client_ip = login_client_ip(&state, connect, &headers);
     // Reserve the attempt against the (IP, username) lockout budget before
     // running the chain; a locked pair is refused without any provider work
     // (no argon2, nothing forwarded upstream).
-    let attempt = match state.login_throttle.begin(client_ip, &body.username).await {
+    let attempt = match state.login_throttle.begin(client_ip, &username).await {
         Ok(attempt) => attempt,
         Err(refused) => {
-            let username = username_for_log(&body.username);
+            let username = username_for_log(&username);
             // `Retry-After` (seconds) lets the UI say how long to wait: a
             // locked pair clears within one failure window (an upper bound),
             // a pair saturated by in-flight attempts within moments.
@@ -744,7 +746,7 @@ async fn password_login(
         }
     };
     let cred = PasswordCredential {
-        username: &body.username,
+        username: &username,
         password: &body.password,
         client_ip,
     };
@@ -804,7 +806,7 @@ async fn password_login(
         )],
         Json(AuthMe {
             user_id: principal.user_id,
-            username: body.username.clone(),
+            username,
             is_admin: state
                 .authz
                 .is_global_admin(&forge_core::auth::Principal::from_user(principal))

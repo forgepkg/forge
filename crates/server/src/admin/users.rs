@@ -78,9 +78,13 @@ pub async fn list(State(state): State<AppState>) -> Response {
 
 /// `POST /admin/users`
 pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>) -> Response {
-    if body.username.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "username is required").into_response();
-    }
+    // Stored canonical (trimmed, NFC, lowercased), like every login looks it up.
+    let username = match forge_core::auth::canonical_username(&body.username) {
+        Ok(u) => u,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid username: {e}")).into_response()
+        }
+    };
     if body.password.is_empty() {
         return (StatusCode::BAD_REQUEST, "password is required").into_response();
     }
@@ -90,12 +94,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(resp) => return resp,
     };
 
-    let new = NewUser::local(
-        body.username.clone(),
-        password_hash,
-        body.is_admin,
-        body.active,
-    );
+    let new = NewUser::local(username, password_hash, body.is_admin, body.active);
     let u = match user_dao::insert_user(&state.pool, new).await {
         Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {

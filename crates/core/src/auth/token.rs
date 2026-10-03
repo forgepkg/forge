@@ -356,6 +356,12 @@ impl PrincipalSource for BasicAuthSource {
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
         if let Some(chain) = self.chain.password_chain().await {
+            // The lockout, the chain and the account lookup all key on the
+            // canonical username, so `Alice`/`alice ` share one budget and
+            // one account. A name that cannot be canonical is a bad login.
+            let Ok(username) = forge_db::username::canonical_username(&username) else {
+                return SourceOutcome::Invalid;
+            };
             // Reserve the attempt against the (IP, username) lockout budget
             // before running the chain; a locked pair is refused without any
             // provider work (no argon2, nothing forwarded upstream).

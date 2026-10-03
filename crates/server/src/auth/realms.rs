@@ -99,6 +99,13 @@ pub struct CredForwardRealmConfig {
     /// Optional upstream group that maps to forge admin on provision.
     #[serde(default)]
     pub admin_group: String,
+    /// `.`-separated path into the JSON success body naming the account the
+    /// upstream authenticated (e.g. `login`). When set it must equal the
+    /// canonical username, or the credential is rejected — required for an
+    /// upstream that accepts a secret with any username (personal access
+    /// tokens). Empty ⇒ the upstream must itself bind username to secret.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub identity_path: String,
     /// Auto-provision an `app_user` on first successful upstream login.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
@@ -631,6 +638,7 @@ impl RealmAuth {
             request_timeout,
             required_groups: cfg.required_groups,
             groups_path: cfg.groups_path,
+            identity_path: cfg.identity_path,
             admin_group: cfg.admin_group,
             provider_id,
             auto_provision: cfg.auto_provision,
@@ -787,6 +795,7 @@ pub async fn seed_auth_realms(
             request_timeout_ms: ub.request_timeout_ms,
             required_groups: ub.required_groups.clone(),
             groups_path: ub.groups_path.clone(),
+            identity_path: ub.identity_path.clone(),
             admin_group: ub.admin_group.clone(),
             auto_provision: ub.auto_provision,
             positive_ttl_secs: ub.cache.positive_ttl_secs,

@@ -16,6 +16,19 @@
 //!   ([`AuthOutcome::Unavailable`]) — **fail-closed**, never granting and never
 //!   cached.
 //!
+//! ## Identity binding
+//!
+//! Forge maps the login to the account named by the **canonical** username
+//! (trimmed, NFC, lowercased — the chain canonicalizes it before this provider
+//! runs) and forwards exactly that name, so the upstream verifies the very
+//! name Forge will act on. That is only sound when the upstream **binds the
+//! username to the secret**. Many do not: a GitHub, Azure DevOps or GitLab
+//! personal access token is accepted with *any* username. For such an
+//! upstream, set `identity_path`: the name the upstream reports in its JSON
+//! response (e.g. `login`) must equal the canonical username, or the
+//! credential is rejected. A success without that field is treated as an
+//! outage (fail closed).
+//!
 //! ## Why this is safe on the hot path
 //!
 //! NuGet clients send Basic credentials on *every* request. This provider never
@@ -70,13 +83,9 @@ pub const UPSTREAM_BASIC_ID: &str = "upstream-basic";
 /// Example: for a body `{"user":{"roles":["nx-admin","dev"]}}`, the path
 /// `user.roles` yields `["nx-admin", "dev"]`.
 fn extract_groups(body: &serde_json::Value, path: &str) -> Vec<String> {
-    let mut cur = body;
-    for segment in path.split('.').filter(|s| !s.is_empty()) {
-        match cur.get(segment) {
-            Some(next) => cur = next,
-            None => return Vec::new(),
-        }
-    }
+    let Some(cur) = lookup(body, path) else {
+        return Vec::new();
+    };
     match cur {
         serde_json::Value::Array(items) => items
             .iter()
@@ -85,6 +94,22 @@ fn extract_groups(body: &serde_json::Value, path: &str) -> Vec<String> {
         serde_json::Value::String(s) => vec![s.clone()],
         _ => Vec::new(),
     }
+}
+
+/// Follow a `.`-separated path of object keys into `body`.
+fn lookup<'a>(body: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = body;
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        cur = cur.get(segment)?;
+    }
+    Some(cur)
+}
+
+/// The account name the upstream reports at `path`, canonicalized; `None`
+/// when it is absent, not a string, or has no canonical form.
+fn extract_identity(body: &serde_json::Value, path: &str) -> Option<String> {
+    let name = lookup(body, path)?.as_str()?;
+    forge_db::username::canonical_username(name).ok()
 }
 
 /// Static configuration for the upstream-basic provider, assembled by the server
@@ -115,6 +140,12 @@ pub struct UpstreamBasicConfig {
     /// `.`-separated path into the JSON body locating the user's groups (see
     /// [`extract_groups`]). Empty ⇒ no group data parsed.
     pub groups_path: String,
+    /// `.`-separated path into the JSON success body naming the account the
+    /// upstream authenticated (e.g. `login`). When set, that name
+    /// (canonicalized) must equal the canonical username presented, or the
+    /// credential is rejected. Empty ⇒ the upstream is trusted to bind the
+    /// username to the secret (see the [module docs](self)).
+    pub identity_path: String,
     /// Optional upstream group that maps to forge admin. When set (with a
     /// `groups_path`), every login that freshly fetched the groups is
     /// authoritative: membership grants admin and its absence revokes it for
@@ -232,27 +263,65 @@ impl UpstreamBasicProvider {
         }
 
         if self.config.success_status.contains(&status) {
-            // Parse groups only if a path is configured (cheap no-op otherwise).
-            let groups = if self.config.groups_path.is_empty() {
-                Vec::new()
+            let needs_identity = !self.config.identity_path.is_empty();
+            // Parse the body only if a path is configured (cheap no-op otherwise).
+            let body = if self.config.groups_path.is_empty() && !needs_identity {
+                None
             } else {
                 match resp.json::<serde_json::Value>().await {
-                    Ok(body) => extract_groups(&body, &self.config.groups_path),
+                    Ok(body) => Some(body),
                     Err(e) => {
                         // A success status but an unparseable body: if a group
-                        // gate is required we cannot evaluate it, so fail closed
-                        // rather than silently granting. With no required groups
-                        // the empty list is harmless.
+                        // gate or an identity check is required we cannot
+                        // evaluate it, so fail closed rather than silently
+                        // granting. With neither, the empty list is harmless.
                         tracing::warn!(error = %e, "upstream-basic: success body parse failed");
-                        if !self.config.required_groups.is_empty() {
+                        if needs_identity || !self.config.required_groups.is_empty() {
                             return ForwardResult {
                                 verdict: UpstreamVerdict::Unavailable,
                                 groups: Vec::new(),
                             };
                         }
-                        Vec::new()
+                        None
                     }
                 }
+            };
+
+            if needs_identity {
+                let reported = body
+                    .as_ref()
+                    .and_then(|b| extract_identity(b, &self.config.identity_path));
+                match reported {
+                    // The secret belongs to the very account Forge maps to.
+                    Some(name) if name == username => {}
+                    // A valid secret of *another* account (e.g. a personal
+                    // access token sent with someone else's username).
+                    Some(_) => {
+                        tracing::warn!(
+                            username = %super::login_throttle::username_for_log(username),
+                            "upstream-basic: upstream authenticated a different account; rejected"
+                        );
+                        return ForwardResult {
+                            verdict: UpstreamVerdict::Rejected,
+                            groups: Vec::new(),
+                        };
+                    }
+                    None => {
+                        tracing::warn!(
+                            identity_path = %self.config.identity_path,
+                            "upstream-basic: success response names no account at identity_path (fail-closed)"
+                        );
+                        return ForwardResult {
+                            verdict: UpstreamVerdict::Unavailable,
+                            groups: Vec::new(),
+                        };
+                    }
+                }
+            }
+
+            let groups = match (&body, self.config.groups_path.is_empty()) {
+                (Some(body), false) => extract_groups(body, &self.config.groups_path),
+                _ => Vec::new(),
             };
 
             // Coarse allow-gate: when required_groups is set, the user must hold
@@ -411,6 +480,21 @@ mod tests {
         assert_eq!(
             extract_groups(&body, "roles"),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_identity_is_canonical_and_string_only() {
+        let body = serde_json::json!({ "user": { "login": " Alice " }, "id": 7 });
+        assert_eq!(
+            extract_identity(&body, "user.login").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(extract_identity(&body, "id"), None);
+        assert_eq!(extract_identity(&body, "user.name"), None);
+        assert_eq!(
+            extract_identity(&serde_json::json!({ "login": "" }), "login"),
+            None
         );
     }
 

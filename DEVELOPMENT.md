@@ -261,6 +261,26 @@ For trust-policy validation, direct-token replay/cache limits, and GitHub
 Actions/GitLab CI examples, see
 [Trusted publishing](./docs/trusted-publishing.md).
 
+### Usernames and credential forwarding
+
+Usernames are **canonical**: surrounding whitespace is trimmed, the name is
+Unicode-NFC-normalized and lowercased, and names that are empty or contain
+control characters are refused. `Alice`, `alice` and ` alice ` are one
+account everywhere — login, the lockout, the credential cache, provisioning —
+and the database enforces it with a unique index on the canonical form.
+Migration 0021 canonicalizes existing accounts; where two collide, the oldest
+keeps the name and the others are renamed `<name>#<id>` (logged as a warning).
+
+A `credential_forwarding` realm forwards the **canonical** username with the
+password and, on success, signs the user in as that name. That is only safe
+when the upstream **binds the username to the secret**. Many do not: GitHub,
+Azure DevOps and GitLab accept a personal access token with *any* username,
+so anyone with a token could sign in as any Forge user. For such an upstream,
+set `identity_path` to where its JSON success response names the
+authenticated account (e.g. `login` for GitHub's `/user`): that name, in
+canonical form, must equal the username entered, or the login is rejected; a
+success without it fails closed.
+
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
 recorded in `forge_setting`); afterwards the database is the authority.

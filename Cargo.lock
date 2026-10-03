@@ -1658,6 +1658,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

@@ -69,6 +69,68 @@ async fn non_admin_forbidden() {
     assert_eq!(resp.status(), 403, "non-admin must be 403");
 }
 
+/// Usernames are stored canonical (trimmed, NFC, lowercased): a case or
+/// spacing variant of an existing name is the same account (409 on create),
+/// and every spelling signs in to it. Names without a canonical form are 400.
+#[tokio::test]
+async fn usernames_are_canonical() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let lower = format!("carol{}", common::unique());
+    let typed = format!("  {} ", lower.to_uppercase());
+
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": typed, "password": "pw123456", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    assert_eq!(created["username"], json!(lower), "stored canonical");
+
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": lower, "password": "other-pw", "is_admin": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "a case variant is the same account");
+
+    for bad in ["", "   ", r"bad\nname", r"nul\u0000name"] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"username": "{bad}", "password": "pw123456"}}"#
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+    }
+
+    for spelling in [lower.to_uppercase(), format!(" {lower}")] {
+        let resp = client
+            .post(format!("{}/auth/login", srv.base_url))
+            .json(&json!({"username": spelling, "password": "pw123456"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{spelling:?} signs in");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["user_id"], created["id"],
+            "{spelling:?} is the same account"
+        );
+        assert_eq!(body["username"], json!(lower));
+    }
+}
+
 /// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
 /// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
 /// for a non-admin caller.

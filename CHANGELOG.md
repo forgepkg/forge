@@ -11,6 +11,14 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Migration 0021 rewrites existing usernames into canonical form. Accounts
+  whose names differ only in case, surrounding spaces or Unicode composition
+  are not merged: the oldest keeps the name, the others are renamed
+  `<name>#<id>` and a warning names each one. Review and delete or rename
+  them; their tokens keep working.
+
 ### Security
 
 - Feed responses (`/v3/...`) are inert in a browser: every one carries
@@ -22,6 +30,20 @@ The release workflow publishes the section whose heading matches the tag
   the server's own origin plus the inline theme bootstrap, allowed by its
   SHA-256 hash (taken from the served `index.html` at startup); no `eval`,
   plugins, `<base>` or framing, and fetches only to the same origin.
+- Usernames are canonical (trimmed, Unicode NFC, lowercased; empty names and
+  control characters are refused) in every login path, the lockout, the
+  credential cache, provisioning and admin user creation, with a unique
+  index on the canonical form. Credential forwarding sends the canonical name
+  upstream and signs in as exactly that account, so case or spacing variants
+  can no longer split one upstream identity into several Forge accounts
+  (or lockout budgets).
+- Credential-forwarding realms take an optional `identity_path`: the account
+  the upstream's JSON success response names must equal the username
+  entered. Set it for upstreams that accept a secret with any username
+  (GitHub, Azure DevOps or GitLab personal access tokens); without it such an
+  upstream lets any token holder sign in as any user. A success without the
+  field fails closed. The docs now state that the upstream must bind the
+  username to the secret.
 
 ## [0.1.0]
 

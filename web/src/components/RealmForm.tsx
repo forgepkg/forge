@@ -81,6 +81,7 @@ export interface RealmFormValues {
   request_timeout_ms: string
   required_groups: string
   groups_path: string
+  identity_path: string
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -169,6 +170,7 @@ function seed(existing?: RealmView): RealmFormValues {
     request_timeout_ms: fwd.request_timeout_ms != null ? String(fwd.request_timeout_ms) : '',
     required_groups: joinList(fwd.required_groups),
     groups_path: fwd.groups_path ?? '',
+    identity_path: fwd.identity_path ?? '',
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
@@ -702,6 +704,23 @@ export function RealmForm({
                 />
               </Field>
             </div>
+
+            <Field>
+              <Label>Identity path</Label>
+              <Input
+                type="text"
+                value={values.identity_path}
+                onChange={(e) => set('identity_path', e.target.value)}
+                placeholder="login"
+              />
+              <Description>
+                Where the upstream&apos;s success response names the account it
+                authenticated. When set, that name must equal the username
+                entered. Required when the upstream accepts a secret with any
+                username (personal access tokens); leave empty only if the
+                upstream itself binds the username to the password.
+              </Description>
+            </Field>
 
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>
@@ -1238,6 +1257,7 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     const requiredGroups = parseList(values.required_groups)
     if (requiredGroups.length > 0) config.required_groups = requiredGroups
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
+    if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive

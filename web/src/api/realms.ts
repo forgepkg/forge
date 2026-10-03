@@ -54,6 +54,8 @@ export interface CredentialForwardingConfig {
   request_timeout_ms?: number
   required_groups?: string[]
   groups_path?: string
+  /** JSON path naming the account the upstream authenticated (e.g. `login`). */
+  identity_path?: string
   admin_group?: string
   auto_provision?: boolean
   positive_ttl_secs?: number

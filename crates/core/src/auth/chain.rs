@@ -26,6 +26,11 @@
 //!    rejection: the local store could not tell whether the username is a
 //!    local password account (user lookup failed, or no argon2 slot freed up
 //!    under load), so the password must not be forwarded upstream either.
+//! 0. The username is **canonicalized** first
+//!    ([`forge_db::username::canonical_username`]: trimmed, NFC, lowercased),
+//!    so every provider — including an upstream that receives it — sees the
+//!    one spelling Forge maps to an account. An invalid username (empty,
+//!    control characters) is rejected without consulting any provider.
 //! 5. No provider authenticated and none rejected/was-unavailable (all
 //!    [`AuthOutcome::Skip`] or an empty chain) → [`ChainOutcome::NoCredentials`]:
 //!    the password path simply had nothing to say, and the caller falls back to
@@ -92,6 +97,14 @@ impl Chain {
     /// See the module-level docs for the exact ordering / fail-closed
     /// semantics.
     pub async fn authenticate(&self, cred: &PasswordCredential<'_>) -> ChainOutcome {
+        let Ok(username) = forge_db::username::canonical_username(cred.username) else {
+            return ChainOutcome::Rejected;
+        };
+        let cred = &PasswordCredential {
+            username: &username,
+            password: cred.password,
+            client_ip: cred.client_ip,
+        };
         let mut saw_rejected = false;
         let mut saw_unavailable = false;
 

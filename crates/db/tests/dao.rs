@@ -1515,3 +1515,45 @@ async fn add_group_member_checked_counts_depth_above_the_group() {
         "3 edges fit a limit of 3"
     );
 }
+
+/// Usernames are canonical: the DAO stores and looks names up in canonical
+/// form, and the database refuses a second row that differs only in case or
+/// Unicode composition even when written around the DAO.
+#[tokio::test]
+async fn usernames_are_unique_in_canonical_form() {
+    use forge_db::user_dao::{self, NewUser};
+    let pool = common::pool().await;
+    let n = common::unique();
+    let user = user_dao::insert_user(
+        &pool,
+        NewUser::local(format!("  Dora{n} "), "x".into(), false, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(user.username, format!("dora{n}"));
+    let found = user_dao::find_user_by_username(&pool, &format!("DORA{n}"))
+        .await
+        .unwrap()
+        .expect("any spelling finds the account");
+    assert_eq!(found.id, user.id);
+
+    let raw = sqlx::query(
+        "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
+         VALUES ($1, 'x', false, true, 'local')",
+    )
+    .bind(format!("DORA{n}"))
+    .execute(&pool)
+    .await;
+    let err = raw.expect_err("a case variant must violate the canonical unique index");
+    assert!(
+        err.to_string().contains("app_user_username_canonical_key"),
+        "{err}"
+    );
+
+    let invalid = user_dao::insert_user(
+        &pool,
+        NewUser::local("bad\nname".into(), "x".into(), false, true),
+    )
+    .await;
+    assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
+}

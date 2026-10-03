@@ -3,6 +3,13 @@
 use sqlx::PgPool;
 
 use crate::model::AppUser;
+use crate::username::canonical_username;
+
+/// The canonical form of a username used as a lookup key, or `None` when it
+/// can never name an account (empty, control characters, oversized).
+fn lookup_key(username: &str) -> Option<String> {
+    canonical_username(username).ok()
+}
 
 /// All settable fields when creating a user row.
 ///
@@ -35,7 +42,13 @@ impl NewUser {
 }
 
 /// Insert a user, returning the persisted row.
+///
+/// The username is stored in its canonical form
+/// ([`crate::username::canonical_username`]); an invalid one is refused with
+/// [`sqlx::Error::InvalidArgument`] (callers validate first to answer 400).
 pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
+    let username = canonical_username(&new.username)
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
     sqlx::query_as!(
         AppUser,
         r#"
@@ -46,7 +59,7 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
             id, username, password_hash, is_admin, active,
             auth_source, external_subject, created_at, updated_at
         "#,
-        new.username,
+        username,
         new.password_hash,
         new.is_admin,
         new.active,
@@ -79,7 +92,8 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 ///   account it did not create. The caller denies.
 ///
 /// The unique constraint on `username` makes the `ON CONFLICT` path race-safe
-/// across instances.
+/// across instances. The username is canonicalized first; an invalid one
+/// provisions nothing (`None` ⇒ deny).
 pub async fn provision_upstream_user(
     pool: &PgPool,
     username: &str,
@@ -87,6 +101,9 @@ pub async fn provision_upstream_user(
     admin_authoritative: bool,
     realm_id: Option<i64>,
 ) -> sqlx::Result<Option<AppUser>> {
+    let Some(username) = lookup_key(username) else {
+        return Ok(None);
+    };
     sqlx::query_as!(
         AppUser,
         r#"
@@ -129,6 +146,9 @@ pub async fn find_upstream_user(
     username: &str,
     realm_id: Option<i64>,
 ) -> sqlx::Result<Option<AppUser>> {
+    let Some(username) = lookup_key(username) else {
+        return Ok(None);
+    };
     sqlx::query_as!(
         AppUser,
         r#"
@@ -147,8 +167,12 @@ pub async fn find_upstream_user(
     .await
 }
 
-/// Find a user by their unique username.
+/// Find a user by their unique username (compared in canonical form, so
+/// `Alice`, `alice` and ` alice ` find the same account).
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Result<Option<AppUser>> {
+    let Some(username) = lookup_key(username) else {
+        return Ok(None);
+    };
     sqlx::query_as!(
         AppUser,
         r#"

@@ -75,9 +75,19 @@ pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaim
     let email = string_claim(claims, &mapping.email_claim);
     // An unverified email is attacker-chosen at many IdPs: never let it become
     // the username (which can drive account linking); fall back to `sub`.
+    // The username is stored canonical (trimmed, NFC, lowercased) like every
+    // other account name; a claim with no canonical form falls through.
+    let canonical = |raw: String| forge_db::username::canonical_username(&raw).ok();
     let username = string_claim(claims, &mapping.username_claim)
-        .or_else(|| email.clone().filter(|_| email_verified(claims)))
-        .unwrap_or_else(|| claims.sub.clone());
+        .and_then(canonical)
+        .or_else(|| {
+            email
+                .clone()
+                .filter(|_| email_verified(claims))
+                .and_then(canonical)
+        })
+        .or_else(|| canonical(claims.sub.clone()))
+        .unwrap_or_else(|| "oidc-user".to_string());
     let display_name = string_claim(claims, &mapping.display_name_claim);
     let is_admin = derive_is_admin(claims, mapping);
     MappedClaims {

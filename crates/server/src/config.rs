@@ -355,6 +355,12 @@ pub struct UpstreamBasicAuthConfig {
     /// (e.g. `user.roles`). Empty ⇒ no group parsing.
     #[serde(default)]
     pub groups_path: String,
+    /// `.`-separated path into the JSON success body naming the account the
+    /// upstream authenticated (e.g. `login`); when set it must equal the
+    /// canonical username. Required for upstreams that accept a secret with
+    /// any username (personal access tokens). Empty ⇒ no identity check.
+    #[serde(default)]
+    pub identity_path: String,
     /// Optional upstream group that maps to forge admin on provision (grant only).
     #[serde(default)]
     pub admin_group: String,
@@ -380,6 +386,7 @@ impl std::fmt::Debug for UpstreamBasicAuthConfig {
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("required_groups", &self.required_groups)
             .field("groups_path", &self.groups_path)
+            .field("identity_path", &self.identity_path)
             .field("admin_group", &self.admin_group)
             .field("auto_provision", &self.auto_provision)
             .field("cache", &self.cache) // cache's own Debug redacts the pepper
@@ -399,6 +406,7 @@ impl UpstreamBasicAuthConfig {
             request_timeout: Duration::from_millis(self.request_timeout_ms),
             required_groups: self.required_groups.clone(),
             groups_path: self.groups_path.clone(),
+            identity_path: self.identity_path.clone(),
             admin_group: self.admin_group.clone(),
             provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
             auto_provision: self.auto_provision,
@@ -1470,6 +1478,13 @@ impl Config {
             );
             self.auth.bootstrap_admin = None;
         }
+        // The account is stored and looked up by its canonical username;
+        // `validate` reports a name that has none.
+        if let Some(ba) = self.auth.bootstrap_admin.as_mut() {
+            if let Ok(canonical) = forge_core::auth::canonical_username(&ba.username) {
+                ba.username = canonical;
+            }
+        }
         if self
             .redis
             .url
@@ -1489,6 +1504,10 @@ impl Config {
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
+        if let Some(ba) = &self.auth.bootstrap_admin {
+            forge_core::auth::canonical_username(&ba.username)
+                .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
+        }
         match self.auth.login_mode.as_str() {
             "identifier_first" | "combined" => {}
             other => {
