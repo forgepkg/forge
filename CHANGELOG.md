@@ -81,6 +81,11 @@ The release workflow publishes the section whose heading matches the tag
   whose directory knew the same username took over the account with its
   roles and tokens. Such accounts are now flagged as orphans and never
   matched again.
+- OIDC `link_existing_by_username` links only an account that no other
+  credential owns: never a credential-forwarding account or one already
+  linked to an IdP identity (before, a colliding `preferred_username` at the
+  same or another IdP took it over). An email claim is used as a username
+  only with `email_verified`, also when `username_claim` names it.
 
 ## [0.1.0]
 

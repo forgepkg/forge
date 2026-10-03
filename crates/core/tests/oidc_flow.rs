@@ -505,7 +505,8 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     let n = unique();
     let username = format!("linkable-{n}");
 
-    // A passwordless, non-admin account (e.g. provisioned by another realm).
+    // A passwordless, non-admin account no other credential owns (an OIDC
+    // account whose identity link was removed).
     let existing = user_dao::insert_user(
         &pool,
         NewUser {
@@ -513,8 +514,8 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
             password_hash: None,
             is_admin: false,
             active: true,
-            auth_source: "upstream-basic".into(),
-            external_subject: Some(username.clone()),
+            auth_source: "oidc".into(),
+            external_subject: None,
         },
     )
     .await
@@ -545,6 +546,81 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     assert_eq!(
         linked.id, existing.id,
         "explicit opt-in links the safe target"
+    );
+}
+
+/// Linking by username never takes over an account another credential owns:
+/// a credential-forwarding account, or an account already linked to an IdP
+/// identity (of another person, possibly at another issuer).
+#[tokio::test]
+async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let link = ResolvePolicy {
+        auto_provision: true,
+        link_existing_by_username: true,
+    };
+
+    let upstream_name = format!("directory-{n}");
+    let upstream = user_dao::insert_user(
+        &pool,
+        NewUser {
+            username: upstream_name.clone(),
+            password_hash: None,
+            is_admin: false,
+            active: true,
+            auth_source: "upstream-basic".into(),
+            external_subject: Some(upstream_name.clone()),
+        },
+    )
+    .await
+    .expect("upstream user");
+    let validated = run_login(
+        &pool,
+        &idp,
+        &format!("sub-u-{n}"),
+        &upstream_name,
+        json!([]),
+    )
+    .await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &link)
+        .await
+        .expect("provisioned separately");
+    assert_ne!(
+        user.id, upstream.id,
+        "a directory account is never linked by name"
+    );
+
+    // Victim signs in once (linked to sub-victim); an attacker whose IdP
+    // account claims the same preferred_username gets a separate account.
+    let victim_name = format!("victim-{n}");
+    let v = run_login(
+        &pool,
+        &idp,
+        &format!("sub-victim-{n}"),
+        &victim_name,
+        json!([]),
+    )
+    .await;
+    let victim = oidc::resolve_user(&pool, &v, &map_claims(&v.claims, &admin_mapping()), &link)
+        .await
+        .expect("victim provisioned");
+    let a = run_login(
+        &pool,
+        &idp,
+        &format!("sub-attacker-{n}"),
+        &victim_name,
+        json!([]),
+    )
+    .await;
+    let attacker = oidc::resolve_user(&pool, &a, &map_claims(&a.claims, &admin_mapping()), &link)
+        .await
+        .expect("attacker provisioned separately");
+    assert_ne!(
+        attacker.id, victim.id,
+        "an account already linked to an identity is never linked to another"
     );
 }
 

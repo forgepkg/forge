@@ -74,11 +74,16 @@ pub struct MappedClaims {
 pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaims {
     let email = string_claim(claims, &mapping.email_claim);
     // An unverified email is attacker-chosen at many IdPs: never let it become
-    // the username (which can drive account linking); fall back to `sub`.
+    // the username (which can drive account linking) — neither as the
+    // fallback nor when the username claim *is* the email claim (a common
+    // `username_claim = "email"` setup); fall back to `sub`.
     // The username is stored canonical (trimmed, NFC, lowercased) like every
     // other account name; a claim with no canonical form falls through.
     let canonical = |raw: String| forge_db::username::canonical_username(&raw).ok();
+    let username_is_email =
+        mapping.username_claim == mapping.email_claim || mapping.username_claim == "email";
     let username = string_claim(claims, &mapping.username_claim)
+        .filter(|_| !username_is_email || email_verified(claims))
         .and_then(canonical)
         .or_else(|| {
             email
@@ -222,6 +227,24 @@ mod tests {
             json!({ "preferred_username": "  ", "email": "c@corp", "email_verified": "true" }),
         );
         assert_eq!(map_claims(&c, &mapping()).username, "c@corp");
+    }
+
+    #[test]
+    fn unverified_email_is_not_the_username_even_as_the_username_claim() {
+        let mut m = mapping();
+        m.username_claim = "email".into();
+        let unverified = claims_with("sub-7", json!({ "email": "Boss@Corp" }));
+        assert_eq!(map_claims(&unverified, &m).username, "sub-7");
+        let verified = claims_with(
+            "sub-7",
+            json!({ "email": "Boss@Corp", "email_verified": true }),
+        );
+        assert_eq!(map_claims(&verified, &m).username, "boss@corp");
+        // Same when a custom email claim doubles as the username claim.
+        m.email_claim = "mail".into();
+        m.username_claim = "mail".into();
+        let unverified = claims_with("sub-8", json!({ "mail": "boss@corp" }));
+        assert_eq!(map_claims(&unverified, &m).username, "sub-8");
     }
 
     #[test]

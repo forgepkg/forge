@@ -61,6 +61,17 @@ pub async fn link(
     .await
 }
 
+/// Whether `user_id` is linked to any IdP identity (of any issuer).
+pub async fn user_has_identity(pool: &PgPool, user_id: i64) -> sqlx::Result<bool> {
+    let linked = sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM external_identity WHERE user_id = $1) AS "linked!""#,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(linked)
+}
+
 /// Find the identity row for `(issuer, subject)`, if any.
 pub async fn find_by_issuer_subject(
     pool: &PgPool,
