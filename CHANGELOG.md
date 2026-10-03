@@ -104,6 +104,11 @@ The release workflow publishes the section whose heading matches the tag
   at all, so a reader cannot prefetch a quarantined release that would later
   be served from the cache. Proxy TTLs and the delay are validated
   (0 to 7 days; delay up to a year).
+- The password lockout keys IPv6 clients by their /64 (one host owns a whole
+  /64, so per-address keys gave it unlimited fresh budgets), and a username
+  guessed from many networks is backed off: past three pair budgets of
+  failures in a window its attempts are spaced (1 s, doubling to 30 s)
+  instead of refused, so the owner can still sign in. A success clears it.
 
 ## [0.1.0]
 

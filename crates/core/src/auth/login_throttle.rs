@@ -11,8 +11,19 @@
 //!
 //! Keying on the pair (not the username alone) means an attacker cannot lock a
 //! victim out from another address, while a single address still cannot brute
-//! force a username. The state is **per instance and in memory** — a cheap
-//! first line of defense, not a cluster-wide guarantee.
+//! force a username. An IPv6 client is keyed by its **/64**: one host
+//! routinely owns a whole /64, so per-address keys would hand it 2^64 fresh
+//! budgets. The state is **per instance and in memory** — a cheap first line
+//! of defense, not a cluster-wide guarantee.
+//!
+//! ## Per-username soft backoff
+//! A guesser spread over many networks never trips a pair's lockout, so
+//! failures are also counted per **username** across all addresses. Past a
+//! threshold (default three pair budgets per window) attempts for that
+//! username are spaced out — each waits for the next slot, the spacing
+//! doubling with every further failure up to a cap — instead of being
+//! refused: the account's owner can still sign in (after a short wait), but
+//! the account can no longer be guessed at full speed. A success clears it.
 //!
 //! ## Reservation, not check-then-record
 //! An attempt is counted against the pair's budget atomically *before* the
@@ -77,6 +88,27 @@ const EVICT_BATCH: usize = MAX_TRACKED / 8;
 
 /// Minimum number of insertions between two sweeps of expired windows.
 const SWEEP_MIN_INSERTS: usize = 1024;
+
+/// The network a client address is accounted to: the address itself for
+/// IPv4 (IPv4-mapped IPv6 included), its /64 for IPv6.
+pub fn client_network(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(std::net::Ipv6Addr::from(prefix))
+        }
+        v4 => v4,
+    }
+}
+
+/// Failures of one username across all networks (the soft backoff).
+#[derive(Debug)]
+struct UserEntry {
+    failures: u32,
+    window_start: Instant,
+    /// Earliest start of the next attempt while backing off.
+    next_allowed: Instant,
+}
 
 /// A tracked pair: the canonical client IP and a SHA-256 of the normalized
 /// (trimmed, lowercased) username. Fixed size, whatever the username.
@@ -158,13 +190,21 @@ enum Verdict {
     Released,
 }
 
-/// Fixed-window failure counter keyed by `(client IP, username)`.
+/// Fixed-window failure counter keyed by `(client network, username)`, plus a
+/// per-username soft backoff (see the [module docs](self)).
 #[derive(Debug)]
 pub struct LoginThrottle {
     max_failures: u32,
     window: Duration,
     max_wait: Duration,
     state: Mutex<State>,
+    /// Failures of a username (all networks) before its attempts are spaced.
+    user_soft_threshold: u32,
+    /// Spacing at the threshold; doubles per further failure.
+    user_backoff_base: Duration,
+    /// Largest spacing.
+    user_backoff_max: Duration,
+    users: Mutex<HashMap<[u8; 32], UserEntry>>,
 }
 
 impl LoginThrottle {
@@ -176,6 +216,89 @@ impl LoginThrottle {
             window,
             max_wait: DEFAULT_MAX_WAIT,
             state: Mutex::new(State::default()),
+            user_soft_threshold: max_failures.saturating_mul(3),
+            user_backoff_base: Duration::from_secs(1),
+            user_backoff_max: Duration::from_secs(30),
+            users: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Override the per-username soft backoff: after `threshold` failures of a
+    /// username (all networks, same window) its attempts are spaced by `base`,
+    /// doubling per further failure up to `max`. A `threshold` of `0` turns
+    /// the backoff off.
+    pub fn with_user_backoff(mut self, threshold: u32, base: Duration, max: Duration) -> Self {
+        self.user_soft_threshold = threshold;
+        self.user_backoff_base = base;
+        self.user_backoff_max = max;
+        self
+    }
+
+    /// How long the next attempt for `user` must wait (`Some(ZERO)` when it
+    /// may start now), claiming that slot; `None` when the wait would exceed
+    /// `max_wait` (nothing is claimed then).
+    fn user_slot(&self, user: [u8; 32]) -> Option<Duration> {
+        if self.user_soft_threshold == 0 {
+            return Some(Duration::ZERO);
+        }
+        let now = Instant::now();
+        let mut users = self.users.lock().expect("login throttle mutex poisoned");
+        let Some(entry) = users.get_mut(&user) else {
+            return Some(Duration::ZERO);
+        };
+        if now.duration_since(entry.window_start) >= self.window {
+            users.remove(&user);
+            return Some(Duration::ZERO);
+        }
+        if entry.failures < self.user_soft_threshold {
+            return Some(Duration::ZERO);
+        }
+        let doublings = (entry.failures - self.user_soft_threshold).min(16);
+        let backoff = self
+            .user_backoff_base
+            .saturating_mul(1u32 << doublings)
+            .min(self.user_backoff_max);
+        let slot = entry.next_allowed.max(now);
+        let wait = slot.duration_since(now);
+        if wait > self.max_wait {
+            return None;
+        }
+        entry.next_allowed = slot + backoff;
+        Some(wait)
+    }
+
+    /// Record a verdict for the username behind `user` (soft backoff).
+    fn record_user(&self, user: [u8; 32], verdict: &Verdict) {
+        if self.user_soft_threshold == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut users = self.users.lock().expect("login throttle mutex poisoned");
+        match verdict {
+            Verdict::Succeeded => {
+                users.remove(&user);
+            }
+            Verdict::Released => {}
+            Verdict::Failed => {
+                if !users.contains_key(&user) && users.len() >= MAX_TRACKED {
+                    let window = self.window;
+                    users.retain(|_, e| now.duration_since(e.window_start) < window);
+                    if users.len() >= MAX_TRACKED {
+                        // Full of live entries: stay bounded, track no more.
+                        return;
+                    }
+                }
+                let entry = users.entry(user).or_insert(UserEntry {
+                    failures: 0,
+                    window_start: now,
+                    next_allowed: now,
+                });
+                if now.duration_since(entry.window_start) >= self.window {
+                    entry.failures = 0;
+                    entry.window_start = now;
+                }
+                entry.failures = entry.failures.saturating_add(1);
+            }
         }
     }
 
@@ -193,7 +316,7 @@ impl LoginThrottle {
 
     fn key(ip: IpAddr, username: &str) -> Key {
         Key {
-            ip: ip.to_canonical(),
+            ip: client_network(ip),
             user: Sha256::digest(username.trim().to_lowercase().as_bytes()).into(),
         }
     }
@@ -217,6 +340,12 @@ impl LoginThrottle {
             });
         }
         let key = Self::key(ip, username);
+        // Per-username soft backoff first: wait for this username's next slot.
+        match self.user_slot(key.user) {
+            None => return Err(AttemptRefused::Busy),
+            Some(wait) if !wait.is_zero() => tokio::time::sleep(wait).await,
+            Some(_) => {}
+        }
         let granted = || LoginAttempt {
             throttle: self,
             key: Some(key),
@@ -274,6 +403,7 @@ impl LoginThrottle {
     }
 
     fn complete(&self, key: Key, verdict: Verdict) {
+        self.record_user(key.user, &verdict);
         let mut state = self.lock();
         let Some(entry) = state.entries.get_mut(&key) else {
             return;
@@ -316,6 +446,56 @@ impl Default for LoginThrottle {
     /// 10 failures per 5 minutes.
     fn default() -> Self {
         Self::new(10, Duration::from_secs(300))
+    }
+}
+
+/// A fixed-window rate limit per client network (IPv6 by /64; see
+/// [`client_network`]), for unauthenticated endpoints that do work or store
+/// state per call (e.g. starting an OIDC login stores a flow row). Bounded
+/// memory: expired windows are swept when the map fills, and a map still
+/// full of live windows refuses networks it does not track yet.
+#[derive(Debug)]
+pub struct WindowLimiter {
+    max: u32,
+    window: Duration,
+    state: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl WindowLimiter {
+    /// Allow `max` calls per `window` per network; `0` disables the limit.
+    pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Count a call from `ip`; `false` when its network is over the limit.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        if self.max == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let net = client_network(ip);
+        let mut state = self.state.lock().expect("window limiter mutex poisoned");
+        if !state.contains_key(&net) && state.len() >= MAX_TRACKED {
+            let window = self.window;
+            state.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if state.len() >= MAX_TRACKED {
+                return false;
+            }
+        }
+        let (start, count) = state.entry(net).or_insert((now, 0));
+        if now.duration_since(*start) >= self.window {
+            *start = now;
+            *count = 0;
+        }
+        if *count >= self.max {
+            return false;
+        }
+        *count += 1;
+        true
     }
 }
 
@@ -388,6 +568,72 @@ mod tests {
         // Other pairs are unaffected: another IP, another username.
         assert!(!t.is_locked(ip("203.0.113.2"), "alice"));
         assert!(!t.is_locked(a, "bob"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_clients_are_keyed_by_their_64() {
+        let t = LoginThrottle::new(2, Duration::from_secs(60));
+        fail(&t, ip("2001:db8:1:2::1"), "alice").await;
+        fail(&t, ip("2001:db8:1:2:ffff::9"), "alice").await;
+        assert!(
+            t.is_locked(ip("2001:db8:1:2:dead:beef::7"), "alice"),
+            "every address of the /64 shares the lockout"
+        );
+        assert!(
+            !t.is_locked(ip("2001:db8:1:3::1"), "alice"),
+            "another /64 does not"
+        );
+        assert_eq!(client_network(ip("::ffff:192.0.2.1")), ip("192.0.2.1"));
+    }
+
+    #[tokio::test]
+    async fn a_username_guessed_from_many_networks_is_backed_off() {
+        let t = LoginThrottle::new(5, Duration::from_secs(60)).with_user_backoff(
+            3,
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        );
+        for n in 1..=3 {
+            fail(&t, ip(&format!("203.0.113.{n}")), "alice").await;
+        }
+        assert!(
+            !t.is_locked(ip("203.0.113.9"), "alice"),
+            "no pair is locked"
+        );
+        // Each further attempt (from yet another network) waits for its slot.
+        let started = Instant::now();
+        fail(&t, ip("198.51.100.1"), "alice").await;
+        fail(&t, ip("198.51.100.2"), "alice").await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        // Other usernames are unaffected.
+        let started = Instant::now();
+        t.begin(ip("198.51.100.3"), "bob").await.unwrap().released();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        // The owner still gets in, and a success clears the backoff.
+        t.begin(ip("198.51.100.4"), "alice")
+            .await
+            .unwrap()
+            .succeeded();
+        let started = Instant::now();
+        t.begin(ip("198.51.100.5"), "alice")
+            .await
+            .unwrap()
+            .released();
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn window_limiter_counts_per_network() {
+        let l = WindowLimiter::new(2, Duration::from_secs(60));
+        assert!(l.allow(ip("2001:db8::1")));
+        assert!(l.allow(ip("2001:db8::2")));
+        assert!(!l.allow(ip("2001:db8::3")), "same /64");
+        assert!(l.allow(ip("2001:db8:0:1::1")), "another /64");
+        assert!(WindowLimiter::new(0, Duration::ZERO).allow(ip("192.0.2.1")));
     }
 
     #[tokio::test]
