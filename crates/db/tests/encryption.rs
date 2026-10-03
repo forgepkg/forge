@@ -578,7 +578,7 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
         let id = repo.id;
         tokio::spawn(async move {
             secret_dao::set_upstream_password(
-                &mut *pool.acquire().await.unwrap(),
+                &mut pool.acquire().await.unwrap(),
                 &envelope,
                 id,
                 Some(&secret("late")),
@@ -658,7 +658,7 @@ async fn upstream_password_end_to_end() {
         .await
         .expect("insert repo1");
     secret_dao::set_upstream_password(
-        &mut *pool.acquire().await.unwrap(),
+        &mut pool.acquire().await.unwrap(),
         &envelope,
         repo1.id,
         Some(&secret("hunter2")),
@@ -743,7 +743,7 @@ async fn upstream_password_end_to_end() {
         "repo1's blob pasted into repo2 must fail (row-bound AAD)"
     );
     secret_dao::set_upstream_password(
-        &mut *pool.acquire().await.unwrap(),
+        &mut pool.acquire().await.unwrap(),
         &envelope,
         repo2.id,
         None,
@@ -1131,7 +1131,7 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
     let read = || secret_dao::get_upstream_credential(&pool, &envelope, repo.id);
 
     secret_dao::set_upstream_password(
-        &mut *pool.acquire().await.unwrap(),
+        &mut pool.acquire().await.unwrap(),
         &envelope,
         repo.id,
         Some(&secret("pw")),

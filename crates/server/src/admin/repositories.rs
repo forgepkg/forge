@@ -472,7 +472,7 @@ async fn store_encrypted_password(
     password: String,
 ) -> Result<(), Response> {
     let secret = forge_crypto::PlaintextSecret::from(password);
-    forge_db::secret_dao::set_upstream_password(&mut **tx, envelope, repo_id, Some(&secret))
+    forge_db::secret_dao::set_upstream_password(tx, envelope, repo_id, Some(&secret))
         .await
         .map_err(|e| {
             tracing::error!(error = %e, repo_id, "failed to store encrypted upstream password");
