@@ -682,8 +682,11 @@ impl ProxyRepo {
                     })
                     .unwrap_or_default();
 
-                // Record each version's first sighting (idempotent, one round-trip).
+                // Record each version's first sighting (idempotent, one round-trip),
+                // then retire versions the upstream no longer lists (deleted
+                // upstream) and drop a stale package-level not-found marker.
                 proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
+                proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
                 Ok(true)
             }
             None => {
@@ -711,6 +714,7 @@ impl ProxyRepo {
                    downloaded, metadata_refreshed_at, not_found, not_found_at
             FROM proxy_cached_version
             WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
+              AND NOT upstream_missing
             "#,
             repo_id,
             lower_id,
@@ -742,8 +746,9 @@ impl ProxyRepo {
         sqlx::query!(
             r#"
             INSERT INTO proxy_cached_version
-                (repository_id, name, version, listed, downloaded, not_found, not_found_at)
-            VALUES ($1, $2, $3, false, false, true, now())
+                (repository_id, name, version, listed, downloaded, not_found, not_found_at,
+                 confirmed)
+            VALUES ($1, $2, $3, false, false, true, now(), false)
             ON CONFLICT (repository_id, name, version)
             DO UPDATE SET not_found = true, not_found_at = now()
             "#,
@@ -792,6 +797,18 @@ impl ProxyRepo {
 
         // Offline and not (or no longer) cached locally ⇒ nothing to serve.
         if !repo.online {
+            return Ok(None);
+        }
+
+        // Package delay: never fetch a version from upstream before its delay
+        // window has passed. Fetching early would cache bytes that are later
+        // served without asking the upstream again — so a release pulled
+        // during the quarantine (the point of the delay) would still be
+        // served afterwards. A version not confirmed yet is looked up in the
+        // upstream listing first: that starts its delay clock.
+        if repo.package_delay_seconds > 0
+            && !self.delay_cleared_upstream(repo, lower_id, version).await?
+        {
             return Ok(None);
         }
 
@@ -870,6 +887,7 @@ impl ProxyRepo {
 
         // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
+        let requested_at = Utc::now();
         // §12.5: decrypt-on-use; the plaintext lives only inside this request
         // (and the zeroizing secret wrapper) — never in a log or model.
         let resp = {
@@ -891,9 +909,19 @@ impl ProxyRepo {
                     .await?
             {
                 if !row.downloaded {
+                    // A listing that confirmed the version after this request
+                    // started outranks the 404 (a request racing publication,
+                    // or a lagging CDN edge): do not hide a version the
+                    // upstream has meanwhile vouched for.
                     sqlx::query!(
-                        r#"UPDATE proxy_cached_version SET not_found = true, not_found_at = now() WHERE id = $1"#,
-                        row.id
+                        r#"
+                        UPDATE proxy_cached_version SET not_found = true, not_found_at = now()
+                        WHERE id = $1
+                          AND NOT (confirmed AND metadata_refreshed_at IS NOT NULL
+                                   AND metadata_refreshed_at >= $2)
+                        "#,
+                        row.id,
+                        requested_at,
                     )
                     .execute(&mut *tx)
                     .await?;
@@ -1085,14 +1113,55 @@ impl ProxyRepo {
         // Mark downloaded and confirmed; a row only the singleflight knew
         // restarts its delay window here (its first real sighting).
         let first_seen_at = proxy_dao::mark_downloaded(&mut tx, locked.id).await?;
+        // The package evidently exists: drop a package-level not-found marker
+        // so listings see it again.
+        let marker_cleared = proxy_dao::clear_package_marker(&mut tx, repo.id, lower_id).await? > 0;
 
         tx.commit().await?;
+        if marker_cleared {
+            // The cached "unknown upstream" listing result goes with it.
+            self.cache
+                .invalidate(
+                    NS_UPSTREAM_VERSIONS,
+                    &format!("{}/{}/{lower_id}", repo.name, repo.id),
+                )
+                .await;
+        }
 
         // Delay gate on the recorded first sighting.
         if !Self::delay_cleared(repo, first_seen_at, Utc::now()) {
             return Ok(None);
         }
         self.local_nupkg(repo.id, lower_id, version).await
+    }
+
+    /// Whether `(lower_id, version)` is confirmed upstream and past its
+    /// package delay. A version without a confirmed row is looked up in the
+    /// upstream listing first (refreshing it when stale), which confirms it
+    /// and starts its delay clock.
+    ///
+    /// Returns a type-erased future: it is awaited inside
+    /// [`Self::ensure_downloaded`], which the listing paths reach in turn, and
+    /// the nested `async fn` types would otherwise recurse.
+    fn delay_cleared_upstream<'a>(
+        &'a self,
+        repo: &'a Repository,
+        lower_id: &'a str,
+        version: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RepoError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let confirmed = |rows: &[forge_db::model::ProxyCachedVersion]| {
+                rows.iter()
+                    .find(|r| r.version == version)
+                    .map(|r| r.first_seen_at)
+            };
+            let first_seen = match confirmed(&self.cached_rows(repo.id, lower_id).await?) {
+                Some(first_seen) => Some(first_seen),
+                None => confirmed(&self.discover_versions(repo, lower_id).await?),
+            };
+            Ok(first_seen.is_some_and(|at| Self::delay_cleared(repo, at, Utc::now())))
+        })
     }
 
     /// Cache key of a remembered rejection of `(lower_id, version)`.
@@ -1509,7 +1578,7 @@ impl ProxyRepo {
             SELECT id, repository_id, name, version, listed, first_seen_at,
                    downloaded, metadata_refreshed_at, not_found, not_found_at
             FROM proxy_cached_version
-            WHERE repository_id = $1 AND version <> '*' AND confirmed
+            WHERE repository_id = $1 AND version <> '*' AND confirmed AND NOT upstream_missing
               AND listed AND ($2 = '' OR strpos(name, $2) > 0)
             ORDER BY name
             "#,

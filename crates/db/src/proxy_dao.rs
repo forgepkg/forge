@@ -80,8 +80,11 @@ pub async fn upsert_cached_versions(
                 ELSE now()
             END,
             confirmed = true,
+            upstream_missing = false,
             metadata_refreshed_at = now()
-        WHERE proxy_cached_version.not_found OR NOT proxy_cached_version.confirmed
+        WHERE proxy_cached_version.not_found
+           OR NOT proxy_cached_version.confirmed
+           OR proxy_cached_version.upstream_missing
         "#,
         repository_id,
         name,
@@ -90,6 +93,54 @@ pub async fn upsert_cached_versions(
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// Reconcile `name`'s confirmed rows with a successful upstream listing of
+/// `versions`: a version the listing no longer names is flagged
+/// `upstream_missing` (no longer enumerated — it was deleted upstream), one it
+/// names again is un-flagged, and the package-level negative-cache marker
+/// (`version = '*'`) is dropped, since the package evidently exists. Returns
+/// how many rows changed.
+pub async fn reconcile_listing(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let flagged = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET upstream_missing = NOT (version = ANY($3::text[]))
+        WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
+          AND upstream_missing IS DISTINCT FROM NOT (version = ANY($3::text[]))
+        "#,
+        repository_id,
+        name,
+        versions,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let cleared = clear_package_marker(&mut tx, repository_id, name).await?;
+    tx.commit().await?;
+    Ok(flagged + cleared)
+}
+
+/// Drop the package-level negative-cache marker (`version = '*'`) of `name`.
+pub async fn clear_package_marker(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    name: &str,
+) -> sqlx::Result<u64> {
+    Ok(sqlx::query!(
+        r#"DELETE FROM proxy_cached_version WHERE repository_id = $1 AND name = $2 AND version = '*'"#,
+        repository_id,
+        name,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected())
 }
 
 /// Guarantee a row exists for a version a client asked to download, so the

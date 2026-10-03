@@ -475,7 +475,7 @@ async fn delayed_proxy_versions(
         SELECT version, listed, first_seen_at
         FROM proxy_cached_version
         WHERE repository_id = $1 AND name = $2 AND version <> '*' AND not_found = false
-          AND confirmed
+          AND confirmed AND NOT upstream_missing
         "#,
         repo.id,
         lower_id,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, repository_id, name, version, listed, first_seen_at,\n                   downloaded, metadata_refreshed_at, not_found, not_found_at\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND version <> '*' AND confirmed\n              AND listed AND ($2 = '' OR strpos(name, $2) > 0)\n            ORDER BY name\n            ",
+  "query": "\n            SELECT id, repository_id, name, version, listed, first_seen_at,\n                   downloaded, metadata_refreshed_at, not_found, not_found_at\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed\n              AND NOT upstream_missing\n            ",
   "describe": {
     "columns": [
       {
@@ -133,5 +133,5 @@
       true
     ]
   },
-  "hash": "495c375b03199cbfc866e86f517fcc58b8f547fa868b28ac14d2deaf2fb8f860"
+  "hash": "db0ff3bc8617c6bea391606aaed3b6cf45e7f96753d3eb33d0f43de3e8053542"
 }

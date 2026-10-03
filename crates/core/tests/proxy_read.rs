@@ -135,6 +135,13 @@ impl MockUpstream {
             .or_default()
             .insert(version.to_string(), bytes);
     }
+    /// Delete a version upstream (gone from the listing and the flat container).
+    fn unpublish(&self, lower_id: &str, version: &str) {
+        if let Some(versions) = self.state.packages.lock().unwrap().get_mut(lower_id) {
+            versions.remove(version);
+        }
+    }
+
     fn fail_nupkg(&self, lower_id: &str, version: &str) {
         self.state
             .failing
@@ -991,6 +998,168 @@ async fn planted_not_found_marker_is_cleared_by_a_later_listing() {
         .await
         .unwrap()
         .is_some());
+}
+
+/// H3 follow-up: a version deleted upstream (e.g. a malicious release pulled
+/// from nuget.org) leaves the listings at the next refresh, instead of
+/// reappearing every `not_found_ttl`; it comes back if the upstream lists it
+/// again.
+#[tokio::test]
+async fn versions_deleted_upstream_leave_the_listings() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.1.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.1.0"]
+    );
+
+    mock.unpublish("contoso.lib", "2.1.0");
+    // A fresh cache stands in for an expired metadata TTL.
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the deleted version is retired"
+    );
+    assert_eq!(
+        px.registration(&repo, "Contoso.Lib").await.unwrap().len(),
+        1
+    );
+    assert_eq!(searched_versions(&px, &repo, "contoso").await, ["1.0.0"]);
+    // Even once the not-found TTL would have expired.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET not_found_at = now() - interval '2 hours' \
+         WHERE name = 'contoso.lib'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+
+    mock.publish("contoso.lib", "2.1.0", make_nupkg("Contoso.Lib", "2.1.0"));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.1.0"],
+        "listed again, visible again"
+    );
+}
+
+/// H3 follow-up: the package-level not-found marker (`*`) is cleared as soon
+/// as the package is downloaded, and an expired one is pruned like any other
+/// unconfirmed row (before, every request for a random id left a permanent
+/// row, and the marker hid a newly published package from listings even
+/// after it had been downloaded).
+#[tokio::test]
+async fn package_marker_is_cleared_by_a_download_and_pruned_when_expired() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let rid = repo_id(&pool, &repo).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+
+    assert!(px
+        .list_versions(&repo, "Contoso.Next")
+        .await
+        .unwrap()
+        .is_empty());
+    let marker = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT confirmed FROM proxy_cached_version \
+                 WHERE repository_id = $1 AND name = $2 AND version = '*'",
+            )
+            .bind(rid)
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        marker("contoso.next").await,
+        Some(false),
+        "an unconfirmed marker"
+    );
+
+    // The package is published and downloaded: its listing is visible again
+    // although the marker's TTL has not elapsed.
+    mock.publish("contoso.next", "1.0.0", make_nupkg("Contoso.Next", "1.0.0"));
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Next", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        marker("contoso.next").await,
+        None,
+        "the download cleared the marker"
+    );
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Next").await.unwrap()),
+        ["1.0.0"]
+    );
+
+    // An expired marker of an id that never appears is pruned.
+    assert!(px
+        .list_versions(&repo, "Contoso.Ghost")
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query(
+        "UPDATE proxy_cached_version SET not_found_at = now() - interval '2 hours' \
+         WHERE repository_id = $1 AND name = 'contoso.ghost'",
+    )
+    .bind(rid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    forge_db::proxy_dao::prune_unconfirmed(&pool, 600, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(marker("contoso.ghost").await, None, "expired marker pruned");
+}
+
+/// Review follow-up: inside the package-delay window the proxy never fetches
+/// the package from upstream (before, a reader could prefetch a quarantined
+/// release, which was then served from the cache after the window without
+/// asking the upstream again).
+#[tokio::test]
+async fn downloads_inside_the_delay_window_never_reach_the_upstream() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        mock.nupkg_hits(),
+        0,
+        "no upstream download inside the delay"
+    );
+    let row = forge_db::proxy_dao::get_cached_version(
+        &pool,
+        repo_id(&pool, &repo).await,
+        "contoso.lib",
+        "1.0.0",
+    )
+    .await
+    .unwrap()
+    .expect("the listing confirmed the version (its delay clock runs)");
+    assert!(!row.downloaded);
 }
 
 /// H3: a download attempt that fails with an upstream 5xx must not leave a

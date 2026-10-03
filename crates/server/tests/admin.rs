@@ -69,6 +69,56 @@ async fn non_admin_forbidden() {
     assert_eq!(resp.status(), 403, "non-admin must be 403");
 }
 
+/// Proxy timings are bounded: a negative TTL made every unconfirmed row
+/// prunable at once, and an unbounded not-found TTL let one request hide a
+/// package for years.
+#[tokio::test]
+async fn proxy_timings_are_validated() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    for (field, value) in [
+        ("not_found_ttl_seconds", -1),
+        ("not_found_ttl_seconds", 31_536_000),
+        ("metadata_ttl_seconds", -5),
+        ("package_delay_seconds", -1),
+    ] {
+        let mut body = json!({
+            "name": format!("px{}", common::unique()),
+            "kind": "proxy",
+            "remote_url": "https://api.nuget.org/v3/index.json",
+        });
+        body[field] = json!(value);
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{field} = {value}");
+    }
+    let name = format!("px{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://api.nuget.org/v3/index.json",
+                      "not_found_ttl_seconds": 600}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .put(format!("{}/admin/repositories/{name}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"not_found_ttl_seconds": -1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "updates are validated too");
+}
+
 /// Usernames are stored canonical (trimmed, NFC, lowercased): a case or
 /// spacing variant of an existing name is the same account (409 on create),
 /// and every spelling signs in to it. Names without a canonical form are 400.

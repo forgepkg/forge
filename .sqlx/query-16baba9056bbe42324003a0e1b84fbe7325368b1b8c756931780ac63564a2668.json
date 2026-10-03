@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        UPDATE proxy_cached_version SET not_found = true, not_found_at = now()\n                        WHERE id = $1\n                          AND NOT (confirmed AND metadata_refreshed_at IS NOT NULL\n                                   AND metadata_refreshed_at >= $2)\n                        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16baba9056bbe42324003a0e1b84fbe7325368b1b8c756931780ac63564a2668"
+}

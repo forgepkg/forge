@@ -95,6 +95,15 @@ The release workflow publishes the section whose heading matches the tag
   catalog documents look up one version instead of all, rendering runs on
   the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
   rejects nesting deeper than 32 levels (it was quadratic in depth).
+- Proxy (completing the 0.1.0 "not found" marker fix): a version deleted
+  upstream leaves the listings at the next refresh (migration 0025) instead
+  of reappearing every `not_found_ttl`; the package-level not-found marker
+  is pruned once expired and cleared by a download of the package; a 404
+  never hides a version a listing confirmed after the request started; and
+  inside the package-delay window the proxy no longer downloads a version
+  at all, so a reader cannot prefetch a quarantined release that would later
+  be served from the cache. Proxy TTLs and the delay are validated
+  (0 to 7 days; delay up to a year).
 
 ## [0.1.0]
 

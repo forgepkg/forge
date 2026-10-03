@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO proxy_cached_version (\n            repository_id, name, version, listed, downloaded, not_found, metadata_refreshed_at,\n            confirmed\n        )\n        SELECT $1, $2, v, true, false, false, now(), true\n        FROM (SELECT DISTINCT v FROM unnest($3::text[]) AS t(v)) AS d\n        ON CONFLICT (repository_id, name, version) DO UPDATE\n        SET not_found = false,\n            not_found_at = NULL,\n            first_seen_at = CASE\n                WHEN proxy_cached_version.confirmed THEN proxy_cached_version.first_seen_at\n                ELSE now()\n            END,\n            confirmed = true,\n            upstream_missing = false,\n            metadata_refreshed_at = now()\n        WHERE proxy_cached_version.not_found\n           OR NOT proxy_cached_version.confirmed\n           OR proxy_cached_version.upstream_missing\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "56c857746368c838ac173ccbece8c1c9c92fc7cabda10aeb437c62e40c5bedb7"
+}

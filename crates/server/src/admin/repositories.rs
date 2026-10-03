@@ -249,6 +249,38 @@ fn validate_remote_url(url: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// Longest accepted `metadata_ttl_seconds` / `not_found_ttl_seconds`: a week.
+const MAX_PROXY_TTL_SECONDS: i32 = 7 * 24 * 60 * 60;
+
+/// Longest accepted `package_delay_seconds`: a year.
+const MAX_PACKAGE_DELAY_SECONDS: i32 = 365 * 24 * 60 * 60;
+
+/// Reject negative or absurd proxy timings. A negative TTL made every
+/// unconfirmed row prunable at once (racing in-flight downloads), and an
+/// unbounded not-found TTL let one request hide a package for years.
+fn validate_timings(
+    package_delay_seconds: i32,
+    metadata_ttl_seconds: Option<i32>,
+    not_found_ttl_seconds: Option<i32>,
+) -> Result<(), Response> {
+    if !(0..=MAX_PACKAGE_DELAY_SECONDS).contains(&package_delay_seconds) {
+        return Err(bad_request(format!(
+            "package_delay_seconds must be between 0 and {MAX_PACKAGE_DELAY_SECONDS}"
+        )));
+    }
+    for (field, value) in [
+        ("metadata_ttl_seconds", metadata_ttl_seconds),
+        ("not_found_ttl_seconds", not_found_ttl_seconds),
+    ] {
+        if value.is_some_and(|v| !(0..=MAX_PROXY_TTL_SECONDS).contains(&v)) {
+            return Err(bad_request(format!(
+                "{field} must be between 0 and {MAX_PROXY_TTL_SECONDS}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `GET /admin/repositories`
 pub async fn list(State(state): State<AppState>) -> Response {
     match repository_dao::list_repositories(&state.pool).await {
@@ -301,6 +333,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     }
     if body.prefer_hosted.is_some() && parsed_kind != RepoKind::Group {
         return bad_request("prefer_hosted is only valid for group repositories");
+    }
+    if let Err(resp) = validate_timings(
+        body.package_delay_seconds,
+        body.metadata_ttl_seconds,
+        body.not_found_ttl_seconds,
+    ) {
+        return resp;
     }
     let mut config = json!({});
     if parsed_kind == RepoKind::Group {
@@ -497,6 +536,13 @@ pub async fn update(
             .unwrap_or(existing.not_found_ttl_seconds),
         allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
     };
+    if let Err(resp) = validate_timings(
+        upd.package_delay_seconds,
+        upd.metadata_ttl_seconds,
+        upd.not_found_ttl_seconds,
+    ) {
+        return resp;
+    }
 
     // The metadata and a replacement secret commit together: otherwise a
     // failed seal after a committed `remote_url` change would leave the new
