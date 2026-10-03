@@ -78,7 +78,8 @@
 //! round-trip: a stalled Redis slows the requests that talk to it, never a
 //! whole namespace. An invalidation advances this instance's tag barrier
 //! **before** it bumps the generation in Redis and publishes it, so reads here
-//! hide older entries at once. A fill that raced it is dropped by the
+//! hide older entries once it returns (when the bump fails, L1 is flushed
+//! instead: the local barrier may lag a generation read from Redis). A fill that raced it is dropped by the
 //! post-fill check, and a caller that arrived after the invalidation but was
 //! coalesced onto a fill that started before it loads again (see
 //! [`Cache::get_or_try_insert_with`]).
@@ -710,7 +711,11 @@ impl Cache {
                     // The locally advanced generation is still published below;
                     // the next fill that sees Redis lagging raises it to catch
                     // up (see `raise_tag`), so this stays a transient gap.
-                    tracing::warn!(error = %err, ns, tag, "Redis tag bump failed; invalidation is local/backplane-only until Redis recovers");
+                    // This instance's map may lag Redis, though: an entry
+                    // stamped with a newer Redis generation would survive the
+                    // local barrier, so drop L1 rather than serve it.
+                    tracing::warn!(error = %err, ns, tag, "Redis tag bump failed; flushed L1, invalidation is local/backplane-only until Redis recovers");
+                    self.inner.l1.invalidate_all();
                     current.saturating_add(1)
                 }
             }

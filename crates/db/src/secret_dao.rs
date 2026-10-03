@@ -12,10 +12,13 @@
 //! bypassed the admin API (which drops or replaces the password when the
 //! origin changes): the password is never sent anywhere else.
 //!
-//! Blobs sealed by earlier builds carry the row-only binding. Readers still
-//! open them, and the re-encrypt sweeps ([`reseal_upstream_passwords_batch`],
-//! [`reseal_realm_secrets`]) re-seal them under the destination binding,
-//! at startup and on every rotation pass.
+//! Blobs sealed by pre-release builds carry the row-only binding. They are
+//! opened only while `crypto.accept_row_bound_secrets` is on
+//! ([`EnvelopeService::accepts_row_bound_secrets`]): then readers accept them
+//! and the re-encrypt sweeps ([`reseal_upstream_passwords_batch`],
+//! [`reseal_realm_secrets`]) re-seal them under the destination binding, at
+//! startup and on every rotation pass. Off (the default), such a blob does
+//! not decrypt, so an old blob replayed into a repointed row is refused too.
 //!
 //! This module is the seam secret columns adopt: one `(table, column)`
 //! constant pair + the same set/get/backfill/sweep helpers per column. Auth
@@ -80,9 +83,10 @@ fn binding(repo_id: i64, destination: &str) -> AeadBinding<'_> {
     }
 }
 
-/// Open `blob` under `binding`, or, for a blob an earlier build sealed, under
-/// the same row's row-only binding. The flag says the blob still has to be
-/// re-sealed under `binding`.
+/// Open `blob` under `binding`, or, for a blob a pre-release build sealed and
+/// only while `crypto.accept_row_bound_secrets` is on, under the same row's
+/// row-only binding. The flag says the blob still has to be re-sealed under
+/// `binding`.
 async fn open_bound(
     envelope: &EnvelopeService,
     blob: &[u8],
@@ -90,7 +94,7 @@ async fn open_bound(
 ) -> Result<(PlaintextSecret, bool), CryptoError> {
     match envelope.open(blob, binding).await {
         Ok(plaintext) => Ok((plaintext, false)),
-        Err(CryptoError::DecryptFailed) => envelope
+        Err(CryptoError::DecryptFailed) if envelope.accepts_row_bound_secrets() => envelope
             .open(blob, binding.row_only())
             .await
             .map(|plaintext| (plaintext, true)),
@@ -448,8 +452,8 @@ pub async fn backfill_upstream_passwords(
 }
 
 /// The re-sealed blob for a sweep, or `None` when `blob` is already sealed
-/// under `binding` with the active DEK. A blob that decrypts under neither
-/// `binding` nor its row-only form is logged and skipped.
+/// under `binding` with the active DEK. A blob that does not decrypt under
+/// `binding` (nor, when accepted, its row-only form) is logged and skipped.
 async fn reseal_if_due(
     envelope: &EnvelopeService,
     blob: &[u8],
@@ -461,8 +465,10 @@ async fn reseal_if_due(
             tracing::warn!(
                 table = binding.table,
                 row = binding.row_pk,
+                accept_row_bound_secrets = envelope.accepts_row_bound_secrets(),
                 "sealed secret does not decrypt for its row's current destination; left as is \
-                 (enter the secret again through the admin API)"
+                 (enter the secret again through the admin API, or, for a secret a pre-release \
+                 build sealed, start once with crypto.accept_row_bound_secrets = true)"
             );
             return Ok(None);
         }
@@ -486,13 +492,13 @@ pub struct SweepBatch {
 
 /// One keyset-paginated batch of the **DEK-rotation re-encrypt sweep** (plan
 /// §2.7): re-seal every `upstream_password_enc` blob that references a
-/// non-active DEK, or that an earlier build sealed under the row-only binding
-/// (it is re-sealed for the row's current origin). Each row is one guarded
-/// UPDATE (last-writer-wins with a concurrent admin password change — both old
-/// and new DEKs decrypt during the window, so any interleaving stays
-/// readable). A blob that decrypts under neither binding (its row was
-/// repointed outside the API) is logged and left alone, so it cannot stall
-/// the sweep for every other row.
+/// non-active DEK, or (with `crypto.accept_row_bound_secrets`) that a
+/// pre-release build sealed under the row-only binding (it is re-sealed for
+/// the row's current origin). Each row is one guarded UPDATE (last-writer-wins
+/// with a concurrent admin password change — both old and new DEKs decrypt
+/// during the window, so any interleaving stays readable). A blob that does
+/// not decrypt (its row was repointed outside the API) is logged and left
+/// alone, so it cannot stall the sweep for every other row.
 pub async fn reseal_upstream_passwords_batch(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -942,8 +948,9 @@ pub async fn backfill_realm_secrets(
 }
 
 /// DEK-rotation re-encrypt sweep over `auth_realm.secrets_enc` (the table is
-/// small, so no pagination): re-seals blobs under a non-active DEK and blobs
-/// an earlier build sealed under the row-only binding. Guarded on the old
+/// small, so no pagination): re-seals blobs under a non-active DEK and (with
+/// `crypto.accept_row_bound_secrets`) blobs a pre-release build sealed under
+/// the row-only binding. Guarded on the old
 /// blob, the config it is bound to and the sealing DEK like the repository
 /// sweep. Returns how many rows were resealed.
 pub async fn reseal_realm_secrets(

@@ -767,7 +767,7 @@ async fn a_silently_dead_subscription_is_detected_and_l1_flushed() {
     relay.go_silent();
     b.invalidate("dead-sub", "k").await;
 
-    // Ping every 10 s with a 2 s answer deadline: flushed well within 30 s.
+    // Ping every 10 s with a 5 s answer deadline: flushed well within 30 s.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if read(&a).await != 0 {

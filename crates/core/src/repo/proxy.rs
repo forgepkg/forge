@@ -1049,7 +1049,10 @@ impl ProxyRepo {
             .cas
             .store(Cursor::new(parsed.nuspec_bytes.clone()), max_bytes)
             .await
-            .map_err(|e| RepoError::Storage(format!("cas store upstream nuspec: {e}")))?;
+            .map_err(|e| match e {
+                e @ CasError::StagingFull { .. } => RepoError::Busy(e.to_string()),
+                e => RepoError::Storage(format!("cas store upstream nuspec: {e}")),
+            })?;
 
         let size = i64::try_from(stored.size)
             .map_err(|_| RepoError::Storage("nupkg size overflow".into()))?;

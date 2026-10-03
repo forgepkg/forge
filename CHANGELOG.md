@@ -329,7 +329,10 @@ First production release.
   the origin of the repository's `remote_url`, an OIDC client secret to the
   realm's issuer and client id. Before, someone who could write to the
   database but not read secrets could point `remote_url` at their own host,
-  and the proxy decrypted the password and sent it there.
+  and the proxy decrypted the password and sent it there. Secrets sealed
+  under the old binding are opened only while
+  `crypto.accept_row_bound_secrets` is on (see Upgrade notes), so an old
+  blob replayed into a repointed row is refused too.
 - The marker that records whether a realm imported from `[oidc]` /
   `[auth.upstream_basic]` was edited no longer hashes the realm's secrets.
   It was an unsalted SHA-256 next to the plaintext config, so a database
@@ -423,7 +426,7 @@ First production release.
   - an invalidation stalled on Redis no longer blocks every lookup in its
     namespace;
   - a subscription that goes silent without a reset is detected by a ping
-    within about 12 s, L1 is flushed, and the instance resubscribes.
+    within about 15 s, L1 is flushed, and the instance resubscribes.
 
   Pushes, deletes and retention runs no longer pay for a Redis
   invalidation of a cache nobody read.
@@ -545,16 +548,19 @@ First production release.
   keep them, set `retention.audit_retention_seconds = 0` (or a longer
   window) before upgrading. Migration 0027 indexes `retention_audit` without
   `CONCURRENTLY`, which briefly blocks writes to a large table.
-- Pre-release installs with secret encryption: at startup, secrets sealed
-  by earlier builds are re-sealed for their destination, which older
-  instances cannot read. Upgrade all instances at once. A secret whose row
-  was changed outside the admin API no longer decrypts; it is logged at
-  startup and must be entered again.
+- Pre-release installs with secret encryption: secrets sealed by earlier
+  builds are bound only to their row and do not decrypt by default. Start
+  all instances at once with `crypto.accept_row_bound_secrets = true`
+  (`FORGE_CRYPTO__ACCEPT_ROW_BOUND_SECRETS=true`): startup re-seals them for
+  their destination, which older instances cannot read. Then remove the
+  setting and restart. A secret that is still logged as undecryptable (its
+  row was changed outside the admin API) must be entered again.
 - Staging is limited to 4 GiB per instance by default (four times the
   larger of `server.max_upload_bytes` and `proxy.max_package_bytes`), in
   `<temp dir>/forge-staging`. Set `server.max_staging_bytes` (`0` for no
   limit) and `server.staging_dir` to match your volume; a budget below the
-  larger of those two limits is refused at startup.
+  larger of those two limits plus `nuget.max_nuspec_bytes` is refused at
+  startup.
 ### Known limitations
 
 - NuGet is the only package format.

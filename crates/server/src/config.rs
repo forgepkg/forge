@@ -1277,6 +1277,13 @@ pub struct CryptoConfig {
     /// Rotation worker tuning.
     #[serde(default)]
     pub rotation: CryptoRotationConfig,
+    /// Also open secrets sealed by pre-release builds, which were bound to
+    /// their row but not to where they are sent, and re-seal them for their
+    /// destination at startup. Turn it on for one start after upgrading such
+    /// an installation, then off again: while on, someone who can write to
+    /// the database can replay such a blob into a repointed row.
+    #[serde(default)]
+    pub accept_row_bound_secrets: bool,
 }
 
 /// `crypto.root.*` — the root-key provider.
@@ -1662,12 +1669,12 @@ impl Config {
             ));
         }
         if let Some(budget) = self.staging_budget() {
-            let largest = self.largest_staged_item();
-            if budget < largest {
+            let needed = self.largest_staged_set();
+            if budget < needed {
                 return Err(ConfigError::Invalid(format!(
                     "server.max_staging_bytes ({budget}) must be at least the larger of \
-                     server.max_upload_bytes and proxy.max_package_bytes ({largest}), or 0 \
-                     for no limit"
+                     server.max_upload_bytes and proxy.max_package_bytes plus \
+                     nuget.max_nuspec_bytes ({needed}), or 0 for no limit"
                 )));
             }
         }
@@ -1679,6 +1686,13 @@ impl Config {
         self.server
             .max_upload_bytes
             .max(self.proxy.max_package_bytes)
+    }
+
+    /// What one push or download stages at once at most: the package, and
+    /// its manifest while the package is still held.
+    fn largest_staged_set(&self) -> u64 {
+        self.largest_staged_item()
+            .saturating_add(self.nuget.max_nuspec_bytes)
     }
 
     /// The directory pushes and proxy downloads are staged in
@@ -1696,7 +1710,11 @@ impl Config {
         match self.server.max_staging_bytes {
             Some(0) => None,
             Some(bytes) => Some(bytes),
-            None => Some(self.largest_staged_item().saturating_mul(4)),
+            None => Some(
+                self.largest_staged_item()
+                    .saturating_mul(4)
+                    .max(self.largest_staged_set()),
+            ),
         }
     }
 
@@ -2712,6 +2730,13 @@ mod tests {
         let too_small = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 1048576");
         let err = Config::from_figment(fig_from_toml(&too_small)).unwrap_err();
         assert!(err.to_string().contains("max_staging_bytes"), "{err}");
+        // Exactly one maximum-size package leaves no room for its manifest,
+        // which is staged while the package is still held.
+        let exact = MINIMAL.replace(
+            "[server]",
+            &format!("[server]\nmax_staging_bytes = {largest}"),
+        );
+        assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
     }
 
     #[test]

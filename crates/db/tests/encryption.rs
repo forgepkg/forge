@@ -502,11 +502,12 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
     let repo = repository_dao::insert_repository(&pool, NewRepository::proxy("crypt-inflight"))
         .await
         .unwrap();
+    let destination = secret_dao::upstream_destination(repo.remote_url.as_deref());
     let repo_binding = forge_crypto::envelope::AeadBinding {
         table: secret_dao::UPSTREAM_PASSWORD_TABLE,
         column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
         row_pk: repo.id,
-        destination: None,
+        destination: Some(&destination),
     };
 
     // A writer sealed under DEK v1, then DEK v2 became active (v1 retiring).
@@ -1106,12 +1107,15 @@ async fn realm_secrets_end_to_end() {
 /// (review: "the ciphertext is not bound to where the secret is sent"). A
 /// row repointed at another host outside the API no longer decrypts, so the
 /// proxy can never send the password there; a path change on the same origin
-/// keeps it. A blob an earlier build sealed under the row-only binding still
-/// opens and is moved to the origin binding by the re-encrypt sweep.
+/// keeps it. A blob a pre-release build sealed under the row-only binding
+/// opens only with `crypto.accept_row_bound_secrets`, and is then moved to
+/// the origin binding by the re-encrypt sweep.
 #[tokio::test]
 async fn upstream_password_is_bound_to_the_remote_origin() {
     let pool = pool().await;
-    let envelope = envelope_with_scope(&pool, &format!("origin-{}", uuid::Uuid::new_v4()));
+    let scope = format!("origin-{}", uuid::Uuid::new_v4());
+    let root = KeyBytes::generate();
+    let envelope = instance(&pool, &scope, &root);
     envelope.ensure_active_keys().await.unwrap();
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let mut new = NewRepository::proxy(format!("crypt-origin-{suffix}"));
@@ -1173,7 +1177,8 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
     set_url("https://nexus.example/index.json").await;
     assert_eq!(read().await.unwrap().unwrap().secret.expose_secret(), "pw");
 
-    // A blob sealed by an earlier build (row-only binding) still opens …
+    // A blob sealed by a pre-release build (row-only binding) is refused by
+    // default, and the sweep leaves it alone …
     let legacy = envelope
         .seal(
             &secret("legacy-pw"),
@@ -1192,19 +1197,50 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
         .execute(&pool)
         .await
         .unwrap();
+    assert!(matches!(
+        read().await,
+        Err(secret_dao::SecretDbError::Crypto(
+            forge_crypto::CryptoError::DecryptFailed
+        ))
+    ));
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, repo.id - 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(swept.resealed, 0);
+    // … but an instance started with `crypto.accept_row_bound_secrets` opens
+    // it, and its sweep re-seals it for the current origin, once.
+    let migrating = EnvelopeService::new(
+        Arc::new(PgKeyStore::new(pool.clone())),
+        Arc::new(StaticRootProvider::new(
+            "env",
+            Algorithm::Aes256Gcm,
+            KeyBytes::from_slice(root.expose()).unwrap(),
+            vec![],
+        )),
+        EnvelopeServiceConfig {
+            scope: scope.clone(),
+            accept_row_bound_secrets: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(
-        read().await.unwrap().unwrap().secret.expose_secret(),
+        secret_dao::get_upstream_credential(&pool, &migrating, repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .secret
+            .expose_secret(),
         "legacy-pw"
     );
-    // … and the sweep re-seals it for the current origin, once.
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, repo.id - 1, 1)
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
         .await
         .unwrap();
     assert_eq!(swept.resealed, 1);
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, repo.id - 1, 1)
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
         .await
         .unwrap();
     assert_eq!(swept.resealed, 0, "converged");
+    // The re-sealed blob opens without the switch.
     assert_eq!(
         read().await.unwrap().unwrap().secret.expose_secret(),
         "legacy-pw"

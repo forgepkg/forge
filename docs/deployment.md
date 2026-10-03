@@ -138,6 +138,11 @@ Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to
 be entered again through the API.
+Secrets sealed by pre-release builds were bound to their row only. They
+do not decrypt unless `crypto.accept_row_bound_secrets = true`; start every
+instance once with it so startup re-seals them for their destination, then
+remove it (while it is on, an old blob copied into a repointed row would be
+accepted).
 `GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
 plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
@@ -276,7 +281,7 @@ Redis is optional at runtime: an instance starts while Redis is unreachable
 (after waiting a few seconds for it) and works from its own memory until
 Redis is back. A Redis that stops answering slows only the requests that
 talk to it, and an instance whose invalidation subscription goes silent
-notices within about 12 s, drops its in-memory cache and resubscribes.
+notices within about 15 s, drops its in-memory cache and resubscribes.
 
 - **Connections.** Every instance opens up to `database.max_connections`
   (default 20); keep instances × that below PostgreSQL's `max_connections`.

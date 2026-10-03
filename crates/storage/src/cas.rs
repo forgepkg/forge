@@ -29,7 +29,7 @@ use std::task::{Context, Poll};
 use sqlx::PgPool;
 use tempfile::TempPath;
 use tokio::io::{copy, AsyncRead, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::hash::HashingWriter;
 use crate::s3::{BlobStore, S3Error};
@@ -82,7 +82,7 @@ pub struct StagedBlob {
     pub size: u64,
     pub temp_path: TempPath,
     /// The temp-space reservation, released with the temp file.
-    reservation: Option<OwnedSemaphorePermit>,
+    reservation: Option<Reservation>,
 }
 
 /// Result of ingesting content: its content address, integrity hash, size, and
@@ -106,7 +106,23 @@ pub struct StoredBlob {
     pub ingest_token: uuid::Uuid,
     _lease_guard: IngestLeaseGuard,
     /// The temp-space reservation, released with the temp file.
-    _reservation: Option<OwnedSemaphorePermit>,
+    _reservation: Option<Reservation>,
+}
+
+/// Bytes reserved from a staging budget, given back when dropped. Counted in
+/// `u64` itself: a tokio permit keeps its count in a `u32`, which one staged
+/// file of 4 GiB or more would overflow.
+#[derive(Debug)]
+struct Reservation {
+    budget: Arc<Semaphore>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget
+            .add_permits(usize::try_from(self.bytes).unwrap_or(usize::MAX));
+    }
 }
 
 #[derive(Debug)]
@@ -465,11 +481,11 @@ impl<R> LimitedReader<R> {
 
 /// Reserves one permit of the staging budget per byte read, failing the read
 /// (and flagging `exhausted`) when the budget has none left. The permits are
-/// kept in `reservation` and released when the staged file is dropped.
+/// counted in `reservation` and given back when the staged file is dropped.
 struct BudgetedReader<R> {
     inner: R,
     budget: Option<Arc<Semaphore>>,
-    reservation: Option<OwnedSemaphorePermit>,
+    reservation: Option<Reservation>,
     exhausted: bool,
 }
 
@@ -487,13 +503,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for BudgetedReader<LimitedReader<R>> {
                 let Some(budget) = me.budget.as_ref().filter(|_| read > 0) else {
                     return Poll::Ready(Ok(()));
                 };
+                // A read never exceeds the caller's buffer, far below u32::MAX.
                 let permits = u32::try_from(read).unwrap_or(u32::MAX);
-                match budget.clone().try_acquire_many_owned(permits) {
+                match budget.try_acquire_many(permits) {
                     Ok(permit) => {
-                        match &mut me.reservation {
-                            Some(held) => held.merge(permit),
-                            None => me.reservation = Some(permit),
-                        }
+                        // Tracked (and given back) by `Reservation` instead.
+                        permit.forget();
+                        let reservation = me.reservation.get_or_insert_with(|| Reservation {
+                            budget: budget.clone(),
+                            bytes: 0,
+                        });
+                        reservation.bytes += u64::from(permits);
                         Poll::Ready(Ok(()))
                     }
                     Err(_) => {
@@ -527,5 +547,29 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reservation of more than `u32::MAX` bytes (one staged file of 4 GiB
+    /// or more) is given back whole.
+    #[test]
+    fn a_reservation_above_u32_is_given_back_whole() {
+        const GIB: usize = 1 << 30;
+        let budget = Arc::new(Semaphore::new(8 * GIB));
+        let mut reservation = Reservation {
+            budget: budget.clone(),
+            bytes: 0,
+        };
+        for _ in 0..5 {
+            budget.try_acquire_many(GIB as u32).unwrap().forget();
+            reservation.bytes += GIB as u64;
+        }
+        assert_eq!(budget.available_permits(), 3 * GIB);
+        drop(reservation);
+        assert_eq!(budget.available_permits(), 8 * GIB);
     }
 }

@@ -38,9 +38,13 @@ use crate::{key_tag, namespace_tag, RedisTimeouts, TagVersions};
 /// The pub/sub channel shared by every cache node.
 pub const CHANNEL: &str = "forge:cache:invalidate";
 
-/// How often the subscriber pings its connection (each ping bounded by the
-/// response timeout).
+/// How often the subscriber pings its connection.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The least time a ping gets to be answered, whatever the (short) command
+/// response timeout: a Redis briefly slow (a fork for BGSAVE) must not make
+/// every instance drop its L1 at once and stampede the database.
+const MIN_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 static NODE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -213,7 +217,8 @@ async fn subscribe(
 }
 
 /// Apply messages until the subscription ends: the stream closes, or a
-/// periodic ping fails or gets no answer within the response timeout.
+/// periodic ping fails or gets no answer within the response timeout (at
+/// least [`MIN_PING_TIMEOUT`]).
 async fn subscriber_loop(
     pubsub: redis::aio::PubSub,
     l2: &RedisL2,
@@ -250,7 +255,8 @@ async fn subscriber_loop(
                 .await;
             }
             _ = ping.tick() => {
-                match tokio::time::timeout(timeouts.response, sink.ping::<redis::Value>()).await {
+                let deadline = timeouts.response.max(MIN_PING_TIMEOUT);
+                match tokio::time::timeout(deadline, sink.ping::<redis::Value>()).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(err)) => {
                         tracing::warn!(error = %err, "backplane ping failed; resubscribing");
@@ -258,7 +264,7 @@ async fn subscriber_loop(
                     }
                     Err(_) => {
                         tracing::warn!(
-                            timeout = ?timeouts.response,
+                            timeout = ?deadline,
                             "backplane ping got no answer; resubscribing"
                         );
                         return;
