@@ -1260,7 +1260,6 @@ impl ProxyRepo {
         }))
     }
 
-    /// The locally cached `.nuspec` of a downloaded version, if stored.
     /// The manifest of a version cached before summaries were stored:
     /// summarized off the async workers and backfilled, so later reads skip
     /// the fetch. `(summary, None)` once summarized; `(None, manifest)` when
@@ -1302,6 +1301,7 @@ impl ProxyRepo {
         }
     }
 
+    /// The locally cached `.nuspec` of a downloaded version, if stored.
     async fn local_nuspec(
         &self,
         repo_id: i64,
@@ -1774,7 +1774,6 @@ fn parse_resources(value: JsonValue) -> UpstreamResources {
     })
 }
 
-/// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
 #[async_trait]
 impl RepoReadOps for ProxyRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {

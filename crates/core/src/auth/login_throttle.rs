@@ -48,7 +48,7 @@
 //! gives the slot back uncounted.
 //!
 //! ## Bounded memory
-//! The key is the canonical client IP plus a SHA-256 of the normalized
+//! The key is the canonical client IP plus a SHA-256 of the canonical
 //! username, so an entry has a fixed size whatever username is presented, and
 //! both entry points refuse usernames over [`MAX_USERNAME_BYTES`] before they
 //! get here. Only pairs with recorded failures or attempts in flight are kept.
@@ -128,8 +128,8 @@ struct UserEntry {
     next_allowed: Instant,
 }
 
-/// A tracked pair: the canonical client IP and a SHA-256 of the normalized
-/// (trimmed, lowercased) username. Fixed size, whatever the username.
+/// A tracked pair: the canonical client IP and a SHA-256 of the canonical
+/// username. Fixed size, whatever the username.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     ip: IpAddr,
@@ -376,9 +376,13 @@ impl LoginThrottle {
     }
 
     fn key(ip: IpAddr, username: &str) -> Key {
+        // The canonical form every account lookup uses, so the spellings of
+        // one name (case, spacing, Unicode composition) share one budget.
+        let user = forge_db::username::canonical_username(username)
+            .unwrap_or_else(|_| username.trim().to_lowercase());
         Key {
             ip: client_network(ip),
-            user: Sha256::digest(username.trim().to_lowercase().as_bytes()).into(),
+            user: Sha256::digest(user.as_bytes()).into(),
         }
     }
 
@@ -638,6 +642,16 @@ mod tests {
         // Other pairs are unaffected: another IP, another username.
         assert!(!t.is_locked(ip("203.0.113.2"), "alice"));
         assert!(!t.is_locked(a, "bob"));
+    }
+
+    #[tokio::test]
+    async fn unicode_spellings_of_a_username_share_one_budget() {
+        let t = LoginThrottle::new(2, Duration::from_secs(60));
+        let a = ip("203.0.113.1");
+        // Precomposed ü, then U + combining diaeresis: one account, one budget.
+        fail(&t, a, "J\u{00fc}rgen").await;
+        fail(&t, a, "JU\u{0308}RGEN").await;
+        assert!(t.is_locked(a, "jürgen"));
     }
 
     #[tokio::test]
