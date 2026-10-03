@@ -180,6 +180,13 @@ The release workflow publishes the section whose heading matches the tag
 - Release workflow: only version tags on the default branch decide whether a
   release moves `:latest` / `:<major>.<minor>` (a stray tag pushed on another
   branch — never released — kept every later release from moving them).
+- Package manifests must have the one shape NuGet reads: exactly one
+  `.nuspec` at the package root, a root `<package>` with a single
+  `<metadata>`, and in it one text-only `<id>` and `<version>` (and at most
+  one `<dependencies>`). Repeated `<id>` elements were joined, and a nested
+  `.nuspec` or `<metadata>` could be taken for the manifest, so Forge and a
+  NuGet client could see different identities for one package — enough to
+  publish past an id-scoped grant.
 
 ## [0.1.0]
 
