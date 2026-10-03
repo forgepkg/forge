@@ -11,45 +11,111 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-### Upgrade notes
+## [0.1.0]
 
-- Migration 0021 rewrites existing usernames into canonical form. Accounts
-  whose names differ only in case, surrounding spaces or Unicode composition
-  are not merged: the oldest keeps the name, the others are renamed
-  `<name>#<id>` and a warning names each one. Review and delete them (there
-  is no rename API); their tokens keep working. Because SQL `lower()` follows
-  the database collation (a `C` ctype lowercases ASCII only), the server then
-  re-canonicalizes every stored name at startup and logs each rename. Two
-  cases it cannot undo, because 0021 already folded them under a non-`C`
-  collation: a capital `İ` (stored as `i`) and a final `Σ` (stored as `σ`);
-  such accounts must be recreated.
-- A password sent over HTTP Basic no longer reaches the admin API or token
-  minting, even for an administrator (403). Scripts that ran
-  `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
-  (session cookie + `X-CSRF-Token`) or use an admin-scoped token
-  (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
-  `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
-- Migration 0023 flags existing credential-forwarding accounts that have no
-  realm (`realm_orphaned`): they can no longer be signed in by any realm.
-  Delete such an account to let its owner's next upstream login provision a
-  fresh one.
-- Workload-identity realms for an issuer other than GitHub Actions or
-  GitLab.com: every rule must now pin a stable identity claim (`sub`,
-  `repository_id`, `job_project_id`, `project_path`, … — see
-  docs/trusted-publishing.md) or a claim the realm lists in the new
-  `identity_claims`. A realm with a stored rule that pins neither no longer
-  loads at all (an error names it in the log), so every one of its rules
-  refuses tokens until the realm is edited.
-- A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
-  is plain `http` to anything but a loopback address no longer loads until it
-  is switched to https or sets `allow_http = true` explicitly. Credential
-  forwarding no longer honours `HTTP(S)_PROXY`.
-- On an https deployment the session and OIDC flow cookies are renamed
-  `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
-  more after the upgrade.
+First production release.
+
+### Features
+
+- **NuGet V3 registry** with three repository kinds:
+  - **hosted**: push, restore, unlist/relist and delete your own packages;
+  - **proxy**: on-demand caching of an upstream V3 feed (nuget.org or a
+    private feed with Basic/PAT credentials), with an optional publication
+    delay and negative caching;
+  - **group**: one feed URL over several members, by priority. A failing
+    member is tolerated, and a dependency-confusion guard keeps public feeds
+    from shadowing internal package ids.
+- **Storage**: content-addressed blobs on any S3-compatible store; metadata in
+  PostgreSQL; race-free garbage collection with an outbox and a reconciler.
+- **Access control**: fine-grained RBAC with users, nested groups, roles,
+  repository grants, and package/content selectors, enforced on every read
+  and publish path. Tokens can be scoped per repository.
+- **Authentication**: ordered, web-managed auth realms (local passwords,
+  OIDC / Microsoft Entra, and credential forwarding to an existing registry),
+  an identifier-first login, and API keys.
+- **Trusted publishing**: CI jobs on GitHub Actions, GitLab CI and compatible
+  issuers publish with their workload OIDC token, with no stored API key. See
+  [docs/trusted-publishing.md](https://github.com/schmitch/repo/blob/main/docs/trusted-publishing.md).
+- **Retention**: policies with preview, run and audit, and download tracking.
+- **Secret encryption at rest**: double-envelope encryption of upstream
+  passwords and realm secrets, with key rotation and backfill.
+- **Web UI**: browse, repository and package detail, self-service tokens, and
+  administration of repositories, users, tokens and realms. It is served by
+  the same process on the same origin.
+- **Operations**: `/healthz`, `/readyz` and `/version`, graceful SIGTERM,
+  supervised background workers, and an optional Redis L2 cache with
+  cross-instance invalidation.
+- **Release**: a signed container image with an SBOM and provenance
+  attestation; see [docs/deployment.md](https://github.com/schmitch/repo/blob/main/docs/deployment.md).
 
 ### Security
 
+- CSRF protection on every cookie-authenticated mutation. In addition,
+  cross-site browser mutations are refused (`Sec-Fetch-Site`/`Origin`), which
+  also covers Basic credentials a browser cached from the feed's login prompt.
+- An expired or revoked session cookie is cleared and treated as signed out,
+  instead of blocking every page including the login.
+- Removing the built-in `admin` role revokes admin rights, including for
+  accounts that carry the legacy admin flag.
+- The bootstrap admin is created once and stays deleted after removal, also
+  for accounts that existed before that rule. Boot logs a security warning
+  while the bootstrap account still accepts the placeholder password.
+- Responses carry `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Content-Security-Policy: frame-ancestors 'none'` and
+  `Referrer-Policy: same-origin`.
+- Startup refuses placeholder credentials. It warns about a non-https or
+  loopback `public_base_url` and about disabled secret encryption.
+- API tokens carry admin rights only when their scope lists `admin`
+  (`{"actions": ["admin"]}`). An unscoped token of an admin can still push
+  and restore, but gets 403 on `/admin/*`, so a leaked CI token cannot mint
+  tokens or create admins.
+- A group's `prefer_hosted` guard now decides over every hosted member,
+  whether or not the caller can read it. A public package can no longer
+  replace an internal id for anonymous or selector-scoped callers; they get
+  404 instead.
+- The login lockout is memory-bounded: usernames over 256 bytes are refused,
+  entries have a fixed size and expire, and parallel guesses cannot outrun
+  the lockout. Password hashing runs behind a bounded queue
+  (`auth.password_verify_concurrency`).
+- Credential forwarding holds no database connection during the upstream
+  call, is bounded per realm (`auth.credential_forward_max_concurrent`),
+  never follows redirects (any 3xx counts as "unavailable"), and now applies
+  the realm's connect/request timeouts.
+- Users can be deactivated (`PATCH /admin/users/{id}` with
+  `{"active": false}`): their sessions and cached upstream verdicts are
+  revoked and their tokens refused. Re-authentication also ends sessions.
+- A proxy drops its stored upstream credentials when its `remote_url` moves
+  to another origin, and credentials can now be cleared.
+- Content-selector `PATCH` keeps fields it does not mention (it used to widen
+  a selector to "every package"). Token scopes reject unknown fields, and
+  token listings show each token's scope.
+- `X-Forwarded-For` is read across all header lines, and IPv4-mapped IPv6
+  peers match IPv4 CIDRs. Under `anonymous_mode = "allowlist"` the anonymous
+  grant requires a `Host` matching `public_base_url` or `server.allowed_hosts`
+  (DNS-rebinding guard).
+- The proxy refuses upstream redirects and resolutions to link-local and
+  cloud-metadata addresses, and serves an upstream `.nuspec` only if it names
+  the requested package.
+- Secret encryption: enabling it later now removes the plaintext copies, and
+  key rotations are serialized (a second rotation answers 409) with
+  compare-and-swap re-wrapping, so a race cannot strand keys.
+- Config errors never echo secret values, and secret environment values are
+  read verbatim.
+- Release images are signed by digest before any tag points at them; the
+  verification command pins the exact release workflow; actions and base
+  images are pinned by digest; CI audits the Rust and shipped web
+  dependencies, and Dependabot keeps them current. The RUSTSEC advisories in
+  the AWS SDK's legacy HTTP stack are gone from the dependency tree.
+- With `anonymous_mode = "all"`, signed-in users can read what anonymous
+  callers can; under `off` and `allowlist` they hold only their own grants
+  (the allowlist depends on the caller's network, which a signed-in user or
+  token must not carry elsewhere).
+- Unknown and federated usernames take the same time in the password chain,
+  so response timing no longer reveals which upstream users exist.
+- Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
+  (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
+- A cancelled admin key rotation can no longer leave the rotation lock held
+  on a pooled connection.
 - Feed responses (`/v3/...`) are inert in a browser: every one carries
   `Content-Security-Policy: default-src 'none'; sandbox`,
   `Content-Disposition: attachment` and `nosniff`. Before, a published
@@ -235,112 +301,6 @@ The release workflow publishes the section whose heading matches the tag
   body is read for `groups_path` / `identity_path` (larger answers fail
   closed).
 
-## [0.1.0]
-
-First production release.
-
-### Features
-
-- **NuGet V3 registry** with three repository kinds:
-  - **hosted**: push, restore, unlist/relist and delete your own packages;
-  - **proxy**: on-demand caching of an upstream V3 feed (nuget.org or a
-    private feed with Basic/PAT credentials), with an optional publication
-    delay and negative caching;
-  - **group**: one feed URL over several members, by priority. A failing
-    member is tolerated, and a dependency-confusion guard keeps public feeds
-    from shadowing internal package ids.
-- **Storage**: content-addressed blobs on any S3-compatible store; metadata in
-  PostgreSQL; race-free garbage collection with an outbox and a reconciler.
-- **Access control**: fine-grained RBAC with users, nested groups, roles,
-  repository grants, and package/content selectors, enforced on every read
-  and publish path. Tokens can be scoped per repository.
-- **Authentication**: ordered, web-managed auth realms (local passwords,
-  OIDC / Microsoft Entra, and credential forwarding to an existing registry),
-  an identifier-first login, and API keys.
-- **Trusted publishing**: CI jobs on GitHub Actions, GitLab CI and compatible
-  issuers publish with their workload OIDC token, with no stored API key. See
-  [docs/trusted-publishing.md](docs/trusted-publishing.md).
-- **Retention**: policies with preview, run and audit, and download tracking.
-- **Secret encryption at rest**: double-envelope encryption of upstream
-  passwords and realm secrets, with key rotation and backfill.
-- **Web UI**: browse, repository and package detail, self-service tokens, and
-  administration of repositories, users, tokens and realms. It is served by
-  the same process on the same origin.
-- **Operations**: `/healthz`, `/readyz` and `/version`, graceful SIGTERM,
-  supervised background workers, and an optional Redis L2 cache with
-  cross-instance invalidation.
-- **Release**: a signed container image with an SBOM and provenance
-  attestation; see [docs/deployment.md](docs/deployment.md).
-
-### Security
-
-- CSRF protection on every cookie-authenticated mutation. In addition,
-  cross-site browser mutations are refused (`Sec-Fetch-Site`/`Origin`), which
-  also covers Basic credentials a browser cached from the feed's login prompt.
-- An expired or revoked session cookie is cleared and treated as signed out,
-  instead of blocking every page including the login.
-- Removing the built-in `admin` role revokes admin rights, including for
-  accounts that carry the legacy admin flag.
-- The bootstrap admin is created once and stays deleted after removal, also
-  for accounts that existed before that rule. Boot logs a security warning
-  while the bootstrap account still accepts the placeholder password.
-- Responses carry `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  `Content-Security-Policy: frame-ancestors 'none'` and
-  `Referrer-Policy: same-origin`.
-- Startup refuses placeholder credentials. It warns about a non-https or
-  loopback `public_base_url` and about disabled secret encryption.
-- API tokens carry admin rights only when their scope lists `admin`
-  (`{"actions": ["admin"]}`). An unscoped token of an admin can still push
-  and restore, but gets 403 on `/admin/*`, so a leaked CI token cannot mint
-  tokens or create admins.
-- A group's `prefer_hosted` guard now decides over every hosted member,
-  whether or not the caller can read it. A public package can no longer
-  replace an internal id for anonymous or selector-scoped callers; they get
-  404 instead.
-- The login lockout is memory-bounded: usernames over 256 bytes are refused,
-  entries have a fixed size and expire, and parallel guesses cannot outrun
-  the lockout. Password hashing runs behind a bounded queue
-  (`auth.password_verify_concurrency`).
-- Credential forwarding holds no database connection during the upstream
-  call, is bounded per realm (`auth.credential_forward_max_concurrent`),
-  never follows redirects (any 3xx counts as "unavailable"), and now applies
-  the realm's connect/request timeouts.
-- Users can be deactivated (`PATCH /admin/users/{id}` with
-  `{"active": false}`): their sessions and cached upstream verdicts are
-  revoked and their tokens refused. Re-authentication also ends sessions.
-- A proxy drops its stored upstream credentials when its `remote_url` moves
-  to another origin, and credentials can now be cleared.
-- Content-selector `PATCH` keeps fields it does not mention (it used to widen
-  a selector to "every package"). Token scopes reject unknown fields, and
-  token listings show each token's scope.
-- `X-Forwarded-For` is read across all header lines, and IPv4-mapped IPv6
-  peers match IPv4 CIDRs. Under `anonymous_mode = "allowlist"` the anonymous
-  grant requires a `Host` matching `public_base_url` or `server.allowed_hosts`
-  (DNS-rebinding guard).
-- The proxy refuses upstream redirects and resolutions to link-local and
-  cloud-metadata addresses, and serves an upstream `.nuspec` only if it names
-  the requested package.
-- Secret encryption: enabling it later now removes the plaintext copies, and
-  key rotations are serialized (a second rotation answers 409) with
-  compare-and-swap re-wrapping, so a race cannot strand keys.
-- Config errors never echo secret values, and secret environment values are
-  read verbatim.
-- Release images are signed by digest before any tag points at them; the
-  verification command pins the exact release workflow; actions and base
-  images are pinned by digest; CI audits the Rust and shipped web
-  dependencies, and Dependabot keeps them current. The RUSTSEC advisories in
-  the AWS SDK's legacy HTTP stack are gone from the dependency tree.
-- With `anonymous_mode = "all"`, signed-in users can read what anonymous
-  callers can; under `off` and `allowlist` they hold only their own grants
-  (the allowlist depends on the caller's network, which a signed-in user or
-  token must not carry elsewhere).
-- Unknown and federated usernames take the same time in the password chain,
-  so response timing no longer reveals which upstream users exist.
-- Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
-  (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
-- A cancelled admin key rotation can no longer leave the rotation lock held
-  on a pooled connection.
-
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
@@ -428,7 +388,7 @@ First production release.
   with `PUT /admin/settings/legacy-open-access {"enabled": false}` so new
   users are no longer given `authenticated`. Migration 0011 changes the
   storage protocol; the upgrade procedure is in
-  [DEVELOPMENT.md](DEVELOPMENT.md).
+  [DEVELOPMENT.md](https://github.com/schmitch/repo/blob/main/DEVELOPMENT.md).
 - Pre-release installs, continued: migration 0017 adds
   `CHECK (ref_count >= 0)` and leaves it `NOT VALID` with a warning if a
   blob's count has already drifted below zero; migration 0019 re-lowers
@@ -451,6 +411,40 @@ First production release.
   CloudNativePG default): Postgres cannot lowercase non-ASCII letters there,
   so migration 0019 leaves package ids with non-ASCII capitals as they were;
   delete and re-push such packages.
+- Migration 0021 rewrites existing usernames into canonical form. Accounts
+  whose names differ only in case, surrounding spaces or Unicode composition
+  are not merged: the oldest keeps the name, the others are renamed
+  `<name>#<id>` and a warning names each one. Review and delete them (there
+  is no rename API); their tokens keep working. Because SQL `lower()` follows
+  the database collation (a `C` ctype lowercases ASCII only), the server then
+  re-canonicalizes every stored name at startup and logs each rename. Two
+  cases it cannot undo, because 0021 already folded them under a non-`C`
+  collation: a capital `İ` (stored as `i`) and a final `Σ` (stored as `σ`);
+  such accounts must be recreated.
+- A password sent over HTTP Basic no longer reaches the admin API or token
+  minting, even for an administrator (403). Scripts that ran
+  `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
+  (session cookie + `X-CSRF-Token`) or use an admin-scoped token
+  (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
+  `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
+- Migration 0023 flags existing credential-forwarding accounts that have no
+  realm (`realm_orphaned`): they can no longer be signed in by any realm.
+  Delete such an account to let its owner's next upstream login provision a
+  fresh one.
+- Workload-identity realms for an issuer other than GitHub Actions or
+  GitLab.com: every rule must now pin a stable identity claim (`sub`,
+  `repository_id`, `job_project_id`, `project_path`, … — see
+  docs/trusted-publishing.md) or a claim the realm lists in the new
+  `identity_claims`. A realm with a stored rule that pins neither no longer
+  loads at all (an error names it in the log), so every one of its rules
+  refuses tokens until the realm is edited.
+- A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
+  is plain `http` to anything but a loopback address no longer loads until it
+  is switched to https or sets `allow_http = true` explicitly. Credential
+  forwarding no longer honours `HTTP(S)_PROXY`.
+- On an https deployment the session and OIDC flow cookies are renamed
+  `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
+  more after the upgrade.
 
 ### Known limitations
 
@@ -477,6 +471,15 @@ First production release.
 - There is no web console yet for RBAC roles and grants, retention, user
   deactivation or key rotation; use the `/admin` API.
 - CI does not scan the container image for OS-package vulnerabilities.
+- A proxy trusts its upstream: it follows the resource `@id`s and redirects
+  the upstream names, also to private or plain-http addresses (credentials
+  go only to the upstream's own origin), and parses its metadata documents
+  (up to `proxy.max_metadata_bytes`, 32 MiB) in memory. Point proxies only
+  at upstreams you trust.
+- A first download through a proxy runs inside the request, so
+  `server.request_timeout_seconds` (900) caps it below
+  `proxy.download_timeout_seconds` (1800); NuGet clients give up far
+  earlier anyway.
 
 [Unreleased]: https://github.com/schmitch/repo/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/schmitch/repo/releases/tag/v0.1.0
