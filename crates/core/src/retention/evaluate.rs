@@ -579,10 +579,10 @@ mod tests {
     #[test]
     fn not_downloaded_for_days_counts_never_downloaded_from_publication() {
         let cands = vec![
-            comp(1, "lib", "1.0.0", 100, None),     // never downloaded, old → cold
-            comp(2, "lib", "2.0.0", 100, Some(5)),  // downloaded 5d ago → warm
+            comp(1, "lib", "1.0.0", 100, None), // never downloaded, old → cold
+            comp(2, "lib", "2.0.0", 100, Some(5)), // downloaded 5d ago → warm
             comp(3, "lib", "3.0.0", 100, Some(60)), // downloaded 60d ago → cold
-            comp(4, "lib", "4.0.0", 0, None),       // pushed today, never downloaded → warm
+            comp(4, "lib", "4.0.0", 0, None),   // pushed today, never downloaded → warm
         ];
         let p = policy_with(vec![rule(
             "r",

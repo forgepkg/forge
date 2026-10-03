@@ -45,11 +45,13 @@
 //!
 //! ## Local-only entries (Redis is a trust boundary)
 //!
-//! Anyone who can write to the Redis instance can write L2 entries. For
-//! ordinary data (upstream metadata) that is tolerable; for **security
-//! decisions** it is not: a forged authorization set, credential verdict,
-//! JWKS or workload-token verdict would be accepted by every instance. Such
-//! values go through [`Cache::get_or_try_insert_local`] /
+//! Anyone who can write to the Redis instance can write L2 entries. That is
+//! tolerable only for values whose forgery costs availability at most (a
+//! proxy's "listing refreshed" and "version rejected" markers). For **security
+//! decisions** and for content clients act on it is not: a forged
+//! authorization set, credential verdict, JWKS, workload-token verdict, or a
+//! proxy's upstream service index, manifest or registration would be accepted
+//! by every instance. Such values go through [`Cache::get_or_try_insert_local`] /
 //! [`Cache::get_or_try_insert_local_with_tags`]: they live in L1 only and
 //! are never read from or written to Redis. Redis still carries their
 //! **invalidations** (tag generations over the backplane), so an

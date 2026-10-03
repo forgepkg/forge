@@ -126,3 +126,82 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
         "an authz set read from Redis would make an ordinary user admin"
     );
 }
+
+/// Redis is a trust boundary for proxied content as well: a forged upstream
+/// service index planted in the shared tier must not redirect another
+/// instance's downloads to the forger's host (whose package would pass the
+/// id/version check and then stay cached for good).
+#[tokio::test]
+async fn proxy_upstream_index_is_not_read_from_redis() {
+    use forge_core::repo::proxy::{UpstreamResources, NS_UPSTREAM_INDEX};
+    use forge_e2e::{make_nupkg_with_desc, MockUpstream, UpstreamPackage};
+
+    let genuine_bytes = make_nupkg_with_desc("Contoso.Lib", "1.0.0", "genuine");
+    let forged_bytes = make_nupkg_with_desc("Contoso.Lib", "1.0.0", "forged");
+    let genuine = MockUpstream::start(vec![UpstreamPackage::single(
+        "Contoso.Lib",
+        "1.0.0",
+        genuine_bytes.clone(),
+    )])
+    .await;
+    let forger = MockUpstream::start(vec![UpstreamPackage::single(
+        "Contoso.Lib",
+        "1.0.0",
+        forged_bytes,
+    )])
+    .await;
+
+    let a = StackBuilder::default().with_redis().start().await;
+    let b = a.spawn_peer().await;
+    let name = format!("px{}", forge_e2e_unique());
+    let resp = a
+        .create_repo(serde_json::json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": genuine.index_url(),
+        }))
+        .await;
+    assert_eq!(resp.status(), 201);
+    let repo = forge_db::repository_dao::find_repository_by_name(&a.pool, &name)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Plant the forger's resources under the key the proxy caches its index.
+    let key = format!("{}/{}/{}", repo.name, repo.id, genuine.index_url());
+    a.state
+        .cache
+        .get_or_try_insert_with::<UpstreamResources, _, _, std::convert::Infallible>(
+            NS_UPSTREAM_INDEX,
+            &key,
+            Duration::from_secs(600),
+            || async {
+                Ok(UpstreamResources {
+                    package_base_address: Some(format!("{}/flat/", forger.base())),
+                    registrations_base_url: None,
+                    search_query_service: None,
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+    let (u, p) = b.admin_basic();
+    let resp = b
+        .client()
+        .get(format!(
+            "{}/v3/{name}/flat/contoso.lib/1.0.0/contoso.lib.1.0.0.nupkg",
+            b.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().to_vec(), genuine_bytes);
+    assert_eq!(
+        forger.nupkg_hits(),
+        0,
+        "nothing was fetched from the forger"
+    );
+}

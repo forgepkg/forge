@@ -258,14 +258,15 @@ password-failure lockout is kept in memory on each instance.
 ### Redis is a trust boundary
 
 Anything that can write to Redis can write Forge's shared cache. Forge
-therefore keeps every value a security decision rests on **out of Redis**:
-authorization sets, credential-forwarding verdicts, OIDC discovery documents
-and signing keys, and workload-identity token verdicts are cached in each
+therefore keeps every value a security decision or a client rests on **out of
+Redis**: authorization sets, credential-forwarding verdicts, OIDC discovery
+documents and signing keys, workload-identity token verdicts, and a proxy's
+upstream service index, manifests and registrations are cached in each
 instance's memory only. Redis carries only their invalidations, so the worst
-a Redis writer can do to them is evict them early. Upstream package metadata
-(proxy listings, manifests, registrations) is still shared through Redis;
-proxied packages themselves are checked against the requested id and
-version before they are served.
+a Redis writer can do to them is evict them early. The only values still
+shared through Redis are two proxy markers ("listing refreshed", "version
+rejected"); forging them can hide a proxied package until its TTL expires,
+not change what is served.
 
 Still treat Redis like the database: a dedicated instance (or ACL user) for
 Forge, `requirepass`/ACL credentials in the URL, not reachable from outside
