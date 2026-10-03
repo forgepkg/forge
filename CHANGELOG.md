@@ -301,6 +301,30 @@ First production release.
   body is read for `groups_path` / `identity_path` (larger answers fail
   closed).
 
+- Redis is a trust boundary for proxied content too: a proxy's upstream
+  service index, manifests and registrations are cached in each instance's
+  memory only. Before, a forged service index planted in Redis made other
+  instances download packages from the forger's host, and the planted
+  package then stayed cached.
+- Admin request bodies for grants, roles, role assignments, content
+  selectors, user creation and group members, and `POST /auth/tokens`,
+  refuse unknown fields. Before, a grant sent as `{"repository_id": 3, ...}`
+  (the shape the grant listing returns) ignored the id and granted the
+  action on **every** repository, a selector with a mistyped `include`
+  matched every package, and `/auth/tokens` dropped a `scope` and minted
+  an unscoped token. A grant now also takes `repository_id`.
+- With `allow_redeploy` on, replacing an existing version needs the delete
+  permission (and passes the delete selectors) as well as write, so a
+  push-only token can no longer overwrite a released version.
+- Every package mutation (push, redeploy, unlist, relist) and every admin
+  change is logged at INFO under the `forge::audit` target with the
+  principal's ids (`user:5 token:12`, `user:5 session`,
+  `workload realm:3 role:7`).
+- An instance without `[crypto]` refuses to start on a database holding
+  encrypted secrets, instead of running with every sealed credential
+  unusable and storing new secrets in plaintext.
+- On installs with `legacy_open_access`, removing a credential-forwarding
+  user's `authenticated` role is no longer undone by the user's next login.
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
@@ -352,6 +376,17 @@ First production release.
   cached data; lockouts and realm errors are shown; Back works on repository
   search; repository names are validated.
 
+- Retention `not_downloaded_for_days` counts a never-downloaded version
+  from its publication (as proxy rules count from `first_seen_at`). It
+  treated such a version as always cold, so a policy with this trigger
+  hard-deleted a version pushed minutes before the next run.
+- A blob left `deleting` while an asset still names it (aftermath of the
+  pre-release concurrent hard-delete race) is restored to `committed`
+  instead of having its object deleted on every re-push of the same bytes;
+  a warning names the S3 key to restore if the object is already gone.
+- The garbage-collection outbox decides which deletions are due on the
+  database clock, so an instance whose clock runs ahead no longer deletes
+  objects before the grace period.
 ### Changed
 
 - The admin UI lives under `/manage/*`. Browser navigations to the former
@@ -446,6 +481,14 @@ First production release.
   `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
   more after the upgrade.
 
+- Automation calling the admin API must not send fields the endpoint does
+  not document (they are now refused with 422), and `POST /auth/tokens`
+  refuses a `scope` (use `POST /admin/me/tokens` for scoped tokens).
+- A CI token or workload role that redeploys existing versions needs the
+  `delete` action on the repository as well as `write`.
+- Retention policies with `not_downloaded_for_days` select fewer versions
+  on their first runs: a never-downloaded version only qualifies once it is
+  that many days old.
 ### Known limitations
 
 - NuGet is the only package format.
@@ -476,6 +519,24 @@ First production release.
   go only to the upstream's own origin), and parses its metadata documents
   (up to `proxy.max_metadata_bytes`, 32 MiB) in memory. Point proxies only
   at upstreams you trust.
+- A group trusts all its hosted members equally: anyone who can push to
+  any hosted member can publish under the group's `reserved_prefixes`, and
+  with `prefer_hosted` can claim any public package id for the whole group
+  (its proxied versions then stop being served). Put only repositories with
+  trusted writers into such a group.
+- Redis is required at startup once configured (an instance cannot start
+  while it is unreachable), a Redis that stalls without refusing
+  connections can stall requests on a cache invalidation for a few
+  seconds, and a silently dropped pub/sub connection is not detected
+  (that instance then converges only by TTL, 60 s for authorization).
+- Retention applies a run's decisions without re-evaluating them: a policy
+  edited, disabled or a protection changed mid-run takes effect on the next
+  run.
+- The login throttle's per-instance state (lockouts and the networks a
+  username signed in from) is lost on restart.
+- Uploads and first-time proxy downloads are staged in the temp directory
+  without a global limit (up to `max_upload_bytes` /
+  `proxy.max_package_bytes` each); size it accordingly.
 - A first download through a proxy runs inside the request, so
   `server.request_timeout_seconds` (900) caps it below
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far

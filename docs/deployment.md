@@ -262,6 +262,27 @@ can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
 password-failure lockout is kept in memory on each instance.
 
+- **Connections.** Every instance opens up to `database.max_connections`
+  (default 20); keep instances × that below PostgreSQL's `max_connections`.
+  Through PgBouncer, use **session** pooling: migrations and key rotation
+  take session-level advisory locks, which transaction pooling breaks.
+- **Upgrades.** Migrations run at startup, serialized by an advisory lock.
+  Once a newer version has migrated, an instance of the older version
+  refuses to start, so roll forward and do not restart old instances in the
+  middle of a rollout.
+- **Rolling deploys.** On SIGTERM Forge stops accepting connections at once
+  and drains in-flight requests. Give the load balancer time to stop routing
+  to the instance first (for Kubernetes a `preStop` sleep of 5 to 10 s),
+  otherwise requests routed in that gap are refused, and a refused push is
+  not retried.
+- **Temp space.** Pushes and first-time proxy downloads are staged in the
+  temp directory (up to `server.max_upload_bytes` and
+  `proxy.max_package_bytes` each, several at once); size it for your
+  largest packages times the expected concurrency.
+- **Audit log.** Package mutations and admin changes are logged at INFO
+  under the `forge::audit` target, with the user/token or workload that
+  made them; keep those lines.
+
 ### Redis is a trust boundary
 
 Anything that can write to Redis can write Forge's shared cache. Forge
