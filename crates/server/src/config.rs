@@ -446,7 +446,9 @@ pub struct UpstreamBasicAuthConfig {
     /// in the clear). Default `false`.
     #[serde(default)]
     pub allow_http: bool,
-    /// Optional upstream group that maps to forge admin on provision (grant only).
+    /// Optional upstream group that maps to forge admin. Every login that
+    /// fetches the groups re-applies it (grants and demotes), with or without
+    /// `auto_provision`.
     #[serde(default)]
     pub admin_group: String,
     /// Auto-provision an `app_user` on first successful upstream login.

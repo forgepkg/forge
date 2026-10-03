@@ -96,7 +96,9 @@ pub struct CredForwardRealmConfig {
     /// `.`-separated path into the JSON body locating the user's groups.
     #[serde(default)]
     pub groups_path: String,
-    /// Optional upstream group that maps to forge admin on provision.
+    /// Optional upstream group that maps to forge admin. Every login that
+    /// fetches the groups re-applies it (grants and demotes), with or without
+    /// `auto_provision`.
     #[serde(default)]
     pub admin_group: String,
     /// `.`-separated path into the JSON success body naming the account the
