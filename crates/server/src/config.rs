@@ -148,7 +148,7 @@ impl ServerConfig {
 }
 
 /// `database.*`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
     /// `postgres://…` connection URL.
     pub url: String,
@@ -161,6 +161,32 @@ pub struct DatabaseConfig {
     pub acquire_timeout_seconds: u64,
 }
 
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redacted_url(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_seconds", &self.acquire_timeout_seconds)
+            .finish()
+    }
+}
+
+/// A connection URL fit for logs: any password is replaced and a query
+/// string (which may carry `password=` or a TLS key path) is dropped. An
+/// unparsable URL is not shown at all.
+pub fn redacted_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "<unparsable url>".into();
+    };
+    if url.password().is_some() {
+        let _ = url.set_password(Some("redacted"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("redacted"));
+    }
+    url.to_string()
+}
+
 fn default_db_max_connections() -> u32 {
     20
 }
@@ -170,7 +196,7 @@ fn default_db_acquire_timeout() -> u64 {
 }
 
 /// `s3.*`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct S3Config {
     /// S3 endpoint URL (e.g. `http://localhost:8422` for versitygw).
     pub endpoint: String,
@@ -196,6 +222,21 @@ pub struct S3Config {
     /// HEAD-then-PUT. Pure optimization — behavior is identical either way.
     #[serde(default)]
     pub conditional_writes: ConditionalWritesMode,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &redacted_url(&self.endpoint))
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("force_path_style", &self.force_path_style)
+            .field("multipart_threshold", &self.multipart_threshold)
+            .field("conditional_writes", &self.conditional_writes)
+            .finish()
+    }
 }
 
 /// `s3.conditional_writes` values (lowercase in TOML/env).
@@ -544,7 +585,7 @@ impl std::fmt::Debug for BootstrapAdmin {
 }
 
 /// `redis.*` (optional).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct RedisConfig {
     /// `redis://…` URL. Absent or blank ⇒ L1-only caching (a blank
     /// `FORGE_REDIS__URL=` disables Redis, see [`Config::load`]).
@@ -557,6 +598,16 @@ pub struct RedisConfig {
     /// treated as unavailable (reads fall through to the source). Default 2000.
     #[serde(default)]
     pub response_timeout_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisConfig")
+            .field("url", &self.url.as_deref().map(redacted_url))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("response_timeout_ms", &self.response_timeout_ms)
+            .finish()
+    }
 }
 
 impl RedisConfig {
@@ -2025,6 +2076,30 @@ mod tests {
         );
         let cfg = Config::from_figment(fig_from_toml(&dev)).expect("valid");
         assert!(cfg.deployment_warnings().is_empty(), "dev mode stays quiet");
+    }
+
+    #[test]
+    fn debug_output_redacts_connection_secrets() {
+        let toml = MINIMAL
+            .replace(
+                "postgres://forge:forge@localhost/forge",
+                "postgres://forge:db-secret-pw@localhost/forge?sslpassword=tls-secret",
+            )
+            .replace("secret_key = \"test\"", "secret_key = \"s3-secret-key\"")
+            + "\n[redis]\nurl = \"rediss://:redis-secret-pw@cache:6380/0\"\n";
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let shown = format!("{cfg:?}");
+        for secret in [
+            "db-secret-pw",
+            "tls-secret",
+            "s3-secret-key",
+            "redis-secret-pw",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("postgres://forge:redacted@localhost/forge"));
+        assert!(shown.contains("rediss://:redacted@cache:6380/0"));
+        assert_eq!(redacted_url("not a url"), "<unparsable url>");
     }
 
     #[test]

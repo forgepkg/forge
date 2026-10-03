@@ -70,8 +70,9 @@ pub enum ConditionalWrites {
     Off,
 }
 
-/// Connection + behavior configuration for [`BlobStore`].
-#[derive(Debug, Clone)]
+/// Connection + behavior configuration for [`BlobStore`]. `Debug` omits the
+/// secret key.
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
@@ -84,6 +85,21 @@ pub struct S3Config {
     pub multipart_threshold: u64,
     /// `If-None-Match: *` dedup PUTs: auto-detect / force on / force off.
     pub conditional_writes: ConditionalWrites,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .field("force_path_style", &self.force_path_style)
+            .field("multipart_threshold", &self.multipart_threshold)
+            .field("conditional_writes", &self.conditional_writes)
+            .finish()
+    }
 }
 
 /// S3 connect deadline.
@@ -627,6 +643,25 @@ mod tests {
             multipart_threshold: 8 * 1024 * 1024,
             conditional_writes: mode,
         })
+    }
+
+    #[test]
+    fn debug_never_shows_the_secret_key() {
+        let shown = format!(
+            "{:?}",
+            S3Config {
+                endpoint: "http://127.0.0.1:1".into(),
+                region: "us-east-1".into(),
+                bucket: "test".into(),
+                access_key: "ak".into(),
+                secret_key: "sk".into(),
+                force_path_style: true,
+                multipart_threshold: 1,
+                conditional_writes: ConditionalWrites::Off,
+            }
+        );
+        assert!(shown.contains("access_key: \"ak\""), "{shown}");
+        assert!(!shown.contains("\"sk\""), "{shown}");
     }
 
     #[test]

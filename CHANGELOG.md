@@ -174,6 +174,9 @@ The release workflow publishes the section whose heading matches the tag
   headers held a connection forever), a request-body idle timeout
   (`body_idle_timeout_seconds`, 60 s) and a response timeout
   (`request_timeout_seconds`, 900 s, answered with 408).
+- The `Debug` output of the database, S3 and Redis configuration no longer
+  contains secrets: connection-URL passwords and query strings and the S3
+  secret key are redacted, so a logged config cannot leak them.
 
 ## [0.1.0]
 
