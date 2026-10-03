@@ -1773,3 +1773,154 @@ async fn group_search_enriches_only_the_final_page() {
         assert_eq!(hit.total_downloads, Some(0), "download totals attached");
     }
 }
+
+// ── owner members (review M-c) ───────────────────────────────────────────────
+
+async fn sorted_versions(g: &GroupRepo, group: &str, id: &str) -> Vec<String> {
+    let mut versions: Vec<String> = g
+        .list_versions(group, id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version)
+        .collect();
+    versions.sort();
+    versions
+}
+
+/// Once a group flags owner members, a writer of another hosted member (a
+/// developer feed in the same group) can neither publish under a reserved
+/// prefix nor take a public id away from the proxy; the owners, including
+/// the hosted leaves of a flagged nested group, still can.
+#[tokio::test]
+async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let releases = seed_member(&pool, false).await;
+    let dev = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    for (member, priority) in [(&proxy, 100), (&releases, 50), (&dev, 10)] {
+        repository_dao::add_group_member(&pool, group.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_version(
+        &pool,
+        &mut blobs,
+        releases.id,
+        "Acme.Internal",
+        "1.0.0",
+        "rel",
+    )
+    .await;
+    seed_version(&pool, &mut blobs, dev.id, "Acme.Internal", "99.0.0", "dev").await;
+    seed_version(&pool, &mut blobs, dev.id, "Sample", "1.0.0", "dev-sample").await;
+
+    // No owner flagged: every hosted member is trusted (the old behaviour).
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_eq!(
+        sorted_versions(&g, &group.name, "acme.internal").await,
+        ["1.0.0", "99.0.0"]
+    );
+    assert_eq!(
+        sorted_versions(&g, &group.name, "sample").await,
+        ["1.0.0"],
+        "dev claims the public id"
+    );
+
+    // `releases` owns the group's ids.
+    assert!(
+        repository_dao::set_group_member_owner(&pool, group.id, releases.id, true)
+            .await
+            .unwrap()
+    );
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert_eq!(
+        sorted_versions(&g, &group.name, "acme.internal").await,
+        ["1.0.0"]
+    );
+    assert!(g
+        .resolve_nupkg(&group.name, "acme.internal", "99.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        sorted_versions(&g, &group.name, "sample").await,
+        ["1.0.0", "99.0.0"],
+        "dev's copy no longer hides the proxy's versions"
+    );
+    let hits = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "acme".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .hits;
+    let internal = hits
+        .iter()
+        .find(|hit| hit.original_id.eq_ignore_ascii_case("acme.internal"))
+        .expect("the owner's package is found");
+    assert_eq!(internal.latest_version, "1.0.0");
+
+    // A flagged nested group: its hosted leaves own ids too.
+    let inner = seed_group(&pool).await;
+    let platform = seed_member(&pool, false).await;
+    repository_dao::add_group_member(&pool, inner.id, platform.id, 10)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, inner.id, 40)
+        .await
+        .unwrap();
+    seed_version(
+        &pool,
+        &mut blobs,
+        platform.id,
+        "Acme.Platform",
+        "2.0.0",
+        "plat",
+    )
+    .await;
+    let g = mixed_group_repo(
+        &pool,
+        blobs.clone(),
+        user(&pool).await,
+        shadowing_proxy(&proxy),
+    );
+    assert!(
+        sorted_versions(&g, &group.name, "acme.platform")
+            .await
+            .is_empty(),
+        "not an owner yet"
+    );
+    repository_dao::set_group_member_owner(&pool, group.id, inner.id, true)
+        .await
+        .unwrap();
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, shadowing_proxy(&proxy));
+    assert_eq!(
+        sorted_versions(&g, &group.name, "acme.platform").await,
+        ["2.0.0"]
+    );
+}

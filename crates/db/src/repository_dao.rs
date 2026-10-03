@@ -165,6 +165,36 @@ pub async fn list_repositories(pool: &PgPool) -> sqlx::Result<Vec<Repository>> {
     .await
 }
 
+/// The members of `group_id` flagged as owners of its package ids
+/// (`group_member.owner`); empty when none is (every hosted member owns).
+pub async fn group_owner_ids(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<i64>> {
+    sqlx::query_scalar!(
+        r#"SELECT member_id FROM group_member WHERE group_id = $1 AND owner ORDER BY member_id"#,
+        group_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Flag (or unflag) `member_id` as an owner of `group_id`'s package ids.
+/// Returns whether that membership exists.
+pub async fn set_group_member_owner(
+    pool: &PgPool,
+    group_id: i64,
+    member_id: i64,
+    owner: bool,
+) -> sqlx::Result<bool> {
+    let result = sqlx::query!(
+        r#"UPDATE group_member SET owner = $3 WHERE group_id = $1 AND member_id = $2"#,
+        group_id,
+        member_id,
+        owner,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Return the members of a group joined to their repository rows, ordered by
 /// `priority` **descending** so the highest-priority member (which wins ties per
 /// spec §7) comes first.

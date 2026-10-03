@@ -10,6 +10,12 @@
 //!   runs in the same transaction as the insert under a row lock, so concurrent
 //!   edits cannot race a cycle into existence).
 //! * `priority` is unique within a group; a duplicate → **409**.
+//! * `owner` flags a member as owning the group's package ids (see
+//!   `forge_core::repo::group`): once any member is flagged, only flagged
+//!   members claim ids under `prefer_hosted` and serve `reserved_prefixes`.
+//!   Set it when adding the member, or later with
+//!   `PATCH /admin/repositories/{name}/members/{member}` `{"owner": bool}`.
+//!   A proxy member cannot be an owner (**400**).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -21,12 +27,14 @@ use serde::{Deserialize, Serialize};
 use super::db_error;
 use crate::state::AppState;
 
-/// A group member view (member name + its priority).
+/// A group member view (member name, its priority, and whether it owns the
+/// group's package ids).
 #[derive(Debug, Serialize)]
 pub struct MemberView {
     pub name: String,
     pub kind: String,
     pub priority: i32,
+    pub owner: bool,
 }
 
 /// Add-member request.
@@ -37,6 +45,31 @@ pub struct AddMember {
     pub member: String,
     /// Priority within the group (higher wins ties; unique per group).
     pub priority: i32,
+    /// Flag the member as an owner of the group's package ids (default
+    /// `false`; see the module docs).
+    #[serde(default)]
+    pub owner: bool,
+}
+
+/// Update-member request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMember {
+    /// Whether the member owns the group's package ids.
+    pub owner: bool,
+}
+
+/// Refuse to flag a proxy as an owner: it would never own anything, and a
+/// group whose only flagged member is a proxy would serve its reserved ids
+/// from nowhere.
+fn owner_kind_error(member: &forge_db::model::Repository) -> Option<Response> {
+    (member.kind() == RepoKind::Proxy).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "a proxy member cannot own package ids",
+        )
+            .into_response()
+    })
 }
 
 /// Resolve the `{name}` path segment to a group repository, or an error
@@ -59,6 +92,10 @@ pub async fn list(State(state): State<AppState>, Path(name): Path<String>) -> Re
         Ok(g) => g,
         Err(resp) => return resp,
     };
+    let owners = match repository_dao::group_owner_ids(&state.pool, group.id).await {
+        Ok(owners) => owners,
+        Err(e) => return db_error(e),
+    };
     match repository_dao::group_members(&state.pool, group.id).await {
         Ok(members) => {
             let views: Vec<MemberView> = members
@@ -67,6 +104,7 @@ pub async fn list(State(state): State<AppState>, Path(name): Path<String>) -> Re
                     name: repo.name.clone(),
                     kind: repo.kind.clone(),
                     priority: *priority,
+                    owner: owners.contains(&repo.id),
                 })
                 .collect();
             Json(views).into_response()
@@ -95,6 +133,11 @@ pub async fn add(
     if member.id == group.id {
         return (StatusCode::BAD_REQUEST, "a group cannot contain itself").into_response();
     }
+    if body.owner {
+        if let Some(resp) = owner_kind_error(&member) {
+            return resp;
+        }
+    }
     // Nested groups are allowed (§12.4); the checked insert runs the cycle +
     // depth guard in the same transaction.
     let max_depth = state.config.groups.max_nesting_depth;
@@ -108,7 +151,15 @@ pub async fn add(
     )
     .await
     {
-        Ok(AddMemberOutcome::Added) => StatusCode::CREATED.into_response(),
+        Ok(AddMemberOutcome::Added) if !body.owner => StatusCode::CREATED.into_response(),
+        Ok(AddMemberOutcome::Added) => {
+            match repository_dao::set_group_member_owner(&state.pool, group.id, member.id, true)
+                .await
+            {
+                Ok(_) => StatusCode::CREATED.into_response(),
+                Err(e) => db_error(e),
+            }
+        }
         Ok(AddMemberOutcome::WouldCycle) => (
             StatusCode::CONFLICT,
             "adding this member would create a cycle in the group graph",
@@ -124,6 +175,34 @@ pub async fn add(
             "duplicate member or priority in this group",
         )
             .into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `PATCH /admin/repositories/{name}/members/{member}` — set `owner`.
+pub async fn update(
+    State(state): State<AppState>,
+    Path((name, member_name)): Path<(String, String)>,
+    Json(body): Json<UpdateMember>,
+) -> Response {
+    let group = match group_or_err(&state, &name).await {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let member = match repository_dao::find_repository_by_name(&state.pool, &member_name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "member repository not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    if body.owner {
+        if let Some(resp) = owner_kind_error(&member) {
+            return resp;
+        }
+    }
+    match repository_dao::set_group_member_owner(&state.pool, group.id, member.id, body.owner).await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "membership not found").into_response(),
         Err(e) => db_error(e),
     }
 }

@@ -950,6 +950,123 @@ async fn group_member_validation() {
     );
 }
 
+/// Group members can be flagged as owners of the group's package ids (review
+/// M-c): when added or later, shown in the member list, never a proxy.
+#[tokio::test]
+async fn group_member_owner_flag() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let base = srv.base_url.clone();
+    for (name, kind, extra) in [
+        (format!("ogrp{s}"), "group", json!({})),
+        (format!("orel{s}"), "hosted", json!({})),
+        (format!("odev{s}"), "hosted", json!({})),
+        (
+            format!("oprx{s}"),
+            "proxy",
+            json!({"remote_url": "https://api.nuget.org/v3/index.json"}),
+        ),
+    ] {
+        let mut body = json!({"name": name, "kind": kind});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let resp = client
+            .post(format!("{base}/admin/repositories"))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    }
+    let members = format!("{base}/admin/repositories/ogrp{s}/members");
+    let add = |body: serde_json::Value| {
+        let (client, url, u, p) = (client.clone(), members.clone(), u.clone(), p.clone());
+        async move {
+            client
+                .post(url)
+                .basic_auth(&u, Some(&p))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(
+        add(json!({"member": format!("orel{s}"), "priority": 50, "owner": true})).await,
+        201
+    );
+    assert_eq!(
+        add(json!({"member": format!("odev{s}"), "priority": 10})).await,
+        201
+    );
+    assert_eq!(
+        add(json!({"member": format!("oprx{s}"), "priority": 100, "owner": true})).await,
+        400,
+        "a proxy cannot own ids"
+    );
+    assert_eq!(
+        add(json!({"member": format!("oprx{s}"), "priority": 100})).await,
+        201
+    );
+
+    let owners = || {
+        let (client, url, u, p) = (client.clone(), members.clone(), u.clone(), p.clone());
+        async move {
+            let list: Vec<serde_json::Value> = client
+                .get(url)
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let mut owners: Vec<String> = list
+                .iter()
+                .filter(|m| m["owner"] == json!(true))
+                .map(|m| m["name"].as_str().unwrap().to_string())
+                .collect();
+            owners.sort();
+            owners
+        }
+    };
+    assert_eq!(owners().await, [format!("orel{s}")]);
+
+    let patch = |member: String, body: serde_json::Value| {
+        let (client, u, p) = (client.clone(), u.clone(), p.clone());
+        let url = format!("{members}/{member}");
+        async move {
+            client
+                .patch(url)
+                .basic_auth(&u, Some(&p))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    assert_eq!(patch(format!("odev{s}"), json!({"owner": true})).await, 204);
+    assert_eq!(
+        patch(format!("orel{s}"), json!({"owner": false})).await,
+        204
+    );
+    assert_eq!(owners().await, [format!("odev{s}")]);
+    assert_eq!(patch(format!("oprx{s}"), json!({"owner": true})).await, 400);
+    assert_eq!(patch(format!("ogrp{s}"), json!({"owner": true})).await, 404);
+    assert_eq!(
+        patch(format!("odev{s}"), json!({"owners": true})).await,
+        422
+    );
+}
+
 // ── §12.5: secret encryption at rest ────────────────────────────────────────
 
 /// Serializes the crypto-enabled tests of this binary: they share the
