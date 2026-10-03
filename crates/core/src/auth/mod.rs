@@ -48,7 +48,10 @@ pub use login_throttle::{
 };
 pub use principal::{AuthMethod, Principal, UserPrincipal};
 pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
-pub use session_source::{cookie_value, SessionCookieSource, SESSION_COOKIE};
+pub use session_source::{
+    cookie_value, session_cookie_name, unique_cookie_value, DuplicateCookie, SessionCookieSource,
+    SECURE_SESSION_COOKIE, SESSION_COOKIE,
+};
 pub use token::{
     generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
     verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,

@@ -34,6 +34,9 @@ The release workflow publishes the section whose heading matches the tag
   docs/trusted-publishing.md) or a claim the realm lists in the new
   `identity_claims`. A stored rule that pins neither stops matching (its
   tokens are refused) until the realm is edited.
+- On an https deployment the session and OIDC flow cookies are renamed
+  `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
+  more after the upgrade.
 
 ### Security
 
@@ -137,6 +140,13 @@ The release workflow publishes the section whose heading matches the tag
   a principal from a stale realm snapshot could still unlist, and those
   changes left no record. The docs recommend pinning `job_workflow_ref` and
   `event_name`.
+- Session and OIDC flow cookies carry the `__Host-` prefix when
+  `public_base_url` is https (the flow cookie moves to `Path=/`, which the
+  prefix requires), so a sibling subdomain or a plain-http response can no
+  longer plant one. A request carrying the session (or flow) cookie more than
+  once is not authenticated by it, and neither copy is cleared — before, the
+  first one won, which let a cookie planted for a narrower path or a parent
+  domain fix the browser's session.
 
 ## [0.1.0]
 

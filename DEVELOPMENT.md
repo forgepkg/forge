@@ -325,9 +325,12 @@ State-changing cookie endpoints (`logout`, token mint/revoke) require a
 ## OIDC / Microsoft Entra login (optional)
 
 Browser login uses the **OpenID Connect authorization-code flow with PKCE**.
-A successful login creates a server-side **session** (an opaque `forge_session`
-cookie → a `session` row; the DB stores only `sha256(cookie)`, like API tokens)
-and maps the IdP identity to an `app_user`. Ordinary NuGet clients authenticate
+A successful login creates a server-side **session** (an opaque cookie → a
+`session` row; the DB stores only `sha256(cookie)`, like API tokens) and maps
+the IdP identity to an `app_user`. The cookie is `__Host-forge_session`
+(`Secure`, host-only) when `public_base_url` is `https://`, and plain
+`forge_session` on an http development setup; a request carrying the session
+cookie twice is treated as signed out. Ordinary NuGet clients authenticate
 with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
 keys after logging in (`POST /auth/tokens`). A validated workload JWT may
 instead be supplied as the Basic password, `X-NuGet-ApiKey`, or

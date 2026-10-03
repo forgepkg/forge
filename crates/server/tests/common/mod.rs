@@ -154,15 +154,19 @@ async fn blob_store() -> BlobStore {
 
 /// A built TOML config string for the harness, parameterized by the bootstrap
 /// admin credentials and anonymous mode.
-fn config_toml(
-    db_url: &str,
-    s3_endpoint: &str,
-    admin: Option<(&str, &str)>,
-    anon: &str,
-    web_assets_dir: Option<&str>,
-    oidc_block: Option<&str>,
-    crypto_block: Option<&str>,
-) -> String {
+fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
+    let admin = opts
+        .bootstrap_admin
+        .as_ref()
+        .map(|(u, p)| (u.as_str(), p.as_str()));
+    let anon = &opts.anonymous_mode;
+    let web_assets_dir = opts.web_assets_dir.as_deref();
+    let oidc_block = opts.oidc_block.as_deref();
+    let crypto_block = opts.crypto_block.as_deref();
+    let public_base_url = opts
+        .public_base_url
+        .as_deref()
+        .unwrap_or("http://test.local");
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -178,7 +182,7 @@ fn config_toml(
         r#"
 [server]
 bind = "127.0.0.1:0"
-public_base_url = "http://test.local"
+public_base_url = "{public_base_url}"
 
 [database]
 url = "{db_url}"
@@ -255,6 +259,9 @@ pub struct ServerOpts {
     /// server builds the secret-encryption envelope service (slice 12.5). The
     /// caller is responsible for exporting the root-key env var it references.
     pub crypto_block: Option<String>,
+    /// `server.public_base_url` (default `http://test.local`); an `https://`
+    /// URL makes the server issue `Secure` (`__Host-`) cookies.
+    pub public_base_url: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -266,6 +273,7 @@ impl Default for ServerOpts {
             web_assets_dir: None,
             oidc_block: None,
             crypto_block: None,
+            public_base_url: None,
         }
     }
 }
@@ -283,19 +291,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
     let store = blob_store().await;
     let s3 = s3_endpoint().await;
 
-    let admin_ref = opts
-        .bootstrap_admin
-        .as_ref()
-        .map(|(u, p)| (u.as_str(), p.as_str()));
-    let toml = config_toml(
-        &db_url,
-        s3,
-        admin_ref,
-        &opts.anonymous_mode,
-        opts.web_assets_dir.as_deref(),
-        opts.oidc_block.as_deref(),
-        opts.crypto_block.as_deref(),
-    );
+    let toml = config_toml(&db_url, s3, &opts);
     use figment::providers::Format as _;
     let config = Config::from_figment(
         figment::Figment::new().merge(figment::providers::Toml::string(&toml)),

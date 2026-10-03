@@ -125,6 +125,88 @@ async fn dead_session_cookie_does_not_lock_out_login_and_is_cleared() {
 }
 
 #[tokio::test]
+async fn duplicate_session_cookies_authenticate_nothing() {
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_password_basic();
+    let client = srv.client();
+    let mine = cookie_pair(&login(&srv, &admin, &password).await);
+    // A second, equally valid session stands in for one planted by a sibling
+    // subdomain or for a narrower path (cookie tossing).
+    let planted = cookie_pair(&login(&srv, &admin, &password).await);
+    assert_ne!(mine, planted);
+
+    let me = |cookie: String| {
+        let req = client
+            .get(format!("{}/admin/users", srv.base_url))
+            .header("cookie", cookie);
+        async move { req.send().await.unwrap() }
+    };
+    assert_eq!(me(mine.clone()).await.status(), 200);
+    for both in [
+        format!("{mine}; {planted}"),
+        format!("{planted}; {mine}"),
+        format!("{mine}; {mine}"),
+    ] {
+        let resp = me(both.clone()).await;
+        assert_eq!(resp.status(), 401, "{both}");
+        // Neither cookie is cleared: that would drop the browser's own
+        // session and leave only the planted one.
+        assert!(!clears_session_cookie(&resp));
+    }
+    let resp = client
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("{mine}; {planted}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "/auth/me refuses an ambiguous session");
+}
+
+#[tokio::test]
+async fn https_deployments_use_host_prefixed_cookies() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            public_base_url: Some("https://forge.example".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (admin, password) = srv.admin_password_basic();
+    let resp = login(&srv, &admin, &password).await;
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_cookie.starts_with("__Host-forge_session=")
+            && set_cookie.contains("; Secure")
+            && set_cookie.contains("Path=/;")
+            && !set_cookie.contains("Domain"),
+        "{set_cookie}"
+    );
+    let pair = cookie_pair(&resp);
+    let secret = pair.split_once('=').unwrap().1;
+
+    let status = |cookie: String| {
+        let req = srv
+            .client()
+            .get(format!("{}/admin/users", srv.base_url))
+            .header("cookie", cookie);
+        async move { req.send().await.unwrap().status() }
+    };
+    assert_eq!(status(pair.clone()).await, 200);
+    // The unprefixed name — which any sibling subdomain could set — is not a
+    // session cookie on an https deployment.
+    assert_eq!(status(format!("forge_session={secret}")).await, 401);
+}
+
+#[tokio::test]
 async fn cross_site_browser_mutations_are_refused_even_with_basic() {
     let srv = common::start().await;
     let (admin, password) = srv.admin_basic();

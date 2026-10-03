@@ -65,6 +65,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         Box::new(SessionCookieSource::new(
             state.sessions.clone(),
             pool.clone(),
+            state.cookie_secure,
         )),
     ];
 

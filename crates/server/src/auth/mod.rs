@@ -40,7 +40,7 @@ use forge_cache::Cache;
 use forge_core::auth::chain::{provision_and_map, ChainOutcome};
 use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip};
 use forge_core::auth::login_throttle::{username_for_log, AttemptRefused, MAX_USERNAME_BYTES};
-use forge_core::auth::session_source::{cookie_value, SESSION_COOKIE};
+use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
@@ -269,7 +269,11 @@ async fn oidc_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    let flow_cookie = cookie_value(&headers, OIDC_FLOW_COOKIE).filter(|v| !v.is_empty());
+    // A duplicated flow cookie is ambiguous (one may be planted): no binding.
+    let flow_cookie = unique_cookie_value(&headers, flow_cookie_name(state.cookie_secure))
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty());
     let mut resp = oidc_callback_inner(&state, q, flow_cookie.clone()).await;
     if flow_cookie.is_some() {
         // Single-use: drop the pre-auth cookie whatever the outcome.
@@ -380,8 +384,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // so logout works whenever sessions do — independent of any oidc realm.
     let rt = SessionAuthCtx::of(&state);
 
-    let Some(secret) = cookie_value(&headers, SESSION_COOKIE) else {
-        // No session to revoke; clearing a non-existent cookie is harmless.
+    let Ok(Some(secret)) = unique_cookie_value(&headers, session_cookie_name(rt.cookie_secure))
+    else {
+        // No (single) session to revoke; clearing a non-existent cookie is
+        // harmless.
         return StatusCode::NO_CONTENT.into_response();
     };
 
@@ -493,7 +499,7 @@ struct ActiveSession {
     user: AppUser,
 }
 
-/// Validate the `forge_session` cookie and return the live session row plus
+/// Validate the session cookie and return the live session row plus
 /// its user's **current** row. A session of a deactivated (or deleted) user is
 /// refused like an unknown cookie: deactivation must cut off a signed-in
 /// browser immediately, not when the session expires. None of the error
@@ -502,7 +508,12 @@ async fn require_session(
     rt: &SessionAuthCtx,
     headers: &HeaderMap,
 ) -> Result<ActiveSession, SessionAuthError> {
-    let Some(secret) = cookie_value(headers, SESSION_COOKIE).filter(|s| !s.is_empty()) else {
+    // Two session cookies are ambiguous: neither proves a session.
+    let Some(secret) = unique_cookie_value(headers, session_cookie_name(rt.cookie_secure))
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    else {
         return Err(SessionAuthError::Unauthorized);
     };
     let session = match rt.sessions.validate(&secret).await {
@@ -1004,16 +1015,18 @@ async fn login_options(State(state): State<AppState>) -> Response {
 /// Build the `Set-Cookie` value that installs the session cookie.
 ///
 /// Attributes: `HttpOnly` (no JS access), `SameSite=Lax` (so the post-IdP
-/// top-level redirect carries it), `Path=/`, host-only (no `Domain`), and
-/// `Secure` when the deployment is HTTPS. `Max-Age` matches the session's
-/// absolute lifetime so the browser drops it around when the server would.
+/// top-level redirect carries it), `Path=/`, host-only (no `Domain`), and on
+/// an HTTPS deployment `Secure` under the `__Host-` name
+/// ([`session_cookie_name`]). `Max-Age` matches the session's absolute
+/// lifetime so the browser drops it around when the server would.
 fn set_cookie_value(issued: &IssuedSession, secure: bool) -> String {
     let max_age = (issued.session.absolute_expiry - issued.session.created_at)
         .num_seconds()
         .max(0);
     let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_attr}",
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_attr}",
+        name = session_cookie_name(secure),
         value = issued.cookie_secret,
     )
 }
@@ -1021,30 +1034,59 @@ fn set_cookie_value(issued: &IssuedSession, secure: bool) -> String {
 /// Build the `Set-Cookie` value that clears the session cookie (`Max-Age=0`).
 fn clear_cookie_value(secure: bool) -> String {
     let secure_attr = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
+    format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}",
+        name = session_cookie_name(secure)
+    )
 }
 
-/// Pre-auth cookie binding an OIDC flow to the browser that started it.
+/// Pre-auth cookie binding an OIDC flow to the browser that started it, on a
+/// plain-http (development) deployment; scoped to `/auth/oidc`.
 const OIDC_FLOW_COOKIE: &str = "forge_oidc_flow";
+
+/// The flow cookie on an HTTPS deployment: `__Host-` (so it cannot be planted
+/// from a sibling subdomain), which requires `Path=/`.
+const SECURE_OIDC_FLOW_COOKIE: &str = "__Host-forge_oidc_flow";
 
 /// `Max-Age` of the pre-auth flow cookie (matches the flow row's 10 min TTL).
 const OIDC_FLOW_COOKIE_MAX_AGE: i64 = 600;
 
+/// The flow cookie's name and path for a deployment.
+fn flow_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_OIDC_FLOW_COOKIE
+    } else {
+        OIDC_FLOW_COOKIE
+    }
+}
+
+fn flow_cookie_attributes(secure: bool) -> &'static str {
+    if secure {
+        "Path=/; HttpOnly; SameSite=Lax; Secure"
+    } else {
+        "Path=/auth/oidc; HttpOnly; SameSite=Lax"
+    }
+}
+
 /// Build the `Set-Cookie` value for the pre-auth flow cookie: `HttpOnly`,
-/// `SameSite=Lax` (sent on the IdP's top-level redirect back), scoped to the
-/// `/auth/oidc` paths, short-lived, and `Secure` on HTTPS deployments.
+/// `SameSite=Lax` (sent on the IdP's top-level redirect back), short-lived,
+/// `__Host-` + `Secure` on HTTPS deployments (scoped to `/auth/oidc` on plain
+/// http, where the prefix is unavailable).
 fn set_flow_cookie_value(binding: &str, secure: bool) -> String {
-    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "{OIDC_FLOW_COOKIE}={binding}; Path=/auth/oidc; HttpOnly; SameSite=Lax; \
-         Max-Age={OIDC_FLOW_COOKIE_MAX_AGE}{secure_attr}"
+        "{name}={binding}; {attributes}; Max-Age={OIDC_FLOW_COOKIE_MAX_AGE}",
+        name = flow_cookie_name(secure),
+        attributes = flow_cookie_attributes(secure),
     )
 }
 
 /// Build the `Set-Cookie` value that clears the pre-auth flow cookie.
 fn clear_flow_cookie_value(secure: bool) -> String {
-    let secure_attr = if secure { "; Secure" } else { "" };
-    format!("{OIDC_FLOW_COOKIE}=; Path=/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0{secure_attr}")
+    format!(
+        "{name}=; {attributes}; Max-Age=0",
+        name = flow_cookie_name(secure),
+        attributes = flow_cookie_attributes(secure),
+    )
 }
 
 #[cfg(test)]
@@ -1074,7 +1116,9 @@ mod tests {
             cookie_secret: "the-secret".into(),
         };
         let secure = set_cookie_value(&issued, true);
-        assert!(secure.contains("forge_session=the-secret"));
+        // HTTPS: the `__Host-` name, which browsers bind to this host.
+        assert!(secure.starts_with("__Host-forge_session=the-secret;"));
+        assert!(!secure.contains("Domain"));
         assert!(secure.contains("HttpOnly"));
         assert!(secure.contains("SameSite=Lax"));
         assert!(secure.contains("Path=/"));
@@ -1082,29 +1126,40 @@ mod tests {
         assert!(secure.contains("Max-Age="));
         // Plain-HTTP deployment omits Secure (so dev over http works).
         let insecure = set_cookie_value(&issued, false);
+        assert!(insecure.starts_with("forge_session=the-secret;"));
         assert!(!insecure.contains("Secure"));
     }
 
     #[test]
     fn flow_cookie_is_short_lived_http_only_and_scoped() {
+        // HTTPS: `__Host-` (Secure, host-only, Path=/).
         let v = set_flow_cookie_value("bind", true);
-        assert!(v.starts_with("forge_oidc_flow=bind;"));
+        assert!(v.starts_with("__Host-forge_oidc_flow=bind;"));
         assert!(v.contains("HttpOnly"));
         assert!(v.contains("SameSite=Lax"));
-        assert!(v.contains("Path=/auth/oidc"));
+        assert!(v.contains("Path=/;"));
         assert!(v.contains("Max-Age=600"));
         assert!(v.contains("Secure"));
-        assert!(!set_flow_cookie_value("bind", false).contains("Secure"));
+        assert!(!v.contains("Domain"));
+        // Plain http: no prefix possible, so scope it to the OIDC paths.
+        let v = set_flow_cookie_value("bind", false);
+        assert!(v.starts_with("forge_oidc_flow=bind;"));
+        assert!(v.contains("Path=/auth/oidc"));
+        assert!(!v.contains("Secure"));
         let clear = clear_flow_cookie_value(false);
-        assert!(clear.contains("forge_oidc_flow=;"));
+        assert!(clear.starts_with("forge_oidc_flow=;"));
         assert!(clear.contains("Max-Age=0"));
+        let clear = clear_flow_cookie_value(true);
+        assert!(clear.starts_with("__Host-forge_oidc_flow=;"));
+        assert!(clear.contains("Path=/;"));
     }
 
     #[test]
     fn clear_cookie_expires_immediately() {
         let v = clear_cookie_value(true);
-        assert!(v.contains("forge_session=;"));
+        assert!(v.starts_with("__Host-forge_session=;"));
         assert!(v.contains("Max-Age=0"));
         assert!(v.contains("HttpOnly"));
+        assert!(clear_cookie_value(false).starts_with("forge_session=;"));
     }
 }
