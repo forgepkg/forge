@@ -15,10 +15,14 @@ updates:
         update-types: [minor, patch]
 
   # Web SPA (pnpm lockfile; Dependabot's npm ecosystem handles pnpm).
+  # web/pnpm-workspace.yaml sets minimumReleaseAge (7 days): pnpm refuses
+  # anything younger, so Dependabot must not propose it either.
   - package-ecosystem: npm
     directory: /web
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     groups:
       web-minor-and-patch:
@@ -38,3 +42,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The Rust image must match rust-toolchain.toml, which Dependabot cannot
+      # edit: bump both (and .gitlab-ci.yml's RUST_IMAGE) by hand. A newer
+      # image builds only because rustup downloads the pinned toolchain at
+      # build time. Digest updates of the pinned tag still come.
+      - dependency-name: rust
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch

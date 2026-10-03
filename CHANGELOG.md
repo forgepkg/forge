@@ -37,8 +37,9 @@ The release workflow publishes the section whose heading matches the tag
   GitLab.com: every rule must now pin a stable identity claim (`sub`,
   `repository_id`, `job_project_id`, `project_path`, … — see
   docs/trusted-publishing.md) or a claim the realm lists in the new
-  `identity_claims`. A stored rule that pins neither stops matching (its
-  tokens are refused) until the realm is edited.
+  `identity_claims`. A realm with a stored rule that pins neither no longer
+  loads at all (an error names it in the log), so every one of its rules
+  refuses tokens until the realm is edited.
 - A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
   is plain `http` to anything but a loopback address no longer loads until it
   is switched to https or sets `allow_http = true` explicitly. Credential
@@ -64,7 +65,9 @@ The release workflow publishes the section whose heading matches the tag
   index on the canonical form. Credential forwarding sends the canonical name
   upstream and signs in as exactly that account, so case or spacing variants
   can no longer split one upstream identity into several Forge accounts
-  (or lockout budgets).
+  (or lockout budgets). An upstream that compares usernames case-sensitively
+  (an htpasswd file, for example) now receives the lowercased name: such
+  users must be known to it in lowercase.
 - Credential-forwarding realms take an optional `identity_path`: the account
   the upstream's JSON success response names must equal the username
   entered. Set it for upstreams that accept a secret with any username
@@ -89,10 +92,13 @@ The release workflow publishes the section whose heading matches the tag
 - The principal records how it authenticated (token, password over Basic,
   or browser session). The admin API accepts a session or an admin-scoped
   token, never a password replayed over Basic; minting tokens
-  (`/admin/me/tokens`) takes a session. Before, the password a NuGet client
-  stores and sends on every feed request — with credential forwarding, the
-  directory password — was a full admin credential that could mint tokens
-  outliving it. An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
+  (`/admin/me/tokens`) takes a session. Before, every feed request a NuGet
+  client sent with a stored password — with credential forwarding, the
+  directory password — could also call the admin API and mint tokens
+  outliving that password. The password itself still signs in through
+  `/auth/login`, so an administrator's password remains an admin
+  credential: give administrators an OIDC realm, and NuGet clients tokens.
+  An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
   also revokes the tokens a user minted from a credential-forwarding session.
 - Deleting a credential-forwarding realm no longer lets another realm adopt
   its users: their missing realm was treated as a wildcard, so the next realm
