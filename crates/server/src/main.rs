@@ -51,6 +51,26 @@ async fn main() -> anyhow::Result<()> {
     .context("connect database")?;
     forge_db::migrate(&pool).await.context("run migrations")?;
 
+    // Staging directory for pushes and proxy downloads: create it and remove
+    // what a killed process left there (files idle for an hour; a live stage
+    // writes continuously, so another instance sharing it is not affected).
+    let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
+        .with_context(|| {
+            format!(
+                "create staging directory {}",
+                config.staging_dir().display()
+            )
+        })?;
+    match staging.sweep_stale(std::time::Duration::from_secs(3600)) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            removed,
+            dir = %staging.dir().display(),
+            "removed staged files left by an earlier process"
+        ),
+        Err(e) => tracing::warn!(error = %e, "staging directory sweep failed"),
+    }
+
     // Object store (ensure the bucket exists).
     let blob_store = BlobStore::new(config.s3.to_storage());
     blob_store

@@ -56,6 +56,10 @@ pub enum RepoError {
     /// rather than overloading [`RepoError::RepoNotFound`].
     #[error("storage error: {0}")]
     Storage(String),
+    /// A local resource is exhausted for now (the temp-space budget for
+    /// staging uploads and downloads); the client should retry later → 503.
+    #[error("temporarily unavailable: {0}")]
+    Busy(String),
 }
 
 /// Errors surfaced by the hosted **write** path (publish / delete / relist).
@@ -105,6 +109,9 @@ impl From<forge_storage::CasError> for WriteError {
         match e {
             forge_storage::CasError::TooLarge { limit } => WriteError::TooLarge { limit },
             forge_storage::CasError::Db(db) => WriteError::Repo(RepoError::Db(db)),
+            e @ forge_storage::CasError::StagingFull { .. } => {
+                WriteError::Repo(RepoError::Busy(e.to_string()))
+            }
             other => WriteError::Repo(RepoError::Storage(other.to_string())),
         }
     }

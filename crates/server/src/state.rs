@@ -117,7 +117,14 @@ impl AppState {
         nuget: Arc<dyn Format>,
         config: Config,
     ) -> Self {
-        let cas = Cas::new(blob_store.clone(), pool.clone());
+        let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
+            .unwrap_or_else(|e| {
+                // main() already created the directory at startup; this only
+                // fires for embedders that skipped that.
+                tracing::error!(error = %e, "staging directory unusable; staging without a budget in the temp directory");
+                forge_storage::Staging::default()
+            });
+        let cas = Cas::new(blob_store.clone(), pool.clone()).with_staging(staging);
         // Signed-in callers share the public read reach only where everyone
         // may read anonymously (see `Authz::with_public_read_for_signed_in`).
         let authz = Authz::new(pool.clone(), cache.clone())

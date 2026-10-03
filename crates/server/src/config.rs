@@ -88,6 +88,18 @@ pub struct ServerConfig {
     /// limit yields HTTP 413. Default 512 MiB.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
+    /// Directory pushes and first-time proxy downloads are staged in. Files a
+    /// killed process left there are removed at startup. Default:
+    /// `forge-staging` under the system temp directory.
+    #[serde(default)]
+    pub staging_dir: Option<std::path::PathBuf>,
+    /// Temp space all staged pushes and proxy downloads of this instance may
+    /// use at once, in bytes; a stage that would exceed it is answered `503`
+    /// with `Retry-After`. Default: four times the larger of
+    /// `max_upload_bytes` and `proxy.max_package_bytes` (4 GiB with the
+    /// defaults). `0` removes the limit. Size the staging volume above it.
+    #[serde(default)]
+    pub max_staging_bytes: Option<u64>,
     /// Permit starting with **known-insecure placeholder credentials** (the
     /// `changeme` bootstrap-admin password, `minioadmin` S3 keys).
     /// Default `false`: such a config refuses to start, so a copied dev config
@@ -1649,7 +1661,43 @@ impl Config {
                 "server.max_upload_bytes must be greater than 0".into(),
             ));
         }
+        if let Some(budget) = self.staging_budget() {
+            let largest = self.largest_staged_item();
+            if budget < largest {
+                return Err(ConfigError::Invalid(format!(
+                    "server.max_staging_bytes ({budget}) must be at least the larger of \
+                     server.max_upload_bytes and proxy.max_package_bytes ({largest}), or 0 \
+                     for no limit"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// The largest single item staged in the temp directory.
+    fn largest_staged_item(&self) -> u64 {
+        self.server
+            .max_upload_bytes
+            .max(self.proxy.max_package_bytes)
+    }
+
+    /// The directory pushes and proxy downloads are staged in
+    /// (`server.staging_dir`).
+    pub fn staging_dir(&self) -> std::path::PathBuf {
+        self.server
+            .staging_dir
+            .clone()
+            .unwrap_or_else(forge_storage::Staging::default_dir)
+    }
+
+    /// The temp-space budget for staging, or `None` for no limit
+    /// (`server.max_staging_bytes`, see there for the default).
+    pub fn staging_budget(&self) -> Option<u64> {
+        match self.server.max_staging_bytes {
+            Some(0) => None,
+            Some(bytes) => Some(bytes),
+            None => Some(self.largest_staged_item().saturating_mul(4)),
+        }
     }
 
     /// Background-worker tuning must be usable: a zero interval makes
@@ -2640,6 +2688,30 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
         assert_eq!(cfg.auth.providers, vec!["local-password".to_string()]);
         assert!(cfg.auth.upstream_basic.is_none());
+    }
+
+    #[test]
+    fn staging_budget_defaults_to_four_of_the_largest_item_and_is_validated() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        let largest = cfg.server.max_upload_bytes.max(cfg.proxy.max_package_bytes);
+        assert_eq!(cfg.staging_budget(), Some(4 * largest));
+        assert_eq!(cfg.staging_dir(), forge_storage::Staging::default_dir());
+
+        let unlimited = MINIMAL.replace(
+            "[server]",
+            "[server]\nmax_staging_bytes = 0\nstaging_dir = \"/var/tmp/forge\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&unlimited)).expect("valid");
+        assert_eq!(cfg.staging_budget(), None);
+        assert_eq!(
+            cfg.staging_dir(),
+            std::path::PathBuf::from("/var/tmp/forge")
+        );
+
+        // Smaller than one maximum-size push: every such push would fail.
+        let too_small = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 1048576");
+        let err = Config::from_figment(fig_from_toml(&too_small)).unwrap_err();
+        assert!(err.to_string().contains("max_staging_bytes"), "{err}");
     }
 
     #[test]

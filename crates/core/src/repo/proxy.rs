@@ -984,6 +984,7 @@ impl ProxyRepo {
                     )
                     .await)
             }
+            Err(e @ CasError::StagingFull { .. }) => return Err(RepoError::Busy(e.to_string())),
             Err(other) => {
                 return Err(RepoError::Storage(format!(
                     "read upstream nupkg {url}: {other}"
