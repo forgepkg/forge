@@ -16,8 +16,13 @@ The release workflow publishes the section whose heading matches the tag
 - Migration 0021 rewrites existing usernames into canonical form. Accounts
   whose names differ only in case, surrounding spaces or Unicode composition
   are not merged: the oldest keeps the name, the others are renamed
-  `<name>#<id>` and a warning names each one. Review and delete or rename
-  them; their tokens keep working.
+  `<name>#<id>` and a warning names each one. Review and delete them (there
+  is no rename API); their tokens keep working. Because SQL `lower()` follows
+  the database collation (a `C` ctype lowercases ASCII only), the server then
+  re-canonicalizes every stored name at startup and logs each rename. Two
+  cases it cannot undo, because 0021 already folded them under a non-`C`
+  collation: a capital `İ` (stored as `i`) and a final `Σ` (stored as `σ`);
+  such accounts must be recreated.
 - A password sent over HTTP Basic no longer reaches the admin API or token
   minting, even for an administrator (403). Scripts that ran
   `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
