@@ -176,6 +176,22 @@ pub async fn group_owner_ids(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<i
     .await
 }
 
+/// The names of the groups `member_id` is flagged as an owner in.
+pub async fn groups_owned_by(pool: &PgPool, member_id: i64) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT g.name
+        FROM group_member gm
+        JOIN repository g ON g.id = gm.group_id
+        WHERE gm.member_id = $1 AND gm.owner
+        ORDER BY g.name
+        "#,
+        member_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Flag (or unflag) `member_id` as an owner of `group_id`'s package ids.
 /// Returns whether that membership exists.
 pub async fn set_group_member_owner(

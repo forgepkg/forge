@@ -1065,6 +1065,35 @@ async fn group_member_owner_flag() {
         patch(format!("odev{s}"), json!({"owners": true})).await,
         422
     );
+
+    // An owner is neither removed from the group nor deleted while flagged:
+    // the group would silently fall back to trusting every hosted member.
+    let remove = client
+        .delete(format!("{members}/odev{s}"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), 409);
+    let delete = client
+        .delete(format!("{base}/admin/repositories/odev{s}"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), 409);
+    assert!(delete.text().await.unwrap().contains(&format!("ogrp{s}")));
+    assert_eq!(
+        patch(format!("odev{s}"), json!({"owner": false})).await,
+        204
+    );
+    let remove = client
+        .delete(format!("{members}/odev{s}"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), 204);
 }
 
 // ── §12.5: secret encryption at rest ────────────────────────────────────────

@@ -112,6 +112,12 @@ export interface MemberView {
   name: string
   kind: string
   priority: number
+  /**
+   * Owns the group's package ids: once any member is an owner, only owners
+   * hide proxy versions (`prefer_hosted`) and serve reserved prefixes. Set
+   * through the admin API; an owner must be unflagged before removal.
+   */
+  owner: boolean
 }
 
 /** `POST /admin/repositories/{name}/members` request body (`AddMember`). */

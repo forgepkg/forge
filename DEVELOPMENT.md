@@ -225,7 +225,8 @@ password supplied to NuGet should be a **token**.
   member, or `PATCH /admin/repositories/all/members/releases`
   `{"owner": true}`. Once any member is flagged, only owners (and the hosted
   repositories inside an owning nested group) hide proxy versions and serve
-  reserved ids.
+  reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
+  the group or deleting it; both are refused with 409 otherwise.
 
 ## Configuration
 

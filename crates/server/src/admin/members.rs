@@ -15,7 +15,9 @@
 //!   members claim ids under `prefer_hosted` and serve `reserved_prefixes`.
 //!   Set it when adding the member, or later with
 //!   `PATCH /admin/repositories/{name}/members/{member}` `{"owner": bool}`.
-//!   A proxy member cannot be an owner (**400**).
+//!   A proxy member cannot be an owner (**400**). An owner cannot be removed
+//!   (**409**) until it is unflagged: removing a group's last owner would
+//!   silently return the group to trusting every hosted member.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -222,6 +224,17 @@ pub async fn remove(
         Err(e) => return db_error(e),
     };
 
+    match repository_dao::group_owner_ids(&state.pool, group.id).await {
+        Ok(owners) if owners.contains(&member.id) => {
+            return (
+                StatusCode::CONFLICT,
+                "this member owns the group's package ids; unflag it as owner before removing it",
+            )
+                .into_response()
+        }
+        Ok(_) => {}
+        Err(e) => return db_error(e),
+    }
     match repository_dao::remove_group_member(&state.pool, group.id, member.id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "membership not found").into_response(),

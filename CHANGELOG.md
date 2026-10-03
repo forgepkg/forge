@@ -344,7 +344,10 @@ First production release.
   (`group_member.owner`). Once any member is flagged, only owners hide proxy
   versions under `prefer_hosted` and serve ids under `reserved_prefixes`, so
   a writer of a developer feed in the same group can no longer publish an
-  internal name or take a public id away from the proxy.
+  internal name or take a public id away from the proxy. An owner must be
+  unflagged before it can be removed from the group or deleted, so a group
+  never falls back to trusting every member unnoticed; the web UI marks
+  owners.
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes

@@ -715,6 +715,22 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return db_error(e),
     };
+    // Deleting an owner member would silently return its groups to trusting
+    // every hosted member (see `admin::members`).
+    match repository_dao::groups_owned_by(&state.pool, existing.id).await {
+        Ok(groups) if !groups.is_empty() => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "repository owns the package ids of group(s) {}; unflag it as owner first",
+                    groups.join(", ")
+                ),
+            )
+                .into_response()
+        }
+        Ok(_) => {}
+        Err(e) => return db_error(e),
+    }
     let grace = state.config.outbox.grace();
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
