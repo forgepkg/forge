@@ -225,7 +225,7 @@ pub fn seal_with_key(
         aad,
     };
     let ciphertext = match algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
             .encrypt(
                 nonce
                     .as_slice()
@@ -235,7 +235,7 @@ pub fn seal_with_key(
             )
             // RustCrypto's encrypt only fails on absurd input sizes.
             .map_err(|_| CryptoError::MalformedEnvelope("AEAD encryption failed"))?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
             .encrypt(
                 nonce
                     .as_slice()
@@ -277,7 +277,7 @@ pub fn open_with_key(
         aad,
     };
     let plaintext = match header.algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
             .decrypt(
                 nonce
                     .try_into()
@@ -285,7 +285,7 @@ pub fn open_with_key(
                 payload,
             )
             .map_err(|_| CryptoError::DecryptFailed)?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
             .decrypt(
                 nonce
                     .try_into()

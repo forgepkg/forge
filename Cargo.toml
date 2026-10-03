@@ -106,9 +106,11 @@ subtle = { version = "2.6" }
 # AEAD ciphers for secret encryption at rest (slice 12.5). AES-256-GCM is the
 # default (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the
 # opt-in alternative whose 192-bit extended nonce makes pure-random nonces
-# collision-safe without any per-key counter state.
-aes-gcm = { version = "0.11" }
-chacha20poly1305 = { version = "0.11" }
+# collision-safe without any per-key counter state. `zeroize` scrubs the
+# expanded key schedule (AES round keys, GHASH/ChaCha state) when a cipher
+# instance is dropped; without it only our own key buffers were wiped.
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 
 # Scrub unwrapped key bytes / transient plaintext from memory on drop (12.5).
 zeroize = { version = "1.8" }
