@@ -31,6 +31,7 @@ pub struct MemberView {
 
 /// Add-member request.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddMember {
     /// Member repository name.
     pub member: String,

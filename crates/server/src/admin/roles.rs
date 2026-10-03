@@ -45,6 +45,7 @@ impl From<Role> for RoleView {
 
 /// Create-role request. `name` must be a non-empty url-safe slug.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRole {
     pub name: String,
     #[serde(default)]
@@ -53,6 +54,7 @@ pub struct CreateRole {
 
 /// Update-role request (only `description` is mutable).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRole {
     pub description: String,
 }

@@ -38,7 +38,14 @@ pub async fn run_once(pool: &PgPool, store: &BlobStore, batch: i64) -> anyhow::R
     //    (the rows stay leased via `locked_until`).
     let claimed = {
         let mut tx = pool.begin().await?;
-        let rows = forge_db::outbox_dao::claim_due(&mut tx, batch, Utc::now(), LEASE).await?;
+        // Due-ness on the database clock, which set `available_at`
+        // (`now() + grace`): an instance whose clock runs ahead would
+        // otherwise delete objects before the grace period that backups and
+        // in-flight downloads rely on.
+        let now: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = forge_db::outbox_dao::claim_due(&mut tx, batch, now, LEASE).await?;
         tx.commit().await?;
         rows
     };

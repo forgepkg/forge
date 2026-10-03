@@ -41,6 +41,7 @@ impl From<&AppUser> for UserView {
 
 /// Create-user request.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUser {
     pub username: String,
     pub password: String,

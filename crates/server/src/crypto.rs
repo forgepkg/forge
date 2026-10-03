@@ -121,6 +121,26 @@ pub async fn try_rotation_lock(pool: &PgPool) -> anyhow::Result<Option<RotationL
     Ok(Some(guard))
 }
 
+/// Refuse to run without an envelope service while the database holds sealed
+/// secrets. Such an instance would serve 500 for every proxy with
+/// credentials, skip the OIDC and credential-forwarding realms whose secrets
+/// are sealed, and store new secrets in plaintext; that is what a deployment
+/// gets when a manifest drops `FORGE_CRYPTO__ROOT__PROVIDER`.
+pub async fn refuse_sealed_secrets_without_envelope(pool: &PgPool) -> anyhow::Result<()> {
+    let sealed = secret_dao::sealed_secrets_present(pool)
+        .await
+        .context("check for sealed secrets")?;
+    if sealed {
+        anyhow::bail!(
+            "the database holds encrypted secrets but secret encryption is not configured \
+             (no [crypto] section / FORGE_CRYPTO__ROOT__PROVIDER): restore the crypto \
+             configuration and its root key; turning encryption off once secrets are \
+             sealed is not supported"
+        );
+    }
+    Ok(())
+}
+
 /// Build the [`EnvelopeService`] from the `[crypto]` config, or `None` when
 /// the section is absent/disabled. Errors (unknown provider, missing or
 /// malformed root key) must abort startup — an operator who configured

@@ -650,6 +650,14 @@ impl HostedWrite {
                         version: parsed.version.clone(),
                     });
                 }
+                // Replacing the bytes destroys the old ones: the caller must
+                // also be allowed to delete this version (refusal drops the
+                // tx like the 409 above).
+                if let (Some((_, policy)), Some(context)) =
+                    (self.publish_policy.as_ref(), publish_context.as_ref())
+                {
+                    policy.authorize_replace(context).await?;
+                }
                 // `false`: a concurrent hard delete removed the version
                 // before this push could lock it, so it is a fresh insert.
                 self.redeploy_in_tx(
@@ -716,6 +724,18 @@ impl HostedWrite {
         }
 
         tx.commit().await.map_err(RepoError::from)?;
+        tracing::info!(
+            target: "forge::audit",
+            repo,
+            id = %parsed.id,
+            version = %parsed.version,
+            outcome = ?outcome,
+            principal = %self
+                .publish_policy
+                .as_ref()
+                .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label()),
+            "package published"
+        );
 
         // 5. Invalidate the per-(repo,id) cache namespace.
         self.cache.invalidate_package(repo, &parsed.id).await;

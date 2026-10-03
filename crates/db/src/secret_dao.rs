@@ -487,6 +487,23 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
     Ok(row.pending)
 }
 
+/// Whether any secret is stored sealed (an upstream password or realm
+/// secrets): such a database needs the envelope service to be usable.
+pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM repository WHERE upstream_password_enc IS NOT NULL
+        ) OR EXISTS (
+            SELECT 1 FROM auth_realm WHERE secrets_enc IS NOT NULL
+        ) AS "present!"
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.present)
+}
+
 /// Whether any auth realm still carries one of its secret keys
 /// (`secret_keys_for(kind)`) in its plaintext `config` (the realm half of the
 /// operator's "plaintext backfill pending" signal).

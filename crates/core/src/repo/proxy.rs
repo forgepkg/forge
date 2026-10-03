@@ -507,10 +507,11 @@ impl ProxyRepo {
     // ── Upstream service-index discovery (Task 8.1) ──────────────────────────
 
     /// Resolve the upstream resource `@id`s for `repo`, reading through the
-    /// cache (L1/L2) and persisting to `proxy_upstream_index`.
+    /// per-instance cache (never Redis) and persisting to
+    /// `proxy_upstream_index`.
     ///
     /// Layering:
-    /// 1. **Cache** (`get_or_try_insert_with`, TTL = metadata_ttl) — per-instance
+    /// 1. **Cache** (`get_or_try_insert_local`, TTL = metadata_ttl) — per-instance
     ///    coalescing + short-circuit; a 2nd call within TTL never touches DB or
     ///    upstream.
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`
@@ -537,8 +538,11 @@ impl ProxyRepo {
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,
         // so the factory yields a `String` and we re-wrap it on the way out.
+        // Local-only (never read from Redis): the index decides which host
+        // packages are downloaded from, and a downloaded package is cached for
+        // good, so a forged index in Redis would substitute packages.
         self.cache
-            .get_or_try_insert_with(
+            .get_or_try_insert_local(
                 NS_UPSTREAM_INDEX,
                 &key,
                 ttl.to_std().unwrap_or_default(),
@@ -1343,7 +1347,9 @@ impl ProxyRepo {
         let key = format!("{}/{}/{lower_id}/{version}", repo.name, repo.id);
         let fetched: Result<Option<Vec<u8>>, String> = self
             .cache
-            .get_or_try_insert_with(NS_UPSTREAM_NUSPEC, &key, NUSPEC_CACHE_TTL, || async {
+            // Local-only, like every upstream document clients act on: a
+            // manifest from Redis could rewrite a version's dependencies.
+            .get_or_try_insert_local(NS_UPSTREAM_NUSPEC, &key, NUSPEC_CACHE_TTL, || async {
                 let resources = Box::pin(self.resolve_upstream_index(repo))
                     .await
                     .map_err(|e| e.to_string())?;
@@ -1464,7 +1470,8 @@ impl ProxyRepo {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
         let key = format!("{}/{}/{lower_id}", repo.name, repo.id);
         self.cache
-            .get_or_try_insert_with(NS_UPSTREAM_REGISTRATION, &key, ttl, || async {
+            // Local-only (listing state, dependencies; see NS_UPSTREAM_NUSPEC).
+            .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION, &key, ttl, || async {
                 let resources = Box::pin(self.resolve_upstream_index(repo))
                     .await
                     .map_err(|e| e.to_string())?;
@@ -1492,7 +1499,8 @@ impl ProxyRepo {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
         let key = format!("{}/{}/{url}", repo.name, repo.id);
         self.cache
-            .get_or_try_insert_with(NS_UPSTREAM_REGISTRATION_PAGE, &key, ttl, || async {
+            // Local-only (see NS_UPSTREAM_REGISTRATION).
+            .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION_PAGE, &key, ttl, || async {
                 let doc = self
                     .fetch_json(repo, url)
                     .await

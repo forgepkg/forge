@@ -178,6 +178,17 @@ async fn begin_ingest_attempt(
 
     let state: String = row.try_get("state")?;
     if state == "deleting" {
+        // A deletion reservation on a blob an asset still names is bogus (a
+        // reservation is never taken while one does, and nothing increments a
+        // deleting blob): cancel it rather than delete the object, then retry
+        // as an ordinary blob.
+        let referenced = asset_references(&mut tx, sha256).await?;
+        if referenced > 0 {
+            let stored_key: String = row.try_get("s3_key")?;
+            cancel_referenced_deletion(&mut tx, sha256, &stored_key, referenced).await?;
+            tx.commit().await?;
+            return Ok(None);
+        }
         let delete_started_at: DateTime<Utc> = row.try_get("delete_started_at")?;
         if delete_started_at < stale_deletion_before {
             let token = Uuid::new_v4();
@@ -467,6 +478,49 @@ pub async fn reserve_dangling_delete(
     .await
 }
 
+/// How many assets name the blob (under the caller's blob row lock).
+async fn asset_references(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sha256: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM asset WHERE blob_sha256 = $1")
+        .bind(sha256)
+        .fetch_one(&mut **tx)
+        .await
+}
+
+/// Cancel the deletion reservation of a blob that assets still name (the
+/// aftermath of the pre-0.1.0 concurrent hard-delete race): back to
+/// `committed` with the true reference count. Its object may already be gone;
+/// the warning names the key to restore from backup if so.
+async fn cancel_referenced_deletion(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sha256: &str,
+    s3_key: &str,
+    referenced: i64,
+) -> sqlx::Result<()> {
+    tracing::warn!(
+        sha256,
+        s3_key,
+        referenced,
+        "blob reserved for deletion is still referenced by assets; deletion cancelled \
+         (if its object is missing from the bucket, restore it from a backup)"
+    );
+    sqlx::query(
+        r#"
+        UPDATE blob
+        SET state = 'committed', ref_count = $2, delete_token = NULL,
+            delete_previous_state = NULL, delete_started_at = NULL
+        WHERE sha256 = $1 AND state = 'deleting'
+        "#,
+    )
+    .bind(sha256)
+    .bind(referenced)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn reserve_delete(
     pool: &PgPool,
     sha256: &str,
@@ -502,10 +556,7 @@ async fn reserve_delete(
     // asset still names, whatever `ref_count` says. Drift is repaired here, to
     // the true asset count, under the blob row lock every increment and
     // decrement also takes, so later decrements stay correct.
-    let referenced: i64 = sqlx::query_scalar("SELECT count(*) FROM asset WHERE blob_sha256 = $1")
-        .bind(sha256)
-        .fetch_one(&mut *tx)
-        .await?;
+    let referenced = asset_references(&mut tx, sha256).await?;
     if referenced > 0 {
         tracing::warn!(
             sha256,
@@ -513,11 +564,17 @@ async fn reserve_delete(
             referenced,
             "blob ref_count drifted below its asset references; repaired, not deleting"
         );
-        sqlx::query("UPDATE blob SET ref_count = $2 WHERE sha256 = $1")
-            .bind(sha256)
-            .bind(referenced)
-            .execute(&mut *tx)
-            .await?;
+        let state: String = row.try_get("state")?;
+        if state == "deleting" {
+            let stored_key: String = row.try_get("s3_key")?;
+            cancel_referenced_deletion(&mut tx, sha256, &stored_key, referenced).await?;
+        } else {
+            sqlx::query("UPDATE blob SET ref_count = $2 WHERE sha256 = $1")
+                .bind(sha256)
+                .bind(referenced)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         return Ok(ReserveDeleteOutcome::Referenced);
     }

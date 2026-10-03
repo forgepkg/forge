@@ -58,11 +58,14 @@ fn subpath(uri: &Uri, repo: &str) -> String {
 }
 
 /// Build a [`RouteContext`] for a resolved repository + principal.
+/// `replace_filter` is the caller's delete predicate, which a redeploy needs
+/// (only computed for writes).
 async fn route_context(
     state: &AppState,
     repo: &Repository,
     principal: Principal,
     package_filter: PackageFilter,
+    replace_filter: PackageFilter,
 ) -> Option<RouteContext> {
     let kind = repo.kind();
     let format = state.formats.for_repository(repo);
@@ -79,6 +82,7 @@ async fn route_context(
             repo.name.clone(),
             principal,
             package_filter.clone(),
+            replace_filter,
         ))),
         _ => None,
     };
@@ -165,7 +169,19 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         .package_filter_for(&principal, &repo, action)
         .await;
 
-    let Some(ctx) = route_context(&state, &repo, principal, package_filter).await else {
+    // A redeploy replaces a version's bytes: it takes the delete permission
+    // (and its selectors) as well as write. Only writes need it, and for a
+    // token it costs a scope lookup.
+    let replace_filter = if action == Action::Write && repo.kind() == RepoKind::Hosted {
+        state
+            .authz
+            .package_filter_for(&principal, &repo, Action::Delete)
+            .await
+    } else {
+        PackageFilter::DenyAll
+    };
+    let Some(ctx) = route_context(&state, &repo, principal, package_filter, replace_filter).await
+    else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     };
 
@@ -190,10 +206,27 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let sub_req = Request::from_parts(parts, body);
 
     let router = nuget_router(repo.kind(), ctx);
-    match router.oneshot(sub_req).await {
+    let response = match router.oneshot(sub_req).await {
         Ok(resp) => resp,
         Err(infallible) => match infallible {},
+    };
+    if action != Action::Read {
+        // Every package mutation (push, unlist, relist) that reached its
+        // handler, whatever its outcome, with who sent it: the trail a leaked
+        // credential's writes are traced by (workload publishes are also in
+        // trusted_publish_audit). Requests the repository gate refuses are
+        // not logged.
+        tracing::info!(
+            target: "forge::audit",
+            %method,
+            repo = %repo.name,
+            path = %rest,
+            status = response.status().as_u16(),
+            principal = %principal.audit_label(),
+            "package mutation"
+        );
     }
+    response
 }
 
 /// Map an authorization denial to the right status: unauthenticated → 401 (send
@@ -253,9 +286,11 @@ impl HostedWriteAdapter {
         repository_name: String,
         principal: Principal,
         package_filter: PackageFilter,
+        replace_filter: PackageFilter,
     ) -> Self {
         let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
             filter: package_filter.clone(),
+            replace_filter,
             repository_id,
             repository_name,
         });
@@ -277,6 +312,8 @@ impl HostedWriteAdapter {
 /// selector can be applied without trusting multipart metadata.
 struct SelectorPublishPolicy {
     filter: PackageFilter,
+    /// The caller's delete predicate, required to replace an existing version.
+    replace_filter: PackageFilter,
     repository_id: i64,
     repository_name: String,
 }
@@ -285,6 +322,19 @@ struct SelectorPublishPolicy {
 impl PublishPolicy for SelectorPublishPolicy {
     async fn authorize(&self, context: &PublishAuthorizationContext) -> Result<(), WriteError> {
         if self.filter.allows(&context.package_id) {
+            Ok(())
+        } else {
+            Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            })
+        }
+    }
+
+    async fn authorize_replace(
+        &self,
+        context: &PublishAuthorizationContext,
+    ) -> Result<(), WriteError> {
+        if self.replace_filter.allows(&context.package_id) {
             Ok(())
         } else {
             Err(WriteError::ForbiddenPackage {

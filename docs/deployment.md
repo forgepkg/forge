@@ -123,9 +123,13 @@ The root key is part of your backup. Without it, stored secrets cannot be
 recovered, although packages and metadata are unaffected. AWS KMS is not
 supported yet.
 
-Enabling encryption on an existing installation is safe: at startup (and on
-every pass of the rotation worker) existing plaintext proxy passwords and
-realm secrets are encrypted and the plaintext copies are removed.
+Enabling encryption on an existing installation is safe, but enable it on
+**every instance at once** (a full restart, not a rolling one): at startup
+(and on every pass of the rotation worker) existing plaintext proxy passwords
+and realm secrets are encrypted and the plaintext copies are removed, and an
+instance still running without `[crypto]` cannot read them from then on.
+Turning encryption off again is not supported: an instance without `[crypto]`
+refuses to start while the database holds encrypted secrets.
 `GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
 plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
@@ -152,8 +156,11 @@ rolling restart after each:
    both roots, so neither fails to unwrap (an instance that has not restarted
    yet may wrap a KEK back under the old root; that is harmless and converges
    once every instance runs phase 2).
-3. Once `GET /admin/crypto/keys` shows every KEK on the new
-   `root_key_version`, remove the previous key and roll out once more.
+3. Once `GET /admin/crypto/keys` shows every **non-revoked** KEK on the new
+   `root_key_version` (revoked KEKs keep the old one and are never used
+   again), remove the previous key and roll out once more. Keep the old root
+   key with your backups for as long as you keep a database backup taken
+   before the rotation: restoring such a backup needs it.
 
 Swapping in one step makes the instances that still run with only the old
 key fail to unwrap KEKs that a new instance has already re-wrapped.
@@ -255,17 +262,39 @@ can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
 password-failure lockout is kept in memory on each instance.
 
+- **Connections.** Every instance opens up to `database.max_connections`
+  (default 20); keep instances × that below PostgreSQL's `max_connections`.
+  Through PgBouncer, use **session** pooling: migrations and key rotation
+  take session-level advisory locks, which transaction pooling breaks.
+- **Upgrades.** Migrations run at startup, serialized by an advisory lock.
+  Once a newer version has migrated, an instance of the older version
+  refuses to start, so roll forward and do not restart old instances in the
+  middle of a rollout.
+- **Rolling deploys.** On SIGTERM Forge stops accepting connections at once
+  and drains in-flight requests. Give the load balancer time to stop routing
+  to the instance first (for Kubernetes a `preStop` sleep of 5 to 10 s),
+  otherwise requests routed in that gap are refused, and a refused push is
+  not retried.
+- **Temp space.** Pushes and first-time proxy downloads are staged in the
+  temp directory (up to `server.max_upload_bytes` and
+  `proxy.max_package_bytes` each, several at once); size it for your
+  largest packages times the expected concurrency.
+- **Audit log.** Package mutations and admin changes are logged at INFO
+  under the `forge::audit` target, with the user/token or workload that
+  made them; keep those lines.
+
 ### Redis is a trust boundary
 
 Anything that can write to Redis can write Forge's shared cache. Forge
-therefore keeps every value a security decision rests on **out of Redis**:
-authorization sets, credential-forwarding verdicts, OIDC discovery documents
-and signing keys, and workload-identity token verdicts are cached in each
+therefore keeps every value a security decision or a client rests on **out of
+Redis**: authorization sets, credential-forwarding verdicts, OIDC discovery
+documents and signing keys, workload-identity token verdicts, and a proxy's
+upstream service index, manifests and registrations are cached in each
 instance's memory only. Redis carries only their invalidations, so the worst
-a Redis writer can do to them is evict them early. Upstream package metadata
-(proxy listings, manifests, registrations) is still shared through Redis;
-proxied packages themselves are checked against the requested id and
-version before they are served.
+a Redis writer can do to them is evict them early. The only values still
+shared through Redis are two proxy markers ("listing refreshed", "version
+rejected"); forging them can hide a proxied package until its TTL expires,
+not change what is served.
 
 Still treat Redis like the database: a dedicated instance (or ACL user) for
 Forge, `requirepass`/ACL credentials in the URL, not reachable from outside
@@ -290,7 +319,9 @@ away, so a bucket copied *later* could already lack them. Either:
   garbage collection deletes an object only after that grace period, so a
   later bucket state can already lack objects the restored database still
   references). Keep noncurrent versions longer than your backup retention; or
-- stop Forge (or at least its garbage collection) while both copies are taken.
+- stop **every** Forge instance while both copies are taken (garbage
+  collection runs on every instance and has no separate switch;
+  `retention.enabled = false` does not stop it).
 
 Objects written after the database snapshot are harmless: nothing in the
 restored database references them. They only use storage.

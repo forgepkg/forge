@@ -1406,6 +1406,25 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     assert_eq!(resp.status(), 401, "a revoked session stays revoked");
 }
 
+/// `POST /auth/tokens` mints unscoped tokens only: a `scope` in the body is
+/// refused, never dropped (which would hand back an unscoped token).
+#[tokio::test]
+async fn auth_tokens_refuses_a_scope_it_would_drop() {
+    let srv = common::start().await;
+    let username = format!("scoped{}", common::unique());
+    let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let resp = srv
+        .client()
+        .post(format!("{}/auth/tokens", srv.base_url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({"name": "ci", "scope": {"actions": ["read"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+}
+
 /// Review M5 / L6: the cookie-authenticated `/auth/me` and `/auth/tokens`
 /// endpoints check the session user's live `active` flag, not just the
 /// session row — even a session that was never revoked (e.g. the account was

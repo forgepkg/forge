@@ -157,8 +157,8 @@ pub struct Criteria {
     /// Trigger: component age since `created_at` is at least this many days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub older_than_days: Option<u32>,
-    /// Trigger: not downloaded for at least this many days (never-downloaded
-    /// always matches).
+    /// Trigger: not downloaded for at least this many days (a version never
+    /// downloaded counts from its publication).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_downloaded_for_days: Option<u32>,
     /// Proxy trigger: cached version not pulled for at least this many days

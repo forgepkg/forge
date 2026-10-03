@@ -318,7 +318,7 @@ combined form with per-realm OIDC buttons.
 | `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
 | `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
 | `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
-| `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens. |
+| `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens (unscoped; `/admin/me/tokens` also takes a `scope`). |
 
 State-changing cookie endpoints (`logout`, token mint/revoke) require a
 **double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the

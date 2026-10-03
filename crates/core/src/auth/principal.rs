@@ -91,6 +91,28 @@ pub enum Principal {
 }
 
 impl Principal {
+    /// Who this is, for audit log lines: ids only, never secrets
+    /// (`user:5 token:12`, `user:5 session`, `workload realm:3 role:7`).
+    pub fn audit_label(&self) -> String {
+        match self {
+            Principal::Unauthenticated => "unauthenticated".into(),
+            Principal::Anonymous { ip } => format!("anonymous {ip}"),
+            Principal::User {
+                user_id,
+                token_id,
+                method,
+                ..
+            } => match (token_id, method) {
+                (Some(token_id), _) => format!("user:{user_id} token:{token_id}"),
+                (None, AuthMethod::Session) => format!("user:{user_id} session"),
+                (None, _) => format!("user:{user_id} password"),
+            },
+            Principal::Workload {
+                realm_id, role_id, ..
+            } => format!("workload realm:{realm_id} role:{role_id}"),
+        }
+    }
+
     /// Build a [`Principal::User`] from a [`UserPrincipal`] verified on this
     /// request: [`AuthMethod::Token`] when a token was used, else
     /// [`AuthMethod::Password`].
@@ -124,6 +146,38 @@ impl Principal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_labels_name_the_credential_never_a_secret() {
+        let user = |token_id, method| Principal::User {
+            user_id: 5,
+            token_id,
+            is_admin: false,
+            method,
+        };
+        assert_eq!(
+            user(Some(12), AuthMethod::Token).audit_label(),
+            "user:5 token:12"
+        );
+        assert_eq!(
+            user(None, AuthMethod::Session).audit_label(),
+            "user:5 session"
+        );
+        assert_eq!(
+            user(None, AuthMethod::Password).audit_label(),
+            "user:5 password"
+        );
+        let workload = Principal::Workload {
+            realm_id: 3,
+            role_id: 7,
+            issuer_sha256: [0; 32],
+            config_sha256: [0; 32],
+            subject_sha256: [0; 32],
+            jti_sha256: None,
+            issued_at: 0,
+        };
+        assert_eq!(workload.audit_label(), "workload realm:3 role:7");
+    }
 
     #[test]
     fn from_user_preserves_fields() {

@@ -618,8 +618,11 @@ impl From<&forge_db::model::Token> for TokenView {
     }
 }
 
-/// `POST /auth/tokens` request body.
+/// `POST /auth/tokens` request body. Unknown fields are rejected, so a `scope`
+/// (supported by `POST /admin/me/tokens`) is refused rather than silently
+/// dropped, which would mint an unscoped token.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTokenBody {
     name: String,
     #[serde(default)]
