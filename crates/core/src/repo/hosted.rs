@@ -25,10 +25,10 @@ use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
-    CacheInvalidator, DeleteOutcome, NupkgLocation, PublishAuthorizationContext, PublishOutcome,
-    PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
-    SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE,
-    NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
+    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
+    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
+    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
 /// Fetch raw bytes of a stored blob by its S3 object key.
@@ -587,6 +587,7 @@ impl HostedWrite {
                 .as_ref()
                 .map(|(principal, _)| PublishAuthorizationContext {
                     principal: *principal,
+                    action: PackageMutation::Publish,
                     package_id: parsed.id.clone(),
                     package_version: parsed.version.clone(),
                 });
@@ -932,11 +933,10 @@ impl HostedWrite {
         }
 
         if !hard {
-            let updated =
-                component_dao::set_listed(&self.pool, repo_row.id, &lower, &norm_ver, false)
-                    .await
-                    .map_err(RepoError::from)?;
-            if !updated {
+            if !self
+                .set_listed_recorded(repo_row.id, &lower, &norm_ver, false)
+                .await?
+            {
                 return Ok(DeleteOutcome::NotFound);
             }
             self.cache.invalidate_package(repo, &lower).await;
@@ -997,10 +997,63 @@ impl HostedWrite {
             .await
             .map_err(RepoError::from)?;
 
+        self.record_mutation(&mut tx, PackageMutation::Delete, &lower, &norm_ver)
+            .await?;
         tx.commit().await.map_err(RepoError::from)?;
 
         self.cache.invalidate_package(repo, &lower).await;
         Ok(DeleteOutcome::Deleted)
+    }
+
+    /// Set `listed` on a version in a transaction that also runs the publish
+    /// policy's fence and ledger ([`PublishPolicy::record_in_transaction`]).
+    /// Returns whether the version exists.
+    async fn set_listed_recorded(
+        &self,
+        repo_id: i64,
+        lower: &str,
+        version: &str,
+        listed: bool,
+    ) -> Result<bool, WriteError> {
+        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
+        let updated = component_dao::set_listed(&mut *tx, repo_id, lower, version, listed)
+            .await
+            .map_err(RepoError::from)?;
+        if !updated {
+            return Ok(false);
+        }
+        let action = if listed {
+            PackageMutation::Relist
+        } else {
+            PackageMutation::Unlist
+        };
+        self.record_mutation(&mut tx, action, lower, version)
+            .await?;
+        tx.commit().await.map_err(RepoError::from)?;
+        Ok(true)
+    }
+
+    /// Run the request's publish policy hook for a non-publish mutation on its
+    /// open transaction (a no-op without a policy). A workload principal is
+    /// fenced against its realm's current config and recorded in the ledger,
+    /// exactly as for a publish.
+    async fn record_mutation(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        action: PackageMutation,
+        lower: &str,
+        version: &str,
+    ) -> Result<(), WriteError> {
+        let Some((principal, policy)) = self.publish_policy.as_ref() else {
+            return Ok(());
+        };
+        let context = PublishAuthorizationContext {
+            principal: *principal,
+            action,
+            package_id: lower.to_string(),
+            package_version: version.to_string(),
+        };
+        policy.record_in_transaction(&context, tx).await
     }
 
     /// Relist a previously unlisted version. Returns whether a row was updated.
@@ -1016,10 +1069,10 @@ impl HostedWrite {
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }
-        let updated = component_dao::set_listed(&self.pool, repo_row.id, &lower, &norm_ver, true)
-            .await
-            .map_err(RepoError::from)?;
-        if !updated {
+        if !self
+            .set_listed_recorded(repo_row.id, &lower, &norm_ver, true)
+            .await?
+        {
             return Ok(DeleteOutcome::NotFound);
         }
         self.cache.invalidate_package(repo, &lower).await;

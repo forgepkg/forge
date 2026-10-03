@@ -96,6 +96,8 @@ export interface RealmFormValues {
   allowed_audiences: string
   /** Optional exact `azp` values for issuers that emit authorized-party claims. */
   allowed_authorized_parties: string
+  /** Comma-separated extra identity claims (custom issuers). */
+  identity_claims: string
   /** Maximum accepted token age and declared token lifetime. */
   max_token_age_seconds: string
   /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
@@ -201,6 +203,7 @@ function seed(existing?: RealmView): RealmFormValues {
     key_pepper: '',
     allowed_audiences: joinList(wif.allowed_audiences),
     allowed_authorized_parties: joinList(wif.allowed_authorized_parties),
+    identity_claims: joinList(wif.identity_claims),
     max_token_age_seconds:
       wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
     positive_cache_seconds:
@@ -910,6 +913,23 @@ export function RealmForm({
             </Field>
 
             <Field>
+              <Label>Identity claims</Label>
+              <Input
+                type="text"
+                value={values.identity_claims}
+                onChange={(e) => set('identity_claims', e.target.value)}
+                placeholder="Optional, e.g. pipeline_id"
+              />
+              <Description>
+                Claims a custom CI issuer uses as a stable workload identity.
+                Each rule must pin one of them or a built-in identity claim
+                (<code>sub</code>, <code>repository_id</code>,{' '}
+                <code>job_project_id</code>, …). Leave blank for GitHub Actions
+                and GitLab.
+              </Description>
+            </Field>
+
+            <Field>
               <Label>Positive verification cache (seconds)</Label>
               <Input
                 type="number"
@@ -1332,6 +1352,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     }
     const positiveCache = parseNumber(values.positive_cache_seconds)
     if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
+    const identityClaims = parseList(values.identity_claims)
+    if (identityClaims.length > 0) config.identity_claims = identityClaims
     return config
   }
   // local (and reserved kinds): no config.

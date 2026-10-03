@@ -100,6 +100,8 @@ export interface WorkloadIdentityConfig {
   allowed_authorized_parties?: string[]
   positive_cache_seconds?: number
   rules: WorkloadIdentityRule[]
+  /** Extra stable workload-identity claims of a custom issuer. */
+  identity_claims?: string[]
 }
 
 /** Kind-specific config; `local` has none. */

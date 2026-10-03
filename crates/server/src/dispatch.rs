@@ -362,6 +362,7 @@ impl PublishPolicy for SelectorPublishPolicy {
                 subject_sha256: &subject_sha256,
                 jti_sha256: jti_sha256.as_ref(),
                 token_issued_at,
+                action: context.action.as_str(),
             },
         )
         .await

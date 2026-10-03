@@ -614,17 +614,46 @@ pub type UploadReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 pub struct PublishAuthorizationContext {
     /// Authenticated request actor (user or workload provenance).
     pub principal: Principal,
+    /// Which package mutation is being performed.
+    pub action: PackageMutation,
     /// Canonical package id extracted by the format parser.
     pub package_id: String,
     /// Canonical normalized package version extracted by the format parser.
     pub package_version: String,
 }
 
+/// A package mutation a [`PublishPolicy`] is consulted about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageMutation {
+    /// Publish or redeploy a version.
+    Publish,
+    /// Unlist (soft-delete) a version.
+    Unlist,
+    /// Relist a version.
+    Relist,
+    /// Hard-delete a version.
+    Delete,
+}
+
+impl PackageMutation {
+    /// The audit-ledger spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageMutation::Publish => "publish",
+            PackageMutation::Unlist => "unlist",
+            PackageMutation::Relist => "relist",
+            PackageMutation::Delete => "delete",
+        }
+    }
+}
+
 /// Request-specific policy and provenance hook for package publication.
 ///
 /// `authorize` runs after local staging and format parsing but before the staged
 /// bytes are promoted into CAS. `record_in_transaction` runs after component and
-/// asset changes on their still-open transaction, immediately before commit.
+/// asset changes on their still-open transaction, immediately before commit —
+/// for publishes and, with the matching [`PackageMutation`], for unlist,
+/// relist and hard delete too, so the same fence and ledger cover them.
 #[async_trait]
 pub trait PublishPolicy: Send + Sync {
     /// Authorize this canonical package identity. A denial must be explicit and

@@ -176,13 +176,16 @@ pub async fn names_present_in_repositories(
 
 /// Set the `listed` flag on a specific component version. Returns whether a row
 /// was updated.
-pub async fn set_listed(
-    pool: &PgPool,
+pub async fn set_listed<'e, E>(
+    executor: E,
     repository_id: i64,
     name: &str,
     version: &str,
     listed: bool,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     let res = sqlx::query!(
         r#"
         UPDATE component
@@ -194,7 +197,7 @@ pub async fn set_listed(
         version,
         listed,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
 }

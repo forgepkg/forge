@@ -28,6 +28,12 @@ The release workflow publishes the section whose heading matches the tag
   realm (`realm_orphaned`): they can no longer be signed in by any realm.
   Delete such an account to let its owner's next upstream login provision a
   fresh one.
+- Workload-identity realms for an issuer other than GitHub Actions or
+  GitLab.com: every rule must now pin a stable identity claim (`sub`,
+  `repository_id`, `job_project_id`, `project_path`, … — see
+  docs/trusted-publishing.md) or a claim the realm lists in the new
+  `identity_claims`. A stored rule that pins neither stops matching (its
+  tokens are refused) until the realm is edited.
 
 ### Security
 
@@ -121,6 +127,16 @@ The release workflow publishes the section whose heading matches the tag
   bounded and escaped. Realms take an optional allow-gate,
   `required_claims` (e.g. `{"tid": ["<tenant>"]}` or `{"hd": ["corp.example"]}`):
   a token without an allowed value is refused.
+- Workload identity (trusted publishing): for a custom issuer, a rule's
+  identity anchor must be one of the known stable identity claims or one the
+  realm declares in `identity_claims` (before, any claim not on a short
+  denylist counted, so a rule on `actor` or `event_name` trusted every
+  workload that carried it). Unlist, relist and delete by a workload now run
+  the same commit-time realm fence as a publish and are recorded in
+  `trusted_publish_audit` with an `action` column (migration 0026); before,
+  a principal from a stale realm snapshot could still unlist, and those
+  changes left no record. The docs recommend pinning `job_workflow_ref` and
+  `event_name`.
 
 ## [0.1.0]
 
