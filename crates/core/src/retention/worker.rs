@@ -407,6 +407,28 @@ fn spawn_lease_heartbeat(
     })
 }
 
+/// Rows deleted per statement by [`prune_audit`].
+const AUDIT_PRUNE_BATCH: i64 = 1_000;
+
+/// Upper bound on statements per [`prune_audit`] call, so one pass stays short
+/// on a large backlog; the rest goes on the next call.
+const AUDIT_PRUNE_MAX_BATCHES: usize = 50;
+
+/// Delete `retention_audit` rows older than `keep`, in short batches. Returns
+/// the number of rows deleted. Safe on every instance at once.
+pub async fn prune_audit(pool: &PgPool, keep: Duration) -> sqlx::Result<u64> {
+    let cutoff = Utc::now() - keep;
+    let mut total = 0u64;
+    for _ in 0..AUDIT_PRUNE_MAX_BATCHES {
+        let deleted = retention_dao::prune_audit(pool, cutoff, AUDIT_PRUNE_BATCH).await?;
+        total += deleted;
+        if deleted < AUDIT_PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// Errors a retention tick can surface (logged; the loop continues).
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {

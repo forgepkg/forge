@@ -592,6 +592,34 @@ pub struct AuditRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Delete up to `limit` audit rows created before `created_before`, oldest
+/// first. Returns how many were deleted; fewer than `limit` means none older
+/// are left. Each call is one short statement, idempotent and safe on every
+/// instance at once.
+pub async fn prune_audit(
+    pool: &PgPool,
+    created_before: DateTime<Utc>,
+    limit: i64,
+) -> sqlx::Result<u64> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM retention_audit
+        WHERE id = ANY(ARRAY(
+            SELECT id
+            FROM retention_audit
+            WHERE created_at < $1
+            ORDER BY created_at
+            LIMIT $2
+        ))
+        "#,
+        created_before,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Read recent audit rows for a repository, newest first. Optionally filter by
 /// `run_id` (one evaluation pass) and/or page with `before` (only rows with a
 /// smaller `id`, i.e. older than the last page). `limit` is clamped by the

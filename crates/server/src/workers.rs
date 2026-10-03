@@ -11,7 +11,8 @@
 //!    `pending` blobs older than the grace window. Idempotent: it deletes the S3
 //!    object first, then drops the row only if it is *still* stale, so two
 //!    instances racing are harmless. Each tick also prunes processed
-//!    `blob_outbox` rows past `outbox.processed_retention_seconds` (bounded
+//!    `blob_outbox` rows past `outbox.processed_retention_seconds` and
+//!    `retention_audit` rows past `retention.audit_retention_seconds` (bounded
 //!    batched `DELETE`s, safe on every instance).
 //! 3. **Proxy metadata refresh** — periodically re-resolves each proxy
 //!    repository's upstream service index. The cross-instance singleflight is a
@@ -113,15 +114,12 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         let (pool, store) = (state.pool.clone(), state.blob_store.clone());
         // Reconcile less often than the outbox polls; it is only a safety net.
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
-        let outbox_retention = state.config.outbox.processed_retention();
+        let prune = PruneAfter {
+            outbox: state.config.outbox.processed_retention(),
+            retention_audit: state.config.retention.audit_retention(),
+        };
         supervise("reconciler", move || {
-            spawn_reconciler(
-                pool.clone(),
-                store.clone(),
-                grace,
-                outbox_retention,
-                interval,
-            )
+            spawn_reconciler(pool.clone(), store.clone(), grace, prune, interval)
         })
     };
 
@@ -310,13 +308,22 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
     })
 }
 
-/// Spawn the orphan-reconciler loop. Each tick also prunes processed
-/// `blob_outbox` rows older than `outbox_retention` (`None` = keep them).
+/// How long the reconciler loop keeps history rows (`None` = keep them all).
+#[derive(Clone, Copy)]
+struct PruneAfter {
+    /// Processed `blob_outbox` rows.
+    outbox: Option<chrono::Duration>,
+    /// `retention_audit` rows.
+    retention_audit: Option<chrono::Duration>,
+}
+
+/// Spawn the orphan-reconciler loop. Each tick also prunes the history rows
+/// `prune` names.
 fn spawn_reconciler(
     pool: PgPool,
     store: BlobStore,
     grace: chrono::Duration,
-    outbox_retention: Option<chrono::Duration>,
+    prune: PruneAfter,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -328,11 +335,18 @@ fn spawn_reconciler(
                 Ok(n) => tracing::info!(reclaimed = n, "reconciler reclaimed orphan blobs"),
                 Err(e) => tracing::error!(error = %e, "reconciler pass failed"),
             }
-            if let Some(retention) = outbox_retention {
+            if let Some(retention) = prune.outbox {
                 match outbox_worker::prune_processed(&pool, retention).await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(pruned = n, "pruned processed blob_outbox rows"),
                     Err(e) => tracing::error!(error = %e, "blob_outbox prune failed"),
+                }
+            }
+            if let Some(keep) = prune.retention_audit {
+                match forge_core::retention::worker::prune_audit(&pool, keep).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(pruned = n, "pruned retention_audit rows"),
+                    Err(e) => tracing::error!(error = %e, "retention_audit prune failed"),
                 }
             }
             // Proxy versions only ever requested, never listed or served

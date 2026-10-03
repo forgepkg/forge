@@ -742,6 +742,13 @@ pub struct RetentionConfig {
     /// Crash-safe lease held while a repo is evaluated (seconds).
     #[serde(default = "default_retention_lease")]
     pub lease_seconds: i64,
+    /// How long `retention_audit` rows are kept before the reconciler loop
+    /// deletes them (default 90 days). Dry-run policies add a row per
+    /// matched version on every run, so the table grows without this. `0`
+    /// keeps every row. Pruning runs on every instance, also where the
+    /// worker is disabled.
+    #[serde(default = "default_retention_audit_retention")]
+    pub audit_retention_seconds: u64,
 }
 
 impl Default for RetentionConfig {
@@ -751,6 +758,7 @@ impl Default for RetentionConfig {
             poll_interval_seconds: default_retention_poll(),
             default_run_interval_seconds: default_retention_run_interval(),
             lease_seconds: default_retention_lease(),
+            audit_retention_seconds: default_retention_audit_retention(),
         }
     }
 }
@@ -767,6 +775,16 @@ impl RetentionConfig {
     /// Lease as a chrono [`chrono::Duration`].
     pub fn lease(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.lease_seconds)
+    }
+    /// How long audit rows are kept, or `None` when pruning is disabled
+    /// (`audit_retention_seconds = 0`). Clamped to 100 years so the cutoff
+    /// arithmetic can never overflow.
+    pub fn audit_retention(&self) -> Option<chrono::Duration> {
+        const MAX_SECS: u64 = 100 * 365 * 24 * 3600;
+        match self.audit_retention_seconds {
+            0 => None,
+            secs => Some(chrono::Duration::seconds(secs.min(MAX_SECS) as i64)),
+        }
     }
 }
 
@@ -1399,6 +1417,9 @@ fn default_retention_run_interval() -> i64 {
 }
 fn default_retention_lease() -> i64 {
     300
+}
+fn default_retention_audit_retention() -> u64 {
+    90 * 24 * 3600
 }
 
 /// Dotted config keys holding **secret strings**. Their `FORGE_*` environment

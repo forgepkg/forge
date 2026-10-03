@@ -138,6 +138,10 @@ grace_seconds = 3600            # (default: 3600) grace before a dereferenced bl
 poll_interval_seconds = 10      # (default: 10)
 processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processed outbox rows this long; 0 = never prune
 
+[retention]
+# enabled = true                         # (default: true) run the retention worker on this instance
+# audit_retention_seconds = 7776000      # (default: 7776000 = 90 days) keep retention_audit rows this long; 0 = never prune
+
 # Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
 # 12.7: this block is a one-shot SEED — on first boot it is imported into an
 # `auth_realm` row and authentication is managed in the admin UI from then on
