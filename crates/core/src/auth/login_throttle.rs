@@ -21,9 +21,16 @@
 //! failures are also counted per **username** across all addresses. Past a
 //! threshold (default three pair budgets per window) attempts for that
 //! username are spaced out — each waits for the next slot, the spacing
-//! doubling with every further failure up to a cap — instead of being
-//! refused: the account's owner can still sign in (after a short wait), but
-//! the account can no longer be guessed at full speed. A success clears it.
+//! doubling with every further failure up to a cap, and an attempt whose wait
+//! would exceed [`DEFAULT_MAX_WAIT`] is refused as busy — so the account can no
+//! longer be guessed at full speed. A success clears it.
+//!
+//! Slots are shared by everyone presenting the username, so a guesser who
+//! keeps claiming them could otherwise keep the owner out. Two rules prevent
+//! that: an attempt from a network the username signed in from successfully
+//! in the last [`KNOWN_NETWORK_TTL`] (the owner's office, VPN or CI runners)
+//! skips the backoff, and an attempt whose pair is already locked is refused
+//! without claiming a slot.
 //!
 //! ## Reservation, not check-then-record
 //! An attempt is counted against the pair's budget atomically *before* the
@@ -88,6 +95,13 @@ const EVICT_BATCH: usize = MAX_TRACKED / 8;
 
 /// Minimum number of insertions between two sweeps of expired windows.
 const SWEEP_MIN_INSERTS: usize = 1024;
+
+/// How long a network a username signed in from stays exempt from that
+/// username's soft backoff.
+pub const KNOWN_NETWORK_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Networks remembered per username (the most recent successes).
+const KNOWN_NETWORKS_PER_USER: usize = 8;
 
 /// The network a client address is accounted to: the address itself for
 /// IPv4 (IPv4-mapped IPv6 included), its /64 for IPv6.
@@ -205,6 +219,9 @@ pub struct LoginThrottle {
     /// Largest spacing.
     user_backoff_max: Duration,
     users: Mutex<HashMap<[u8; 32], UserEntry>>,
+    /// Networks each username recently signed in from, newest last; exempt
+    /// from its soft backoff.
+    known_networks: Mutex<HashMap<[u8; 32], Vec<(IpAddr, Instant)>>>,
 }
 
 impl LoginThrottle {
@@ -220,6 +237,7 @@ impl LoginThrottle {
             user_backoff_base: Duration::from_secs(1),
             user_backoff_max: Duration::from_secs(30),
             users: Mutex::new(HashMap::new()),
+            known_networks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -265,6 +283,45 @@ impl LoginThrottle {
         }
         entry.next_allowed = slot + backoff;
         Some(wait)
+    }
+
+    /// Whether the username behind `key` signed in from its network within
+    /// [`KNOWN_NETWORK_TTL`].
+    fn is_known_network(&self, key: Key) -> bool {
+        let now = Instant::now();
+        self.known_networks
+            .lock()
+            .expect("login throttle mutex poisoned")
+            .get(&key.user)
+            .is_some_and(|nets| {
+                nets.iter()
+                    .any(|(net, at)| *net == key.ip && now.duration_since(*at) < KNOWN_NETWORK_TTL)
+            })
+    }
+
+    /// Remember that the username behind `key` signed in from its network.
+    fn remember_network(&self, key: Key) {
+        let now = Instant::now();
+        let mut known = self
+            .known_networks
+            .lock()
+            .expect("login throttle mutex poisoned");
+        if !known.contains_key(&key.user) && known.len() >= MAX_TRACKED {
+            known.retain(|_, nets| {
+                nets.retain(|(_, at)| now.duration_since(*at) < KNOWN_NETWORK_TTL);
+                !nets.is_empty()
+            });
+            if known.len() >= MAX_TRACKED {
+                // Full of live entries: stay bounded, remember no more.
+                return;
+            }
+        }
+        let nets = known.entry(key.user).or_default();
+        nets.retain(|(net, at)| *net != key.ip && now.duration_since(*at) < KNOWN_NETWORK_TTL);
+        if nets.len() >= KNOWN_NETWORKS_PER_USER {
+            nets.remove(0);
+        }
+        nets.push((key.ip, now));
     }
 
     /// Record a verdict for the username behind `user` (soft backoff).
@@ -340,11 +397,16 @@ impl LoginThrottle {
             });
         }
         let key = Self::key(ip, username);
-        // Per-username soft backoff first: wait for this username's next slot.
-        match self.user_slot(key.user) {
-            None => return Err(AttemptRefused::Busy),
-            Some(wait) if !wait.is_zero() => tokio::time::sleep(wait).await,
-            Some(_) => {}
+        // Per-username soft backoff first: wait for this username's next slot,
+        // unless the attempt comes from a network the username signed in from
+        // or its pair is locked anyway (refused below without taking a slot
+        // from the owner).
+        if !self.is_known_network(key) && !self.pair_locked(key) {
+            match self.user_slot(key.user) {
+                None => return Err(AttemptRefused::Busy),
+                Some(wait) if !wait.is_zero() => tokio::time::sleep(wait).await,
+                Some(_) => {}
+            }
         }
         let granted = || LoginAttempt {
             throttle: self,
@@ -404,6 +466,9 @@ impl LoginThrottle {
 
     fn complete(&self, key: Key, verdict: Verdict) {
         self.record_user(key.user, &verdict);
+        if matches!(verdict, Verdict::Succeeded) {
+            self.remember_network(key);
+        }
         let mut state = self.lock();
         let Some(entry) = state.entries.get_mut(&key) else {
             return;
@@ -427,13 +492,14 @@ impl LoginThrottle {
         if self.max_failures == 0 {
             return false;
         }
+        self.pair_locked(Self::key(ip, username))
+    }
+
+    fn pair_locked(&self, key: Key) -> bool {
         let now = Instant::now();
-        self.lock()
-            .entries
-            .get(&Self::key(ip, username))
-            .is_some_and(|e| {
-                now.duration_since(e.window_start) < self.window && e.failures >= self.max_failures
-            })
+        self.lock().entries.get(&key).is_some_and(|e| {
+            now.duration_since(e.window_start) < self.window && e.failures >= self.max_failures
+        })
     }
 
     /// How many pairs are currently tracked (diagnostics and tests).
@@ -624,6 +690,53 @@ mod tests {
             .unwrap()
             .released();
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn the_backoff_cannot_keep_the_owner_out_of_a_known_network() {
+        let t = LoginThrottle::new(5, Duration::from_secs(60))
+            .with_user_backoff(2, Duration::from_millis(400), Duration::from_millis(400))
+            .with_max_wait(Duration::from_millis(100));
+        let office = ip("192.0.2.10");
+        t.begin(office, "alice").await.unwrap().succeeded();
+        // A guesser elsewhere pushes alice into the backoff and takes the
+        // next slot, so another unknown network is turned away...
+        fail(&t, ip("203.0.113.1"), "alice").await;
+        fail(&t, ip("203.0.113.2"), "alice").await;
+        t.begin(ip("203.0.113.3"), "alice")
+            .await
+            .unwrap()
+            .released();
+        assert_eq!(
+            t.begin(ip("203.0.113.4"), "alice").await.unwrap_err(),
+            AttemptRefused::Busy
+        );
+        // ...but the network alice signed in from is not held back.
+        let started = Instant::now();
+        t.begin(office, "alice").await.unwrap().released();
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn locked_attempts_do_not_take_the_usernames_slots() {
+        let t = LoginThrottle::new(1, Duration::from_secs(60))
+            .with_user_backoff(1, Duration::from_millis(400), Duration::from_millis(400))
+            .with_max_wait(Duration::from_millis(100));
+        let attacker = ip("203.0.113.1");
+        fail(&t, attacker, "alice").await;
+        for _ in 0..5 {
+            assert_eq!(
+                t.begin(attacker, "alice").await.unwrap_err(),
+                AttemptRefused::Locked
+            );
+        }
+        // The refused attempts claimed nothing: the next slot is still free.
+        let started = Instant::now();
+        t.begin(ip("198.51.100.1"), "alice")
+            .await
+            .unwrap()
+            .released();
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 
     #[test]

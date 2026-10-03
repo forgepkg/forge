@@ -120,8 +120,12 @@ The release workflow publishes the section whose heading matches the tag
 - The password lockout keys IPv6 clients by their /64 (one host owns a whole
   /64, so per-address keys gave it unlimited fresh budgets), and a username
   guessed from many networks is backed off: past three pair budgets of
-  failures in a window its attempts are spaced (1 s, doubling to 30 s)
-  instead of refused, so the owner can still sign in. A success clears it.
+  failures in a window its attempts are spaced (1 s, doubling to 30 s; an
+  attempt that would wait more than 10 s is refused). Attempts from a
+  network the username signed in from in the last 30 days are not backed
+  off, and attempts already refused by a pair lockout take no slot, so a
+  guesser cannot keep the owner out of their usual networks. A success
+  clears it.
 - OIDC hardening: a realm's stored client secret is dropped when its
   `issuer` or `client_id` changes (the update must supply a new one, so the
   old IdP's secret is never sent to a new issuer); discovery, JWKS and token
