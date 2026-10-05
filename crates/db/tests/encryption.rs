@@ -475,6 +475,7 @@ fn realm_like(row_pk: i64) -> forge_crypto::envelope::AeadBinding<'static> {
         table: "test",
         column: "secret",
         row_pk,
+        destination: None,
     }
 }
 
@@ -501,10 +502,12 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
     let repo = repository_dao::insert_repository(&pool, NewRepository::proxy("crypt-inflight"))
         .await
         .unwrap();
+    let destination = secret_dao::upstream_destination(repo.remote_url.as_deref());
     let repo_binding = forge_crypto::envelope::AeadBinding {
         table: secret_dao::UPSTREAM_PASSWORD_TABLE,
         column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
         row_pk: repo.id,
+        destination: Some(&destination),
     };
 
     // A writer sealed under DEK v1, then DEK v2 became active (v1 retiring).
@@ -575,7 +578,13 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
         let envelope = envelope.clone();
         let id = repo.id;
         tokio::spawn(async move {
-            secret_dao::set_upstream_password(&pool, &envelope, id, Some(&secret("late"))).await
+            secret_dao::set_upstream_password(
+                &mut pool.acquire().await.unwrap(),
+                &envelope,
+                id,
+                Some(&secret("late")),
+            )
+            .await
         })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -649,9 +658,14 @@ async fn upstream_password_end_to_end() {
     let repo1 = repository_dao::insert_repository(&pool, NewRepository::proxy("crypt-p1"))
         .await
         .expect("insert repo1");
-    secret_dao::set_upstream_password(&pool, &envelope, repo1.id, Some(&secret("hunter2")))
-        .await
-        .expect("set password");
+    secret_dao::set_upstream_password(
+        &mut pool.acquire().await.unwrap(),
+        &envelope,
+        repo1.id,
+        Some(&secret("hunter2")),
+    )
+    .await
+    .expect("set password");
     let got = secret_dao::get_upstream_password(&pool, &envelope, repo1.id)
         .await
         .expect("get password")
@@ -729,9 +743,14 @@ async fn upstream_password_end_to_end() {
             .is_err(),
         "repo1's blob pasted into repo2 must fail (row-bound AAD)"
     );
-    secret_dao::set_upstream_password(&pool, &envelope, repo2.id, None)
-        .await
-        .unwrap();
+    secret_dao::set_upstream_password(
+        &mut pool.acquire().await.unwrap(),
+        &envelope,
+        repo2.id,
+        None,
+    )
+    .await
+    .unwrap();
 
     // ── plaintext backfill (slice-1 rows) ────────────────────────────────────
     let mut legacy = NewRepository::proxy("crypt-legacy");
@@ -752,6 +771,7 @@ async fn upstream_password_end_to_end() {
                 table: secret_dao::UPSTREAM_PASSWORD_TABLE,
                 column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
                 row_pk: leftover.id,
+                destination: None,
             },
         )
         .await
@@ -779,6 +799,7 @@ async fn upstream_password_end_to_end() {
                 table: secret_dao::UPSTREAM_PASSWORD_TABLE,
                 column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
                 row_pk: stale.id,
+                destination: None,
             },
         )
         .await
@@ -1080,4 +1101,210 @@ async fn realm_secrets_end_to_end() {
     for id in [sealed.id, legacy.id] {
         auth_realm_dao::delete_realm(&pool, id).await.unwrap();
     }
+}
+
+/// The upstream password is bound to the origin of its row's `remote_url`
+/// (review: "the ciphertext is not bound to where the secret is sent"). A
+/// row repointed at another host outside the API no longer decrypts, so the
+/// proxy can never send the password there; a path change on the same origin
+/// keeps it. A blob a pre-release build sealed under the row-only binding
+/// opens only with `crypto.accept_row_bound_secrets`, and is then moved to
+/// the origin binding by the re-encrypt sweep.
+#[tokio::test]
+async fn upstream_password_is_bound_to_the_remote_origin() {
+    let pool = pool().await;
+    let scope = format!("origin-{}", uuid::Uuid::new_v4());
+    let root = KeyBytes::generate();
+    let envelope = instance(&pool, &scope, &root);
+    envelope.ensure_active_keys().await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let mut new = NewRepository::proxy(format!("crypt-origin-{suffix}"));
+    new.remote_url = Some("https://Nexus.Example:443/repository/nuget/index.json".into());
+    let repo = repository_dao::insert_repository(&pool, new).await.unwrap();
+    let set_url = |url: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE repository SET remote_url = $2 WHERE id = $1")
+                .bind(repo.id)
+                .bind(url)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    let read = || secret_dao::get_upstream_credential(&pool, &envelope, repo.id);
+
+    secret_dao::set_upstream_password(
+        &mut pool.acquire().await.unwrap(),
+        &envelope,
+        repo.id,
+        Some(&secret("pw")),
+    )
+    .await
+    .unwrap();
+    let got = read().await.unwrap().unwrap();
+    assert_eq!(got.secret.expose_secret(), "pw");
+    assert_eq!(
+        got.remote_url.as_deref(),
+        Some("https://Nexus.Example:443/repository/nuget/index.json")
+    );
+
+    // Same origin (case, default port and path do not matter): still readable.
+    set_url("https://nexus.example/other/index.json").await;
+    assert_eq!(read().await.unwrap().unwrap().secret.expose_secret(), "pw");
+
+    // Another origin: the password does not decrypt, and the sweep leaves it.
+    for elsewhere in [
+        "https://attacker.example/index.json",
+        "http://nexus.example/index.json",
+        "https://nexus.example:8443/index.json",
+    ] {
+        set_url(elsewhere).await;
+        assert!(
+            matches!(
+                read().await,
+                Err(secret_dao::SecretDbError::Crypto(
+                    forge_crypto::CryptoError::DecryptFailed
+                ))
+            ),
+            "{elsewhere}"
+        );
+    }
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, repo.id - 1, 1)
+        .await
+        .expect("an undecryptable row does not fail the sweep");
+    assert_eq!(swept.resealed, 0);
+    set_url("https://nexus.example/index.json").await;
+    assert_eq!(read().await.unwrap().unwrap().secret.expose_secret(), "pw");
+
+    // A blob sealed by a pre-release build (row-only binding) is refused by
+    // default, and the sweep leaves it alone …
+    let legacy = envelope
+        .seal(
+            &secret("legacy-pw"),
+            forge_crypto::envelope::AeadBinding {
+                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
+                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
+                row_pk: repo.id,
+                destination: None,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repository SET upstream_password_enc = $2 WHERE id = $1")
+        .bind(repo.id)
+        .bind(&legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read().await,
+        Err(secret_dao::SecretDbError::Crypto(
+            forge_crypto::CryptoError::DecryptFailed
+        ))
+    ));
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, repo.id - 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(swept.resealed, 0);
+    // … but an instance started with `crypto.accept_row_bound_secrets` opens
+    // it, and its sweep re-seals it for the current origin, once.
+    let migrating = EnvelopeService::new(
+        Arc::new(PgKeyStore::new(pool.clone())),
+        Arc::new(StaticRootProvider::new(
+            "env",
+            Algorithm::Aes256Gcm,
+            KeyBytes::from_slice(root.expose()).unwrap(),
+            vec![],
+        )),
+        EnvelopeServiceConfig {
+            scope: scope.clone(),
+            accept_row_bound_secrets: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        secret_dao::get_upstream_credential(&pool, &migrating, repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .secret
+            .expose_secret(),
+        "legacy-pw"
+    );
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(swept.resealed, 1);
+    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(swept.resealed, 0, "converged");
+    // The re-sealed blob opens without the switch.
+    assert_eq!(
+        read().await.unwrap().unwrap().secret.expose_secret(),
+        "legacy-pw"
+    );
+    set_url("https://attacker.example/index.json").await;
+    assert!(read().await.is_err(), "now bound to the origin");
+}
+
+/// An OIDC realm's client secret is bound to its issuer and client id: a
+/// realm repointed at another issuer outside the API fails closed instead of
+/// handing the secret to that issuer's token endpoint.
+#[tokio::test]
+async fn oidc_client_secret_is_bound_to_the_issuer() {
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("issuer-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    let realm = secret_dao::insert_realm_with_secrets(
+        &pool,
+        Some(&envelope),
+        NewAuthRealm {
+            kind: "oidc".into(),
+            name: format!("idp-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: 4_000_000 + (std::process::id() % 100_000) as i32,
+            config: serde_json::json!({
+                "issuer": "https://login.example/tenant/v2.0",
+                "client_id": "forge",
+                "client_secret": "s3cret",
+            }),
+        },
+        &["client_secret"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        secret_dao::realm_config(Some(&envelope), &realm)
+            .await
+            .unwrap()["client_secret"],
+        "s3cret"
+    );
+    for (key, value) in [
+        ("issuer", "https://attacker.example/v2.0"),
+        ("client_id", "someone-else"),
+    ] {
+        let mut repointed = realm.clone();
+        repointed.config[key] = serde_json::json!(value);
+        assert!(
+            matches!(
+                secret_dao::realm_config(Some(&envelope), &repointed).await,
+                Err(secret_dao::SecretDbError::Crypto(
+                    forge_crypto::CryptoError::DecryptFailed
+                ))
+            ),
+            "{key}"
+        );
+    }
+    // Fields the secret is not bound to may change.
+    let mut renamed = realm.clone();
+    renamed.config["scopes"] = serde_json::json!(["openid", "email"]);
+    assert_eq!(
+        secret_dao::realm_config(Some(&envelope), &renamed)
+            .await
+            .unwrap()["client_secret"],
+        "s3cret"
+    );
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
 }

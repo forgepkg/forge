@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM group_member\n        WHERE group_id = $1 AND member_id = $2 AND NOT owner\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df6da7e66daca811f6157e8d92ac3866ebadab35669c05ddba9bfe77672904de"
+}

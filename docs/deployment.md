@@ -130,6 +130,19 @@ and realm secrets are encrypted and the plaintext copies are removed, and an
 instance still running without `[crypto]` cannot read them from then on.
 Turning encryption off again is not supported: an instance without `[crypto]`
 refuses to start while the database holds encrypted secrets.
+
+Each encrypted secret is bound to its row and to where it is sent: a proxy
+password to the origin (scheme, host and port) of the repository's
+`remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`.
+Changing those through the admin API asks for the secret again. Changing
+them directly in the database makes the secret undecryptable (the proxy
+then fails instead of sending the password to the new host), and it has to
+be entered again through the API.
+Secrets sealed by pre-release builds were bound to their row only. They
+do not decrypt unless `crypto.accept_row_bound_secrets = true`; start every
+instance once with it so startup re-seals them for their destination, then
+remove it (while it is on, an old blob copied into a repointed row would be
+accepted).
 `GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
 plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
@@ -260,7 +273,15 @@ largest package download.
 Instances coordinate through PostgreSQL (row locks and leases), so any number
 can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
-password-failure lockout is kept in memory on each instance.
+password-failure lockout is kept in memory on each instance; the networks a
+username signed in from, which that username's backoff exempts, are shared
+through the database.
+
+Redis is optional at runtime: an instance starts while Redis is unreachable
+(after waiting a few seconds for it) and works from its own memory until
+Redis is back. A Redis that stops answering slows only the requests that
+talk to it, and an instance whose invalidation subscription goes silent
+notices within about 15 s, drops its in-memory cache and resubscribes.
 
 - **Connections.** Every instance opens up to `database.max_connections`
   (default 20); keep instances × that below PostgreSQL's `max_connections`.
@@ -275,10 +296,14 @@ password-failure lockout is kept in memory on each instance.
   to the instance first (for Kubernetes a `preStop` sleep of 5 to 10 s),
   otherwise requests routed in that gap are refused, and a refused push is
   not retried.
-- **Temp space.** Pushes and first-time proxy downloads are staged in the
-  temp directory (up to `server.max_upload_bytes` and
-  `proxy.max_package_bytes` each, several at once); size it for your
-  largest packages times the expected concurrency.
+- **Temp space.** Pushes and first-time proxy downloads are staged in
+  `server.staging_dir` (default `forge-staging` in the system temp
+  directory). All staged files of an instance share `server.max_staging_bytes`
+  (default four times the larger of `server.max_upload_bytes` and
+  `proxy.max_package_bytes`, so 4 GiB; `0` removes the limit); past it,
+  pushes and downloads are answered `503` with `Retry-After` until space
+  frees up. Size the volume above that budget. Files a killed process left
+  there are removed at startup.
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.

@@ -6,16 +6,29 @@
 //! Callers see [`PlaintextSecret`] only; the envelope blob never leaves this
 //! module's helpers undecrypted except as the opaque `bytea` column value. The
 //! AAD binds each ciphertext to `('repository', 'upstream_password_enc',
-//! <row id>)`, so a blob copied into another row (or a future secret column)
-//! fails to decrypt.
+//! <row id>)` and to the **origin of the row's `remote_url`**, so a blob
+//! copied into another row (or a future secret column) fails to decrypt, and
+//! so does one whose row was repointed at another host by a write that
+//! bypassed the admin API (which drops or replaces the password when the
+//! origin changes): the password is never sent anywhere else.
+//!
+//! Blobs sealed by pre-release builds carry the row-only binding. They are
+//! opened only while `crypto.accept_row_bound_secrets` is on
+//! ([`EnvelopeService::accepts_row_bound_secrets`]): then readers accept them
+//! and the re-encrypt sweeps ([`reseal_upstream_passwords_batch`],
+//! [`reseal_realm_secrets`]) re-seal them under the destination binding, at
+//! startup and on every rotation pass. Off (the default), such a blob does
+//! not decrypt, so an old blob replayed into a repointed row is refused too.
 //!
 //! This module is the seam secret columns adopt: one `(table, column)`
 //! constant pair + the same set/get/backfill/sweep helpers per column. Auth
 //! realm secrets (OIDC `client_secret`, credential-forwarding `key_pepper`,
 //! review P1.5) use it too: the secret keys of a realm `config` are sealed as
 //! one JSON object into `auth_realm.secrets_enc`, AAD-bound to
-//! `('auth_realm', 'secrets_enc', <row id>)`, and stripped from the plaintext
-//! `config` (see [`insert_realm_with_secrets`] / [`realm_config`]).
+//! `('auth_realm', 'secrets_enc', <row id>)` plus the config fields the
+//! secret belongs to ([`realm_secret_binding_keys`]: an OIDC realm's issuer
+//! and client id), and stripped from the plaintext `config` (see
+//! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
 //! ## DEK revocation vs. concurrent writers
 //!
@@ -45,12 +58,47 @@ pub const UPSTREAM_PASSWORD_TABLE: &str = "repository";
 /// Owning column of the encrypted upstream password (AAD component).
 pub const UPSTREAM_PASSWORD_COLUMN: &str = "upstream_password_enc";
 
-/// The AAD binding for `repository.upstream_password_enc` of one row.
-fn binding(repo_id: i64) -> AeadBinding<'static> {
+/// Where a repository's upstream password may be sent: the origin of its
+/// `remote_url` (`scheme://host[:port]`, as the proxy attaches credentials
+/// only to that origin), the raw value if it does not parse, or `""` without
+/// one.
+pub fn upstream_destination(remote_url: Option<&str>) -> String {
+    match remote_url {
+        Some(raw) => match url::Url::parse(raw) {
+            Ok(url) => url.origin().ascii_serialization(),
+            Err(_) => raw.to_string(),
+        },
+        None => String::new(),
+    }
+}
+
+/// The AAD binding for `repository.upstream_password_enc` of one row whose
+/// [`upstream_destination`] is `destination`.
+fn binding(repo_id: i64, destination: &str) -> AeadBinding<'_> {
     AeadBinding {
         table: UPSTREAM_PASSWORD_TABLE,
         column: UPSTREAM_PASSWORD_COLUMN,
         row_pk: repo_id,
+        destination: Some(destination),
+    }
+}
+
+/// Open `blob` under `binding`, or, for a blob a pre-release build sealed and
+/// only while `crypto.accept_row_bound_secrets` is on, under the same row's
+/// row-only binding. The flag says the blob still has to be re-sealed under
+/// `binding`.
+async fn open_bound(
+    envelope: &EnvelopeService,
+    blob: &[u8],
+    binding: AeadBinding<'_>,
+) -> Result<(PlaintextSecret, bool), CryptoError> {
+    match envelope.open(blob, binding).await {
+        Ok(plaintext) => Ok((plaintext, false)),
+        Err(CryptoError::DecryptFailed) if envelope.accepts_row_bound_secrets() => envelope
+            .open(blob, binding.row_only())
+            .await
+            .map(|plaintext| (plaintext, true)),
+        Err(e) => Err(e),
     }
 }
 
@@ -67,6 +115,10 @@ pub enum SecretDbError {
     /// The referenced repository row does not exist.
     #[error("repository {0} not found")]
     RepoNotFound(i64),
+    /// The repository's `remote_url` changed while its password was being
+    /// sealed for the previous one; nothing was written.
+    #[error("repository {0} changed its remote_url concurrently")]
+    DestinationChanged(i64),
     /// A realm's secrets are encrypted but no envelope service is configured
     /// (or the decrypted document is malformed): fail closed.
     #[error("auth realm {0} secrets unavailable: {1}")]
@@ -74,26 +126,35 @@ pub enum SecretDbError {
 }
 
 /// Store (or clear) a repository's upstream password, **encrypted** under the
-/// active DEK with the row-bound AAD. The plaintext `upstream_password` column
-/// is cleared in the same statement: once a secret is written through the
-/// envelope, plaintext never reappears for that row.
+/// active DEK with the AAD bound to the row and its current `remote_url`
+/// origin. The plaintext `upstream_password` column is cleared in the same
+/// statement: once a secret is written through the envelope, plaintext never
+/// reappears for that row.
 ///
-/// Accepts any executor so the admin API can commit it atomically with the
-/// repository metadata it belongs to (a new `remote_url` must never become
-/// visible with the previous host's credentials). The write holds a
-/// `FOR SHARE` lock on the sealing DEK (see the module docs) and fails with
-/// [`CryptoError::KeyRevoked`] if that DEK was revoked concurrently.
-pub async fn set_upstream_password<'e, E>(
-    executor: E,
+/// Takes a connection (a transaction's, from the admin API) so it can commit
+/// atomically with the repository metadata it belongs to (a new `remote_url`
+/// must never become visible with the previous host's credentials); the
+/// `remote_url` that transaction wrote is the one bound.
+/// The write holds a `FOR SHARE` lock on the sealing DEK (see the module
+/// docs) and fails with [`CryptoError::KeyRevoked`] if that DEK was revoked
+/// concurrently, or with [`SecretDbError::DestinationChanged`] if the
+/// `remote_url` changed in between.
+pub async fn set_upstream_password(
+    conn: &mut sqlx::PgConnection,
     envelope: &EnvelopeService,
     repo_id: i64,
     secret: Option<&PlaintextSecret>,
-) -> Result<(), SecretDbError>
-where
-    E: sqlx::PgExecutor<'e>,
-{
+) -> Result<(), SecretDbError> {
+    let remote_url = sqlx::query_scalar!(
+        r#"SELECT remote_url FROM repository WHERE id = $1"#,
+        repo_id,
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(SecretDbError::RepoNotFound(repo_id))?;
+    let destination = upstream_destination(remote_url.as_deref());
     let blob = match secret {
-        Some(pt) => Some(envelope.seal(pt, binding(repo_id)).await?),
+        Some(pt) => Some(envelope.seal(pt, binding(repo_id, &destination)).await?),
         None => None,
     };
     let dek_version = blob
@@ -112,24 +173,30 @@ where
             UPDATE repository
             SET upstream_password_enc = $2, upstream_password = NULL
             WHERE id = $1 AND ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek))
+              AND remote_url IS NOT DISTINCT FROM $5
             RETURNING id
         )
         SELECT
             EXISTS (SELECT 1 FROM upd) AS "updated!",
-            ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek)) AS "dek_usable!"
+            ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek)) AS "dek_usable!",
+            EXISTS (SELECT 1 FROM repository WHERE id = $1) AS "exists!"
         "#,
         repo_id,
         blob.as_deref(),
         envelope.scope(),
         dek_version,
+        remote_url,
     )
-    .fetch_one(executor)
+    .fetch_one(&mut *conn)
     .await?;
     if !row.dek_usable {
         return Err(revoked_dek(dek_version));
     }
-    if !row.updated {
+    if !row.exists {
         return Err(SecretDbError::RepoNotFound(repo_id));
+    }
+    if !row.updated {
+        return Err(SecretDbError::DestinationChanged(repo_id));
     }
     Ok(())
 }
@@ -169,6 +236,16 @@ async fn lock_sealing_dek(
     }
 }
 
+/// A repository's upstream password with the `remote_url` read in the same
+/// row: the URL whose origin the password is bound to, and so the only place
+/// it may be sent.
+pub struct UpstreamPassword {
+    /// The decrypted (or legacy plaintext) password.
+    pub secret: PlaintextSecret,
+    /// The row's `remote_url` at the time of the read.
+    pub remote_url: Option<String>,
+}
+
 /// Read a repository's upstream password, decrypting the envelope blob.
 ///
 /// Backfill compatibility: a row that has not been backfilled yet (plaintext
@@ -181,9 +258,22 @@ pub async fn get_upstream_password(
     envelope: &EnvelopeService,
     repo_id: i64,
 ) -> Result<Option<PlaintextSecret>, SecretDbError> {
+    Ok(get_upstream_credential(pool, envelope, repo_id)
+        .await?
+        .map(|password| password.secret))
+}
+
+/// [`get_upstream_password`] together with the `remote_url` it is bound to.
+/// A blob whose row now names another origin does not decrypt
+/// ([`CryptoError::DecryptFailed`]).
+pub async fn get_upstream_credential(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+    repo_id: i64,
+) -> Result<Option<UpstreamPassword>, SecretDbError> {
     let row = sqlx::query!(
         r#"
-        SELECT upstream_password_enc, upstream_password
+        SELECT upstream_password_enc, upstream_password, remote_url
         FROM repository
         WHERE id = $1
         "#,
@@ -193,10 +283,21 @@ pub async fn get_upstream_password(
     .await?
     .ok_or(SecretDbError::RepoNotFound(repo_id))?;
 
-    match row.upstream_password_enc {
-        Some(blob) => Ok(Some(envelope.open(&blob, binding(repo_id)).await?)),
-        None => Ok(row.upstream_password.map(PlaintextSecret::from)),
-    }
+    let secret = match row.upstream_password_enc {
+        Some(blob) => {
+            let destination = upstream_destination(row.remote_url.as_deref());
+            let (secret, _) = open_bound(envelope, &blob, binding(repo_id, &destination)).await?;
+            secret
+        }
+        None => match row.upstream_password {
+            Some(plaintext) => PlaintextSecret::from(plaintext),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(UpstreamPassword {
+        secret,
+        remote_url: row.remote_url,
+    }))
 }
 
 /// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3).
@@ -226,7 +327,8 @@ pub async fn backfill_upstream_passwords(
         r#"
         SELECT id,
                upstream_password AS "upstream_password!",
-               upstream_password_enc AS "upstream_password_enc!"
+               upstream_password_enc AS "upstream_password_enc!",
+               remote_url
         FROM repository
         WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NOT NULL
         ORDER BY id
@@ -238,8 +340,11 @@ pub async fn backfill_upstream_passwords(
     .await?;
     let mut cleared: u64 = 0;
     for row in both {
+        let destination = upstream_destination(row.remote_url.as_deref());
+        // A blob still under the row-only binding counts as a mismatch: it is
+        // re-sealed from the plaintext copy under the destination binding.
         let matches = match envelope
-            .open(&row.upstream_password_enc, binding(row.id))
+            .open(&row.upstream_password_enc, binding(row.id, &destination))
             .await
         {
             Ok(opened) => opened.expose_secret() == row.upstream_password.as_str(),
@@ -266,7 +371,9 @@ pub async fn backfill_upstream_passwords(
             .await?
         } else {
             let secret = PlaintextSecret::from(row.upstream_password.clone());
-            let blob = envelope.seal(&secret, binding(row.id)).await?;
+            let blob = envelope
+                .seal(&secret, binding(row.id, &destination))
+                .await?;
             let dek_version = EnvelopeService::blob_dek_version(&blob)?;
             sqlx::query!(
                 r#"
@@ -278,6 +385,7 @@ pub async fn backfill_upstream_passwords(
                 UPDATE repository
                 SET upstream_password_enc = $2, upstream_password = NULL
                 WHERE id = $1 AND upstream_password = $3 AND upstream_password_enc = $4
+                  AND remote_url IS NOT DISTINCT FROM $7
                   AND EXISTS (SELECT 1 FROM dek)
                 "#,
                 row.id,
@@ -286,6 +394,7 @@ pub async fn backfill_upstream_passwords(
                 row.upstream_password_enc,
                 envelope.scope(),
                 dek_version,
+                row.remote_url,
             )
             .execute(pool)
             .await?
@@ -295,7 +404,7 @@ pub async fn backfill_upstream_passwords(
 
     let rows = sqlx::query!(
         r#"
-        SELECT id, upstream_password AS "upstream_password!"
+        SELECT id, upstream_password AS "upstream_password!", remote_url
         FROM repository
         WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NULL
         ORDER BY id
@@ -309,7 +418,10 @@ pub async fn backfill_upstream_passwords(
     let mut done = usize::try_from(cleared).unwrap_or(0);
     for row in rows {
         let secret = PlaintextSecret::from(row.upstream_password.clone());
-        let blob = envelope.seal(&secret, binding(row.id)).await?;
+        let destination = upstream_destination(row.remote_url.as_deref());
+        let blob = envelope
+            .seal(&secret, binding(row.id, &destination))
+            .await?;
         let dek_version = EnvelopeService::blob_dek_version(&blob)?;
         let res = sqlx::query!(
             r#"
@@ -322,6 +434,7 @@ pub async fn backfill_upstream_passwords(
             SET upstream_password_enc = $2, upstream_password = NULL
             WHERE id = $1 AND upstream_password = $3
               AND upstream_password_enc IS NULL
+              AND remote_url IS NOT DISTINCT FROM $6
               AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
@@ -329,12 +442,42 @@ pub async fn backfill_upstream_passwords(
             row.upstream_password,
             envelope.scope(),
             dek_version,
+            row.remote_url,
         )
         .execute(pool)
         .await?;
         done += usize::try_from(res.rows_affected()).unwrap_or(0);
     }
     Ok(done)
+}
+
+/// The re-sealed blob for a sweep, or `None` when `blob` is already sealed
+/// under `binding` with the active DEK. A blob that does not decrypt under
+/// `binding` (nor, when accepted, its row-only form) is logged and skipped.
+async fn reseal_if_due(
+    envelope: &EnvelopeService,
+    blob: &[u8],
+    binding: AeadBinding<'_>,
+) -> Result<Option<Vec<u8>>, SecretDbError> {
+    let (plaintext, legacy) = match open_bound(envelope, blob, binding).await {
+        Ok(opened) => opened,
+        Err(CryptoError::DecryptFailed) => {
+            tracing::warn!(
+                table = binding.table,
+                row = binding.row_pk,
+                accept_row_bound_secrets = envelope.accepts_row_bound_secrets(),
+                "sealed secret does not decrypt for its row's current destination; left as is \
+                 (enter the secret again through the admin API, or, for a secret a pre-release \
+                 build sealed, start once with crypto.accept_row_bound_secrets = true)"
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !legacy && !envelope.needs_reseal(blob).await? {
+        return Ok(None);
+    }
+    Ok(Some(envelope.seal(&plaintext, binding).await?))
 }
 
 /// Result of one [`reseal_upstream_passwords_batch`] call.
@@ -349,9 +492,13 @@ pub struct SweepBatch {
 
 /// One keyset-paginated batch of the **DEK-rotation re-encrypt sweep** (plan
 /// §2.7): re-seal every `upstream_password_enc` blob that references a
-/// non-active DEK. Each row is one guarded UPDATE (last-writer-wins with a
-/// concurrent admin password change — both old and new DEKs decrypt during the
-/// window, so any interleaving stays readable).
+/// non-active DEK, or (with `crypto.accept_row_bound_secrets`) that a
+/// pre-release build sealed under the row-only binding (it is re-sealed for
+/// the row's current origin). Each row is one guarded UPDATE (last-writer-wins
+/// with a concurrent admin password change — both old and new DEKs decrypt
+/// during the window, so any interleaving stays readable). A blob that does
+/// not decrypt (its row was repointed outside the API) is logged and left
+/// alone, so it cannot stall the sweep for every other row.
 pub async fn reseal_upstream_passwords_batch(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -360,7 +507,7 @@ pub async fn reseal_upstream_passwords_batch(
 ) -> Result<SweepBatch, SecretDbError> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, upstream_password_enc AS "upstream_password_enc!"
+        SELECT id, upstream_password_enc AS "upstream_password_enc!", remote_url
         FROM repository
         WHERE upstream_password_enc IS NOT NULL AND id > $1
         ORDER BY id
@@ -380,15 +527,16 @@ pub async fn reseal_upstream_passwords_batch(
 
     let mut resealed = 0;
     for row in rows {
-        if !envelope.needs_reseal(&row.upstream_password_enc).await? {
+        let destination = upstream_destination(row.remote_url.as_deref());
+        let bound = binding(row.id, &destination);
+        let Some(new_blob) = reseal_if_due(envelope, &row.upstream_password_enc, bound).await?
+        else {
             continue;
-        }
-        let new_blob = envelope
-            .reseal(&row.upstream_password_enc, binding(row.id))
-            .await?;
-        // Guarded on the old blob value so a racing password change (or a
-        // racing sweep on another instance) is never overwritten, and on the
-        // sealing DEK still being usable (module docs).
+        };
+        // Guarded on the old blob value and the URL it was bound to, so a
+        // racing password change (or a racing sweep on another instance) is
+        // never overwritten, and on the sealing DEK still being usable
+        // (module docs).
         let res = sqlx::query!(
             r#"
             WITH dek AS (
@@ -399,6 +547,7 @@ pub async fn reseal_upstream_passwords_batch(
             UPDATE repository
             SET upstream_password_enc = $2
             WHERE id = $1 AND upstream_password_enc = $3
+              AND remote_url IS NOT DISTINCT FROM $6
               AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
@@ -406,6 +555,7 @@ pub async fn reseal_upstream_passwords_batch(
             &row.upstream_password_enc,
             envelope.scope(),
             EnvelopeService::blob_dek_version(&new_blob)?,
+            row.remote_url,
         )
         .execute(pool)
         .await?;
@@ -582,12 +732,36 @@ pub const REALM_SECRETS_TABLE: &str = "auth_realm";
 /// Owning column of encrypted realm secrets (AAD component).
 pub const REALM_SECRETS_COLUMN: &str = "secrets_enc";
 
+/// Config keys a realm kind's secrets belong to: the secret is the
+/// credential for that party, so changing any of them makes the stored secret
+/// unusable (the admin API then requires a new one, and the ciphertext is
+/// bound to them).
+pub fn realm_secret_binding_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        // The client secret is the IdP's credential for this client.
+        "oidc" => &["issuer", "client_id"],
+        _ => &[],
+    }
+}
+
+/// The destination a realm's sealed secrets are bound to: its
+/// [`realm_secret_binding_keys`] values, as a JSON array (`[]` for a kind
+/// without any).
+fn realm_destination(kind: &str, config: &JsonValue) -> String {
+    let values = realm_secret_binding_keys(kind)
+        .iter()
+        .map(|key| config.get(*key).cloned().unwrap_or(JsonValue::Null))
+        .collect();
+    JsonValue::Array(values).to_string()
+}
+
 /// The AAD binding for `auth_realm.secrets_enc` of one row.
-fn realm_binding(realm_id: i64) -> AeadBinding<'static> {
+fn realm_binding(realm_id: i64, destination: &str) -> AeadBinding<'_> {
     AeadBinding {
         table: REALM_SECRETS_TABLE,
         column: REALM_SECRETS_COLUMN,
         row_pk: realm_id,
+        destination: Some(destination),
     }
 }
 
@@ -628,7 +802,8 @@ pub async fn realm_config(
         realm.id,
         "secrets are encrypted but secret encryption is not configured",
     ))?;
-    let plaintext = envelope.open(blob, realm_binding(realm.id)).await?;
+    let destination = realm_destination(&realm.kind, &realm.config);
+    let (plaintext, _) = open_bound(envelope, blob, realm_binding(realm.id, &destination)).await?;
     let secrets: Map<String, JsonValue> = serde_json::from_str(plaintext.expose_secret())
         .map_err(|_| SecretDbError::RealmSecrets(realm.id, "malformed secrets document"))?;
     let mut config = realm.config.clone();
@@ -643,10 +818,15 @@ pub async fn realm_config(
 async fn seal_realm_secrets(
     envelope: &EnvelopeService,
     realm_id: i64,
+    kind: &str,
+    config: &JsonValue,
     secrets: &Map<String, JsonValue>,
 ) -> Result<Vec<u8>, SecretDbError> {
     let doc = PlaintextSecret::from(JsonValue::Object(secrets.clone()).to_string());
-    Ok(envelope.seal(&doc, realm_binding(realm_id)).await?)
+    let destination = realm_destination(kind, config);
+    Ok(envelope
+        .seal(&doc, realm_binding(realm_id, &destination))
+        .await?)
 }
 
 /// Insert a realm whose `new.config` is the full logical document. With an
@@ -669,7 +849,7 @@ pub async fn insert_realm_with_secrets(
     new.config = stripped;
     let mut tx = pool.begin().await?;
     let row = auth_realm_dao::insert_realm(&mut *tx, new).await?;
-    let blob = seal_realm_secrets(envelope, row.id, &secrets).await?;
+    let blob = seal_realm_secrets(envelope, row.id, &row.kind, &row.config, &secrets).await?;
     lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row = auth_realm_dao::update_realm_and_secrets(
         &mut *tx,
@@ -711,7 +891,16 @@ pub async fn update_realm_with_secrets(
             if secrets.is_empty() {
                 None
             } else {
-                Some(seal_realm_secrets(envelope, id, &secrets).await?)
+                // The kind never changes, so the destination is taken from
+                // the config this update writes.
+                let Some(kind) =
+                    sqlx::query_scalar!(r#"SELECT kind FROM auth_realm WHERE id = $1"#, id)
+                        .fetch_optional(pool)
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                Some(seal_realm_secrets(envelope, id, &kind, &upd.config, &secrets).await?)
             }
         }
     };
@@ -724,6 +913,39 @@ pub async fn update_realm_with_secrets(
     let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(sealed)).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// [`update_realm_with_secrets`] as a compare-and-set in the caller's
+/// transaction: the row is written only while it is still `expected`
+/// ([`auth_realm_dao::update_realm_and_secrets_if_unchanged`]). `None` when it
+/// changed or is gone; nothing is written then.
+pub async fn update_realm_with_secrets_if_unchanged(
+    conn: &mut sqlx::PgConnection,
+    envelope: Option<&EnvelopeService>,
+    expected: &AuthRealm,
+    mut upd: AuthRealmUpdate,
+    secret_keys: &[&str],
+) -> Result<Option<AuthRealm>, SecretDbError> {
+    let mut blob = None;
+    if let Some(envelope) = envelope {
+        let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
+        upd.config = stripped;
+        if !secrets.is_empty() {
+            let sealed =
+                seal_realm_secrets(envelope, expected.id, &expected.kind, &upd.config, &secrets)
+                    .await?;
+            // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
+            lock_sealing_dek(conn, envelope, &sealed).await?;
+            blob = Some(sealed);
+        }
+    }
+    Ok(auth_realm_dao::update_realm_and_secrets_if_unchanged(
+        &mut *conn,
+        expected,
+        upd,
+        blob.as_deref(),
+    )
+    .await?)
 }
 
 /// Plaintext → encrypted **backfill** for realm secrets: every realm whose
@@ -759,15 +981,18 @@ pub async fn backfill_realm_secrets(
 }
 
 /// DEK-rotation re-encrypt sweep over `auth_realm.secrets_enc` (the table is
-/// small, so no pagination). Guarded on the old blob and the sealing DEK like
-/// the repository sweep. Returns how many rows were resealed.
+/// small, so no pagination): re-seals blobs under a non-active DEK and (with
+/// `crypto.accept_row_bound_secrets`) blobs a pre-release build sealed under
+/// the row-only binding. Guarded on the old
+/// blob, the config it is bound to and the sealing DEK like the repository
+/// sweep. Returns how many rows were resealed.
 pub async fn reseal_realm_secrets(
     pool: &PgPool,
     envelope: &EnvelopeService,
 ) -> Result<usize, SecretDbError> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, secrets_enc AS "secrets_enc!"
+        SELECT id, kind, config, secrets_enc AS "secrets_enc!"
         FROM auth_realm
         WHERE secrets_enc IS NOT NULL
         ORDER BY id
@@ -777,12 +1002,11 @@ pub async fn reseal_realm_secrets(
     .await?;
     let mut resealed = 0;
     for row in rows {
-        if !envelope.needs_reseal(&row.secrets_enc).await? {
+        let destination = realm_destination(&row.kind, &row.config);
+        let bound = realm_binding(row.id, &destination);
+        let Some(new_blob) = reseal_if_due(envelope, &row.secrets_enc, bound).await? else {
             continue;
-        }
-        let new_blob = envelope
-            .reseal(&row.secrets_enc, realm_binding(row.id))
-            .await?;
+        };
         let res = sqlx::query!(
             r#"
             WITH dek AS (
@@ -792,7 +1016,7 @@ pub async fn reseal_realm_secrets(
             )
             UPDATE auth_realm
             SET secrets_enc = $2
-            WHERE id = $1 AND secrets_enc = $3
+            WHERE id = $1 AND secrets_enc = $3 AND config = $6
               AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,
@@ -800,6 +1024,7 @@ pub async fn reseal_realm_secrets(
             &row.secrets_enc,
             envelope.scope(),
             EnvelopeService::blob_dek_version(&new_blob)?,
+            &row.config,
         )
         .execute(pool)
         .await?;

@@ -243,7 +243,10 @@ pub async fn map_identity_to_principal(
 ///   holding the authorization cache drop the user's effective set.
 /// * [`AuthSource::UpstreamBasic`] without `auto_provision` → behave like
 ///   [`map_identity_to_principal`]: an existing, active upstream-basic user of
-///   that name, else `Ok(None)` (caller denies).
+///   that name, else `Ok(None)` (caller denies). The account is never created
+///   here, but an authoritative admin reading is tracked exactly as above: a
+///   realm switched to `auto_provision = false` must not keep an upstream
+///   demotion from taking effect.
 /// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → never provisioned here;
 ///   delegate to [`map_identity_to_principal`].
 ///
@@ -297,11 +300,7 @@ pub async fn provision_and_map(
         if identity.admin_authoritative {
             // Keep the RBAC admin role in step with the (authoritative) upstream
             // verdict so a demotion does not leave a stale role behind.
-            let changed =
-                forge_db::authz_dao::sync_admin_role(pool, user.id, user.is_admin).await?;
-            if changed && !user.is_admin {
-                revoke_sessions_on_demotion(pool, user.id).await?;
-            }
+            sync_upstream_admin(pool, user.id, user.is_admin, false).await?;
         }
         return Ok(Some(UserPrincipal {
             user_id: user.id,
@@ -310,7 +309,53 @@ pub async fn provision_and_map(
         }));
     }
 
+    if identity.source == AuthSource::UpstreamBasic && identity.admin_authoritative {
+        // No provisioning, but the realm fetched the groups: the upstream's
+        // admin verdict applies to the existing account all the same.
+        let Some(user) =
+            forge_db::user_dao::find_upstream_user(pool, &identity.username, identity.realm_id)
+                .await?
+        else {
+            return Ok(None);
+        };
+        if !user.active {
+            return Ok(None);
+        }
+        let is_admin = identity.suggested_is_admin;
+        if user.is_admin != is_admin {
+            match forge_db::user_dao::update_is_admin(pool, user.id, is_admin).await {
+                Ok(_) => {}
+                // Deleted since the lookup: nothing to sign in as.
+                Err(sqlx::Error::RowNotFound) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        sync_upstream_admin(pool, user.id, is_admin, user.is_admin && !is_admin).await?;
+        return Ok(Some(UserPrincipal {
+            user_id: user.id,
+            token_id: None,
+            is_admin,
+        }));
+    }
+
     map_identity_to_principal(pool, identity).await
+}
+
+/// Bring the built-in `admin` role in line with an upstream user's
+/// authoritative admin flag, ending their browser sessions when this demotes
+/// them (`column_demoted`: the `is_admin` column was just cleared, or the
+/// role was just removed).
+async fn sync_upstream_admin(
+    pool: &PgPool,
+    user_id: i64,
+    is_admin: bool,
+    column_demoted: bool,
+) -> sqlx::Result<()> {
+    let role_changed = forge_db::authz_dao::sync_admin_role(pool, user_id, is_admin).await?;
+    if !is_admin && (role_changed || column_demoted) {
+        revoke_sessions_on_demotion(pool, user_id).await?;
+    }
+    Ok(())
 }
 
 /// End every browser session of a user an authoritative source (upstream

@@ -18,6 +18,13 @@
 //! `k`/`n` sent by an already tag-capable publisher doubles as a recovery
 //! channel: receivers re-sync that tag's generation from Redis, so an
 //! invalidation whose tag publish was lost is not silently dropped.
+//!
+//! The subscription connection is pinged every [`PING_INTERVAL`]: a Redis that
+//! vanished without closing the socket (node lost, failover, NAT state
+//! dropped) would otherwise leave the subscriber waiting forever while
+//! invalidations went unheard. A ping that fails or times out ends the
+//! subscription like a closed stream: L1 is flushed and the supervisor
+//! resubscribes.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +37,14 @@ use crate::{key_tag, namespace_tag, RedisTimeouts, TagVersions};
 
 /// The pub/sub channel shared by every cache node.
 pub const CHANNEL: &str = "forge:cache:invalidate";
+
+/// How often the subscriber pings its connection.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The least time a ping gets to be answered, whatever the (short) command
+/// response timeout: a Redis briefly slow (a fork for BGSAVE) must not make
+/// every instance drop its L1 at once and stampede the database.
+const MIN_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 static NODE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -55,12 +70,13 @@ pub struct Backplane {
 }
 
 impl Backplane {
-    /// Connect the publisher and spawn the subscriber supervisor, then wait —
-    /// bounded by [`initial_subscribe_wait`] — until the first subscription is
-    /// live, so a cache handed to callers already hears peer invalidations.
-    /// If the wait times out (Redis slow at boot), construction still succeeds:
-    /// the supervisor keeps retrying and flushes L1 once it subscribes, which
-    /// drops anything filled while invalidations could not be heard.
+    /// Create the (lazily connecting) publisher and spawn the subscriber
+    /// supervisor, then wait — bounded by [`initial_subscribe_wait`] — until
+    /// the first subscription is live, so a cache handed to callers already
+    /// hears peer invalidations. If the wait times out (Redis slow or down at
+    /// boot), construction still succeeds: the supervisor keeps retrying and
+    /// flushes L1 once it subscribes, which drops anything filled while
+    /// invalidations could not be heard.
     pub async fn start(
         client: redis::Client,
         l2: RedisL2,
@@ -69,11 +85,10 @@ impl Backplane {
         timeouts: RedisTimeouts,
     ) -> Result<Self, redis::RedisError> {
         let node_id = fresh_node_id();
-        let conn = redis::aio::ConnectionManager::new_with_config(
+        let conn = redis::aio::ConnectionManager::new_lazy_with_config(
             client.clone(),
             timeouts.manager_config(),
-        )
-        .await?;
+        )?;
 
         let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(subscriber_supervisor(
@@ -166,7 +181,7 @@ async fn subscriber_supervisor(
                     ),
                 }
                 backoff = std::time::Duration::from_millis(250);
-                subscriber_loop(pubsub, &l2, &publisher, &tag_versions, node_id).await;
+                subscriber_loop(pubsub, &l2, &publisher, &tag_versions, node_id, timeouts).await;
                 // The stream ended: from here until resubscribed, peers'
                 // invalidations are not seen — flush eagerly too.
                 l1.invalidate_all();
@@ -201,33 +216,62 @@ async fn subscribe(
     Ok(pubsub)
 }
 
+/// Apply messages until the subscription ends: the stream closes, or a
+/// periodic ping fails or gets no answer within the response timeout (at
+/// least [`MIN_PING_TIMEOUT`]).
 async fn subscriber_loop(
-    mut pubsub: redis::aio::PubSub,
+    pubsub: redis::aio::PubSub,
     l2: &RedisL2,
     publisher: &redis::aio::ConnectionManager,
     tag_versions: &TagVersions,
     node_id: u64,
+    timeouts: RedisTimeouts,
 ) {
     use futures_util::StreamExt;
     let mut tag_capable_origins = HashSet::new();
-    let mut stream = pubsub.on_message();
-    while let Some(message) = stream.next().await {
-        let payload: String = match message.get_payload() {
-            Ok(payload) => payload,
-            Err(err) => {
-                tracing::warn!(error = %err, "backplane: undecodable message payload");
-                continue;
+    let (mut sink, mut stream) = pubsub.split();
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // the first tick completes immediately
+    loop {
+        tokio::select! {
+            message = stream.next() => {
+                let Some(message) = message else { return };
+                let payload: String = match message.get_payload() {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "backplane: undecodable message payload");
+                        continue;
+                    }
+                };
+                apply_message(
+                    l2,
+                    publisher,
+                    tag_versions,
+                    &mut tag_capable_origins,
+                    node_id,
+                    &payload,
+                )
+                .await;
             }
-        };
-        apply_message(
-            l2,
-            publisher,
-            tag_versions,
-            &mut tag_capable_origins,
-            node_id,
-            &payload,
-        )
-        .await;
+            _ = ping.tick() => {
+                let deadline = timeouts.response.max(MIN_PING_TIMEOUT);
+                match tokio::time::timeout(deadline, sink.ping::<redis::Value>()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "backplane ping failed; resubscribing");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout = ?deadline,
+                            "backplane ping got no answer; resubscribing"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 

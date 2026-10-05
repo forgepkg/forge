@@ -34,8 +34,13 @@ use crate::secret::KeyBytes;
 /// Current envelope `format_version` byte.
 pub const FORMAT_VERSION: u8 = 1;
 
-/// Domain-separation prefix for secret-value AADs (versioned).
+/// Domain-separation prefix for secret-value AADs bound to a row only
+/// (versioned; see [`AeadBinding::destination`]).
 const SECRET_AAD_PREFIX: &[u8] = b"forge.secret.v1";
+
+/// Domain-separation prefix for secret-value AADs bound to a row **and** the
+/// destination the secret is sent to.
+const SECRET_AAD_V2_PREFIX: &[u8] = b"forge.secret.v2";
 
 /// Domain-separation prefix for DEK-wrapped-by-KEK AADs (versioned).
 const KEY_WRAP_AAD_PREFIX: &[u8] = b"forge.key.wrap.v1";
@@ -125,22 +130,51 @@ pub struct AeadBinding<'a> {
     pub column: &'a str,
     /// The row's primary key.
     pub row_pk: i64,
+    /// Where the secret is used, taken from the same row: an upstream
+    /// origin, an OIDC issuer. Binding it means a row repointed elsewhere
+    /// (by a database write that bypasses the API, which drops or replaces
+    /// the secret) no longer decrypts, so the secret is never sent to the
+    /// new destination. `None` is the row-only binding of earlier builds.
+    pub destination: Option<&'a str>,
 }
 
 impl AeadBinding<'_> {
     /// Serialize the binding into AAD bytes:
-    /// `"forge.secret.v1" || table || 0x1F || column || 0x1F || row_pk_be`.
+    /// `"forge.secret.v1" || table || 0x1F || column || 0x1F || row_pk_be`
+    /// without a destination, and
+    /// `"forge.secret.v2" || table || 0x1F || column || 0x1F || row_pk_be ||
+    /// destination` with one (the fixed-width row key keeps the destination
+    /// unambiguous).
     pub fn aad(&self) -> Vec<u8> {
+        let destination = self.destination.unwrap_or_default();
         let mut aad = Vec::with_capacity(
-            SECRET_AAD_PREFIX.len() + self.table.len() + self.column.len() + 2 + 8,
+            SECRET_AAD_V2_PREFIX.len()
+                + self.table.len()
+                + self.column.len()
+                + 2
+                + 8
+                + destination.len(),
         );
-        aad.extend_from_slice(SECRET_AAD_PREFIX);
+        aad.extend_from_slice(match self.destination {
+            Some(_) => SECRET_AAD_V2_PREFIX,
+            None => SECRET_AAD_PREFIX,
+        });
         aad.extend_from_slice(self.table.as_bytes());
         aad.push(AAD_SEP);
         aad.extend_from_slice(self.column.as_bytes());
         aad.push(AAD_SEP);
         aad.extend_from_slice(&self.row_pk.to_be_bytes());
+        aad.extend_from_slice(destination.as_bytes());
         aad
+    }
+
+    /// The same row without its destination: the binding earlier builds
+    /// sealed under.
+    pub fn row_only(self) -> Self {
+        AeadBinding {
+            destination: None,
+            ..self
+        }
     }
 }
 
@@ -225,7 +259,7 @@ pub fn seal_with_key(
         aad,
     };
     let ciphertext = match algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
             .encrypt(
                 nonce
                     .as_slice()
@@ -235,7 +269,7 @@ pub fn seal_with_key(
             )
             // RustCrypto's encrypt only fails on absurd input sizes.
             .map_err(|_| CryptoError::MalformedEnvelope("AEAD encryption failed"))?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
             .encrypt(
                 nonce
                     .as_slice()
@@ -277,7 +311,7 @@ pub fn open_with_key(
         aad,
     };
     let plaintext = match header.algorithm {
-        Algorithm::Aes256Gcm => Aes256Gcm::new(&(*key.expose()).into())
+        Algorithm::Aes256Gcm => Aes256Gcm::new(key.expose().into())
             .decrypt(
                 nonce
                     .try_into()
@@ -285,7 +319,7 @@ pub fn open_with_key(
                 payload,
             )
             .map_err(|_| CryptoError::DecryptFailed)?,
-        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(&(*key.expose()).into())
+        Algorithm::XChaCha20Poly1305 => XChaCha20Poly1305::new(key.expose().into())
             .decrypt(
                 nonce
                     .try_into()
@@ -308,6 +342,7 @@ mod tests {
             table: "repository",
             column: "upstream_password_enc",
             row_pk,
+            destination: None,
         }
     }
 
@@ -366,6 +401,7 @@ mod tests {
             table: "repository",
             column: "other_secret_enc",
             row_pk: 7,
+            destination: None,
         };
         assert!(matches!(
             open_with_key(&key, &blob, &other_column.aad()).unwrap_err(),
@@ -376,11 +412,53 @@ mod tests {
             table: "oidc",
             column: "upstream_password_enc",
             row_pk: 7,
+            destination: None,
         };
         assert!(matches!(
             open_with_key(&key, &blob, &other_table.aad()).unwrap_err(),
             CryptoError::DecryptFailed
         ));
+    }
+
+    #[test]
+    fn destination_is_bound_and_distinct_from_the_row_only_binding() {
+        let key = KeyBytes::generate();
+        let to = |destination| AeadBinding {
+            destination: Some(destination),
+            ..binding(7)
+        };
+        let blob = seal_with_key(
+            Algorithm::Aes256Gcm,
+            &key,
+            1,
+            b"pw",
+            &to("https://nexus.example").aad(),
+        )
+        .unwrap();
+        assert_eq!(
+            &*open_with_key(&key, &blob, &to("https://nexus.example").aad()).unwrap(),
+            b"pw"
+        );
+        // Repointed elsewhere, or read under the row-only binding: no plaintext.
+        for aad in [
+            to("https://attacker.example").aad(),
+            to("").aad(),
+            to("https://nexus.example").row_only().aad(),
+        ] {
+            assert!(matches!(
+                open_with_key(&key, &blob, &aad).unwrap_err(),
+                CryptoError::DecryptFailed
+            ));
+        }
+        // An empty destination is still a destination binding, not the v1 one.
+        assert_ne!(to("").aad(), binding(7).aad());
+        // The row-only binding is byte-for-byte what earlier builds used.
+        let mut v1 = b"forge.secret.v1repository".to_vec();
+        v1.push(0x1F);
+        v1.extend_from_slice(b"upstream_password_enc");
+        v1.push(0x1F);
+        v1.extend_from_slice(&7i64.to_be_bytes());
+        assert_eq!(binding(7).aad(), v1);
     }
 
     #[test]
@@ -390,11 +468,13 @@ mod tests {
             table: "ab",
             column: "c",
             row_pk: 1,
+            destination: None,
         };
         let b = AeadBinding {
             table: "a",
             column: "bc",
             row_pk: 1,
+            destination: None,
         };
         assert_ne!(a.aad(), b.aad());
     }

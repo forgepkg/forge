@@ -96,7 +96,9 @@ pub struct CredForwardRealmConfig {
     /// `.`-separated path into the JSON body locating the user's groups.
     #[serde(default)]
     pub groups_path: String,
-    /// Optional upstream group that maps to forge admin on provision.
+    /// Optional upstream group that maps to forge admin. Every login that
+    /// fetches the groups re-applies it (grants and demotes), with or without
+    /// `auto_provision`.
     #[serde(default)]
     pub admin_group: String,
     /// `.`-separated path into the JSON success body naming the account the
@@ -338,13 +340,10 @@ pub fn redact_config(kind: &str, config: &JsonValue) -> JsonValue {
 }
 
 /// Config keys a realm's stored secrets are bound to: the secret belongs to
-/// that party, so changing any of them requires entering the secret again.
+/// that party, so changing any of them requires entering the secret again
+/// (the ciphertext is bound to them as well).
 fn secret_binding_keys(kind: &str) -> &'static [&'static str] {
-    match kind {
-        // The client secret is the IdP's credential for this client.
-        KIND_OIDC => &["issuer", "client_id"],
-        _ => &[],
-    }
+    secret_dao::realm_secret_binding_keys(kind)
 }
 
 /// Whether `key` differs between two config documents (strings compared
@@ -774,16 +773,62 @@ impl ChainSource for RealmAuth {
 
 // ─── legacy-config import (seed with drift detection) ───────────────────────
 
-/// Fingerprint a realm config document (canonical serde_json string → sha256
-/// hex, via the token hasher). Used to detect whether a seeded realm row has
-/// been modified through the admin API since the last import.
-fn config_fingerprint(config: &JsonValue) -> String {
+/// Prefix of the current seed-marker format (see [`seed_fingerprint`]).
+const SEED_FINGERPRINT_V2: &str = "v2:";
+
+/// Fingerprint a seeded realm config: sha256 hex (via the token hasher) of
+/// its canonical serde_json form **without its secret keys**. Used to detect
+/// whether a seeded realm row has been modified since the last import.
+///
+/// The secrets are left out because the marker is stored in plaintext in
+/// `forge_setting` next to the plaintext `auth_realm.config`: a hash over the
+/// whole document let anyone with a database dump test guesses for an
+/// encrypted `client_secret` / `key_pepper` offline. A secret changed
+/// through the admin API is caught by [`forget_seed`] instead, which drops
+/// the marker.
+fn seed_fingerprint(kind: &str, config: &JsonValue) -> String {
+    let mut doc = config.clone();
+    if let JsonValue::Object(map) = &mut doc {
+        for key in secret_keys(kind) {
+            map.remove(*key);
+        }
+    }
+    format!(
+        "{SEED_FINGERPRINT_V2}{}",
+        forge_core::auth::token::hash_token(&doc.to_string())
+    )
+}
+
+/// The marker pre-release builds stored: sha256 hex over the whole config,
+/// secrets included. Only ever compared once, then replaced or dropped.
+fn legacy_seed_fingerprint(config: &JsonValue) -> String {
     forge_core::auth::token::hash_token(&config.to_string())
 }
 
 /// The `forge_setting` key holding the seed fingerprint for a realm kind.
 fn seed_fingerprint_key(kind: &str) -> String {
     format!("auth_realm_seed_{kind}")
+}
+
+/// The realm row a legacy config block of `kind` is imported into.
+fn seed_name(kind: &str) -> Option<&'static str> {
+    match kind {
+        KIND_CRED_FORWARD => Some("upstream-basic"),
+        KIND_OIDC => Some("oidc"),
+        _ => None,
+    }
+}
+
+/// Record that `realm` is about to be changed through the admin API: when it
+/// is the row a legacy config block was imported into, drop the seed marker,
+/// so the block no longer re-applies over the change (the database is the
+/// authority from now on). Call it before the write: if the write then
+/// fails, the block merely stops re-applying.
+pub async fn forget_seed(pool: &PgPool, realm: &forge_db::model::AuthRealm) -> sqlx::Result<()> {
+    if seed_name(&realm.kind) == Some(realm.name.as_str()) {
+        authz_dao::delete_setting(pool, &seed_fingerprint_key(&realm.kind)).await?;
+    }
+    Ok(())
 }
 
 /// Import the legacy `[oidc]` / `[auth.upstream_basic]` TOML blocks into
@@ -793,11 +838,13 @@ fn seed_fingerprint_key(kind: &str) -> String {
 /// * **First boot** (no realm of the kind): insert a realm row from the block
 ///   and record a fingerprint of the seeded config in `forge_setting`.
 /// * **Later boots with the block still present**: if the seeded row's config
-///   still matches the recorded fingerprint (i.e. nobody edited it through the
-///   admin API), a *changed* block re-applies — operators who manage forge
+///   still matches the recorded fingerprint and nobody edited it through the
+///   admin API, a *changed* block re-applies — operators who manage forge
 ///   purely through TOML keep working the way they always did. The moment the
-///   row is edited via the API the fingerprint no longer matches and the TOML
-///   block stops clobbering it (the database is the authority).
+///   row's config is edited via the API the marker is dropped
+///   ([`forget_seed`]) and the TOML block stops clobbering it (the database
+///   is the authority). The fingerprint covers the non-secret fields only
+///   ([`seed_fingerprint`]).
 /// * A renamed/deleted seeded row is left alone (the operator took over).
 ///
 /// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
@@ -862,7 +909,6 @@ pub async fn seed_auth_realms(
             pool,
             envelope,
             KIND_CRED_FORWARD,
-            "upstream-basic",
             priority,
             serde_json::to_value(&cfg).expect("serializable"),
         )
@@ -893,7 +939,6 @@ pub async fn seed_auth_realms(
             pool,
             envelope,
             KIND_OIDC,
-            "oidc",
             priority,
             serde_json::to_value(&cfg).expect("serializable"),
         )
@@ -912,11 +957,11 @@ async fn apply_seed(
     pool: &PgPool,
     envelope: Option<&EnvelopeService>,
     kind: &str,
-    name: &str,
     priority: i32,
     config: JsonValue,
 ) -> anyhow::Result<()> {
-    let fingerprint = config_fingerprint(&config);
+    let name = seed_name(kind).expect("a seeded realm kind");
+    let fingerprint = seed_fingerprint(kind, &config);
     let key = seed_fingerprint_key(kind);
 
     match auth_realm_dao::find_realm_by_name(pool, name).await? {
@@ -950,25 +995,58 @@ async fn apply_seed(
                 tracing::warn!(realm = %name, "seeded realm secrets unreadable; skipping re-apply");
                 return Ok(());
             };
-            let last_seed = authz_dao::get_setting(pool, &key).await?;
-            let unmodified =
-                last_seed.as_deref() == Some(&config_fingerprint(&existing_config) as &str);
-            if unmodified && existing_config != config {
-                secret_dao::update_realm_with_secrets(
-                    pool,
-                    envelope,
-                    existing.id,
-                    forge_db::auth_realm_dao::AuthRealmUpdate {
-                        name: existing.name.clone(),
-                        enabled: existing.enabled,
-                        priority: existing.priority,
-                        config,
-                    },
-                    secret_keys(kind),
-                )
-                .await?;
-                authz_dao::set_setting(pool, &key, &fingerprint).await?;
+            let Some(last_seed) = authz_dao::get_setting(pool, &key).await? else {
+                return Ok(());
+            };
+            // The marker this boot may still re-apply under. An admin edit
+            // drops the marker before it writes ([`forget_seed`]), so every
+            // write below is a compare-and-set against it: a seed racing an
+            // edit backs off instead of re-creating the marker over it.
+            let marker = if last_seed.starts_with(SEED_FINGERPRINT_V2) {
+                if last_seed != seed_fingerprint(kind, &existing_config) {
+                    return Ok(());
+                }
+                last_seed
+            } else if last_seed == legacy_seed_fingerprint(&existing_config) {
+                // A pre-release marker hashes the secret as well: replace it
+                // whatever happens below.
+                let current = seed_fingerprint(kind, &existing_config);
+                if !authz_dao::replace_setting(pool, &key, &last_seed, &current).await? {
+                    return Ok(());
+                }
+                current
+            } else {
+                // A pre-release marker of an edited row.
+                authz_dao::delete_setting(pool, &key).await?;
+                return Ok(());
+            };
+            if existing_config == config {
+                return Ok(());
+            }
+            // The row is written only while it is still the one compared
+            // above, and the marker only while it is still `marker`.
+            let mut tx = pool.begin().await?;
+            let applied = secret_dao::update_realm_with_secrets_if_unchanged(
+                &mut tx,
+                envelope,
+                &existing,
+                forge_db::auth_realm_dao::AuthRealmUpdate {
+                    name: existing.name.clone(),
+                    enabled: existing.enabled,
+                    priority: existing.priority,
+                    config,
+                },
+                secret_keys(kind),
+            )
+            .await?
+            .is_some()
+                && authz_dao::replace_setting(&mut *tx, &key, &marker, &fingerprint).await?;
+            if applied {
+                tx.commit().await?;
                 tracing::info!(realm = %name, %kind, "re-applied changed legacy config (row unmodified since seed)");
+            } else {
+                tx.rollback().await?;
+                tracing::info!(realm = %name, %kind, "seeded realm changed while its legacy config was re-applied; left as is");
             }
         }
         Some(_) => {

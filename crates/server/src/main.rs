@@ -51,6 +51,26 @@ async fn main() -> anyhow::Result<()> {
     .context("connect database")?;
     forge_db::migrate(&pool).await.context("run migrations")?;
 
+    // Staging directory for pushes and proxy downloads: create it and remove
+    // what a killed process left there (files idle for an hour; a live stage
+    // writes continuously, so another instance sharing it is not affected).
+    let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
+        .with_context(|| {
+            format!(
+                "create staging directory {}",
+                config.staging_dir().display()
+            )
+        })?;
+    match staging.sweep_stale(std::time::Duration::from_secs(3600)) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            removed,
+            dir = %staging.dir().display(),
+            "removed staged files left by an earlier process"
+        ),
+        Err(e) => tracing::warn!(error = %e, "staging directory sweep failed"),
+    }
+
     // Object store (ensure the bucket exists).
     let blob_store = BlobStore::new(config.s3.to_storage());
     blob_store
@@ -58,12 +78,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure S3 bucket")?;
 
-    // Cache: L2 Redis when configured, else L1-only.
+    // Cache: L2 Redis when configured, else L1-only. Redis is connected
+    // lazily: an unreachable Redis delays startup by a few seconds (the first
+    // backplane subscription is awaited briefly) but does not prevent it.
     let cache = match &config.redis.url {
         Some(url) => {
             Cache::with_redis_timeouts(config.cache.l1_max_capacity, url, config.redis.timeouts())
                 .await
-                .context("connect redis cache")?
+                .context("configure redis cache")?
         }
         None => Cache::l1_only(config.cache.l1_max_capacity),
     };

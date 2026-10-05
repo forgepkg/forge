@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT network, last_success_at\n        FROM login_known_network\n        WHERE username_sha256 = $1 AND last_success_at >= $2\n        ORDER BY last_success_at DESC\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "network",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "login_known_network",
+            "name": "network"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_success_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "login_known_network",
+            "name": "last_success_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "70e4ea5022589af096d166fac2f1c5fdbf736679c48e9b8b4e8c398621cdb91d"
+}

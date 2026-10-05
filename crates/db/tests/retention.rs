@@ -446,6 +446,60 @@ async fn insert_audit_persists_row() {
     assert_eq!(count, 1);
 }
 
+/// Audit rows past the retention window are pruned; newer ones stay.
+#[tokio::test]
+async fn prune_audit_deletes_only_rows_past_the_cutoff() {
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("aud-prune-{n}")))
+            .await
+            .unwrap();
+    let run_id = uuid::Uuid::new_v4();
+    for version in ["1.0.0", "2.0.0"] {
+        retention_dao::insert_audit(
+            &pool,
+            &AuditRow {
+                repository_id: repo.id,
+                run_id,
+                rule_id: "r".into(),
+                action: "skipped".into(),
+                target_kind: "component".into(),
+                package_name: "lib".into(),
+                version: version.into(),
+                component_id: None,
+                blob_sha256: None,
+                ref_count_after: None,
+                blob_delete_enqueued: false,
+                dry_run: true,
+                reason: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "UPDATE retention_audit SET created_at = now() - interval '100 days' \
+         WHERE repository_id = $1 AND version = '1.0.0'",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pruned = retention_dao::prune_audit(&pool, Utc::now() - Duration::days(90), 1000)
+        .await
+        .unwrap();
+    assert!(pruned >= 1);
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM retention_audit WHERE repository_id = $1")
+            .bind(repo.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(left, vec!["2.0.0".to_string()]);
+}
+
 #[tokio::test]
 async fn schedule_now_makes_repo_immediately_due() {
     let pool = common::pool().await;

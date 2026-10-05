@@ -1,4 +1,5 @@
 import type { MemberView } from '~/api/repositories'
+import { Badge } from '~/components/catalyst/badge'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 
 /**
@@ -56,6 +57,11 @@ export function PriorityList({ members, busy, onRemove }: PriorityListProps) {
               {m.name}
             </span>
             <RepoKindBadge kind={m.kind} />
+            {m.owner && (
+              <Badge color="emerald" title="Owns this group's package ids">
+                owner
+              </Badge>
+            )}
           </span>
           <button
             type="button"

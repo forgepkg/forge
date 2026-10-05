@@ -819,6 +819,14 @@ where
         .await
 }
 
+/// Delete a `forge_setting` row by key. Returns whether it existed.
+pub async fn delete_setting(pool: &PgPool, key: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query!(r#"DELETE FROM forge_setting WHERE key = $1"#, key)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Upsert a `forge_setting` value by key (e.g. one-shot import markers like
 /// the 12.7 `auth_realms_seeded` flag).
 pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {
@@ -834,6 +842,31 @@ pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Replace a `forge_setting` value only while it is still `expected`.
+/// Returns whether it was replaced (`false` when it changed or is gone).
+pub async fn replace_setting<'e, E>(
+    executor: E,
+    key: &str,
+    expected: &str,
+    value: &str,
+) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query!(
+        r#"
+        UPDATE forge_setting SET value = $3, updated_at = now()
+        WHERE key = $1 AND value = $2
+        "#,
+        key,
+        expected,
+        value,
+    )
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Whether this install opted into legacy open access (slice-1 behavior). A

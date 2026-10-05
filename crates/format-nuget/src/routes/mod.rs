@@ -239,12 +239,18 @@ pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
         RepoError::Db(_) | RepoError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
+        RepoError::Busy(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "30")],
+            "temporarily unavailable, try again later",
+        )
+            .into_response(),
     }
 }
 
 /// Map a [`forge_core::WriteError`] to an HTTP response (spec §6 publish status
 /// codes): 413 too-large, 409 conflict, 400 invalid, else the wrapped
-/// [`RepoError`] mapping (404 / 500).
+/// [`RepoError`] mapping (404 / 500 / 503).
 pub(crate) fn write_error_response(err: forge_core::WriteError) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -269,5 +275,25 @@ pub(crate) fn write_error_response(err: forge_core::WriteError) -> axum::respons
         )
             .into_response(),
         WriteError::Repo(re) => repo_error_response(re),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A full staging budget is "try again later", not a server error.
+    #[test]
+    fn busy_is_503_with_retry_after() {
+        let resp = repo_error_response(RepoError::Busy("staging".into()));
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "30"
+        );
+        let resp = write_error_response(forge_core::WriteError::Repo(RepoError::Busy(
+            "staging".into(),
+        )));
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -181,7 +181,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/repositories/{name}/members/{member}",
-            axum::routing::delete(members::remove),
+            axum::routing::patch(members::update).delete(members::remove),
         )
         .route("/users", get(users::list).post(users::create))
         .route(

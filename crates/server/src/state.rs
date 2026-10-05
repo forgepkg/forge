@@ -11,8 +11,6 @@
 //!
 //! * [`BlobBytes`] implements both [`forge_core::repo::hosted::BlobFetch`] and
 //!   [`forge_nuget::routes::NupkgBytes`] over a [`forge_storage::BlobStore`].
-//! * [`CacheInvalidatorAdapter`] implements
-//!   [`forge_core::repo::CacheInvalidator`] over a [`forge_cache::Cache`].
 //! * [`MemberFactory`] implements [`forge_core::repo::group::MemberOpsFactory`]
 //!   by branching on a member repository's `kind`.
 
@@ -27,7 +25,9 @@ use forge_core::net::upstream::UpstreamHttp;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
-use forge_core::repo::{CacheInvalidator, PackageFilteredReadOps, RepoError, RepoReadOps};
+use forge_core::repo::{
+    CacheInvalidator, NoopCacheInvalidator, PackageFilteredReadOps, RepoError, RepoReadOps,
+};
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobStore, Cas};
@@ -35,12 +35,6 @@ use sqlx::PgPool;
 
 use crate::auth::RealmAuth;
 use crate::config::Config;
-
-/// Namespace under which hosted read responses are cached / invalidated.
-///
-/// The write path invalidates `(NS_PACKAGE, "{repo}/{lower_id}")` after a
-/// publish/unlist/relist so stale registration/search/flat reads are dropped.
-pub const NS_PACKAGE: &str = "package";
 
 /// Shared, cheaply-cloneable application state.
 #[derive(Clone)]
@@ -123,7 +117,14 @@ impl AppState {
         nuget: Arc<dyn Format>,
         config: Config,
     ) -> Self {
-        let cas = Cas::new(blob_store.clone(), pool.clone());
+        let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
+            .unwrap_or_else(|e| {
+                // main() already created the directory at startup; this only
+                // fires for embedders that skipped that.
+                tracing::error!(error = %e, "staging directory unusable; staging without a budget in the temp directory");
+                forge_storage::Staging::default()
+            });
+        let cas = Cas::new(blob_store.clone(), pool.clone()).with_staging(staging);
         // Signed-in callers share the public read reach only where everyone
         // may read anonymously (see `Authz::with_public_read_for_signed_in`).
         let authz = Authz::new(pool.clone(), cache.clone())
@@ -142,10 +143,15 @@ impl AppState {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
         });
-        let login_throttle = Arc::new(forge_core::auth::LoginThrottle::new(
-            config.auth.login_max_failures,
-            std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
-        ));
+        let login_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::new(
+                config.auth.login_max_failures,
+                std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
+            )
+            .with_known_network_store(Arc::new(
+                forge_core::auth::PgKnownNetworks::new(pool.clone()),
+            )),
+        );
         let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),
@@ -193,11 +199,13 @@ impl AppState {
         })
     }
 
-    /// A cache invalidator over the hybrid cache.
-    pub fn cache_invalidator(&self) -> Arc<CacheInvalidatorAdapter> {
-        Arc::new(CacheInvalidatorAdapter {
-            cache: self.cache.clone(),
-        })
+    /// The invalidator the write path and retention call after a package
+    /// changes. Hosted reads (registration, search, flat container) are not
+    /// cached, so there is nothing to drop: invalidating a namespace nobody
+    /// reads only cost every push, unlist, delete and retention decision a
+    /// Redis round-trip (and stalled them while Redis did).
+    pub fn cache_invalidator(&self) -> Arc<dyn CacheInvalidator> {
+        Arc::new(NoopCacheInvalidator)
     }
 
     /// Build the read ops for a single repository, branching on its `kind`.
@@ -302,20 +310,6 @@ impl forge_nuget::routes::NupkgBytes for BlobBytes {
         Ok(Box::pin(tokio_util::io::ReaderStream::new(
             stream.into_async_read(),
         )))
-    }
-}
-
-/// Invalidates cached read responses for a `(repo, id)` after a write.
-pub struct CacheInvalidatorAdapter {
-    cache: Cache,
-}
-
-#[async_trait]
-impl CacheInvalidator for CacheInvalidatorAdapter {
-    async fn invalidate_package(&self, repo: &str, lower_id: &str) {
-        self.cache
-            .invalidate(NS_PACKAGE, &format!("{repo}/{lower_id}"))
-            .await;
     }
 }
 

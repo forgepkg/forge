@@ -386,17 +386,20 @@ impl ProxyRepo {
     /// Resolve the upstream password for the outbound Basic header — the
     /// **single sanctioned decrypt site** of the proxy credential (plan §2.4):
     /// an encrypted row decrypts through `forge_db::secret_dao` (re-reading the
-    /// row so the AAD binds to fresh data); a not-yet-backfilled row falls back
-    /// to the legacy plaintext column. Fail closed: an encrypted blob without a
-    /// configured envelope service is an error, not an anonymous fetch.
+    /// row so the AAD binds to fresh data, its `remote_url` origin included);
+    /// a not-yet-backfilled row falls back to the legacy plaintext column.
+    /// Returns the password with the `remote_url` it belongs to. Fail closed:
+    /// an encrypted blob without a configured envelope service is an error,
+    /// not an anonymous fetch.
     async fn upstream_password(
         &self,
         repo: &Repository,
-    ) -> Result<Option<forge_crypto::PlaintextSecret>, RepoError> {
+    ) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
         match (&repo.upstream_password_enc, &self.envelope) {
             (Some(_), Some(envelope)) => {
-                forge_db::secret_dao::get_upstream_password(&self.pool, envelope, repo.id)
+                forge_db::secret_dao::get_upstream_credential(&self.pool, envelope, repo.id)
                     .await
+                    .map(|found| found.map(|p| (p.secret, p.remote_url)))
                     .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
             }
             (Some(_), None) => Err(RepoError::Storage(
@@ -404,24 +407,28 @@ impl ProxyRepo {
                  configured (missing [crypto] config)"
                     .into(),
             )),
-            (None, _) => Ok(repo
-                .upstream_password
-                .clone()
-                .map(forge_crypto::PlaintextSecret::from)),
+            (None, _) => Ok(repo.upstream_password.clone().map(|password| {
+                (
+                    forge_crypto::PlaintextSecret::from(password),
+                    repo.remote_url.clone(),
+                )
+            })),
         }
     }
 
     /// The Basic credentials for `repo`'s upstream, if both a username and a
-    /// password are configured.
+    /// password are configured. They are attached only to the origin of the
+    /// `remote_url` the password was read (and, encrypted, bound) with, which
+    /// may be newer than the cached `repo` row.
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RepoError> {
         let Some(username) = repo.upstream_username.clone() else {
             return Ok(None);
         };
-        let Some(password) = self.upstream_password(repo).await? else {
+        let Some((password, remote_url)) = self.upstream_password(repo).await? else {
             return Ok(None);
         };
         Ok(Some(Credentials {
-            origin: repo.remote_url.as_deref().and_then(Origin::of),
+            origin: remote_url.as_deref().and_then(Origin::of),
             username,
             password,
         }))
@@ -977,6 +984,7 @@ impl ProxyRepo {
                     )
                     .await)
             }
+            Err(e @ CasError::StagingFull { .. }) => return Err(RepoError::Busy(e.to_string())),
             Err(other) => {
                 return Err(RepoError::Storage(format!(
                     "read upstream nupkg {url}: {other}"
@@ -1041,7 +1049,10 @@ impl ProxyRepo {
             .cas
             .store(Cursor::new(parsed.nuspec_bytes.clone()), max_bytes)
             .await
-            .map_err(|e| RepoError::Storage(format!("cas store upstream nuspec: {e}")))?;
+            .map_err(|e| match e {
+                e @ CasError::StagingFull { .. } => RepoError::Busy(e.to_string()),
+                e => RepoError::Storage(format!("cas store upstream nuspec: {e}")),
+            })?;
 
         let size = i64::try_from(stored.size)
             .map_err(|_| RepoError::Storage("nupkg size overflow".into()))?;

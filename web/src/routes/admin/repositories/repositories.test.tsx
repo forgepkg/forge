@@ -255,7 +255,10 @@ describe('admin repositories', () => {
         repo({ id: 1, name: 'grp', kind: 'group' }),
         repo({ id: 2, name: 'inner', kind: 'hosted' }),
       ],
-      members: [{ name: 'existing', kind: 'hosted', priority: 100 }],
+      members: [
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+        { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+      ],
       onAddMember: () => {
         addCalled = true
         return json(null, 201)
@@ -265,8 +268,9 @@ describe('admin repositories', () => {
     const user = userEvent.setup()
     await renderAt('/manage/repositories/grp/members')
 
-    // The existing member is shown with its priority.
+    // The existing member is shown with its priority, and an owner is marked.
     expect(await screen.findByText('existing')).toBeInTheDocument()
+    expect(screen.getAllByText('owner')).toHaveLength(1)
 
     // Pick the candidate and reuse the existing priority (100) → blocked.
     await user.selectOptions(screen.getByLabelText('Repository'), 'inner')
@@ -288,7 +292,7 @@ describe('admin repositories', () => {
         repo({ id: 1, name: 'grp', kind: 'group' }),
         repo({ id: 2, name: 'inner', kind: 'hosted' }),
       ],
-      members: [{ name: 'existing', kind: 'hosted', priority: 100 }],
+      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false }],
       onAddMember: (body) => {
         posted = body
         return json(null, 201)

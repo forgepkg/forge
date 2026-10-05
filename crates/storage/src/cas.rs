@@ -9,13 +9,27 @@
 //!
 //! The returned [`StoredBlob`] keeps the temp file alive ([`tempfile::TempPath`])
 //! so the caller can hand it to a format parser before dropping it.
+//!
+//! ## Temp space
+//!
+//! Staged files live in one directory ([`Staging`]) and count against an
+//! optional byte budget shared by every upload and download of the process:
+//! bytes are reserved as they arrive and released when the temp file is
+//! dropped, and a stage that would exceed the budget fails with
+//! [`CasError::StagingFull`] instead of filling the disk (a burst of
+//! first-time proxy downloads of large packages would otherwise get the pod
+//! evicted). Files a killed process left there are removed by
+//! [`Staging::sweep_stale`] at startup.
 
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use sqlx::PgPool;
 use tempfile::TempPath;
 use tokio::io::{copy, AsyncRead, ReadBuf};
+use tokio::sync::Semaphore;
 
 use crate::hash::HashingWriter;
 use crate::s3::{BlobStore, S3Error};
@@ -43,6 +57,10 @@ const DELETION_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 pub enum CasError {
     #[error("content exceeds max_bytes limit of {limit} bytes")]
     TooLarge { limit: u64 },
+    /// Staging this content would exceed the process-wide temp-space budget
+    /// (`limit` bytes); the caller should answer "try again later".
+    #[error("temporary staging space is exhausted ({limit} bytes in use)")]
+    StagingFull { limit: u64 },
     #[error("content size {size} bytes exceeds i64::MAX and cannot be stored")]
     SizeOverflow { size: u64 },
     #[error("io error: {0}")]
@@ -63,6 +81,8 @@ pub struct StagedBlob {
     pub sha512_base64: String,
     pub size: u64,
     pub temp_path: TempPath,
+    /// The temp-space reservation, released with the temp file.
+    reservation: Option<Reservation>,
 }
 
 /// Result of ingesting content: its content address, integrity hash, size, and
@@ -85,6 +105,24 @@ pub struct StoredBlob {
     /// Lease consumed atomically with the reference-count increment.
     pub ingest_token: uuid::Uuid,
     _lease_guard: IngestLeaseGuard,
+    /// The temp-space reservation, released with the temp file.
+    _reservation: Option<Reservation>,
+}
+
+/// Bytes reserved from a staging budget, given back when dropped. Counted in
+/// `u64` itself: a tokio permit keeps its count in a `u32`, which one staged
+/// file of 4 GiB or more would overflow.
+#[derive(Debug)]
+struct Reservation {
+    budget: Arc<Semaphore>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget
+            .add_permits(usize::try_from(self.bytes).unwrap_or(usize::MAX));
+    }
 }
 
 #[derive(Debug)]
@@ -154,16 +192,110 @@ impl Drop for IngestLeaseGuard {
     }
 }
 
+/// Where staged bytes are written and how many may be staged at once.
+#[derive(Clone, Debug)]
+pub struct Staging {
+    dir: PathBuf,
+    /// One permit per byte; `None` = no budget.
+    budget: Option<Arc<Semaphore>>,
+    limit: u64,
+}
+
+impl Staging {
+    /// File-name prefix of staged files (what [`Self::sweep_stale`] removes).
+    const PREFIX: &'static str = "forge-staging-";
+
+    /// The default staging directory: `forge-staging` under the system temp
+    /// directory.
+    pub fn default_dir() -> PathBuf {
+        std::env::temp_dir().join("forge-staging")
+    }
+
+    /// Stage under `dir` (created if missing) with at most `max_bytes` in use
+    /// at once (`None`: no budget).
+    pub fn new(dir: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let limit = max_bytes.unwrap_or(0);
+        let budget = max_bytes.map(|bytes| {
+            let permits = usize::try_from(bytes)
+                .unwrap_or(usize::MAX)
+                .min(Semaphore::MAX_PERMITS);
+            Arc::new(Semaphore::new(permits))
+        });
+        Ok(Staging { dir, budget, limit })
+    }
+
+    /// The staging directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Remove staged files not modified for `older_than`: what a process left
+    /// behind when it was killed mid-request (a running stage writes its file
+    /// continuously and holds it for seconds after, so a long-idle one is
+    /// orphaned, also when several instances share the directory). Returns
+    /// how many were removed.
+    pub fn sweep_stale(&self, older_than: std::time::Duration) -> std::io::Result<usize> {
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(Self::PREFIX)
+            {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let idle = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or_default();
+            if meta.is_file() && idle >= older_than && std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+impl Default for Staging {
+    /// [`Self::default_dir`] without a budget. Falls back to the system temp
+    /// directory itself if the subdirectory cannot be created.
+    fn default() -> Self {
+        Staging::new(Self::default_dir(), None).unwrap_or_else(|_| Staging {
+            dir: std::env::temp_dir(),
+            budget: None,
+            limit: 0,
+        })
+    }
+}
+
 /// Content-addressed store coordinating the S3 object store and the blob table.
 #[derive(Clone)]
 pub struct Cas {
     store: BlobStore,
     pool: PgPool,
+    staging: Staging,
 }
 
 impl Cas {
     pub fn new(store: BlobStore, pool: PgPool) -> Self {
-        Self { store, pool }
+        Self {
+            store,
+            pool,
+            staging: Staging::default(),
+        }
+    }
+
+    /// Stage into `staging` (directory and temp-space budget) instead of the
+    /// unbounded default.
+    pub fn with_staging(mut self, staging: Staging) -> Self {
+        self.staging = staging;
+        self
     }
 
     /// Compute the stable prefix for a content hash:
@@ -192,22 +324,37 @@ impl Cas {
     {
         // Hold a NamedTempFile; convert to TempPath only on success. Until then,
         // dropping it (on any early return) unlinks the file.
-        let temp = tempfile::NamedTempFile::new()?;
+        let temp = tempfile::Builder::new()
+            .prefix(Staging::PREFIX)
+            .tempfile_in(&self.staging.dir)?;
 
+        // Cap the body while streaming so we never buffer an oversized
+        // payload to disk in full, and reserve temp space as it arrives.
+        let mut reader = BudgetedReader {
+            inner: LimitedReader::new(reader, max_bytes),
+            budget: self.staging.budget.clone(),
+            reservation: None,
+            exhausted: false,
+        };
         let (sha256, sha512_base64, size) = {
             let file = tokio::fs::File::create(temp.path()).await?;
             let mut writer = HashingWriter::new(file);
-
-            // Cap the body while streaming so we never buffer an oversized
-            // payload to disk in full.
-            let mut limited = LimitedReader::new(reader, max_bytes);
-            match copy(&mut limited, &mut writer).await {
+            match copy(&mut reader, &mut writer).await {
                 Ok(_) => {}
-                Err(e) if limited.exceeded => {
-                    // The copy failed because we tripped the limit; surface a
-                    // typed error rather than the synthetic io error.
-                    let _ = e;
+                // The copy failed because we tripped a limit; surface a typed
+                // error rather than the synthetic io error.
+                Err(_) if reader.inner.exceeded => {
                     return Err(CasError::TooLarge { limit: max_bytes });
+                }
+                Err(_) if reader.exhausted => {
+                    tracing::warn!(
+                        limit = self.staging.limit,
+                        dir = %self.staging.dir.display(),
+                        "staging budget exhausted; refusing this upload or download for now"
+                    );
+                    return Err(CasError::StagingFull {
+                        limit: self.staging.limit,
+                    });
                 }
                 Err(e) => return Err(CasError::Io(e)),
             }
@@ -221,6 +368,7 @@ impl Cas {
             sha512_base64,
             size,
             temp_path,
+            reservation: reader.reservation,
         })
     }
 
@@ -296,6 +444,7 @@ impl Cas {
             uploaded,
             ingest_token,
             _lease_guard: lease_guard,
+            _reservation: staged.reservation,
         })
     }
 
@@ -330,6 +479,54 @@ impl<R> LimitedReader<R> {
     }
 }
 
+/// Reserves one permit of the staging budget per byte read, failing the read
+/// (and flagging `exhausted`) when the budget has none left. The permits are
+/// counted in `reservation` and given back when the staged file is dropped.
+struct BudgetedReader<R> {
+    inner: R,
+    budget: Option<Arc<Semaphore>>,
+    reservation: Option<Reservation>,
+    exhausted: bool,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for BudgetedReader<LimitedReader<R>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let me = &mut *self;
+        match Pin::new(&mut me.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let read = buf.filled().len() - before;
+                let Some(budget) = me.budget.as_ref().filter(|_| read > 0) else {
+                    return Poll::Ready(Ok(()));
+                };
+                // A read never exceeds the caller's buffer, far below u32::MAX.
+                let permits = u32::try_from(read).unwrap_or(u32::MAX);
+                match budget.try_acquire_many(permits) {
+                    Ok(permit) => {
+                        // Tracked (and given back) by `Reservation` instead.
+                        permit.forget();
+                        let reservation = me.reservation.get_or_insert_with(|| Reservation {
+                            budget: budget.clone(),
+                            bytes: 0,
+                        });
+                        reservation.bytes += u64::from(permits);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(_) => {
+                        me.exhausted = true;
+                        Poll::Ready(Err(std::io::Error::other("staging budget exhausted")))
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -350,5 +547,29 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
             }
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reservation of more than `u32::MAX` bytes (one staged file of 4 GiB
+    /// or more) is given back whole.
+    #[test]
+    fn a_reservation_above_u32_is_given_back_whole() {
+        const GIB: usize = 1 << 30;
+        let budget = Arc::new(Semaphore::new(8 * GIB));
+        let mut reservation = Reservation {
+            budget: budget.clone(),
+            bytes: 0,
+        };
+        for _ in 0..5 {
+            budget.try_acquire_many(GIB as u32).unwrap().forget();
+            reservation.bytes += GIB as u64;
+        }
+        assert_eq!(budget.available_permits(), 3 * GIB);
+        drop(reservation);
+        assert_eq!(budget.available_permits(), 8 * GIB);
     }
 }

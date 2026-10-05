@@ -518,6 +518,9 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
         RepoError::RepoNotFound(_) => {
             (StatusCode::NOT_FOUND, "repository not found").into_response()
         }
+        RepoError::Busy(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response()
+        }
         other => {
             tracing::error!(error = %other, "browse read error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

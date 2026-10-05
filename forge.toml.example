@@ -20,6 +20,11 @@ allow_insecure_defaults = true  # (default: false)
 # Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
 # (never buffered in memory); larger pushes get HTTP 413.
 max_upload_bytes = 536870912    # (default: 512 MiB)
+# Pushes and first-time proxy downloads are staged here; files a killed process
+# left behind are removed at startup. All staged files of this instance share
+# max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
+# staging_dir = "/var/tmp/forge"  # (default: <system temp dir>/forge-staging)
+# max_staging_bytes = 4294967296  # (default: 4 x max(max_upload_bytes, proxy.max_package_bytes); 0 = no limit)
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
 # anonymous_mode = "allowlist": a request naming any other host is not served
@@ -137,6 +142,10 @@ batch_size = 100                # (default: 100)
 grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted
 poll_interval_seconds = 10      # (default: 10)
 processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processed outbox rows this long; 0 = never prune
+
+[retention]
+# enabled = true                         # (default: true) run the retention worker on this instance
+# audit_retention_seconds = 7776000      # (default: 7776000 = 90 days) keep retention_audit rows this long; 0 = never prune
 
 # Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
 # 12.7: this block is a one-shot SEED — on first boot it is imported into an

@@ -35,7 +35,7 @@ use forge_db::retention_dao::{self, RunSummary};
 
 use crate::format::Format;
 use crate::repo::CacheInvalidator;
-use crate::retention::apply::{apply, ApplyContext};
+use crate::retention::apply::{apply, ApplyContext, RunFence};
 use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
 use crate::retention::model::{validate_policy, RetentionPolicy};
 
@@ -155,7 +155,7 @@ impl RetentionWorker {
         // like any other failed run instead of unwinding past `fail_run` and
         // leaving the ledger row `running` until its lease expires. Nothing is
         // shared mutably across the unwind: every applied decision committed
-        // in its own transaction, and the in-flight one rolled back on drop.
+        // in its batch's transaction, and the in-flight one rolled back on drop.
         let result = AssertUnwindSafe(self.process(&repo, run_id))
             .catch_unwind()
             .await
@@ -280,6 +280,11 @@ impl RetentionWorker {
             delete_grace: self.config.delete_grace,
             dry_run: policy.dry_run_only,
             evaluated_at: Some(now),
+            fence: Some(RunFence {
+                stored_policy: &repo.policy,
+                policy: &policy,
+                format: self.format.as_ref(),
+            }),
         };
         let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
 
@@ -405,6 +410,28 @@ fn spawn_lease_heartbeat(
             }
         }
     })
+}
+
+/// Rows deleted per statement by [`prune_audit`].
+const AUDIT_PRUNE_BATCH: i64 = 1_000;
+
+/// Upper bound on statements per [`prune_audit`] call, so one pass stays short
+/// on a large backlog; the rest goes on the next call.
+const AUDIT_PRUNE_MAX_BATCHES: usize = 50;
+
+/// Delete `retention_audit` rows older than `keep`, in short batches. Returns
+/// the number of rows deleted. Safe on every instance at once.
+pub async fn prune_audit(pool: &PgPool, keep: Duration) -> sqlx::Result<u64> {
+    let cutoff = Utc::now() - keep;
+    let mut total = 0u64;
+    for _ in 0..AUDIT_PRUNE_MAX_BATCHES {
+        let deleted = retention_dao::prune_audit(pool, cutoff, AUDIT_PRUNE_BATCH).await?;
+        total += deleted;
+        if deleted < AUDIT_PRUNE_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Errors a retention tick can surface (logged; the loop continues).

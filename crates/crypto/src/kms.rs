@@ -27,6 +27,7 @@
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::envelope::{self, Algorithm, ROOT_WRAP_AAD};
 use crate::error::CryptoError;
@@ -194,13 +195,18 @@ impl KmsProvider for StaticRootProvider {
     }
 }
 
-fn env_value(var: &str) -> Result<String, CryptoError> {
+// The encoded and decoded root key are wiped once the key is loaded: only
+// the `KeyBytes` (itself zeroized on drop) outlives these helpers.
+
+fn env_value(var: &str) -> Result<Zeroizing<String>, CryptoError> {
     std::env::var(var)
+        .map(Zeroizing::new)
         .map_err(|_| CryptoError::RootKeyUnavailable(format!("env var {var} is not set")))
 }
 
-fn file_value(path: &std::path::Path) -> Result<String, CryptoError> {
+fn file_value(path: &std::path::Path) -> Result<Zeroizing<String>, CryptoError> {
     std::fs::read_to_string(path)
+        .map(Zeroizing::new)
         .map_err(|e| CryptoError::RootKeyUnavailable(format!("read {}: {e}", path.display())))
 }
 
@@ -210,6 +216,7 @@ fn key_from_base64(b64: &str) -> Result<KeyBytes, CryptoError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
+        .map(Zeroizing::new)
         .map_err(|e| CryptoError::RootKeyUnavailable(format!("invalid base64 root key: {e}")))?;
     if bytes.len() != KEY_LEN {
         return Err(CryptoError::InvalidKeyLength {

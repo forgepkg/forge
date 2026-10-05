@@ -88,6 +88,18 @@ pub struct ServerConfig {
     /// limit yields HTTP 413. Default 512 MiB.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
+    /// Directory pushes and first-time proxy downloads are staged in. Files a
+    /// killed process left there are removed at startup. Default:
+    /// `forge-staging` under the system temp directory.
+    #[serde(default)]
+    pub staging_dir: Option<std::path::PathBuf>,
+    /// Temp space all staged pushes and proxy downloads of this instance may
+    /// use at once, in bytes; a stage that would exceed it is answered `503`
+    /// with `Retry-After`. Default: four times the larger of
+    /// `max_upload_bytes` and `proxy.max_package_bytes` (4 GiB with the
+    /// defaults). `0` removes the limit. Size the staging volume above it.
+    #[serde(default)]
+    pub max_staging_bytes: Option<u64>,
     /// Permit starting with **known-insecure placeholder credentials** (the
     /// `changeme` bootstrap-admin password, `minioadmin` S3 keys).
     /// Default `false`: such a config refuses to start, so a copied dev config
@@ -446,7 +458,9 @@ pub struct UpstreamBasicAuthConfig {
     /// in the clear). Default `false`.
     #[serde(default)]
     pub allow_http: bool,
-    /// Optional upstream group that maps to forge admin on provision (grant only).
+    /// Optional upstream group that maps to forge admin. Every login that
+    /// fetches the groups re-applies it (grants and demotes), with or without
+    /// `auto_provision`.
     #[serde(default)]
     pub admin_group: String,
     /// Auto-provision an `app_user` on first successful upstream login.
@@ -740,6 +754,13 @@ pub struct RetentionConfig {
     /// Crash-safe lease held while a repo is evaluated (seconds).
     #[serde(default = "default_retention_lease")]
     pub lease_seconds: i64,
+    /// How long `retention_audit` rows are kept before the reconciler loop
+    /// deletes them (default 90 days). Dry-run policies add a row per
+    /// matched version on every run, so the table grows without this. `0`
+    /// keeps every row. Pruning runs on every instance, also where the
+    /// worker is disabled.
+    #[serde(default = "default_retention_audit_retention")]
+    pub audit_retention_seconds: u64,
 }
 
 impl Default for RetentionConfig {
@@ -749,6 +770,7 @@ impl Default for RetentionConfig {
             poll_interval_seconds: default_retention_poll(),
             default_run_interval_seconds: default_retention_run_interval(),
             lease_seconds: default_retention_lease(),
+            audit_retention_seconds: default_retention_audit_retention(),
         }
     }
 }
@@ -765,6 +787,16 @@ impl RetentionConfig {
     /// Lease as a chrono [`chrono::Duration`].
     pub fn lease(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.lease_seconds)
+    }
+    /// How long audit rows are kept, or `None` when pruning is disabled
+    /// (`audit_retention_seconds = 0`). Clamped to 100 years so the cutoff
+    /// arithmetic can never overflow.
+    pub fn audit_retention(&self) -> Option<chrono::Duration> {
+        const MAX_SECS: u64 = 100 * 365 * 24 * 3600;
+        match self.audit_retention_seconds {
+            0 => None,
+            secs => Some(chrono::Duration::seconds(secs.min(MAX_SECS) as i64)),
+        }
     }
 }
 
@@ -1245,6 +1277,13 @@ pub struct CryptoConfig {
     /// Rotation worker tuning.
     #[serde(default)]
     pub rotation: CryptoRotationConfig,
+    /// Also open secrets sealed by pre-release builds, which were bound to
+    /// their row but not to where they are sent, and re-seal them for their
+    /// destination at startup. Turn it on for one start after upgrading such
+    /// an installation, then off again: while on, someone who can write to
+    /// the database can replay such a blob into a repointed row.
+    #[serde(default)]
+    pub accept_row_bound_secrets: bool,
 }
 
 /// `crypto.root.*` — the root-key provider.
@@ -1397,6 +1436,9 @@ fn default_retention_run_interval() -> i64 {
 }
 fn default_retention_lease() -> i64 {
     300
+}
+fn default_retention_audit_retention() -> u64 {
+    90 * 24 * 3600
 }
 
 /// Dotted config keys holding **secret strings**. Their `FORGE_*` environment
@@ -1626,7 +1668,54 @@ impl Config {
                 "server.max_upload_bytes must be greater than 0".into(),
             ));
         }
+        if let Some(budget) = self.staging_budget() {
+            let needed = self.largest_staged_set();
+            if budget < needed {
+                return Err(ConfigError::Invalid(format!(
+                    "server.max_staging_bytes ({budget}) must be at least the larger of \
+                     server.max_upload_bytes and proxy.max_package_bytes plus \
+                     nuget.max_nuspec_bytes ({needed}), or 0 for no limit"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// The largest single item staged in the temp directory.
+    fn largest_staged_item(&self) -> u64 {
+        self.server
+            .max_upload_bytes
+            .max(self.proxy.max_package_bytes)
+    }
+
+    /// What one push or download stages at once at most: the package, and
+    /// its manifest while the package is still held.
+    fn largest_staged_set(&self) -> u64 {
+        self.largest_staged_item()
+            .saturating_add(self.nuget.max_nuspec_bytes)
+    }
+
+    /// The directory pushes and proxy downloads are staged in
+    /// (`server.staging_dir`).
+    pub fn staging_dir(&self) -> std::path::PathBuf {
+        self.server
+            .staging_dir
+            .clone()
+            .unwrap_or_else(forge_storage::Staging::default_dir)
+    }
+
+    /// The temp-space budget for staging, or `None` for no limit
+    /// (`server.max_staging_bytes`, see there for the default).
+    pub fn staging_budget(&self) -> Option<u64> {
+        match self.server.max_staging_bytes {
+            Some(0) => None,
+            Some(bytes) => Some(bytes),
+            None => Some(
+                self.largest_staged_item()
+                    .saturating_mul(4)
+                    .max(self.largest_staged_set()),
+            ),
+        }
     }
 
     /// Background-worker tuning must be usable: a zero interval makes
@@ -2617,6 +2706,37 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
         assert_eq!(cfg.auth.providers, vec!["local-password".to_string()]);
         assert!(cfg.auth.upstream_basic.is_none());
+    }
+
+    #[test]
+    fn staging_budget_defaults_to_four_of_the_largest_item_and_is_validated() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        let largest = cfg.server.max_upload_bytes.max(cfg.proxy.max_package_bytes);
+        assert_eq!(cfg.staging_budget(), Some(4 * largest));
+        assert_eq!(cfg.staging_dir(), forge_storage::Staging::default_dir());
+
+        let unlimited = MINIMAL.replace(
+            "[server]",
+            "[server]\nmax_staging_bytes = 0\nstaging_dir = \"/var/tmp/forge\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&unlimited)).expect("valid");
+        assert_eq!(cfg.staging_budget(), None);
+        assert_eq!(
+            cfg.staging_dir(),
+            std::path::PathBuf::from("/var/tmp/forge")
+        );
+
+        // Smaller than one maximum-size push: every such push would fail.
+        let too_small = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 1048576");
+        let err = Config::from_figment(fig_from_toml(&too_small)).unwrap_err();
+        assert!(err.to_string().contains("max_staging_bytes"), "{err}");
+        // Exactly one maximum-size package leaves no room for its manifest,
+        // which is staged while the package is still held.
+        let exact = MINIMAL.replace(
+            "[server]",
+            &format!("[server]\nmax_staging_bytes = {largest}"),
+        );
+        assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
     }
 
     #[test]

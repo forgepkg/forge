@@ -11,7 +11,8 @@
 //!     is when the realm's admin mapping authoritatively says so;
 //!   * an existing LOCAL user is never clobbered NOR mapped (the upstream login
 //!     is denied) when an upstream login shares the username;
-//!   * `auto_provision = false` does not create a user (unknown → `None`);
+//!   * `auto_provision = false` does not create a user (unknown → `None`),
+//!     but still applies an authoritative admin demotion;
 //!   * a deactivated user resolves to `None` (login denied).
 //!
 //! Requires Docker.
@@ -126,6 +127,83 @@ async fn admin_group_grants_admin_on_provision() {
             .await
             .unwrap(),
         "admin role removed on authoritative demotion"
+    );
+}
+
+/// A realm switched to `auto_provision = false` still applies the upstream's
+/// authoritative admin verdict to an existing account: the demotion clears
+/// the column and the role and ends the sessions opened as an admin.
+#[tokio::test]
+async fn demotion_applies_without_auto_provision() {
+    let pool = pool().await;
+    let username = unique_user("prov-noauto");
+
+    let mut grant = upstream_identity(&username, true, true);
+    grant.admin_authoritative = true;
+    let admin = provision_and_map(&pool, &grant).await.unwrap().unwrap();
+    assert!(admin.is_admin);
+    let now = chrono::Utc::now();
+    let session = forge_db::session_dao::create(
+        &pool,
+        forge_db::session_dao::NewSession {
+            user_id: admin.user_id,
+            external_identity_id: None,
+            token_hash: format!("hash-{username}"),
+            csrf_secret: "csrf".to_string(),
+            user_agent_hash: None,
+            idle_expiry: now + chrono::Duration::hours(1),
+            absolute_expiry: now + chrono::Duration::hours(8),
+        },
+    )
+    .await
+    .unwrap();
+
+    // The operator turns auto-provisioning off; the directory then removes
+    // the user from the admin group.
+    let mut demote = upstream_identity(&username, false, false);
+    demote.admin_authoritative = true;
+    let demoted = provision_and_map(&pool, &demote).await.unwrap().unwrap();
+    assert_eq!(demoted.user_id, admin.user_id);
+    assert!(!demoted.is_admin, "authoritative demotion tracked");
+    let user = user_dao::find_user_by_id(&pool, admin.user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!user.is_admin, "is_admin column cleared");
+    assert!(
+        !forge_db::authz_dao::user_has_role(&pool, admin.user_id, "admin")
+            .await
+            .unwrap(),
+        "admin role removed"
+    );
+    assert!(
+        forge_db::session_dao::find_valid_by_hash(&pool, &session.token_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "the admin session was ended"
+    );
+
+    // A non-authoritative login (no group reading) changes nothing, and an
+    // authoritative one re-grants.
+    let plain = provision_and_map(&pool, &upstream_identity(&username, true, false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!plain.is_admin);
+    let mut regrant = upstream_identity(&username, true, false);
+    regrant.admin_authoritative = true;
+    assert!(
+        provision_and_map(&pool, &regrant)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_admin
+    );
+    assert!(
+        forge_db::authz_dao::user_has_role(&pool, admin.user_id, "admin")
+            .await
+            .unwrap()
     );
 }
 

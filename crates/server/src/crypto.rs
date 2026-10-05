@@ -192,8 +192,15 @@ pub fn build_envelope(
             scope: "default".to_string(),
             unwrapped_key_ttl: std::time::Duration::from_secs(crypto.cache.unwrapped_key_ttl_secs),
             unwrapped_key_max: crypto.cache.unwrapped_key_max,
+            accept_row_bound_secrets: crypto.accept_row_bound_secrets,
         },
     );
+    if crypto.accept_row_bound_secrets {
+        tracing::warn!(
+            "crypto.accept_row_bound_secrets is on: secrets sealed by pre-release builds are \
+             accepted without their destination binding; turn it off once startup has re-sealed them"
+        );
+    }
     tracing::info!(
         provider = %crypto.root.provider,
         algorithm = %algorithm,
@@ -250,7 +257,42 @@ pub async fn bootstrap(
     if realms > 0 {
         tracing::info!(realms, "encrypted plaintext auth-realm secrets at rest");
     }
+
+    // Secrets sealed by earlier builds are bound to their row only: re-seal
+    // them for the destination they are sent to (the rotation worker repeats
+    // this, but it may be disabled). Rows already converged cost one open.
+    let resealed = reseal_all(pool, envelope, batch)
+        .await
+        .context("re-seal secrets for their destination")?;
+    if resealed > 0 {
+        tracing::info!(
+            rows = resealed,
+            "re-sealed secrets for the destination they are sent to"
+        );
+    }
     Ok(())
+}
+
+/// Run both re-encrypt sweeps to the end; returns how many rows were
+/// re-sealed.
+async fn reseal_all(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+    batch: i64,
+) -> Result<usize, secret_dao::SecretDbError> {
+    let mut resealed = 0;
+    let mut after_id = 0i64;
+    loop {
+        let swept =
+            secret_dao::reseal_upstream_passwords_batch(pool, envelope, after_id, batch).await?;
+        resealed += swept.resealed;
+        match swept.next_after_id {
+            Some(id) => after_id = id,
+            None => break,
+        }
+    }
+    resealed += secret_dao::reseal_realm_secrets(pool, envelope).await?;
+    Ok(resealed)
 }
 
 /// Spawn the rotation/backfill worker loop. Each tick tries the cluster-wide
@@ -351,20 +393,11 @@ async fn rotation_pass(
         .await
         .context("realm secrets backfill")?;
 
-    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
-    let mut after_id = 0i64;
-    loop {
-        let swept = secret_dao::reseal_upstream_passwords_batch(pool, envelope, after_id, batch)
-            .await
-            .context("DEK re-encrypt sweep")?;
-        match swept.next_after_id {
-            Some(id) => after_id = id,
-            None => break,
-        }
-    }
-    secret_dao::reseal_realm_secrets(pool, envelope)
+    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns),
+    //    which also moves row-only bindings to destination bindings.
+    reseal_all(pool, envelope, batch)
         .await
-        .context("realm secrets re-encrypt sweep")?;
+        .context("DEK re-encrypt sweep")?;
 
     // 6. Revoke keys nothing references anymore.
     secret_dao::revoke_unreferenced_deks(pool, envelope)

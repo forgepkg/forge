@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO login_known_network (username_sha256, network, last_success_at)\n        VALUES ($1, $2, $3)\n        ON CONFLICT (username_sha256, network) DO UPDATE\n        SET last_success_at = GREATEST(login_known_network.last_success_at, EXCLUDED.last_success_at)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6ba255e801f929e74524eb10343acbc9405248d47701227b45d6a20815c9a19"
+}

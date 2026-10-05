@@ -46,16 +46,18 @@ pub struct RedisL2 {
 }
 
 impl RedisL2 {
-    /// Establish the connection manager from an already-opened client.
+    /// Build the connection manager from an already-opened client. It
+    /// connects lazily, on the first command: an unreachable Redis makes
+    /// commands fail (and the cache degrade), not construction.
     ///
     /// Every command is bounded by `timeouts`: a partitioned (blackholed)
     /// Redis then fails fast into the cache's degrade-to-factory path instead
     /// of hanging every cached read.
-    pub async fn connect(
+    pub fn connect(
         client: redis::Client,
         timeouts: crate::RedisTimeouts,
     ) -> Result<Self, redis::RedisError> {
-        let conn = ConnectionManager::new_with_config(client, timeouts.manager_config()).await?;
+        let conn = ConnectionManager::new_lazy_with_config(client, timeouts.manager_config())?;
         Ok(RedisL2 { conn })
     }
 

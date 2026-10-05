@@ -592,6 +592,117 @@ pub struct AuditRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Delete up to `limit` audit rows created before `created_before`, oldest
+/// first. Returns how many were deleted; fewer than `limit` means none older
+/// are left. Each call is one short statement, idempotent and safe on every
+/// instance at once.
+pub async fn prune_audit(
+    pool: &PgPool,
+    created_before: DateTime<Utc>,
+    limit: i64,
+) -> sqlx::Result<u64> {
+    let result = sqlx::query!(
+        r#"
+        DELETE FROM retention_audit
+        WHERE id = ANY(ARRAY(
+            SELECT id
+            FROM retention_audit
+            WHERE created_at < $1
+            ORDER BY created_at
+            LIMIT $2
+        ))
+        "#,
+        created_before,
+        limit,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Fence one apply step to its run: inside the caller's transaction, take a
+/// `FOR SHARE` lock on the repository row and its `retention_run` row while
+/// the run still owns a live lease (`current_run_id = run_id`,
+/// `locked_until` in the future) and the stored policy still equals the one
+/// the run evaluated. Returns `false` when any of that no longer holds; the
+/// run must then stop applying.
+///
+/// The share lock makes a concurrent policy write (or a reclaim of the lease
+/// by another instance) wait until this step commits, and a write that
+/// committed first is seen here, so no decision is applied after the policy
+/// it was made under changed.
+pub async fn lock_run_fence(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    run_id: uuid::Uuid,
+    policy: &JsonValue,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT 1 AS "fenced!"
+        FROM repository r
+        JOIN retention_run rr ON rr.repository_id = r.id
+        WHERE r.id = $1
+          AND rr.state = 'running'
+          AND rr.current_run_id = $2
+          AND rr.locked_until > now()
+          AND r.retention_policy = $3
+        FOR SHARE OF r, rr
+        "#,
+        repository_id,
+        run_id,
+        policy,
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Lock (`FOR UPDATE`, in id order) and load every component of one package
+/// for the apply path to re-evaluate its decision against current state:
+/// [`load_candidate_components`] restricted to `name`.
+pub async fn lock_package_candidates(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    name: &str,
+) -> sqlx::Result<Vec<CandidateRow>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            c.id            AS component_id,
+            c.name          AS name,
+            c.version       AS version,
+            c.listed        AS listed,
+            c.created_at    AS created_at,
+            c.last_downloaded_at AS last_downloaded_at,
+            EXISTS (
+                SELECT 1 FROM asset a
+                WHERE a.component_id = c.id AND a.path LIKE '%.nupkg'
+            ) AS "has_nupkg!"
+        FROM component c
+        WHERE c.repository_id = $1 AND c.name = $2
+        ORDER BY c.id
+        FOR UPDATE OF c
+        "#,
+        repository_id,
+        name,
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|r| r.has_nupkg)
+        .map(|r| CandidateRow {
+            component_id: r.component_id,
+            name: r.name,
+            version: r.version,
+            listed: r.listed,
+            created_at: r.created_at,
+            last_downloaded_at: r.last_downloaded_at,
+        })
+        .collect())
+}
+
 /// Read recent audit rows for a repository, newest first. Optionally filter by
 /// `run_id` (one evaluation pass) and/or page with `before` (only rows with a
 /// smaller `id`, i.e. older than the last page). `limit` is clamped by the
