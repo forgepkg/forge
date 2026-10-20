@@ -1,0 +1,76 @@
+# Redis for Forge (forge chart: `redis:`). Anything that can write to Redis
+# can write Forge's shared cache, so keep it password-protected and reachable
+# from Forge only (docs/deployment.md).
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: docker.io
+  repository: library/redis
+  tag: 7.4-alpine
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+auth:
+  enabled: true
+  # Generated on install and kept when empty. Forge pastes it into its Redis
+  # URL unescaped: use a URL-safe value (`openssl rand -hex 24`).
+  password: ""
+  # An existing Secret holding the password instead of the chart's.
+  existingSecret: ""
+  secretKey: password
+
+service:
+  type: ClusterIP
+  port: 6379
+  annotations: {}
+  labels: {}
+
+# Further redis-server arguments, e.g. ["--maxmemory", "200mb",
+# "--maxmemory-policy", "allkeys-lru"]. The chart already turns persistence
+# off (--save "" --appendonly no).
+extraArgs: []
+extraEnv: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podSecurityContext:
+  # The image's `redis` user.
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Probe timing; the handler is a TCP check of the redis port.
+readinessProbe:
+  periodSeconds: 5
+livenessProbe:
+  periodSeconds: 10
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Only Forge reaches Redis (where the CNI enforces NetworkPolicy).
+networkPolicy:
+  enabled: true
+  extraFrom: []

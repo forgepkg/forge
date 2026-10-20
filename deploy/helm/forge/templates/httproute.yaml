@@ -1,0 +1,46 @@
+{{- if .Values.httpRoute.enabled }}
+{{- $route := .Values.httpRoute }}
+{{- $fullname := include "forge.fullname" . }}
+{{- $parentRefs := list }}
+{{- range $route.parentRefs }}{{ $parentRefs = append $parentRefs . }}{{ end }}
+{{- if .Values.listenerSet.enabled }}
+{{- $group := regexReplaceAll "/.*$" .Values.listenerSet.apiVersion "" }}
+{{- $parentRefs = append $parentRefs (dict "group" $group "kind" "ListenerSet" "name" $fullname) }}
+{{- end }}
+{{- if not $parentRefs }}
+{{- fail "httpRoute.enabled needs httpRoute.parentRefs (your Gateway) or listenerSet.enabled" }}
+{{- end }}
+{{- $hostnames := $route.hostnames }}
+{{- if and (not $hostnames) .Values.host }}
+{{- $hostnames = list .Values.host }}
+{{- end }}
+apiVersion: {{ $route.apiVersion }}
+kind: HTTPRoute
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $route.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $route.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- tpl (toYaml $parentRefs) . | nindent 4 }}
+  {{- with $hostnames }}
+  hostnames:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $route.rules }}
+    {{- $rule := deepCopy . }}
+    {{- if not (hasKey $rule "backendRefs") }}
+    {{- $_ := set $rule "backendRefs" (list (dict "name" $fullname "port" (int $.Values.service.port))) }}
+    {{- end }}
+    - {{ tpl (toYaml $rule) $ | nindent 6 | trim }}
+    {{- end }}
+{{- end }}

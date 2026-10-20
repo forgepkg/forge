@@ -180,9 +180,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Kubernetes manifests (deploy/kubernetes) ──────────────────────────────
-  # Builds every overlay, and the base with each component, and validates the
-  # output against the Kubernetes schemas. Both tools are pinned by checksum.
+  # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
+  # Builds every overlay, and the base with each component; lints and renders
+  # the chart with each of its ci/ values files; and validates the output
+  # against the Kubernetes schemas. kustomize and kubeconform are pinned by
+  # checksum, Helm is built from its pinned Go module (verified by the Go
+  # checksum database; keep HELM_VERSION in step with release.yml).
   kubernetes:
     name: kubernetes
     runs-on: ubuntu-latest
@@ -191,6 +194,7 @@ jobs:
       KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
       KUBECONFORM_VERSION: "0.7.0"
       KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      HELM_VERSION: v4.3.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install kustomize + kubeconform
@@ -205,6 +209,20 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Build and validate
         run: .github/scripts/kustomize-check.sh 1.33.0
+      - name: Cache the Helm build
+        id: helm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/helm
+          key: ${{ runner.os }}-helm-${{ env.HELM_VERSION }}
+      - name: Install Helm
+        run: |
+          if [ "${{ steps.helm-cache.outputs.cache-hit }}" != "true" ]; then
+            GOBIN="$RUNNER_TEMP/helm" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
+          fi
+          echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
+      - name: Lint, render and validate the Helm chart
+        run: .github/scripts/helm-check.sh 1.33.0
 
   # ── Frontend (TanStack Router SPA in web/) ─────────────────────────────────
   # Typecheck + unit/component tests (Vitest + RTL) + production build. The build

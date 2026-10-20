@@ -1,0 +1,60 @@
+{{- $svc := .Values.service }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $svc.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $svc.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.type }}
+  {{- with $svc.clusterIP }}
+  clusterIP: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.internalTrafficPolicy }}
+  internalTrafficPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.ipFamilyPolicy }}
+  ipFamilyPolicy: {{ . }}
+  {{- end }}
+  {{- with $svc.ipFamilies }}
+  ipFamilies:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc.sessionAffinity }}
+  sessionAffinity: {{ . }}
+  {{- end }}
+  {{- with $svc.trafficDistribution }}
+  trafficDistribution: {{ . }}
+  {{- end }}
+  selector:
+    {{- include "forge.selectorLabels" . | nindent 4 }}
+  ports:
+    # API, NuGet feed and web UI share this one port.
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (has $svc.type (list "NodePort" "LoadBalancer")) $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
+      {{- end }}
+    {{- with $svc.extraPorts }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}

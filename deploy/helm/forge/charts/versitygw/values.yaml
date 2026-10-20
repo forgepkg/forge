@@ -1,0 +1,92 @@
+# versitygw for Forge (forge chart: `versitygw:`). The gateway's root
+# credentials are Forge's S3 credentials; Forge creates the bucket on its
+# first start.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: docker.io
+  repository: versity/versitygw
+  tag: v1.4.1
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+auth:
+  # Generated on install and kept (also across `helm uninstall`, with the
+  # data) when empty.
+  accessKey: ""
+  secretKey: ""
+  # An existing Secret holding both instead of the chart's.
+  existingSecret: ""
+  accessKeyKey: accessKey
+  secretKeyKey: secretKey
+
+# The bucket Forge uses (config.s3.bucket).
+bucket: forge
+
+service:
+  type: ClusterIP
+  port: 8422
+  annotations: {}
+  labels: {}
+
+persistence:
+  # Needs a filesystem with user extended attributes (ext4, xfs). Without
+  # persistence the packages live in an emptyDir and are lost with the pod.
+  enabled: true
+  # null: the cluster's default StorageClass.
+  storageClassName: null
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+  annotations: {}
+  labels: {}
+  retentionPolicy: {}
+
+# Further gateway flags (before the backend), and posix backend flags.
+extraArgs: []
+posixArgs: []
+extraEnv: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+podSecurityContext:
+  # The image defaults to root; the posix backend only needs to own /data.
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Probe timing; the handler is GET /health.
+readinessProbe:
+  periodSeconds: 5
+livenessProbe:
+  periodSeconds: 10
+
+terminationGracePeriodSeconds: 30
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Only Forge reaches the gateway (where the CNI enforces NetworkPolicy).
+networkPolicy:
+  enabled: true
+  extraFrom: []

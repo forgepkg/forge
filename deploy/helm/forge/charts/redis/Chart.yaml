@@ -1,0 +1,9 @@
+# A Redis for Forge's shared L2 cache and invalidation backplane (cache only,
+# nothing on disk). Enabled with `redis.enabled` in the forge chart, which
+# then sets FORGE_REDIS__URL.
+apiVersion: v2
+name: redis
+description: Password-protected, cache-only Redis for envisia-forge
+type: application
+version: 1.0.0
+appVersion: "7.4"

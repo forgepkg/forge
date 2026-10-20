@@ -1,0 +1,38 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+  {{- with include "forge.annotations" (dict "ctx" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "forge.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress }}
+    - Egress
+    {{- end }}
+  ingress:
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- with $np.from }}
+      from:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+      {{- end }}
+    {{- with $np.extraIngress }}
+    {{- tpl (toYaml .) $ | nindent 4 }}
+    {{- end }}
+  {{- with $np.egress }}
+  egress:
+    {{- tpl (toYaml .) $ | nindent 4 }}
+  {{- end }}
+{{- end }}

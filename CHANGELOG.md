@@ -24,6 +24,18 @@ The release workflow publishes the section whose heading matches the tag
   `[Unreleased]` changelog section into the release's, commits and tags. The
   release workflow now also refuses a tag whose Kubernetes base names another
   image version.
+- **Helm chart** in `deploy/helm/forge`, published with every release to
+  `oci://ghcr.io/schmitch/charts/forge` (same version as the image, signed
+  with cosign, and attached to the GitHub release). The published chart pulls
+  the release image by the digest the release workflow signed. Forge's whole
+  configuration is settable as `config` (rendered to `forge.toml`), secrets
+  through a chart-managed or existing Secret; routing through a Gateway API
+  HTTPRoute and an optional ListenerSet (plus a cert-manager Certificate);
+  PodDisruptionBudget, HorizontalPodAutoscaler, NetworkPolicy and
+  `extraObjects`; and optional in-cluster PostgreSQL, Redis and versitygw
+  dependencies. `cargo xtask release` also sets the chart's version and
+  `appVersion`, and the release workflow refuses a tag whose chart names
+  another version.
 
 ### Changed
 
