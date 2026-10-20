@@ -1,0 +1,36 @@
+{{- if .Values.listenerSet.enabled }}
+{{- $ls := .Values.listenerSet }}
+{{- $fullname := include "forge.fullname" . }}
+apiVersion: {{ $ls.apiVersion }}
+kind: ListenerSet
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $ls.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $ls.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRef:
+    {{- tpl (toYaml $ls.parentRef) . | nindent 4 }}
+  listeners:
+    {{- range $ls.listeners }}
+    {{- $listener := deepCopy . }}
+    {{- if and (not $listener.hostname) $.Values.host }}
+    {{- $_ := set $listener "hostname" $.Values.host }}
+    {{- end }}
+    {{- if not $listener.hostname }}
+    {{- $_ := unset $listener "hostname" }}
+    {{- end }}
+    {{- if and (eq (upper (toString $listener.protocol)) "HTTPS") (not $listener.tls) }}
+    {{- $secretName := default (printf "%s-tls" $fullname) $.Values.certificate.secretName }}
+    {{- $_ := set $listener "tls" (dict "mode" "Terminate" "certificateRefs" (list (dict "name" $secretName))) }}
+    {{- end }}
+    - {{ tpl (toYaml $listener) $ | nindent 6 | trim }}
+    {{- end }}
+{{- end }}

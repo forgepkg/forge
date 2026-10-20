@@ -1,0 +1,36 @@
+{{- if .Values.certificate.enabled }}
+{{- $cert := .Values.certificate }}
+{{- $dnsNames := $cert.dnsNames }}
+{{- if and (not $dnsNames) .Values.host }}
+{{- $dnsNames = list .Values.host }}
+{{- end }}
+{{- if not $dnsNames }}
+{{- fail "certificate.enabled needs certificate.dnsNames or host" }}
+{{- end }}
+{{- if not $cert.issuerRef.name }}
+{{- fail "certificate.enabled needs certificate.issuerRef.name" }}
+{{- end }}
+apiVersion: {{ $cert.apiVersion }}
+kind: Certificate
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $cert.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $cert.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  secretName: {{ default (printf "%s-tls" (include "forge.fullname" .)) $cert.secretName }}
+  dnsNames:
+    {{- tpl (toYaml $dnsNames) . | nindent 4 }}
+  issuerRef:
+    {{- toYaml $cert.issuerRef | nindent 4 }}
+  {{- with $cert.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}

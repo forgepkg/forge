@@ -133,8 +133,9 @@ the user password).
 
 - **[Production deployment](./docs/deployment.md)** — required settings, TLS
   and reverse proxy, secret encryption, health probes, backup/restore and
-  upgrades. Kubernetes manifests (kustomize base, components and overlays)
-  are in **[deploy/kubernetes](./deploy/kubernetes/README.md)**.
+  upgrades. Kubernetes: a Helm chart published with every release
+  (**[deploy/helm/forge](./deploy/helm/forge/README.md)**), or kustomize
+  manifests (**[deploy/kubernetes](./deploy/kubernetes/README.md)**).
 - **[CHANGELOG.md](./CHANGELOG.md)** — release notes, upgrade notes and known
   limitations; **[SECURITY.md](./SECURITY.md)** — how to report a
   vulnerability.

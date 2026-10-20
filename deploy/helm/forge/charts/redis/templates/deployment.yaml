@@ -1,0 +1,98 @@
+{{- $fullname := include "forge-redis.fullname" . }}
+{{- $tcpCheck := dict "tcpSocket" (dict "port" "redis") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge-redis.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "forge-redis.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "forge-redis.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A changed auth.password or existingSecret restarts Redis.
+        checksum/auth: {{ toJson .Values.auth | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "forge-redis.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $args := list }}
+          {{- if .Values.auth.enabled }}
+          {{- $args = list "--requirepass" "$(REDIS_PASSWORD)" }}
+          {{- end }}
+          args:
+            {{- toYaml (concat $args (list "--save" "" "--appendonly" "no") .Values.extraArgs) | nindent 12 }}
+          {{- if or .Values.auth.enabled .Values.extraEnv }}
+          env:
+            {{- if .Values.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default $fullname .Values.auth.existingSecret }}
+                  key: {{ .Values.auth.secretKey }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            {{- toYaml (mergeOverwrite (deepCopy $tcpCheck) (deepCopy .Values.readinessProbe)) | nindent 12 }}
+          livenessProbe:
+            {{- toYaml (mergeOverwrite (deepCopy $tcpCheck) (deepCopy .Values.livenessProbe)) | nindent 12 }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}

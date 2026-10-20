@@ -1,0 +1,8 @@
+# Not part of the packaged chart.
+ci/
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*.orig
+*~

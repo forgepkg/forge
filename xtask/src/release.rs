@@ -1,9 +1,10 @@
 //! `cargo xtask release <version>`: cut a release.
 //!
 //! Sets the version everywhere the release workflow checks it (the workspace
-//! `Cargo.toml` and `Cargo.lock`, `web/package.json`, and the image tag of the
-//! Kubernetes base), turns the changelog's `[Unreleased]` section into the
-//! version's section, commits, and creates the annotated `v<version>` tag.
+//! `Cargo.toml` and `Cargo.lock`, `web/package.json`, the image tag of the
+//! Kubernetes base, and the Helm chart's `version` and `appVersion`), turns
+//! the changelog's `[Unreleased]` section into the version's section,
+//! commits, and creates the annotated `v<version>` tag.
 //! Pushing is left to the caller. Every edit is computed before the first
 //! file is written, so a failed precondition leaves the tree untouched.
 
@@ -13,6 +14,7 @@ use std::fs;
 const CARGO_TOML: &str = "Cargo.toml";
 const PACKAGE_JSON: &str = "web/package.json";
 const KUSTOMIZATION: &str = "deploy/kubernetes/base/kustomization.yaml";
+const CHART: &str = "deploy/helm/forge/Chart.yaml";
 const CHANGELOG: &str = "CHANGELOG.md";
 
 pub fn release(args: &[String]) -> Result<(), String> {
@@ -70,6 +72,7 @@ pub fn release(args: &[String]) -> Result<(), String> {
             KUSTOMIZATION,
             set_image_tag(&read(KUSTOMIZATION)?, &version),
         ),
+        (CHART, set_chart_version(&read(CHART)?, &version)),
         (CHANGELOG, release_changelog(&read(CHANGELOG)?, &version)),
     ];
     let mut contents = Vec::new();
@@ -98,7 +101,9 @@ pub fn release(args: &[String]) -> Result<(), String> {
         Cmd::new("git")
             .args(["tag", "-a", &tag_name, "-m", &tag_name])
             .run()?;
-        println!("Tagged {tag_name}. Publish it (release.yml builds and signs the image):");
+        println!(
+            "Tagged {tag_name}. Publish it (release.yml builds and signs the image and the chart):"
+        );
         println!("  git push --atomic origin {branch} {tag_name}");
     } else {
         println!("Prepared {tag_name} on `{branch}`. Once it is merged, tag the merge commit:");
@@ -192,6 +197,19 @@ fn set_image_tag(kustomization: &str, version: &str) -> Result<String, String> {
         value.strip_prefix("newTag:")?;
         let indent = &line[..line.len() - value.len()];
         Some(format!("{indent}newTag: {version}"))
+    })
+}
+
+/// The chart's own `version` and its `appVersion` (the image tag it deploys);
+/// only top-level keys, never a dependency's indented `version:`.
+fn set_chart_version(chart: &str, version: &str) -> Result<String, String> {
+    let chart = replace_one_line(chart, "top-level `version:`", |line| {
+        line.starts_with("version:")
+            .then(|| format!("version: {version}"))
+    })?;
+    replace_one_line(&chart, "top-level `appVersion:`", |line| {
+        line.starts_with("appVersion:")
+            .then(|| format!("appVersion: \"{version}\""))
     })
 }
 
@@ -302,6 +320,19 @@ mod tests {
         set_workspace_version(&read(CARGO_TOML), "9.9.9").unwrap();
         set_package_version(&read(PACKAGE_JSON), "9.9.9").unwrap();
         set_image_tag(&read(KUSTOMIZATION), "9.9.9").unwrap();
+        set_chart_version(&read(CHART), "9.9.9").unwrap();
+    }
+
+    #[test]
+    fn chart_version_and_app_version_only_at_the_top_level() {
+        let chart = "apiVersion: v2\nname: forge\nversion: 0.1.0\nappVersion: \"0.1.0\"\n\
+                     dependencies:\n  - name: redis\n    version: 1.0.0\n";
+        assert_eq!(
+            set_chart_version(chart, "0.2.0-rc.1").unwrap(),
+            "apiVersion: v2\nname: forge\nversion: 0.2.0-rc.1\nappVersion: \"0.2.0-rc.1\"\n\
+             dependencies:\n  - name: redis\n    version: 1.0.0\n"
+        );
+        assert!(set_chart_version("apiVersion: v2\nversion: 0.1.0\n", "0.2.0").is_err());
     }
 
     const CHANGELOG_FIXTURE: &str = "# Changelog\n\nIntro.\n\n## [Unreleased]\n\n### Fixed\n\n\

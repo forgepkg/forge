@@ -1,0 +1,28 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $pdb := .Values.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+  {{- with include "forge.annotations" (dict "ctx" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not (kindIs "invalid" $pdb.minAvailable) }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else if not (kindIs "invalid" $pdb.maxUnavailable) }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- else }}
+  {{- fail "podDisruptionBudget.enabled needs maxUnavailable or minAvailable" }}
+  {{- end }}
+  {{- with $pdb.unhealthyPodEvictionPolicy }}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "forge.selectorLabels" . | nindent 6 }}
+{{- end }}

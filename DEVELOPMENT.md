@@ -503,10 +503,13 @@ http://localhost:8421.
 
 A `v<version>` tag on the default branch publishes the release: the release
 workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/schmitch/forge:<version>` and creates the GitHub release from the
-matching `CHANGELOG.md` section. It refuses a tag unless the workspace
-version (`Cargo.toml`), `web/package.json` and the image tag of the
-Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) all equal it.
+`ghcr.io/schmitch/forge:<version>`, packages the Helm chart pinned to that
+image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
+(version `<version>`), and creates the GitHub release from the matching
+`CHANGELOG.md` section with the chart attached. It refuses a tag unless the
+workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
+Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
+`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it.
 
 `cargo xtask release` makes those edits and the tag in one step:
 
@@ -516,7 +519,7 @@ git push --atomic origin main v0.2.0
 ```
 
 It sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
---workspace`), `web/package.json` and the Kubernetes base, renames
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart, renames
 `## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0]` (keeping a section that
 already exists) and updates the links at its bottom, commits
 `release: v0.2.0`, and creates the annotated tag. It pushes nothing. When

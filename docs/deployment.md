@@ -17,10 +17,12 @@ CI publishing without stored API keys see
 Forge is a single stateless process. The API, the NuGet feed and the web UI
 share one port (`8421`), so one upstream on the reverse proxy is enough.
 
-On Kubernetes, start from the kustomize manifests in
-[`deploy/kubernetes`](../deploy/kubernetes/README.md): they set the probes,
-the shutdown timing and the security context described below, and pin the
-image to the release they were tagged with.
+On Kubernetes, install the Helm chart
+(`oci://ghcr.io/<owner>/charts/forge`, see
+[`deploy/helm/forge`](../deploy/helm/forge/README.md)) or start from the
+kustomize manifests in [`deploy/kubernetes`](../deploy/kubernetes/README.md).
+Both set the probes, the shutdown timing and the security context described
+below, and pin the image to the release they belong to.
 
 ## Image
 
@@ -38,6 +40,11 @@ cosign verify ghcr.io/<owner>/<repo>@<digest> \
   --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+Each release also publishes the Helm chart of the same version,
+`oci://ghcr.io/<owner>/charts/forge`, which pulls the image by the digest the
+release signed. It is signed the same way; its `cosign verify` command is in
+the release notes too.
 
 `:latest` always names the newest stable release and `:<major>.<minor>` the
 newest release of that line; prereleases and patches to older lines never move

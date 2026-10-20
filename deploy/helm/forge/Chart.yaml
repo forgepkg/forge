@@ -1,0 +1,40 @@
+# envisia-forge Helm chart.
+#
+# `version` and `appVersion` are the release version: `cargo xtask release
+# <version>` sets both, the release workflow refuses a tag whose chart names
+# another version, and the image tag defaults to `appVersion`.
+apiVersion: v2
+name: forge
+description: Self-hosted NuGet V3 registry (hosted, proxy and group feeds)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"
+home: https://github.com/schmitch/forge
+sources:
+  - https://github.com/schmitch/forge
+keywords:
+  - nuget
+  - registry
+  - package-registry
+annotations:
+  artifacthub.io/license: AGPL-3.0-only OR LicenseRef-envisia
+  # The digest of the appVersion image. Empty here; the release workflow sets
+  # it to the digest it signed before it publishes the chart
+  # (oci://ghcr.io/schmitch/charts/forge), so the published chart always pulls
+  # exactly that image (unless image.tag or image.digest is set).
+  forge.envisia.de/image-digest: ""
+
+# Optional in-cluster backing services for evaluation and small installs,
+# shipped inside this chart (charts/). Each one is off by default; production
+# installs point Forge at a managed PostgreSQL, object store and Redis.
+dependencies:
+  - name: postgresql
+    version: 1.0.0
+    condition: postgresql.enabled
+  - name: redis
+    version: 1.0.0
+    condition: redis.enabled
+  - name: versitygw
+    version: 1.0.0
+    condition: versitygw.enabled

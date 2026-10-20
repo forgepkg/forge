@@ -1,0 +1,8 @@
+# CI: everything in-cluster (helm-check.sh renders the chart with each file
+# here and validates the output). Like deploy/kubernetes/overlays/evaluation.
+postgresql:
+  enabled: true
+versitygw:
+  enabled: true
+secretEnv:
+  FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: check-only

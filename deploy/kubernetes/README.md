@@ -2,7 +2,9 @@
 
 Kustomize manifests for running Forge on Kubernetes (1.30 or later). Read
 [docs/deployment.md](../../docs/deployment.md) first: it explains every
-setting these manifests set or leave to you.
+setting these manifests set or leave to you. If you deploy with Helm, use the
+chart in [deploy/helm/forge](../helm/forge/README.md) instead: it is
+published with every release and needs no copied overlay.
 
 ```
 deploy/kubernetes/

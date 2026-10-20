@@ -7,7 +7,9 @@ name: Release
 #   prerelease never moves them),
 # with a BuildKit SBOM + max-mode provenance attestation, a keyless cosign
 # signature, and a GitHub release whose notes come from the matching
-# CHANGELOG.md section.
+# CHANGELOG.md section. The Helm chart (deploy/helm/forge) is published next
+# to it as oci://ghcr.io/<owner>/charts/forge:<version>, pinned to the signed
+# image digest and signed the same way.
 #
 # Order of operations: the image is pushed BY DIGEST (untagged), the digest is
 # signed and the signature verified, and only then are the tags attached
@@ -16,9 +18,10 @@ name: Release
 # was resolved from is in the trailing comment); Dependabot keeps them current.
 #
 # Guard rails: the tag must equal the workspace version in Cargo.toml, the
-# web/package.json version and the image tag of the Kubernetes base
-# (deploy/kubernetes/base), and must point at a commit on the default branch.
-# `cargo xtask release <version>` sets all three and creates the tag.
+# web/package.json version, the image tag of the Kubernetes base
+# (deploy/kubernetes/base) and the Helm chart's version and appVersion, and
+# must point at a commit on the default branch. `cargo xtask release
+# <version>` sets all of them and creates the tag.
 on:
   push:
     tags: ["v*.*.*"]
@@ -32,6 +35,11 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  CHART_DIR: deploy/helm/forge
+  CHART_REPO: ghcr.io/${{ github.repository_owner }}/charts
+  # Built from source by `go install`, so the Go checksum database verifies
+  # it (get.helm.sh publishes no signed checksums we could pin here).
+  HELM_VERSION: v4.3.1
 
 jobs:
   image:
@@ -47,16 +55,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check tag matches the workspace, web and Kubernetes versions
+      - name: Check tag matches the workspace, web, Kubernetes and chart versions
         id: version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)
           web_version=$(node -p "require('./web/package.json').version")
           k8s_version=$(sed -n 's/^ *newTag: *//p' deploy/kubernetes/base/kustomization.yaml)
-          echo "tag=$tag cargo=$cargo_version web=$web_version kubernetes=$k8s_version"
-          if [ "$tag" != "$cargo_version" ] || [ "$tag" != "$web_version" ] || [ "$tag" != "$k8s_version" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml ($cargo_version) / web/package.json ($web_version) / deploy/kubernetes/base ($k8s_version); cut releases with 'cargo xtask release $tag'"
+          chart_version=$(sed -n 's/^version: *//p' "$CHART_DIR/Chart.yaml")
+          chart_app_version=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CHART_DIR/Chart.yaml")
+          echo "tag=$tag cargo=$cargo_version web=$web_version kubernetes=$k8s_version chart=$chart_version chart-app=$chart_app_version"
+          for v in "$cargo_version" "$web_version" "$k8s_version" "$chart_version" "$chart_app_version"; do
+            if [ "$tag" != "$v" ]; then
+              echo "::error::tag v$tag does not match Cargo.toml ($cargo_version) / web/package.json ($web_version) / deploy/kubernetes/base ($k8s_version) / $CHART_DIR ($chart_version, appVersion $chart_app_version); cut releases with 'cargo xtask release $tag'"
+              exit 1
+            fi
+          done
+          # The chart's default image must be the one this workflow pushes.
+          chart_image="$(sed -n 's/^  registry: *//p' "$CHART_DIR/values.yaml")/$(sed -n 's/^  repository: *//p' "$CHART_DIR/values.yaml")"
+          if [ "$chart_image" != "$IMAGE" ]; then
+            echo "::error::$CHART_DIR/values.yaml deploys $chart_image, but this workflow publishes $IMAGE"
             exit 1
           fi
           git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}" \
@@ -87,6 +105,14 @@ jobs:
             echo "::error::CHANGELOG.md has no section for ${{ steps.version.outputs.version }}"
             exit 1
           fi
+
+      # Before anything is pushed, so a chart that does not lint stops the
+      # release.
+      - name: Install Helm and lint the chart
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/helm" lint --strict --with-subcharts "$CHART_DIR"
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -163,10 +189,58 @@ jobs:
             exit 1
           fi
 
+      # The packaged chart records the signed digest (Chart.yaml annotation
+      # forge.envisia.de/image-digest), so it deploys exactly this image while
+      # image.tag and image.digest are left unset. The checkout itself keeps
+      # the annotation empty.
+      - name: Package the Helm chart, pinned to the signed image digest
+        id: chart
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          annotation='  forge.envisia.de/image-digest:'
+          if [ "$(grep -cx "${annotation} \"\"" "$CHART_DIR/Chart.yaml")" != 1 ]; then
+            echo "::error::$CHART_DIR/Chart.yaml needs exactly one empty '${annotation# }' annotation"
+            exit 1
+          fi
+          sed -i "s|^${annotation} \"\"\$|${annotation} \"${DIGEST}\"|" "$CHART_DIR/Chart.yaml"
+          helm package "$CHART_DIR" --destination "$RUNNER_TEMP/chart"
+          package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
+          rendered=$(helm template forge "$package" --show-only templates/deployment.yaml | sed -n 's/^ *image: *//p' | tr -d '"')
+          if [ "$rendered" != "${IMAGE}:${VERSION}@${DIGEST}" ]; then
+            echo "::error::the packaged chart deploys '$rendered', not ${IMAGE}:${VERSION}@${DIGEST}"
+            exit 1
+          fi
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+
+      - name: Push the chart, sign its digest (keyless) and verify the signature
+        id: chart-push
+        env:
+          PACKAGE: ${{ steps.chart.outputs.package }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          helm push "$PACKAGE" "oci://${CHART_REPO}" 2>&1 | tee helm-push.log
+          digest=$(sed -n 's/^Digest: *//p' helm-push.log)
+          if [ -z "$digest" ]; then
+            echo "::error::helm push reported no digest"
+            exit 1
+          fi
+          cosign sign --yes "${CHART_REPO}/forge@${digest}"
+          cosign verify "${CHART_REPO}/forge@${digest}" \
+            --certificate-identity "${IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          CHART_DIGEST: ${{ steps.chart-push.outputs.digest }}
+          PACKAGE: ${{ steps.chart.outputs.package }}
         run: |
           {
             cat release-notes.md
@@ -180,8 +254,20 @@ jobs:
             echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
+            echo
+            echo "### Helm chart"
+            echo
+            echo "Deploys exactly the image above (by digest)."
+            echo
+            echo '```'
+            echo "helm install forge oci://${CHART_REPO}/forge --version ${{ steps.version.outputs.version }}"
+            echo "# digest: ${CHART_DIGEST}"
+            echo "cosign verify ${CHART_REPO}/forge@${CHART_DIGEST} \\"
+            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
           } > release-body.md
           prerelease=""
           case "${{ steps.version.outputs.version }}" in *-*) prerelease="--prerelease";; esac
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+          gh release create "$GITHUB_REF_NAME" "$PACKAGE" --title "$GITHUB_REF_NAME" \
             --notes-file release-body.md $prerelease --verify-tag

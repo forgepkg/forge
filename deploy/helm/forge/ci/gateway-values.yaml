@@ -1,0 +1,18 @@
+# CI: an HTTPRoute on an existing Gateway listener, a LoadBalancer Service,
+# and a pinned image digest.
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames: [forge.example.com, nuget.example.com]
+config:
+  server:
+    public_base_url: https://forge.example.com
+service:
+  type: LoadBalancer
+  loadBalancerSourceRanges: [10.0.0.0/8]
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+existingSecret: forge-env
