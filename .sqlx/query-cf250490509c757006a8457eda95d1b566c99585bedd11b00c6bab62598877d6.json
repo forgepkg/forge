@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT name AS \"name!\"\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND version <> '*' AND confirmed AND NOT upstream_missing\n              AND listed AND ($2 = '' OR strpos(name, $2) > 0)\n              AND first_seen_at <= $3\n              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)\n              AND ($5 OR strpos(version, '-') = 0)\n              AND ($6 OR version !~ '[+]|-.*[.]')\n            ORDER BY name\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cf250490509c757006a8457eda95d1b566c99585bedd11b00c6bab62598877d6"
+}

@@ -18,8 +18,10 @@
 //! dropped, and a stage that would exceed the budget fails with
 //! [`CasError::StagingFull`] instead of filling the disk (a burst of
 //! first-time proxy downloads of large packages would otherwise get the pod
-//! evicted). Files a killed process left there are removed by
-//! [`Staging::sweep_stale`] at startup.
+//! evicted). Each process stages in a subdirectory of its own, locked while
+//! the process lives, so [`Staging::sweep_stale`] removes what a killed
+//! process left there at startup, however recent, instead of letting it take
+//! up space beside the new process's budget.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -83,6 +85,9 @@ pub struct StagedBlob {
     pub temp_path: TempPath,
     /// The temp-space reservation, released with the temp file.
     reservation: Option<Reservation>,
+    /// Keeps the process's staging subdirectory (and its lock) alive while
+    /// the temp file is in it.
+    own_dir: Option<Arc<OwnDir>>,
 }
 
 /// Result of ingesting content: its content address, integrity hash, size, and
@@ -107,6 +112,8 @@ pub struct StoredBlob {
     _lease_guard: IngestLeaseGuard,
     /// The temp-space reservation, released with the temp file.
     _reservation: Option<Reservation>,
+    /// Keeps the staging subdirectory alive while the temp file is in it.
+    _own_dir: Option<Arc<OwnDir>>,
 }
 
 /// Bytes reserved from a staging budget, given back when dropped. Counted in
@@ -195,15 +202,71 @@ impl Drop for IngestLeaseGuard {
 /// Where staged bytes are written and how many may be staged at once.
 #[derive(Clone, Debug)]
 pub struct Staging {
+    /// The staging directory, possibly shared with other processes.
     dir: PathBuf,
+    /// This process's own subdirectory of `dir`, where it stages (`None` only
+    /// for the fallback of [`Staging::default`], which stages in `dir`).
+    own: Option<Arc<OwnDir>>,
     /// One permit per byte; `None` = no budget.
     budget: Option<Arc<Semaphore>>,
     limit: u64,
 }
 
+/// A process's own staging subdirectory, removed with the last handle to it.
+/// Its lock file stays locked (`flock`) while the directory is in use, and
+/// the kernel releases the lock when the process dies: that is how
+/// [`Staging::sweep_stale`] tells a live process's directory, however old,
+/// from one a killed process left, however recent.
+#[derive(Debug)]
+struct OwnDir {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl OwnDir {
+    /// Create and lock a new subdirectory of `dir`. It is locked under a
+    /// hidden name and only then renamed to one a sweep looks at, so no sweep
+    /// ever finds it unlocked.
+    fn create(dir: &Path) -> std::io::Result<Arc<Self>> {
+        let name = format!(
+            "{}{}",
+            Staging::OWN_DIR_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let pending = dir.join(format!(".{name}"));
+        let path = dir.join(name);
+        std::fs::create_dir(&pending)?;
+        let locked = (|| {
+            let lock = std::fs::File::create(pending.join(Staging::LOCK_FILE))?;
+            lock.try_lock()?;
+            std::fs::rename(&pending, &path)?;
+            Ok(lock)
+        })();
+        match locked {
+            Ok(lock) => Ok(Arc::new(OwnDir { path, _lock: lock })),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&pending);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for OwnDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 impl Staging {
-    /// File-name prefix of staged files (what [`Self::sweep_stale`] removes).
+    /// File-name prefix of staged files.
     const PREFIX: &'static str = "forge-staging-";
+
+    /// Name prefix of a process's own subdirectory ([`OwnDir`]).
+    const OWN_DIR_PREFIX: &'static str = "forge-staging-proc-";
+
+    /// The lock file in such a subdirectory.
+    const LOCK_FILE: &'static str = ".lock";
 
     /// The default staging directory: `forge-staging` under the system temp
     /// directory.
@@ -211,11 +274,13 @@ impl Staging {
         std::env::temp_dir().join("forge-staging")
     }
 
-    /// Stage under `dir` (created if missing) with at most `max_bytes` in use
-    /// at once (`None`: no budget).
+    /// Stage under `dir` (created if missing), in a new subdirectory of this
+    /// process's own, with at most `max_bytes` in use at once (`None`: no
+    /// budget).
     pub fn new(dir: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        let own = Some(OwnDir::create(&dir)?);
         let limit = max_bytes.unwrap_or(0);
         let budget = max_bytes.map(|bytes| {
             let permits = usize::try_from(bytes)
@@ -223,7 +288,12 @@ impl Staging {
                 .min(Semaphore::MAX_PERMITS);
             Arc::new(Semaphore::new(permits))
         });
-        Ok(Staging { dir, budget, limit })
+        Ok(Staging {
+            dir,
+            own,
+            budget,
+            limit,
+        })
     }
 
     /// The staging directory.
@@ -231,30 +301,66 @@ impl Staging {
         &self.dir
     }
 
-    /// Remove staged files not modified for `older_than`: what a process left
-    /// behind when it was killed mid-request (a running stage writes its file
-    /// continuously and holds it for seconds after, so a long-idle one is
-    /// orphaned, also when several instances share the directory). Returns
-    /// how many were removed.
+    /// Where this process stages its files.
+    fn own_dir(&self) -> &Path {
+        self.own.as_ref().map_or(&self.dir, |own| &own.path)
+    }
+
+    /// Remove what killed processes left in the staging directory. Returns
+    /// how many staged files were removed.
+    ///
+    /// - A process subdirectory goes whenever its lock is free, whatever its
+    ///   age: a live process (this one, or another instance sharing the
+    ///   directory) holds its lock until it exits.
+    /// - Loose staged files (from versions that staged in the directory
+    ///   itself) go once not modified for `older_than`: a running stage writes
+    ///   its file continuously and holds it for seconds after, so a long-idle
+    ///   one is orphaned. So do subdirectories whose creation was cut short.
     pub fn sweep_stale(&self, older_than: std::time::Duration) -> std::io::Result<usize> {
         let now = std::time::SystemTime::now();
+        let idle = |meta: &std::fs::Metadata| {
+            meta.modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or_default()
+        };
+        let is_staged = |name: &str| name.starts_with(Self::PREFIX);
         let mut removed = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(Self::PREFIX)
-            {
-                continue;
-            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             let Ok(meta) = entry.metadata() else { continue };
-            let idle = meta
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .unwrap_or_default();
-            if meta.is_file() && idle >= older_than && std::fs::remove_file(entry.path()).is_ok() {
+            let path = entry.path();
+            if meta.is_dir() && name.starts_with(Self::OWN_DIR_PREFIX) {
+                // Taking the lock proves its process gone; held until removed.
+                let Ok(lock) = std::fs::File::open(path.join(Self::LOCK_FILE)) else {
+                    continue;
+                };
+                if lock.try_lock().is_err() {
+                    continue;
+                }
+                let staged = std::fs::read_dir(&path).map_or(0, |entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| is_staged(&entry.file_name().to_string_lossy()))
+                        .count()
+                });
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    removed += staged;
+                }
+            } else if meta.is_dir()
+                && name
+                    .strip_prefix('.')
+                    .is_some_and(|name| name.starts_with(Self::OWN_DIR_PREFIX))
+                && idle(&meta) >= older_than
+            {
+                let _ = std::fs::remove_dir_all(&path);
+            } else if meta.is_file()
+                && is_staged(&name)
+                && idle(&meta) >= older_than
+                && std::fs::remove_file(&path).is_ok()
+            {
                 removed += 1;
             }
         }
@@ -268,6 +374,7 @@ impl Default for Staging {
     fn default() -> Self {
         Staging::new(Self::default_dir(), None).unwrap_or_else(|_| Staging {
             dir: std::env::temp_dir(),
+            own: None,
             budget: None,
             limit: 0,
         })
@@ -326,7 +433,7 @@ impl Cas {
         // dropping it (on any early return) unlinks the file.
         let temp = tempfile::Builder::new()
             .prefix(Staging::PREFIX)
-            .tempfile_in(&self.staging.dir)?;
+            .tempfile_in(self.staging.own_dir())?;
 
         // Cap the body while streaming so we never buffer an oversized
         // payload to disk in full, and reserve temp space as it arrives.
@@ -369,6 +476,7 @@ impl Cas {
             size,
             temp_path,
             reservation: reader.reservation,
+            own_dir: self.staging.own.clone(),
         })
     }
 
@@ -445,6 +553,7 @@ impl Cas {
             ingest_token,
             _lease_guard: lease_guard,
             _reservation: staged.reservation,
+            _own_dir: staged.own_dir,
         })
     }
 

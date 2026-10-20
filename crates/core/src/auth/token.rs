@@ -11,6 +11,11 @@
 //! * **Bad credentials are never downgraded to anonymous.** If any source
 //!   reports credentials were present but invalid, [`resolve_principal`]
 //!   returns `Unauthorized` even when anonymous access would otherwise apply.
+//! * **A credential that could not be checked fails closed.** A database error
+//!   while looking up a token or a session is [`AuthError::Unavailable`]
+//!   (503), never `Unauthorized` (a client would take its credential for
+//!   wrong) nor "not a token": the secret is not run through the password
+//!   chain, whose credential-forwarding realm could send it upstream.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -46,16 +51,21 @@ pub fn generate_token_secret() -> String {
 
 /// Verify an API token secret.
 ///
-/// Returns `Some(UserPrincipal)` only if the token exists, is neither expired
-/// nor revoked, and belongs to an active user. Best-effort updates
-/// `last_used_at` (failure there does not fail authentication).
-pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> {
+/// Returns `Ok(Some(UserPrincipal))` only if the token exists, is neither
+/// expired nor revoked, and belongs to an active user; `Ok(None)` when the
+/// secret is not such a token. `Err` only on a database failure: the secret may
+/// still be a live token, so the caller must fail closed and must not treat it
+/// as anything else (e.g. a password). Best-effort updates `last_used_at`
+/// (failure there does not fail authentication).
+pub async fn verify_token(pool: &PgPool, secret: &str) -> sqlx::Result<Option<UserPrincipal>> {
     let hash = hash_token(secret);
 
-    let token = forge_db::token_dao::find_token_by_hash(pool, &hash)
+    let Some(token) = forge_db::token_dao::find_token_by_hash(pool, &hash)
         .await
-        .map_err(|e| tracing::warn!(error = %e, "token lookup failed"))
-        .ok()??;
+        .inspect_err(|e| tracing::warn!(error = %e, "token lookup failed"))?
+    else {
+        return Ok(None);
+    };
 
     // Defense in depth: constant-time compare of stored vs recomputed hash.
     // (The DB lookup matched on `hash`, but we never want a timing side channel
@@ -67,25 +77,27 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> 
         .unwrap_u8()
         != 1
     {
-        return None;
+        return Ok(None);
     }
 
     let now = Utc::now();
     if let Some(exp) = token.expires_at {
         if exp <= now {
-            return None;
+            return Ok(None);
         }
     }
     if token.revoked_at.is_some() {
-        return None;
+        return Ok(None);
     }
 
-    let user = forge_db::user_dao::find_user_by_id(pool, token.user_id)
+    let Some(user) = forge_db::user_dao::find_user_by_id(pool, token.user_id)
         .await
-        .map_err(|e| tracing::warn!(error = %e, "user lookup failed"))
-        .ok()??;
+        .inspect_err(|e| tracing::warn!(error = %e, "token user lookup failed"))?
+    else {
+        return Ok(None);
+    };
     if !user.active {
-        return None;
+        return Ok(None);
     }
 
     // Best-effort touch; ignore errors.
@@ -93,11 +105,11 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> 
         tracing::debug!(error = %e, token_id = token.id, "touch_last_used failed");
     }
 
-    Some(UserPrincipal {
+    Ok(Some(UserPrincipal {
         user_id: user.id,
         token_id: Some(token.id),
         is_admin: user.is_admin,
-    })
+    }))
 }
 
 /// Verify a username/password pair against the stored argon2 PHC hash.
@@ -167,6 +179,15 @@ pub enum SourceOutcome {
     /// Otherwise a stale cookie would lock the user out of every route,
     /// including the login endpoint and the SPA itself.
     Stale,
+    /// The source could not check the credential it was handed (a database
+    /// error looking up the token or the session). **Fail closed** and, like
+    /// [`Self::Reject`], terminal: the request is refused with
+    /// [`AuthError::Unavailable`] (503) and no later source is tried. Not
+    /// [`Self::Invalid`]: a 401 would tell the client its possibly valid
+    /// credential is wrong, and a later source could reinterpret the secret
+    /// (an unchecked token must never reach the password chain, whose
+    /// credential-forwarding realm would send it upstream).
+    Unavailable,
 }
 
 /// Errors from principal resolution.
@@ -175,6 +196,10 @@ pub enum AuthError {
     /// Credentials were supplied but rejected.
     #[error("unauthorized")]
     Unauthorized,
+    /// Credentials were supplied but could not be checked (a database error).
+    /// Fail closed: the caller answers 503, not 401.
+    #[error("authentication unavailable")]
+    Unavailable,
 }
 
 /// A way to derive a principal from request headers (token header, basic auth, …).
@@ -222,8 +247,9 @@ impl PrincipalSource for TokenHeaderSource {
             return SourceOutcome::NoCredentials;
         }
         match verify_token(&self.pool, secret).await {
-            Some(up) => SourceOutcome::Authenticated(Principal::from_user(up)),
-            None => SourceOutcome::Invalid,
+            Ok(Some(up)) => SourceOutcome::Authenticated(Principal::from_user(up)),
+            Ok(None) => SourceOutcome::Invalid,
+            Err(_) => SourceOutcome::Unavailable,
         }
     }
 }
@@ -359,9 +385,13 @@ impl PrincipalSource for BasicAuthSource {
         }
 
         // Try the secret as a token first (unchanged from slice 1, runs ahead
-        // of the password chain).
-        if let Some(up) = verify_token(&self.pool, &secret).await {
-            return SourceOutcome::Authenticated(Principal::from_user(up));
+        // of the password chain). A lookup that failed has not ruled out a
+        // live token: never run it through the password chain (a
+        // credential-forwarding realm would send it upstream), fail closed.
+        match verify_token(&self.pool, &secret).await {
+            Ok(Some(up)) => return SourceOutcome::Authenticated(Principal::from_user(up)),
+            Ok(None) => {}
+            Err(_) => return SourceOutcome::Unavailable,
         }
         // Then, if a password chain is configured, run the secret as a password
         // through the AuthProvider chain. The chain is re-resolved per attempt
@@ -468,6 +498,9 @@ pub use crate::auth::client_ip::AnonPolicy;
 ///   `Err(Unauthorized)` — the source has positively claimed the credential and
 ///   no later source may reinterpret it (WIF uses this so a rejected workload
 ///   JWT is never forwarded to a password provider).
+/// * An `Unavailable` (a credential that could not be checked) likewise stops
+///   the chain, with `Err(Unavailable)`: fail closed, and no 401 for a
+///   credential that may be valid.
 /// * If no source authenticates or rejects but **any** reported `Invalid`,
 ///   return `Err(Unauthorized)`. Bad credentials are *never* downgraded to
 ///   anonymous.
@@ -519,6 +552,8 @@ pub async fn resolve_principal_with_origin(
             }
             // Terminal: the source owns this credential and rejected it.
             SourceOutcome::Reject => return Err(AuthError::Unauthorized),
+            // Terminal: the credential could not be checked (fail closed).
+            SourceOutcome::Unavailable => return Err(AuthError::Unavailable),
             SourceOutcome::Invalid => saw_invalid = true,
             SourceOutcome::Stale => saw_stale = true,
             SourceOutcome::NoCredentials => {}
@@ -696,6 +731,35 @@ mod tests {
         ];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
         assert_eq!(res, Err(AuthError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn unavailable_is_terminal_and_never_anonymous_nor_unauthorized() {
+        // A credential the source could not check (a lookup error) fails
+        // closed as `Unavailable` (503): not anonymous even when anonymous
+        // access is open, not a 401 that would condemn a possibly valid
+        // credential, and no later source gets to reinterpret it.
+        let authed = Principal::User {
+            user_id: 1,
+            token_id: None,
+            is_admin: false,
+            method: crate::auth::AuthMethod::Password,
+        };
+        for sources in [
+            vec![Box::new(StubSource(SourceOutcome::Unavailable)) as Box<dyn PrincipalSource>],
+            vec![
+                Box::new(StubSource(SourceOutcome::NoCredentials)),
+                Box::new(StubSource(SourceOutcome::Unavailable)),
+                Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+            ],
+            vec![
+                Box::new(StubSource(SourceOutcome::Invalid)),
+                Box::new(StubSource(SourceOutcome::Unavailable)),
+            ],
+        ] {
+            let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
+            assert_eq!(res, Err(AuthError::Unavailable));
+        }
     }
 
     #[tokio::test]

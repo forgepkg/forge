@@ -7,9 +7,10 @@
 //! `q` understands `packageid:`, `id:` and multi-term queries (see
 //! [`forge_core::repo::SearchQuery`]). SemVer 2.0.0 versions (dotted
 //! prerelease labels, build metadata) are only returned to clients that send
-//! `semVerLevel=2.0.0`, as the protocol requires. Hits carry description,
-//! authors, tags, icon/project/license URLs, package types and total
-//! downloads from the latest version's manifest.
+//! `semVerLevel=2.0.0`, as the protocol requires; core drops them before
+//! counting and paging, so pages stay full and `totalHits` exact. Hits carry
+//! description, authors, tags, icon/project/license URLs, package types and
+//! total downloads from the latest version's manifest.
 
 use std::collections::HashMap;
 
@@ -18,8 +19,8 @@ use axum::response::Json;
 use forge_core::repo::SearchParams;
 use serde_json::{json, Value};
 
+use crate::nuspec;
 use crate::routes::RouteContext;
-use crate::{nuspec, version};
 
 /// Parse the raw query map into [`SearchParams`].
 fn parse_params(raw: &HashMap<String, String>) -> SearchParams {
@@ -41,6 +42,7 @@ fn parse_params(raw: &HashMap<String, String>) -> SearchParams {
         skip,
         take,
         prerelease,
+        include_semver2: wants_semver2(raw),
     }
 }
 
@@ -54,28 +56,18 @@ fn wants_semver2(raw: &HashMap<String, String>) -> bool {
 }
 
 /// Build the search-response JSON from core search results.
-pub fn search_json(
-    ctx: &RouteContext,
-    result: &forge_core::repo::SearchResult,
-    include_semver2: bool,
-) -> Value {
+///
+/// Version filtering (listed, prerelease, SemVer 2.0.0) already happened in
+/// core, before paging, so every hit and `total_hits` are rendered as is.
+pub fn search_json(ctx: &RouteContext, result: &forge_core::repo::SearchResult) -> Value {
     let base = ctx.base();
-    let mut dropped = 0usize;
     let data: Vec<Value> = result
         .hits
         .iter()
-        .filter_map(|hit| {
+        .map(|hit| {
             let lower_id = ctx.format.lower_id(&hit.original_id);
-            let visible: Vec<&forge_core::repo::VersionEntry> = hit
+            let versions: Vec<Value> = hit
                 .versions
-                .iter()
-                .filter(|v| include_semver2 || !version::is_semver2(&v.version_original))
-                .collect();
-            let Some(latest) = visible.last() else {
-                dropped += 1;
-                return None;
-            };
-            let versions: Vec<Value> = visible
                 .iter()
                 .map(|v| {
                     json!({
@@ -88,14 +80,9 @@ pub fn search_json(
                     })
                 })
                 .collect();
-            // The manifest describes the backend's latest version; only use
-            // it when that version survived the SemVer filter.
-            let meta = if latest.version == hit.latest_version {
+            let meta =
                 nuspec::summary_of(hit.manifest_summary.as_ref(), hit.nuspec_bytes.as_deref())
-                    .metadata
-            } else {
-                nuspec::NuspecMetadata::default()
-            };
+                    .metadata;
             let authors: Vec<Value> = meta
                 .authors
                 .as_deref()
@@ -125,7 +112,7 @@ pub fn search_json(
                 "@type": "Package",
                 "registration": format!("{base}/registration/{lower_id}/index.json"),
                 "id": hit.original_id,
-                "version": latest.version,
+                "version": hit.latest_version,
                 "description": meta.description.clone().unwrap_or_default(),
                 "summary": meta.summary.clone().unwrap_or_default(),
                 "title": meta.title.clone().unwrap_or_else(|| hit.original_id.clone()),
@@ -145,12 +132,12 @@ pub fn search_json(
                     obj[key] = Value::String(value);
                 }
             }
-            Some(obj)
+            obj
         })
         .collect();
 
     json!({
-        "totalHits": result.total_hits.saturating_sub(dropped),
+        "totalHits": result.total_hits,
         "data": data,
     })
 }
@@ -163,7 +150,7 @@ pub async fn query(
     use axum::response::IntoResponse;
     let params = parse_params(&raw);
     match ctx.ops.search(&ctx.repo, &params).await {
-        Ok(result) => Json(search_json(&ctx, &result, wants_semver2(&raw))).into_response(),
+        Ok(result) => Json(search_json(&ctx, &result)).into_response(),
         Err(e) => crate::routes::repo_error_response(e),
     }
 }

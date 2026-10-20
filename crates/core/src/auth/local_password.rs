@@ -5,10 +5,14 @@
 //! chain. Its behaviour is **byte-for-byte** the slice-1 logic:
 //!
 //! * Look up the user by username.
-//! * An inactive user, an unknown user, or a user without a local
-//!   `password_hash` (i.e. an `upstream-basic` / `oidc` provisioned account)
-//!   can never authenticate here — they are [`AuthOutcome::Skip`] ("not my
-//!   user"), so a later provider may still accept them.
+//! * An unknown user, or a user without a local `password_hash` (i.e. an
+//!   `upstream-basic` / `oidc` provisioned account) can never authenticate
+//!   here — they are [`AuthOutcome::Skip`] ("not my user"), so a later
+//!   provider may still accept them.
+//! * An inactive local account (one with a `password_hash`) can never
+//!   authenticate either, but its username is still owned by a local password
+//!   account: it is [`AuthOutcome::Rejected`], like a wrong password, so no
+//!   password typed for it is ever forwarded to a later (upstream) provider.
 //! * argon2id PHC verification runs on a blocking thread (CPU-bound), behind a
 //!   process-wide [`PasswordHashLimiter`]: at most N verifications run at once
 //!   (each holds ~19 MiB and a core for tens of milliseconds), and one that finds
@@ -16,11 +20,11 @@
 //!   (an overload, not a wrong password: never counted towards the lockout).
 //! * A present-but-wrong password is [`AuthOutcome::Rejected`] (terminal in
 //!   the chain: the password is never forwarded upstream).
-//! * The unknown-user and inactive-user `Skip` paths still run one argon2
-//!   verification against a static dummy hash, so they cost the same time as a
-//!   known local account (no timing-based enumeration of local accounts). A
-//!   federated account (no local `password_hash`) skips at once — see
-//!   [`LocalPasswordProvider::authenticate`] for that trade-off.
+//! * The unknown-user `Skip` path and the inactive-account rejection still run
+//!   one argon2 verification against a static dummy hash, so they cost the
+//!   same time as a known local account (no timing-based enumeration of local
+//!   accounts). A federated account (no local `password_hash`) skips at once —
+//!   see [`LocalPasswordProvider::authenticate`] for that trade-off.
 //! * A correct password yields [`AuthOutcome::Authenticated`] with a
 //!   [`ProvenIdentity::local`].
 //!
@@ -32,11 +36,12 @@
 //! ## Skip vs Rejected — why it matters for the chain
 //! Slice 1's [`super::token::verify_password`] returned `None` for *both*
 //! "unknown user" and "wrong password". In the chain those must differ:
-//! * unknown / no-local-hash / inactive → **Skip** (a later provider, e.g.
+//! * unknown / no-local-hash → **Skip** (a later provider, e.g.
 //!   `upstream-basic`, may own this username);
-//! * known local user, wrong password → **Rejected** (definitive "no"; the
-//!   chain stops here — a username owned by a local account with a password is
-//!   never forwarded to an upstream realm).
+//! * known local user, wrong password, or an inactive local account with any
+//!   password → **Rejected** (definitive "no"; the chain stops here — a
+//!   username owned by a local account with a password is never forwarded to
+//!   an upstream realm).
 //!
 //! When the chain is just `["local-password"]` this distinction is invisible on
 //! the wire: both `Skip` (→ `NoCredentials` → anon policy) and `Rejected`
@@ -213,17 +218,17 @@ impl LocalPasswordProvider {
         if self.forwarding_follows {
             AuthOutcome::Skip
         } else {
-            self.skip_after_dummy_verify(candidate).await
+            self.after_dummy_verify(candidate, AuthOutcome::Skip).await
         }
     }
 
-    /// Burn one argon2 verification on the dummy hash, then report `Skip`: the
-    /// caller learns "not ours" in the same time a wrong password would take.
-    /// A saturated limiter answers `Unavailable`, exactly as it does for a real
+    /// Burn one argon2 verification on the dummy hash, then report `outcome`:
+    /// the caller learns it in the same time a wrong password would take. A
+    /// saturated limiter answers `Unavailable`, exactly as it does for a real
     /// account, so an overload does not reveal which usernames exist either.
-    async fn skip_after_dummy_verify(&self, candidate: &str) -> AuthOutcome {
+    async fn after_dummy_verify(&self, candidate: &str, outcome: AuthOutcome) -> AuthOutcome {
         match self.limiter.verify_dummy(candidate.to_string()).await {
-            Ok(_) => AuthOutcome::Skip,
+            Ok(_) => outcome,
             Err(LimiterSaturated) => saturated(),
         }
     }
@@ -285,12 +290,15 @@ impl AuthProvider for LocalPasswordProvider {
             return self.skip_foreign(cred.password).await;
         };
 
-        // Inactive users never authenticate locally. Slice 1 returned `None`
-        // here; in the chain this is Skip (the account exists but isn't ours to
-        // accept — and an inactive user shouldn't be forwarded upstream either,
-        // but that is the upstream provider's own active-check concern).
+        // Inactive users never authenticate locally. The name still belongs to
+        // a local password account, so this is a terminal rejection, not a
+        // Skip: neither the owner's password nor a guess may reach a later
+        // (upstream) realm. It costs a (dummy) verification and answers like a
+        // wrong password, so it does not show that the account is deactivated.
         if !user.active {
-            return self.skip_after_dummy_verify(cred.password).await;
+            return self
+                .after_dummy_verify(cred.password, AuthOutcome::Rejected)
+                .await;
         }
 
         match self.limiter.verify(stored, cred.password.to_string()).await {

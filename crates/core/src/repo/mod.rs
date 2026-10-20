@@ -339,6 +339,11 @@ pub struct SearchParams {
     pub take: usize,
     /// Include prerelease versions.
     pub prerelease: bool,
+    /// Include SemVer 2.0.0 versions ([`is_semver2`]). Applied with the other
+    /// version filters, before counting and paging, so an id left with only
+    /// such versions is neither a hit nor counted. The NuGet route sets it
+    /// from `semVerLevel`; it defaults to `true`.
+    pub include_semver2: bool,
 }
 
 impl Default for SearchParams {
@@ -348,6 +353,7 @@ impl Default for SearchParams {
             skip: 0,
             take: SearchParams::DEFAULT_TAKE,
             prerelease: false,
+            include_semver2: true,
         }
     }
 }
@@ -365,6 +371,19 @@ impl SearchParams {
             n => n.min(Self::MAX_TAKE),
         }
     }
+}
+
+/// Whether `version` (as published) is a SemVer 2.0.0 version in NuGet's
+/// sense: it carries build metadata or a dotted prerelease label. Clients that
+/// do not send `semVerLevel=2.0.0` must not be shown these.
+pub fn is_semver2(version: &str) -> bool {
+    let version = version.trim();
+    if version.contains('+') {
+        return true;
+    }
+    version
+        .split_once('-')
+        .is_some_and(|(_, prerelease)| prerelease.contains('.'))
 }
 
 /// Read operations a NuGet route handler needs, abstracted so handlers can be
@@ -753,7 +772,15 @@ pub trait RepoWriteOps: Send + Sync {
 
 #[cfg(test)]
 mod search_query_tests {
-    use super::SearchQuery;
+    use super::{is_semver2, SearchQuery};
+
+    #[test]
+    fn semver2_detection() {
+        assert!(is_semver2("1.0.0-beta.1"));
+        assert!(is_semver2("1.0.0+sha.abc"));
+        assert!(!is_semver2("1.0.0-beta1"));
+        assert!(!is_semver2("1.0.0"));
+    }
 
     #[test]
     fn parses_client_syntax() {

@@ -28,6 +28,7 @@ use forge_core::auth::login_throttle::{LoginThrottle, MAX_USERNAME_BYTES};
 use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential};
 use forge_core::auth::token::{
     generate_token_secret, hash_token, BasicAuthSource, PrincipalSource, SourceOutcome,
+    TokenHeaderSource,
 };
 use forge_core::auth::Principal;
 use forge_db::token_dao::{self, NewToken};
@@ -128,14 +129,23 @@ async fn local_provider_skips_unknown_user() {
 }
 
 #[tokio::test]
-async fn local_provider_skips_inactive_user() {
+async fn local_provider_rejects_inactive_user() {
+    // A deactivated local account never authenticates, and its name is still
+    // a local password account's: a definitive Rejected (never a Skip that
+    // would hand the password to a later provider), whatever the password.
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", false, false).await;
-    let provider = LocalPasswordProvider::new(pool.clone());
-    assert_eq!(
-        provider.authenticate(&cred(&username, "pw")).await,
-        AuthOutcome::Skip
-    );
+    for forwarding_follows in [false, true] {
+        let provider =
+            LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
+        for password in ["pw", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password} (forwarding follows: {forwarding_follows})"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -468,6 +478,51 @@ async fn foreign_names_cost_the_same_as_each_other() {
     }
 }
 
+/// Review 2026-10-20 L2: in a local → credential-forwarding chain, a
+/// deactivated local account's password (its owner's, or an attacker's
+/// guesses) is never forwarded, even to an upstream that would vouch for the
+/// name. It is a failed attempt like any wrong password.
+#[tokio::test]
+async fn inactive_local_account_is_never_forwarded() {
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", false, false).await;
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity {
+            source: AuthSource::UpstreamBasic,
+            external_subject: Some(username.clone()),
+            auto_provision: true,
+            ..forge_core::auth::ProvenIdentity::local(username.clone())
+        }),
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![
+        Box::new(LocalPasswordProvider::new(pool.clone()).forwarding_follows(true)),
+        Box::new(upstream),
+    ]));
+    for password in ["pw", "a-guess"] {
+        assert_eq!(
+            chain.authenticate(&cred(&username, password)).await,
+            ChainOutcome::Rejected,
+            "{password}"
+        );
+    }
+
+    let throttle = Arc::new(LoginThrottle::new(5, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header(&username, "pw"), ip()).await,
+        SourceOutcome::Invalid
+    );
+    assert_eq!(throttle.tracked(), 1, "counted like a wrong password");
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "an inactive local account's password never reaches the upstream"
+    );
+}
+
 #[tokio::test]
 async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
     // M4(b): with every argon2 slot busy, a local account's correct password
@@ -510,6 +565,53 @@ async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
         0,
         "a local account's password never reaches the upstream"
     );
+}
+
+/// Review 2026-10-20 L3: a token lookup that fails (pool exhausted, short
+/// acquire timeout) has not ruled out a live token. It is `Unavailable` (503),
+/// not "not a token": the secret never runs through the password chain, whose
+/// credential-forwarding realm would send it upstream.
+#[tokio::test]
+async fn token_lookup_error_is_unavailable_and_never_reaches_the_password_chain() {
+    // A closed pool fails every query, like an exhausted one.
+    let pool = common::pool().await;
+    pool.close().await;
+    let secret = generate_token_secret();
+    assert!(forge_core::auth::verify_token(&pool, &secret)
+        .await
+        .is_err());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        TokenHeaderSource::HEADER,
+        HeaderValue::from_str(&secret).unwrap(),
+    );
+    assert_eq!(
+        TokenHeaderSource::new(pool.clone())
+            .resolve(&headers, ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(upstream)]));
+    let throttle = Arc::new(LoginThrottle::default());
+    let src = BasicAuthSource::with_chain(pool, Some(chain)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header("nuget-user", &secret), ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "an unchecked token is never forwarded as a password"
+    );
+    assert_eq!(throttle.tracked(), 0, "nor counted as a failed password");
 }
 
 #[tokio::test]

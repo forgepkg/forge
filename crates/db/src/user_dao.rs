@@ -279,7 +279,10 @@ pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
 /// Used by OIDC login to **recompute** admin on every sign-in from the IdP's
 /// group/role claim (slice 12.2 §3.6): a user added to or removed from the admin
 /// group gains/loses admin on their next login.
-pub async fn update_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> sqlx::Result<AppUser> {
+pub async fn update_is_admin<'e, E>(executor: E, id: i64, is_admin: bool) -> sqlx::Result<AppUser>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         AppUser,
         r#"
@@ -294,7 +297,7 @@ pub async fn update_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> sqlx::Re
         id,
         is_admin,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -306,7 +309,10 @@ pub async fn update_is_admin(pool: &PgPool, id: i64, is_admin: bool) -> sqlx::Re
 /// logins), and no provisioning path ever flips it back: the upstream-basic
 /// upsert ([`provision_upstream_user`]) and OIDC resolution leave an existing
 /// row's `active` alone.
-pub async fn set_active(pool: &PgPool, id: i64, active: bool) -> sqlx::Result<Option<AppUser>> {
+pub async fn set_active<'e, E>(executor: E, id: i64, active: bool) -> sqlx::Result<Option<AppUser>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         AppUser,
         r#"
@@ -321,14 +327,17 @@ pub async fn set_active(pool: &PgPool, id: i64, active: bool) -> sqlx::Result<Op
         id,
         active,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a user by id (cascading their tokens). Returns whether a row went.
-pub async fn delete_user(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+pub async fn delete_user<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let res = sqlx::query!(r#"DELETE FROM app_user WHERE id = $1"#, id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected() > 0)
 }

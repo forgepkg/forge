@@ -2,7 +2,9 @@
 //!
 //! * `GET    /admin/users/{id}/roles` — list the roles a user holds.
 //! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent).
-//! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role.
+//! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role. Taking the
+//!   built-in `admin` role from the last active administrator is refused
+//!   (**409**, [`super::last_admin_conflict`]).
 //!
 //! A `user_role` change affects exactly one principal, so it uses **targeted**
 //! cache invalidation ([`invalidate_user`]) rather than the epoch roll — cheaper
@@ -16,7 +18,7 @@ use forge_db::authz_dao::{self, Role};
 use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
-use super::db_error;
+use super::{db_error, last_admin_conflict};
 use crate::state::AppState;
 
 /// A role view (same shape as [`super::roles::RoleView`]).
@@ -99,18 +101,40 @@ pub async fn unassign(
     State(state): State<AppState>,
     Path((user_id, role_id)): Path<(i64, i64)>,
 ) -> Response {
-    // Clear the legacy flag first: while `app_user.is_admin` is set the user
-    // stays a global admin through the dual-read fallback, so removing only the
-    // role would silently leave the admin rights in place.
-    if let Err(e) = sync_legacy_admin_flag(&state, user_id, role_id, false).await {
-        return db_error(e);
-    }
-    let result = authz_dao::unassign_role(&state.pool, user_id, role_id).await;
+    let result = unassign_guarded(&state, user_id, role_id).await;
     invalidate_user(&state.cache, user_id).await;
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => db_error(e),
+        Err(resp) => resp,
     }
+}
+
+/// Unassign the role in one transaction. Taking the built-in `admin` role
+/// away runs under the last-admin guard.
+async fn unassign_guarded(state: &AppState, user_id: i64, role_id: i64) -> Result<(), Response> {
+    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let admin_role = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
+        .await
+        .map_err(db_error)?;
+    if admin_role == Some(role_id) {
+        if authz_dao::would_leave_no_admin(&mut tx, user_id)
+            .await
+            .map_err(db_error)?
+        {
+            return Err(last_admin_conflict());
+        }
+        // Clear the legacy flag too: while `app_user.is_admin` is set the user
+        // stays a global admin through the dual-read fallback, so removing only
+        // the role would silently leave the admin rights in place.
+        match user_dao::update_is_admin(&mut *tx, user_id, false).await {
+            Ok(_) | Err(sqlx::Error::RowNotFound) => {}
+            Err(e) => return Err(db_error(e)),
+        }
+    }
+    authz_dao::unassign_role(&mut *tx, user_id, role_id)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)
 }
 
 /// Keep the slice-1 `app_user.is_admin` column in step with membership of the

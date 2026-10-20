@@ -48,9 +48,12 @@
 //!   away from its proxy.
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
-//!   remaining members. Only when *every* consulted member fails does the
-//!   group return an error, so a public-feed outage never breaks restores of
-//!   internal packages.
+//!   remaining members, so a public-feed outage never breaks restores of
+//!   internal packages. A miss is only authoritative if every consulted
+//!   member answered: when a member failed and the answer would be empty (no
+//!   versions, no registration, no such exact version), the group returns the
+//!   error, so clients and downstream proxies retry rather than cache a
+//!   not-found. Search errors only when *every* member fails.
 //!
 //! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
 //! a group** (nested groups). Resolution first loads each readable group node
@@ -790,7 +793,7 @@ impl RepoReadOps for GroupRepo {
                 Err(e) => failures.failed(&m.repo.name, e),
             }
         }
-        failures.into_result()?;
+        failures.into_merged_result(merged.is_empty())?;
         merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
         Ok(merged)
     }
@@ -863,9 +866,31 @@ impl RepoReadOps for GroupRepo {
                 Err(e) => failures.failed(&m.repo.name, e),
             }
         }
-        failures.into_result()?;
+        failures.into_merged_result(merged.is_empty())?;
         merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
         Ok(merged)
+    }
+
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+        // Highest-priority serving member that has the exact (id, version),
+        // the entry `registration` would keep; a miss is strict like downloads.
+        let mut failures = MemberFailures::default();
+        for m in &members {
+            match m.ops.registration_entry(&m.repo.name, id, version).await {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => failures.ok(),
+                Err(e) => failures.failed(&m.repo.name, e),
+            }
+        }
+        failures.into_strict_result()?;
+        Ok(None)
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
@@ -943,6 +968,17 @@ impl MemberFailures {
         match self.last_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    /// For a merge across members: an empty merge is a miss, so it is strict
+    /// ([`Self::into_strict_result`]); a non-empty one is served from the
+    /// members that answered.
+    fn into_merged_result(self, merged_is_empty: bool) -> Result<(), RepoError> {
+        if merged_is_empty {
+            self.into_strict_result()
+        } else {
+            self.into_result()
         }
     }
 }

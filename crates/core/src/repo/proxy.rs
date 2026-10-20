@@ -22,11 +22,13 @@
 //! * **NO advisory locks, no DB transaction across network I/O** — first-time
 //!   fetch singleflight is a plain row lock:
 //!   [`proxy_dao::insert_unconfirmed_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
-//!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
+//!   guarantee a row exists, then [`proxy_dao::lock_or_insert_cached_version`]
 //!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
 //!   and finalize transactions; it is **released before** the upstream HTTP
-//!   fetch and the CAS/S3 PUT (Addendum A7). Within one instance, concurrent
-//!   first-time fetches of the same version are serialized by an in-process
+//!   fetch and the CAS/S3 PUT (Addendum A7), so the reconciler may prune a
+//!   still-unconfirmed row meanwhile; the next lock then creates it again.
+//!   Within one instance, concurrent first-time fetches of the same version
+//!   are serialized by an in-process
 //!   gate ([`inflight_gate`]): the first caller fetches, the others wait and
 //!   then find `downloaded` set, so N simultaneous restores cost one upstream
 //!   download and one temp file. Across instances the singleflight is
@@ -67,6 +69,11 @@
 //!   to the flat-container view (listed, no dependencies).
 //! * **Metadata TTL** — the upstream service index *and* each package's
 //!   version listing are re-fetched at most once per `metadata_ttl_seconds`.
+//! * **Repointing** — the service index, version listings, manifests and
+//!   registrations cached from the upstream are tied to the `remote_url` they
+//!   came from: once it changes, nothing more is requested from the previous
+//!   upstream, and a failing new one is an error, never a fallback to the
+//!   previous upstream's index. Packages already downloaded stay cached.
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made.
 
@@ -86,6 +93,7 @@ use forge_db::{blob_dao, repository_dao};
 use forge_storage::{Cas, CasError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use crate::authz::PackageFilter;
@@ -99,22 +107,25 @@ use crate::repo::{
     NUSPEC_CONTENT_TYPE,
 };
 
-/// Cache namespace for resolved upstream service indexes, keyed by repo name.
+/// Cache namespace for resolved upstream service indexes, keyed by
+/// `"{repo}/{repo_id}/{remote_url}"`.
 pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// Cache namespace marking a package's upstream version listing as fresh,
-/// keyed by `"{repo}/{lower_id}"`.
+/// keyed by `"{scope}/{lower_id}"`. In this and the namespaces below, `scope`
+/// is `"{repo}/{repo_id}/{remote_url digest}"`, so nothing cached from a
+/// previous upstream is used once a proxy is repointed.
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
 /// Cache namespace for upstream `.nuspec` documents of not-yet-downloaded
-/// versions, keyed by `"{repo}/{lower_id}/{version}"`.
+/// versions, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_NUSPEC: &str = "proxy_nuspec";
 /// Cache namespace for a package's upstream registration index (its pages,
-/// with any inlined leaves), keyed by `"{repo}/{repo_id}/{lower_id}"`.
+/// with any inlined leaves), keyed by `"{scope}/{lower_id}"`.
 pub const NS_UPSTREAM_REGISTRATION: &str = "proxy_registration";
 /// Cache namespace for one non-inlined upstream registration page, keyed by
-/// `"{repo}/{repo_id}/{page url}"`.
+/// `"{scope}/{page url}"`.
 pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
 /// Cache namespace remembering why an upstream package was rejected for its
-/// content, keyed by `"{repo}/{repo_id}/{lower_id}/{version}"`.
+/// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
 
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
@@ -132,8 +143,9 @@ const MAX_REGISTRATION_PAGES: usize = 10;
 /// Concurrent upstream registration page fetches per request.
 const REGISTRATION_PAGE_CONCURRENCY: usize = 4;
 
-/// The upstream resource `@id`s resolved from a V3 service index, persisted as
-/// the `proxy_upstream_index.resources` JSON and cached.
+/// The upstream resource `@id`s resolved from a V3 service index, persisted in
+/// the `proxy_upstream_index.resources` JSON (with the URL they came from) and
+/// cached.
 ///
 /// Stored absolute (the upstream advertises absolute `@id`s); we always keep a
 /// trailing slash on the base-address style resources so we can append path
@@ -204,6 +216,16 @@ impl UpstreamResources {
         }
         out
     }
+}
+
+/// The `proxy_upstream_index.resources` JSON: the resolved resources and the
+/// `remote_url` they were resolved from. A row that came from another URL (the
+/// proxy has been repointed since), or that predates this field, is never used.
+#[derive(Serialize, Deserialize)]
+struct PersistedIndex {
+    remote_url: String,
+    #[serde(flatten)]
+    resources: UpstreamResources,
 }
 
 /// One upstream dependency group as cached: `(targetFramework, [(id, range)])`.
@@ -463,6 +485,21 @@ impl ProxyRepo {
         Ok(row)
     }
 
+    /// The key prefix of everything cached from `repo`'s upstream: the
+    /// repository (its id too, so a deleted-and-recreated repository starts
+    /// afresh) and a digest of its `remote_url`, so a repointed proxy never
+    /// serves what the previous upstream answered. A digest rather than the
+    /// URL itself keeps keys that append another URL unambiguous.
+    fn upstream_scope(repo: &Repository) -> String {
+        let digest = Sha256::digest(repo.remote_url.as_deref().unwrap_or_default());
+        format!("{}/{}/{}", repo.name, repo.id, hex::encode(&digest[..8]))
+    }
+
+    /// Cache key of the "listing refreshed" marker of `lower_id`.
+    fn versions_key(repo: &Repository, lower_id: &str) -> String {
+        format!("{}/{lower_id}", Self::upstream_scope(repo))
+    }
+
     fn metadata_ttl(repo: &Repository) -> Duration {
         Duration::seconds(
             repo.metadata_ttl_seconds
@@ -522,15 +559,17 @@ impl ProxyRepo {
     ///    coalescing + short-circuit; a 2nd call within TTL never touches DB or
     ///    upstream.
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`
-    ///    is within metadata_ttl, reuse it without a network call.
+    ///    is within metadata_ttl, reuse it without a network call. Only a row
+    ///    fetched from the current `remote_url` is used, fresh or stale.
     /// 3. **Refresh** — otherwise fetch the upstream index (no DB transaction
     ///    or row lock held across the request), resolve the `@id`s, and
     ///    upsert them. Concurrent instances may both refresh; the result is
     ///    idempotent.
     ///
-    /// The cache key includes the repository id and `remote_url` so a changed
-    /// upstream (or a deleted-and-recreated repository) never serves the old
-    /// upstream's resources.
+    /// The cache key includes the repository id and `remote_url`, and the
+    /// persisted row records its URL, so a changed upstream (or a
+    /// deleted-and-recreated repository) never serves the old upstream's
+    /// resources.
     pub async fn resolve_upstream_index(
         &self,
         repo: &Repository,
@@ -571,17 +610,24 @@ impl ProxyRepo {
         ttl: Duration,
         remote_url: &str,
     ) -> Result<UpstreamResources, RepoError> {
-        let persisted = proxy_dao::get_upstream_index(&self.pool, repo.id).await?;
-        if let Some(idx) = &persisted {
-            if Utc::now() - idx.fetched_at < ttl {
-                return Ok(parse_resources(idx.resources.clone()));
+        // An index fetched from another URL is not this upstream's: neither
+        // reused nor fallen back to below.
+        let persisted = proxy_dao::get_upstream_index(&self.pool, repo.id)
+            .await?
+            .and_then(|idx| {
+                let stored: PersistedIndex = serde_json::from_value(idx.resources).ok()?;
+                (stored.remote_url == remote_url).then_some((stored.resources, idx.fetched_at))
+            });
+        if let Some((resources, fetched_at)) = &persisted {
+            if Utc::now() - *fetched_at < ttl {
+                return Ok(resources.clone());
             }
         }
 
         // Offline: never fetch. Serve a persisted (possibly stale) index if present.
         if !repo.online {
             return match persisted {
-                Some(idx) => Ok(parse_resources(idx.resources)),
+                Some((resources, _)) => Ok(resources),
                 None => Err(RepoError::Storage(
                     "proxy is offline and has no cached upstream index".into(),
                 )),
@@ -598,16 +644,19 @@ impl ProxyRepo {
             Err(e) => {
                 // A stale persisted index is better than failing every read
                 // while the upstream is briefly unreachable.
-                if let Some(idx) = persisted {
+                if let Some((resources, _)) = persisted {
                     tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
-                    return Ok(parse_resources(idx.resources));
+                    return Ok(resources);
                 }
                 return Err(e);
             }
         };
         let resources = UpstreamResources::from_service_index(&doc);
-        let resources_json = serde_json::to_value(&resources)
-            .map_err(|e| RepoError::Storage(format!("serialize resources: {e}")))?;
+        let resources_json = serde_json::to_value(PersistedIndex {
+            remote_url: remote_url.to_string(),
+            resources: resources.clone(),
+        })
+        .map_err(|e| RepoError::Storage(format!("serialize resources: {e}")))?;
 
         sqlx::query!(
             r#"
@@ -647,7 +696,7 @@ impl ProxyRepo {
         }
 
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{}/{lower_id}", repo.name, repo.id);
+        let key = Self::versions_key(repo, lower_id);
         let refreshed = self
             .cache
             .get_or_try_insert_with(NS_UPSTREAM_VERSIONS, &key, ttl, || async {
@@ -860,11 +909,8 @@ impl ProxyRepo {
         {
             let mut tx = self.pool.begin().await?;
             let locked =
-                proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
-                    .await?
-                    .ok_or_else(|| {
-                        RepoError::Storage("cached-version row vanished under lock".into())
-                    })?;
+                proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version)
+                    .await?;
 
             // Decide on the locked row, then release the lock before any
             // further query.
@@ -1060,10 +1106,10 @@ impl ProxyRepo {
             .map_err(|_| RepoError::Storage("nuspec size overflow".into()))?;
 
         // ── Finalize (short tx) — re-lock, re-check, attach, mark downloaded. ─
+        // An unconfirmed row pruned during the fetch is created again here.
         let mut tx = self.pool.begin().await?;
-        let locked = proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
-            .await?
-            .ok_or_else(|| RepoError::Storage("cached-version row vanished under lock".into()))?;
+        let locked =
+            proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version).await?;
 
         // A racing caller finished while we were fetching. The blob we stored is
         // already on disk (CAS dedup); just roll back and serve the local copy.
@@ -1152,10 +1198,7 @@ impl ProxyRepo {
         if marker_cleared {
             // The cached "unknown upstream" listing result goes with it.
             self.cache
-                .invalidate(
-                    NS_UPSTREAM_VERSIONS,
-                    &format!("{}/{}/{lower_id}", repo.name, repo.id),
-                )
+                .invalidate(NS_UPSTREAM_VERSIONS, &Self::versions_key(repo, lower_id))
                 .await;
         }
 
@@ -1197,7 +1240,7 @@ impl ProxyRepo {
 
     /// Cache key of a remembered rejection of `(lower_id, version)`.
     fn rejection_key(repo: &Repository, lower_id: &str, version: &str) -> String {
-        format!("{}/{}/{lower_id}/{version}", repo.name, repo.id)
+        format!("{}/{lower_id}/{version}", Self::upstream_scope(repo))
     }
 
     /// Why a recent fetch of `(lower_id, version)` was rejected for its content
@@ -1355,7 +1398,7 @@ impl ProxyRepo {
         lower_id: &str,
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
-        let key = format!("{}/{}/{lower_id}/{version}", repo.name, repo.id);
+        let key = format!("{}/{lower_id}/{version}", Self::upstream_scope(repo));
         let fetched: Result<Option<Vec<u8>>, String> = self
             .cache
             // Local-only, like every upstream document clients act on: a
@@ -1479,7 +1522,7 @@ impl ProxyRepo {
         lower_id: &str,
     ) -> Result<Option<Vec<UpstreamRegistrationPage>>, RepoError> {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{}/{lower_id}", repo.name, repo.id);
+        let key = format!("{}/{lower_id}", Self::upstream_scope(repo));
         self.cache
             // Local-only (listing state, dependencies; see NS_UPSTREAM_NUSPEC).
             .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION, &key, ttl, || async {
@@ -1508,7 +1551,7 @@ impl ProxyRepo {
         url: &str,
     ) -> Result<BTreeMap<String, UpstreamLeaf>, RepoError> {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{}/{url}", repo.name, repo.id);
+        let key = format!("{}/{url}", Self::upstream_scope(repo));
         self.cache
             // Local-only (see NS_UPSTREAM_REGISTRATION).
             .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION_PAGE, &key, ttl, || async {
@@ -1633,10 +1676,10 @@ impl ProxyRepo {
 
     /// Search the locally known proxy corpus once, applying authorization
     /// before total-count calculation and client paging. Every per-version
-    /// condition (listing state, package delay, not-found marker, prerelease)
-    /// runs in PostgreSQL, which returns only the matching ids; versions are
-    /// loaded for the requested page alone, so an empty query over a large
-    /// proxy cache does not load every cached version.
+    /// condition (listing state, package delay, not-found marker, prerelease,
+    /// SemVer 2.0.0) runs in PostgreSQL, which returns only the matching ids;
+    /// versions are loaded for the requested page alone, so an empty query
+    /// over a large proxy cache does not load every cached version.
     /// With `enrich`, the returned page carries cached manifests
     /// ([`Self::enrich_hits`]); a group searches its members without and
     /// enriches only its own final page.
@@ -1655,6 +1698,7 @@ impl ProxyRepo {
         let marked_after = now - Self::not_found_ttl(&repo_row);
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
+        // The version regex is `is_semver2`: build metadata, or a `.` after a `-`.
         let names = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT name AS "name!"
@@ -1664,6 +1708,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
+              AND ($6 OR version !~ '[+]|-.*[.]')
             ORDER BY name
             "#,
             repo_row.id,
@@ -1671,6 +1716,7 @@ impl ProxyRepo {
             seen_before,
             marked_after,
             params.prerelease,
+            params.include_semver2,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1699,12 +1745,14 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
+              AND ($6 OR version !~ '[+]|-.*[.]')
             "#,
             repo_row.id,
             &page,
             seen_before,
             marked_after,
             params.prerelease,
+            params.include_semver2,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1781,16 +1829,6 @@ fn spawn_proxy_download_bump(pool: PgPool, repo_id: i64, name: String, version: 
             tracing::warn!(error = %e, repo_id, %name, %version, "proxy download tracking bump failed");
         }
     });
-}
-
-/// Parse a stored `resources` JSON into [`UpstreamResources`], tolerating a
-/// shape mismatch by falling back to an empty resource set.
-fn parse_resources(value: JsonValue) -> UpstreamResources {
-    serde_json::from_value::<UpstreamResources>(value).unwrap_or(UpstreamResources {
-        package_base_address: None,
-        registrations_base_url: None,
-        search_query_service: None,
-    })
 }
 
 #[async_trait]
@@ -2111,6 +2149,31 @@ mod tests {
                 .as_deref(),
             Some("https://up/reg/")
         );
+    }
+
+    #[test]
+    fn persisted_index_records_its_url() {
+        let resources = UpstreamResources {
+            package_base_address: Some("https://up/flat/".into()),
+            registrations_base_url: None,
+            search_query_service: None,
+        };
+        let stored = serde_json::to_value(PersistedIndex {
+            remote_url: "https://up/index.json".into(),
+            resources: resources.clone(),
+        })
+        .unwrap();
+        // The resources keep their shape; the URL is one more field.
+        assert_eq!(
+            serde_json::from_value::<UpstreamResources>(stored.clone()).unwrap(),
+            resources
+        );
+        let parsed: PersistedIndex = serde_json::from_value(stored).unwrap();
+        assert_eq!(parsed.remote_url, "https://up/index.json");
+        assert_eq!(parsed.resources, resources);
+        // A row written before the URL was recorded belongs to no URL.
+        let legacy = serde_json::to_value(&resources).unwrap();
+        assert!(serde_json::from_value::<PersistedIndex>(legacy).is_err());
     }
 
     #[test]

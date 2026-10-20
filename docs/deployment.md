@@ -95,6 +95,11 @@ account. It is not re-created on later restarts. Then remove the password from
 the environment: with no bootstrap password configured, Forge simply starts
 without a bootstrap admin.
 
+Forge never lets the last active administrator go: deleting or deactivating
+that account, or removing its `admin` role, is refused with `409 Conflict`.
+So the replacement admin has to exist first; an OIDC or credential-forwarding
+admin counts once they have signed in.
+
 ### Password Basic auth
 
 The image defaults to `allow_password_basic = false`: the web UI signs in
@@ -149,7 +154,10 @@ password to the origin (scheme, host and port) of the repository's
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to
-be entered again through the API.
+be entered again through the API. For a realm, that is an edit
+(`PATCH /admin/realms/{id}` or the realm form) that includes the secret:
+until then the realm is skipped at login, and an edit without the secret
+answers 400 naming it.
 Secrets sealed by pre-release builds were bound to their row only. They
 do not decrypt unless `crypto.accept_row_bound_secrets = true`; start every
 instance once with it so startup re-seals them for their destination, then
@@ -314,8 +322,10 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   (default four times the larger of `server.max_upload_bytes` and
   `proxy.max_package_bytes`, so 4 GiB; `0` removes the limit); past it,
   pushes and downloads are answered `503` with `Retry-After` until space
-  frees up. Size the volume above that budget. Files a killed process left
-  there are removed at startup.
+  frees up. Size the volume above that budget. Each process stages in a
+  locked subdirectory of its own, and the files a killed process left are
+  removed at the next start however recent they are, so they do not add to
+  the space a restarted instance needs.
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.

@@ -10,6 +10,10 @@
 //! * If any source reports credentials were **present but invalid**, the request
 //!   is rejected with **401** — bad credentials are never downgraded to
 //!   anonymous.
+//! * If a source could not **check** the credentials (a database error looking
+//!   up a token or session), the request fails closed with **503**: not
+//!   anonymous, and not a 401 that would make a client discard a credential
+//!   that may be valid.
 //! * With no credentials, the anonymous policy decides between
 //!   [`Principal::Anonymous`] and [`Principal::Unauthenticated`]; the latter is
 //!   still passed downstream (authorization, not authentication, returns 401/403
@@ -246,6 +250,13 @@ pub async fn attach_principal(
             Ok(r) => r,
             Err(AuthError::Unauthorized) => {
                 return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+            }
+            Err(AuthError::Unavailable) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication temporarily unavailable",
+                )
+                    .into_response();
             }
         };
 
@@ -841,6 +852,36 @@ mod tests {
             .unwrap();
         // Even though anon=All would otherwise allow anonymous, bad creds → 401.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unavailable_credential_check_yields_503_not_401() {
+        // A token or session lookup that failed fails closed with 503, even
+        // with anonymous access open; no later source (here a session cookie
+        // that would authenticate) is consulted and the handler never runs.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource {
+                outcome: SourceOutcome::Unavailable,
+                require_header: true,
+            }),
+            Box::new(AmbientStub),
+        ];
+        let resp = app(layer(sources, AnonPolicy::All))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(AUTHORIZATION, "Basic x")
+                    .header(header::COOKIE, "forge_session=s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_string(resp).await,
+            "authentication temporarily unavailable"
+        );
     }
 
     #[tokio::test]

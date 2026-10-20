@@ -310,7 +310,10 @@ Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":
 true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the
 password goes straight to the configured host), follows no redirects and reads
-at most 1 MiB of a success body for `groups_path` / `identity_path`.
+at most 1 MiB of a success body for `groups_path` / `identity_path`. With the
+`local` realm ordered before it, a name that belongs to a local password
+account is never forwarded: a wrong password, or any password for a
+deactivated local account, is refused locally.
 
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
@@ -355,7 +358,9 @@ the IdP identity to an `app_user`. The cookie is `__Host-forge_session`
 `forge_session` on an http development setup; a request carrying the session
 cookie twice is treated as signed out. Ordinary NuGet clients authenticate
 with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
-keys after logging in (`POST /auth/tokens`). A validated workload JWT may
+keys after logging in (`POST /auth/tokens`). When the database cannot say
+whether a presented token or session is valid, the request is answered `503`,
+not `401`, and a Basic secret is then not tried as a password. A validated workload JWT may
 instead be supplied as the Basic password, `X-NuGet-ApiKey`, or
 `Authorization: Bearer` for the direct-token publishing flow.
 

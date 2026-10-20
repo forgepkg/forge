@@ -24,7 +24,7 @@ use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::db_error;
+use super::{db_error, double_option};
 use crate::state::AppState;
 
 /// Public, password-free view of a repository (REDACTED secrets).
@@ -75,8 +75,10 @@ impl From<&Repository> for RepoView {
     }
 }
 
-/// Create-repository request body.
+/// Create-repository request body. Unknown fields are rejected: a misspelled
+/// `anonymous_read` or `reserved_prefixes` must not fall back to its default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRepo {
     pub name: String,
     /// `hosted` | `proxy` | `group`.
@@ -134,7 +136,10 @@ pub struct CreateRepo {
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
+/// * Unknown fields are rejected (a misspelled field would otherwise keep the
+///   stored value).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRepo {
     pub name: Option<String>,
     pub anonymous_read: Option<bool>,
@@ -165,17 +170,6 @@ pub struct UpdatedRepoView {
     /// `true` iff `remote_url` moved to another origin without a new
     /// `upstream_password`, and stored credentials were removed.
     pub upstream_credentials_dropped: bool,
-}
-
-/// Deserialize a field that distinguishes *absent* (`None`, through
-/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
-/// (`Some(Some(v))`).
-fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(de).map(Some)
 }
 
 /// The longest accepted repository name.

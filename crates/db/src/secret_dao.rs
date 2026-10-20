@@ -950,8 +950,15 @@ pub async fn update_realm_with_secrets_if_unchanged(
 
 /// Plaintext → encrypted **backfill** for realm secrets: every realm whose
 /// plaintext `config` still carries one of its `secret_keys_for(kind)` keys is
-/// re-stored through [`update_realm_with_secrets`] (keys move into
-/// `secrets_enc`). Idempotent; returns how many realms were re-encrypted.
+/// re-stored with those keys moved into `secrets_enc`.
+///
+/// Each realm is written only while it is still the row read here
+/// ([`update_realm_with_secrets_if_unchanged`]), so a concurrent admin edit is
+/// never undone; a row that changed is left for the next pass. When the row's
+/// `secrets_enc` does not decrypt, the plaintext copy is the only recoverable
+/// one: it is sealed afresh and replaces the ciphertext, as the
+/// upstream-password backfill does. Idempotent; returns how many realms were
+/// re-encrypted.
 pub async fn backfill_realm_secrets(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -963,17 +970,29 @@ pub async fn backfill_realm_secrets(
         if split_realm_secrets(&realm.config, keys).1.is_empty() {
             continue;
         }
-        let config = realm_config(Some(envelope), &realm).await?;
+        let config = match realm_config(Some(envelope), &realm).await {
+            Ok(config) => config,
+            Err(SecretDbError::Crypto(CryptoError::DecryptFailed)) => {
+                tracing::warn!(
+                    realm_id = realm.id,
+                    "stored realm secrets do not decrypt; re-sealing them from the plaintext copy"
+                );
+                realm.config.clone()
+            }
+            Err(e) => return Err(e),
+        };
         let upd = AuthRealmUpdate {
             name: realm.name.clone(),
             enabled: realm.enabled,
             priority: realm.priority,
             config,
         };
-        if update_realm_with_secrets(pool, Some(envelope), realm.id, upd, keys)
-            .await?
-            .is_some()
-        {
+        let mut tx = pool.begin().await?;
+        let written =
+            update_realm_with_secrets_if_unchanged(&mut tx, Some(envelope), &realm, upd, keys)
+                .await?;
+        tx.commit().await?;
+        if written.is_some() {
             done += 1;
         }
     }

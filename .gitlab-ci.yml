@@ -1,14 +1,22 @@
 # GitLab CI for envisia-forge.
 #
-# Mirrors .github/workflows/ci.yml: fmt → clippy → test → e2e.
-# Unit tests build/run with SQLX_OFFLINE=true against the committed .sqlx/ dir;
-# the test/e2e jobs additionally provision a live Postgres 17 service, and e2e
-# adds a versitygw S3 gateway. Dev credentials below are CI-only.
+# Mirrors .github/workflows/ci.yml job for job (fmt, clippy, audit, test,
+# docker, kubernetes, web; e2e and web-e2e on the default branch), with the
+# same tool versions and cargo settings; change both together. Images are
+# pinned by digest (tag kept for readability), as ci.yml pins its actions;
+# nothing bumps them here, so do it by hand. The images the test harnesses
+# start themselves (postgres:17, versity/versitygw:v1.4.1, redis) are named by
+# tag in their code, as on GitHub.
+#
+# The GitHub runners come with a Docker daemon; here the jobs that need one
+# (test, docker, e2e, web-e2e) get a Docker-in-Docker service, which needs a
+# runner that allows privileged services. Dev credentials below are CI-only.
 
 # One pipeline per change: merge-request pipelines for MRs, branch pipelines
 # only when no MR is open for the branch (and always for the default branch
 # and tags). Without this, a push to an MR branch starts both a branch and an
-# MR pipeline running the same jobs.
+# MR pipeline running the same jobs. A newer commit cancels a still-running
+# pipeline, except on the default branch, so every merge is fully verified.
 workflow:
   auto_cancel:
     on_new_commit: interruptible
@@ -16,18 +24,23 @@ workflow:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
       when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      auto_cancel:
+        on_new_commit: none
     - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
 
 stages:
   - fmt
   - clippy
   - test
+  - build
   - web
   - e2e
 
 default:
-  # Keep in lock-step with rust-toolchain.toml.
-  image: rust:1.95.0
+  # Keep in lock-step with rust-toolchain.toml (same image as the Dockerfile's
+  # builder stage).
+  image: rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
   # A newer commit on the same MR/branch cancels a still-running pipeline.
   interruptible: true
 
@@ -39,11 +52,13 @@ variables:
   CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
   # Build against the committed .sqlx/ cache; no live DB needed for compilation.
   SQLX_OFFLINE: "true"
-  # Keep cargo's registry/git caches inside the project dir so GitLab can cache them.
+  # Keep cargo's registry/git caches inside the project dir so GitLab can cache
+  # them. `cargo install` (and rustup) then put binaries in $CARGO_HOME/bin,
+  # which is not on the image's PATH: a job that runs one adds it.
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
 
-# Shared cache for the cargo registry and build artefacts. Keyed per-branch so
-# feature branches don't fight over a single cache entry.
+# Cache for the cargo registry and build artefacts, one per job, keyed on
+# Cargo.lock and the toolchain.
 .cargo-cache: &cargo-cache
   key:
     files:
@@ -55,6 +70,18 @@ variables:
     - .cargo/registry/cache/
     - .cargo/git/db/
     - target/
+
+# Docker-in-Docker, reached over TCP (no TLS inside the job's network). The
+# testcontainers harnesses take the host of a container's published ports
+# from DOCKER_HOST, so they connect to `docker` with no further settings.
+.dind-service: &dind-service
+  name: docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+  alias: docker
+  command: ["--tls=false"]
+
+.dind-variables: &dind-variables
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
 
 # ── Formatting ─────────────────────────────────────────────────────────────
 fmt:
@@ -73,17 +100,33 @@ clippy:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
 
-# ── Unit tests (live Postgres service, SQLX_OFFLINE build) ───────────────────
-# GitLab does not support per-service health-check options the way GitHub
-# Actions does, so each job waits for its service containers to accept
-# connections before running anything that touches them.
+# ── Dependency advisories (RustSec) ────────────────────────────────────────
+# Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
+# with a one-line rationale, live in .cargo/audit.toml. Reads only the
+# lockfile (no build), so it needs no build cache.
+audit:
+  stage: test
+  needs: []
+  script:
+    - cargo install cargo-audit --version 0.22.2 --locked
+    - cargo audit
+
+# ── Unit tests ─────────────────────────────────────────────────────────────
+# As on GitHub, the db/core/server/storage/cache integration tests start their
+# own Postgres, versitygw and Redis with testcontainers, here on the dind
+# service, so every test binary gets fresh containers (FORGE_TEST_* pointed at
+# GitLab services would make all crates' suites share one database). The
+# Postgres service is for the sqlx drift guard. GitLab services have no health
+# checks like GitHub's, so the job waits for both before using them.
 test:
   stage: test
   needs: ["fmt"]
   services:
-    - name: postgres:17
+    - name: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
       alias: postgres
+    - *dind-service
   variables:
+    <<: *dind-variables
     POSTGRES_DB: forge
     POSTGRES_USER: forge
     POSTGRES_PASSWORD: forge
@@ -92,20 +135,62 @@ test:
   cache:
     <<: *cargo-cache
   before_script:
-    # Wait for the postgres service to accept connections.
     - apt-get update -qq && apt-get install -y -qq postgresql-client
     - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
+    - timeout 60 bash -c 'until curl -fs http://docker:2375/_ping >/dev/null; do sleep 1; done'
   script:
     - cargo build --workspace
     # forge-e2e feature is intentionally excluded here — unit tests only.
     - cargo test --workspace
     # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
     # the committed .sqlx/ cache matches the current queries + schema.
-    - cargo install sqlx-cli --version ^0.9 --no-default-features --features rustls,postgres --locked
+    - cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
+    - export PATH="$CARGO_HOME/bin:$PATH"
     - SQLX_OFFLINE= sqlx migrate run --source migrations
     - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
-# ── Frontend (TanStack Start SPA in web/) ────────────────────────────────────
+# ── Container image (build only; releases push from release.yml) ─────────
+# Builds the production Dockerfile on every change so a broken image is
+# caught before a release tag, not by it.
+docker:
+  stage: build
+  needs: ["fmt"]
+  image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+  services:
+    - *dind-service
+  variables:
+    <<: *dind-variables
+  before_script:
+    - timeout 60 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+  script:
+    - docker build --build-arg FORGE_GIT_SHA="$CI_COMMIT_SHA" .
+
+# ── Kubernetes manifests (deploy/kubernetes) ──────────────────────────────
+# Builds every overlay, and the base with each component, and validates the
+# output against the Kubernetes schemas. Both tools are pinned by checksum.
+# Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
+# chart (.github/scripts/helm-check.sh, Helm built with `go install`), which
+# needs a pinned Go image here.
+kubernetes:
+  stage: test
+  needs: []
+  variables:
+    KUSTOMIZE_VERSION: "5.7.1"
+    KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
+    KUBECONFORM_VERSION: "0.7.0"
+    KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+  before_script:
+    - tools=$(mktemp -d)
+    - curl -sSfL -o "$tools/kustomize.tgz" "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+    - curl -sSfL -o "$tools/kubeconform.tgz" "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+    - printf '%s  %s\n' "$KUSTOMIZE_SHA256" "$tools/kustomize.tgz" "$KUBECONFORM_SHA256" "$tools/kubeconform.tgz" | sha256sum -c -
+    - tar -xzf "$tools/kustomize.tgz" -C "$tools" kustomize
+    - tar -xzf "$tools/kubeconform.tgz" -C "$tools" kubeconform
+    - export PATH="$tools:$PATH"
+  script:
+    - .github/scripts/kustomize-check.sh 1.33.0
+
+# ── Frontend (TanStack Router SPA in web/) ───────────────────────────────────
 # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
 # output (web/dist/) is what the Rust server serves via ServeDir; building here
 # guards against TS/Vite breakage. Runs on the node image, independent of the
@@ -113,7 +198,7 @@ test:
 web:
   stage: web
   needs: []
-  image: node:22
+  image: node:22-bookworm@sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8
   variables:
     PNPM_HOME: "$CI_PROJECT_DIR/.pnpm-store"
   cache:
@@ -133,6 +218,9 @@ web:
     - pnpm run tsc
     - pnpm run test
     - pnpm run build
+    # Known-vulnerability check of the shipped (non-dev) web dependencies;
+    # the Rust side is covered by the `audit` job.
+    - pnpm audit --prod
   artifacts:
     paths:
       - web/dist/
@@ -140,26 +228,19 @@ web:
 
 # ── E2E / integration tests (forge-e2e crate, testcontainers) ────────────────
 # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis) containers
-# via testcontainers, so this job needs a Docker daemon rather than GitLab
-# `services:`. We run Docker-in-Docker and point testcontainers at it.
+# via testcontainers on the dind service, so no other `services:` are needed.
 # Gated behind the `forge-e2e` feature; runs only on the default branch to keep
 # MR pipelines fast. The optional dotnet smoke test is skipped here (no SDK on
 # the rust image); add a dotnet SDK to the image to exercise it.
 e2e:
   stage: e2e
-  needs: ["test"]
+  needs: []
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
-    - name: docker:27-dind
-      alias: docker
+    - *dind-service
   variables:
-    # Talk to the dind daemon over TCP (no TLS inside the CI network).
-    DOCKER_HOST: "tcp://docker:2375"
-    DOCKER_TLS_CERTDIR: ""
-    # testcontainers connects to the same daemon.
-    TESTCONTAINERS_HOST_OVERRIDE: "docker"
-    TESTCONTAINERS_RYUK_DISABLED: "true"
+    <<: *dind-variables
   cache:
     <<: *cargo-cache
   before_script:
@@ -178,33 +259,39 @@ e2e:
 # SPA + server, and runs the browser specs. The compose-published ports live on
 # the `docker` (dind) host, so the harness is pointed there via
 # FORGE_E2E_DOCKER_HOST. Default-branch only (slow). Uses the official
-# Playwright image which bundles browsers + a Node + system deps; the Rust
-# toolchain is installed on top via rustup.
+# Playwright image (Ubuntu with Node, the browsers and their system deps) at
+# the version of @playwright/test in web/package.json; the Rust toolchain is
+# installed on top via rustup.
 web-e2e:
   stage: e2e
-  needs: ["web"]
-  image: mcr.microsoft.com/playwright:v1.63.0-noble
+  needs: []
+  image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
-    - name: docker:27-dind
-      alias: docker
+    - *dind-service
   variables:
-    DOCKER_HOST: "tcp://docker:2375"
-    DOCKER_TLS_CERTDIR: ""
+    <<: *dind-variables
     FORGE_E2E_DOCKER_HOST: "docker"
     SQLX_OFFLINE: "true"
+  cache:
+    <<: *cargo-cache
   before_script:
-    - apt-get update -qq && apt-get install -y -qq docker.io docker-compose-plugin curl build-essential
+    # Ubuntu packages the compose v2 plugin (`docker compose`) as docker-compose-v2.
+    - apt-get update -qq && apt-get install -y -qq docker.io docker-compose-v2 curl build-essential
     - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
     - docker pull postgres:17
     - docker pull versity/versitygw:v1.4.1
+    # rustup installs into $CARGO_HOME (see `variables`), not ~/.cargo.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
-    - . "$HOME/.cargo/env"
+    - export PATH="$CARGO_HOME/bin:$PATH"
     - corepack enable && corepack prepare pnpm@11.5.0 --activate
   script:
-    - cd web && pnpm install --frozen-lockfile && cd ..
-    - . "$HOME/.cargo/env" && cd web && pnpm run e2e
+    - cd web
+    - pnpm install --frozen-lockfile
+    # As on GitHub; a no-op while the image matches @playwright/test.
+    - pnpm exec playwright install --with-deps chromium
+    - pnpm run e2e
   artifacts:
     when: always
     paths:

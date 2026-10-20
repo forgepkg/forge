@@ -7,6 +7,9 @@
 //! upstream verdicts. Deleting is *not* a block for federated users — an
 //! auto-provisioning realm re-creates a deleted account on its next valid
 //! upstream login — so deactivate instead.
+//!
+//! Neither may remove the last active administrator: deactivating or deleting
+//! that user answers **409** ([`super::last_admin_conflict`]).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,7 +19,7 @@ use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use serde::{Deserialize, Serialize};
 
-use super::{db_error, hash_password};
+use super::{db_error, hash_password, last_admin_conflict};
 use crate::state::AppState;
 
 /// Password-free view of a user.
@@ -149,6 +152,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
 /// reactivated user's tokens work again; revoke them individually
 /// (`DELETE /admin/tokens/{id}`) to kill them for good. Reactivation changes
 /// only the flag.
+///
+/// Deactivating the last active administrator is refused (**409**).
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -161,10 +166,10 @@ pub async fn update(
         )
             .into_response();
     };
-    let user = match user_dao::set_active(&state.pool, id, active).await {
+    let user = match set_active_guarded(&state, id, active).await {
         Ok(Some(u)) => u,
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
-        Err(e) => return db_error(e),
+        Err(resp) => return resp,
     };
     if !active {
         if let Err(resp) = revoke_sessions_and_verdicts(&state, &user).await {
@@ -179,17 +184,18 @@ pub async fn update(
 /// `DELETE /admin/users/{id}` — delete the user (sessions, tokens, role
 /// assignments and identity links cascade) and purge the username's cached
 /// validated-credential verdicts, so no pre-deletion upstream verdict
-/// outlives the account.
+/// outlives the account. Deleting the last active administrator is refused
+/// (**409**).
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let user = match user_dao::find_user_by_id(&state.pool, id).await {
         Ok(Some(u)) => u,
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => return db_error(e),
     };
-    match user_dao::delete_user(&state.pool, id).await {
+    match delete_guarded(&state, id).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
-        Err(e) => return db_error(e),
+        Err(resp) => return resp,
     }
     // After the delete, so a verdict cached by a login racing the delete is
     // purged too (a forward still in flight is fenced by the revocation).
@@ -240,6 +246,45 @@ pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         }
         Err(e) => db_error(e),
     }
+}
+
+/// Set `active` in a transaction under the last-admin guard (only a
+/// deactivation can remove an admin). `Ok(None)` when no such user exists.
+async fn set_active_guarded(
+    state: &AppState,
+    id: i64,
+    active: bool,
+) -> Result<Option<AppUser>, Response> {
+    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    if !active
+        && authz_dao::would_leave_no_admin(&mut tx, id)
+            .await
+            .map_err(db_error)?
+    {
+        return Err(last_admin_conflict());
+    }
+    let user = user_dao::set_active(&mut *tx, id, active)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(user)
+}
+
+/// Delete the user in a transaction under the last-admin guard. `Ok(false)`
+/// when no such user exists.
+async fn delete_guarded(state: &AppState, id: i64) -> Result<bool, Response> {
+    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    if authz_dao::would_leave_no_admin(&mut tx, id)
+        .await
+        .map_err(db_error)?
+    {
+        return Err(last_admin_conflict());
+    }
+    let deleted = user_dao::delete_user(&mut *tx, id)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(deleted)
 }
 
 /// Revoke what lets an already-authenticated `user` keep going without

@@ -21,6 +21,10 @@
 //! invalidation. This follows FusionCache's passive tag-expiration model without
 //! scanning every tagged key.
 //!
+//! A generation far beyond anything a tag can reach by counting (2^48) is
+//! forged: it counts as an invalidation but raises the barrier by one only, so
+//! no barrier is ever left without room to advance.
+//!
 //! ## Coalescing / stampede protection
 //!
 //! Concurrent callers asking for the same `(ns, key)` are coalesced by moka's
@@ -131,6 +135,15 @@ struct Inner {
 const MAX_LOAD_ATTEMPTS: usize = 3;
 
 const ENTRY_FORMAT_VERSION: u8 = 1;
+
+/// The highest tag generation a barrier adopts from Redis or the backplane.
+/// Generations count one tag's invalidations one at a time, so a genuine one
+/// never comes near this: a larger one was forged by someone who can write to
+/// Redis. Adopting it (`u64::MAX` in particular) would leave the barrier no
+/// room to advance, so every later invalidation of the tag would be ignored.
+/// It stays well below 2^53, where the Redis scripts' (double-precision)
+/// arithmetic stops counting exactly.
+const MAX_GENERATION: u64 = 1 << 48;
 
 /// One tag generation captured when an entry was produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +264,9 @@ impl TagVersions {
             .collect()
     }
 
+    /// Raise each tag's barrier to its stamp. A generation above
+    /// [`MAX_GENERATION`] is forged: it still reports an invalidation of the
+    /// tag, so the barrier advances, but by one rather than to that value.
     pub(crate) fn observe(&self, stamps: &[TagStamp]) {
         let mut versions = self
             .inner
@@ -258,7 +274,16 @@ impl TagVersions {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for stamp in stamps {
             let current = versions.entry(stamp.tag.clone()).or_default();
-            *current = (*current).max(stamp.generation);
+            if stamp.generation > MAX_GENERATION {
+                tracing::warn!(
+                    tag = %stamp.tag,
+                    generation = stamp.generation,
+                    "implausible cache tag generation; advancing the barrier by one instead"
+                );
+                *current = current.saturating_add(1);
+            } else {
+                *current = (*current).max(stamp.generation);
+            }
         }
     }
 

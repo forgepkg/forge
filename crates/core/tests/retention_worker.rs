@@ -20,7 +20,9 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use forge_core::repo::NoopCacheInvalidator;
-use forge_core::retention::worker::{RetentionConfig, RetentionWorker, WorkerError};
+use forge_core::retention::worker::{
+    RetentionConfig, RetentionWorker, WorkerError, MIN_RUN_INTERVAL_SECONDS,
+};
 use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
@@ -272,6 +274,79 @@ async fn next_run_at_respects_per_repo_min_interval() {
         run.next_run_at >= before + Duration::seconds(86_400 - 5),
         "next_run_at should honor the larger per-repo interval"
     );
+}
+
+#[tokio::test]
+async fn zero_run_intervals_do_not_rerun_back_to_back() {
+    // Regression (#25): with `default_run_interval = 0` and a policy's
+    // `min_run_interval_seconds: 0` (both accepted), a finished run was due
+    // again at once, so the drain loop re-claimed the repository forever,
+    // a dry-run policy appending audit rows on every pass. Runs are now at
+    // least MIN_RUN_INTERVAL_SECONDS apart; a failed run is retried no sooner.
+    let pool = pool().await;
+    let n = unique();
+    let w = worker(
+        &pool,
+        RetentionConfig {
+            default_run_interval: Duration::zero(),
+            ..config()
+        },
+    );
+    let floor = Duration::seconds(MIN_RUN_INTERVAL_SECONDS - 5);
+
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "dry_run_only": true,
+            "min_run_interval_seconds": 0,
+            "rules": [{ "id": "r", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let before = Utc::now();
+    let summary = w.tick_repo(repo.id).await.unwrap().expect("first run");
+    assert_eq!(summary.deleted, 1);
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(run.next_run_at >= before + floor, "{:?}", run.next_run_at);
+    // The drain loop's next tick finds the repository not due and stops.
+    assert!(
+        w.tick_repo(repo.id).await.unwrap().is_none(),
+        "the repository must not be due again right away"
+    );
+    assert_eq!(audit_total(&pool, repo.id).await, 1);
+
+    // A run that fails is rescheduled by the default interval alone.
+    let broken =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0b-{n}")))
+            .await
+            .unwrap();
+    arm(
+        &pool,
+        broken.id,
+        &json!({ "version": 1, "min_run_interval_seconds": 0, "rules": [] }),
+    )
+    .await;
+    let before = Utc::now();
+    w.tick_repo(broken.id)
+        .await
+        .expect_err("an invalid policy fails the run");
+    let run = retention_dao::get_run(&pool, broken.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(run.next_run_at >= before + floor, "{:?}", run.next_run_at);
+    assert!(w.tick_repo(broken.id).await.unwrap().is_none());
 }
 
 #[tokio::test]

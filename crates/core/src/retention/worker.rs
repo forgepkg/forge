@@ -39,13 +39,18 @@ use crate::retention::apply::{apply, ApplyContext, RunFence};
 use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
 use crate::retention::model::{validate_policy, RetentionPolicy};
 
+/// The shortest interval the worker ever schedules between two automatic runs
+/// of a repository, whatever the config and the policy say (both accept 0).
+pub const MIN_RUN_INTERVAL_SECONDS: i64 = 60;
+
 /// Tuning for the retention worker, mirrored from the server config.
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
     /// How often each instance polls for a due repository.
     pub poll_interval: StdDuration,
     /// Floor on the next-run interval (a per-repo `min_run_interval_seconds`
-    /// larger than this wins). Bounds how often a repo is re-evaluated.
+    /// larger than this wins). Bounds how often a repo is re-evaluated; values
+    /// below [`MIN_RUN_INTERVAL_SECONDS`] are raised to it.
     pub default_run_interval: Duration,
     /// Crash-safe lease held while a repo is being evaluated.
     pub lease: Duration,
@@ -80,8 +85,16 @@ impl RetentionWorker {
         pool: PgPool,
         format: Arc<dyn Format>,
         cache: Arc<dyn CacheInvalidator>,
-        config: RetentionConfig,
+        mut config: RetentionConfig,
     ) -> Self {
+        // The config and a policy's `min_run_interval_seconds` both accept 0.
+        // With both at 0 a finished run would be due again at once, and the
+        // drain loop in `spawn_loop` would re-claim the same repository
+        // back-to-back forever. Raising the default also spaces out the
+        // retries of a failing run, which are rescheduled by it alone.
+        config.default_run_interval = config
+            .default_run_interval
+            .max(Duration::seconds(MIN_RUN_INTERVAL_SECONDS));
         RetentionWorker {
             pool,
             format,
@@ -258,9 +271,26 @@ impl RetentionWorker {
             Vec::new()
         };
 
-        // ── Pure evaluation. ──
-        let hosted_decisions = evaluate(self.format.as_ref(), now, &policy, &hosted);
-        let proxy_decisions = evaluate_proxy(now, &policy, &proxy);
+        // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
+        // with the repository, so it must not stall a runtime worker thread. ──
+        let evaluation = {
+            let format = Arc::clone(&self.format);
+            let policy = policy.clone();
+            tokio::task::spawn_blocking(move || {
+                (
+                    evaluate(format.as_ref(), now, &policy, &hosted),
+                    evaluate_proxy(now, &policy, &proxy),
+                )
+            })
+        };
+        // A panic there (e.g. a panicking `Format`) fails the run like a panic
+        // anywhere else in `process`.
+        let (hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
+            WorkerError::Panicked(match e.try_into_panic() {
+                Ok(panic) => panic_message(&*panic),
+                Err(e) => e.to_string(), // cancelled: the runtime is shutting down
+            })
+        })?;
 
         // Affected package names (for cache invalidation after the run).
         let mut affected: BTreeSet<String> = BTreeSet::new();
@@ -317,7 +347,8 @@ impl RetentionWorker {
     }
 
     /// The next-run interval for a policy: the larger of the repo's
-    /// `min_run_interval_seconds` and the global default.
+    /// `min_run_interval_seconds` and the global default (which [`Self::new`]
+    /// raised to at least [`MIN_RUN_INTERVAL_SECONDS`]).
     fn next_interval(&self, policy: &RetentionPolicy) -> Duration {
         // Clamped defensively: validation already bounds the policy value, and
         // an out-of-range interval must never panic the worker loop.
