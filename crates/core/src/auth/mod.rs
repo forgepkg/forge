@@ -59,4 +59,4 @@ pub use token::{
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
 // Canonical usernames live with the DAOs that enforce them.
-pub use forge_db::username::{canonical_username, InvalidUsername};
+pub use forge_db::username::{canonical_password_username, canonical_username, InvalidUsername};

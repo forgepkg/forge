@@ -12,6 +12,9 @@
 //! looks up a username canonicalizes it, and `app_user` carries a unique index
 //! on the canonical form (migration 0021), so no code path can create two
 //! accounts that differ only in case, spacing or Unicode composition.
+//!
+//! A name that signs in with a password must also fit in an HTTP Basic
+//! `user-id` ([`canonical_password_username`]), which cannot hold a `:`.
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -31,6 +34,10 @@ pub enum InvalidUsername {
     /// Longer than [`MAX_USERNAME_BYTES`].
     #[error("username must be at most {MAX_USERNAME_BYTES} bytes")]
     TooLong,
+    /// Contains a `:` where the name signs in with a password
+    /// ([`canonical_password_username`]).
+    #[error("username must not contain ':'")]
+    Colon,
 }
 
 /// The canonical form of `raw` (see the [module docs](self)).
@@ -46,6 +53,23 @@ pub fn canonical_username(raw: &str) -> Result<String, InvalidUsername> {
     let canonical: String = lowered.nfc().collect();
     if canonical.len() > MAX_USERNAME_BYTES {
         return Err(InvalidUsername::TooLong);
+    }
+    Ok(canonical)
+}
+
+/// The canonical form of a username that signs in with a password: a local
+/// account, or a login forwarded to a credential-forwarding realm.
+///
+/// Such a name must not contain `:`. HTTP Basic carries `user-id:password`
+/// and splits it at the first colon (RFC 7617), so `mallory:abc` with the
+/// password `def` reaches an upstream as `mallory` / `abc:def`: the upstream
+/// would vouch for one account while Forge signs in another. Feed clients
+/// cannot send such a name over Basic either. Federated names (OIDC claims)
+/// and lookups of stored rows use [`canonical_username`].
+pub fn canonical_password_username(raw: &str) -> Result<String, InvalidUsername> {
+    let canonical = canonical_username(raw)?;
+    if canonical.contains(':') {
+        return Err(InvalidUsername::Colon);
     }
     Ok(canonical)
 }
@@ -90,6 +114,28 @@ mod tests {
             Err(InvalidUsername::TooLong)
         );
         assert!(canonical_username(&"a".repeat(MAX_USERNAME_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn password_usernames_refuse_a_colon() {
+        assert_eq!(
+            canonical_password_username(" Alice@Corp.Example ").unwrap(),
+            "alice@corp.example"
+        );
+        for raw in ["mallory:abc", ":alice", "alice:", "a:b:c"] {
+            assert_eq!(
+                canonical_password_username(raw),
+                Err(InvalidUsername::Colon),
+                "{raw}"
+            );
+            // Federated names and stored rows keep their canonical form.
+            assert!(canonical_username(raw).is_ok(), "{raw}");
+        }
+        // The other refusals still come first.
+        assert_eq!(
+            canonical_password_username(" "),
+            Err(InvalidUsername::Empty)
+        );
     }
 
     #[test]

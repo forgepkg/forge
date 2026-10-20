@@ -161,6 +161,13 @@ First production release.
   upstream lets any token holder sign in as any user. A success without the
   field fails closed. The docs now state that the upstream must bind the
   username to the secret.
+- A username containing `:` is never forwarded to a credential-forwarding
+  realm. The upstream splits Basic credentials at the first colon, so a form
+  login as `mallory:abc` with the password `def` was checked upstream as
+  `mallory` / `abc:def`. Forge then provisioned and signed in a separate,
+  active account `mallory:abc`, which got around a deactivation of
+  `mallory`. Form login answers such a name with the usual 401, and admin
+  user creation and `auth.bootstrap_admin.username` refuse it.
 - Package ids in feed URLs are validated against the NuGet id grammar on
   every read and unlist/relist route (404 otherwise), and again before a
   proxy builds an upstream URL. A percent-encoded `..%2F`, `?` or `#` in an
@@ -562,6 +569,11 @@ First production release.
   realm (`realm_orphaned`): they can no longer be signed in by any realm.
   Delete such an account to let its owner's next upstream login provision a
   fresh one.
+- Pre-release installs: an account whose name contains `:` can no longer
+  sign in with a password. Its sessions and API tokens keep working. A
+  credential-forwarding account with such a name was signed in by the
+  upstream account named before the colon. Deactivate it, which also ends
+  its sessions and refuses its tokens.
 - Workload-identity realms for an issuer other than GitHub Actions or
   GitLab.com: every rule must now pin a stable identity claim (`sub`,
   `repository_id`, `job_project_id`, `project_path`, … — see

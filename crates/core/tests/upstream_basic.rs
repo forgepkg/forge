@@ -501,6 +501,52 @@ async fn chain_rejects_empty_and_control_character_usernames_without_forwarding(
     }
 }
 
+/// Review 2026-10-20 M2: Basic splits `user:password` at the first colon, so
+/// `mallory:abc` / `def` would be checked upstream as `mallory` / `abc:def`
+/// while Forge signs in `mallory:abc`. Such a name is never forwarded, and a
+/// verdict cached for it is never used.
+#[tokio::test]
+async fn username_with_a_colon_is_rejected_without_forwarding() {
+    let server = MockServer::start().await;
+    // An upstream that would accept the split reading of the credential.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let config = config_for(format!("{}/status", server.uri()));
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool().await,
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
+    let user = format!("{}:abc", unique_user("mallory"));
+    // A positive verdict for the exact credential is already cached.
+    let seeded = cache
+        .check(&config.provider_id, &user, "def", || async {
+            forge_core::auth::UpstreamVerdict::Valid
+        })
+        .await;
+    assert_eq!(seeded, Ok(true));
+    let client = credential_forward_client(config.connect_timeout).expect("forwarding client");
+    let provider = UpstreamBasicProvider::new(config, client, cache);
+
+    assert!(matches!(
+        provider.authenticate(&cred(&user, "def")).await,
+        AuthOutcome::Rejected
+    ));
+    // Through the chain it is a rejection, never "no credentials" (which
+    // would fall back to anonymous access).
+    let chain = Chain::new(vec![Box::new(provider)]);
+    assert_eq!(
+        chain.authenticate(&cred(&user, "def")).await,
+        ChainOutcome::Rejected
+    );
+    // `server` drops at end of test and verifies `.expect(0)`.
+}
+
 /// An upstream that accepts a secret with any username (a personal access
 /// token) must not let one user's secret sign in as another: with
 /// `identity_path`, the account the upstream reports must be the one Forge
