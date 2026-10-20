@@ -407,6 +407,9 @@ First production release.
   unflagged before it can be removed from the group or deleted, so a group
   never falls back to trusting every member unnoticed; the web UI marks
   owners.
+- `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.10: certificate
+  verification no longer accepts distrusted intermediates
+  (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
