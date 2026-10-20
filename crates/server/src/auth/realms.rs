@@ -70,7 +70,12 @@ pub const KIND_WORKLOAD_IDENTITY: &str = "workload_identity";
 /// `key_pepper` is a **secret**: write-only at the API layer ([`redact_config`]
 /// strips it / [`merge_secrets`] keeps the stored value when omitted) and
 /// redacted from `Debug`.
+///
+/// Unknown keys are refused, so a misspelled gate (`identity_pth`,
+/// `required_group`) never silently takes its permissive default. Stored rows
+/// are parsed with this type too: a field removed later must stay accepted.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredForwardRealmConfig {
     /// Upstream endpoint hit with the user's Basic credentials (http/https).
     pub url: String,
@@ -143,8 +148,10 @@ impl std::fmt::Debug for CredForwardRealmConfig {
 /// (`auth.session_*`).
 ///
 /// `client_secret` is a **secret** (write-only / redacted), like `key_pepper`
-/// above.
+/// above. Unknown keys are refused, as there (a misspelled `required_claims`
+/// would let every account of a multi-tenant issuer sign in).
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcRealmConfig {
     /// OIDC issuer URL (`https`, unless `allow_http_issuer` for dev IdPs).
     pub issuer: String,
@@ -268,9 +275,11 @@ pub fn secret_keys(kind: &str) -> &'static [&'static str] {
 
 /// Parse + validate a realm `config` document for `kind`. Returns a normalized
 /// document (kind-specific defaults filled) or a human-readable error. `local`
-/// accepts only an empty/no-op config; workload-identity documents are
-/// validated by the stricter WIF parser, which rejects unknown policy fields.
+/// accepts only an empty/no-op config; every other kind refuses unknown keys
+/// (the `<key>_set` markers of [`redact_config`], which a client may echo
+/// back, are dropped first).
 pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, String> {
+    let config = &without_secret_markers(kind, config);
     match kind {
         KIND_LOCAL => Ok(JsonValue::Object(Default::default())),
         KIND_CRED_FORWARD => {
@@ -320,6 +329,18 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
         KIND_WORKLOAD_IDENTITY => super::wif::validate_workload_identity_config(config),
         other => Err(format!("unknown realm kind {other:?}")),
     }
+}
+
+/// `config` without the `<key>_set` markers [`redact_config`] puts in place of
+/// the secrets.
+fn without_secret_markers(kind: &str, config: &JsonValue) -> JsonValue {
+    let mut doc = config.clone();
+    if let JsonValue::Object(map) = &mut doc {
+        for key in secret_keys(kind) {
+            map.remove(&format!("{key}_set"));
+        }
+    }
+    doc
 }
 
 /// Strip secrets from a realm `config` for an API response: each secret key is
@@ -1104,6 +1125,36 @@ mod tests {
             &json!({"url": "https://x/s", "key_pepper": "p", "required_groups": ["g"]}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn realm_configs_refuse_unknown_keys_but_not_secret_markers() {
+        let cred = json!({"url": "https://nexus.internal/status", "key_pepper": "p"});
+        let oidc = json!({
+            "issuer": "https://login.microsoftonline.com/tid/v2.0",
+            "client_id": "cid",
+            "client_secret": "shh",
+        });
+        for (kind, base, typo) in [
+            (KIND_CRED_FORWARD, &cred, "identity_pth"),
+            (KIND_CRED_FORWARD, &cred, "required_group"),
+            (KIND_CRED_FORWARD, &cred, "autoprovision"),
+            (KIND_OIDC, &oidc, "required_claim"),
+            (KIND_OIDC, &oidc, "auto_provison"),
+        ] {
+            let mut config = base.clone();
+            config[typo] = json!("x");
+            let err = validate_config(kind, &config).expect_err(typo);
+            assert!(err.contains(&format!("unknown field `{typo}`")), "{err}");
+        }
+        // The redaction markers are dropped, not refused, and never stored.
+        let mut echoed = cred.clone();
+        echoed["key_pepper_set"] = json!(true);
+        let ok = validate_config(KIND_CRED_FORWARD, &echoed).expect("marker dropped");
+        assert!(ok.get("key_pepper_set").is_none());
+        let mut echoed = oidc.clone();
+        echoed["client_secret_set"] = json!(true);
+        assert!(validate_config(KIND_OIDC, &echoed).is_ok());
     }
 
     #[test]

@@ -2468,6 +2468,31 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
     with_priority["priority"] = json!(1);
     let resp = post("/admin/realms", with_priority).await.unwrap();
     assert_eq!(resp.status(), 422);
+    for (kind, config, typo) in [
+        (
+            "credential_forwarding",
+            json!({"url": "https://nexus.internal/status", "key_pepper": "p", "identity_pth": "login"}),
+            "identity_pth",
+        ),
+        (
+            "oidc",
+            json!({
+                "issuer": "https://login.example.com", "client_id": "forge",
+                "client_secret": "s", "required_claim": {"hd": ["corp.example"]}
+            }),
+            "required_claim",
+        ),
+    ] {
+        let resp = post(
+            "/admin/realms",
+            json!({"kind": kind, "name": format!("typo{typo}{s}"), "enabled": false, "config": config}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400, "{kind}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains(&format!("unknown field `{typo}`")), "{msg}");
+    }
     let resp = post("/admin/realms", realm).await.unwrap();
     assert_eq!(resp.status(), 201);
     let realm_url = format!(
@@ -2487,6 +2512,23 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
         patch(json!({"enabled": false})).await.unwrap().status(),
         200
     );
+    // A misspelled key inside `config` is refused too: a dropped
+    // `identity_path` let any token holder sign in as any account.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "identity_pth": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `identity_pth`"), "{msg}");
+    // The redaction marker a client echoes back is not an unknown field.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "key_pepper_set": true, "identity_path": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
     let resp = client
         .delete(&realm_url)
         .basic_auth(&u, Some(&p))
