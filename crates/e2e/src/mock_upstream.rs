@@ -76,7 +76,8 @@ fn nuspec_of(nupkg: &[u8]) -> Option<Vec<u8>> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(nupkg)).ok()?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).ok()?;
-        if entry.name().to_ascii_lowercase().ends_with(".nuspec") && !entry.name().contains('/') {
+        let name = entry.name().ok()?.to_ascii_lowercase();
+        if name.ends_with(".nuspec") && !name.contains('/') {
             let mut out = Vec::new();
             entry.read_to_end(&mut out).ok()?;
             return Some(out);
