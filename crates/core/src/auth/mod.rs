@@ -35,7 +35,10 @@ pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
     StaticChainSource,
 };
-pub use client_ip::{forwarded_for, resolve_client_ip, AllowlistParseError, AnonPolicy};
+pub use client_ip::{
+    forwarded_for, resolve_client, resolve_client_ip, AllowlistParseError, AnonPolicy,
+    ResolvedClient,
+};
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
     UpstreamVerdict, ValidatedCredentialCache, DEFAULT_FORWARD_TIMEOUT,

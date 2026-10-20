@@ -117,6 +117,56 @@ async fn anon_mode_allowlist_gates_by_ip() {
     );
 }
 
+/// A malformed `X-Forwarded-For` never makes a client look like the trusted
+/// proxy. The harness's peer (loopback) is a trusted proxy and is itself on
+/// the allowlist, as an nginx in a private network on an allowlist of
+/// `[private]` is. nginx appends the real client to the line the client sent,
+/// so an unreadable byte in the client's part must not hide it, and a hop the
+/// walk cannot read must not fall back to the proxy's address.
+#[tokio::test]
+async fn malformed_forwarded_for_is_never_allowlisted_as_the_proxy() {
+    let srv = StackBuilder::default()
+        .anon(AnonMode::Allowlist(vec!["loopback".into()]))
+        .start()
+        .await;
+    let client = srv.client();
+    srv.create_repo(
+        serde_json::json!({"name": "xff-repo", "kind": "hosted", "anonymous_read": true}),
+    )
+    .await;
+    srv.grant_anonymous_read("xff-repo").await;
+    let url = format!("{}/v3/xff-repo/index.json", srv.base_url);
+
+    // The proxy host itself (no forwarded hop) is allowlisted.
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "request from the allowlisted proxy itself"
+    );
+
+    let denied = DENIED_IP.as_bytes();
+    for (value, why) in [
+        (
+            [&b"\xff, "[..], denied].concat(),
+            "nginx: unreadable client part",
+        ),
+        ([denied, &b", \xff"[..]].concat(), "unreadable hop reached"),
+        ([denied, &b", "[..]].concat(), "empty hop reached"),
+    ] {
+        let resp = client
+            .get(&url)
+            .header(
+                "X-Forwarded-For",
+                reqwest::header::HeaderValue::from_bytes(&value).unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{why}: {value:?}");
+    }
+}
+
 /// The admin API requires an admin principal; the bootstrap admin works, and a
 /// non-admin user is forbidden (403).
 #[tokio::test]

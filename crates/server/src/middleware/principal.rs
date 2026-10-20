@@ -38,7 +38,8 @@
 //! ## Client IP and DNS rebinding
 //! The client IP is resolved from the socket peer and **every**
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
-//! addresses canonicalized ([`forge_core::auth::client_ip`]). The IP-allowlist
+//! addresses canonicalized ([`forge_core::auth::client_ip`]). A client whose
+//! forwarded address is malformed is unknown and never allowlisted. The IP-allowlist
 //! anonymous grant (`anonymous_mode = "allowlist"`) additionally requires the
 //! request's `Host` to name this server (the host of `server.public_base_url`
 //! or an entry of `server.allowed_hosts`): a DNS-rebinding page in an internal
@@ -59,7 +60,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip, AnonPolicy};
+use forge_core::auth::client_ip::{forwarded_for, resolve_client, AnonPolicy};
 use forge_core::auth::principal::Principal;
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
 use forge_core::auth::token::{resolve_principal_with_origin, AuthError, PrincipalSource};
@@ -234,11 +235,14 @@ pub async fn attach_principal(
     }
 
     let xff = forwarded_for(req.headers());
-    let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
+    let client = resolve_client(peer, xff.as_deref(), &layer.trusted_proxies);
+    let client_ip = client.ip;
 
     // DNS-rebinding guard: the IP-allowlist grant applies only to requests
-    // addressing this server by one of its own host names.
-    let anon = match &*layer.anon {
+    // addressing this server by one of its own host names. It never applies to
+    // a client whose address a malformed `X-Forwarded-For` hid: its `ip` is
+    // the proxy's own.
+    let anon = match layer.anon.for_client(client) {
         AnonPolicy::Allowlist(_) if !host_is_allowed(&req, &layer.allowed_hosts) => {
             &AnonPolicy::Off
         }

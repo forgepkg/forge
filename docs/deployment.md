@@ -75,7 +75,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin password (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` defaults to `admin`). Without it no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
-| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so anonymous-IP allowlists and the login lockout see one client. |
+| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
 password, `minioadmin` S3 keys). It logs a warning when `public_base_url` is
