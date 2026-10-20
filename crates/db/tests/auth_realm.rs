@@ -185,9 +185,12 @@ async fn compare_and_set_writes_refuse_a_changed_row_or_marker() {
     let pool = pool().await;
     let n = unique();
     let name = format!("cas-{n}");
+    // Its own band: `300_000 + n` collides with the `300_000 + 2n` slots
+    // `duplicate_name_and_bad_slug_rejected` takes whenever its `n` is half
+    // of this one's.
     let realm = auth_realm_dao::insert_realm(
         &pool,
-        new_realm(&name, "credential_forwarding", 300_000 + n as i32),
+        new_realm(&name, "credential_forwarding", 400_000 + n as i32),
     )
     .await
     .expect("insert");
