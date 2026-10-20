@@ -52,8 +52,11 @@ async fn main() -> anyhow::Result<()> {
     forge_db::migrate(&pool).await.context("run migrations")?;
 
     // Staging directory for pushes and proxy downloads: create it and remove
-    // what a killed process left there (files idle for an hour; a live stage
-    // writes continuously, so another instance sharing it is not affected).
+    // what killed processes left there. Each process stages in a locked
+    // subdirectory of its own, so a dead one's goes at once and another
+    // instance sharing the directory is not affected (loose files from older
+    // versions go once idle for an hour). `AppState` builds the staging that
+    // requests use; this one is dropped after the sweep.
     let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
         .with_context(|| {
             format!(
@@ -70,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         Err(e) => tracing::warn!(error = %e, "staging directory sweep failed"),
     }
+    drop(staging);
 
     // Object store (ensure the bucket exists).
     let blob_store = BlobStore::new(config.s3.to_storage());

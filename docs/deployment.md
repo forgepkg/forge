@@ -319,8 +319,10 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   (default four times the larger of `server.max_upload_bytes` and
   `proxy.max_package_bytes`, so 4 GiB; `0` removes the limit); past it,
   pushes and downloads are answered `503` with `Retry-After` until space
-  frees up. Size the volume above that budget. Files a killed process left
-  there are removed at startup.
+  frees up. Size the volume above that budget. Each process stages in a
+  locked subdirectory of its own, and the files a killed process left are
+  removed at the next start however recent they are, so they do not add to
+  the space a restarted instance needs.
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.
