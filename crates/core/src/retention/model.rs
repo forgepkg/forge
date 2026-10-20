@@ -28,6 +28,7 @@ pub const POLICY_VERSION: u32 = 1;
 /// `None` policy column ⇒ no retention. An `enabled = false` policy is parsed
 /// and stored but produces no decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionPolicy {
     /// Policy schema version (must equal [`POLICY_VERSION`]).
     pub version: u32,
@@ -58,6 +59,7 @@ fn default_min_run_interval() -> u64 {
 /// A single retention rule. Criteria within a rule are ANDed; a component is
 /// acted on if **any** rule selects it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionRule {
     /// Stable, human-chosen id, recorded on every audit row this rule produces.
     pub id: String,
@@ -142,6 +144,7 @@ pub enum ReleaseType {
 /// are then **unioned**: a version protected by any rule is never unlisted or
 /// deleted by any rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Criteria {
     /// Protection: the newest N **listed** versions (by format version order)
     /// of each package id in this rule's pool. Unlisted versions neither count

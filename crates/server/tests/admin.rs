@@ -2316,6 +2316,84 @@ async fn repository_names_are_validated() {
     assert_eq!(resp.status(), 200);
 }
 
+/// Repository and realm bodies refuse a misspelled field instead of dropping
+/// it: a dropped `reserved_prefixes` turned a group's dependency-confusion
+/// guard off, and a dropped `anonymous_read` left a repository public.
+#[tokio::test]
+async fn repository_and_realm_bodies_reject_unknown_fields() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let post = |path: &str, body: Value| {
+        client
+            .post(format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+
+    let resp = post(
+        "/admin/repositories",
+        json!({"name": format!("strictgrp{s}"), "kind": "group", "reserved_prefix": ["acme."]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `reserved_prefix`"), "{msg}");
+    let name = format!("strict{s}");
+    let resp = post(
+        "/admin/repositories",
+        json!({"name": name, "kind": "hosted", "anonymous_read": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = put_repo(&srv, &name, json!({"anonymous": false})).await;
+    assert_eq!(resp.status(), 422);
+    let resp = put_repo(&srv, &name, json!({"anonymous_read": false})).await;
+    assert_eq!(resp.status(), 200);
+
+    let config = json!({"url": "https://nexus.internal/status", "key_pepper": "pepper"});
+    let realm = json!({
+        "kind": "credential_forwarding",
+        "name": format!("strict{s}"),
+        "enabled": false,
+        "config": config,
+    });
+    let mut with_priority = realm.clone();
+    with_priority["priority"] = json!(1);
+    let resp = post("/admin/realms", with_priority).await.unwrap();
+    assert_eq!(resp.status(), 422);
+    let resp = post("/admin/realms", realm).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let realm_url = format!(
+        "{}/admin/realms/{}",
+        srv.base_url,
+        resp.json::<Value>().await.unwrap()["id"]
+    );
+    let patch = |body: Value| {
+        client
+            .patch(&realm_url)
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    assert_eq!(patch(json!({"enable": true})).await.unwrap().status(), 422);
+    assert_eq!(
+        patch(json!({"enabled": false})).await.unwrap().status(),
+        200
+    );
+    let resp = client
+        .delete(&realm_url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 /// M20: turning `anonymous_read` off also deletes the anonymous role's
 /// unscoped read grant on the repository (what migration 0007 synthesized),
 /// while an update that leaves the flag off does not touch explicit grants.

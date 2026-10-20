@@ -86,8 +86,9 @@ fn secret_db_error(e: SecretDbError) -> Result<sqlx::Error, Response> {
     }
 }
 
-/// Create-realm request body.
+/// Create-realm request body. Unknown fields are rejected, not dropped.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRealm {
     /// `local` | `oidc` | `credential_forwarding` | `workload_identity`.
     pub kind: String,
@@ -101,7 +102,9 @@ pub struct CreateRealm {
 
 /// Update-realm request body. Absent fields keep their stored value; `kind` is
 /// immutable; ordering changes go through the dedicated reorder endpoint.
+/// Unknown fields are rejected, not dropped.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRealm {
     pub name: Option<String>,
     pub enabled: Option<bool>,

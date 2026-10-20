@@ -75,8 +75,10 @@ impl From<&Repository> for RepoView {
     }
 }
 
-/// Create-repository request body.
+/// Create-repository request body. Unknown fields are rejected: a misspelled
+/// `anonymous_read` or `reserved_prefixes` must not fall back to its default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRepo {
     pub name: String,
     /// `hosted` | `proxy` | `group`.
@@ -134,7 +136,10 @@ pub struct CreateRepo {
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
+/// * Unknown fields are rejected (a misspelled field would otherwise keep the
+///   stored value).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRepo {
     pub name: Option<String>,
     pub anonymous_read: Option<bool>,
