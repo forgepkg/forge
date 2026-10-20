@@ -282,3 +282,32 @@ async fn a_subdirectory_swept_from_under_a_live_process_is_replaced() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// #83: a process subdirectory without its lock file is what a process on
+/// NFS leaves (unlinking its open lock renamed it, so the directory could
+/// not be removed): it goes once idle, while a recent one stays.
+#[test]
+fn an_idle_subdirectory_without_a_lock_file_is_removed() {
+    let dir = scratch_dir("lockless");
+    let staging = Staging::new(&dir, None).unwrap();
+    let leftover = |name: &str, idle: Duration| {
+        let path = dir.join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - idle)
+            .unwrap();
+        path
+    };
+    let old = leftover("forge-staging-proc-old-leftover", Duration::from_secs(7200));
+    let recent = leftover(
+        "forge-staging-proc-recent-leftover",
+        Duration::from_secs(10),
+    );
+
+    staging.sweep_stale(Duration::from_secs(3600)).unwrap();
+    assert!(!old.exists(), "an idle leftover went");
+    assert!(recent.exists(), "a recent one stays until idle");
+    drop(staging);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -223,11 +223,12 @@ pub struct Staging {
 /// Its lock file stays locked (`flock`) while the directory is in use, and
 /// the kernel releases the lock when the process dies: that is how
 /// [`Staging::sweep_stale`] tells a live process's directory, however old,
-/// from one a killed process left, however recent.
+/// from one a killed process left, however recent. On a file system without
+/// working locks there is no lock (`None`); sweeps then go by idle time.
 #[derive(Debug)]
 struct OwnDir {
     path: PathBuf,
-    _lock: std::fs::File,
+    lock: Option<std::fs::File>,
 }
 
 impl OwnDir {
@@ -245,12 +246,29 @@ impl OwnDir {
         std::fs::create_dir(&pending)?;
         let locked = (|| {
             let lock = std::fs::File::create(pending.join(Staging::LOCK_FILE))?;
-            lock.try_lock()?;
+            let lock = match lock.try_lock() {
+                Ok(()) => Some(lock),
+                // A file system without working locks (`flock` unsupported,
+                // NFS without lockd): stage anyway. Sweeps cannot try this
+                // lock either, so they remove only files idle past their
+                // threshold here, never a stage in flight.
+                Err(std::fs::TryLockError::Error(error)) => {
+                    tracing::warn!(
+                        %error,
+                        dir = %dir.display(),
+                        "the staging directory does not support file locks; staging without one"
+                    );
+                    None
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+            };
             std::fs::rename(&pending, &path)?;
             Ok(lock)
         })();
         match locked {
-            Ok(lock) => Ok(Arc::new(OwnDir { path, _lock: lock })),
+            Ok(lock) => Ok(Arc::new(OwnDir { path, lock })),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&pending);
                 Err(e)
@@ -261,6 +279,9 @@ impl OwnDir {
 
 impl Drop for OwnDir {
     fn drop(&mut self) {
+        // Close the lock first: on NFS an open file that is unlinked is
+        // renamed to `.nfsXXXX` instead, and the directory could not go.
+        drop(self.lock.take());
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -387,18 +408,31 @@ impl Staging {
                     .map_err(std::fs::TryLockError::Error)
                     .and_then(|lock| lock.try_lock().map(|()| lock));
                 match lock {
-                    Ok(_lock) => {
+                    Ok(lock) => {
                         let staged = std::fs::read_dir(&path).map_or(0, |entries| {
                             entries
                                 .filter_map(Result::ok)
                                 .filter(|entry| is_staged(&entry.file_name().to_string_lossy()))
                                 .count()
                         });
+                        // Closed before the removal, as in `OwnDir::drop`.
+                        drop(lock);
                         if std::fs::remove_dir_all(&path).is_ok() {
                             removed += staged;
                         }
                     }
                     Err(std::fs::TryLockError::WouldBlock) => {}
+                    // No lock file: a directory is locked under a hidden name
+                    // before it gets this one, so it was left by a process
+                    // that removed its lock on exit but not the directory
+                    // (NFS renames an open file on unlink). Gone once idle.
+                    Err(std::fs::TryLockError::Error(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        if idle(&meta) >= older_than {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
                     Err(std::fs::TryLockError::Error(error)) => {
                         tracing::warn!(
                             %error,
