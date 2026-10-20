@@ -272,8 +272,22 @@ pub async fn preview(
 
     let evaluated = hosted.len() + proxy.len();
     let format = state.formats.for_repository(&repo);
-    let decisions = evaluate(format.as_ref(), now, &policy, &hosted);
-    let proxy_decisions = evaluate_proxy(now, &policy, &proxy);
+    // The evaluator is CPU-bound and grows with the repository: run it on the
+    // blocking pool so a large preview does not stall a runtime worker thread.
+    let evaluation = tokio::task::spawn_blocking(move || {
+        (
+            evaluate(format.as_ref(), now, &policy, &hosted),
+            evaluate_proxy(now, &policy, &proxy),
+        )
+    })
+    .await;
+    let (decisions, proxy_decisions) = match evaluation {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, repo = %repo.name, "retention preview evaluation failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
 
     use forge_core::retention::model::Action;
     let unlisted = decisions

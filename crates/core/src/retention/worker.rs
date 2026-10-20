@@ -258,9 +258,26 @@ impl RetentionWorker {
             Vec::new()
         };
 
-        // ── Pure evaluation. ──
-        let hosted_decisions = evaluate(self.format.as_ref(), now, &policy, &hosted);
-        let proxy_decisions = evaluate_proxy(now, &policy, &proxy);
+        // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
+        // with the repository, so it must not stall a runtime worker thread. ──
+        let evaluation = {
+            let format = Arc::clone(&self.format);
+            let policy = policy.clone();
+            tokio::task::spawn_blocking(move || {
+                (
+                    evaluate(format.as_ref(), now, &policy, &hosted),
+                    evaluate_proxy(now, &policy, &proxy),
+                )
+            })
+        };
+        // A panic there (e.g. a panicking `Format`) fails the run like a panic
+        // anywhere else in `process`.
+        let (hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
+            WorkerError::Panicked(match e.try_into_panic() {
+                Ok(panic) => panic_message(&*panic),
+                Err(e) => e.to_string(), // cancelled: the runtime is shutting down
+            })
+        })?;
 
         // Affected package names (for cache invalidation after the run).
         let mut affected: BTreeSet<String> = BTreeSet::new();
