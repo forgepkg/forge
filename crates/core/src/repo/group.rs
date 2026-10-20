@@ -19,8 +19,8 @@
 //!   Merged versions are ordered by the format's version precedence (so
 //!   `1.10.0` sorts after `1.9.0`).
 //! * **Prefer hosted** (group `config.prefer_hosted`, default on): once a
-//!   package id exists (listed or not) in **any** hosted leaf reachable from
-//!   the group, proxy members are not consulted for that id at all — for
+//!   package id exists (listed or not) in **any** owning hosted leaf reachable
+//!   from the group, proxy members are not consulted for that id at all — for
 //!   every caller. Ownership is decided over the whole membership DAG,
 //!   independent of the caller's repo grants and package selectors: a caller
 //!   who cannot see the hosted copy (an anonymous caller on a mixed-anonymity
@@ -38,14 +38,21 @@
 //!   deleted).
 //! * **Owner members** (`group_member.owner`): by default every hosted leaf
 //!   owns ids for both guards above. Once a group flags at least one member,
-//!   only the flagged members, and the hosted leaves inside a flagged nested
-//!   group, do. Under prefer-hosted, an id an owner has is then served by
+//!   only the flagged members, and the owners of a flagged nested group, do.
+//!   A nested group's owners are its own: its flagged members, or every
+//!   hosted leaf below it when it flags none. Under prefer-hosted, an id an owner has is then served by
 //!   the owners alone: neither a proxy nor another hosted member adds
 //!   versions to it. Only owners serve ids under a reserved prefix. Someone
 //!   who can push to another hosted member (a scratch or developer feed in
 //!   the same group) can then neither publish an internal name the group
 //!   serves, nor add a version to an owner's package, nor take a public id
 //!   away from its proxy.
+//! * **Nested groups keep their guards**: every group on the way from the
+//!   requested group to a leaf applies its own prefer-hosted setting,
+//!   reserved prefixes and owners to what its members serve. Reading an inner
+//!   group through an outer one is therefore never less protective than
+//!   reading it directly, whatever the outer group's settings. A leaf reached
+//!   along several paths serves an id if one visible path admits it.
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
 //!   remaining members, so a public-feed outage never breaks restores of
@@ -166,23 +173,46 @@ struct GraphMember {
 #[derive(Debug)]
 struct GroupGraph {
     root_id: i64,
-    /// The requested group's `prefer_hosted` option.
-    prefer_hosted: bool,
-    /// The requested group's reserved id prefixes (lowercase).
-    reserved_prefixes: Vec<String>,
     max_depth: u32,
     groups: HashMap<i64, Vec<GraphMember>>,
     leaves: Vec<Repository>,
-    /// Every hosted leaf reachable from the root within the depth bound,
-    /// **regardless of the principal**, that owns ids here (all of them unless
-    /// the group flags owner members) — the owners the prefer-hosted guard
-    /// consults ([`GroupRepo::hosted_owned_ids`]).
-    hosted_leaf_ids: Vec<i64>,
-    /// The leaves allowed to serve reserved ids: `None` when the group flags
-    /// no owner member (every non-proxy leaf may).
-    owner_leaf_ids: Option<HashSet<i64>>,
+    /// The dependency-confusion guard of every group reachable from the root
+    /// within the depth bound, decided **regardless of the principal**.
+    guards: HashMap<i64, GroupGuard>,
     visible_leaf_cache: Mutex<HashMap<String, Arc<VisibleLeaves>>>,
     cycle_logged: AtomicBool,
+}
+
+/// One group's dependency-confusion guard: its own options and owners.
+#[derive(Debug)]
+struct GroupGuard {
+    /// The group's `prefer_hosted` option.
+    prefer_hosted: bool,
+    /// The group's reserved id prefixes (lowercase).
+    reserved_prefixes: Vec<String>,
+    /// The hosted leaves that own ids in this group: the flagged hosted
+    /// members and the owners of flagged nested groups, or every hosted leaf
+    /// below the group (nested groups contributing their own owners) when it
+    /// flags no member. Proxies never own ids.
+    owners: HashSet<i64>,
+}
+
+impl GroupGuard {
+    /// Whether the lowercase `id` falls under one of the group's reserved
+    /// prefixes (only owners serve it).
+    fn is_reserved(&self, lower_id: &str) -> bool {
+        self.reserved_prefixes
+            .iter()
+            .any(|prefix| lower_id.starts_with(prefix.as_str()))
+    }
+}
+
+/// The guard state of one package id for [`GroupGraph::serving_leaves`].
+struct IdGuards<'a> {
+    /// The id, lowercase.
+    lower_id: &'a str,
+    /// The prefer-hosted groups one of whose owners has the id.
+    owned_in: &'a HashSet<i64>,
 }
 
 #[derive(Debug)]
@@ -192,32 +222,72 @@ struct VisibleLeaves {
 }
 
 impl GroupGraph {
-    /// Whether the lowercase `id` falls under one of the group's reserved
-    /// prefixes (never served from a proxy member).
-    fn is_reserved(&self, lower_id: &str) -> bool {
-        self.reserved_prefixes
+    /// Whether `group_id`'s guard restricts `id` to the group's owners: the id
+    /// is under one of its reserved prefixes, or the group prefers hosted
+    /// packages and one of its owners has the id.
+    fn guard_active(&self, group_id: i64, id: &IdGuards<'_>) -> Option<&HashSet<i64>> {
+        let guard = self.guards.get(&group_id)?;
+        (guard.is_reserved(id.lower_id) || (guard.prefer_hosted && id.owned_in.contains(&group_id)))
+            .then_some(&guard.owners)
+    }
+
+    /// Whether a prefer-hosted group could take `leaf` out for an id its
+    /// owners have, i.e. whether serving it needs the ownership lookup.
+    fn may_yield(&self, leaf_id: i64) -> bool {
+        self.guards
+            .values()
+            .any(|guard| guard.prefer_hosted && !guard.owners.contains(&leaf_id))
+    }
+
+    /// The prefer-hosted groups whose owners have the id, given the hosted
+    /// leaves that have it.
+    fn owned_in(&self, having: &HashSet<i64>) -> HashSet<i64> {
+        self.guards
             .iter()
-            .any(|prefix| lower_id.starts_with(prefix.as_str()))
+            .filter(|(_, guard)| {
+                guard.prefer_hosted && guard.owners.iter().any(|leaf| having.contains(leaf))
+            })
+            .map(|(group_id, _)| *group_id)
+            .collect()
     }
 
-    /// Whether `leaf` may serve an id under a reserved prefix: never a proxy,
-    /// and only an owner when the group names owners.
-    fn may_serve_reserved(&self, leaf: &Repository) -> bool {
-        !is_proxy(leaf)
-            && self
-                .owner_leaf_ids
-                .as_ref()
-                .is_none_or(|owners| owners.contains(&leaf.id))
+    /// Every owning hosted leaf of a prefer-hosted group: what the ownership
+    /// lookup has to consult.
+    fn prefer_hosted_owners(&self) -> Vec<i64> {
+        let mut owners: Vec<i64> = self
+            .guards
+            .values()
+            .filter(|guard| guard.prefer_hosted)
+            .flat_map(|guard| guard.owners.iter().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        owners.sort_unstable();
+        owners
     }
 
-    /// Whether `leaf` gives way under prefer-hosted once an owning hosted
-    /// leaf has the id: every proxy, and, when the group names owners, every
-    /// leaf that is not one.
-    fn yields_to_owners(&self, leaf: &Repository) -> bool {
-        match &self.owner_leaf_ids {
-            None => is_proxy(leaf),
-            Some(owners) => !owners.contains(&leaf.id),
-        }
+    /// The leaves that serve `package_id`, in priority order: the visible
+    /// leaves ([`Self::visible_leaves`]) that every group on their way from the
+    /// root lets through. A group whose guard is active for the id
+    /// ([`Self::guard_active`]) lets through only its owners.
+    fn serving_leaves(&self, package_id: &str, id: &IdGuards<'_>) -> Vec<i64> {
+        let key = crate::format::lower_invariant(package_id);
+        let mut path = HashSet::from([self.root_id]);
+        let mut best_group_depth = HashMap::from([(self.root_id, 0)]);
+        let mut seen_leaves = HashSet::new();
+        let mut out = Vec::new();
+        self.walk_visible(
+            self.root_id,
+            0,
+            &key,
+            Some(id),
+            &mut Vec::new(),
+            &mut path,
+            &mut best_group_depth,
+            &mut seen_leaves,
+            &mut out,
+        );
+        out
     }
 
     /// Visible leaf ids for `package_id`, in the same package-specific stable
@@ -244,6 +314,8 @@ impl GroupGraph {
             self.root_id,
             0,
             &key,
+            None,
+            &mut Vec::new(),
             &mut path,
             &mut best_group_depth,
             &mut seen_leaves,
@@ -266,12 +338,18 @@ impl GroupGraph {
         out
     }
 
+    /// Pre-order walk of the visible leaves below `group_id`. With `guards`,
+    /// a leaf is only emitted if the owner set of every group on the path
+    /// whose guard is active for the id (`required`) contains it; a leaf left
+    /// out is not marked seen, so another path may still admit it.
     #[allow(clippy::too_many_arguments)]
-    fn walk_visible(
-        &self,
+    fn walk_visible<'g>(
+        &'g self,
         group_id: i64,
         depth: u32,
         package_id: &str,
+        guards: Option<&IdGuards<'_>>,
+        required: &mut Vec<&'g HashSet<i64>>,
         path: &mut HashSet<i64>,
         best_group_depth: &mut HashMap<i64, u32>,
         seen_leaves: &mut HashSet<i64>,
@@ -284,6 +362,10 @@ impl GroupGraph {
         let Some(members) = self.groups.get(&group_id) else {
             return;
         };
+        let active = guards.and_then(|id| self.guard_active(group_id, id));
+        if let Some(owners) = active {
+            required.push(owners);
+        }
         for member in members {
             if !member.filter.allows(package_id) {
                 continue;
@@ -313,15 +395,24 @@ impl GroupGraph {
                     member.repo.id,
                     next_depth,
                     package_id,
+                    guards,
+                    required,
                     path,
                     best_group_depth,
                     seen_leaves,
                     out,
                 );
                 path.remove(&member.repo.id);
-            } else if seen_leaves.insert(member.repo.id) {
+            } else if required
+                .iter()
+                .all(|owners| owners.contains(&member.repo.id))
+                && seen_leaves.insert(member.repo.id)
+            {
                 out.push(member.repo.id);
             }
+        }
+        if active.is_some() {
+            required.pop();
         }
     }
 
@@ -410,9 +501,9 @@ impl GroupRepo {
         // Pass 1. A group past the depth bound is not expanded: no caller can
         // be served from below it, so its leaves own nothing here either.
         let mut adjacency: HashMap<i64, Vec<Repository>> = HashMap::new();
-        let mut hosted_leaf_ids = Vec::new();
-        let mut seen_hosted = HashSet::new();
-        let mut discovered_groups = HashSet::from([group_row.id]);
+        let mut flagged: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut group_rows: HashMap<i64, Repository> =
+            HashMap::from([(group_row.id, group_row.clone())]);
         let mut queue = VecDeque::from([(group_row.id, 0_u32)]);
         while let Some((group_id, depth)) = queue.pop_front() {
             if depth >= self.max_depth {
@@ -421,70 +512,42 @@ impl GroupRepo {
             let rows = repository_dao::group_members(&self.pool, group_id).await?;
             let mut members = Vec::with_capacity(rows.len());
             for (member, _priority) in rows {
-                match member.kind() {
-                    RepoKind::Group => {
-                        if discovered_groups.insert(member.id) {
-                            queue.push_back((member.id, depth + 1));
-                        }
-                    }
-                    RepoKind::Hosted => {
-                        if seen_hosted.insert(member.id) {
-                            hosted_leaf_ids.push(member.id);
-                        }
-                    }
-                    RepoKind::Proxy => {}
+                if member.kind() == RepoKind::Group && !group_rows.contains_key(&member.id) {
+                    group_rows.insert(member.id, member.clone());
+                    queue.push_back((member.id, depth + 1));
                 }
                 members.push(member);
             }
             adjacency.insert(group_id, members);
+            let owners = repository_dao::group_owner_ids(&self.pool, group_id).await?;
+            flagged.insert(group_id, owners.into_iter().collect());
         }
 
-        // Owner members: the hosted leaves reachable through a flagged member
-        // of the requested group (within the same depth bound) own ids here.
-        let flagged = repository_dao::group_owner_ids(&self.pool, group_row.id).await?;
-        let owner_leaf_ids = if flagged.is_empty() {
-            None
-        } else {
-            let mut owners = HashSet::new();
-            let mut seen_groups = HashSet::new();
-            let mut queue: VecDeque<(i64, u32)> = VecDeque::new();
-            for member in adjacency
-                .get(&group_row.id)
-                .map(Vec::as_slice)
-                .unwrap_or_default()
-            {
-                if !flagged.contains(&member.id) {
-                    continue;
-                }
-                match member.kind() {
-                    RepoKind::Hosted => {
-                        owners.insert(member.id);
-                    }
-                    RepoKind::Group => queue.push_back((member.id, 1)),
-                    RepoKind::Proxy => {}
-                }
-            }
-            while let Some((group_id, depth)) = queue.pop_front() {
-                if depth >= self.max_depth || !seen_groups.insert(group_id) {
-                    continue;
-                }
-                for member in adjacency
-                    .get(&group_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
-                {
-                    match member.kind() {
-                        RepoKind::Hosted => {
-                            owners.insert(member.id);
-                        }
-                        RepoKind::Group => queue.push_back((member.id, depth + 1)),
-                        RepoKind::Proxy => {}
-                    }
-                }
-            }
-            hosted_leaf_ids.retain(|id| owners.contains(id));
-            Some(owners)
-        };
+        // Every group's own guard. Its owners are decided over the whole
+        // structure, never the caller's grants: a caller's grants must not
+        // decide whether an internal id is shielded from the proxies.
+        let mut owner_sets: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let guards = group_rows
+            .iter()
+            .filter(|(group_id, _)| adjacency.contains_key(group_id))
+            .map(|(group_id, row)| {
+                let owners = group_owners(
+                    *group_id,
+                    &adjacency,
+                    &flagged,
+                    &mut owner_sets,
+                    &mut HashSet::new(),
+                );
+                (
+                    *group_id,
+                    GroupGuard {
+                        prefer_hosted: row.prefer_hosted(),
+                        reserved_prefixes: row.reserved_prefixes(),
+                        owners,
+                    },
+                )
+            })
+            .collect();
 
         // Pass 2.
         let mut groups = HashMap::new();
@@ -537,13 +600,10 @@ impl GroupRepo {
 
         Ok(Arc::new(GroupGraph {
             root_id: group_row.id,
-            prefer_hosted: group_row.prefer_hosted(),
-            reserved_prefixes: group_row.reserved_prefixes(),
             max_depth: self.max_depth,
             groups,
             leaves,
-            hosted_leaf_ids,
-            owner_leaf_ids,
+            guards,
             visible_leaf_cache: Mutex::new(HashMap::new()),
             cycle_logged: AtomicBool::new(false),
         }))
@@ -558,43 +618,71 @@ impl GroupRepo {
         }
     }
 
-    /// The subset of `lower_ids` (canonical ids) owned by a hosted leaf of the
-    /// group: present there in any version, listed or not.
+    /// For each of `lower_ids` (canonical ids), the prefer-hosted groups of
+    /// the graph one of whose owners has it (present there in any version,
+    /// listed or not); ids no such owner has are absent.
     ///
-    /// Decided over **every** hosted leaf reachable from the group
-    /// ([`GroupGraph::hosted_leaf_ids`]), independent of the principal's repo
-    /// grants and package selectors, in one batched existence query. An error
+    /// Decided over the owners of every group in the graph
+    /// ([`GroupGuard::owners`]), independent of the principal's repo grants
+    /// and package selectors, in one batched existence query. An error
     /// propagates: deciding without it could expose an internal id to a
     /// public-feed shadow (fail closed).
-    async fn hosted_owned_ids(
+    async fn owned_in(
         &self,
         graph: &GroupGraph,
         lower_ids: &[String],
-    ) -> Result<HashSet<String>, RepoError> {
-        if graph.hosted_leaf_ids.is_empty() || lower_ids.is_empty() {
-            return Ok(HashSet::new());
+    ) -> Result<HashMap<String, HashSet<i64>>, RepoError> {
+        let owners = graph.prefer_hosted_owners();
+        if owners.is_empty() || lower_ids.is_empty() {
+            return Ok(HashMap::new());
         }
-        Ok(component_dao::names_present_in_repositories(
-            &self.pool,
-            &graph.hosted_leaf_ids,
-            lower_ids,
-        )
-        .await?
-        .into_iter()
-        .collect())
+        let mut having: HashMap<String, HashSet<i64>> = HashMap::new();
+        for (repository_id, name) in
+            component_dao::repositories_having_names(&self.pool, &owners, lower_ids).await?
+        {
+            having.entry(name).or_default().insert(repository_id);
+        }
+        Ok(having
+            .into_iter()
+            .map(|(name, having)| (name, graph.owned_in(&having)))
+            .collect())
     }
 
-    /// Construct each package-visible leaf once, in package-specific priority
-    /// order. The requested root repository's filter remains the caller's outer
-    /// [`crate::repo::PackageFilteredReadOps`] responsibility.
-    fn visible_members_for_id(
+    /// The members allowed to serve `package_id`, in priority order: the
+    /// visible members that every group on their way lets through
+    /// ([`GroupGraph::serving_leaves`]). A group lets only its owners serve an
+    /// id under one of its reserved prefixes, and, when it prefers hosted
+    /// packages and **any** of its owners has the id
+    /// ([`Self::owned_in`]) — whether or not this principal can see that
+    /// owner. A caller who cannot is then left with no serving member and gets
+    /// the ordinary not-found answer. A lookup failure propagates (fail
+    /// closed).
+    async fn serving_members_for_id(
         &self,
         graph: &GroupGraph,
         package_id: &str,
     ) -> Result<Vec<VisibleMember>, RepoError> {
+        let lower = self.lower_id(package_id);
+        let owned_in = if graph
+            .visible_leaves(package_id)
+            .ordered
+            .iter()
+            .any(|leaf| graph.may_yield(*leaf))
+        {
+            self.owned_in(graph, std::slice::from_ref(&lower))
+                .await?
+                .remove(&lower)
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let guards = IdGuards {
+            lower_id: &lower,
+            owned_in: &owned_in,
+        };
         let mut out = Vec::new();
-        for leaf_id in &graph.visible_leaves(package_id).ordered {
-            let Some(repo) = graph.leaves.iter().find(|repo| repo.id == *leaf_id) else {
+        for leaf_id in graph.serving_leaves(package_id, &guards) {
+            let Some(repo) = graph.leaves.iter().find(|repo| repo.id == leaf_id) else {
                 continue;
             };
             out.push(VisibleMember {
@@ -603,41 +691,6 @@ impl GroupRepo {
             });
         }
         Ok(out)
-    }
-
-    /// The members allowed to serve `package_id`: for an id under a reserved
-    /// prefix only the members that may serve it
-    /// ([`GroupGraph::may_serve_reserved`]); otherwise the visible members,
-    /// minus every member that yields to owners
-    /// ([`GroupGraph::yields_to_owners`]) when the group prefers hosted
-    /// packages and **any** owning hosted leaf of the group has the id
-    /// ([`Self::hosted_owned_ids`]) — whether or not this principal can see
-    /// that leaf. A caller who cannot is then left with no serving member and
-    /// gets the ordinary not-found answer. A lookup failure propagates (fail
-    /// closed).
-    async fn serving_members_for_id(
-        &self,
-        graph: &GroupGraph,
-        package_id: &str,
-    ) -> Result<Vec<VisibleMember>, RepoError> {
-        let members = self.visible_members_for_id(graph, package_id)?;
-        let lower = self.lower_id(package_id);
-        if graph.is_reserved(&lower) {
-            return Ok(members
-                .into_iter()
-                .filter(|m| graph.may_serve_reserved(&m.repo))
-                .collect());
-        }
-        if !graph.prefer_hosted || !members.iter().any(|m| graph.yields_to_owners(&m.repo)) {
-            return Ok(members);
-        }
-        if self.hosted_owned_ids(graph, &[lower]).await?.is_empty() {
-            return Ok(members);
-        }
-        Ok(members
-            .into_iter()
-            .filter(|m| !graph.yields_to_owners(&m.repo))
-            .collect())
     }
 
     /// Merge member search results with the caller's package predicate pushed
@@ -660,8 +713,7 @@ impl GroupRepo {
 
         // `member_ops[i]` reads `graph.leaves[i]`.
         let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
-        let mut by_id: BTreeMap<String, RankedHit> = BTreeMap::new();
-        let mut yielding_hits: Vec<RankedHit> = Vec::new();
+        let mut candidates: Vec<RankedHit> = Vec::new();
         let mut failures = MemberFailures::default();
         for (member, leaf) in graph.leaves.iter().enumerate() {
             let ops = self.factory.ops_for(leaf)?;
@@ -684,33 +736,39 @@ impl GroupRepo {
                 let Some(rank) = graph.leaf_rank(&hit.original_id, leaf.id) else {
                     continue;
                 };
-                let ranked = RankedHit { rank, member, hit };
-                if graph.is_reserved(&self.lower_id(&ranked.hit.original_id))
-                    && !graph.may_serve_reserved(leaf)
-                {
-                    continue;
-                }
-                if graph.prefer_hosted && graph.yields_to_owners(leaf) {
-                    // Decided below against every owning hosted leaf of the group.
-                    yielding_hits.push(ranked);
-                    continue;
-                }
-                insert_ranked(&mut by_id, ranked);
+                candidates.push(RankedHit { rank, member, hit });
             }
         }
         failures.into_result()?;
-        if !yielding_hits.is_empty() {
-            let candidates: Vec<String> = yielding_hits
-                .iter()
-                .map(|ranked| self.lower_id(&ranked.hit.original_id))
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let owned = self.hosted_owned_ids(&graph, &candidates).await?;
-            for ranked in yielding_hits {
-                if !owned.contains(&self.lower_id(&ranked.hit.original_id)) {
-                    insert_ranked(&mut by_id, ranked);
-                }
+
+        // The guards of every group on the way, decided against every owner
+        // ([`Self::serving_members_for_id`]). Only hits a prefer-hosted group
+        // could take out need the ownership lookup.
+        let lookup: Vec<String> = candidates
+            .iter()
+            .filter(|ranked| graph.may_yield(graph.leaves[ranked.member].id))
+            .map(|ranked| self.lower_id(&ranked.hit.original_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let owned_in = self.owned_in(&graph, &lookup).await?;
+        let no_owner = HashSet::new();
+        let mut serving: HashMap<String, HashSet<i64>> = HashMap::new();
+        let mut by_id: BTreeMap<String, RankedHit> = BTreeMap::new();
+        for ranked in candidates {
+            let lower = self.lower_id(&ranked.hit.original_id);
+            let leaves = serving.entry(lower.clone()).or_insert_with(|| {
+                let guards = IdGuards {
+                    lower_id: &lower,
+                    owned_in: owned_in.get(&lower).unwrap_or(&no_owner),
+                };
+                graph
+                    .serving_leaves(&ranked.hit.original_id, &guards)
+                    .into_iter()
+                    .collect()
+            });
+            if leaves.contains(&graph.leaves[ranked.member].id) {
+                insert_ranked(&mut by_id, ranked);
             }
         }
 
@@ -908,8 +966,47 @@ impl RepoReadOps for GroupRepo {
     }
 }
 
-fn is_proxy(repo: &Repository) -> bool {
-    repo.kind() == RepoKind::Proxy
+/// The hosted leaves that own ids in `group_id` ([`GroupGuard::owners`]):
+/// those of its flagged members, or of all its members when it flags none. A
+/// nested group contributes its own owners, so its flags still count when it
+/// is read through an outer group. A group already on the current descent
+/// (a cycle a raw database write could create) contributes nothing.
+fn group_owners(
+    group_id: i64,
+    adjacency: &HashMap<i64, Vec<Repository>>,
+    flagged: &HashMap<i64, HashSet<i64>>,
+    memo: &mut HashMap<i64, HashSet<i64>>,
+    descent: &mut HashSet<i64>,
+) -> HashSet<i64> {
+    if let Some(owners) = memo.get(&group_id) {
+        return owners.clone();
+    }
+    if !descent.insert(group_id) {
+        return HashSet::new();
+    }
+    let flags = flagged.get(&group_id);
+    let mut owners = HashSet::new();
+    for member in adjacency
+        .get(&group_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if flags.is_some_and(|flags| !flags.is_empty() && !flags.contains(&member.id)) {
+            continue;
+        }
+        match member.kind() {
+            RepoKind::Hosted => {
+                owners.insert(member.id);
+            }
+            RepoKind::Group => {
+                owners.extend(group_owners(member.id, adjacency, flagged, memo, descent));
+            }
+            RepoKind::Proxy => {}
+        }
+    }
+    descent.remove(&group_id);
+    memo.insert(group_id, owners.clone());
+    owners
 }
 
 /// A merged search hit: its package-specific priority `rank` (lower wins) and

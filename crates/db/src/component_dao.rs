@@ -147,23 +147,24 @@ pub async fn list_components_for_repo_matching(
     .await
 }
 
-/// The subset of `names` (lowercased package ids) that have at least one
-/// component row — any version, listed or not — in any of `repository_ids`.
+/// The `(repository_id, name)` pairs of `repository_ids` × `names`
+/// (lowercased package ids) with at least one component row — any version,
+/// listed or not.
 ///
 /// One batched existence query, used by group resolution's dependency-confusion
-/// guard to decide whether a hosted leaf owns an id regardless of who asks.
-/// Each returned name appears once; order is unspecified.
-pub async fn names_present_in_repositories(
+/// guard to decide which hosted leaves own an id regardless of who asks. Each
+/// pair appears once; order is unspecified.
+pub async fn repositories_having_names(
     pool: &PgPool,
     repository_ids: &[i64],
     names: &[String],
-) -> sqlx::Result<Vec<String>> {
+) -> sqlx::Result<Vec<(i64, String)>> {
     if repository_ids.is_empty() || names.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_scalar!(
+    let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT name AS "name!"
+        SELECT DISTINCT repository_id, name
         FROM component
         WHERE repository_id = ANY($1) AND name = ANY($2)
         "#,
@@ -171,7 +172,11 @@ pub async fn names_present_in_repositories(
         names,
     )
     .fetch_all(pool)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.repository_id, row.name))
+        .collect())
 }
 
 /// Set the `listed` flag on a specific component version. Returns whether a row
