@@ -55,6 +55,13 @@ app.kubernetes.io/part-of: envisia-forge
 {{- end }}
 {{- end }}
 
+{{/* The Secret the chart creates from secretEnv. Reserved: existingSecret
+may not name it (deployment.yaml fails), or Helm would refuse to take over a
+Secret created outside the release. */}}
+{{- define "forge.secretEnvName" -}}
+{{- printf "%s-secret-env" (include "forge.fullname" .) }}
+{{- end }}
+
 {{/* ── Image ────────────────────────────────────────────────────────────── */}}
 
 {{- define "forge.imageTag" -}}

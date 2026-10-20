@@ -15,4 +15,4 @@ service:
   loadBalancerSourceRanges: [10.0.0.0/8]
 image:
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-existingSecret: forge-env
+existingSecret: forge-credentials

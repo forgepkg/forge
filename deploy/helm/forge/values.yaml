@@ -65,7 +65,7 @@ config:
 logLevel: info
 
 # Secret settings as environment variables, stored in a Secret the chart
-# creates (<fullname>-env) and loaded with envFrom: FORGE_DATABASE__URL,
+# creates (<fullname>-secret-env) and loaded with envFrom: FORGE_DATABASE__URL,
 # FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,
 # FORGE_ROOT_KEY, FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD,
 # FORGE_OIDC__CLIENT_SECRET, ...
@@ -78,6 +78,8 @@ secretEnv: {}
 
 # An existing Secret loaded with envFrom (the same keys as secretEnv), for
 # secrets managed elsewhere: External Secrets, Sealed Secrets, SOPS, ...
+# Both can be set (for a key in both, existingSecret's value wins). Any name
+# but <fullname>-secret-env, the chart's own, e.g. forge-credentials.
 existingSecret: ""
 
 # Extra environment variables (Kubernetes EnvVar objects), after the chart's

@@ -39,8 +39,8 @@ them like this:
 | --- | --- |
 | `config` | `forge.toml` in a ConfigMap, loaded through `FORGE_CONFIG`. Any key of [forge.toml.example](../../../forge.toml.example), as YAML, nested by section. |
 | `host` | `server.public_base_url` (`https://<host>`), and the default host of the HTTPRoute, the ListenerSet listener and the Certificate. |
-| `secretEnv` | A Secret the chart creates, loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY`, … |
-| `existingSecret` | An existing Secret loaded with `envFrom` (External Secrets, Sealed Secrets, SOPS, …). |
+| `secretEnv` | A Secret the chart creates (`<fullname>-secret-env`), loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY`, … |
+| `existingSecret` | An existing Secret loaded with `envFrom` (External Secrets, Sealed Secrets, SOPS, …); it wins over `secretEnv` for a key in both. Any name but the chart's own `<fullname>-secret-env`. |
 | `env`, `envFrom` | Further variables; `valueFrom` reads single Secret keys. They win over the chart's own. |
 
 Environment variables override `forge.toml`. Keep secrets out of `config`:
@@ -66,7 +66,7 @@ config:
     root:
       provider: env                     # secret encryption at rest
 
-existingSecret: forge-env               # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
+existingSecret: forge-credentials       # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
                                         # FORGE_S3__SECRET_KEY, FORGE_ROOT_KEY,
                                         # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 redis:
