@@ -20,11 +20,12 @@ name: Release
 # full commit SHA (the tag it was resolved from is in the trailing comment);
 # Dependabot keeps them current.
 #
-# Guard rails: the tag must equal the workspace version in Cargo.toml, the
-# web/package.json version, the image tag of the Kubernetes base
-# (deploy/kubernetes/base) and the Helm chart's version and appVersion, and
-# must point at a commit on the default branch. `cargo xtask release
-# <version>` sets all of them and creates the tag.
+# Guard rails: the tag must point at a commit on the default branch whose CI
+# run (ci.yml) passed, e2e and web-e2e included (the `ci` job waits for it).
+# It must equal the workspace version in Cargo.toml, the web/package.json
+# version, the image tag of the Kubernetes base (deploy/kubernetes/base) and
+# the Helm chart's version and appVersion. `cargo xtask release <version>`
+# sets all of them.
 on:
   push:
     tags: ["v*.*.*"]
@@ -48,8 +49,85 @@ env:
   HELM_VERSION: v4.3.1
 
 jobs:
+  # Nothing is built for a commit whose CI did not pass on the default branch,
+  # e2e and web-e2e included: pull requests never run those two. Passes once
+  # one CI run (ci.yml, a push or a manual run on the default branch) of the
+  # tagged commit has succeeded with every job in REQUIRED_JOBS; waits up to an
+  # hour for runs still queued or in progress (a tag pushed right after the
+  # merge), and fails when every run has finished without passing.
+  ci:
+    name: CI passed for the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    permissions:
+      actions: read # the CI workflow's runs and their jobs
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      # The `name:` of every ci.yml job that runs on the default branch.
+      REQUIRED_JOBS: fmt clippy audit test docker kubernetes web e2e web-e2e
+    steps:
+      - name: Wait for the commit's CI run and check its jobs
+        shell: bash # -eo pipefail: a failing gh call fails the step
+        run: |
+          api() { # `gh api`, retried so that one transient error does not end the wait
+            local out attempt
+            for attempt in 1 2 3; do
+              if out=$(gh api "$@"); then printf '%s\n' "$out"; return 0; fi
+              echo "gh api failed (attempt $attempt)" >&2
+              sleep 10
+            done
+            return 1
+          }
+          start=$(date +%s)
+          while :; do
+            # Newest first; the jobs endpoint reports a run's latest attempt.
+            runs=$(api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&branch=${DEFAULT_BRANCH}&per_page=100" \
+              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | "\(.id) \(.status) \(.conclusion // "none")"')
+            pending=0
+            while read -r id status conclusion; do
+              [ -n "$id" ] || continue
+              url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${id}"
+              if [ "$status" != completed ]; then
+                pending=$((pending + 1))
+                echo "CI run $url is $status"
+                continue
+              fi
+              if [ "$conclusion" != success ]; then
+                echo "CI run $url concluded $conclusion"
+                continue
+              fi
+              jobs=$(api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/jobs?per_page=100" \
+                --jq '.jobs[] | "\(.name) \(.conclusion)"')
+              missing=""
+              for job in $REQUIRED_JOBS; do
+                grep -qxF "$job success" <<< "$jobs" || missing="$missing $job"
+              done
+              if [ -z "$missing" ]; then
+                echo "CI run $url passed: $REQUIRED_JOBS"
+                exit 0
+              fi
+              echo "CI run $url succeeded without:$missing"
+            done <<< "$runs"
+            elapsed=$(( $(date +%s) - start ))
+            if [ -z "$runs" ] && [ "$elapsed" -ge 600 ]; then
+              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH; tag a commit CI ran on (the newest commit of a push to $DEFAULT_BRANCH) once that run passed"
+              exit 1
+            fi
+            if [ -n "$runs" ] && [ "$pending" -eq 0 ]; then
+              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH passed with every job in: $REQUIRED_JOBS. Re-run CI for the commit, then this workflow."
+              exit 1
+            fi
+            if [ "$elapsed" -ge 3600 ]; then
+              echo "::error::CI for $GITHUB_SHA did not finish within an hour; re-run this workflow once it has passed"
+              exit 1
+            fi
+            sleep 30
+          done
+
   image:
     name: build, push, sign
+    needs: [ci]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release

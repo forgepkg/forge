@@ -552,7 +552,10 @@ git push -u origin release-1.0.1          # open a pull request, merge it
 
 Then wait until CI on the merge commit is green, **including `e2e` and
 `web-e2e`**: they run only on `main`, after the merge, never on the pull
-request. Tag that commit and push the tag:
+request. Every push to `main` gets its own CI run, which a later push never
+cancels. The release workflow checks this as well: before it builds anything,
+it waits (up to an hour) for the tagged commit's CI run on `main` and fails
+unless every job of it passed. Tag that commit and push the tag:
 
 ```bash
 git fetch origin
