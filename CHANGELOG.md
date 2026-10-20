@@ -410,6 +410,10 @@ First production release.
 - `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.10: certificate
   verification no longer accepts distrusted intermediates
   (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
+- Credential-forwarding verdicts are cached in memory no longer than they
+  live: a rejection for `negative_ttl`, and a verdict another instance wrote
+  only for what its row has left (before, both for the positive TTL).
+
 ### Fixed
 
 - Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
@@ -501,6 +505,10 @@ First production release.
   username's login backoff during a password spray, are stored in the
   database. Before, they were lost on restart and known only to the
   instance that saw the sign-in.
+- Leases, retry backoffs and staleness cutoffs are computed on the database's
+  clock, so a skewed application clock no longer makes failing outbox rows
+  retry every poll or retention runs fail their own lease.
+
 ### Changed
 
 - The admin UI lives under `/manage/*`. Browser navigations to the former
@@ -651,6 +659,9 @@ First production release.
   that miss the same version at the same time each download it.
 - A group's search is capped at 1,000 results per member, so totals and
   paging are exact only below that.
+- A token whose scope lists a group's repository id reads through the group
+  only from the members it lists as well: reading a group grants no read on
+  its members.
 - Retention has no per-run delete cap.
 - No metrics endpoint, request IDs or JSON log output. Shutdown drains
   in-flight requests without a deadline.
