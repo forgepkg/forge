@@ -311,6 +311,16 @@ authenticated account (e.g. `login` for GitHub's `/user`): that name, in
 canonical form, must equal the username entered, or the login is rejected; a
 success without it fails closed.
 
+`identity_path` also matters for deactivation. A directory often accepts
+other spellings of one account (`CORP\mallory`, `mallory@corp`), and Forge
+provisions each spelling it forwards as an account of its own. Deactivating
+`mallory` then does not stop a login as `corp\mallory` unless the upstream
+names the account it authenticated (`identity_path`), or `auto_provision` is
+off, or the user is disabled in the directory too. Names a directory could
+fold onto another account by Unicode alone (full-width letters, a soft
+hyphen, zero-width characters) are never forwarded. Forge logs a warning for
+an auto-provisioning realm without `identity_path`.
+
 Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":
 true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the

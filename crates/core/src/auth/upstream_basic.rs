@@ -405,7 +405,12 @@ impl AuthProvider for UpstreamBasicProvider {
         // forwarded nor answered from the cache. A rejection, not a skip: the
         // chain still lets a later local realm decide, but never falls back to
         // anonymous access.
-        if cred.username.contains(':') {
+        //
+        // Likewise a name a folding directory could map onto another account
+        // (full-width letters, a soft hyphen, ...): the upstream would vouch
+        // for that account while Forge provisions and signs in a new one,
+        // which gets around a deactivation of the plain name (#69).
+        if cred.username.contains(':') || forge_db::username::may_alias_upstream(cred.username) {
             return AuthOutcome::Rejected;
         }
 

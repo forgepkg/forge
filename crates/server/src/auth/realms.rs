@@ -702,6 +702,15 @@ impl RealmAuth {
         // in the clear to a non-loopback host unless the realm says so.
         ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
             .map_err(|e| anyhow::anyhow!("url: {e}"))?;
+        if cfg.auto_provision && cfg.identity_path.trim().is_empty() {
+            tracing::warn!(
+                realm = %realm.name,
+                "credential-forwarding realm provisions accounts without identity_path: \
+                 an upstream that also accepts another spelling of a username \
+                 (DOMAIN\\user, user@domain) signs that spelling in as a new account, \
+                 which a deactivation of the usual name does not stop"
+            );
+        }
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
         // Never follows redirects: a 3xx is judged (as unavailable) by the
