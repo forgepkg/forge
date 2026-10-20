@@ -297,6 +297,32 @@ impl TagVersions {
         }
     }
 
+    /// A peer's invalidation of `tag` at `generation`: the barrier moves past
+    /// what this instance has seen even when `generation` is not above it.
+    /// A peer's generations restart low once Redis lost the tag's key (a
+    /// restart without persistence, an LRU eviction) and that peer starts
+    /// afresh; taken as a plain maximum, its invalidations would be ignored
+    /// until its counter caught up. A forged, implausibly large generation
+    /// still advances the barrier by one only.
+    pub(crate) fn observe_invalidation(&self, tag: &str, generation: u64) {
+        let mut versions = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = versions.entry(tag.to_string()).or_default();
+        let next = current.saturating_add(1);
+        if generation > MAX_GENERATION {
+            tracing::warn!(
+                tag,
+                generation,
+                "implausible cache tag generation; advancing the barrier by one instead"
+            );
+            *current = next;
+        } else {
+            *current = next.max(generation);
+        }
+    }
+
     pub(crate) fn observe_one(&self, tag: &str, generation: u64) {
         self.observe(&[TagStamp {
             tag: tag.to_string(),
