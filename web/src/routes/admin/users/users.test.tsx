@@ -21,7 +21,8 @@ import { routeTree } from '~/routeTree.gen'
  * are all exercised:
  *  - the users list renders users and create-user POSTs the right body + the
  *    list re-fetches (invalidation);
- *  - delete-user invalidates the list;
+ *  - delete-user invalidates the list, and a refused delete (409 for the last
+ *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
  *    revoke removes the token (list invalidation reflecting `revoked_at`).
  */
@@ -228,6 +229,29 @@ describe('admin users', () => {
     await u.click(screen.getByRole('button', { name: 'Confirm' }))
 
     await waitFor(() => expect(deleted).toBe(7))
+  })
+
+  it('shows why a delete was refused and keeps the user', async () => {
+    mockApi({
+      users: [user({ id: 4, username: 'sole-admin', is_admin: true })],
+      onDeleteUser: () =>
+        new Response(
+          'this would leave no active administrator; make another user an admin first',
+          { status: 409 },
+        ),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users')
+
+    await u.click(await screen.findByRole('button', { name: 'Delete' }))
+    await u.click(screen.getByRole('button', { name: 'Confirm' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'this would leave no active administrator',
+    )
+    expect(screen.getByText('sole-admin')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
   })
 })
 

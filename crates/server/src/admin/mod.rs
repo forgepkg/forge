@@ -278,6 +278,19 @@ pub(crate) fn db_error(e: sqlx::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
+/// The **409** answer to a change refused by the last-admin guard
+/// ([`forge_db::authz_dao::would_leave_no_admin`]): deactivating, deleting or
+/// unassigning the `admin` role of the last active administrator. Without it
+/// the install would need direct SQL to get an administrator back: a deleted
+/// bootstrap admin is never re-created.
+pub(crate) fn last_admin_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "this would leave no active administrator; make another user an admin first",
+    )
+        .into_response()
+}
+
 /// Deserialize a field that distinguishes *absent* (`None`, through
 /// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
 /// (`Some(Some(v))`).

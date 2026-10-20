@@ -1640,6 +1640,184 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     assert_eq!(resp.status(), 401, "a revoked session stays revoked");
 }
 
+/// `(active, is_admin flag, holds the built-in admin role)` of a user.
+async fn admin_state(pool: &sqlx::PgPool, id: i64) -> (bool, bool, bool) {
+    sqlx::query_as(
+        "SELECT u.active, u.is_admin, EXISTS (
+             SELECT 1 FROM user_role ur JOIN role r ON r.id = ur.role_id
+             WHERE ur.user_id = u.id AND r.name = 'admin')
+         FROM app_user u WHERE u.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Create an active admin through the API, returning its id.
+async fn create_admin(srv: &common::TestServer, username: &str, password: &str) -> i64 {
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"username": username, "password": password, "is_admin": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap()
+}
+
+/// L4: nothing takes admin away from the last active administrator, not
+/// deactivating or deleting the account and not unassigning its `admin`
+/// role, since getting an administrator back would take SQL (a deleted
+/// bootstrap admin is never re-created). Each path answers 409 and changes
+/// nothing. An admin by the role alone and one by the legacy `is_admin` flag
+/// alone both count; an inactive admin does not.
+#[tokio::test]
+async fn the_last_active_admin_cannot_lose_admin() {
+    // Its own database: the shared one holds every other test's admins.
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let boot = admin_id(&srv).await;
+    let admin_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "admin")
+        .await
+        .unwrap()
+        .unwrap();
+    let req = |method: reqwest::Method, path: &str, body: &Option<Value>| {
+        let rb = client.request(method, format!("{}{path}", srv.base_url));
+        match body {
+            Some(body) => rb.json(body),
+            None => rb,
+        }
+    };
+    let removals = |id: i64| {
+        [
+            (
+                reqwest::Method::PATCH,
+                format!("/admin/users/{id}"),
+                Some(json!({"active": false})),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("/admin/users/{id}/roles/{admin_role}"),
+                None,
+            ),
+            (reqwest::Method::DELETE, format!("/admin/users/{id}"), None),
+        ]
+    };
+
+    // The bootstrap admin, an admin by the role alone, removes itself.
+    forge_db::user_dao::update_is_admin(&srv.pool, boot, false)
+        .await
+        .unwrap();
+    let dormant = create_admin(&srv, "dormant", "pw-dormant").await;
+    forge_db::user_dao::set_active(&srv.pool, dormant, false)
+        .await
+        .unwrap();
+    for (method, path, body) in removals(boot) {
+        let resp = req(method, &path, &body)
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{path}");
+    }
+    assert_eq!(admin_state(&srv.pool, boot).await, (true, false, true));
+
+    // With a second admin, by the legacy flag alone, the bootstrap admin may
+    // step down, and the second one is then the last.
+    let second = create_admin(&srv, "second", "pw-second").await;
+    forge_db::authz_dao::unassign_role(&srv.pool, second, admin_role)
+        .await
+        .unwrap();
+    let resp = req(
+        reqwest::Method::DELETE,
+        &format!("/admin/users/{boot}/roles/{admin_role}"),
+        &None,
+    )
+    .basic_auth(&u, Some(&p))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204, "another active admin remains");
+
+    let session = srv.login("second", "pw-second").await;
+    for (method, path, body) in removals(second) {
+        let resp = session
+            .apply(req(method, &path, &body))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{path}");
+    }
+    assert_eq!(admin_state(&srv.pool, second).await, (true, true, false));
+    let resp = session
+        .apply(req(
+            reqwest::Method::DELETE,
+            &format!("/admin/users/{boot}"),
+            &None,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "a former admin can be deleted");
+}
+
+/// L4: the last-admin guard is race-safe. Two admins deactivated at once
+/// would each still see the other as an admin; the guard runs them one at a
+/// time on the built-in `admin` role row, so the second is refused (409) and
+/// one active admin remains.
+#[tokio::test]
+async fn concurrent_admin_deactivations_leave_one_admin() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (u, p) = srv.admin_basic();
+    let boot = admin_id(&srv).await;
+    let second = create_admin(&srv, "second", "pw-second").await;
+
+    // Hold the role row so both requests park inside the guard.
+    let mut holder = srv.pool.begin().await.unwrap();
+    let pid = backend_pid(&mut holder).await;
+    sqlx::query("SELECT 1 FROM role WHERE name = 'admin' FOR NO KEY UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let deactivate = |id: i64| {
+        let (client, url, u, p) = (
+            srv.client(),
+            format!("{}/admin/users/{id}", srv.base_url),
+            u.clone(),
+            p.clone(),
+        );
+        tokio::spawn(async move {
+            client
+                .patch(url)
+                .basic_auth(u, Some(p))
+                .json(&json!({"active": false}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    let (a, b) = (deactivate(boot), deactivate(second));
+    wait_blocked_behind(&srv.pool, pid, 2).await;
+    holder.commit().await.unwrap();
+
+    let mut statuses = vec![a.await.unwrap(), b.await.unwrap()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 409]);
+    let (boot_active, ..) = admin_state(&srv.pool, boot).await;
+    let (second_active, ..) = admin_state(&srv.pool, second).await;
+    assert!(
+        boot_active != second_active,
+        "exactly one admin stays active"
+    );
+}
+
 /// `POST /auth/tokens` mints unscoped tokens only: a `scope` in the body is
 /// refused, never dropped (which would hand back an unscoped token).
 #[tokio::test]

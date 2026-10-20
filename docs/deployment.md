@@ -95,6 +95,11 @@ account. It is not re-created on later restarts. Then remove the password from
 the environment: with no bootstrap password configured, Forge simply starts
 without a bootstrap admin.
 
+Forge never lets the last active administrator go: deleting or deactivating
+that account, or removing its `admin` role, is refused with `409 Conflict`.
+So the replacement admin has to exist first; an OIDC or credential-forwarding
+admin counts once they have signed in.
+
 ### Password Basic auth
 
 The image defaults to `allow_password_basic = false`: the web UI signs in

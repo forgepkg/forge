@@ -407,6 +407,51 @@ pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sql
     Ok(changed > 0)
 }
 
+/// The last-admin guard: whether taking `user_id`'s admin rights away
+/// (deactivating, deleting, or unassigning its `admin` role) would leave no
+/// active administrator. `true` iff `user_id` is an active admin and no other
+/// active user is. "Admin" is what the authz seam honours for a user: the
+/// built-in `admin` role or the slice-1 `app_user.is_admin` dual-read flag.
+///
+/// Call it in the transaction that applies the change, and apply it only on
+/// `false`. It first locks the built-in `admin` role row (`FOR NO KEY UPDATE`,
+/// which the `FOR KEY SHARE` of a concurrent role assignment's foreign-key
+/// check does not wait for) until that transaction ends, so guarded changes
+/// run one at a time across instances. The count is a later statement, which
+/// under `READ COMMITTED` sees what the previous lock holder committed: two
+/// admins demoting each other at once cannot both pass. Changes that only add
+/// admins need no lock.
+pub async fn would_leave_no_admin(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"SELECT id FROM role WHERE name = $1 FOR NO KEY UPDATE"#,
+        ADMIN_ROLE,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    sqlx::query_scalar!(
+        r#"
+        WITH active_admin AS (
+            SELECT u.id FROM app_user u
+            WHERE u.active
+              AND (u.is_admin OR EXISTS (
+                  SELECT 1 FROM user_role ur
+                  JOIN role r ON r.id = ur.role_id
+                  WHERE ur.user_id = u.id AND r.name = $2
+              ))
+        )
+        SELECT EXISTS (SELECT 1 FROM active_admin WHERE id = $1)
+           AND NOT EXISTS (SELECT 1 FROM active_admin WHERE id <> $1) AS "last!"
+        "#,
+        user_id,
+        ADMIN_ROLE,
+    )
+    .fetch_one(&mut *conn)
+    .await
+}
+
 /// Insert a repository-privilege grant for a role. `repository_id = None` ⇒ ANY
 /// repo; `selector_id = None` ⇒ unscoped. Idempotent via the unique index
 /// (COALESCE-folded NULLs). Accepts any executor.
