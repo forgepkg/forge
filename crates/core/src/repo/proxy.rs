@@ -652,6 +652,20 @@ impl ProxyRepo {
             }
         };
         let resources = UpstreamResources::from_service_index(&doc);
+        // An index without a package base address is not a NuGet V3 service
+        // index (a captive portal, a gateway's error page, a mistyped URL):
+        // an upstream failure, never stored over the last good index. Taken
+        // for an empty upstream, it would answer every id 404.
+        if resources.package_base_address.is_none() {
+            let e = RepoError::Storage(format!(
+                "upstream service index {remote_url} advertises no PackageBaseAddress"
+            ));
+            if let Some((resources, _)) = persisted {
+                tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
+                return Ok(resources);
+            }
+            return Err(e);
+        }
         let resources_json = serde_json::to_value(PersistedIndex {
             remote_url: remote_url.to_string(),
             resources: resources.clone(),
@@ -726,7 +740,9 @@ impl ProxyRepo {
     async fn refresh_versions(&self, repo: &Repository, lower_id: &str) -> Result<bool, RepoError> {
         let resources = Box::pin(self.resolve_upstream_index(repo)).await?;
         let Some(base) = resources.package_base_address else {
-            return Ok(true);
+            return Err(RepoError::Storage(
+                "upstream advertises no PackageBaseAddress".into(),
+            ));
         };
         let url = format!("{base}{lower_id}/index.json");
         match self.fetch_json(repo, &url).await? {
@@ -1408,7 +1424,7 @@ impl ProxyRepo {
                     .await
                     .map_err(|e| e.to_string())?;
                 let Some(base) = resources.package_base_address else {
-                    return Ok(None);
+                    return Err("upstream advertises no PackageBaseAddress".to_string());
                 };
                 let url = format!("{base}{lower_id}/{version}/{lower_id}.nuspec");
                 let creds = self.credentials(repo).await.map_err(|e| e.to_string())?;

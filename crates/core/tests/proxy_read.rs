@@ -78,6 +78,8 @@ struct MockState {
     /// `lower_id -> flat-container listing document` served instead of the
     /// corpus's.
     flat_index_override: Mutex<HashMap<String, serde_json::Value>>,
+    /// The service index served instead of the real one.
+    index_override: Mutex<Option<serde_json::Value>>,
     /// When set, a `.nupkg` request signals the first `Notify` on arrival and
     /// answers only once the second is notified (a slow download).
     hold_nupkg: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
@@ -114,6 +116,10 @@ struct MockUpstream {
 }
 
 impl MockUpstream {
+    /// Serve `doc` as the service index from now on.
+    fn override_index(&self, doc: serde_json::Value) {
+        *self.state.index_override.lock().unwrap() = Some(doc);
+    }
     fn index_hits(&self) -> usize {
         self.state.index_hits.load(Ordering::SeqCst)
     }
@@ -200,6 +206,9 @@ async fn serve_index(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     st.index_hits.fetch_add(1, Ordering::SeqCst);
+    if let Some(doc) = st.index_override.lock().unwrap().clone() {
+        return (StatusCode::OK, axum::Json(doc)).into_response();
+    }
     let body = serde_json::json!({
         "version": "3.0.0",
         "resources": [
@@ -357,6 +366,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         registrations: Mutex::default(),
         registration_pages: Mutex::default(),
         flat_index_override: Mutex::default(),
+        index_override: Mutex::default(),
         hold_nupkg: Mutex::default(),
     });
 
@@ -841,6 +851,77 @@ async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+}
+
+/// #76: a service index without `PackageBaseAddress` (a captive portal, a
+/// gateway's error page) is an upstream failure. It never replaces the last
+/// good index, and without one the proxy errors instead of answering every id
+/// with an authoritative "not found".
+#[tokio::test]
+async fn service_index_without_a_package_base_address_is_an_upstream_failure() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let id = repo_id(&pool, &repo).await;
+    let stale = || async {
+        sqlx::query(
+            "UPDATE proxy_upstream_index SET fetched_at = now() - interval '2 hours' \
+             WHERE repository_id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    };
+
+    // A good index first, then the upstream answers an empty one.
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    mock.override_index(serde_json::json!({"version": "3.0.0", "resources": []}));
+    stale().await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "New.Lib").await.unwrap()),
+        Vec::<String>::new(),
+        "the stale good index is still used: the upstream says New.Lib is unknown"
+    );
+    let stored = forge_db::proxy_dao::get_upstream_index(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.resources["package_base_address"].is_string(),
+        "the empty index was not stored: {:?}",
+        stored.resources
+    );
+    assert!(
+        px.resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+            .await
+            .unwrap()
+            .is_some(),
+        "downloads keep going to the last good package base address"
+    );
+
+    // No good index at all: an error, never an empty answer.
+    let fresh = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    fresh.override_index(serde_json::json!({}));
+    let repo = make_proxy(&pool, &format!("{}/index.json", fresh.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(px.list_versions(&repo, "Contoso.Lib").await.is_err());
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .is_err());
+    assert!(
+        forge_db::proxy_dao::get_upstream_index(&pool, repo_id(&pool, &repo).await)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// #65: a repointed proxy forgets the previous upstream's per-version state.
