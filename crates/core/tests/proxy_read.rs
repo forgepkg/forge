@@ -813,6 +813,126 @@ async fn unauthorized_upstream_is_an_error_not_an_empty_listing() {
     assert!(px.list_versions(&repo, "Sample.Lib").await.is_err());
 }
 
+/// Requests a mock upstream has answered, per resource.
+fn upstream_hits(mock: &MockUpstream) -> [usize; 6] {
+    [
+        mock.index_hits(),
+        mock.flat_index_hits(),
+        mock.nuspec_hits(),
+        mock.nupkg_hits(),
+        mock.registration_hits(),
+        mock.registration_page_hits(),
+    ]
+}
+
+/// Point proxy `repo` at another upstream (the admin update's write).
+async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
+    sqlx::query("UPDATE repository SET remote_url = $2 WHERE name = $1")
+        .bind(repo)
+        .bind(remote_url)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// #13: repointing a proxy (`remote_url`) takes effect at once. Nothing more
+/// is requested from the previous upstream: not through its persisted service
+/// index (fresh or stale), nor through the listings, manifests and
+/// registrations cached from it. A failing new upstream is an error, not a
+/// silent fallback to the previous upstream's index.
+#[tokio::test]
+async fn repointed_proxy_never_fetches_from_the_previous_upstream() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let old = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let new = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", old.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+
+    // Warm every upstream cache from the old feed.
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    assert_eq!(
+        px.registration(&repo, "Contoso.Lib").await.unwrap().len(),
+        1
+    );
+    assert!(px
+        .resolve_nuspec(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    let from_old = upstream_hits(&old);
+
+    // Same instance and cache, well within the metadata TTL.
+    repoint(&pool, &repo, &format!("{}/index.json", new.base)).await;
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"],
+        "the new upstream's listing"
+    );
+    assert_eq!(
+        px.registration(&repo, "Contoso.Lib").await.unwrap().len(),
+        2
+    );
+    assert!(px
+        .resolve_nuspec(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "2.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        upstream_hits(&old),
+        from_old,
+        "nothing more from the old feed"
+    );
+    assert_eq!(upstream_hits(&new), [1, 1, 1, 1, 1, 0]);
+
+    // The proxy is repointed at a failing upstream (it demands credentials
+    // the proxy lacks), while the previous feed's index row is still fresh,
+    // and once it is stale.
+    let failing =
+        start_mock_with_auth(corpus_of("Contoso.Lib", &["3.0.0"]), Some("Basic x".into())).await;
+    repoint(&pool, &repo, &format!("{}/index.json", failing.base)).await;
+    let from_new = upstream_hits(&new);
+    for stale in [false, true] {
+        if stale {
+            sqlx::query(
+                "UPDATE proxy_upstream_index SET fetched_at = now() - interval '2 hours' \
+                 WHERE repository_id = $1",
+            )
+            .bind(repo_id(&pool, &repo).await)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // A fresh cache: another instance, or the metadata TTL elapsed.
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+        assert!(
+            px.resolve_nupkg(&repo, "Contoso.Lib", "3.0.0")
+                .await
+                .is_err(),
+            "stale: {stale}"
+        );
+        assert_eq!(
+            versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+            ["1.0.0", "2.0.0"],
+            "versions cached locally are still served (stale: {stale})"
+        );
+    }
+    assert_eq!(upstream_hits(&old), from_old);
+    assert_eq!(
+        upstream_hits(&new),
+        from_new,
+        "nothing from the previous feed"
+    );
+}
+
 /// An upstream serving package bytes whose manifest names a different
 /// identity than the requested path must not be cached under that path.
 #[tokio::test]
