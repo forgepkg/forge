@@ -137,6 +137,75 @@ async fn browse_search_and_detail() {
     assert!(deps[0]["range"].is_string());
 }
 
+/// With more packages than `take`, `total` counts all of them, not just the
+/// requested window, so the SPA's paginator can move past the first page. A
+/// single repository pages in its backend; a cross-repo search merges, and
+/// its totals add up across repositories.
+#[tokio::test]
+async fn browse_pages_past_take() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let suffix = common::unique();
+    let repo = format!("pg{suffix}");
+    let other = format!("pgo{suffix}");
+    let prefix = format!("Paged{suffix}");
+    for n in 0..7 {
+        publish_one(&srv, &repo, &format!("{prefix}.P{n}"), "1.0.0", false).await;
+    }
+    for n in 0..3 {
+        publish_one(&srv, &other, &format!("{prefix}.Q{n}"), "1.0.0", false).await;
+    }
+
+    let page = |query: String| {
+        let srv = &srv;
+        let (u, p) = (u.clone(), p.clone());
+        async move {
+            let resp = srv
+                .client()
+                .get(format!("{}/browse/packages?{query}", srv.base_url))
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            let ids: Vec<String> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["original_id"].as_str().unwrap().to_string())
+                .collect();
+            (body["total"].as_u64().unwrap(), ids)
+        }
+    };
+    let ids =
+        |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("{prefix}.{n}")).collect() };
+
+    // One repository (the SPA's case).
+    assert_eq!(
+        page(format!("repo={repo}&take=3")).await,
+        (7, ids(&["P0", "P1", "P2"]))
+    );
+    assert_eq!(
+        page(format!("repo={repo}&skip=3&take=3")).await,
+        (7, ids(&["P3", "P4", "P5"]))
+    );
+    assert_eq!(
+        page(format!("repo={repo}&skip=6&take=3")).await,
+        (7, ids(&["P6"]))
+    );
+
+    // Across repositories: the merged window spans both.
+    assert_eq!(
+        page(format!("q={prefix}&take=3")).await,
+        (10, ids(&["P0", "P1", "P2"]))
+    );
+    assert_eq!(
+        page(format!("q={prefix}&skip=5&take=3")).await,
+        (10, ids(&["P5", "P6", "Q0"]))
+    );
+}
+
 /// An unknown package id returns 404 from the detail endpoint.
 #[tokio::test]
 async fn browse_detail_unknown_package_404() {

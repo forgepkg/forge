@@ -169,7 +169,13 @@ pub struct BrowseResult {
 /// Iterates every repository the principal may read (honoring
 /// `anonymous_read`), runs the slice-1 [`RepoReadOps::search`] on each, merges
 /// the hits, then sorts + paginates the merged set. A `repo` filter restricts to
-/// a single repository.
+/// a single repository, which then pages in its backend. `total` is the sum of
+/// the backends' `total_hits` (already filtered by the caller's package
+/// selector).
+///
+/// A merged page needs every repository's first `skip + take` hits, so the
+/// merge is exact while that window stays within
+/// [`SearchParams::MAX_TAKE`]; pass `repo` to page deeper.
 pub async fn search_packages(
     State(state): State<AppState>,
     Query(query): Query<BrowseQuery>,
@@ -185,22 +191,34 @@ pub async fn search_packages(
         Err(e) => return db_error(e),
     };
 
-    // Per-repo search is bounded so a single huge repo can't starve the merge;
-    // we request enough to fill the requested window (`skip + take`, always ≥ 1
-    // because `effective_take()` is ≥ 1), capped at the read ops' own MAX_TAKE.
-    let want = query.skip.saturating_add(query.effective_take());
-    let per_repo_take = want.min(forge_core::repo::SearchParams::MAX_TAKE);
-
-    let mut all: Vec<BrowseItem> = Vec::new();
+    let mut readable: Vec<&Repository> = Vec::new();
     for repo in &repos {
         if let Some(filter) = &query.repo {
             if &repo.name != filter {
                 continue;
             }
         }
-        if !state.authz.can_read(&principal, repo).await {
-            continue;
+        if state.authz.can_read(&principal, repo).await {
+            readable.push(repo);
         }
+    }
+
+    // A single repository pages in its backend, whose order (by lowered id)
+    // is the browse order. A merge asks each repository for the window it
+    // must fill (`skip + take`, always ≥ 1 because `effective_take()` is ≥ 1),
+    // capped at the read ops' own MAX_TAKE so a single huge repo can't starve
+    // it, then pages the merged set below.
+    let merged = readable.len() > 1;
+    let (skip, take) = if merged {
+        let want = query.skip.saturating_add(query.effective_take());
+        (0, want.min(SearchParams::MAX_TAKE))
+    } else {
+        (query.skip, query.effective_take())
+    };
+
+    let mut total = 0usize;
+    let mut all: Vec<BrowseItem> = Vec::new();
+    for repo in readable {
         let ops = match state.read_ops_for(repo, principal).await {
             Ok(o) => o,
             // A misconfigured repo (e.g. nested group) is skipped, not fatal.
@@ -208,8 +226,8 @@ pub async fn search_packages(
         };
         let params = SearchParams {
             q: query.q.clone(),
-            skip: 0,
-            take: per_repo_take,
+            skip,
+            take,
             prerelease: query.prerelease,
             // The web UI shows every version; only legacy NuGet clients
             // need SemVer 2.0.0 hidden.
@@ -217,6 +235,7 @@ pub async fn search_packages(
         };
         match ops.search(&repo.name, &params).await {
             Ok(result) => {
+                total = total.saturating_add(result.total_hits);
                 for hit in result.hits {
                     all.push(BrowseItem {
                         repo: repo.name.clone(),
@@ -239,12 +258,14 @@ pub async fn search_packages(
 
     // Stable global ordering: by id, then repo.
     all.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.repo.cmp(&b.repo)));
-    let total = all.len();
-    let items = all
-        .into_iter()
-        .skip(query.skip)
-        .take(query.effective_take())
-        .collect();
+    let items = if merged {
+        all.into_iter()
+            .skip(query.skip)
+            .take(query.effective_take())
+            .collect()
+    } else {
+        all
+    };
     Json(BrowseResult { total, items }).into_response()
 }
 
