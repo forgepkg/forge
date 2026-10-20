@@ -13,7 +13,7 @@
 //! immediately visible (and revocable) on instance B.
 
 use base64::Engine;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
 use forge_db::model::Session;
 use forge_db::session_dao::{self, NewSession};
 use rand::Rng;
@@ -87,7 +87,11 @@ impl SessionService {
         let cookie_secret = random_secret();
         let token_hash = sha256_hex(&cookie_secret);
         let csrf_secret = random_secret();
-        let now = Utc::now();
+        // The expiries are compared with the database's clock (`now()` in the
+        // validity check), so they are computed on it too.
+        let now = forge_db::db_now(&self.pool)
+            .await
+            .map_err(|e| SessionError::Db(e.to_string()))?;
 
         let session = session_dao::create(
             &self.pool,

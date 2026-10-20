@@ -512,7 +512,8 @@ async fn delayed_proxy_versions(
     .fetch_all(&state.pool)
     .await?;
 
-    let now = Utc::now();
+    // `first_seen_at` is on the database's clock.
+    let now = forge_db::db_now(&state.pool).await?;
     let delay = Duration::seconds(i64::from(repo.package_delay_seconds));
     let mut out = Vec::new();
     for row in rows {

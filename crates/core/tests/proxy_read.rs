@@ -853,6 +853,81 @@ async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
     tx.commit().await.unwrap();
 }
 
+/// #77: the package delay and the not-found TTL count on the database's
+/// clock, which writes `first_seen_at` and `not_found_at`. Here it runs an
+/// hour ahead of the application's.
+#[tokio::test]
+async fn proxy_delay_and_not_found_ttl_run_on_the_database_clock() {
+    let pool = common::pool_with_clock_ahead().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let backdate = |column: &'static str, minutes: i32, repo: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match column {
+                "first_seen_at" => {
+                    "UPDATE proxy_cached_version SET first_seen_at = now() - make_interval(mins => $2) \
+                     WHERE repository_id = (SELECT id FROM repository WHERE name = $1)"
+                }
+                _ => {
+                    "UPDATE proxy_cached_version SET not_found_at = now() - make_interval(mins => $2) \
+                     WHERE repository_id = (SELECT id FROM repository WHERE name = $1)"
+                }
+            };
+            sqlx::query(sql)
+                .bind(repo)
+                .bind(minutes)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // A 30-minute delay. (A column default reads the real clock, not the
+    // skewed `now()`, so the first sighting is stamped explicitly.)
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 1800, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    px.list_versions(&repo, "Contoso.Lib").await.unwrap();
+    backdate("first_seen_at", 0, repo.clone()).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(
+        px.list_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap()
+            .is_empty(),
+        "just seen: inside the delay"
+    );
+    // First seen 31 minutes ago on the database's clock.
+    backdate("first_seen_at", 31, repo.clone()).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "past the delay on the database's clock"
+    );
+
+    // A 10-minute not-found TTL, marked 11 minutes ago.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Fabrikam.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    mock.state
+        .packages
+        .lock()
+        .unwrap()
+        .extend(corpus_of("Fabrikam.Lib", &["2.0.0"]));
+    backdate("not_found_at", 11, repo.clone()).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Fabrikam.Lib").await.unwrap()),
+        ["2.0.0"],
+        "the marker expired on the database's clock"
+    );
+}
+
 /// #76: a service index without `PackageBaseAddress` (a captive portal, a
 /// gateway's error page) is an upstream failure. It never replaces the last
 /// good index, and without one the proxy errors instead of answering every id

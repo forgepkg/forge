@@ -517,6 +517,14 @@ impl ProxyRepo {
         )
     }
 
+    /// The database's clock. Every time this module compares with is written
+    /// by Postgres (`first_seen_at`, `not_found_at`, `fetched_at`,
+    /// `metadata_refreshed_at`), so comparing it with the application's clock
+    /// would shift the package delay and the TTLs by the clock skew.
+    async fn db_now(&self) -> Result<DateTime<Utc>, RepoError> {
+        Ok(forge_db::db_now(&self.pool).await?)
+    }
+
     /// Whether a version with the given `first_seen_at` has cleared the proxy's
     /// package-delay window and may now be served/enumerated.
     fn delay_cleared(repo: &Repository, first_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -619,7 +627,7 @@ impl ProxyRepo {
                 (stored.remote_url == remote_url).then_some((stored.resources, idx.fetched_at))
             });
         if let Some((resources, fetched_at)) = &persisted {
-            if Utc::now() - *fetched_at < ttl {
+            if self.db_now().await? - *fetched_at < ttl {
                 return Ok(resources.clone());
             }
         }
@@ -817,8 +825,12 @@ impl ProxyRepo {
         lower_id: &str,
         version: &str,
     ) -> Result<bool, RepoError> {
-        let row = proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?;
-        Ok(row.is_some_and(|row| Self::not_found_live(repo, &row, Utc::now())))
+        let Some(row) =
+            proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
+        else {
+            return Ok(false);
+        };
+        Ok(Self::not_found_live(repo, &row, self.db_now().await?))
     }
 
     /// Write/refresh a genuine-404 negative-cache marker.
@@ -866,15 +878,16 @@ impl ProxyRepo {
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
         {
+            let now = self.db_now().await?;
             if row.downloaded {
-                if !Self::delay_cleared(repo, row.first_seen_at, Utc::now()) {
+                if !Self::delay_cleared(repo, row.first_seen_at, now) {
                     return Ok(None);
                 }
                 if let Some(loc) = self.local_nupkg(repo.id, lower_id, version).await? {
                     return Ok(Some(loc));
                 }
                 // Marked downloaded but the local copy is gone: re-fetch below.
-            } else if Self::not_found_live(repo, &row, Utc::now()) {
+            } else if Self::not_found_live(repo, &row, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
                 return Ok(None);
             }
@@ -927,12 +940,13 @@ impl ProxyRepo {
             let locked =
                 proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version)
                     .await?;
+            let now = forge_db::db_now(&mut *tx).await?;
 
             // Decide on the locked row, then release the lock before any
             // further query.
             tx.commit().await?;
             if locked.downloaded {
-                if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+                if !Self::delay_cleared(repo, locked.first_seen_at, now) {
                     return Ok(None);
                 }
                 // A racing caller already finished the fetch.
@@ -944,7 +958,7 @@ impl ProxyRepo {
                 // the missing copy (`first_seen_at` and confirmation stay).
                 tracing::info!(repo = %repo.name, id = %lower_id, %version, "cached proxy package is missing locally; fetching it again");
                 proxy_dao::mark_not_downloaded(&self.pool, locked.id).await?;
-            } else if Self::not_found_live(repo, &locked, Utc::now()) {
+            } else if Self::not_found_live(repo, &locked, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
                 return Ok(None);
             }
@@ -969,7 +983,7 @@ impl ProxyRepo {
 
         // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let requested_at = Utc::now();
+        let requested_at = self.db_now().await?;
         // §12.5: decrypt-on-use; the plaintext lives only inside this request
         // (and the zeroizing secret wrapper) — never in a log or model.
         let resp = {
@@ -1130,8 +1144,9 @@ impl ProxyRepo {
         // A racing caller finished while we were fetching. The blob we stored is
         // already on disk (CAS dedup); just roll back and serve the local copy.
         if locked.downloaded {
+            let now = forge_db::db_now(&mut *tx).await?;
             tx.rollback().await?;
-            if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+            if !Self::delay_cleared(repo, locked.first_seen_at, now) {
                 return Ok(None);
             }
             return self.local_nupkg(repo.id, lower_id, version).await;
@@ -1219,7 +1234,7 @@ impl ProxyRepo {
         }
 
         // Delay gate on the recorded first sighting.
-        if !Self::delay_cleared(repo, first_seen_at, Utc::now()) {
+        if !Self::delay_cleared(repo, first_seen_at, self.db_now().await?) {
             return Ok(None);
         }
         self.local_nupkg(repo.id, lower_id, version).await
@@ -1250,7 +1265,10 @@ impl ProxyRepo {
                 Some(first_seen) => Some(first_seen),
                 None => confirmed(&self.discover_versions(repo, lower_id).await?),
             };
-            Ok(first_seen.is_some_and(|at| Self::delay_cleared(repo, at, Utc::now())))
+            Ok(match first_seen {
+                Some(at) => Self::delay_cleared(repo, at, self.db_now().await?),
+                None => false,
+            })
         })
     }
 
@@ -1707,7 +1725,7 @@ impl ProxyRepo {
         enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let now = Utc::now();
+        let now = self.db_now().await?;
         // The `listable` conditions as bounds: past the delay window, and no
         // not-found marker younger than the TTL.
         let seen_before = now - Duration::seconds(i64::from(repo_row.package_delay_seconds));
@@ -1861,7 +1879,7 @@ impl RepoReadOps for ProxyRepo {
         }
 
         let rows = self.discover_versions(&repo_row, &lower).await?;
-        let now = Utc::now();
+        let now = self.db_now().await?;
         let mut versions: Vec<VersionEntry> = rows
             .into_iter()
             .filter(|r| Self::listable(&repo_row, r, now))
@@ -1923,7 +1941,9 @@ impl RepoReadOps for ProxyRepo {
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo_row.id, &lower, &norm).await?
         {
-            if !row.not_found && !Self::delay_cleared(&repo_row, row.first_seen_at, Utc::now()) {
+            if !row.not_found
+                && !Self::delay_cleared(&repo_row, row.first_seen_at, self.db_now().await?)
+            {
                 return Ok(None);
             }
             if row.downloaded {
@@ -1937,10 +1957,11 @@ impl RepoReadOps for ProxyRepo {
             return Ok(None);
         }
         // The version must be known upstream (and past its delay window).
-        let known = Box::pin(self.discover_versions(&repo_row, &lower))
-            .await?
+        let rows = Box::pin(self.discover_versions(&repo_row, &lower)).await?;
+        let now = self.db_now().await?;
+        let known = rows
             .into_iter()
-            .any(|r| r.version == norm && Self::listable(&repo_row, &r, Utc::now()));
+            .any(|r| r.version == norm && Self::listable(&repo_row, &r, now));
         if !known {
             return Ok(None);
         }
@@ -1981,7 +2002,7 @@ impl RepoReadOps for ProxyRepo {
         }
 
         let rows = self.discover_versions(&repo_row, &lower).await?;
-        let now = Utc::now();
+        let now = self.db_now().await?;
         let mut visible: Vec<forge_db::model::ProxyCachedVersion> = rows
             .into_iter()
             .filter(|r| Self::listable(&repo_row, r, now))

@@ -37,7 +37,7 @@
 //! also uses `jsonwebtoken` directly rather than the heavier `openidconnect`.
 
 use base64::Engine;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
 use forge_db::oidc_flow_dao::{self, NewOidcFlow};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -171,7 +171,11 @@ pub async fn begin_login(
 
     // Persist BEFORE redirecting: the row is the only record of this flow, shared
     // across instances. Generating the URL after the insert means a failed insert
-    // never sends the browser to the IdP for a flow we can't complete.
+    // never sends the browser to the IdP for a flow we can't complete. The expiry
+    // is on the database's clock, which the callback's lookup compares it with.
+    let now = forge_db::db_now(pool)
+        .await
+        .map_err(|e| FlowError::Db(e.to_string()))?;
     oidc_flow_dao::begin(
         pool,
         NewOidcFlow {
@@ -179,7 +183,7 @@ pub async fn begin_login(
             nonce: nonce.clone(),
             pkce_verifier: code_verifier,
             redirect_to: redirect_to.to_string(),
-            expires_at: Utc::now() + FLOW_TTL,
+            expires_at: now + FLOW_TTL,
         },
     )
     .await
