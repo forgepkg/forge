@@ -21,7 +21,7 @@
 # the lockfile install is reproducible.
 # Base images are pinned by digest (tag kept for readability); Dependabot
 # (.github/dependabot.yml) proposes tag + digest bumps.
-FROM node:26-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS web
+FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913 AS web
 WORKDIR /web
 
 # Enable the pinned pnpm via corepack before any install. Node 25+ no longer
