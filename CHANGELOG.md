@@ -41,7 +41,7 @@ First production release.
   an identifier-first login, and API keys.
 - **Trusted publishing**: CI jobs on GitHub Actions, GitLab CI and compatible
   issuers publish with their workload OIDC token, with no stored API key. See
-  [docs/trusted-publishing.md](https://github.com/schmitch/repo/blob/main/docs/trusted-publishing.md).
+  [docs/trusted-publishing.md](https://github.com/schmitch/forge/blob/main/docs/trusted-publishing.md).
 - **Retention**: policies with preview, run and audit, and download tracking.
 - **Secret encryption at rest**: double-envelope encryption of upstream
   passwords and realm secrets, with key rotation and backfill.
@@ -52,7 +52,7 @@ First production release.
   supervised background workers, and an optional Redis L2 cache with
   cross-instance invalidation.
 - **Release**: a signed container image with an SBOM and provenance
-  attestation; see [docs/deployment.md](https://github.com/schmitch/repo/blob/main/docs/deployment.md).
+  attestation; see [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md).
 
 ### Security
 
@@ -495,7 +495,7 @@ First production release.
   with `PUT /admin/settings/legacy-open-access {"enabled": false}` so new
   users are no longer given `authenticated`. Migration 0011 changes the
   storage protocol; the upgrade procedure is in
-  [DEVELOPMENT.md](https://github.com/schmitch/repo/blob/main/DEVELOPMENT.md).
+  [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md).
 - Pre-release installs, continued: migration 0017 adds
   `CHECK (ref_count >= 0)` and leaves it `NOT VALID` with a warning if a
   blob's count has already drifted below zero; migration 0019 re-lowers
@@ -629,5 +629,5 @@ First production release.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/repo/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/schmitch/repo/releases/tag/v0.1.0
+[Unreleased]: https://github.com/schmitch/forge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/schmitch/forge/releases/tag/v0.1.0

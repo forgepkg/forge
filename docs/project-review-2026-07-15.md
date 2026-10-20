@@ -508,7 +508,7 @@ identification, and add replay controls appropriate to the chosen token flow.
 #### P1.10 Current default-branch CI is red
 
 At review time, the GitHub Actions run for the reviewed HEAD was
-[run 28359773732](https://github.com/schmitch/repo/actions/runs/28359773732) and
+run 28359773732 (in the original, private repository) and
 finished failed. Formatting, Clippy, Rust unit/workspace tests, SQLx checks, and
 frontend unit/build jobs passed. The container E2E job exhausted disk while
 compiling, and web E2E had one failing group-form selector because
