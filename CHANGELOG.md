@@ -11,6 +11,20 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Added
+
+- **Kubernetes manifests** in `deploy/kubernetes`: a kustomize base for the
+  server, components for an Ingress or Gateway API HTTPRoute, in-cluster
+  Redis, PostgreSQL and S3 (versitygw), two replicas with a
+  PodDisruptionBudget, and following `:latest`; plus a production and an
+  evaluation overlay. The base pins the image to the release it is tagged
+  with.
+- **`cargo xtask release <version>`** sets the version in `Cargo.toml`,
+  `Cargo.lock`, `web/package.json` and the Kubernetes base, turns the
+  `[Unreleased]` changelog section into the release's, commits and tags. The
+  release workflow now also refuses a tag whose Kubernetes base names another
+  image version.
+
 ### Changed
 
 - **License**: envisia-forge is now dual-licensed under the GNU AGPL v3
