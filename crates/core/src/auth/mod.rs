@@ -56,9 +56,9 @@ pub use session_source::{
     SECURE_SESSION_COOKIE, SESSION_COOKIE,
 };
 pub use token::{
-    generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
-    verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,
-    SourceOutcome, TokenHeaderSource,
+    check_token, generate_token_secret, hash_token, resolve_principal,
+    resolve_principal_with_origin, verify_password, verify_token, AuthError, BasicAuthSource,
+    PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
 // Canonical usernames live with the DAOs that enforce them.

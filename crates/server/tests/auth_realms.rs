@@ -519,3 +519,106 @@ async fn admin_realm_crud_with_write_only_secrets() {
         .unwrap();
     assert_eq!(resp.status(), 204);
 }
+
+/// #71: an API token Forge issued is never tried as a password, even when it
+/// cannot be used (its owner is deactivated, it expired or was revoked): a
+/// credential-forwarding realm would send the live secret upstream on every
+/// request of a client that still stores it.
+#[tokio::test]
+async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "credential_forwarding",
+            "name": "nexus",
+            "config": {"url": format!("{}/status", upstream.uri()), "key_pepper": "pepper"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    // A forwarded (password-less) account that owns three tokens.
+    let username = format!("fed{}", common::unique());
+    let user = forge_db::user_dao::insert_user(
+        &srv.pool,
+        forge_db::user_dao::NewUser {
+            username: username.clone(),
+            password_hash: None,
+            is_admin: false,
+            active: true,
+            auth_source: "upstream-basic".into(),
+            external_subject: Some(username.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let mint = |expires_at: Option<chrono::DateTime<chrono::Utc>>| {
+        let pool = srv.pool.clone();
+        async move {
+            let secret = forge_core::auth::generate_token_secret();
+            let token = forge_db::token_dao::insert_token(
+                &pool,
+                forge_db::token_dao::NewToken {
+                    user_id: user.id,
+                    name: "ci".into(),
+                    token_hash: forge_core::auth::hash_token(&secret),
+                    expires_at,
+                    minted_with_forwarded_credential: false,
+                },
+            )
+            .await
+            .unwrap();
+            (secret, token.id)
+        }
+    };
+    let (live, _) = mint(None).await;
+    let (expired, _) = mint(Some(chrono::Utc::now() - chrono::Duration::hours(1))).await;
+    let (revoked, revoked_id) = mint(None).await;
+    forge_db::token_dao::revoke_token(&srv.pool, revoked_id)
+        .await
+        .unwrap();
+
+    let feed = format!("{}/admin/me", srv.base_url);
+    let get = |secret: String| {
+        let client = client.clone();
+        let username = username.clone();
+        let feed = feed.clone();
+        async move {
+            client
+                .get(&feed)
+                .basic_auth(&username, Some(&secret))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_ne!(get(live.clone()).await, 401, "the live token signs in");
+    assert_eq!(get(expired).await, 401);
+    assert_eq!(get(revoked).await, 401);
+
+    let resp = client
+        .patch(format!("{}/admin/users/{}", srv.base_url, user.id))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(get(live).await, 401, "a deactivated owner's token");
+    // Dropping `upstream` verifies it received no request.
+}

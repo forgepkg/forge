@@ -322,9 +322,9 @@ async fn basic_no_authorization_header_is_no_credentials() {
 }
 
 #[tokio::test]
-async fn basic_revoked_token_falls_through_to_password_chain() {
-    // A revoked token used as the basic secret is not a valid token; the secret
-    // then runs as a password. If it isn't a valid password either → Invalid.
+async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
+    // A revoked token used as the basic secret is not a valid token, and a
+    // token Forge issued is never run through the password chain (#71).
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", false, true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
