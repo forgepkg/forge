@@ -184,12 +184,12 @@ architecture.
 
 The approved design promises hosted, proxy, and group repositories backed by
 PostgreSQL and S3-compatible CAS in
-[the NuGet design](superpowers/specs/2026-05-29-envisia-forge-nuget-design.md).
+the NuGet design.
 Those repository types, NuGet routes, storage, outbox, authentication, workers,
 and E2E suites are present. Multipart S3 storage also exists and is tested.
 
 The corresponding
-[Slice 1 implementation plan](superpowers/plans/2026-05-29-slice1-nuget-registry.md)
+Slice 1 implementation plan
 still has every task checkbox unchecked even though its own self-review says the
 coverage is complete. The implementation exists; the status document was never
 maintained.
