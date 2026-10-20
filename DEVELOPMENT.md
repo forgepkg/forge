@@ -414,6 +414,12 @@ identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the
 username when `email_verified` is true.
 
+The discovery document's token, JWKS and authorization endpoints must live on
+the issuer's host. An IdP that serves them elsewhere needs those hosts in the
+realm's `endpoint_hosts`: for Google (issuer `https://accounts.google.com`)
+`["oauth2.googleapis.com", "www.googleapis.com"]`; restrict it to your
+Workspace domain with `required_claims = {"hd": ["corp.example"]}`.
+
 ### Multi-instance / scale-out
 
 All ephemeral flow state (`state`/`nonce`/PKCE verifier/redirect) and all

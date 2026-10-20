@@ -172,6 +172,8 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # # admin assignment — empty admin_groups means OIDC never grants admin (safe default)
 # admin_groups = ["forge-admins"]            # group/role values that grant is_admin
 # admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")
+# # IdPs that serve tokens and keys on other hosts than the issuer's (Google):
+# endpoint_hosts = ["oauth2.googleapis.com", "www.googleapis.com"]   # (default: [] = issuer host only)
 # # session lifecycle
 # session_idle_ttl_seconds     = 28800       # (default: 8h) idle timeout
 # session_absolute_ttl_seconds = 604800      # (default: 7d) absolute lifetime

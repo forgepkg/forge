@@ -72,6 +72,7 @@ export interface RealmFormValues {
   admin_groups: string
   admin_claim: string
   login_domains: string
+  endpoint_hosts: string
   /** One `claim = value, value` per line (parsed to a map on submit). */
   required_claims: string
   button_label: string
@@ -188,6 +189,7 @@ function seed(existing?: RealmView): RealmFormValues {
     admin_groups: joinList(oidc.admin_groups),
     admin_claim: oidc.admin_claim ?? '',
     login_domains: joinList(oidc.login_domains),
+    endpoint_hosts: joinList(oidc.endpoint_hosts),
     required_claims: formatClaimRules(oidc.required_claims),
     button_label: oidc.button_label ?? '',
     url: fwd.url ?? '',
@@ -558,6 +560,21 @@ export function RealmForm({
               <Description>
                 Email domains routed to this IdP by identifier-first login.
                 Comma-separated.
+              </Description>
+            </Field>
+
+            <Field>
+              <Label>Endpoint hosts</Label>
+              <Input
+                type="text"
+                value={values.endpoint_hosts}
+                onChange={(e) => set('endpoint_hosts', e.target.value)}
+                placeholder="oauth2.googleapis.com, www.googleapis.com"
+              />
+              <Description>
+                Hosts besides the issuer&apos;s that the IdP&apos;s token and
+                key endpoints may use (Google, AWS Cognito). Comma-separated;
+                leave empty for most IdPs.
               </Description>
             </Field>
 
@@ -1313,6 +1330,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.admin_claim.trim() !== '') config.admin_claim = values.admin_claim.trim()
     const loginDomains = parseList(values.login_domains)
     if (loginDomains.length > 0) config.login_domains = loginDomains
+    const endpointHosts = parseList(values.endpoint_hosts)
+    if (endpointHosts.length > 0) config.endpoint_hosts = endpointHosts
     const requiredClaims = parseClaimRules(values.required_claims)
     if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()

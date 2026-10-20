@@ -207,6 +207,10 @@ pub struct OidcMetadataClient {
     discovery_ttl: Duration,
     /// JWKS TTL.
     jwks_ttl: Duration,
+    /// Hosts besides the issuer's that the advertised endpoints may use
+    /// (lowercase), for IdPs that serve tokens and keys elsewhere (Google,
+    /// AWS Cognito).
+    endpoint_hosts: Vec<String>,
 }
 
 impl OidcMetadataClient {
@@ -219,7 +223,15 @@ impl OidcMetadataClient {
             cache,
             discovery_ttl: DEFAULT_DISCOVERY_TTL,
             jwks_ttl: DEFAULT_JWKS_TTL,
+            endpoint_hosts: Vec::new(),
         }
+    }
+
+    /// Also accept advertised endpoints on these hosts (compared
+    /// case-insensitively). The issuer's own host is always accepted.
+    pub fn with_endpoint_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.endpoint_hosts = hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect();
+        self
     }
 
     /// Override the discovery/JWKS TTLs (mainly for tests).
@@ -246,12 +258,14 @@ impl OidcMetadataClient {
     /// The well-known URL is derived from the **configured** issuer (trusted),
     /// never from any IdP-supplied value, and the returned document's own
     /// `issuer` must equal the configured issuer. The advertised endpoints are
-    /// sanity-checked to be https and to live on the issuer's host (SSRF
-    /// defense-in-depth on top of the guarded client).
+    /// sanity-checked to use the issuer's scheme and to live on the issuer's
+    /// host or one of the configured endpoint hosts (SSRF defense-in-depth on
+    /// top of the guarded client).
     pub async fn discovery(&self) -> Result<DiscoveryDocument, OidcError> {
         let url = discovery_url(&self.issuer);
         let http = self.http.clone();
         let expected_issuer = self.issuer.clone();
+        let endpoint_hosts = self.endpoint_hosts.clone();
 
         let doc: DiscoveryDocument = self
             .cache
@@ -261,11 +275,14 @@ impl OidcMetadataClient {
                 self.discovery_ttl,
                 || async move {
                     let doc: DiscoveryDocument = fetch_json(&http, &url, "discovery").await?;
-                    validate_discovery(&doc, &expected_issuer)?;
+                    validate_discovery(&doc, &expected_issuer, &endpoint_hosts)?;
                     Ok(doc)
                 },
             )
             .await?;
+        // The cache is per issuer: a document another client (with other
+        // endpoint hosts) stored must pass this client's check too.
+        validate_discovery(&doc, &self.issuer, &self.endpoint_hosts)?;
         Ok(doc)
     }
 
@@ -646,12 +663,18 @@ fn discovery_url(issuer: &str) -> String {
 }
 
 /// Validate the discovery document: its `issuer` must equal the configured
-/// issuer, and the advertised token/jwks endpoints must be https and share the
-/// issuer's host (SSRF sanity on top of the guarded client).
-fn validate_discovery(doc: &DiscoveryDocument, expected_issuer: &str) -> Result<(), OidcError> {
+/// issuer, and the advertised token/jwks endpoints must use the issuer's
+/// scheme and live on the issuer's host or one of `endpoint_hosts` (SSRF
+/// sanity on top of the guarded client).
+fn validate_discovery(
+    doc: &DiscoveryDocument,
+    expected_issuer: &str,
+    endpoint_hosts: &[String],
+) -> Result<(), OidcError> {
     validate_discovery_identity_and_endpoints(
         &doc.issuer,
         expected_issuer,
+        endpoint_hosts,
         &[
             ("jwks_uri", doc.jwks_uri.as_str()),
             ("token_endpoint", doc.token_endpoint.as_str()),
@@ -670,6 +693,7 @@ fn validate_workload_discovery(
     validate_discovery_identity_and_endpoints(
         &doc.issuer,
         expected_issuer,
+        &[],
         &[("jwks_uri", doc.jwks_uri.as_str())],
     )
 }
@@ -677,6 +701,7 @@ fn validate_workload_discovery(
 fn validate_discovery_identity_and_endpoints(
     document_issuer: &str,
     expected_issuer: &str,
+    endpoint_hosts: &[String],
     endpoints: &[(&'static str, &str)],
 ) -> Result<(), OidcError> {
     if normalize_issuer(document_issuer.to_string()) != expected_issuer {
@@ -694,8 +719,8 @@ fn validate_discovery_identity_and_endpoints(
         .to_string();
     // Endpoints must use the **same scheme as the trusted issuer** (https in
     // production — the config loader requires an https issuer; http only for the
-    // loopback mock in tests) and share the issuer's host (SSRF sanity on top of
-    // the guarded client).
+    // loopback mock in tests) and share the issuer's host, or use one the realm
+    // names in `endpoint_hosts` (SSRF sanity on top of the guarded client).
     let issuer_scheme = issuer_url.scheme();
 
     for (label, endpoint) in endpoints {
@@ -708,7 +733,11 @@ fn validate_discovery_identity_and_endpoints(
             )));
         }
         match url.host_str() {
-            Some(host) if host == issuer_host => {}
+            Some(host)
+                if host == issuer_host
+                    || endpoint_hosts
+                        .iter()
+                        .any(|allowed| host.eq_ignore_ascii_case(allowed)) => {}
             other => {
                 return Err(OidcError::DiscoveryMismatch(format!(
                     "{label} host {other:?} does not match issuer host {issuer_host:?}"
@@ -1498,6 +1527,38 @@ mod tests {
         assert!(
             matches!(err, OidcError::DiscoveryMismatch(_)),
             "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_accepts_endpoints_on_configured_hosts_only() {
+        // Google serves its token endpoint and keys on other hosts than the
+        // issuer's. The realm names them; nothing else is accepted.
+        let issuer = "https://accounts.google.com";
+        let doc = DiscoveryDocument {
+            issuer: issuer.into(),
+            authorization_endpoint: format!("{issuer}/o/oauth2/v2/auth"),
+            token_endpoint: "https://oauth2.googleapis.com/token".into(),
+            jwks_uri: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            end_session_endpoint: None,
+        };
+        assert!(matches!(
+            validate_discovery(&doc, issuer, &[]),
+            Err(OidcError::DiscoveryMismatch(_))
+        ));
+        let hosts = vec![
+            "oauth2.googleapis.com".to_string(),
+            "WWW.googleapis.com".to_string(),
+        ];
+        assert_eq!(validate_discovery(&doc, issuer, &hosts), Ok(()));
+        let mut attacker = doc.clone();
+        attacker.jwks_uri = "https://attacker.example/certs".into();
+        assert!(validate_discovery(&attacker, issuer, &hosts).is_err());
+        let mut http = doc.clone();
+        http.token_endpoint = "http://oauth2.googleapis.com/token".into();
+        assert!(
+            validate_discovery(&http, issuer, &hosts).is_err(),
+            "scheme still checked"
         );
     }
 

@@ -44,6 +44,8 @@ export interface OidcRealmConfig {
   /** Allow-gate: claim name -> allowed values (e.g. `{ tid: ['<tenant>'] }`). */
   required_claims?: Record<string, string[]>
   button_label?: string | null
+  /** Hosts besides the issuer's that the IdP's endpoints may use (Google). */
+  endpoint_hosts?: string[]
 }
 
 /** Credential-forwarding realm config (redacted: `key_pepper` -> `key_pepper_set`). */

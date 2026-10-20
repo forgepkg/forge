@@ -1165,6 +1165,12 @@ pub struct OidcConfig {
     /// tenant, `hd` for a Google Workspace domain, `groups`). Empty ⇒ off.
     #[serde(default)]
     pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
+    /// Hosts besides the issuer's that the discovery document's token, JWKS
+    /// and authorization endpoints may use, for IdPs that serve them elsewhere
+    /// (Google: `oauth2.googleapis.com`, `www.googleapis.com`). Empty ⇒ the
+    /// issuer's host only.
+    #[serde(default)]
+    pub endpoint_hosts: Vec<String>,
 
     // ---- session lifecycle ----
     /// Idle timeout (seconds): a session expires this long after its last use.
@@ -1195,6 +1201,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("link_existing_by_username", &self.link_existing_by_username)
             .field("admin_groups", &self.admin_groups)
             .field("admin_claim", &self.admin_claim)
+            .field("endpoint_hosts", &self.endpoint_hosts)
             .field("session_idle_ttl_seconds", &self.session_idle_ttl_seconds)
             .field(
                 "session_absolute_ttl_seconds",
@@ -2057,6 +2064,8 @@ impl Config {
                 redirect.path()
             )));
         }
+        crate::auth::normalize_endpoint_hosts(&oidc.endpoint_hosts)
+            .map_err(|e| ConfigError::Invalid(format!("oidc.{e}")))?;
         Ok(())
     }
 

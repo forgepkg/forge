@@ -206,6 +206,11 @@ pub struct OidcRealmConfig {
     /// the realm name.
     #[serde(default)]
     pub button_label: Option<String>,
+    /// Hosts besides the issuer's that the IdP's token, JWKS and
+    /// authorization endpoints may use (Google: `oauth2.googleapis.com`,
+    /// `www.googleapis.com`). Empty ⇒ the issuer's host only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for OidcRealmConfig {
@@ -305,8 +310,9 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
         KIND_OIDC => {
-            let cfg: OidcRealmConfig = serde_json::from_value(config.clone())
+            let mut cfg: OidcRealmConfig = serde_json::from_value(config.clone())
                 .map_err(|e| format!("invalid config: {e}"))?;
+            cfg.endpoint_hosts = normalize_endpoint_hosts(&cfg.endpoint_hosts)?;
             let issuer = url::Url::parse(cfg.issuer.trim())
                 .map_err(|e| format!("invalid issuer {:?}: {e}", cfg.issuer))?;
             match issuer.scheme() {
@@ -329,6 +335,28 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
         KIND_WORKLOAD_IDENTITY => super::wif::validate_workload_identity_config(config),
         other => Err(format!("unknown realm kind {other:?}")),
     }
+}
+
+/// `endpoint_hosts` lowercased and checked: each one a bare host name (no
+/// scheme, port, path or wildcard).
+pub(crate) fn normalize_endpoint_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
+    hosts
+        .iter()
+        .map(|raw| {
+            let host = raw.trim().to_ascii_lowercase();
+            let is_name = !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            let parses = url::Url::parse(&format!("https://{host}/"))
+                .is_ok_and(|url| url.host_str() == Some(host.as_str()));
+            if is_name && parses {
+                Ok(host)
+            } else {
+                Err(format!("endpoint_hosts: {raw:?} is not a host name"))
+            }
+        })
+        .collect()
 }
 
 /// `config` without the `<key>_set` markers [`redact_config`] puts in place of
@@ -751,6 +779,7 @@ impl RealmAuth {
             admin_groups: cfg.admin_groups.clone(),
             admin_claim: cfg.admin_claim.clone(),
             required_claims: cfg.required_claims.clone(),
+            endpoint_hosts: cfg.endpoint_hosts.clone(),
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
@@ -954,6 +983,8 @@ pub async fn seed_auth_realms(
             required_claims: o.required_claims.clone(),
             login_domains: Vec::new(),
             button_label: None,
+            endpoint_hosts: normalize_endpoint_hosts(&o.endpoint_hosts)
+                .map_err(anyhow::Error::msg)?,
         };
         let priority = auth_realm_dao::next_priority(pool).await?;
         apply_seed(
@@ -1155,6 +1186,35 @@ mod tests {
         let mut echoed = oidc.clone();
         echoed["client_secret_set"] = json!(true);
         assert!(validate_config(KIND_OIDC, &echoed).is_ok());
+    }
+
+    #[test]
+    fn oidc_endpoint_hosts_are_host_names_and_normalized() {
+        let mut config = json!({
+            "issuer": "https://accounts.google.com",
+            "client_id": "cid",
+            "client_secret": "shh",
+            "endpoint_hosts": [" OAuth2.googleapis.com ", "www.googleapis.com"],
+        });
+        let ok = validate_config(KIND_OIDC, &config).expect("valid");
+        assert_eq!(
+            ok["endpoint_hosts"],
+            json!(["oauth2.googleapis.com", "www.googleapis.com"])
+        );
+        for bad in [
+            "https://oauth2.googleapis.com",
+            "host:443",
+            "host/path",
+            "",
+            "*.googleapis.com",
+        ] {
+            config["endpoint_hosts"] = json!([bad]);
+            assert!(validate_config(KIND_OIDC, &config).is_err(), "{bad:?}");
+        }
+        // Absent stays absent in the stored document.
+        config.as_object_mut().unwrap().remove("endpoint_hosts");
+        let ok = validate_config(KIND_OIDC, &config).expect("valid");
+        assert!(ok.get("endpoint_hosts").is_none());
     }
 
     #[test]
