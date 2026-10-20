@@ -168,6 +168,9 @@ docker:
 # ── Kubernetes manifests (deploy/kubernetes) ──────────────────────────────
 # Builds every overlay, and the base with each component, and validates the
 # output against the Kubernetes schemas. Both tools are pinned by checksum.
+# Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
+# chart (.github/scripts/helm-check.sh, Helm built with `go install`), which
+# needs a pinned Go image here.
 kubernetes:
   stage: test
   needs: []
