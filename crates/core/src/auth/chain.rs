@@ -12,9 +12,10 @@
 //! 2. [`AuthOutcome::Skip`] advances to the next provider.
 //! 3. [`AuthOutcome::Rejected`] from a **local** provider is **terminal**: the
 //!    username belongs to a local account with a password, so a wrong password
-//!    is a definitive "no" and is never forwarded to a later (upstream)
-//!    provider — otherwise an upstream account sharing the name could vouch for
-//!    it, and the local user's typed password would leak upstream. A rejection
+//!    (or any password for a deactivated local account) is a definitive "no"
+//!    and is never forwarded to a later (upstream) provider — otherwise an
+//!    upstream account sharing the name could vouch for it, and the local
+//!    user's typed password would leak upstream. A rejection
 //!    from a non-local provider is remembered but does **not** stop the chain
 //!    (a username may exist in a later provider). On its own it never grants.
 //! 4. [`AuthOutcome::Unavailable`] is remembered but does **not** grant.
