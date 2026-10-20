@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+  labels:
+    app.kubernetes.io/name: forge
+    app.kubernetes.io/component: server
+spec:
+  # One instance needs no Redis; ../components/high-availability runs two.
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forge
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: forge
+        app.kubernetes.io/component: server
+    spec:
+      serviceAccountName: forge
+      automountServiceAccountToken: false
+      # A Service named `forge` would otherwise inject FORGE_PORT=tcp://… and
+      # friends, which land in Forge's own FORGE_* configuration namespace.
+      enableServiceLinks: false
+      # On SIGTERM Forge stops accepting connections and drains in-flight
+      # requests; this bounds the drain (the largest download you expect).
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: forge
+          # Tag set by `images:` in kustomization.yaml.
+          image: ghcr.io/schmitch/forge
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8421
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: forge-config
+            - secretRef:
+                name: forge-env
+          lifecycle:
+            # Let the Service / load balancer stop routing here before Forge
+            # stops accepting connections; a push refused in that gap is not
+            # retried by the client.
+            preStop:
+              sleep:
+                seconds: 10
+          # Forge listens only after migrations and the startup checks, which
+          # can take a while on the first start of a new version.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          # 503 while PostgreSQL or S3 is unreachable.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+              ephemeral-storage: 1Gi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Pushes and first-time proxy downloads are staged in
+        # /tmp/forge-staging; large proxy metadata spills to /tmp. Staging is
+        # capped by server.max_staging_bytes (default 4 GiB), so keep the
+        # limit above it (raise both together).
+        - name: tmp
+          emptyDir:
+            sizeLimit: 6Gi
