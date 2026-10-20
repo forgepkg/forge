@@ -142,9 +142,6 @@ the user password).
   server, tests, and Docker packaging details.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers.
-- **Design specs** — `docs/superpowers/specs/` (NuGet registry design;
-  auth-realms & workload-identity design) and implementation plans in
-  `docs/superpowers/plans/`.
 
 Run `cargo xtask help` for the complete command list.
 
