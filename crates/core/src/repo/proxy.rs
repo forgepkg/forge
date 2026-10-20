@@ -1633,10 +1633,10 @@ impl ProxyRepo {
 
     /// Search the locally known proxy corpus once, applying authorization
     /// before total-count calculation and client paging. Every per-version
-    /// condition (listing state, package delay, not-found marker, prerelease)
-    /// runs in PostgreSQL, which returns only the matching ids; versions are
-    /// loaded for the requested page alone, so an empty query over a large
-    /// proxy cache does not load every cached version.
+    /// condition (listing state, package delay, not-found marker, prerelease,
+    /// SemVer 2.0.0) runs in PostgreSQL, which returns only the matching ids;
+    /// versions are loaded for the requested page alone, so an empty query
+    /// over a large proxy cache does not load every cached version.
     /// With `enrich`, the returned page carries cached manifests
     /// ([`Self::enrich_hits`]); a group searches its members without and
     /// enriches only its own final page.
@@ -1655,6 +1655,7 @@ impl ProxyRepo {
         let marked_after = now - Self::not_found_ttl(&repo_row);
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
+        // The version regex is `is_semver2`: build metadata, or a `.` after a `-`.
         let names = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT name AS "name!"
@@ -1664,6 +1665,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
+              AND ($6 OR version !~ '[+]|-.*[.]')
             ORDER BY name
             "#,
             repo_row.id,
@@ -1671,6 +1673,7 @@ impl ProxyRepo {
             seen_before,
             marked_after,
             params.prerelease,
+            params.include_semver2,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1699,12 +1702,14 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
+              AND ($6 OR version !~ '[+]|-.*[.]')
             "#,
             repo_row.id,
             &page,
             seen_before,
             marked_after,
             params.prerelease,
+            params.include_semver2,
         )
         .fetch_all(&self.pool)
         .await?;

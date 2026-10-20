@@ -1736,6 +1736,7 @@ async fn group_search_enriches_only_the_final_page() {
                 skip: 27,
                 take: 5,
                 prerelease: false,
+                include_semver2: true,
             },
         )
         .await

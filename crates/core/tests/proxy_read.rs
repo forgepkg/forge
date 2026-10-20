@@ -1091,9 +1091,9 @@ async fn versions_deleted_upstream_leave_the_listings() {
     );
 }
 
-/// Search applies every listing condition (prerelease, the package delay, a
-/// live not-found marker) in SQL and pages over ids, loading versions for the
-/// returned page only.
+/// Search applies every listing condition (prerelease, SemVer 2.0.0, the
+/// package delay, a live not-found marker) in SQL and pages over ids, loading
+/// versions for the returned page only.
 #[tokio::test]
 async fn search_applies_listing_conditions_and_pages_over_ids() {
     let pool = common::pool().await;
@@ -1114,6 +1114,7 @@ async fn search_applies_listing_conditions_and_pages_over_ids() {
             skip,
             take,
             prerelease,
+            include_semver2: true,
         };
         let px = &px;
         let repo = repo.clone();
@@ -1159,6 +1160,31 @@ async fn search_applies_listing_conditions_and_pages_over_ids() {
     assert_eq!(total, 3);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "contoso.b");
+
+    // Without SemVer 2.0.0, contoso.c (only `3.0.0-rc.1`) is neither counted
+    // nor paged over; `2.0.0-beta` is SemVer 1 and stays.
+    for (skip, take, expected) in [
+        (0, 20, vec!["contoso.a", "contoso.b"]),
+        (1, 1, vec!["contoso.b"]),
+    ] {
+        let params = forge_core::repo::SearchParams {
+            q: String::new(),
+            skip,
+            take,
+            prerelease: true,
+            include_semver2: false,
+        };
+        let result = px.search(&repo, &params).await.unwrap();
+        assert_eq!(result.total_hits, 2);
+        let ids: Vec<&str> = result.hits.iter().map(|h| h.original_id.as_str()).collect();
+        assert_eq!(ids, expected);
+        if skip == 0 {
+            assert_eq!(
+                versions_of(&result.hits[0].versions),
+                ["1.0.0", "2.0.0-beta"]
+            );
+        }
+    }
 
     // A live not-found marker hides a version; an expired one does not.
     let mark = |age: &'static str| {

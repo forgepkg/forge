@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use forge_core::repo::{
-    NupkgLocation, RegistrationEntry, RepoError, RepoKind, RepoReadOps, SearchHit, SearchParams,
-    SearchResult, VersionEntry,
+    is_semver2, NupkgLocation, RegistrationEntry, RepoError, RepoKind, RepoReadOps, SearchHit,
+    SearchParams, SearchResult, VersionEntry,
 };
 use forge_nuget::routes::{nuget_router, NupkgBytes, RouteContext};
 use forge_nuget::NugetFormat;
@@ -83,16 +83,23 @@ impl RepoReadOps for MockOps {
     }
 
     async fn search(&self, _repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        // Echo the configured hits, applying skip/take so paging is observable.
-        let total = self.search_hits.len();
-        let take = params.effective_take();
-        let hits: Vec<SearchHit> = self
+        // Echo the configured hits, dropping SemVer 2.0.0 versions unless
+        // asked for (before paging, as core does) and applying skip/take so
+        // paging is observable.
+        let matching: Vec<SearchHit> = self
             .search_hits
             .iter()
-            .skip(params.skip)
-            .take(take)
-            .cloned()
+            .filter_map(|hit| {
+                let mut hit = hit.clone();
+                hit.versions
+                    .retain(|v| params.include_semver2 || !is_semver2(&v.version_original));
+                hit.latest_version = hit.versions.last()?.version.clone();
+                Some(hit)
+            })
             .collect();
+        let total = matching.len();
+        let take = params.effective_take();
+        let hits: Vec<SearchHit> = matching.into_iter().skip(params.skip).take(take).collect();
         Ok(SearchResult {
             total_hits: total,
             hits,
@@ -881,44 +888,70 @@ async fn search_skip_take_page_window_at_route_layer() {
 async fn search_hides_semver2_versions_unless_semver_level_2() {
     // Protocol rule: SemVer 2.0.0 versions (dotted prerelease labels, build
     // metadata) are only returned to clients sending `semVerLevel=2.0.0`.
-    let mut ops = MockOps::default();
-    ops.search_hits = vec![SearchHit {
-        original_id: "Sample.Lib".into(),
-        latest_version: "2.0.0-beta.1".into(),
-        versions: vec![
-            VersionEntry {
-                original_id: "Sample.Lib".into(),
-                version: "1.0.0".into(),
-                version_original: "1.0.0".into(),
+    // They are dropped before paging, so a legacy client's pages stay full
+    // and `totalHits` counts only what it can page through.
+    let hit = |id: &str, versions: &[(&str, &str)]| SearchHit {
+        original_id: id.into(),
+        latest_version: versions.last().unwrap().0.into(),
+        versions: versions
+            .iter()
+            .map(|(version, original)| VersionEntry {
+                original_id: id.into(),
+                version: (*version).into(),
+                version_original: (*original).into(),
                 listed: true,
-            },
-            VersionEntry {
-                original_id: "Sample.Lib".into(),
-                version: "2.0.0-beta.1".into(),
-                version_original: "2.0.0-beta.1".into(),
-                listed: true,
-            },
-        ],
+            })
+            .collect(),
         ..Default::default()
-    }];
+    };
+    let mut ops = MockOps::default();
+    ops.search_hits = vec![
+        hit("Only.Dotted", &[("1.0.0-beta.1", "1.0.0-beta.1")]),
+        hit("Plain.One", &[("1.0.0", "1.0.0")]),
+        hit("Only.Metadata", &[("2.0.0", "2.0.0+build.5")]),
+        hit(
+            "Sample.Lib",
+            &[("1.0.0", "1.0.0"), ("2.0.0-beta.1", "2.0.0-beta.1")],
+        ),
+        hit("Plain.Two", &[("1.0.0", "1.0.0")]),
+    ];
     let router = nuget_router(
         RepoKind::Hosted,
         ctx(RepoKind::Hosted, ops, MockBytes::default()),
     );
+    let ids = |v: &Value| -> Vec<String> {
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_string())
+            .collect()
+    };
 
-    let (status, _h, body) = get(&router, "/query?q=sample&prerelease=true").await;
+    let (status, _h, body) = get(&router, "/query?prerelease=true&take=2").await;
     assert_eq!(status, StatusCode::OK);
     let legacy = json(&body);
-    assert_eq!(legacy["data"][0]["version"], "1.0.0");
-    assert_eq!(legacy["data"][0]["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(legacy["totalHits"], 3);
+    assert_eq!(ids(&legacy), ["Plain.One", "Sample.Lib"], "a full page");
+    assert_eq!(legacy["data"][1]["version"], "1.0.0");
+    assert_eq!(legacy["data"][1]["versions"].as_array().unwrap().len(), 1);
 
-    let (status, _h, body) =
-        get(&router, "/query?q=sample&prerelease=true&semVerLevel=2.0.0").await;
+    let (_status, _h, body) = get(&router, "/query?prerelease=true&skip=2&take=2").await;
+    let legacy = json(&body);
+    assert_eq!(legacy["totalHits"], 3);
+    assert_eq!(ids(&legacy), ["Plain.Two"]);
+
+    let (status, _h, body) = get(
+        &router,
+        "/query?prerelease=true&skip=2&take=2&semVerLevel=2.0.0",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let modern = json(&body);
-    assert_eq!(modern["totalHits"], 1);
-    assert_eq!(modern["data"][0]["version"], "2.0.0-beta.1");
-    assert_eq!(modern["data"][0]["versions"].as_array().unwrap().len(), 2);
+    assert_eq!(modern["totalHits"], 5);
+    assert_eq!(ids(&modern), ["Only.Metadata", "Sample.Lib"]);
+    assert_eq!(modern["data"][1]["version"], "2.0.0-beta.1");
+    assert_eq!(modern["data"][1]["versions"].as_array().unwrap().len(), 2);
 }
 
 fn nuspec_with_metadata() -> Vec<u8> {

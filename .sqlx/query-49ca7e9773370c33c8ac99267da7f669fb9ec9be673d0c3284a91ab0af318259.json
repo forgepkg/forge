@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, repository_id, name, version, listed, first_seen_at,\n                   downloaded, metadata_refreshed_at, not_found, not_found_at\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND name = ANY($2::text[])\n              AND version <> '*' AND confirmed AND NOT upstream_missing AND listed\n              AND first_seen_at <= $3\n              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)\n              AND ($5 OR strpos(version, '-') = 0)\n            ",
+  "query": "\n            SELECT id, repository_id, name, version, listed, first_seen_at,\n                   downloaded, metadata_refreshed_at, not_found, not_found_at\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND name = ANY($2::text[])\n              AND version <> '*' AND confirmed AND NOT upstream_missing AND listed\n              AND first_seen_at <= $3\n              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)\n              AND ($5 OR strpos(version, '-') = 0)\n              AND ($6 OR version !~ '[+]|-.*[.]')\n            ",
   "describe": {
     "columns": [
       {
@@ -120,6 +120,7 @@
         "TextArray",
         "Timestamptz",
         "Timestamptz",
+        "Bool",
         "Bool"
       ]
     },
@@ -136,5 +137,5 @@
       true
     ]
   },
-  "hash": "b980f487290e0c5ab855d14af1f7fc2606123042466fddb6466e7787ab9a0978"
+  "hash": "49ca7e9773370c33c8ac99267da7f669fb9ec9be673d0c3284a91ab0af318259"
 }

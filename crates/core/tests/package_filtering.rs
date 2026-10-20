@@ -156,6 +156,7 @@ async fn search_filters_before_paging_and_total_count() {
                 skip: 1,
                 take: 1,
                 prerelease: false,
+                include_semver2: true,
             },
         )
         .await

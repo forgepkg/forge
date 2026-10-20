@@ -25,10 +25,10 @@ use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
-    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
-    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
-    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
-    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    is_semver2, CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation,
+    PublishAuthorizationContext, PublishOutcome, PublishPolicy, RegistrationEntry, RepoError,
+    RepoReadOps, SearchHit, SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
+    NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
 /// Fetch raw bytes of a stored blob by its S3 object key.
@@ -116,6 +116,7 @@ impl HostedRepo {
                 .into_iter()
                 .filter(|c| c.listed)
                 .filter(|c| params.prerelease || !is_prerelease(&c.version))
+                .filter(|c| params.include_semver2 || !is_semver2(&c.version_original))
                 .map(|c| VersionEntry {
                     original_id: c.original_id,
                     version: c.version,
