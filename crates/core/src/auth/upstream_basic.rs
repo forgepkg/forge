@@ -29,6 +29,10 @@
 //! credential is rejected. A success without that field is treated as an
 //! outage (fail closed).
 //!
+//! A username containing `:` is rejected without forwarding: HTTP Basic
+//! splits at the first colon, so the upstream would verify a different name
+//! ([`forge_db::username::canonical_password_username`]).
+//!
 //! ## Why this is safe on the hot path
 //!
 //! NuGet clients send Basic credentials on *every* request. This provider never
@@ -395,6 +399,16 @@ impl AuthProvider for UpstreamBasicProvider {
     }
 
     async fn authenticate(&self, cred: &PasswordCredential<'_>) -> AuthOutcome {
+        // The upstream splits `user:password` at the first colon (RFC 7617),
+        // so for `mallory:abc` / `def` it would check `mallory` / `abc:def`
+        // while Forge signs in the account `mallory:abc`. Such a name is never
+        // forwarded nor answered from the cache. A rejection, not a skip: the
+        // chain still lets a later local realm decide, but never falls back to
+        // anonymous access.
+        if cred.username.contains(':') {
+            return AuthOutcome::Rejected;
+        }
+
         // The cache stashes only a boolean verdict (never the groups — they are
         // not security-critical and re-deriving them on a cold cache is cheap and
         // correct). On a cache miss the factory runs `forward`, whose `groups`

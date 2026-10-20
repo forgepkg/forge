@@ -239,6 +239,40 @@ async fn usernames_are_canonical() {
     }
 }
 
+/// Review 2026-10-20 M2: a local account signs in with a password, and no
+/// password login accepts a name containing `:` (HTTP Basic splits at the
+/// first colon), so such an account is refused at creation.
+#[tokio::test]
+async fn usernames_with_a_colon_are_refused() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+
+    for bad in [
+        format!("mallory{s}:abc"),
+        format!(":dave{s}"),
+        format!("erin{s}:"),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"username": bad, "password": "pw123456"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid username: username must not contain ':'"
+        );
+        let stored = forge_db::user_dao::find_user_by_username(&srv.pool, &bad)
+            .await
+            .unwrap();
+        assert!(stored.is_none(), "{bad:?} was not created");
+    }
+}
+
 /// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
 /// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
 /// for a non-admin caller.

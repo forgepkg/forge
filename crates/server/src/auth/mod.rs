@@ -753,8 +753,9 @@ struct LoginBody {
 /// `auth.allow_password_basic` (that flag governs API Basic auth only). The
 /// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
 /// are a uniform 401 (no username-exists oracle). A username over
-/// [`MAX_USERNAME_BYTES`] is refused the same way before any lookup or lockout
-/// bookkeeping (it is never counted, so it cannot grow the lockout map).
+/// [`MAX_USERNAME_BYTES`], or one containing `:`, is refused the same way
+/// before any lookup or lockout bookkeeping (it is never counted, so it cannot
+/// grow the lockout map).
 async fn password_login(
     State(state): State<AppState>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -774,8 +775,10 @@ async fn password_login(
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
     // The lockout, the chain and the account lookup all key on the canonical
-    // username (trimmed, NFC, lowercased).
-    let Ok(username) = forge_core::auth::canonical_username(&body.username) else {
+    // username (trimmed, NFC, lowercased). A name with a `:` cannot sign in
+    // with a password (a forwarding realm's upstream would split it, and Basic
+    // cannot carry one); like an oversized one it is never counted.
+    let Ok(username) = forge_core::auth::canonical_password_username(&body.username) else {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     };
 

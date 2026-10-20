@@ -290,6 +290,11 @@ account everywhere â€” login, the lockout, the credential cache, provisioning â€
 and the database enforces it with a unique index on the canonical form.
 Migration 0021 canonicalizes existing accounts; where two collide, the oldest
 keeps the name and the others are renamed `<name>#<id>` (logged as a warning).
+A name that signs in with a password must not contain `:`: HTTP Basic splits
+at the first colon, so neither a feed client nor a forwarding realm's upstream
+could carry it. Form login answers such a name with 401, and admin user
+creation and the bootstrap admin refuse it. OIDC-provisioned names may still
+contain one.
 
 A `credential_forwarding` realm forwards the **canonical** username with the
 password and, on success, signs the user in as that name. That is only safe

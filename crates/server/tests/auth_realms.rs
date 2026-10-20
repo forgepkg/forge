@@ -231,6 +231,110 @@ async fn oversized_login_username_is_refused_without_growing_the_lockout_map() {
     assert_eq!(srv.state.login_throttle.tracked(), 1);
 }
 
+/// Review 2026-10-20 M2: a `:` in the form-login username is never forwarded.
+/// The upstream would split `mallory:abc` / `def` into `mallory` / `abc:def`
+/// (RFC 7617) and vouch for Mallory, while Forge signed in a fresh, active
+/// account `mallory:abc`, getting around her deactivation.
+#[tokio::test]
+async fn form_login_with_a_colon_is_not_forwarded() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    let mallory = format!("mallory{}", common::unique());
+    let basic = |user: &str, password: &str| {
+        use base64::Engine as _;
+        let raw = format!("{user}:{password}");
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(raw)
+        )
+    };
+    // Mallory's real upstream password is `abc:def`. Only her own login
+    // below may reach the upstream.
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .and(header("authorization", basic(&mallory, "abc:def").as_str()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+
+    // Its own database: an enabled forwarding realm would join the login
+    // chains of every other test sharing one.
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let login = format!("{}/auth/login", srv.base_url);
+
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "credential_forwarding",
+            "name": "nexus",
+            "config": {
+                "url": format!("{}/status", upstream.uri()),
+                "key_pepper": "pepper",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    // The realm is live: Mallory signs in and is provisioned...
+    let resp = client
+        .post(&login)
+        .json(&json!({ "username": mallory, "password": "abc:def" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: Value = resp.json().await.unwrap();
+    let mallory_id = me["user_id"].as_i64().unwrap();
+
+    // ...and is then deactivated.
+    let resp = client
+        .patch(format!("{}/admin/users/{mallory_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "active": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let tracked = srv.state.login_throttle.tracked();
+    let alias = format!("{mallory}:abc");
+    let resp = client
+        .post(&login)
+        .json(&json!({ "username": alias, "password": "def" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.text().await.unwrap(), "invalid credentials");
+    assert!(
+        forge_db::user_dao::find_user_by_username(&srv.pool, &alias)
+            .await
+            .unwrap()
+            .is_none(),
+        "no alias account is provisioned"
+    );
+    assert_eq!(
+        srv.state.login_throttle.tracked(),
+        tracked,
+        "the refused name never enters the lockout map"
+    );
+    // `upstream` drops at end of test and verifies that only Mallory's own
+    // login was forwarded.
+}
+
 /// A locked (IP, username) pair is a 429 whose `Retry-After` is the failure
 /// window, so the sign-in page can say how long to wait.
 #[tokio::test]

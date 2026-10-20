@@ -1647,7 +1647,9 @@ impl Config {
         self.validate_oidc()?;
         self.validate_auth_providers()?;
         if let Some(ba) = &self.auth.bootstrap_admin {
-            forge_core::auth::canonical_username(&ba.username)
+            // A local password account: its name must be one a password
+            // login accepts (no `:`).
+            forge_core::auth::canonical_password_username(&ba.username)
                 .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
         }
         match self.auth.login_mode.as_str() {
@@ -2875,6 +2877,22 @@ mod tests {
         assert_eq!(ba.username, "admin");
         assert_eq!(ba.password, "s3cret-Pw!");
         assert!(!cfg.server.allow_insecure_defaults, "off by default");
+    }
+
+    /// Review 2026-10-20 M2: the bootstrap admin signs in with a password, so
+    /// its name must not contain `:`.
+    #[test]
+    fn bootstrap_admin_username_with_a_colon_refused() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"ad:min\"\npassword = \"s3cret-Pw!\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth.bootstrap_admin.username: username must not contain ':'"),
+            "{err}"
+        );
     }
 
     #[test]
