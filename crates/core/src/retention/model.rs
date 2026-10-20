@@ -39,7 +39,8 @@ pub struct RetentionPolicy {
     #[serde(default)]
     pub dry_run_only: bool,
     /// Minimum seconds between automatic runs for this repo (advisory scheduling
-    /// floor used by the worker; a manual trigger bypasses it).
+    /// floor used by the worker; a manual trigger bypasses it). The worker
+    /// never schedules runs less than 60 s apart, whatever this says.
     #[serde(default = "default_min_run_interval")]
     pub min_run_interval_seconds: u64,
     /// The ordered list of rules. Must be non-empty.

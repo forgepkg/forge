@@ -748,7 +748,9 @@ pub struct RetentionConfig {
     /// How often each instance polls for a due repository (seconds).
     #[serde(default = "default_retention_poll")]
     pub poll_interval_seconds: u64,
-    /// Default floor between automatic runs per repo (seconds).
+    /// Default floor between automatic runs per repo (seconds). The worker
+    /// never schedules runs less than 60 s apart, so `0` leaves the interval
+    /// to each policy's `min_run_interval_seconds`.
     #[serde(default = "default_retention_run_interval")]
     pub default_run_interval_seconds: i64,
     /// Crash-safe lease held while a repo is evaluated (seconds).

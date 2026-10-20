@@ -39,13 +39,18 @@ use crate::retention::apply::{apply, ApplyContext, RunFence};
 use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
 use crate::retention::model::{validate_policy, RetentionPolicy};
 
+/// The shortest interval the worker ever schedules between two automatic runs
+/// of a repository, whatever the config and the policy say (both accept 0).
+pub const MIN_RUN_INTERVAL_SECONDS: i64 = 60;
+
 /// Tuning for the retention worker, mirrored from the server config.
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
     /// How often each instance polls for a due repository.
     pub poll_interval: StdDuration,
     /// Floor on the next-run interval (a per-repo `min_run_interval_seconds`
-    /// larger than this wins). Bounds how often a repo is re-evaluated.
+    /// larger than this wins). Bounds how often a repo is re-evaluated; values
+    /// below [`MIN_RUN_INTERVAL_SECONDS`] are raised to it.
     pub default_run_interval: Duration,
     /// Crash-safe lease held while a repo is being evaluated.
     pub lease: Duration,
@@ -80,8 +85,16 @@ impl RetentionWorker {
         pool: PgPool,
         format: Arc<dyn Format>,
         cache: Arc<dyn CacheInvalidator>,
-        config: RetentionConfig,
+        mut config: RetentionConfig,
     ) -> Self {
+        // The config and a policy's `min_run_interval_seconds` both accept 0.
+        // With both at 0 a finished run would be due again at once, and the
+        // drain loop in `spawn_loop` would re-claim the same repository
+        // back-to-back forever. Raising the default also spaces out the
+        // retries of a failing run, which are rescheduled by it alone.
+        config.default_run_interval = config
+            .default_run_interval
+            .max(Duration::seconds(MIN_RUN_INTERVAL_SECONDS));
         RetentionWorker {
             pool,
             format,
@@ -334,7 +347,8 @@ impl RetentionWorker {
     }
 
     /// The next-run interval for a policy: the larger of the repo's
-    /// `min_run_interval_seconds` and the global default.
+    /// `min_run_interval_seconds` and the global default (which [`Self::new`]
+    /// raised to at least [`MIN_RUN_INTERVAL_SECONDS`]).
     fn next_interval(&self, policy: &RetentionPolicy) -> Duration {
         // Clamped defensively: validation already bounds the policy value, and
         // an out-of-range interval must never panic the worker loop.
