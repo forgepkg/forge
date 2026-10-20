@@ -18,6 +18,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
+# AGPL v3 or the envisia license, at the user's choice (see README → License).
+license = "AGPL-3.0-only OR LicenseRef-envisia"
 publish = false
 
 [workspace.dependencies]
