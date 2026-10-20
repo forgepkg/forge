@@ -1221,6 +1221,11 @@ async fn failing_member_is_skipped_while_others_answer() {
         g.registration(&group.name, "sample").await.unwrap().len(),
         1
     );
+    assert!(g
+        .registration_entry(&group.name, "sample", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
     let params = SearchParams {
         q: "sample".into(),
         ..SearchParams::default()
@@ -1232,6 +1237,82 @@ async fn failing_member_is_skipped_while_others_answer() {
         .resolve_nupkg(&group.name, "sample", "9.9.9")
         .await
         .is_err());
+    assert!(g
+        .registration_entry(&group.name, "sample", "9.9.9")
+        .await
+        .is_err());
+}
+
+/// An id only the failing member could serve is "unknown", not "absent": the
+/// group returns the member's error rather than an empty answer, which the
+/// routes would turn into a 404 that clients and downstream proxies cache.
+#[tokio::test]
+async fn id_only_a_failing_member_could_serve_is_an_error() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    // The hosted member answers, but only has an internal package.
+    seed_version(&pool, &mut blobs, hosted.id, "Internal", "1.0.0", "h").await;
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    let mut proxies = HashMap::new();
+    proxies.insert(
+        proxy.id,
+        Arc::new(FakeProxy {
+            versions: vec![],
+            fail: true,
+        }),
+    );
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, proxies);
+
+    let member_error = |result: Result<_, RepoError>| matches!(result, Err(RepoError::Storage(_)));
+    assert!(member_error(
+        g.list_versions(&group.name, "sample").await.map(|_| ())
+    ));
+    assert!(member_error(
+        g.registration(&group.name, "sample").await.map(|_| ())
+    ));
+    assert!(member_error(
+        g.registration_entry(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+    assert!(member_error(
+        g.resolve_nupkg(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+    assert!(member_error(
+        g.resolve_nuspec(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+
+    // Search stays lenient: the hosted member answered (with no hits).
+    let params = SearchParams {
+        q: "sample".into(),
+        ..SearchParams::default()
+    };
+    assert_eq!(g.search(&group.name, &params).await.unwrap().total_hits, 0);
+
+    // The hosted member owns its id, so the failing proxy is not consulted.
+    assert_eq!(
+        g.list_versions(&group.name, "internal")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        g.registration(&group.name, "internal").await.unwrap().len(),
+        1
+    );
 }
 
 /// Merged versions follow NuGet precedence, not string order.
