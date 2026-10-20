@@ -164,6 +164,14 @@ async fn resolve_role_id(
     role_name: &Option<String>,
     role_id: Option<i64>,
 ) -> Result<i64, Response> {
+    // Both given: one of them would silently win (and they may disagree).
+    if role_name.is_some() && role_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "give either role or role_id, not both",
+        )
+            .into_response());
+    }
     if let Some(id) = role_id {
         match authz_dao::find_role_by_id(&state.pool, id).await {
             Ok(Some(_)) => return Ok(id),

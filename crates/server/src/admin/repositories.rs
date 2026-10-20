@@ -660,8 +660,11 @@ pub async fn update(
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
+    // Not only the anonymous principal reads through the anonymous role: a
+    // user or workload assigned that role holds its grants too, cached under
+    // its own key. Drop every cached set (as other grant mutations do).
     if anonymous_revoked {
-        forge_core::authz::invalidate_anonymous(&state.cache).await;
+        forge_core::authz::invalidate_all(&state.cache).await;
     }
     if credentials_dropped {
         tracing::warn!(
