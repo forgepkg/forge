@@ -2250,6 +2250,108 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
     assert_eq!((pw, enc), (None, false));
 }
 
+/// An OIDC realm whose sealed client secret no longer decrypts (its issuer
+/// was changed in SQL) is repaired through `PATCH`: the stored secret counts
+/// as absent, so an update without one is a 400 naming it (never a 500, and
+/// the sealed copy is left alone), and one that carries it re-seals it.
+#[tokio::test]
+async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "kind": "oidc",
+            "name": format!("repairidp{}", common::unique()),
+            "enabled": false,
+            "config": {
+                "issuer": "https://login.example.com/tenant/v2.0",
+                "client_id": "forge",
+                "client_secret": "first-secret",
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let issuer = "https://login.example.org/tenant/v2.0";
+    sqlx::query("UPDATE auth_realm SET config = jsonb_set(config, '{issuer}', to_jsonb($2::text)) WHERE id = $1")
+        .bind(id)
+        .bind(issuer)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    let sealed = || forge_db::auth_realm_dao::find_realm_by_id(&srv.pool, id);
+    let broken = sealed().await.unwrap().unwrap();
+    assert!(
+        forge_db::secret_dao::realm_config(Some(envelope), &broken)
+            .await
+            .is_err(),
+        "the secret is bound to the old issuer"
+    );
+
+    let patch = |body: Value| {
+        client
+            .patch(format!("{}/admin/realms/{id}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    for body in [
+        json!({"enabled": false}),
+        json!({"config": {"issuer": issuer, "client_id": "forge"}}),
+    ] {
+        let resp = patch(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains("client_secret"), "{body}: {msg}");
+    }
+    let unchanged = sealed().await.unwrap().unwrap();
+    assert_eq!(unchanged.secrets_enc, broken.secrets_enc, "left alone");
+
+    let resp = patch(json!({"config": {
+        "issuer": issuer,
+        "client_id": "forge",
+        "client_secret": "second-secret",
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["config"]["client_secret_set"], json!(true));
+    let repaired = sealed().await.unwrap().unwrap();
+    let config = forge_db::secret_dao::realm_config(Some(envelope), &repaired)
+        .await
+        .expect("re-sealed for the new issuer");
+    assert_eq!(config["client_secret"], json!("second-secret"));
+    assert_eq!(config["issuer"], json!(issuer));
+
+    let resp = client
+        .delete(format!("{}/admin/realms/{id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 /// M18: repository names are URL path segments: anything outside
 /// `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and the reserved `new`, is a 400 on
 /// create and on rename.

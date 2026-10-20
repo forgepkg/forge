@@ -154,7 +154,10 @@ password to the origin (scheme, host and port) of the repository's
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to
-be entered again through the API.
+be entered again through the API. For a realm, that is an edit
+(`PATCH /admin/realms/{id}` or the realm form) that includes the secret:
+until then the realm is skipped at login, and an edit without the secret
+answers 400 naming it.
 Secrets sealed by pre-release builds were bound to their row only. They
 do not decrypt unless `crypto.accept_row_bound_secrets = true`; start every
 instance once with it so startup re-seals them for their destination, then

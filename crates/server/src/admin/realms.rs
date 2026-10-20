@@ -6,7 +6,8 @@
 //! (`<key>_set` markers instead of values) and an update that omits/blanks a
 //! secret keeps the stored one. With `[crypto]` enabled they are encrypted at
 //! rest in `auth_realm.secrets_enc` (every write re-encrypts; legacy plaintext
-//! rows are still read).
+//! rows are still read). Sealed secrets that no longer decrypt count as
+//! absent: the realm is repaired by an update that sends them again.
 //!
 //! Every successful write invalidates the local realm snapshot so this
 //! instance converges immediately; peers converge within
@@ -16,6 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
+use forge_crypto::CryptoError;
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
 use forge_db::model::AuthRealm;
 use forge_db::secret_dao::{self, SecretDbError};
@@ -307,10 +309,23 @@ pub async fn update(
     }
 
     // The stored *logical* config (encrypted secrets merged in) — secrets are
-    // write-only, so an omitted one must be kept from here.
+    // write-only, so an omitted one must be kept from here. Sealed secrets
+    // that no longer decrypt (the realm's issuer or client id was changed
+    // outside the API, or a pre-release blob without
+    // `crypto.accept_row_bound_secrets`) count as absent, so the update must
+    // carry them again: that is how such a realm is repaired.
+    let mut secrets_unreadable = false;
     let existing_config = match secret_dao::realm_config(state.envelope.as_deref(), &existing).await
     {
         Ok(c) => c,
+        Err(SecretDbError::Crypto(CryptoError::DecryptFailed)) => {
+            tracing::warn!(
+                realm = %existing.name,
+                "realm secrets do not decrypt; the update must supply them again"
+            );
+            secrets_unreadable = true;
+            existing.config.clone()
+        }
         Err(e) => {
             tracing::error!(realm = %existing.name, error = %e, "realm secrets unreadable");
             return (
@@ -331,7 +346,10 @@ pub async fn update(
                 Err(msg) => return bad_request(msg),
             }
         }
-        None if existing.kind == KIND_WORKLOAD_IDENTITY => {
+        // Without readable secrets the stored config is incomplete: refuse it
+        // (validation names the missing secret) rather than re-store it and
+        // drop the sealed copy.
+        None if existing.kind == KIND_WORKLOAD_IDENTITY || secrets_unreadable => {
             match validate_config(&existing.kind, &existing_config) {
                 Ok(config) => config,
                 Err(message) => return bad_request(message),
