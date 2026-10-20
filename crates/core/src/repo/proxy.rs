@@ -22,11 +22,13 @@
 //! * **NO advisory locks, no DB transaction across network I/O** — first-time
 //!   fetch singleflight is a plain row lock:
 //!   [`proxy_dao::insert_unconfirmed_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
-//!   guarantee a row exists, then [`proxy_dao::lock_cached_version_for_update`]
+//!   guarantee a row exists, then [`proxy_dao::lock_or_insert_cached_version`]
 //!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
 //!   and finalize transactions; it is **released before** the upstream HTTP
-//!   fetch and the CAS/S3 PUT (Addendum A7). Within one instance, concurrent
-//!   first-time fetches of the same version are serialized by an in-process
+//!   fetch and the CAS/S3 PUT (Addendum A7), so the reconciler may prune a
+//!   still-unconfirmed row meanwhile; the next lock then creates it again.
+//!   Within one instance, concurrent first-time fetches of the same version
+//!   are serialized by an in-process
 //!   gate ([`inflight_gate`]): the first caller fetches, the others wait and
 //!   then find `downloaded` set, so N simultaneous restores cost one upstream
 //!   download and one temp file. Across instances the singleflight is
@@ -860,11 +862,8 @@ impl ProxyRepo {
         {
             let mut tx = self.pool.begin().await?;
             let locked =
-                proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
-                    .await?
-                    .ok_or_else(|| {
-                        RepoError::Storage("cached-version row vanished under lock".into())
-                    })?;
+                proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version)
+                    .await?;
 
             // Decide on the locked row, then release the lock before any
             // further query.
@@ -1060,10 +1059,10 @@ impl ProxyRepo {
             .map_err(|_| RepoError::Storage("nuspec size overflow".into()))?;
 
         // ── Finalize (short tx) — re-lock, re-check, attach, mark downloaded. ─
+        // An unconfirmed row pruned during the fetch is created again here.
         let mut tx = self.pool.begin().await?;
-        let locked = proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
-            .await?
-            .ok_or_else(|| RepoError::Storage("cached-version row vanished under lock".into()))?;
+        let locked =
+            proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version).await?;
 
         // A racing caller finished while we were fetching. The blob we stored is
         // already on disk (CAS dedup); just roll back and serve the local copy.

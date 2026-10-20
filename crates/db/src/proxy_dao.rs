@@ -182,7 +182,9 @@ pub async fn insert_unconfirmed_cached_version(
 ///
 /// The `confirmed`/`downloaded` conditions are repeated on the outer `DELETE`
 /// so a row a concurrent download confirms meanwhile is re-checked after its
-/// lock is released and kept.
+/// lock is released and kept. A download that is still fetching holds no lock,
+/// so its row can go; it is created again when that download finalizes
+/// ([`lock_or_insert_cached_version`]).
 pub async fn prune_unconfirmed(
     pool: &PgPool,
     default_ttl_seconds: i64,
@@ -335,6 +337,44 @@ pub async fn lock_cached_version_for_update(
         version,
     )
     .fetch_optional(&mut **tx)
+    .await
+}
+
+/// [`lock_cached_version_for_update`] for the download singleflight, which
+/// holds no lock while it fetches: when the row is gone because
+/// [`prune_unconfirmed`] deleted it meanwhile (it was still unconfirmed), it
+/// is created again, unconfirmed (see [`insert_unconfirmed_cached_version`]),
+/// and locked, so the download can still finish.
+pub async fn lock_or_insert_cached_version(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    name: &str,
+    version: &str,
+) -> sqlx::Result<ProxyCachedVersion> {
+    if let Some(row) = lock_cached_version_for_update(tx, repository_id, name, version).await? {
+        return Ok(row);
+    }
+    // `DO UPDATE` (a no-op) rather than `DO NOTHING`: it locks and returns a
+    // row a concurrent caller created first, so one statement always yields
+    // a locked row.
+    sqlx::query_as!(
+        ProxyCachedVersion,
+        r#"
+        INSERT INTO proxy_cached_version (
+            repository_id, name, version, listed, downloaded, not_found, confirmed
+        )
+        VALUES ($1, $2, $3, true, false, false, false)
+        ON CONFLICT (repository_id, name, version)
+        DO UPDATE SET listed = proxy_cached_version.listed
+        RETURNING
+            id, repository_id, name, version, listed, first_seen_at,
+            downloaded, metadata_refreshed_at, not_found, not_found_at
+        "#,
+        repository_id,
+        name,
+        version,
+    )
+    .fetch_one(&mut **tx)
     .await
 }
 

@@ -45,6 +45,7 @@ use forge_db::repository_dao::{self, NewRepository};
 use forge_nuget::NugetFormat;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────
 
@@ -77,6 +78,9 @@ struct MockState {
     /// `lower_id -> flat-container listing document` served instead of the
     /// corpus's.
     flat_index_override: Mutex<HashMap<String, serde_json::Value>>,
+    /// When set, a `.nupkg` request signals the first `Notify` on arrival and
+    /// answers only once the second is notified (a slow download).
+    hold_nupkg: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl MockState {
@@ -180,6 +184,12 @@ impl MockUpstream {
             .unwrap()
             .insert(format!("{lower_id}/{file}"), doc);
     }
+    /// Hold every `.nupkg` response: returns `(arrived, release)`.
+    fn hold_nupkgs(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let gates = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        *self.state.hold_nupkg.lock().unwrap() = Some(gates.clone());
+        gates
+    }
 }
 
 async fn serve_index(
@@ -252,6 +262,11 @@ async fn serve_nupkg(
         };
     }
     st.nupkg_hits.fetch_add(1, Ordering::SeqCst);
+    let hold = st.hold_nupkg.lock().unwrap().clone();
+    if let Some((arrived, release)) = hold {
+        arrived.notify_one();
+        release.notified().await;
+    }
     if st.failing.lock().unwrap().contains(&key) {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -342,6 +357,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         registrations: Mutex::default(),
         registration_pages: Mutex::default(),
         flat_index_override: Mutex::default(),
+        hold_nupkg: Mutex::default(),
     });
 
     let app = Router::new()
@@ -1332,6 +1348,56 @@ async fn package_marker_is_cleared_by_a_download_and_pruned_when_expired() {
         .await
         .unwrap();
     assert_eq!(marker("contoso.ghost").await, None, "expired marker pruned");
+}
+
+/// #23: the reconciler prunes unconfirmed rows while a first-time download of
+/// a version no listing confirmed (a client fetching it by URL) can still be
+/// fetching; with `not_found_ttl_seconds = 0` the row is prunable at once. The
+/// download creates its row again and succeeds, instead of answering 500 after
+/// it stored the package.
+#[tokio::test]
+async fn prune_during_a_first_download_does_not_fail_it() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let rid = repo_id(&pool, &repo).await;
+    sqlx::query("UPDATE repository SET not_found_ttl_seconds = 0 WHERE id = $1")
+        .bind(rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (arrived, release) = mock.hold_nupkgs();
+    let px = Arc::new(proxy_repo(&pool, cas, Cache::l1_only(128)));
+
+    let download = {
+        let (px, repo) = (px.clone(), repo.clone());
+        tokio::spawn(async move { px.resolve_nupkg(&repo, "Contoso.Lib", "1.0.0").await })
+    };
+    arrived.notified().await;
+    let row = || {
+        let pool = pool.clone();
+        async move {
+            forge_db::proxy_dao::get_cached_version(&pool, rid, "contoso.lib", "1.0.0")
+                .await
+                .unwrap()
+        }
+    };
+    assert!(row().await.is_some(), "the download's unconfirmed row");
+    forge_db::proxy_dao::prune_unconfirmed(&pool, 600, 1_000_000)
+        .await
+        .unwrap();
+    assert!(row().await.is_none(), "pruned while the download fetches");
+
+    release.notify_one();
+    let loc = download.await.unwrap().expect("the download succeeds");
+    assert!(loc.is_some());
+    assert!(row().await.expect("created again").downloaded);
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    assert_eq!(mock.nupkg_hits(), 1);
 }
 
 /// Review follow-up: inside the package-delay window the proxy never fetches
