@@ -14,8 +14,11 @@ name: Release
 # Order of operations: the image is pushed BY DIGEST (untagged), the digest is
 # signed and the signature verified, and only then are the tags attached
 # (`docker buildx imagetools create`), so no tag ever points at an unsigned
-# image. Every third-party action is pinned to a full commit SHA (the tag it
-# was resolved from is in the trailing comment); Dependabot keeps them current.
+# image. The floating tags are decided right before they are attached, against
+# the tags that exist by then, so an overlapping run for an older tag that
+# finishes last cannot move them back. Every third-party action is pinned to a
+# full commit SHA (the tag it was resolved from is in the trailing comment);
+# Dependabot keeps them current.
 #
 # Guard rails: the tag must equal the workspace version in Cargo.toml, the
 # web/package.json version, the image tag of the Kubernetes base
@@ -29,6 +32,9 @@ on:
 permissions:
   contents: read
 
+# Per tag, so runs for different tags overlap: one global group would keep only
+# the newest pending run and cancel the others, silently dropping a release
+# when several tags are pushed at once.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -49,7 +55,6 @@ jobs:
       contents: write # create the GitHub release
       packages: write # push to ghcr.io
       id-token: write # keyless cosign signing + provenance
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,18 +85,6 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}" \
             || { echo "::error::tag is not on the default branch"; exit 1; }
           echo "version=$tag" >> "$GITHUB_OUTPUT"
-
-      # Which floating tags this release may move: `latest` only for the
-      # highest non-prerelease version and `<major>.<minor>` only for the
-      # highest of its line, counting only tags on the default branch (see the
-      # script; tested by xtask/tests/release_channels.rs).
-      - name: Decide floating tags
-        id: channels
-        shell: bash # -eo pipefail: a failing script fails the step
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          BASE: origin/${{ github.event.repository.default_branch }}
-        run: .github/scripts/release-channels.sh "$VERSION" "$BASE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Extract release notes from CHANGELOG.md
         run: |
@@ -127,14 +120,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
-          # `latest` is decided explicitly above, never automatically.
+          # Only the fixed tags: the floating ones (`<major>.<minor>`,
+          # `latest`) are decided just before the tags are attached.
           flavor: |
             latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.channels.outputs.line_latest }}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ steps.channels.outputs.latest }}
           labels: |
             org.opencontainers.image.title=envisia-forge
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
@@ -169,16 +161,37 @@ jobs:
             --certificate-identity "${IDENTITY}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
 
+      # Which floating tags this release may move: `latest` only for the
+      # highest non-prerelease version and `<major>.<minor>` only for the
+      # highest of its line, counting only tags on the default branch (see the
+      # script; tested by xtask/tests/release_channels.rs). Decided against the
+      # tags as they are now, not at checkout: a newer tag pushed while this
+      # run was building keeps it from moving them.
+      - name: Decide floating tags
+        id: channels
+        shell: bash # -eo pipefail: a failing script fails the step
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --force --tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          .github/scripts/release-channels.sh "$VERSION" "origin/${DEFAULT_BRANCH}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Attach the tags to the signed digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
           VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.channels.outputs.latest }}
+          LINE_LATEST: ${{ steps.channels.outputs.line_latest }}
         run: |
           args=()
           while IFS= read -r tag; do
             [ -n "$tag" ] && args+=(--tag "$tag")
           done <<< "$TAGS"
+          # Both are false for a prerelease, so VERSION is MAJOR.MINOR.PATCH here.
+          if [ "$LINE_LATEST" = true ]; then args+=(--tag "${IMAGE}:${VERSION%.*}"); fi
+          if [ "$LATEST" = true ]; then args+=(--tag "${IMAGE}:latest"); fi
           echo "tags: ${args[*]}"
           docker buildx imagetools create "${args[@]}" "${IMAGE}@${DIGEST}"
           # A single-index source is copied as-is; make sure the tag really
