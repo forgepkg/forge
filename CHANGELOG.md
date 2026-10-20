@@ -43,6 +43,65 @@ The release workflow publishes the section whose heading matches the tag
   (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
   choice.
 
+### Fixed
+
+- **Admin API**: retention policy, repository and realm request bodies
+  reject unknown fields (422 naming the field) instead of dropping them. A
+  misspelled field used to fall back to the unsafe default: a live policy
+  over every package, a public repository, or no reserved prefixes.
+- The last active administrator can no longer be deactivated, deleted or
+  lose the `admin` role: each answers 409. The check holds a lock on the
+  `admin` role, so two concurrent demotions cannot both pass.
+- `PATCH /admin/tokens/{id}/scope` with `{}` answers 400 instead of clearing
+  the token's scope; only an explicit `"scope": null` clears it.
+- **Realms**: a realm whose secrets no longer decrypt can be repaired with
+  `PATCH /admin/realms/{id}` carrying the secret again; an edit without it
+  answers 400 naming it instead of 500. The realm-secret backfill (at
+  startup and on key rotation) no longer overwrites a realm edited while it
+  runs, and re-seals a realm whose sealed secrets no longer decrypt from its
+  plaintext copy instead of failing the whole pass.
+- **Authentication**: a deactivated local account's password is refused by
+  the local realm, like a wrong password, and never forwarded to a
+  credential-forwarding realm. A database error while looking up a token or
+  session answers 503 instead of 401, and a token sent as the Basic password
+  is never tried as a password.
+- **Proxy**: changing a proxy's `remote_url` takes effect at once. The
+  previous upstream's service index, listings, manifests and registrations
+  are no longer used, and a failing new upstream is an error instead of a
+  silent fallback to the old index. A first download no longer answers 500
+  when the cleanup of unconfirmed versions removes its row mid-download.
+- **Groups** answer a failing member's error instead of 404 for a package
+  only that member could serve, such as a proxy whose upstream is briefly
+  unreachable, so clients retry instead of reporting NU1101 and a Forge
+  proxy in front of the group does not cache the miss.
+- **Search** without `semVerLevel=2.0.0` drops SemVer 2.0.0 versions before
+  paging, so pages are full and `totalHits` is exact. The web UI pages
+  through repositories with more than 20 packages: `/browse/packages`
+  reports the total number of matches instead of capping it at
+  `skip + take`.
+- **Retention** groups versions by package in one pass and evaluates on the
+  blocking pool, so a large repository's run or preview no longer stalls
+  the instance. Automatic runs of a repository are at least 60 s apart;
+  with both run intervals set to 0 it used to re-run back to back forever.
+- **Staging**: files a killed process left in the staging directory are
+  removed at the next start instead of after an hour, so a restart can no
+  longer use more than `max_staging_bytes` and fail uploads with 500.
+- **Cache backplane**: a forged `u64::MAX` tag generation published to
+  Redis can no longer stop every instance from applying later
+  invalidations.
+- **Releases**: the release workflow decides whether to move `:latest` and
+  `:<major>.<minor>` right before tagging, so an older release whose run
+  finishes last no longer moves them back. The GitLab pipeline passes again
+  and mirrors the GitHub CI, except for the Helm chart check.
+
+### Upgrade notes
+
+- Admin API clients that send fields the retention policy, repository or
+  realm endpoints do not know now get 422; remove those fields.
+- The retention worker never runs a repository automatically more often
+  than every 60 s, whatever `default_run_interval_seconds` and the policy's
+  `min_run_interval_seconds` say (0 is still accepted).
+
 ## [0.1.0]
 
 First production release.
