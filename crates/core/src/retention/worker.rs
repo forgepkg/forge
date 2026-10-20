@@ -107,7 +107,8 @@ impl RetentionWorker {
     /// sweep). The claim query already tolerates expired leases; this is a
     /// belt-and-suspenders cleanup. Returns the number reclaimed.
     pub async fn release_stale_leases(&self) -> sqlx::Result<u64> {
-        retention_dao::release_stale_leases(&self.pool, Utc::now()).await
+        let now = forge_db::db_now(&self.pool).await?;
+        retention_dao::release_stale_leases(&self.pool, now).await
     }
 
     /// Run one tick: claim at most one due repository and evaluate it.
@@ -138,13 +139,12 @@ impl RetentionWorker {
         // work below happens with NO transaction held (mirrors the proxy A7 rule).
         let claimed = {
             let mut tx = self.pool.begin().await?;
-            let claimed = retention_dao::claim_next_due_repo(
-                &mut tx,
-                Utc::now(),
-                self.config.lease,
-                only_repo,
-            )
-            .await?;
+            // Due-ness and the lease (checked by the run fence against
+            // `now()`) run on the database's clock.
+            let now = forge_db::db_now(&mut *tx).await?;
+            let claimed =
+                retention_dao::claim_next_due_repo(&mut tx, now, self.config.lease, only_repo)
+                    .await?;
             tx.commit().await?;
             claimed
         };
@@ -180,7 +180,10 @@ impl RetentionWorker {
             Err(e) => {
                 tracing::error!(error = %e, repo = %repo.name, %run_id, "retention run failed");
                 // Release the lease, record the error, reschedule.
-                let next = Utc::now() + self.config.default_run_interval;
+                let now = forge_db::db_now(&self.pool)
+                    .await
+                    .unwrap_or_else(|_| Utc::now());
+                let next = now + self.config.default_run_interval;
                 if let Err(e2) = retention_dao::fail_run(
                     &self.pool,
                     repo.repository_id,
@@ -218,7 +221,9 @@ impl RetentionWorker {
         validate_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
 
-        let now = Utc::now();
+        // The database's clock: `next_run_at` is compared with it, and the
+        // ages evaluated below are of timestamps it wrote.
+        let now = forge_db::db_now(&self.pool).await?;
         let next_run_at = now + self.next_interval(&policy);
 
         // Disabled policy ⇒ no-op run (still advance the schedule).
@@ -427,9 +432,13 @@ fn spawn_lease_heartbeat(
         ticker.tick().await; // the first tick completes immediately
         loop {
             ticker.tick().await;
-            match retention_dao::renew_run_lease(&pool, repository_id, run_id, Utc::now() + lease)
-                .await
-            {
+            let renewed = match forge_db::db_now(&pool).await {
+                Ok(now) => {
+                    retention_dao::renew_run_lease(&pool, repository_id, run_id, now + lease).await
+                }
+                Err(e) => Err(e),
+            };
+            match renewed {
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::warn!(repository_id, %run_id, "retention lease lost; heartbeat stopped");
@@ -453,7 +462,7 @@ const AUDIT_PRUNE_MAX_BATCHES: usize = 50;
 /// Delete `retention_audit` rows older than `keep`, in short batches. Returns
 /// the number of rows deleted. Safe on every instance at once.
 pub async fn prune_audit(pool: &PgPool, keep: Duration) -> sqlx::Result<u64> {
-    let cutoff = Utc::now() - keep;
+    let cutoff = forge_db::db_now(pool).await? - keep;
     let mut total = 0u64;
     for _ in 0..AUDIT_PRUNE_MAX_BATCHES {
         let deleted = retention_dao::prune_audit(pool, cutoff, AUDIT_PRUNE_BATCH).await?;

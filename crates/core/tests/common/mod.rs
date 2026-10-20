@@ -87,6 +87,32 @@ pub async fn small_pool(max_connections: u32, acquire_timeout: Duration) -> PgPo
         .expect("connect")
 }
 
+/// A pool on the same database whose clock runs one hour **ahead** of this
+/// process's: unqualified `now()` in its queries resolves to
+/// `forge_skew.now()` (search_path puts that schema before `pg_catalog`), the
+/// way a database host with a skewed clock would answer. Column defaults keep
+/// the real clock.
+#[allow(dead_code)]
+pub async fn pool_with_clock_ahead() -> PgPool {
+    let pool = pool().await;
+    sqlx::raw_sql(
+        "CREATE SCHEMA IF NOT EXISTS forge_skew; \
+         CREATE OR REPLACE FUNCTION forge_skew.now() RETURNS timestamptz \
+         LANGUAGE sql STABLE AS $$ SELECT pg_catalog.now() + interval '1 hour' $$;",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the skewed clock");
+    pool.close().await;
+    let options: sqlx::postgres::PgConnectOptions =
+        database_url().await.parse().expect("database url");
+    PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(options.options([("search_path", "forge_skew,public,pg_catalog")]))
+        .await
+        .expect("connect")
+}
+
 /// A fresh, migrated pool for the calling test, backed by the shared container
 /// — or by an external Postgres when `FORGE_TEST_DATABASE_URL` is set (for
 /// environments without Docker).

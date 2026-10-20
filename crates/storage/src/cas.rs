@@ -150,11 +150,16 @@ impl IngestLeaseGuard {
                 tokio::select! {
                     _ = &mut stopped => break,
                     _ = ticker.tick() => {
-                        match forge_db::blob_dao::refresh_ingest(
-                            &heartbeat_pool,
-                            token,
-                            chrono::Utc::now() + INGEST_LEASE,
-                        ).await {
+                        // The lease end is compared with the database's clock.
+                        let renewed = match forge_db::db_now(&heartbeat_pool).await {
+                            Ok(now) => forge_db::blob_dao::refresh_ingest(
+                                &heartbeat_pool,
+                                token,
+                                now + INGEST_LEASE,
+                            ).await,
+                            Err(error) => Err(error),
+                        };
+                        match renewed {
                             Ok(true) => {}
                             Ok(false) => break,
                             Err(error) => tracing::warn!(
@@ -496,7 +501,9 @@ impl Cas {
         );
 
         let (ingest_token, s3_key) = loop {
-            let now = chrono::Utc::now();
+            // The lease end and the staleness cutoff are compared with the
+            // database's clock, so they are computed from it.
+            let now = forge_db::db_now(&self.pool).await?;
             match forge_db::blob_dao::begin_ingest(
                 &self.pool,
                 &staged.sha256,

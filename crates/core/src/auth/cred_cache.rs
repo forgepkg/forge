@@ -86,7 +86,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
 use forge_cache::Cache;
 use forge_db::validated_credential_dao::{self as vc_dao, Claim, ClaimState, NewVerdict};
 use hmac::{Hmac, KeyInit, Mac};
@@ -643,7 +642,8 @@ impl Fill {
             }
         };
 
-        let expires_at = Utc::now()
+        // The row's expiry is compared with the database's clock.
+        let expires_at = forge_db::db_now(&self.pool).await?
             + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
         // On a store error the lease stays and lapses on its own.
         guard.disarm();

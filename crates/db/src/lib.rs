@@ -31,4 +31,4 @@ pub mod user_dao;
 pub mod username;
 pub mod validated_credential_dao;
 
-pub use pool::{connect, connect_with, migrate};
+pub use pool::{connect, connect_with, db_now, migrate};
