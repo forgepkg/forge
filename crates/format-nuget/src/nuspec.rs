@@ -291,7 +291,7 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
     // Vet the end-of-central-directory records before the zip reader loads
     // the central directory, and bound what it may read while doing so.
     let vetted = check_archive_directory(file, limits)?;
-    let budget = Rc::new(Cell::new(Some(vetted)));
+    let budget = Rc::new(Cell::new(Some(vetted.read_budget)));
     let reader = BudgetReader {
         inner: file,
         budget: budget.clone(),
@@ -323,10 +323,22 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         )));
     }
 
+    // The zip reader indexes entries by name, so a repeated name hides all
+    // but one of its entries. NuGet sees each of them (and refuses a package
+    // with two manifests), so a name may not repeat.
+    if archive.len() as u64 != vetted.entries {
+        return Err(NupkgError::UnsupportedEntry(
+            "the archive holds two entries with the same name".into(),
+        ));
+    }
+
     // First pass: find the manifest without decompressing. NuGet reads the
     // one `*.nuspec` at the package root (and refuses a package with several),
     // ignoring nested ones; anything else would let Forge and the client
     // disagree about which manifest — and so which identity — the package has.
+    // Every entry that some reading of its name puts at the root counts
+    // ([`could_be_root_manifest`]), and the one manifest must be named
+    // literally, so no reader can resolve it to a different entry.
     let mut nuspec_index: Option<usize> = None;
     let mut total_uncompressed: u64 = 0;
 
@@ -343,6 +355,18 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
                 "entry {name:?} is encrypted"
             )));
         }
+        // The zip reader renames an entry after its Info-ZIP Unicode Path
+        // field (0x7075), which .NET ignores, so the two would not agree on
+        // the name, and the name the central directory itself holds is no
+        // longer visible here. Neither NuGet nor .NET writes the field.
+        if entry
+            .extra_data_fields()
+            .any(|f| matches!(f, zip::ExtraField::UnicodePath(_)))
+        {
+            return Err(NupkgError::UnsupportedEntry(format!(
+                "entry {name:?} carries an Info-ZIP Unicode Path field"
+            )));
+        }
 
         // Entries other than the manifest are never decompressed, so neither
         // their individual size nor their compression ratio matters here; the
@@ -355,11 +379,17 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
             )));
         }
 
-        if is_nuspec_name(&name) && !name.contains('/') {
+        let raw = entry.name_raw();
+        if could_be_root_manifest(raw) {
             if nuspec_index.is_some() {
                 return Err(NupkgError::MalformedNuspec(
                     "the package root holds more than one .nuspec".into(),
                 ));
+            }
+            if raw.contains(&b'%') || raw.contains(&b'\\') {
+                return Err(NupkgError::MalformedNuspec(format!(
+                    "the manifest name {name:?} must not contain '%' or '\\'"
+                )));
             }
             nuspec_index = Some(i);
         }
@@ -425,10 +455,18 @@ const ZIP_TRAILER_WINDOW: u64 = EOCD_LEN + u16::MAX as u64 + ZIP64_LOCATOR_LEN +
 /// small blocks and probes a few headers around the central directory).
 const ZIP_READ_SLACK: u64 = 64 * 1024;
 
+/// What [`check_archive_directory`] vetted.
+#[derive(Debug)]
+struct VettedDirectory {
+    /// How many bytes the zip reader may read while opening the archive.
+    read_budget: u64,
+    /// How many central-directory entries the zip reader walks.
+    entries: u64,
+}
+
 /// Vet the archive's end-of-central-directory records against the entry-count
 /// and central-directory limits **before** `zip::ZipArchive::new` parses (and
-/// allocates for) the central directory they describe. Returns how many bytes
-/// the zip reader may read while opening the archive.
+/// allocates for) the central directory they describe.
 ///
 /// Mirrors the zip reader's choice: it searches backwards and uses the last
 /// EOCD signature whose record and comment fit in the file (plus, for ZIP64,
@@ -440,7 +478,7 @@ const ZIP_READ_SLACK: u64 = 64 * 1024;
 fn check_archive_directory(
     file: &mut dyn ReadSeek,
     limits: &NupkgLimits,
-) -> Result<u64, NupkgError> {
+) -> Result<VettedDirectory, NupkgError> {
     let len = file.seek(SeekFrom::End(0))?;
     let trailer = ZIP_TRAILER_WINDOW.min(len);
     let mut chosen = None;
@@ -463,29 +501,32 @@ fn check_archive_directory(
             "no end-of-central-directory record near the end of the archive".into(),
         ));
     };
-    let directory = check_eocd_candidate(file, pos, len, limits)?;
-    let budget = trailer
+    let (directory, entries) = check_eocd_candidate(file, pos, len, limits)?;
+    let read_budget = trailer
         .saturating_add(directory)
         .saturating_add(ZIP_READ_SLACK);
     file.seek(SeekFrom::Start(0))?;
-    Ok(budget)
+    Ok(VettedDirectory {
+        read_budget,
+        entries,
+    })
 }
 
-/// Check one EOCD candidate at `pos`. Returns the largest central-directory
-/// size it declares.
+/// Check one EOCD candidate at `pos`. Returns the central-directory size it
+/// declares and the number of entries the zip reader walks.
 ///
 /// Mirrors how the zip reader interprets the record: when a field holds the
 /// ZIP64 marker (`0xFFFF…`) and a ZIP64 locator precedes the record, only the
 /// ZIP64 record's counts are used (the one at the locator's offset), otherwise
-/// the 32-bit counts are.
+/// the 32-bit counts are; of those, it walks the entries on this disk.
 fn check_eocd_candidate(
     file: &mut dyn ReadSeek,
     pos: u64,
     len: u64,
     limits: &NupkgLimits,
-) -> Result<u64, NupkgError> {
+) -> Result<(u64, u64), NupkgError> {
     if pos + EOCD_LEN > len {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let rec = read_at(file, pos, EOCD_LEN as usize)?;
     let (on_disk, total) = (le_u16(&rec, 8), le_u16(&rec, 10));
@@ -510,25 +551,26 @@ fn check_eocd_candidate(
         }
     }
     check_directory_limits(u64::from(on_disk.max(total)), u64::from(directory), limits)?;
-    Ok(u64::from(directory))
+    Ok((u64::from(directory), u64::from(on_disk)))
 }
 
 /// Check one ZIP64 end-of-central-directory record at `pos`. Returns the
-/// central-directory size it declares.
+/// central-directory size it declares and the number of entries the zip
+/// reader walks (the total).
 fn check_zip64_record(
     file: &mut dyn ReadSeek,
     pos: u64,
     len: u64,
     limits: &NupkgLimits,
-) -> Result<u64, NupkgError> {
+) -> Result<(u64, u64), NupkgError> {
     if pos + ZIP64_EOCD_LEN > len {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let rec = read_at(file, pos, ZIP64_EOCD_LEN as usize)?;
-    let entries = le_u64(&rec, 24).max(le_u64(&rec, 32));
+    let (on_disk, total) = (le_u64(&rec, 24), le_u64(&rec, 32));
     let directory = le_u64(&rec, 40);
-    check_directory_limits(entries, directory, limits)?;
-    Ok(directory)
+    check_directory_limits(on_disk.max(total), directory, limits)?;
+    Ok((directory, total))
 }
 
 fn check_directory_limits(
@@ -634,14 +676,50 @@ impl Seek for BudgetReader<'_> {
     }
 }
 
-fn is_nuspec_name(name: &str) -> bool {
-    // Case-insensitive `.nuspec` suffix; ignore directory entries.
-    !name.ends_with('/')
-        && name
-            .rsplit('/')
-            .next()
-            .map(|f| f.to_ascii_lowercase().ends_with(".nuspec"))
-            .unwrap_or(false)
+/// Whether some reader could take the entry named `name` (the bytes the
+/// central directory holds) for the manifest at the package root.
+///
+/// NuGet percent-decodes a name that holds `%` (`UnescapePath`), then treats
+/// one ending in `.nuspec` (any case) with neither `/` nor `\` in it as a root
+/// manifest (`PackageHelper.IsManifest` and `IsRoot`). Both the raw and the
+/// decoded name are checked, so an entry counts if either reading puts it at
+/// the root.
+fn could_be_root_manifest(name: &[u8]) -> bool {
+    is_root_nuspec(name) || (name.contains(&b'%') && is_root_nuspec(&percent_decode(name)))
+}
+
+fn is_root_nuspec(name: &[u8]) -> bool {
+    const SUFFIX: &[u8] = b".nuspec";
+    // `/` nests the entry under every reading of the name. `\` does for NuGet
+    // too, but .NET Framework decodes a name without the UTF-8 flag in the
+    // system code page, where a `\` byte can be the second half of a
+    // double-byte character: in a name that is not pure ASCII it may not be a
+    // separator at all.
+    let nested = name.contains(&b'/') || (name.is_ascii() && name.contains(&b'\\'));
+    !nested
+        && name.len() >= SUFFIX.len()
+        && name[name.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+}
+
+/// `name` with every `%XX` escape decoded to its byte, as
+/// `Uri.UnescapeDataString` does for the ASCII ones (it keeps escapes that do
+/// not form UTF-8, which only ever differ from these bytes outside ASCII).
+fn percent_decode(name: &[u8]) -> Vec<u8> {
+    let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+    let mut out = Vec::with_capacity(name.len());
+    let mut i = 0;
+    while i < name.len() {
+        if name[i] == b'%' {
+            if let (Some(hi), Some(lo)) = (hex(name.get(i + 1)), hex(name.get(i + 2))) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(name[i]);
+        i += 1;
+    }
+    out
 }
 
 /// The fields we pull out of a `.nuspec` manifest before normalization.
@@ -811,6 +889,13 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                     }
                 }
                 path.pop();
+            }
+            // NuGet reads manifests with `DtdProcessing.Prohibit`, so it
+            // refuses a package whose manifest declares a document type.
+            Event::DocType(_) => {
+                return Err(NupkgError::MalformedNuspec(
+                    "a <!DOCTYPE> declaration is not allowed".into(),
+                ));
             }
             Event::Eof => break,
             _ => {}
@@ -1178,6 +1263,152 @@ mod tests {
         ]);
         let bytes = extract(zip).unwrap();
         assert_eq!(parse_nuspec(&bytes).unwrap().id, "Real");
+    }
+
+    fn nuspec_of(id: &str) -> Vec<u8> {
+        format!("<package><metadata><id>{id}</id><version>1.0.0</version></metadata></package>")
+            .into_bytes()
+    }
+
+    fn manifest_id(zip: Vec<u8>) -> Result<String, NupkgError> {
+        let bytes = extract_nuspec(&mut std::io::Cursor::new(zip), &NupkgLimits::default())?;
+        Ok(parse_nuspec(&bytes)?.id)
+    }
+
+    #[test]
+    fn the_manifest_is_chosen_by_nuget_s_reading_of_entry_names() {
+        // The review's case: NuGet takes `x\allowed.nuspec` as nested and
+        // decodes `victim%2Enuspec` to the root manifest `victim.nuspec`; a
+        // reader splitting on `/` alone and not decoding takes the other.
+        let zip = zip_of(&[
+            ("x\\allowed.nuspec", &nuspec_of("Allowed.Lib")),
+            ("victim%2Enuspec", &nuspec_of("Victim.Lib")),
+        ]);
+        assert!(matches!(
+            manifest_id(zip),
+            Err(NupkgError::MalformedNuspec(_))
+        ));
+        // A manifest NuGet finds only by decoding its name is refused too.
+        let zip = zip_of(&[("victim%2Enuspec", &nuspec_of("Victim.Lib"))]);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("must not contain '%'"), "{err}");
+        // So is one whose decoded name is nested but raw name is not.
+        let zip = zip_of(&[("x%2Fvictim.nuspec", &nuspec_of("Victim.Lib"))]);
+        assert!(manifest_id(zip).is_err());
+        // Escapes that decode to a second root manifest count as one.
+        let zip = zip_of(&[
+            ("Real.nuspec", &nuspec_of("Real")),
+            ("Other%2Enuspec", &nuspec_of("Other")),
+        ]);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
+        // Root manifests that differ only in case are two manifests.
+        let zip = zip_of(&[
+            ("Real.nuspec", &nuspec_of("Real")),
+            ("real.NUSPEC", &nuspec_of("Other")),
+        ]);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("more than one"), "{err}");
+
+        // `\` nests a manifest as `/` does: it is ignored beside the root one,
+        // and on its own leaves the package without a manifest.
+        let zip = zip_of(&[
+            ("content\\Decoy.nuspec", &nuspec_of("Decoy")),
+            ("Real.NuSpec", &nuspec_of("Real")),
+        ]);
+        assert_eq!(manifest_id(zip).unwrap(), "Real");
+        let zip = zip_of(&[("lib\\Decoy.nuspec", &nuspec_of("Decoy"))]);
+        assert!(matches!(manifest_id(zip), Err(NupkgError::MissingNuspec)));
+        // In a non-ASCII name a `\` byte may belong to a double-byte
+        // character, so it does not count as nesting the entry.
+        let zip = zip_of(&[
+            ("Ü\\Decoy.nuspec", &nuspec_of("Decoy")),
+            ("Real.nuspec", &nuspec_of("Real")),
+        ]);
+        assert!(manifest_id(zip).is_err());
+
+        // Escaped names elsewhere in the package are fine: `nuget pack`
+        // writes them for file names with spaces and the like.
+        let zip = zip_of(&[
+            ("lib/net8.0/My%20Lib.dll", b"MZ"),
+            ("content/a%5Cb.nuspec", &nuspec_of("Decoy")),
+            ("Real.nuspec", &nuspec_of("Real")),
+        ]);
+        assert_eq!(manifest_id(zip).unwrap(), "Real");
+    }
+
+    #[test]
+    fn repeated_entry_names_are_refused() {
+        // Two entries named `a.nuspec`: NuGet sees two manifests, the zip
+        // reader only the last one (its index is keyed by name).
+        let mut zip = zip_of(&[
+            ("a.nuspec", &nuspec_of("First")),
+            ("b.nuspec", &nuspec_of("Second")),
+        ]);
+        let mut renamed = 0;
+        for at in 0..zip.len() - 7 {
+            if &zip[at..at + 8] == b"b.nuspec" {
+                zip[at] = b'a';
+                renamed += 1;
+            }
+        }
+        assert_eq!(renamed, 2, "local header and central directory");
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        assert_eq!(archive.len(), 1);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("same name"), "{err}");
+    }
+
+    /// CRC-32 (IEEE), as the Info-ZIP Unicode Path field stores it.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn unicode_path_extra_fields_are_refused() {
+        // Each entry's Info-ZIP Unicode Path field (0x7075) swaps its name
+        // for the other's role: the zip reader applies the field, .NET (and
+        // so NuGet) ignores it and reads `Victim.nuspec` as the manifest.
+        let unicode_path = |header: &str, unicode: &str| {
+            let mut data = vec![1u8];
+            data.extend_from_slice(&crc32(header.as_bytes()).to_le_bytes());
+            data.extend_from_slice(unicode.as_bytes());
+            let mut opts = zip::write::FullFileOptions::default();
+            opts.add_extra_field(0x7075, data, false).unwrap();
+            opts
+        };
+        let zip = {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zw.start_file("lib/a.dat", unicode_path("lib/a.dat", "Allowed.nuspec"))
+                .unwrap();
+            zw.write_all(&nuspec_of("Allowed.Lib")).unwrap();
+            zw.start_file("Victim.nuspec", unicode_path("Victim.nuspec", "lib/v.dat"))
+                .unwrap();
+            zw.write_all(&nuspec_of("Victim.Lib")).unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        // The zip reader really does see the swapped names.
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        let names: Vec<_> = archive.file_names().map(|n| n.unwrap()).collect();
+        assert_eq!(names, ["Allowed.nuspec", "lib/v.dat"]);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("Unicode Path"), "{err}");
+    }
+
+    #[test]
+    fn a_doctype_is_refused_as_nuget_does() {
+        let xml = br#"<?xml version="1.0"?><!DOCTYPE package [<!ENTITY x "Victim">]>
+            <package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
+        let err = parse_nuspec(xml).unwrap_err();
+        assert!(err.to_string().contains("DOCTYPE"), "{err}");
     }
 
     #[test]
