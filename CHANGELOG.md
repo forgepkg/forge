@@ -508,6 +508,11 @@ First production release.
 - Leases, retry backoffs and staleness cutoffs are computed on the database's
   clock, so a skewed application clock no longer makes failing outbox rows
   retry every poll or retention runs fail their own lease.
+- A staging directory on NFS is swept too (the sweep could not take a lock
+  through a read-only file there), a lock that cannot be tried falls back to
+  removing files idle for an hour instead of keeping them forever, and an
+  instance whose staging subdirectory was removed under it stages in a new
+  one instead of failing every push and download until restarted.
 
 ### Changed
 
