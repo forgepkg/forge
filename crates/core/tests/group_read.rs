@@ -2180,3 +2180,41 @@ async fn a_nested_group_keeps_its_guards_when_read_through_an_outer_group() {
         }
     }
 }
+
+/// #73: an offline hosted member is a failing member: what only it could
+/// serve is an error (clients retry), never a not-found; the other members
+/// still answer.
+#[tokio::test]
+async fn an_offline_hosted_member_fails_instead_of_serving() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let a = seed_member(&pool, false).await;
+    let b = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, a.id, 20)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, b.id, 10)
+        .await
+        .unwrap();
+    seed_version(&pool, &mut blobs, a.id, "Only.In.A", "1.0.0", "a").await;
+    seed_version(&pool, &mut blobs, b.id, "Only.In.B", "2.0.0", "b").await;
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, HashMap::new());
+    assert!(matches!(
+        g.list_versions(&group.name, "only.in.a").await,
+        Err(forge_core::repo::RepoError::Busy(_))
+    ));
+    assert!(g
+        .resolve_nupkg(&group.name, "only.in.a", "1.0.0")
+        .await
+        .is_err());
+    assert_eq!(
+        sorted_versions(&g, &group.name, "only.in.b").await,
+        ["2.0.0"]
+    );
+}

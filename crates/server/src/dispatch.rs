@@ -21,7 +21,7 @@
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{header, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::principal::Principal;
 use forge_core::authz::{Action, PackageFilter};
@@ -34,6 +34,9 @@ use tower::ServiceExt;
 
 use crate::middleware::principal_of;
 use crate::state::AppState;
+
+/// `Retry-After` (seconds) of an offline repository's 503.
+const OFFLINE_RETRY_AFTER_SECS: &str = "60";
 
 /// RBAC action corresponding to one NuGet protocol request.
 fn action_for_method(method: &Method) -> Action {
@@ -163,6 +166,18 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     };
     if !allowed {
         return authz_denied(&principal);
+    }
+    // An offline hosted or group repository serves nothing (a maintenance
+    // window); an offline proxy still serves what it cached, without asking
+    // its upstream. Answered after authorization, so it reveals nothing to a
+    // caller who may not use the repository.
+    if !repo.online && repo.kind() != RepoKind::Proxy {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, OFFLINE_RETRY_AFTER_SECS)],
+            "repository is offline",
+        )
+            .into_response();
     }
     let package_filter = state
         .authz

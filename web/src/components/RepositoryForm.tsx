@@ -258,7 +258,12 @@ export function RepositoryForm({
             checked={values.online}
             onChange={(c) => set('online', c)}
           />
-          <Label>Online (serve requests)</Label>
+          <Label>Online</Label>
+          <Description>
+            {isProxy
+              ? 'Offline, the proxy serves only packages it has already cached and never contacts the upstream.'
+              : 'Offline, the repository answers every feed request with 503 (a maintenance window); in a group it counts as a failing member.'}
+          </Description>
         </CheckboxField>
         <CheckboxField>
           <Checkbox

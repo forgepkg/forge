@@ -609,6 +609,15 @@ impl GroupRepo {
         }))
     }
 
+    /// The read ops of `member`: an offline hosted member fails every read
+    /// ([`OfflineMember`]); an offline proxy still serves what it cached.
+    fn member_ops(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        if !member.online && member.kind() == RepoKind::Hosted {
+            return Ok(Arc::new(OfflineMember(member.name.clone())));
+        }
+        self.factory.ops_for(member)
+    }
+
     /// The format's canonical (stored) form of a package id — what
     /// `component.name` holds.
     fn lower_id(&self, id: &str) -> String {
@@ -687,7 +696,7 @@ impl GroupRepo {
             };
             out.push(VisibleMember {
                 repo: repo.clone(),
-                ops: self.factory.ops_for(repo)?,
+                ops: self.member_ops(repo)?,
             });
         }
         Ok(out)
@@ -747,7 +756,7 @@ impl GroupRepo {
         let mut candidates: Vec<RankedHit> = Vec::new();
         let mut failures = MemberFailures::default();
         for (member, leaf) in graph.leaves.iter().enumerate() {
-            let ops = self.factory.ops_for(leaf)?;
+            let ops = self.member_ops(leaf)?;
             member_ops.push(ops.clone());
             let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let result = match ops
@@ -999,6 +1008,54 @@ impl RepoReadOps for GroupRepo {
 /// nested group contributes its own owners, so its flags still count when it
 /// is read through an outer group. A group already on the current descent
 /// (a cycle a raw database write could create) contributes nothing.
+/// The read ops of an offline hosted member: every read fails as
+/// temporarily unavailable, so the group treats it as a failing member
+/// (clients retry rather than cache a miss) instead of serving it.
+struct OfflineMember(String);
+
+impl OfflineMember {
+    fn error(&self) -> RepoError {
+        RepoError::Busy(format!("repository {} is offline", self.0))
+    }
+}
+
+#[async_trait]
+impl RepoReadOps for OfflineMember {
+    async fn list_versions(&self, _repo: &str, _id: &str) -> Result<Vec<VersionEntry>, RepoError> {
+        Err(self.error())
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        Err(self.error())
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        Err(self.error())
+    }
+
+    async fn registration(
+        &self,
+        _repo: &str,
+        _id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        Err(self.error())
+    }
+
+    async fn search(&self, _repo: &str, _params: &SearchParams) -> Result<SearchResult, RepoError> {
+        Err(self.error())
+    }
+}
+
 fn group_owners(
     group_id: i64,
     adjacency: &HashMap<i64, Vec<Repository>>,
