@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM proxy_cached_version\n        WHERE repository_id = $1 AND NOT downloaded\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16cab622f9d9fc03966b7b1def58ac10eb2d046fa4a47f01a7b234860e68578c"
+}

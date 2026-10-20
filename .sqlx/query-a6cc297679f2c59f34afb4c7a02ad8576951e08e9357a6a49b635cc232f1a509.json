@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, repository_id, name, original_id, version, version_original,\n            listed, created_at, updated_at\n        FROM component\n        WHERE repository_id = $1 AND strpos(name, $2) > 0\n        ORDER BY name, id\n        ",
+  "query": "\n        SELECT\n            c.id, c.original_id, c.version, c.listed, c.created_at,\n            c.manifest_summary, a.sha512_base64 AS \"package_hash_sha512_base64?\"\n        FROM component c\n        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4\n        WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3::text[])\n        ORDER BY c.id\n        ",
   "describe": {
     "columns": [
       {
@@ -16,28 +16,6 @@
       },
       {
         "ordinal": 1,
-        "name": "repository_id",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "component",
-            "name": "repository_id"
-          }
-        }
-      },
-      {
-        "ordinal": 2,
-        "name": "name",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "component",
-            "name": "name"
-          }
-        }
-      },
-      {
-        "ordinal": 3,
         "name": "original_id",
         "type_info": "Text",
         "origin": {
@@ -48,7 +26,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 2,
         "name": "version",
         "type_info": "Text",
         "origin": {
@@ -59,18 +37,7 @@
         }
       },
       {
-        "ordinal": 5,
-        "name": "version_original",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "component",
-            "name": "version_original"
-          }
-        }
-      },
-      {
-        "ordinal": 6,
+        "ordinal": 3,
         "name": "listed",
         "type_info": "Bool",
         "origin": {
@@ -81,7 +48,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 4,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -92,13 +59,24 @@
         }
       },
       {
-        "ordinal": 8,
-        "name": "updated_at",
-        "type_info": "Timestamptz",
+        "ordinal": 5,
+        "name": "manifest_summary",
+        "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "component",
-            "name": "updated_at"
+            "name": "manifest_summary"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "package_hash_sha512_base64?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "sha512_base64"
           }
         }
       }
@@ -106,6 +84,8 @@
     "parameters": {
       "Left": [
         "Int8",
+        "Text",
+        "TextArray",
         "Text"
       ]
     },
@@ -115,11 +95,9 @@
       false,
       false,
       false,
-      false,
-      false,
-      false,
-      false
+      true,
+      true
     ]
   },
-  "hash": "1ef3ef61c9441ad7466686e678401cb95c5bbc9a7470ddf89bb6210957664bef"
+  "hash": "a6cc297679f2c59f34afb4c7a02ad8576951e08e9357a6a49b635cc232f1a509"
 }

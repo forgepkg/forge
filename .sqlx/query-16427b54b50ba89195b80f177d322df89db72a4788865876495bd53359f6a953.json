@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE asset SET download_count = $3, last_downloaded_at = $4\n                WHERE component_id = $1 AND path = $2\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16427b54b50ba89195b80f177d322df89db72a4788865876495bd53359f6a953"
+}
