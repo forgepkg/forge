@@ -11,6 +11,11 @@
 #   2. chef/...  — cargo-chef + release build of forge-server (SQLX_OFFLINE)
 #   3. runtime  — debian:bookworm-slim with the binary, the SPA, and migrations/
 #
+# Licenses: the runtime image carries LICENSE and the third-party notices of
+# the Rust crates and npm packages it ships in /usr/share/doc/forge/. For the
+# SBOM attestation (release.yml), the web and builder stages are scanned as
+# well as the final one, and the binary embeds its crate list (cargo-auditable).
+#
 # Build:  docker build -t envisia-forge:latest .   (or `cargo xtask docker-build`)
 # Run:    see the `runtime` stage footer for required FORGE_* env vars.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -22,6 +27,10 @@
 # Base images are pinned by digest (tag kept for readability); Dependabot
 # (.github/dependabot.yml) proposes tag + digest bumps.
 FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913 AS web
+# BuildKit scans only the final stage for the SBOM unless a stage declares
+# this: the npm packages are in node_modules here, but only minified into the
+# bundle the runtime image ships.
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 WORKDIR /web
 
 # Enable the pinned pnpm via corepack before any install. Node 25+ no longer
@@ -29,9 +38,16 @@ WORKDIR /web
 RUN npm install -g corepack@0.36.0 && corepack enable
 
 # Install deps first (cache layer keyed on the lockfile + manifests only).
+# `pnpm licenses` reads the store, a cache mount, so it runs in the same step:
+# the licenses of the production dependencies, the packages the SPA ships.
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile \
+    && mkdir /licenses \
+    && pnpm licenses list --prod --json > /licenses/web-licenses.json
+# Their third-party notices, with each package's license files.
+COPY docker/licenses/web-notices.mjs /licenses/
+RUN node /licenses/web-notices.mjs /licenses/web-licenses.json > /licenses/THIRD-PARTY-WEB.txt
 
 # Build the SPA. `pnpm run build` = `tsc --noEmit && vite build` → web/dist.
 COPY web/ ./
@@ -52,6 +68,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # Exact version: the dependency-layer recipe format is cargo-chef specific.
 RUN cargo install cargo-chef --locked --version 0.1.78
+# cargo-auditable embeds the binary's crate list in it, where SBOM generators
+# and image scanners find it (they do not read Cargo.lock in an image);
+# cargo-about renders the crates' license notices. Pinned like cargo-chef.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install cargo-auditable --locked --version 0.7.7 \
+    && cargo install cargo-about --locked --version 0.9.2 --features cli
 WORKDIR /app
 
 # ── Stage 2b: plan the dependency graph ───────────────────────────────────────
@@ -61,6 +83,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Stage 2c: build dependencies, then the workspace ──────────────────────────
 FROM chef AS builder
+# Scanned for the SBOM as well (see the web stage): Cargo.lock and the crates.
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 # sqlx is compile-time-checked against the committed .sqlx/ offline cache; no DB
 # is reachable in the image build, so the offline mode is mandatory.
 ENV SQLX_OFFLINE=true
@@ -79,8 +103,18 @@ ENV FORGE_GIT_SHA=${FORGE_GIT_SHA}
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p forge-server \
+    cargo auditable build --release --locked -p forge-server \
     && cp target/release/forge-server /usr/local/bin/forge-server
+# Third-party notices for the crates compiled into forge-server
+# (docker/licenses/about.toml). cargo-about reads the metadata of every locked
+# crate, so fetch those of the other platforms too; then it needs no network
+# (--frozen) and takes the license texts from the crates' sources.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo fetch --locked \
+    && mkdir /licenses \
+    && cargo about generate --frozen --fail -c docker/licenses/about.toml \
+       -m crates/server/Cargo.toml -o /licenses/THIRD-PARTY-RUST.txt \
+       docker/licenses/about.hbs
 
 
 # ── Stage 3: slim runtime ─────────────────────────────────────────────────────
@@ -103,6 +137,11 @@ RUN apt-get update \
 RUN useradd --system --uid 10001 --user-group --no-create-home forge
 WORKDIR /app
 
+# The license (AGPL-3.0-only; see README.md for the alternative envisia
+# license) and the third-party notices of what the image redistributes.
+COPY LICENSE /usr/share/doc/forge/LICENSE
+COPY --from=builder /licenses/THIRD-PARTY-RUST.txt /usr/share/doc/forge/
+COPY --from=web /licenses/THIRD-PARTY-WEB.txt /usr/share/doc/forge/
 # The server binary.
 COPY --from=builder /usr/local/bin/forge-server /usr/local/bin/forge-server
 # The built SPA (served from FORGE_WEB__ASSETS_DIR, default /app/web/dist below).

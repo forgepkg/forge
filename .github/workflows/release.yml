@@ -230,6 +230,8 @@ jobs:
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
             FORGE_VERSION=${{ steps.version.outputs.version }}
+          # Covers the crates and npm packages too: the Dockerfile has its web
+          # and builder stages scanned, and the binary embeds its crate list.
           sbom: true
           provenance: mode=max
           cache-from: type=gha

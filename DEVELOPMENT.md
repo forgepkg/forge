@@ -516,6 +516,17 @@ and the static SPA on a single port (no Node in prod):
    the `migrations/` dir, and a baked secret-free base config at `/app/forge.toml`
    (migrations are also embedded into the binary via `sqlx::migrate!`).
 
+The runtime image carries `LICENSE` and the third-party notices of what it
+redistributes in `/usr/share/doc/forge/`: `THIRD-PARTY-RUST.txt` for the
+crates compiled into the binary (cargo-about, configured in
+`docker/licenses/about.toml`; a crate under a license missing from its
+`accepted` list fails the build) and `THIRD-PARTY-WEB.txt` for the npm
+packages the SPA ships (`pnpm licenses list --prod`, rendered by
+`docker/licenses/web-notices.mjs`). The binary is built with `cargo auditable`,
+so it embeds its crate list for SBOM generators and image scanners, and the
+`web` and `builder` stages declare `BUILDKIT_SBOM_SCAN_STAGE`, so the release's
+SBOM attestation covers the npm packages and crates, not just Debian's.
+
 ```bash
 cargo xtask docker-build       # docker build -t envisia-forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
