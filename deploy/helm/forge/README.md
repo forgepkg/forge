@@ -10,7 +10,7 @@ Each release publishes the chart to GitHub Container Registry as an OCI
 artifact, with the same version as the image:
 
 ```bash
-helm install forge oci://ghcr.io/schmitch/charts/forge --version 0.1.0 \
+helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
   --namespace forge --create-namespace --values my-values.yaml
 ```
 
@@ -22,7 +22,7 @@ built and signed into the published chart (the `forge.envisia.de/image-digest`
 annotation in `Chart.yaml`), so a published chart deploys exactly that image:
 
 ```
-ghcr.io/schmitch/forge:0.1.0@sha256:…
+ghcr.io/schmitch/forge:1.0.0@sha256:…
 ```
 
 Setting `image.tag` or `image.digest` replaces that pin. Upgrading Forge is
@@ -182,7 +182,7 @@ Evaluation install, everything in the cluster:
 
 ```bash
 password=$(openssl rand -hex 12); echo "admin password: $password"
-helm install forge oci://ghcr.io/schmitch/charts/forge --version 0.1.0 \
+helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
   --namespace forge-eval --create-namespace \
   --set postgresql.enabled=true --set versitygw.enabled=true \
   --set secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD="$password"

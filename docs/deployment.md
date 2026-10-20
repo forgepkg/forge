@@ -27,7 +27,7 @@ below, and pin the image to the release they belong to.
 ## Image
 
 ```bash
-docker pull ghcr.io/<owner>/<repo>:0.1.0
+docker pull ghcr.io/<owner>/<repo>:1.0.0
 ```
 
 Release images are signed with keyless cosign and carry an SBOM and a
@@ -37,7 +37,7 @@ that release's tag:
 
 ```bash
 cosign verify ghcr.io/<owner>/<repo>@<digest> \
-  --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v1.0.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -417,6 +417,6 @@ as described above, then start Forge. Practise this before you need it.
   the database requires restoring the backup taken before the upgrade.
 - Back up (see above) before every upgrade.
 
-## Known limitations in 0.1.0
+## Known limitations
 
-See the "Known limitations" section of the [changelog](../CHANGELOG.md#010).
+See the "Known limitations" section of the [changelog](../CHANGELOG.md#known-limitations).

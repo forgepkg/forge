@@ -326,7 +326,7 @@ async fn blob_upsert_pending_returns_true_then_false() {
     assert_eq!(blob.size, 123);
 }
 
-/// The aftermath of the pre-0.1.0 concurrent hard-delete race: a blob left
+/// The aftermath of the pre-release concurrent hard-delete race: a blob left
 /// `deleting` with `ref_count` 0 that an asset still names. Neither the outbox
 /// nor a re-push of the same bytes may delete its object (a re-push used to
 /// take the stale reservation over and delete the object every 60 s); the

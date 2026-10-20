@@ -305,11 +305,12 @@ fn release_changelog(changelog: &str, version: &str) -> Result<String, String> {
         if i == start {
             out.push_str("## [Unreleased]\n\n");
             out.push_str(&heading);
-        } else if let Some((repo, _)) = line
-            .strip_prefix("[Unreleased]: ")
-            .and_then(|url| url.split_once("/compare/"))
-        {
-            // `[Unreleased]: <repo>/compare/v<previous>...HEAD`
+        } else if let Some((repo, _)) = line.strip_prefix("[Unreleased]: ").and_then(|url| {
+            url.split_once("/compare/")
+                .or_else(|| url.split_once("/commits/"))
+        }) {
+            // `[Unreleased]: <repo>/compare/v<previous>...HEAD`, or before
+            // the first release `<repo>/commits/<branch>`.
             out.push_str(&format!("[Unreleased]: {repo}/compare/v{version}...HEAD\n"));
             out.push_str(&format!("[{version}]: {repo}/releases/tag/v{version}"));
         } else {
@@ -413,6 +414,18 @@ mod tests {
              [Unreleased]: https://github.com/o/r/compare/v0.2.0...HEAD\n\
              [0.2.0]: https://github.com/o/r/releases/tag/v0.2.0\n\
              [0.1.0]: https://github.com/o/r/releases/tag/v0.1.0\n"
+        );
+    }
+
+    #[test]
+    fn first_release_links_compare_from_its_tag() {
+        let first = "# Changelog\n\n## [Unreleased]\n\n- everything\n\n\
+                     [Unreleased]: https://github.com/o/r/commits/main\n";
+        assert_eq!(
+            release_changelog(first, "1.0.0").unwrap(),
+            "# Changelog\n\n## [Unreleased]\n\n## [1.0.0]\n\n- everything\n\n\
+             [Unreleased]: https://github.com/o/r/compare/v1.0.0...HEAD\n\
+             [1.0.0]: https://github.com/o/r/releases/tag/v1.0.0\n"
         );
     }
 

@@ -3134,7 +3134,7 @@ mod tests {
         });
     }
 
-    /// Secret env values keep their pre-0.1.0 normalization: surrounding
+    /// Secret env values keep their pre-release normalization: surrounding
     /// whitespace (a trailing newline from a secret file) is trimmed and one
     /// pair of surrounding double quotes is removed.
     #[test]

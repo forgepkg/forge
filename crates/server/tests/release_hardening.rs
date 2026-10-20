@@ -1,4 +1,4 @@
-//! E2E regressions for the 0.1.0 release blockers:
+//! E2E regressions for the first release's blockers:
 //! * a dead session cookie never locks the browser out (login, pages) and is
 //!   cleared on the response;
 //! * a cross-site browser mutation is refused even with cached Basic

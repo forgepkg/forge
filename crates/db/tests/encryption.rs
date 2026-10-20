@@ -758,7 +758,7 @@ async fn upstream_password_end_to_end() {
     let legacy = repository_dao::insert_repository(&pool, legacy)
         .await
         .unwrap();
-    // A row 0.1.0's backfill left behind: envelope written, plaintext kept.
+    // A row a pre-release backfill left behind: envelope written, plaintext kept.
     let mut leftover = NewRepository::proxy("crypt-leftover");
     leftover.upstream_password = Some("leftover-pw".to_string());
     let leftover = repository_dao::insert_repository(&pool, leftover)

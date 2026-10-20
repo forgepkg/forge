@@ -303,8 +303,8 @@ pub async fn get_upstream_credential(
 /// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3).
 ///
 /// 1. Rows that already carry `_enc` **and** a leftover plaintext copy (rows
-///    backfilled by 0.1.0, which kept the plaintext) lose the plaintext: the
-///    envelope is the authoritative value on every read path.
+///    backfilled by pre-release builds, which kept the plaintext) lose the
+///    plaintext: the envelope is the authoritative value on every read path.
 /// 2. Up to `batch` rows whose plaintext column is set and whose `_enc` column
 ///    is still NULL are sealed; the plaintext is NULLed **in the same guarded
 ///    UPDATE** (guarded on the exact plaintext read and `_enc IS NULL`, and on
