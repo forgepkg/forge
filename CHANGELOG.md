@@ -300,6 +300,16 @@ First production release.
   `.nuspec` or `<metadata>` could be taken for the manifest, so Forge and a
   NuGet client could see different identities for one package — enough to
   publish past an id-scoped grant.
+- The root manifest is found the way NuGet finds it: an entry name holding
+  `%` is percent-decoded, and `\` separates directories as `/` does. Before,
+  a package holding `x\allowed.nuspec` and `victim%2Enuspec` was stored as
+  `Allowed.*` while NuGet read `Victim.*` from it. A package is now refused
+  when any reading of its entry names finds more than one root manifest, or
+  when the manifest's own name holds `%` or `\`. Also refused: an archive
+  that repeats an entry name (the zip reader saw one of them, NuGet all);
+  an entry with an Info-ZIP Unicode Path field (0x7075), which renames the
+  entry for the zip reader but not for .NET; and a manifest with a
+  `<!DOCTYPE>`, which NuGet will not read.
 - Request bounds on the feed: a search `q` is cut to 256 bytes and at most
   8 distinct terms (each term costs a substring scan per candidate id, and
   `q` was unbounded), and a push whose multipart body does not reach its
