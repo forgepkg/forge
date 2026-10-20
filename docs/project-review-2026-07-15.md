@@ -1,7 +1,7 @@
 # Envisia Forge whole-project review
 
 **Review date:** 2026-07-15
-**Reviewed revision:** `93d4648f24f2` (`main`)
+**Reviewed revision:** `848c5e446dee` (`main`)
 **Scope:** architecture, NuGet behavior, storage, authentication, authorization,
 secret handling, workers, frontend, tests, CI/CD, operations, documentation, the
 published roadmap, and trusted-publishing readiness.
@@ -16,7 +16,7 @@ is in [deployment.md](deployment.md).
 ## Remediation addendum — 2026-07-16 working tree
 
 The review below is intentionally preserved as the point-in-time assessment of
-revision `93d4648f24f2`. The following items have since been implemented in the
+revision `848c5e446dee`. The following items have since been implemented in the
 current working tree:
 
 | Original finding | Current remediation status |

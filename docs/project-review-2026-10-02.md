@@ -1,7 +1,7 @@
 # Envisia Forge production-readiness review
 
 **Review date:** 2026-10-02
-**Reviewed revision:** `69436de` (`main`, the merge of PR #8, "0.1.0 readiness")
+**Reviewed revision:** `027c54d` (`main`, the merge of PR #8, "0.1.0 readiness")
 **Question:** is the 0.1.0 release ready for production?
 
 ## Verdict
@@ -37,51 +37,51 @@ and upgrade notes are in the [0.1.0 changelog](../CHANGELOG.md#010).
 
 | Finding | Status | Commits |
 |---|---|---|
-| B1 hard-delete double decrement | Fixed; reproduced first, deterministic race tests; migration 0017 adds `CHECK (ref_count >= 0)` and repairs pre-existing drift; GC never deletes a blob an asset names | `e5dc1c9` `567d7d7` `076d896` `79b9ef8` `4d53dec` |
-| B2 `prefer_hosted` guard bypass | Fixed: ownership decided over every hosted leaf, caller-independent; e2e for anonymous and selector-scoped callers | `d10576f` |
-| B3 login-lockout memory exhaustion | Fixed: 256-byte username cap, fixed-size keys, swept entries | `ef1c95d` |
-| B4 admin tokens as admin credentials | Fixed: admin only with an explicit `admin` token scope | `6aec710` |
-| H1 DB connection held across credential forwards | Fixed: lease-based singleflight, per-realm concurrency bound, realm timeouts applied | `52188da` |
-| H2 hosted-scope retention on proxies | Fixed: rejected at validation and in the worker; proxy self-heals a missing local copy | `70dd66d` `1b6ef2b` |
-| H3 proxy not-found marker | Fixed: TTL-bound, cleared by listings, unconfirmed rows never listed and pruned | `1b6ef2b` `b275e04` |
-| H4 SPA 401 loop | Fixed | `431cc1a` |
-| M1 selector PATCH | Fixed | `b2dda5b` |
-| M2 upstream credentials after `remote_url` change | Fixed (server and UI) | `b2dda5b` `e31f2de` |
-| M3 credential forwarding follows redirects | Fixed | `52188da` |
-| M4 argon2 cost and concurrency | Fixed; timing of unknown vs. federated names equalized | `ef1c95d` `dbcfa31` |
-| M5 federated users cannot be cut off | Fixed: `PATCH /admin/users/{id}` deactivation | `f4adc41` |
-| M6 `keep_last_n` semantics | Fixed | `e0a09c3` |
-| M7 proxy eviction resets `first_seen_at` | Fixed | `72b5701` |
-| M8 group search amplification | Fixed | `383fcfc` `d10576f` |
-| M9 ZIP limits on every entry | Fixed; pre-check vets only the EOCD the reader uses | `f33977f` `7ddd59f` |
-| M10 upstream `.nuspec` passthrough | Fixed: identity check, metadata-address refusal | `c7449e6` `1b6ef2b` |
-| M11 proxy registration metadata | Fixed | `1b6ef2b` |
-| M12 `X-Forwarded-For` lines, mapped IPv6 | Fixed; mapped CIDR entries canonicalized | `ef1c95d` `8b05bd5` |
-| M13 key-rotation races | Fixed; lock guard owns the connection before locking | `24d09c6` `cebb9de` |
-| M14 plaintext left after enabling encryption | Fixed; ciphertext verified before a plaintext copy is dropped | `24d09c6` `bca4045` |
-| M15 bootstrap password removal breaks the image | Fixed: env-only bootstrap | `a9ec8f4` |
-| M16 release-pipeline trust | Fixed: sign by digest, exact identity, SHA-pinned actions, digest-pinned bases | `f332b1d` |
-| M17 admin deep links | Fixed: UI under `/manage/*`, legacy redirect | `45ead2b` `91c6a7a` |
-| M18 repository names | Fixed (server and UI) | `b2dda5b` `e31f2de` |
-| M19 GC indexes, outbox pruning | Fixed | `567d7d7` |
-| M20 legacy RBAC switches | Fixed for switches made from now on; earlier ones are an upgrade note | `b2dda5b` |
-| L1 cache first subscription | Fixed | `db7dbac` |
-| L2 multipart abort | Fixed | `8559741` |
-| L3 repository-delete gap | Fixed | `e5dc1c9` |
-| L4 publish vs. GC finalize | Fixed | `567d7d7` |
-| L5 backup wording | Fixed | `189f730` |
-| L6 token scope, nesting depth, signed-in reads | Fixed; signed-in public reach only under `anonymous_mode = "all"` | `6aec710` `b2dda5b` `fdeef48` |
-| L7 auth edge cases | Fixed (bootstrap marker, trailing-slash issuers, concurrent first OIDC logins, Host check) | `e113bfd` `4034f5b` `ef1c95d` `3ee50d6` |
-| L8 parsing edge cases | Fixed: ids lowered like .NET, ZIP directory pre-check, 1 MiB nuspec cap | `f33977f` `7c17f1c` `26e1398` |
-| L9 image and config | Fixed (numeric UID, secret env handling, exact `FORGE_CONFIG`, Basic default) | `a9ec8f4` `f332b1d` `6d960d0` |
-| L10 retention panic | Fixed | `70dd66d` |
-| L11 SPA polish | Fixed (`Retry-After` added server-side) | `45ead2b` `431cc1a` `6fd8204` |
-| L12 dependencies | Fixed: advisories removed, `cargo audit` and `pnpm audit --prod` in CI, Dependabot. **Not done:** container image OS scan (see the changelog) | `f332b1d` `9b5b6c3` |
-| L13 docs drift | Fixed | `189f730` |
+| B1 hard-delete double decrement | Fixed; reproduced first, deterministic race tests; migration 0017 adds `CHECK (ref_count >= 0)` and repairs pre-existing drift; GC never deletes a blob an asset names | `11b08dc` `54fa80e` `6acdc24` `1129109` `2fe6e5e` |
+| B2 `prefer_hosted` guard bypass | Fixed: ownership decided over every hosted leaf, caller-independent; e2e for anonymous and selector-scoped callers | `b12d5ce` |
+| B3 login-lockout memory exhaustion | Fixed: 256-byte username cap, fixed-size keys, swept entries | `b5aea85` |
+| B4 admin tokens as admin credentials | Fixed: admin only with an explicit `admin` token scope | `15bc88f` |
+| H1 DB connection held across credential forwards | Fixed: lease-based singleflight, per-realm concurrency bound, realm timeouts applied | `9b6894e` |
+| H2 hosted-scope retention on proxies | Fixed: rejected at validation and in the worker; proxy self-heals a missing local copy | `3bfeefc` `f812950` |
+| H3 proxy not-found marker | Fixed: TTL-bound, cleared by listings, unconfirmed rows never listed and pruned | `f812950` `a5d6697` |
+| H4 SPA 401 loop | Fixed | `4ca273c` |
+| M1 selector PATCH | Fixed | `486cc6b` |
+| M2 upstream credentials after `remote_url` change | Fixed (server and UI) | `486cc6b` `7fe8299` |
+| M3 credential forwarding follows redirects | Fixed | `9b6894e` |
+| M4 argon2 cost and concurrency | Fixed; timing of unknown vs. federated names equalized | `b5aea85` `863047c` |
+| M5 federated users cannot be cut off | Fixed: `PATCH /admin/users/{id}` deactivation | `8a79ce0` |
+| M6 `keep_last_n` semantics | Fixed | `bd33ffa` |
+| M7 proxy eviction resets `first_seen_at` | Fixed | `375b483` |
+| M8 group search amplification | Fixed | `df73d41` `b12d5ce` |
+| M9 ZIP limits on every entry | Fixed; pre-check vets only the EOCD the reader uses | `295c87b` `d904efb` |
+| M10 upstream `.nuspec` passthrough | Fixed: identity check, metadata-address refusal | `65beb52` `f812950` |
+| M11 proxy registration metadata | Fixed | `f812950` |
+| M12 `X-Forwarded-For` lines, mapped IPv6 | Fixed; mapped CIDR entries canonicalized | `b5aea85` `7afb40b` |
+| M13 key-rotation races | Fixed; lock guard owns the connection before locking | `501c2fe` `1e6b6da` |
+| M14 plaintext left after enabling encryption | Fixed; ciphertext verified before a plaintext copy is dropped | `501c2fe` `0606ff4` |
+| M15 bootstrap password removal breaks the image | Fixed: env-only bootstrap | `55c497f` |
+| M16 release-pipeline trust | Fixed: sign by digest, exact identity, SHA-pinned actions, digest-pinned bases | `be5337e` |
+| M17 admin deep links | Fixed: UI under `/manage/*`, legacy redirect | `804a350` `9e3b0d4` |
+| M18 repository names | Fixed (server and UI) | `486cc6b` `7fe8299` |
+| M19 GC indexes, outbox pruning | Fixed | `54fa80e` |
+| M20 legacy RBAC switches | Fixed for switches made from now on; earlier ones are an upgrade note | `486cc6b` |
+| L1 cache first subscription | Fixed | `51400fc` |
+| L2 multipart abort | Fixed | `04dd2a5` |
+| L3 repository-delete gap | Fixed | `11b08dc` |
+| L4 publish vs. GC finalize | Fixed | `54fa80e` |
+| L5 backup wording | Fixed | `4f6a2ea` |
+| L6 token scope, nesting depth, signed-in reads | Fixed; signed-in public reach only under `anonymous_mode = "all"` | `15bc88f` `486cc6b` `3febade` |
+| L7 auth edge cases | Fixed (bootstrap marker, trailing-slash issuers, concurrent first OIDC logins, Host check) | `678a6d7` `843944c` `b5aea85` `b2af52a` |
+| L8 parsing edge cases | Fixed: ids lowered like .NET, ZIP directory pre-check, 1 MiB nuspec cap | `295c87b` `3e35a28` `0f2bbe8` |
+| L9 image and config | Fixed (numeric UID, secret env handling, exact `FORGE_CONFIG`, Basic default) | `55c497f` `be5337e` `7618701` |
+| L10 retention panic | Fixed | `3bfeefc` |
+| L11 SPA polish | Fixed (`Retry-After` added server-side) | `804a350` `4ca273c` `667540c` |
+| L12 dependencies | Fixed: advisories removed, `cargo audit` and `pnpm audit --prod` in CI, Dependabot. **Not done:** container image OS scan (see the changelog) | `be5337e` `863d86c` |
+| L13 docs drift | Fixed | `4f6a2ea` |
 
 Additional defects found while fixing: unlist rules re-touched unlisted
-versions (`61c0bfc`); NuGet `DELETE` and redeploy race losers returned 500
-(`076d896`, `1828dc0`); lock-order deadlocks between deleters (`4d53dec`).
+versions (`b86438b`); NuGet `DELETE` and redeploy race losers returned 500
+(`6acdc24`, `43c2818`); lock-order deadlocks between deleters (`2fe6e5e`).
 
 The product gaps listed above (RBAC, retention and user-lifecycle consoles,
 anonymous web browse) are unchanged and recorded as known limitations.
