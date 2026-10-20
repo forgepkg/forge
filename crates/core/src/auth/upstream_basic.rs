@@ -467,7 +467,7 @@ impl AuthProvider for UpstreamBasicProvider {
                 // A store error talking to Postgres is infrastructure: fail
                 // closed (deny), never grant.
                 tracing::warn!(error = %e, "upstream-basic: credential cache store error (fail-closed)");
-                AuthOutcome::Unavailable
+                AuthOutcome::Failed
             }
         }
     }

@@ -531,9 +531,10 @@ impl WorkloadIdentitySource {
                 );
                 SourceOutcome::Reject
             }
+            // Not a verdict on the token: 503, so the CI job retries.
             Err(e) => {
                 tracing::error!(error = %e, "WIF role lookup failed");
-                SourceOutcome::Reject
+                SourceOutcome::Unavailable
             }
         }
     }
@@ -560,17 +561,18 @@ impl PrincipalSource for WorkloadIdentitySource {
         }
 
         // Resolve the realm snapshot. On a snapshot error we cannot route. If any
-        // presented secret structurally parses as a JWT we **reject** (terminal)
-        // rather than let it fall through to the password/token sources — a JWT
-        // must never be reinterpreted as a password, even while the realm table
-        // is unreadable. A request carrying no JWT-shaped secret declines, so the
-        // (separately fail-closed) token/Basic sources handle it as before.
+        // presented secret structurally parses as a JWT we stop as temporarily
+        // unavailable (terminal, 503) rather than let it fall through to the
+        // password/token sources — a JWT must never be reinterpreted as a
+        // password, even while the realm table is unreadable. A request
+        // carrying no JWT-shaped secret declines, so the (separately
+        // fail-closed) token/Basic sources handle it as before.
         let snap = match self.realms.snapshot().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "WIF realm snapshot failed");
                 if candidates.iter().any(|s| jwt_issuer(s).is_some()) {
-                    return SourceOutcome::Reject;
+                    return SourceOutcome::Unavailable;
                 }
                 return SourceOutcome::NoCredentials;
             }

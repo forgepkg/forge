@@ -66,6 +66,9 @@ pub enum ChainOutcome {
     /// but per §12.3 the wire response is still a denial (typically 401 to
     /// avoid leaking upstream health).
     Unavailable,
+    /// A provider's own store failed ([`AuthOutcome::Failed`]): the chain
+    /// stopped there. The caller denies, as "temporarily unavailable" (503).
+    Failed,
     /// No provider had anything to say about this credential (all skipped, or
     /// the chain is empty). The caller applies its anonymous-access policy.
     NoCredentials,
@@ -128,6 +131,8 @@ impl Chain {
                 AuthOutcome::Unavailable if provider.source() == AuthSource::Local => {
                     return ChainOutcome::Unavailable;
                 }
+                // The database failed: no later provider can decide either.
+                AuthOutcome::Failed => return ChainOutcome::Failed,
                 AuthOutcome::Rejected => saw_rejected = true,
                 AuthOutcome::Unavailable => saw_unavailable = true,
                 AuthOutcome::Skip => {}
@@ -158,9 +163,14 @@ impl Chain {
 #[async_trait::async_trait]
 pub trait ChainSource: Send + Sync {
     /// The chain to run a password credential through right now, or `None`
-    /// when the password path is disabled.
-    async fn password_chain(&self) -> Option<Arc<Chain>>;
+    /// when the password path is disabled. `Err` when the realms cannot be
+    /// read: the caller denies, as "temporarily unavailable".
+    async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable>;
 }
+
+/// The realm configuration could not be read ([`ChainSource::password_chain`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainUnavailable;
 
 /// A fixed [`ChainSource`]: the startup-built chain (or a disabled path).
 /// Used by tests and any wiring without DB-driven realms.
@@ -168,8 +178,8 @@ pub struct StaticChainSource(pub Option<Arc<Chain>>);
 
 #[async_trait::async_trait]
 impl ChainSource for StaticChainSource {
-    async fn password_chain(&self) -> Option<Arc<Chain>> {
-        self.0.clone()
+    async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable> {
+        Ok(self.0.clone())
     }
 }
 

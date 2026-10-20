@@ -425,7 +425,11 @@ impl PrincipalSource for BasicAuthSource {
         // Then, if a password chain is configured, run the secret as a password
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
-        if let Some(chain) = self.chain.password_chain().await {
+        let chain = match self.chain.password_chain().await {
+            Ok(chain) => chain,
+            Err(_) => return SourceOutcome::Unavailable,
+        };
+        if let Some(chain) = chain {
             // The lockout, the chain and the account lookup all key on the
             // canonical username, so `Alice`/`alice ` share one budget and
             // one account. A name that cannot be canonical is a bad login.
@@ -473,18 +477,20 @@ impl PrincipalSource for BasicAuthSource {
                             }
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
-                        // Vouched-for but no (active) app_user row, or a DB
-                        // error during mapping: fail closed. Basic creds were
-                        // presented, so this is an attempted-but-failed login
-                        // (Invalid → 401), never a downgrade to anonymous.
+                        // Vouched-for but no (active) app_user row: fail closed.
+                        // Basic creds were presented, so this is an
+                        // attempted-but-failed login (Invalid → 401), never a
+                        // downgrade to anonymous.
                         Ok(None) => {
                             attempt.failed();
                             return SourceOutcome::Invalid;
                         }
+                        // A DB error during mapping: denied too, but as
+                        // temporarily unavailable (503), so clients retry.
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
                             attempt.released();
-                            return SourceOutcome::Invalid;
+                            return SourceOutcome::Unavailable;
                         }
                     }
                 }
@@ -501,6 +507,12 @@ impl PrincipalSource for BasicAuthSource {
                 ChainOutcome::Unavailable => {
                     attempt.released();
                     return SourceOutcome::Invalid;
+                }
+                // Forge's own database failed: 503, so clients retry instead
+                // of asking for new credentials.
+                ChainOutcome::Failed => {
+                    attempt.released();
+                    return SourceOutcome::Unavailable;
                 }
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still

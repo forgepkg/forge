@@ -33,7 +33,7 @@ pub mod upstream_basic;
 pub use authz::Authz;
 pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
-    StaticChainSource,
+    ChainUnavailable, StaticChainSource,
 };
 pub use client_ip::{
     forwarded_for, resolve_client, resolve_client_ip, AllowlistParseError, AnonPolicy,

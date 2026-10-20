@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use forge_cache::Cache;
 use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, CredKeyPepper, ForwardLimits, LocalPasswordProvider,
-    PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
+    AuthProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper, ForwardLimits,
+    LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_crypto::service::EnvelopeService;
@@ -780,13 +780,13 @@ impl RealmAuth {
 /// handling.
 #[async_trait::async_trait]
 impl ChainSource for RealmAuth {
-    async fn password_chain(&self) -> Option<Arc<Chain>> {
+    async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable> {
         match self.snapshot().await {
-            Ok(s) if s.wire_password_enabled => s.chain.clone(),
-            Ok(_) => None,
+            Ok(s) if s.wire_password_enabled => Ok(s.chain.clone()),
+            Ok(_) => Ok(None),
             Err(e) => {
                 tracing::error!(error = %e, "realm snapshot failed; password path denied");
-                None
+                Err(ChainUnavailable)
             }
         }
     }
