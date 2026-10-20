@@ -302,7 +302,8 @@ fn nuspec_of(nupkg: &[u8]) -> Vec<u8> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(nupkg)).expect("nupkg zip");
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).unwrap();
-        if entry.name().ends_with(".nuspec") && !entry.name().contains('/') {
+        let name = entry.name().unwrap().into_owned();
+        if name.ends_with(".nuspec") && !name.contains('/') {
             let mut out = Vec::new();
             entry.read_to_end(&mut out).unwrap();
             return out;

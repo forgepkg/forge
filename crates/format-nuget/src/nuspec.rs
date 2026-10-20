@@ -334,11 +334,13 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| NupkgError::InvalidZip(e.to_string()))?;
+        let name = entry
+            .name()
+            .map_err(|e| NupkgError::InvalidZip(e.to_string()))?;
 
         if entry.encrypted() {
             return Err(NupkgError::UnsupportedEntry(format!(
-                "entry {:?} is encrypted",
-                entry.name()
+                "entry {name:?} is encrypted"
             )));
         }
 
@@ -353,8 +355,7 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
             )));
         }
 
-        let name = entry.name();
-        if is_nuspec_name(name) && !name.contains('/') {
+        if is_nuspec_name(&name) && !name.contains('/') {
             if nuspec_index.is_some() {
                 return Err(NupkgError::MalformedNuspec(
                     "the package root holds more than one .nuspec".into(),
