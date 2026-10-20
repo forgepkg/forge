@@ -25,10 +25,10 @@ use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
-    is_semver2, CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation,
-    PublishAuthorizationContext, PublishOutcome, PublishPolicy, RegistrationEntry, RepoError,
-    RepoReadOps, SearchHit, SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
-    NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
+    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
+    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
+    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
 /// Fetch raw bytes of a stored blob by its S3 object key.
@@ -79,11 +79,11 @@ impl HostedRepo {
     }
 
     /// Build one exact search result while applying package authorization
-    /// before paging. Hosted search currently loads its small Slice-1 corpus in
-    /// one query, so doing this here avoids reloading that corpus once per
-    /// selector page. With `enrich`, the returned page carries manifests and
-    /// download totals ([`Self::enrich_hits`]); a group searches its members
-    /// without and enriches only its own final page.
+    /// before paging: the ids that match are listed once, filtered by the
+    /// selector, counted and paged, and only the page's versions are loaded.
+    /// With `enrich`, the returned page carries manifests and download totals
+    /// ([`Self::enrich_hits`]); a group searches its members without and
+    /// enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -93,30 +93,52 @@ impl HostedRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let query = SearchQuery::parse(&params.q);
-        let comps = match query.prefilter() {
-            Some(sub) => {
-                component_dao::list_components_for_repo_matching(&self.pool, repo_id, sub).await?
-            }
-            None => component_dao::list_components_for_repo(&self.pool, repo_id).await?,
-        };
+        // Page over ids, not versions: the filters run in SQL, the selector
+        // and the query's terms on the (much shorter) id list, and versions
+        // are loaded for the returned page only.
+        let mut names: Vec<String> = component_dao::search_names(
+            &self.pool,
+            repo_id,
+            query.prefilter().unwrap_or(""),
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        .into_iter()
+        .filter(|name| filter.allows(name) && query.matches(name))
+        .collect();
+        // Byte order, as group results are ordered (SQL orders by the
+        // database collation, which may weigh punctuation differently).
+        names.sort_unstable();
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
 
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
-        for c in comps {
-            if !filter.allows(&c.name) || !query.matches(&c.name) {
-                continue;
-            }
+        use std::collections::HashMap;
+        let mut by_id: HashMap<String, Vec<forge_db::model::Component>> = HashMap::new();
+        for c in component_dao::search_versions(
+            &self.pool,
+            repo_id,
+            &page,
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        {
             by_id.entry(c.name.clone()).or_default().push(c);
         }
-
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, comps) in by_id {
-            let comps = self.sort_versions(comps);
-            let versions: Vec<VersionEntry> = comps
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
+        for name in &page {
+            let Some(comps) = by_id.remove(name) else {
+                // Changed between the two queries.
+                continue;
+            };
+            let versions: Vec<VersionEntry> = self
+                .sort_versions(comps)
                 .into_iter()
-                .filter(|c| c.listed)
-                .filter(|c| params.prerelease || !is_prerelease(&c.version))
-                .filter(|c| params.include_semver2 || !is_semver2(&c.version_original))
                 .map(|c| VersionEntry {
                     original_id: c.original_id,
                     version: c.version,
@@ -124,9 +146,6 @@ impl HostedRepo {
                     listed: c.listed,
                 })
                 .collect();
-            if versions.is_empty() {
-                continue;
-            }
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -135,17 +154,6 @@ impl HostedRepo {
                 ..Default::default()
             });
         }
-
-        hits.sort_by(|a, b| {
-            crate::format::lower_invariant(&a.original_id)
-                .cmp(&crate::format::lower_invariant(&b.original_id))
-        });
-        let total_hits = hits.len();
-        let mut hits: Vec<SearchHit> = hits
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
         if enrich {
             self.enrich_hits(repo_id, &mut hits).await?;
         }
@@ -281,11 +289,6 @@ impl HostedRepo {
             None => Ok(None),
         }
     }
-}
-
-/// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
-fn is_prerelease(version: &str) -> bool {
-    version.contains('-')
 }
 
 impl HostedRepo {

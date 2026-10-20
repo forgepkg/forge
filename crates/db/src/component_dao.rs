@@ -100,36 +100,50 @@ pub async fn list_versions(
     .await
 }
 
-/// List every component (all ids, all versions) in a repository, ordered by
-/// `(name, id)`. Used by hosted search, which groups in memory.
-pub async fn list_components_for_repo(
+/// The ids (lowercase names) of `repository_id` with at least one version a
+/// search shows: listed, a release unless `prerelease`, and not SemVer 2.0.0
+/// (build metadata, or a `.` in the prerelease label of `version_original`)
+/// unless `include_semver2`. With a non-empty `name_substring`, only ids
+/// containing it. Ordered by name; hosted search pages over this list and
+/// loads versions for the page only ([`search_versions`]).
+pub async fn search_names(
     pool: &PgPool,
     repository_id: i64,
-) -> sqlx::Result<Vec<Component>> {
-    sqlx::query_as!(
-        Component,
+    name_substring: &str,
+    prerelease: bool,
+    include_semver2: bool,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
         r#"
-        SELECT
-            id, repository_id, name, original_id, version, version_original,
-            listed, created_at, updated_at
+        SELECT DISTINCT name AS "name!"
         FROM component
-        WHERE repository_id = $1
-        ORDER BY name, id
+        WHERE repository_id = $1 AND listed
+          AND ($2 = '' OR strpos(name, $2) > 0)
+          AND ($3 OR strpos(version, '-') = 0)
+          AND ($4 OR version_original !~ '[+]|-.*[.]')
+        ORDER BY name
         "#,
         repository_id,
+        name_substring,
+        prerelease,
+        include_semver2,
     )
     .fetch_all(pool)
     .await
 }
 
-/// Like [`list_components_for_repo`], restricted in SQL to ids containing
-/// `name_substring` (lowercased) — a prefilter for search so a large
-/// repository is not loaded whole.
-pub async fn list_components_for_repo_matching(
+/// The versions of `names` in `repository_id` that [`search_names`] counts
+/// (same filters), ordered by `(name, id)`.
+pub async fn search_versions(
     pool: &PgPool,
     repository_id: i64,
-    name_substring: &str,
+    names: &[String],
+    prerelease: bool,
+    include_semver2: bool,
 ) -> sqlx::Result<Vec<Component>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_as!(
         Component,
         r#"
@@ -137,11 +151,15 @@ pub async fn list_components_for_repo_matching(
             id, repository_id, name, original_id, version, version_original,
             listed, created_at, updated_at
         FROM component
-        WHERE repository_id = $1 AND strpos(name, $2) > 0
+        WHERE repository_id = $1 AND name = ANY($2::text[]) AND listed
+          AND ($3 OR strpos(version, '-') = 0)
+          AND ($4 OR version_original !~ '[+]|-.*[.]')
         ORDER BY name, id
         "#,
         repository_id,
-        name_substring,
+        names,
+        prerelease,
+        include_semver2,
     )
     .fetch_all(pool)
     .await

@@ -570,3 +570,56 @@ async fn search_take_is_clamped() {
     };
     assert_eq!(z.effective_take(), SearchParams::DEFAULT_TAKE);
 }
+
+/// #66: search pages over ids: `totalHits` counts every matching id, the
+/// selector applies before paging, and the page's versions are complete.
+#[tokio::test]
+async fn search_pages_over_ids_with_a_selector() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for i in 0..6 {
+        let id = format!("Pkg.{i}");
+        let lower = id.to_lowercase();
+        for (n, version) in ["1.0.0", "1.1.0"].into_iter().enumerate() {
+            seed_version(
+                &pool,
+                &mut blobs,
+                repo.id,
+                &id,
+                &lower,
+                version,
+                true,
+                &format!("p{i}{n}"),
+            )
+            .await;
+        }
+    }
+    let h = hosted(&pool, blobs);
+    let page = |skip, take| SearchParams {
+        q: "pkg".into(),
+        skip,
+        take,
+        ..SearchParams::default()
+    };
+    let res = h.search(&repo.name, &page(2, 2)).await.unwrap();
+    assert_eq!(res.total_hits, 6);
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(ids, ["Pkg.2", "Pkg.3"]);
+    let versions: Vec<&str> = res.hits[0]
+        .versions
+        .iter()
+        .map(|v| v.version.as_str())
+        .collect();
+    assert_eq!(versions, ["1.0.0", "1.1.0"]);
+    assert_eq!(res.hits[0].latest_version, "1.1.0");
+
+    let filter = forge_core::authz::PackageFilter::Predicate(Arc::new(|id: &str| id != "pkg.3"));
+    let res = h
+        .search_with_package_filter(&repo.name, &page(2, 2), &filter)
+        .await
+        .unwrap();
+    assert_eq!(res.total_hits, 5);
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(ids, ["Pkg.2", "Pkg.4"]);
+}
