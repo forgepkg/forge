@@ -152,16 +152,26 @@ pub enum Claim {
     Won { token: Uuid },
     /// The row already carries a fresh verdict (a peer wrote it): use it, do
     /// not forward.
-    Verdict(bool),
+    Verdict(FreshVerdict),
     /// A peer holds a live lease: poll [`claim_state`] and retry.
     Busy,
+}
+
+/// A fresh (non-expired) verdict and how long it has left, measured on the
+/// database clock, so a cache in front of the row never keeps it longer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshVerdict {
+    /// `true` = the credential was accepted.
+    pub verdict: bool,
+    /// Time until the row's `expires_at`.
+    pub remaining: Duration,
 }
 
 /// What a polling loser sees on the row (see [`claim_state`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimState {
     /// A fresh verdict landed.
-    Fresh(bool),
+    Fresh(FreshVerdict),
     /// A peer still holds a live lease.
     Claimed,
     /// Neither: the row is gone, expired, released or its lease lapsed — the
@@ -217,7 +227,7 @@ pub async fn claim_singleflight(
     }
     Ok(
         match claim_state(pool, provider_id, username, cred_hmac).await? {
-            ClaimState::Fresh(verdict) => Claim::Verdict(verdict),
+            ClaimState::Fresh(fresh) => Claim::Verdict(fresh),
             // `Open` here means the blocking row vanished or its lease lapsed
             // between the two statements; the caller's next poll re-claims it.
             ClaimState::Claimed | ClaimState::Open => Claim::Busy,
@@ -237,6 +247,7 @@ pub async fn claim_state(
         r#"
         SELECT verdict,
                expires_at > now() AS "fresh!",
+               GREATEST(EXTRACT(EPOCH FROM expires_at - now()), 0)::float8 AS "remaining_secs!",
                COALESCE(claimed_until > now(), false) AS "claimed!"
         FROM validated_credential
         WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3
@@ -248,7 +259,10 @@ pub async fn claim_state(
     .fetch_optional(pool)
     .await?;
     Ok(match row {
-        Some(r) if r.fresh => ClaimState::Fresh(r.verdict),
+        Some(r) if r.fresh => ClaimState::Fresh(FreshVerdict {
+            verdict: r.verdict,
+            remaining: Duration::from_secs_f64(r.remaining_secs),
+        }),
         Some(r) if r.claimed => ClaimState::Claimed,
         _ => ClaimState::Open,
     })

@@ -110,11 +110,13 @@ impl L1 {
             }
         }
 
-        let expires_at = Instant::now() + ttl;
+        let started = Instant::now();
         let entry = self
             .cache
             .try_get_with(full_key, async move {
                 let entry = init().await?;
+                // A factory-chosen lifetime only ever shortens the TTL.
+                let expires_at = started + entry.lifetime().map_or(ttl, |l| l.min(ttl));
                 Ok::<L1Entry, E>(L1Entry { expires_at, entry })
             })
             .await

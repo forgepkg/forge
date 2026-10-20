@@ -350,6 +350,36 @@ async fn zero_run_intervals_do_not_rerun_back_to_back() {
 }
 
 #[tokio::test]
+async fn a_run_survives_an_app_clock_behind_the_database() {
+    // #27: with this process's clock an hour behind the database's, the
+    // run's lease was computed from the process clock and so had already
+    // run out by the database's `now()`: every apply step failed its lease
+    // fence, and retention on the instance never removed anything.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rwc-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "r", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let skewed = common::pool_with_clock_ahead().await;
+    let w = worker(&skewed, config()); // a 60 s lease, an hour of skew
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(summary.deleted, 1);
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+}
+
+#[tokio::test]
 async fn dry_run_only_audits_but_mutates_nothing() {
     let pool = pool().await;
     let n = unique();

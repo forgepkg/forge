@@ -689,6 +689,85 @@ async fn token_scope_narrows_to_read_only() {
     assert_eq!(status, 201, "unscoped token may write; got {status}");
 }
 
+/// #32: reading a group grants no read on its members, and a token scope is
+/// no exception. Scoped to the group alone a token sees an empty feed; with
+/// the member listed too, the group serves it. (Documented behavior.)
+#[tokio::test]
+async fn a_token_scoped_to_a_group_reads_only_the_members_it_lists() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let hosted = make_repo(&srv).await;
+    let id = format!("Scoped.Group{}", common::unique());
+    let admin_token = srv.admin_token().await;
+    assert_eq!(
+        publish_with_token(&srv, &hosted, &admin_token, &id, "1.0.0").await,
+        201
+    );
+    let group = format!("grp{}", common::unique());
+    for (url, body) in [
+        (
+            format!("{}/admin/repositories", srv.base_url),
+            json!({"name": group, "kind": "group"}),
+        ),
+        (
+            format!("{}/admin/repositories/{group}/members", srv.base_url),
+            json!({"member": hosted, "priority": 100}),
+        ),
+    ] {
+        let resp = client
+            .post(url)
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+    let repo_id = |name: String| {
+        let pool = srv.pool.clone();
+        async move {
+            forge_db::repository_dao::find_repository_by_name(&pool, &name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        }
+    };
+    let (group_id, hosted_id) = (repo_id(group.clone()).await, repo_id(hosted.clone()).await);
+    let admin_id = forge_db::user_dao::find_user_by_username(&srv.pool, &au)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let listing = |repositories: Vec<i64>| {
+        let (client, srv_url) = (client.clone(), srv.base_url.clone());
+        let (au, ap, group, lower) = (au.clone(), ap.clone(), group.clone(), id.to_lowercase());
+        async move {
+            let created: Value = client
+                .post(format!("{srv_url}/admin/users/{admin_id}/tokens"))
+                .basic_auth(&au, Some(&ap))
+                .json(&json!({"name": "ci", "scope": {"actions": ["read"],
+                                                       "repositories": repositories}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            client
+                .get(format!("{srv_url}/v3/{group}/flat/{lower}/index.json"))
+                .header("X-NuGet-ApiKey", created["token"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(listing(vec![group_id]).await, 404, "the group alone: empty");
+    assert_eq!(listing(vec![group_id, hosted_id]).await, 200);
+}
+
 /// M1: `PATCH /admin/content-selectors/{id}` is a true PATCH — an omitted
 /// `includes` / `excludes` / `description` keeps the stored value (an omitted
 /// `includes` reset to `[]` would mean match-all and widen every grant).

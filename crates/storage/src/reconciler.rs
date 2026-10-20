@@ -19,7 +19,7 @@
 //! token, deletes the object, then token-conditionally deletes the row. Live
 //! ingest leases make a candidate ineligible.
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use sqlx::PgPool;
 
 use crate::s3::BlobStore;
@@ -34,8 +34,11 @@ pub async fn reconcile_orphans(
     store: &BlobStore,
     grace: Duration,
 ) -> anyhow::Result<usize> {
-    let cutoff = Utc::now() - grace;
-    let stale_deletion_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
+    // Both cutoffs are compared with database timestamps: take the
+    // database's clock.
+    let now = forge_db::db_now(pool).await?;
+    let cutoff = now - grace;
+    let stale_deletion_before = now - crate::cas::DELETE_RESERVATION_LEASE;
     let mut removed = 0usize;
 
     // Expired leases on live/referenced blobs might never pass through a delete

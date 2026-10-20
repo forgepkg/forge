@@ -568,7 +568,9 @@ pub struct TokenScope {
     /// (never `admin`, which must be listed explicitly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<Action>>,
-    /// Allowed repository ids; `None` ⇒ all repos the owner can touch.
+    /// Allowed repository ids; `None` ⇒ all repos the owner can touch. A group
+    /// listed here grants no read on its members (as for any principal): to
+    /// read through a group, list the members it should serve from as well.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<i64>>,
 }

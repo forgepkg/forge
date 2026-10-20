@@ -8,6 +8,10 @@
 //! JSON shape here (a malformed scope would fail-closed at evaluation, denying
 //! the token everything — better to reject the write with a 400).
 //!
+//! A group in `repositories` reaches only the members also listed: reading a
+//! group never grants read on its members, so a token scoped to the group
+//! alone sees an empty feed.
+//!
 //! The token `scope` is read **outside** the per-user effective-set cache (the
 //! seam loads it per request and intersects after the cache lookup), so a scope
 //! change needs **no cache invalidation**: the next request reads the new value.

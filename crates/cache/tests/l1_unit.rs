@@ -498,3 +498,34 @@ async fn custom_tag_invalidation_expires_only_matching_entries() {
     assert_eq!(alice_two, "FRESH-ALICE-2");
     assert_eq!(bob, "OLD-BOB");
 }
+
+#[tokio::test]
+async fn a_factory_chosen_lifetime_shortens_the_ttl() {
+    // A value copied from a record that expires in 1 s lives 1 s, not the
+    // caller's 60 s; a longer factory lifetime never extends the TTL.
+    let cache = Cache::l1_only(100);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let load = |lifetime: Duration| {
+        let (cache, calls) = (cache.clone(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local_with_tags_expiring::<usize, _, _, TestError>(
+                    "ns",
+                    "expiring",
+                    &[],
+                    Duration::from_millis(500),
+                    || async move { Ok((calls.fetch_add(1, Ordering::SeqCst) + 1, lifetime)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(load(Duration::from_millis(100)).await, 1);
+    assert_eq!(load(Duration::from_millis(100)).await, 1, "still live");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(load(Duration::from_secs(60)).await, 2, "expired at 100 ms");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(load(Duration::from_secs(60)).await, 2, "capped at the TTL");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(load(Duration::from_secs(60)).await, 3, "expired at 500 ms");
+}

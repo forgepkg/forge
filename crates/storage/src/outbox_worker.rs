@@ -63,10 +63,21 @@ pub async fn run_once(pool: &PgPool, store: &BlobStore, batch: i64) -> anyhow::R
                     error = %e,
                     "outbox delete failed; rescheduling with backoff"
                 );
-                let next = Utc::now() + backoff(row.attempts);
                 // Best-effort reschedule; if this also fails the lease will
-                // simply expire and the row gets retried later.
-                if let Err(e2) = forge_db::outbox_dao::bump_attempt(pool, row.id, next).await {
+                // simply expire and the row gets retried later. Due-ness is
+                // decided on the database's clock, so the backoff is too.
+                let bumped = match forge_db::db_now(pool).await {
+                    Ok(now) => {
+                        forge_db::outbox_dao::bump_attempt(
+                            pool,
+                            row.id,
+                            now + backoff(row.attempts),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e2) = bumped {
                     tracing::error!(outbox_id = row.id, error = %e2, "bump_attempt failed");
                 }
             }
@@ -87,7 +98,7 @@ async fn process_row(
 ) -> anyhow::Result<bool> {
     use forge_db::blob_dao::ReserveDeleteOutcome;
 
-    let stale_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
+    let stale_before = forge_db::db_now(pool).await? - crate::cas::DELETE_RESERVATION_LEASE;
     match forge_db::blob_dao::reserve_outbox_row_delete(pool, row.id, &row.sha256, stale_before)
         .await?
     {
@@ -156,7 +167,7 @@ const PRUNE_MAX_BATCHES: usize = 50;
 /// transaction, no lock on live rows), and the delete is idempotent, so every
 /// instance can run it concurrently.
 pub async fn prune_processed(pool: &PgPool, retention: chrono::Duration) -> anyhow::Result<u64> {
-    let cutoff = Utc::now() - retention;
+    let cutoff = forge_db::db_now(pool).await? - retention;
     let mut total = 0u64;
     for _ in 0..PRUNE_MAX_BATCHES {
         let deleted = forge_db::outbox_dao::prune_processed(pool, cutoff, PRUNE_BATCH).await?;

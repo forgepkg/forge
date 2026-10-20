@@ -228,6 +228,11 @@ password supplied to NuGet should be a **token**.
   is served by the owners alone (no proxy or other hosted member adds
   versions to it), and only owners serve reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
   the group or deleting it; both are refused with 409 otherwise.
+  Reading a group grants no read on its members: a caller is served from
+  the members it may read itself. The same holds for a token whose `scope`
+  lists repositories: scoped to the group alone it sees an empty feed, so
+  list the group **and** every member it should be served from, e.g.
+  `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
 
 ## Configuration
 
