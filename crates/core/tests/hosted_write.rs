@@ -646,3 +646,79 @@ async fn hard_delete_removes_rows_and_decrefs_blobs() {
     let nf = w.delete_component(&repo, &id, "1.0.0", true).await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
 }
+
+/// The `.nupkg` download counter of `(repo_id, lower, version)`.
+async fn download_count(pool: &PgPool, repo_id: i64, lower: &str, version: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT a.download_count FROM asset a JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3 AND a.path = $4",
+    )
+    .bind(repo_id)
+    .bind(lower)
+    .bind(version)
+    .bind(NUPKG_ASSET_PATH)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// #74: a `HEAD` on a `.nupkg` is not a download, and a redeploy keeps the
+/// version's download count (retention and search read it).
+#[tokio::test]
+async fn head_is_not_a_download_and_a_redeploy_keeps_the_count() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let r = reader(&pool, store);
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    // The bump is spawned off the response path: wait for it.
+    let settled = |expected: i64| {
+        let pool = pool.clone();
+        let lower = lower.clone();
+        async move {
+            for _ in 0..100 {
+                if download_count(&pool, repo_id, &lower, "1.0.0").await == expected {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    };
+
+    for _ in 0..3 {
+        assert!(r
+            .resolve_nupkg_head(&repo, &lower, "1.0.0")
+            .await
+            .unwrap()
+            .is_some());
+    }
+    assert!(r
+        .resolve_nupkg(&repo, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(settled(1).await, "one GET, no HEADs");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(download_count(&pool, repo_id, &lower, "1.0.0").await, 1);
+
+    w.store_upload(&repo, &make_nupkg_variant(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("redeploy");
+    assert_eq!(
+        download_count(&pool, repo_id, &lower, "1.0.0").await,
+        1,
+        "the redeployed version keeps its count"
+    );
+}

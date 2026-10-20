@@ -400,13 +400,25 @@ pub trait RepoReadOps: Send + Sync {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError>;
 
     /// Resolve the `.nupkg` blob for an exact `(id, version)`, or `None` if
-    /// that version is absent.
+    /// that version is absent. A resolved `.nupkg` counts as a download.
     async fn resolve_nupkg(
         &self,
         repo: &str,
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError>;
+
+    /// [`Self::resolve_nupkg`] for a `HEAD` request: the same answer, but not
+    /// counted as a download (a probe must not keep a version "warm" for
+    /// retention).
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.resolve_nupkg(repo, id, version).await
+    }
 
     /// Resolve the stored `.nuspec` bytes for an exact `(id, version)`, or
     /// `None` if absent.
@@ -573,6 +585,18 @@ impl RepoReadOps for PackageFilteredReadOps {
             return Ok(None);
         }
         self.inner.resolve_nupkg(repo, id, version).await
+    }
+
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.resolve_nupkg_head(repo, id, version).await
     }
 
     async fn resolve_nuspec(

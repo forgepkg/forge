@@ -62,7 +62,13 @@ pub async fn content(
 }
 
 async fn serve_nupkg(ctx: &RouteContext, id: &str, version: &str, head: bool) -> Response {
-    let loc = match ctx.ops.resolve_nupkg(&ctx.repo, id, version).await {
+    // A HEAD (a probe, a mirror tool) is not a download.
+    let resolved = if head {
+        ctx.ops.resolve_nupkg_head(&ctx.repo, id, version).await
+    } else {
+        ctx.ops.resolve_nupkg(&ctx.repo, id, version).await
+    };
+    let loc = match resolved {
         Ok(Some(l)) => l,
         Ok(None) => return (StatusCode::NOT_FOUND, "package not found").into_response(),
         Err(e) => return repo_error_response(e),

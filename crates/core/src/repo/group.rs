@@ -693,6 +693,37 @@ impl GroupRepo {
         Ok(out)
     }
 
+    /// The highest-priority serving member's `.nupkg` for the exact
+    /// `(id, version)`; for a `HEAD` request (`head`) without counting a
+    /// download.
+    async fn resolve_nupkg_from_members(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        head: bool,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+        let mut failures = MemberFailures::default();
+        for m in &members {
+            let resolved = if head {
+                m.ops.resolve_nupkg_head(&m.repo.name, id, version).await
+            } else {
+                m.ops.resolve_nupkg(&m.repo.name, id, version).await
+            };
+            match resolved {
+                Ok(Some(loc)) => return Ok(Some(loc)),
+                Ok(None) => failures.ok(),
+                Err(e) => failures.failed(&m.repo.name, e),
+            }
+        }
+        // Not found anywhere reachable: a member failure means "unknown", not
+        // "absent" — report it so clients retry instead of caching a miss.
+        failures.into_strict_result()?;
+        Ok(None)
+    }
+
     /// Merge member search results with the caller's package predicate pushed
     /// through every member wrapper. This keeps selector filtering inside each
     /// production backend's single corpus scan rather than repeatedly
@@ -862,21 +893,18 @@ impl RepoReadOps for GroupRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
-        let graph = self.group_graph(repo).await?;
-        let members = self.serving_members_for_id(&graph, id).await?;
-        // Highest-priority serving member that has the exact (id, version).
-        let mut failures = MemberFailures::default();
-        for m in &members {
-            match m.ops.resolve_nupkg(&m.repo.name, id, version).await {
-                Ok(Some(loc)) => return Ok(Some(loc)),
-                Ok(None) => failures.ok(),
-                Err(e) => failures.failed(&m.repo.name, e),
-            }
-        }
-        // Not found anywhere reachable: a member failure means "unknown", not
-        // "absent" — report it so clients retry instead of caching a miss.
-        failures.into_strict_result()?;
-        Ok(None)
+        self.resolve_nupkg_from_members(repo, id, version, false)
+            .await
+    }
+
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.resolve_nupkg_from_members(repo, id, version, true)
+            .await
     }
 
     async fn resolve_nuspec(

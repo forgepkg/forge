@@ -1920,6 +1920,25 @@ impl RepoReadOps for ProxyRepo {
         Ok(loc)
     }
 
+    /// Like [`Self::resolve_nupkg`] (the package is cached on first sight), but
+    /// a `HEAD` is not a pull: nothing is stamped.
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
+        let norm = self
+            .format
+            .normalize_version(version)
+            .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
+        Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await
+    }
+
     /// Serve the manifest of a proxied version: the locally stored `.nuspec`
     /// once the package is cached, otherwise the upstream's flat-container
     /// `.nuspec` (without downloading the whole package). Delay-gated and

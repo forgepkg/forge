@@ -288,6 +288,45 @@ fn is_prerelease(version: &str) -> bool {
     version.contains('-')
 }
 
+impl HostedRepo {
+    /// The `.nupkg` of `(id, version)` in `repo`, counted as a download when
+    /// `count` ([`RepoReadOps::resolve_nupkg`] / [`RepoReadOps::resolve_nupkg_head`]).
+    async fn locate_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        count: bool,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
+        else {
+            return Ok(None);
+        };
+        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
+        else {
+            return Ok(None);
+        };
+        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
+            return Ok(None);
+        };
+
+        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
+        // A resolved `.nupkg` is a download (a `HEAD` is not); bump
+        // asynchronously so a tracking write never blocks (or fails) the
+        // response. Non-authoritative — failures are logged, not propagated.
+        if count {
+            spawn_download_bump(self.pool.clone(), asset.id, comp.id);
+        }
+
+        Ok(Some(NupkgLocation {
+            blob_s3_key: blob.s3_key,
+            size: asset.size,
+            content_type: asset.content_type,
+        }))
+    }
+}
+
 /// Fire a best-effort download-tracking bump for a served hosted `.nupkg`,
 /// off the response hot path (slice 12.1 §3.7).
 ///
@@ -329,30 +368,16 @@ impl RepoReadOps for HostedRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
-        let repo_id = self.repo_id(repo).await?;
-        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
-        else {
-            return Ok(None);
-        };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
-        else {
-            return Ok(None);
-        };
-        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
-            return Ok(None);
-        };
+        self.locate_nupkg(repo, id, version, true).await
+    }
 
-        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
-        // A resolved `.nupkg` is a download; bump asynchronously so a tracking
-        // write never blocks (or fails) the response. Non-authoritative —
-        // failures are logged, not propagated.
-        spawn_download_bump(self.pool.clone(), asset.id, comp.id);
-
-        Ok(Some(NupkgLocation {
-            blob_s3_key: blob.s3_key,
-            size: asset.size,
-            content_type: asset.content_type,
-        }))
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.locate_nupkg(repo, id, version, false).await
     }
 
     async fn resolve_nuspec(
@@ -840,11 +865,26 @@ impl HostedWrite {
             .map_err(RepoError::from)?;
 
         // Capture the old blob shas, delete the asset rows, decref the old blobs.
+        // The `.nupkg`'s download counters carry over to the new row: a
+        // redeploy is the same version, and retention and search
+        // (`totalDownloads`) read them.
+        let mut downloads = None;
         for path in [NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH] {
             if let Some(old) = asset_dao::find_asset(&mut **tx, comp.id, path)
                 .await
                 .map_err(RepoError::from)?
             {
+                if path == NUPKG_ASSET_PATH {
+                    downloads = Some(
+                        sqlx::query!(
+                            r#"SELECT download_count, last_downloaded_at FROM asset WHERE id = $1"#,
+                            old.id
+                        )
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_err(RepoError::from)?,
+                    );
+                }
                 sqlx::query!(r#"DELETE FROM asset WHERE id = $1"#, old.id)
                     .execute(&mut **tx)
                     .await
@@ -882,6 +922,21 @@ impl HostedWrite {
             nuspec_size,
         )
         .await?;
+        if let Some(downloads) = downloads {
+            sqlx::query!(
+                r#"
+                UPDATE asset SET download_count = $3, last_downloaded_at = $4
+                WHERE component_id = $1 AND path = $2
+                "#,
+                comp.id,
+                NUPKG_ASSET_PATH,
+                downloads.download_count,
+                downloads.last_downloaded_at,
+            )
+            .execute(&mut **tx)
+            .await
+            .map_err(RepoError::from)?;
+        }
         Ok(true)
     }
 
