@@ -751,10 +751,11 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
     let mut id: Option<String> = None;
     let mut ver: Option<String> = None;
     let mut groups: Vec<DependencyGroup> = Vec::new();
-    // The currently open <group> (or the implicit flat group keyed by None).
+    // The currently open <group> (a direct child of <dependencies>).
     let mut current_group: Option<DependencyGroup> = None;
-    // Whether we are inside a <dependencies> element.
-    let mut in_dependencies = false;
+    // Whether the manifest's <dependencies> holds a <group>: NuGet then
+    // ignores the flat <dependency> elements beside them.
+    let mut saw_group = false;
     // Flat (groupless) dependencies collected directly under <dependencies>.
     let mut flat_group: Option<DependencyGroup> = None;
     let mut metadata = NuspecMetadata::default();
@@ -784,9 +785,8 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                     }
                     // `<dependency ...></dependency>` (explicit end tag) is as
                     // valid as the self-closing form.
-                    b"dependency" if in_dependencies => {
-                        let dep = parse_dependency(&e)?;
-                        push_dependency(&mut current_group, &mut flat_group, dep);
+                    b"dependency" => {
+                        collect_dependency(&path, &e, &mut current_group, &mut flat_group)?;
                     }
                     b"packageType" if path.last().map(Vec::as_slice) == Some(b"packageTypes") => {
                         if let Some(name) = attr_local(&e, b"name")? {
@@ -794,10 +794,10 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                         }
                     }
                     b"dependencies" if in_metadata(&path) => {
-                        in_dependencies = true;
                         flat_group = None;
                     }
-                    b"group" if in_dependencies => {
+                    b"group" if in_dependencies_element(&path) => {
+                        saw_group = true;
                         let tfm = attr_local(&e, b"targetFramework")?;
                         current_group = Some(DependencyGroup {
                             target_framework: tfm,
@@ -812,9 +812,8 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                 let local = e.local_name().as_ref().as_bytes().to_vec();
                 check_element(&path, &local, &mut seen)?;
                 match local.as_slice() {
-                    b"dependency" if in_dependencies => {
-                        let dep = parse_dependency(&e)?;
-                        push_dependency(&mut current_group, &mut flat_group, dep);
+                    b"dependency" => {
+                        collect_dependency(&path, &e, &mut current_group, &mut flat_group)?;
                     }
                     b"packageType" if path.last().map(Vec::as_slice) == Some(b"packageTypes") => {
                         if let Some(name) = attr_local(&e, b"name")? {
@@ -823,7 +822,8 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
                     }
                     // A self-closing <group/> with no dependencies still
                     // represents a target framework group.
-                    b"group" if in_dependencies => {
+                    b"group" if in_dependencies_element(&path) => {
+                        saw_group = true;
                         let tfm = attr_local(&e, b"targetFramework")?;
                         groups.push(DependencyGroup {
                             target_framework: tfm,
@@ -878,13 +878,16 @@ fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
             }
             Event::End(e) => {
                 let local = e.local_name().as_ref().as_bytes().to_vec();
-                if local.as_slice() == b"group" && in_dependencies {
+                // `path` still ends with the element being closed.
+                let parent = &path[..path.len().saturating_sub(1)];
+                if local.as_slice() == b"group" && in_dependencies_element(parent) {
                     if let Some(g) = current_group.take() {
                         groups.push(g);
                     }
-                } else if local.as_slice() == b"dependencies" {
-                    in_dependencies = false;
-                    if let Some(g) = flat_group.take() {
+                } else if local.as_slice() == b"dependencies" && in_metadata(parent) {
+                    // Like NuGet: flat dependencies only count when no
+                    // <group> exists.
+                    if let Some(g) = flat_group.take().filter(|_| !saw_group) {
                         groups.push(g);
                     }
                 }
@@ -970,23 +973,37 @@ fn parse_dependency(e: &quick_xml::events::BytesStart) -> Result<Dependency, Nup
     Ok(Dependency { id: dep_id, range })
 }
 
-/// Add `dep` to the open `<group>`, or to the flat (groupless) group.
-fn push_dependency(
+/// Record a `<dependency>` (whose parents are `path`) the way NuGet reads
+/// it: a direct child of `<dependencies>` is a flat (groupless) dependency,
+/// a direct child of a `<group>` there belongs to that group, and one nested
+/// anywhere else is not a dependency at all.
+fn collect_dependency(
+    path: &[Vec<u8>],
+    e: &quick_xml::events::BytesStart<'_>,
     current_group: &mut Option<DependencyGroup>,
     flat_group: &mut Option<DependencyGroup>,
-    dep: Dependency,
-) {
-    if let Some(g) = current_group.as_mut() {
-        g.dependencies.push(dep);
-    } else {
+) -> Result<(), NupkgError> {
+    if in_dependencies_element(path) {
         flat_group
             .get_or_insert_with(|| DependencyGroup {
                 target_framework: None,
                 dependencies: Vec::new(),
             })
             .dependencies
-            .push(dep);
+            .push(parse_dependency(e)?);
+    } else if let (Some((last, parent)), Some(group)) = (path.split_last(), current_group.as_mut())
+    {
+        if last.as_slice() == b"group" && in_dependencies_element(parent) {
+            group.dependencies.push(parse_dependency(e)?);
+        }
     }
+    Ok(())
+}
+
+/// True if the next element is a direct child of the manifest's
+/// `<dependencies>` — the path is `[package, metadata, dependencies]`.
+fn in_dependencies_element(path: &[Vec<u8>]) -> bool {
+    path.len() == 3 && path[1].as_slice() == b"metadata" && path[2].as_slice() == b"dependencies"
 }
 
 /// True if the *parent* of the current text node is the manifest's
@@ -1170,6 +1187,60 @@ mod tests {
         assert_eq!(raw.deps[0].dependencies.len(), 2);
         assert_eq!(raw.deps[0].dependencies[1].id, "B");
         assert_eq!(raw.deps[0].dependencies[1].range, None);
+    }
+
+    #[test]
+    fn dependency_groups_are_read_the_way_nuget_reads_them() {
+        // #75: NuGet reads only direct children of <dependencies>, and once a
+        // <group> exists it ignores the flat <dependency> elements.
+        let xml = br#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>Mixed.Pkg</id>
+    <version>1.0.0</version>
+    <dependencies>
+      <group targetFramework="net8.0">
+        <dependency id="A" version="1.0.0" />
+        <x><dependency id="Nested.In.Group" /></x>
+      </group>
+      <dependency id="B" version="1.0.0" />
+      <wrapper>
+        <group targetFramework="net48"><dependency id="C" /></group>
+        <dependency id="D" />
+      </wrapper>
+    </dependencies>
+  </metadata>
+</package>"#;
+        let raw = parse_nuspec(xml).unwrap();
+        assert_eq!(raw.deps.len(), 1, "{:?}", raw.deps);
+        assert_eq!(raw.deps[0].target_framework.as_deref(), Some("net8.0"));
+        let ids: Vec<&str> = raw.deps[0]
+            .dependencies
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, ["A"]);
+
+        // Without a group, only the direct flat dependencies count.
+        let xml = br#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>Flat.Pkg</id>
+    <version>1.0.0</version>
+    <dependencies>
+      <dependency id="B" />
+      <wrapper><dependency id="D" /></wrapper>
+    </dependencies>
+  </metadata>
+</package>"#;
+        let raw = parse_nuspec(xml).unwrap();
+        assert_eq!(raw.deps.len(), 1);
+        let ids: Vec<&str> = raw.deps[0]
+            .dependencies
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, ["B"]);
     }
 
     #[test]
