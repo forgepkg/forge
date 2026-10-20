@@ -159,3 +159,7 @@ either of:
   other than the AGPL's.
 
 The SPDX expression for the project is `AGPL-3.0-only OR LicenseRef-envisia`.
+
+Contributions are accepted under the [Contributor License Agreement](./CLA.md),
+which lets envisia offer them under both licenses. See
+[CONTRIBUTING.md](./CONTRIBUTING.md) for how to sign it.

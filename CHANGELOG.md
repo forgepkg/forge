@@ -16,6 +16,9 @@ The release workflow publishes the section whose heading matches the tag
 - **License**: envisia-forge is now dual-licensed under the GNU AGPL v3
   (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
   choice.
+- **Contributions**: pull requests now require signing the Contributor
+  License Agreement (`CLA.md`), checked by the `CLA` workflow. See
+  `CONTRIBUTING.md`.
 
 ## [0.1.0]
 
