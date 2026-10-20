@@ -1103,6 +1103,180 @@ async fn realm_secrets_end_to_end() {
     }
 }
 
+/// The server's realm secret keys (`forge_server::auth::secret_keys`).
+fn realm_secret_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "oidc" => &["client_secret"],
+        "credential_forwarding" => &["key_pepper"],
+        _ => &[],
+    }
+}
+
+/// A priority no other test of this binary uses (the column is unique).
+fn race_priority(offset: i32) -> i32 {
+    5_000_000 + (std::process::id() % 100_000) as i32 * 10 + offset
+}
+
+/// Wait until some backend is blocked behind the locks `holder_pid` holds.
+async fn wait_blocked_behind(pool: &PgPool, holder_pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing ever blocked behind pid {holder_pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The realm backfill writes a realm back only while it is still the row it
+/// read: an admin edit that commits between the backfill's read and its write
+/// is kept, not overwritten with the name and secret read before it.
+#[tokio::test]
+async fn realm_backfill_never_undoes_a_concurrent_edit() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let scope = format!("realm-race-{}", uuid::Uuid::new_v4());
+    let envelope = Arc::new(envelope_with_scope(&pool, &scope));
+    envelope.ensure_active_keys().await.unwrap();
+    let realm = auth_realm_dao::insert_realm(
+        &pool,
+        NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("race-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(0),
+            config: serde_json::json!({ "url": "https://nexus.test/s", "key_pepper": "old-pepper" }),
+        },
+    )
+    .await
+    .unwrap();
+
+    // An admin edit on another instance renames the realm and enters a new
+    // pepper; it holds the row until it commits.
+    let mut edit = pool.begin().await.unwrap();
+    let edit_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *edit)
+        .await
+        .unwrap();
+    let edited = secret_dao::update_realm_with_secrets_if_unchanged(
+        &mut edit,
+        Some(&*envelope),
+        &realm,
+        AuthRealmUpdate {
+            name: format!("{}-edited", realm.name),
+            enabled: false,
+            priority: realm.priority,
+            config: serde_json::json!({ "url": "https://nexus.test/s", "key_pepper": "new-pepper" }),
+        },
+        realm_secret_keys(&realm.kind),
+    )
+    .await
+    .unwrap()
+    .expect("the edit applies");
+
+    // The backfill reads the committed plaintext row, then waits for the edit.
+    let backfill = tokio::spawn({
+        let (pool, envelope) = (pool.clone(), envelope.clone());
+        async move { secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys).await }
+    });
+    wait_blocked_behind(&pool, edit_pid).await;
+    edit.commit().await.unwrap();
+    backfill.await.unwrap().expect("backfill");
+
+    let now = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(now.name, edited.name, "the edit's name is kept");
+    assert_eq!(now.secrets_enc, edited.secrets_enc);
+    assert_eq!(
+        secret_dao::realm_config(Some(&*envelope), &now)
+            .await
+            .unwrap()["key_pepper"],
+        "new-pepper"
+    );
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
+/// A realm whose `secrets_enc` does not decrypt but whose `config` holds a
+/// plaintext secret (an OIDC realm "repaired" in SQL with a new issuer and
+/// client secret) does not fail the backfill: the plaintext copy is sealed
+/// for the new issuer and replaces the old ciphertext.
+#[tokio::test]
+async fn realm_backfill_reseals_an_undecryptable_realm_from_its_plaintext() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("realm-fix-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    let realm = secret_dao::insert_realm_with_secrets(
+        &pool,
+        Some(&envelope),
+        NewAuthRealm {
+            kind: "oidc".into(),
+            name: format!("sqlfix-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(1),
+            config: serde_json::json!({
+                "issuer": "https://login.example/old/v2.0",
+                "client_id": "forge",
+                "client_secret": "old-secret",
+            }),
+        },
+        realm_secret_keys("oidc"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE auth_realm SET config = config || $2::jsonb WHERE id = $1")
+        .bind(realm.id)
+        .bind(
+            serde_json::json!({
+                "issuer": "https://login.example/new/v2.0",
+                "client_secret": "new-secret",
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repaired = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        secret_dao::realm_config(Some(&envelope), &repaired).await,
+        Err(secret_dao::SecretDbError::Crypto(
+            forge_crypto::CryptoError::DecryptFailed
+        ))
+    ));
+
+    secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys)
+        .await
+        .expect("an undecryptable realm does not fail the backfill");
+    let now = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(now.config.get("client_secret").is_none(), "{}", now.config);
+    assert_ne!(now.secrets_enc, repaired.secrets_enc);
+    let config = secret_dao::realm_config(Some(&envelope), &now)
+        .await
+        .expect("sealed for the new issuer");
+    assert_eq!(config["client_secret"], "new-secret");
+    assert_eq!(config["issuer"], "https://login.example/new/v2.0");
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
 /// The upstream password is bound to the origin of its row's `remote_url`
 /// (review: "the ciphertext is not bound to where the secret is sent"). A
 /// row repointed at another host outside the API no longer decrypts, so the
