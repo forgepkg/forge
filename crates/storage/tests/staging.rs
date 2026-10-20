@@ -209,3 +209,76 @@ fn sweep_removes_only_idle_staged_files() {
     assert!(foreign.exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Issue #57: the sweep counted every failure to try a process
+/// subdirectory's lock as "held", so where locks do not work (on NFS a
+/// read-only file could not take one at all) a killed process's files were
+/// never removed. A lock that cannot be tried falls back to the idle rule for
+/// the files inside, and the directory stays. A `.lock` that is a directory
+/// stands in for such a file system: it cannot be opened for writing.
+#[test]
+fn a_subdirectory_whose_lock_cannot_be_tried_keeps_only_its_live_files() {
+    let dir = scratch_dir("unlockable");
+    let staging = Staging::new(&dir, None).unwrap();
+    let other = dir.join("forge-staging-proc-on-a-lockless-mount");
+    std::fs::create_dir_all(other.join(".lock")).unwrap();
+    let file = |name: &str, idle: Duration| {
+        let path = other.join(name);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_modified(SystemTime::now() - idle).unwrap();
+        path
+    };
+    let orphan = file("forge-staging-orphan", Duration::from_secs(7200));
+    let live = file("forge-staging-live", Duration::from_secs(10));
+
+    assert_eq!(staging.sweep_stale(Duration::from_secs(3600)).unwrap(), 1);
+    assert!(!orphan.exists(), "the idle file went");
+    assert!(live.exists(), "a possibly live file stays");
+    assert!(other.join(".lock").exists(), "and so does its directory");
+    drop(staging);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Issue #57: where locks only work within one host, a sweep on another
+/// host can take a live process's lock and remove its subdirectory. The
+/// process then staged into a missing directory until it restarted; now the
+/// next stage creates (and locks) a new one.
+#[tokio::test]
+async fn a_subdirectory_swept_from_under_a_live_process_is_replaced() {
+    let dir = scratch_dir("replaced");
+    let staging = Staging::new(&dir, None).unwrap();
+    let cas = cas(staging.clone());
+    let first = cas
+        .stage(Cursor::new(vec![1u8; 1_000]), 1_000_000)
+        .await
+        .unwrap();
+    let swept = first.temp_path.parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&swept).unwrap();
+
+    let second = cas
+        .stage(Cursor::new(vec![2u8; 1_000]), 1_000_000)
+        .await
+        .expect("staged in a new subdirectory");
+    let replacement = second.temp_path.parent().unwrap();
+    assert_ne!(replacement, swept);
+    assert!(replacement.starts_with(&dir));
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(replacement.join(".lock"))
+        .unwrap();
+    assert!(
+        matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "the new subdirectory is locked"
+    );
+    // Every clone stages there too.
+    let third = cas
+        .stage(Cursor::new(vec![3u8; 1_000]), 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(third.temp_path.parent().unwrap(), replacement);
+
+    drop((first, second, third, staging, cas));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

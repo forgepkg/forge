@@ -54,9 +54,11 @@ async fn main() -> anyhow::Result<()> {
     // Staging directory for pushes and proxy downloads: create it and remove
     // what killed processes left there. Each process stages in a locked
     // subdirectory of its own, so a dead one's goes at once and another
-    // instance sharing the directory is not affected (loose files from older
-    // versions go once idle for an hour). `AppState` builds the staging that
-    // requests use; this one is dropped after the sweep.
+    // instance sharing the directory, with locks that reach it, is not
+    // affected. Loose files from older versions, and the files in a
+    // subdirectory whose lock cannot be tried, go once idle for an hour.
+    // `AppState` builds the staging that requests use; this one is dropped
+    // after the sweep.
     let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
         .with_context(|| {
             format!(

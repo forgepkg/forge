@@ -325,7 +325,13 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   frees up. Size the volume above that budget. Each process stages in a
   locked subdirectory of its own, and the files a killed process left are
   removed at the next start however recent they are, so they do not add to
-  the space a restarted instance needs.
+  the space a restarted instance needs. Give each instance a volume of its
+  own (the Helm chart and the Kubernetes base do). Instances on different
+  hosts may share one only if its file locks work across those hosts (NFSv4,
+  or NFSv3 with `lockd`; not a mount with `nolock` or `local_lock`):
+  otherwise one instance's startup can remove another's files mid-request.
+  Where locks do not work at all, a killed process's files are removed once
+  idle for an hour instead.
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.

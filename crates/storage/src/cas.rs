@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use sqlx::PgPool;
@@ -211,7 +211,9 @@ pub struct Staging {
     dir: PathBuf,
     /// This process's own subdirectory of `dir`, where it stages (`None` only
     /// for the fallback of [`Staging::default`], which stages in `dir`).
-    own: Option<Arc<OwnDir>>,
+    /// Shared by every clone, so a replacement ([`Staging::own_dir`]) is
+    /// seen by all of them.
+    own: Option<Arc<Mutex<Arc<OwnDir>>>>,
     /// One permit per byte; `None` = no budget.
     budget: Option<Arc<Semaphore>>,
     limit: u64,
@@ -285,7 +287,7 @@ impl Staging {
     pub fn new(dir: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        let own = Some(OwnDir::create(&dir)?);
+        let own = Some(Arc::new(Mutex::new(OwnDir::create(&dir)?)));
         let limit = max_bytes.unwrap_or(0);
         let budget = max_bytes.map(|bytes| {
             let permits = usize::try_from(bytes)
@@ -306,17 +308,37 @@ impl Staging {
         &self.dir
     }
 
-    /// Where this process stages its files.
-    fn own_dir(&self) -> &Path {
-        self.own.as_ref().map_or(&self.dir, |own| &own.path)
+    /// This process's own subdirectory, and the handle that keeps it alive
+    /// while a staged file is in it (`None`: stage in `dir` itself). One that
+    /// has disappeared is replaced by a new one: a sweep on another host,
+    /// whose locks this host's do not reach, can remove it while this process
+    /// lives, and only the stages in flight then should fail.
+    fn own_dir(&self) -> std::io::Result<Option<Arc<OwnDir>>> {
+        let Some(own) = &self.own else {
+            return Ok(None);
+        };
+        let mut current = own.lock().unwrap_or_else(PoisonError::into_inner);
+        if !current.path.is_dir() {
+            tracing::warn!(
+                dir = %current.path.display(),
+                "staging subdirectory disappeared; staging in a new one"
+            );
+            std::fs::create_dir_all(&self.dir)?;
+            *current = OwnDir::create(&self.dir)?;
+        }
+        Ok(Some(Arc::clone(&current)))
     }
 
     /// Remove what killed processes left in the staging directory. Returns
-    /// how many staged files were removed.
+    /// how many staged files were removed. Run it at startup, before the
+    /// process makes another [`Staging`] in the same directory: on NFS,
+    /// whose locks are per process, the sweep could take that one's lock.
     ///
     /// - A process subdirectory goes whenever its lock is free, whatever its
     ///   age: a live process (this one, or another instance sharing the
-    ///   directory) holds its lock until it exits.
+    ///   directory) holds its lock until it exits. If the lock cannot be
+    ///   tried at all (a file system without working locks), only its staged
+    ///   files idle for `older_than` go, by the rule below.
     /// - Loose staged files (from versions that staged in the directory
     ///   itself) go once not modified for `older_than`: a running stage writes
     ///   its file continuously and holds it for seconds after, so a long-idle
@@ -330,6 +352,20 @@ impl Staging {
                 .unwrap_or_default()
         };
         let is_staged = |name: &str| name.starts_with(Self::PREFIX);
+        let remove_if_idle = |path: &Path, name: &str, meta: &std::fs::Metadata| {
+            meta.is_file()
+                && is_staged(name)
+                && idle(meta) >= older_than
+                && std::fs::remove_file(path).is_ok()
+        };
+        // Never this staging's own subdirectory: on NFS its lock, an `fcntl`
+        // lock, does not stop this same process from taking it again.
+        let own = self.own.as_ref().map(|own| {
+            own.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .path
+                .clone()
+        });
         let mut removed = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -337,22 +373,49 @@ impl Staging {
             let name = name.to_string_lossy();
             let Ok(meta) = entry.metadata() else { continue };
             let path = entry.path();
+            if own.as_ref() == Some(&path) {
+                continue;
+            }
             if meta.is_dir() && name.starts_with(Self::OWN_DIR_PREFIX) {
                 // Taking the lock proves its process gone; held until removed.
-                let Ok(lock) = std::fs::File::open(path.join(Self::LOCK_FILE)) else {
-                    continue;
-                };
-                if lock.try_lock().is_err() {
-                    continue;
-                }
-                let staged = std::fs::read_dir(&path).map_or(0, |entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .filter(|entry| is_staged(&entry.file_name().to_string_lossy()))
-                        .count()
-                });
-                if std::fs::remove_dir_all(&path).is_ok() {
-                    removed += staged;
+                // Opened for writing: NFS emulates `flock` with `fcntl` locks,
+                // and an exclusive one needs a writable file.
+                let lock = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(path.join(Self::LOCK_FILE))
+                    .map_err(std::fs::TryLockError::Error)
+                    .and_then(|lock| lock.try_lock().map(|()| lock));
+                match lock {
+                    Ok(_lock) => {
+                        let staged = std::fs::read_dir(&path).map_or(0, |entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .filter(|entry| is_staged(&entry.file_name().to_string_lossy()))
+                                .count()
+                        });
+                        if std::fs::remove_dir_all(&path).is_ok() {
+                            removed += staged;
+                        }
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        tracing::warn!(
+                            %error,
+                            dir = %path.display(),
+                            "cannot try a staging subdirectory's lock; removing only its idle staged files"
+                        );
+                        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                            if let Ok(meta) = entry.metadata() {
+                                let name = entry.file_name();
+                                removed += usize::from(remove_if_idle(
+                                    &entry.path(),
+                                    &name.to_string_lossy(),
+                                    &meta,
+                                ));
+                            }
+                        }
+                    }
                 }
             } else if meta.is_dir()
                 && name
@@ -361,11 +424,7 @@ impl Staging {
                 && idle(&meta) >= older_than
             {
                 let _ = std::fs::remove_dir_all(&path);
-            } else if meta.is_file()
-                && is_staged(&name)
-                && idle(&meta) >= older_than
-                && std::fs::remove_file(&path).is_ok()
-            {
+            } else if remove_if_idle(&path, &name, &meta) {
                 removed += 1;
             }
         }
@@ -436,9 +495,10 @@ impl Cas {
     {
         // Hold a NamedTempFile; convert to TempPath only on success. Until then,
         // dropping it (on any early return) unlinks the file.
+        let own_dir = self.staging.own_dir()?;
         let temp = tempfile::Builder::new()
             .prefix(Staging::PREFIX)
-            .tempfile_in(self.staging.own_dir())?;
+            .tempfile_in(own_dir.as_ref().map_or(&self.staging.dir, |own| &own.path))?;
 
         // Cap the body while streaming so we never buffer an oversized
         // payload to disk in full, and reserve temp space as it arrives.
@@ -481,7 +541,7 @@ impl Cas {
             size,
             temp_path,
             reservation: reader.reservation,
-            own_dir: self.staging.own.clone(),
+            own_dir,
         })
     }
 
