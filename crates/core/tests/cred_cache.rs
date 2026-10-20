@@ -224,6 +224,64 @@ async fn ttl_expiry_forces_recheck() {
 }
 
 #[tokio::test]
+async fn a_rejection_lives_only_for_the_negative_ttl() {
+    // #17: an upstream 401 (say, its own short lockout) must not keep a
+    // correct password rejected for the much longer positive TTL.
+    let cache = make_cache(Duration::from_secs(300), Duration::from_millis(200)).await;
+    let user = format!("neg-ttl-{}", unique());
+    let hits = Arc::new(AtomicU32::new(0));
+    for expected_forwards in [1, 2] {
+        let ok = cache
+            .check(
+                PROVIDER,
+                &user,
+                "pw",
+                counting_forward(hits.clone(), UpstreamVerdict::Rejected),
+            )
+            .await
+            .unwrap();
+        assert!(!ok);
+        assert_eq!(hits.load(Ordering::SeqCst), expected_forwards);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_peers_verdict_is_cached_only_for_what_its_row_has_left() {
+    // #17: instance B reads instance A's verdict shortly before its row
+    // expires. B must not then keep accepting the credential in memory for a
+    // whole positive TTL of its own: past the row's expiry it re-validates.
+    let pool = pool().await;
+    let instance = |positive_ttl| {
+        ValidatedCredentialCache::new(
+            Cache::l1_only(256),
+            pool.clone(),
+            pepper(),
+            positive_ttl,
+            Duration::from_secs(30),
+        )
+    };
+    let a = instance(Duration::from_millis(600));
+    let b = instance(Duration::from_secs(300));
+    let user = format!("peer-ttl-{}", unique());
+    let forwards = Arc::new(AtomicU32::new(0));
+
+    let forward = || counting_forward(forwards.clone(), UpstreamVerdict::Valid);
+    assert_eq!(a.check(PROVIDER, &user, "pw", forward()).await, Ok(true));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(b.check(PROVIDER, &user, "pw", forward()).await, Ok(true));
+    assert_eq!(forwards.load(Ordering::SeqCst), 1, "B read A's verdict");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(b.check(PROVIDER, &user, "pw", forward()).await, Ok(true));
+    assert_eq!(
+        forwards.load(Ordering::SeqCst),
+        2,
+        "past the row's expiry B forwards again"
+    );
+}
+
+#[tokio::test]
 async fn revoke_user_forces_recheck() {
     let cache = make_cache(Duration::from_secs(300), Duration::from_secs(30)).await;
     let user = format!("revoke-user-{}", unique());

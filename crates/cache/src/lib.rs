@@ -159,9 +159,19 @@ pub(crate) struct StoredEntry {
     format_version: u8,
     tags: Vec<TagStamp>,
     value: Vec<u8>,
+    /// A lifetime shorter than the caller's TTL that the factory chose for
+    /// this value ([`Cache::get_or_try_insert_local_with_tags_expiring`]).
+    /// In-process only: an entry read back from Redis carries the remaining
+    /// Redis TTL instead.
+    #[serde(skip)]
+    lifetime: Option<Duration>,
 }
 
 impl StoredEntry {
+    pub(crate) fn lifetime(&self) -> Option<Duration> {
+        self.lifetime
+    }
+
     fn has_tags(&self, expected: &[String]) -> bool {
         self.format_version == ENTRY_FORMAT_VERSION
             && self.tags.len() == expected.len()
@@ -468,6 +478,41 @@ impl Cache {
         self.load(ns, key, tags, ttl, factory, false).await
     }
 
+    /// [`Cache::get_or_try_insert_local_with_tags`] for a value whose own
+    /// lifetime the factory knows: it returns the value with how long it may
+    /// live, and the entry expires after the shorter of that and `ttl` (counted
+    /// from the start of the fill). For a value copied from a record that
+    /// expires on its own (a stored verdict nearer its expiry than `ttl`), or
+    /// for values of one kind that deserve different TTLs.
+    pub async fn get_or_try_insert_local_with_tags_expiring<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Duration), E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load_with_lifetime(
+            ns,
+            key,
+            tags,
+            ttl,
+            || async move {
+                factory()
+                    .await
+                    .map(|(value, lifetime)| (value, Some(lifetime)))
+            },
+            false,
+        )
+        .await
+    }
+
     /// The shared lookup: L1 → (L2, when `shared` and configured) → factory.
     async fn load<T, F, Fut, E>(
         &self,
@@ -482,6 +527,33 @@ impl Cache {
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load_with_lifetime(
+            ns,
+            key,
+            tags,
+            ttl,
+            || async move { factory().await.map(|value| (value, None)) },
+            shared,
+        )
+        .await
+    }
+
+    /// [`Cache::load`] for a factory that may cap its value's lifetime.
+    async fn load_with_lifetime<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+        shared: bool,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Option<Duration>), E>>,
         E: Clone + Send + Sync + 'static,
     {
         let full_key = make_key(ns, key);
@@ -545,7 +617,7 @@ impl Cache {
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        Fut: Future<Output = Result<(T, Option<Duration>), E>>,
         E: Clone + Send + Sync + 'static,
     {
         let entry_tags = entry_tags.clone();
@@ -664,24 +736,28 @@ impl Cache {
                 };
 
                 // Factory: errors propagate (and are NOT cached by moka).
-                let value = factory().await?;
+                let (value, lifetime) = factory().await?;
                 let value = serde_json::to_vec(&value)
                     .expect("cache value must serialize to JSON");
+                let lifetime = lifetime.filter(|lifetime| *lifetime < ttl);
                 let entry = Arc::new(StoredEntry {
                     format_version: ENTRY_FORMAT_VERSION,
                     tags: stamps,
                     value,
+                    lifetime,
                 });
+                let l2_ttl = lifetime.unwrap_or(ttl);
 
                 // Redis compares every captured tag generation atomically before
                 // writing. If an invalidation raced the factory, the stale value
                 // is returned to the already-running caller but is not persisted.
-                if redis_generations_available {
+                // A value with no lifetime left is not written at all.
+                if redis_generations_available && !l2_ttl.is_zero() {
                     if let Some(l2) = &l2 {
                         let encoded = serde_json::to_vec(entry.as_ref())
                             .expect("tagged cache entry must serialize to JSON");
                         match l2
-                            .set_if_tag_versions(&key_for_l2, &encoded, ttl, &entry.tags)
+                            .set_if_tag_versions(&key_for_l2, &encoded, l2_ttl, &entry.tags)
                             .await
                         {
                             Ok(true) => {}
