@@ -313,6 +313,8 @@ async fn apply_message(
             tag_capable_origins.insert(origin);
             // No namespace fence here (see module docs): barriers are
             // monotonic and every read/fill path re-validates against them.
+            // A forged, implausibly large generation only advances the
+            // barrier by one (see `TagVersions::observe`).
             tag_versions.observe_one(tag, generation);
         }
         "k" | "n" => {

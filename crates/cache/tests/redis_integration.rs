@@ -592,6 +592,98 @@ async fn local_entries_are_invalidated_across_instances() {
     }
 }
 
+/// Issue #29: anyone who can write to Redis can publish a tag generation of
+/// `u64::MAX`. Adopted, it left the barrier nowhere to go: every later
+/// invalidation was ignored, so a locally cached authorization or credential
+/// verdict outlived its revocation until TTL. Forged generations and
+/// malformed messages may at most evict early; a peer's later invalidation
+/// must still evict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_tag_generations_do_not_stop_later_invalidations() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let ns = format!("forged-{}", std::process::id());
+    let sentinel = format!("{ns}-sentinel");
+    let read = |cache: &Cache, ns: &str, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.to_string(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let a_sentinel = Arc::new(AtomicUsize::new(0));
+    let b_sentinel = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&a, &ns, &a_calls).await, 0);
+    assert_eq!(read(&a, &sentinel, &a_sentinel).await, 0);
+    assert_eq!(read(&b, &sentinel, &b_sentinel).await, 0);
+
+    let client = redis::Client::open(url).unwrap();
+    let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let max = u64::MAX;
+    let huge = 1u64 << 60;
+    for message in [
+        format!("1|t|{ns}|{max}|@ns:{ns}"),
+        format!("1|t|{ns}|{max}|@key:{ns}:verdict"),
+        format!("1|t|{ns}|{huge}|@ns:{ns}"),
+        // Malformed: each is dropped and must not end the subscription.
+        "garbage".to_string(),
+        format!("x|t|{ns}|1|@ns:{ns}"),
+        format!("1|t|{ns}"),
+        format!("1|t|{ns}|-1|@ns:{ns}"),
+        format!("1|t|{ns}|18446744073709551616|@ns:{ns}"),
+        "1|k|no-colon".to_string(),
+        "1|zz|whatever".to_string(),
+        // Delivered in order: once this applies, so has everything above.
+        format!("1|t|{sentinel}|1|@ns:{sentinel}"),
+    ] {
+        let _: () = publisher
+            .publish("forge:cache:invalidate", message)
+            .await
+            .unwrap();
+    }
+    // A forged generation may sit in Redis too (the Lua bump then overflows).
+    let _: () = publisher
+        .set(format!("forge:cache:tag:@ns:{ns}"), max)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    for (cache, calls) in [(&a, &a_sentinel), (&b, &b_sentinel)] {
+        while read(cache, &sentinel, calls).await == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the subscriber stopped applying messages after malformed ones"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // The forged generations counted as an invalidation (evicting early), and
+    // the refill is cached again.
+    assert_eq!(read(&a, &ns, &a_calls).await, 1);
+    assert_eq!(read(&a, &ns, &a_calls).await, 1);
+
+    // A revocation on b must still reach a's local entry.
+    b.invalidate_ns(&ns).await;
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&a, &ns, &a_calls).await == 1 {
+        assert!(
+            Instant::now() < deadline,
+            "after a forged tag generation, a peer's invalidation was ignored"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// `rediss://` (TLS) URLs are supported, and an unreachable Redis does not
 /// keep a cache from being built (an instance can start during a Redis
 /// outage): connections are lazy, and reads fall back to the factory.
