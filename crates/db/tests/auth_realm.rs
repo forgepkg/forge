@@ -19,6 +19,12 @@ use serde_json::json;
 
 use common::{pool, unique};
 
+/// `reorder_realms` renumbers every realm in the shared database and bumps its
+/// `updated_at`, so it would make a concurrent compare-and-set write see its
+/// row as changed. The reorder and compare-and-set tests hold this lock for
+/// their whole body.
+static REWRITES_ALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn new_realm(name: &str, kind: &str, priority: i32) -> NewAuthRealm {
     NewAuthRealm {
         kind: kind.to_string(),
@@ -129,6 +135,7 @@ async fn duplicate_name_and_bad_slug_rejected() {
 
 #[tokio::test]
 async fn reorder_swaps_priorities_transactionally() {
+    let _rewrites_all = REWRITES_ALL.lock().await;
     let pool = pool().await;
     let n = unique();
     let a = auth_realm_dao::insert_realm(
@@ -182,6 +189,7 @@ async fn reorder_swaps_priorities_transactionally() {
 /// edit dropped or replaced.
 #[tokio::test]
 async fn compare_and_set_writes_refuse_a_changed_row_or_marker() {
+    let _rewrites_all = REWRITES_ALL.lock().await;
     let pool = pool().await;
     let n = unique();
     let name = format!("cas-{n}");
