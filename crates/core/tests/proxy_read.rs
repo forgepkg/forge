@@ -825,14 +825,96 @@ fn upstream_hits(mock: &MockUpstream) -> [usize; 6] {
     ]
 }
 
-/// Point proxy `repo` at another upstream (the admin update's write).
+/// Point proxy `repo` at another upstream, as the admin update does: the new
+/// URL, and in the same transaction the reset of what the proxy learned from
+/// the previous one.
 async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
-    sqlx::query("UPDATE repository SET remote_url = $2 WHERE name = $1")
-        .bind(repo)
+    let id = repo_id(pool, repo).await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE repository SET remote_url = $2 WHERE id = $1")
+        .bind(id)
         .bind(remote_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+    forge_db::proxy_dao::reset_for_new_upstream(&mut tx, id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// #65: a repointed proxy forgets the previous upstream's per-version state.
+/// A package-level not-found marker the old upstream caused does not keep
+/// answering 404 for the new one, and a version the old upstream listed long
+/// ago waits out the package delay again before the new upstream's bytes are
+/// served.
+#[tokio::test]
+async fn repointed_proxy_forgets_the_previous_upstreams_markers_and_delay_clock() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+
+    // Not-found marker.
+    let old = start_mock(corpus_of("Other.Lib", &["1.0.0"])).await;
+    let new = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", old.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    repoint(&pool, &repo, &format!("{}/index.json", new.base)).await;
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the old upstream's not-found marker must not hide the new upstream's package"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Package delay: the old upstream listed 1.0.0 two hours ago, past the
+    // one-hour delay; the new upstream's 1.0.0 is a different package.
+    let old = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let new = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", old.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo_id(&pool, &repo).await)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the old upstream's version cleared the delay"
+    );
+    repoint(&pool, &repo, &format!("{}/index.json", new.base)).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(
+        px.list_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the new upstream's version waits out the delay"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(new.nupkg_hits(), 0, "nothing downloaded inside the delay");
 }
 
 /// #13: repointing a proxy (`remote_url`) takes effect at once. Nothing more
@@ -919,9 +1001,11 @@ async fn repointed_proxy_never_fetches_from_the_previous_upstream() {
                 .is_err(),
             "stale: {stale}"
         );
+        // 2.0.0 was downloaded; 1.0.0 was only listed by the previous
+        // upstream, which the proxy no longer asks for it (#65).
         assert_eq!(
             versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
-            ["1.0.0", "2.0.0"],
+            ["2.0.0"],
             "versions cached locally are still served (stale: {stale})"
         );
     }

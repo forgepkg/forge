@@ -2016,6 +2016,86 @@ async fn put_repo(srv: &common::TestServer, name: &str, body: Value) -> reqwest:
         .unwrap()
 }
 
+/// #65: changing a proxy's `remote_url` forgets what it learned from the
+/// previous upstream: versions never downloaded (and the not-found markers)
+/// are dropped, downloaded ones lose their not-found and missing flags. An
+/// update that keeps the URL leaves the rows alone.
+#[tokio::test]
+async fn repointing_a_proxy_resets_its_cached_version_rows() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let name = format!("repoint{}", common::unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://feed-a.example/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let seed = || async {
+        sqlx::query("DELETE FROM proxy_cached_version WHERE repository_id = $1")
+            .bind(id)
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_cached_version \
+                 (repository_id, name, version, listed, downloaded, not_found, not_found_at, \
+                  upstream_missing, metadata_refreshed_at) VALUES \
+             ($1, 'contoso.lib', '*', false, false, true, now(), false, NULL), \
+             ($1, 'contoso.lib', '1.0.0', true, false, false, NULL, false, now()), \
+             ($1, 'sample', '2.0.0', true, true, true, now(), true, now())",
+        )
+        .bind(id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    };
+    let rows = || async {
+        sqlx::query_as::<_, (String, String, bool, bool, bool)>(
+            "SELECT name, version, downloaded, not_found, upstream_missing \
+             FROM proxy_cached_version WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(id)
+        .fetch_all(&srv.pool)
+        .await
+        .unwrap()
+    };
+
+    seed().await;
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-a.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(rows().await.len(), 3, "the same URL keeps every row");
+
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-b.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        rows().await,
+        [(
+            "sample".to_string(),
+            "2.0.0".to_string(),
+            true,
+            false,
+            false
+        )],
+        "only the downloaded version stays, with its flags cleared"
+    );
+}
+
 /// M2: update body semantics — absent keeps, `null` clears (TTLs fall back to
 /// the default), a value sets.
 #[tokio::test]

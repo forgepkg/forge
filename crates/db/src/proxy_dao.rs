@@ -216,6 +216,44 @@ pub async fn prune_unconfirmed(
     Ok(result.rows_affected())
 }
 
+/// Forget what a proxy learned from its previous upstream, inside the
+/// transaction that changes its `remote_url`. Versions that were never
+/// downloaded (listing rows and the not-found markers, including the
+/// package-level `*` markers) are deleted, so the new upstream's listings start
+/// fresh rows and its versions wait out the package delay from their own first
+/// sighting. Downloaded versions stay cached, with their not-found and
+/// missing-upstream flags cleared and their metadata due for a refresh from
+/// the new upstream. Returns the number of deleted rows.
+pub async fn reset_for_new_upstream(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+) -> sqlx::Result<u64> {
+    let deleted = sqlx::query!(
+        r#"
+        DELETE FROM proxy_cached_version
+        WHERE repository_id = $1 AND NOT downloaded
+        "#,
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET not_found = false,
+            not_found_at = NULL,
+            upstream_missing = false,
+            metadata_refreshed_at = NULL
+        WHERE repository_id = $1
+        "#,
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(deleted)
+}
+
 /// Finalize a successful download of the row `id` inside the caller's
 /// transaction: mark it downloaded, clear any not-found marker and confirm it.
 /// A row confirmed only now (it was created by the download singleflight)

@@ -621,6 +621,15 @@ pub async fn update(
         Err(e) => return db_error(e),
     };
 
+    // #65: what the proxy learned from its previous upstream (not-found
+    // markers, listings, the package-delay clock) must not decide for the new
+    // one.
+    if existing.kind() == RepoKind::Proxy && updated.remote_url != existing.remote_url {
+        if let Err(e) = forge_db::proxy_dao::reset_for_new_upstream(&mut tx, updated.id).await {
+            return db_error(e);
+        }
+    }
+
     // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
     // so switching the flag off must also remove the grant migration 0007
     // synthesized from it, or the repository stays anonymously readable.
