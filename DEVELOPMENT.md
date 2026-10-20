@@ -143,10 +143,10 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 > **Admin UI paths:** the admin screens live under **`/manage/*`**
 > (`/manage/repositories`, `/manage/users/<id>`, `/manage/realms`, ...);
 > `/admin/*` belongs to the admin REST API, which is routed before the SPA
-> fallback. (Until 0.1.0 the UI shared `/admin/*`, so a refresh, bookmark or
-> deep link of an admin screen got raw JSON, a 404 or a 405.) A browser
-> navigation (`Sec-Fetch-Dest: document`, or an `Accept` preferring
-> `text/html`) to a former UI path such as `/admin/repositories?x=1` is
+> fallback. (Before the first release, 1.0.0, the UI shared `/admin/*`, so a
+> refresh, bookmark or deep link of an admin screen got raw JSON, a 404 or a
+> 405.) A browser navigation (`Sec-Fetch-Dest: document`, or an `Accept`
+> preferring `text/html`) to a former UI path such as `/admin/repositories?x=1` is
 > 302-redirected to `/manage/repositories?x=1`; API requests to `/admin/*` are
 > unchanged. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
 > `crates/server/tests/web_ui.rs`. In Vite dev (`:8420`) `/manage/*` is served
@@ -535,23 +535,42 @@ image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
 Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
-`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it.
+`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
+unless the `[Unreleased]` section of `CHANGELOG.md` is empty (entries left
+there would be missing from the release notes).
 
-`cargo xtask release` makes those edits and the tag in one step:
+`main` only accepts commits whose required checks passed, so the release
+commit goes through a pull request and the tag goes on the merge commit; a
+direct `git push origin main v1.0.1` of the release commit is refused.
+`cargo xtask release <version> --no-tag` prepares the commit:
 
 ```bash
-cargo xtask release 0.2.0          # on an up-to-date, clean main
-git push --atomic origin main v0.2.0
+git switch -c release-1.0.1 origin/main   # clean and up to date
+cargo xtask release 1.0.1 --no-tag        # commits `release: v1.0.1`
+git push -u origin release-1.0.1          # open a pull request, merge it
 ```
 
-It sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
---workspace`), `web/package.json`, the Kubernetes base and the Helm chart, renames
-`## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0]` (keeping a section that
-already exists) and updates the links at its bottom, commits
-`release: v0.2.0`, and creates the annotated tag. It pushes nothing. When
-`main` only takes pull requests, run it with `--no-tag` on a branch, merge the
-pull request, and tag the merge commit (`git tag -a v0.2.0 -m v0.2.0
-<commit>`).
+Then wait until CI on the merge commit is green, **including `e2e` and
+`web-e2e`**: they run only on `main`, after the merge, never on the pull
+request. Tag that commit and push the tag:
+
+```bash
+git fetch origin
+git tag -a v1.0.1 -m v1.0.1 <merge commit>
+git push origin v1.0.1
+```
+
+The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart,
+renames `## [Unreleased]` in `CHANGELOG.md` to `## [1.0.1]` under a new, empty
+`[Unreleased]`, updates the links at its bottom, and commits
+`release: v1.0.1`. It pushes nothing. A `## [1.0.1]` section drafted ahead of
+time is kept as it is, but only while `[Unreleased]` is empty; with entries
+in both, the release is refused. It also refuses a changelog with a version
+section whose tag does not exist (a section drafted for a release that then
+got another number): fold its entries into `[Unreleased]` first. Run without
+`--no-tag` on a clean `main`, it also creates the annotated tag, for a
+repository whose `main` accepts direct pushes.
 
 ### Upgrade boundary for migration 0011
 

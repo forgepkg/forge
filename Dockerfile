@@ -87,7 +87,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
-ARG FORGE_VERSION=0.1.0
+# The image's version label. The release workflow passes the released version;
+# a local or CI build is not a release, so it says so instead of naming one.
+ARG FORGE_VERSION=0.0.0-dev
 ARG FORGE_GIT_SHA=unknown
 LABEL org.opencontainers.image.title="envisia-forge" \
       org.opencontainers.image.description="Self-hosted NuGet V3 registry (hosted, proxy, group)" \

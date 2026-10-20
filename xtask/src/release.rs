@@ -7,6 +7,12 @@
 //! commits, and creates the annotated `v<version>` tag.
 //! Pushing is left to the caller. Every edit is computed before the first
 //! file is written, so a failed precondition leaves the tree untouched.
+//!
+//! Two changelog guards keep the release notes (the version's section alone)
+//! whole. A release is refused while the changelog has a version section
+//! whose tag was never created: a section drafted for a release that then got
+//! another number would be left behind. It is also refused when the
+//! version's section already exists and `[Unreleased]` still has entries.
 
 use crate::proc::Cmd;
 use std::fs;
@@ -50,6 +56,10 @@ pub fn release(args: &[String]) -> Result<(), String> {
     {
         return Err(format!("release: tag {tag_name} already exists"));
     }
+    let changelog = read(CHANGELOG)?;
+    let tags = git(&["tag", "--list", "v*"])?;
+    check_sections_are_tagged(&changelog, &tags.lines().collect::<Vec<_>>(), &version)
+        .map_err(|e| format!("release: {CHANGELOG}: {e}"))?;
     let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
     if tag && branch != "main" && branch != "master" {
         // release.yml only publishes tags on the default branch.
@@ -73,7 +83,7 @@ pub fn release(args: &[String]) -> Result<(), String> {
             set_image_tag(&read(KUSTOMIZATION)?, &version),
         ),
         (CHART, set_chart_version(&read(CHART)?, &version)),
-        (CHANGELOG, release_changelog(&read(CHANGELOG)?, &version)),
+        (CHANGELOG, release_changelog(&changelog, &version)),
     ];
     let mut contents = Vec::new();
     for (path, edited) in edits {
@@ -106,7 +116,10 @@ pub fn release(args: &[String]) -> Result<(), String> {
         );
         println!("  git push --atomic origin {branch} {tag_name}");
     } else {
-        println!("Prepared {tag_name} on `{branch}`. Once it is merged, tag the merge commit:");
+        println!(
+            "Prepared {tag_name} on `{branch}`. Open a pull request; once it is merged and CI \
+             on the merge commit (e2e and web-e2e included) is green, tag that commit:"
+        );
         println!("  git tag -a {tag_name} -m {tag_name} <commit> && git push origin {tag_name}");
     }
     Ok(())
@@ -213,27 +226,77 @@ fn set_chart_version(chart: &str, version: &str) -> Result<String, String> {
     })
 }
 
-/// The changelog with a `## [<version>]` section: unchanged if it has one,
-/// otherwise its non-empty `[Unreleased]` section renamed (under a new, empty
-/// `[Unreleased]`) and the link references at the bottom updated.
+/// The version a `## [<version>]` (or `## [<version>] …`) heading names;
+/// `None` for `## [Unreleased]` and any other line.
+fn section_version(line: &str) -> Option<&str> {
+    let (name, rest) = line.strip_prefix("## [")?.split_once(']')?;
+    (is_release_version(name) && (rest.is_empty() || rest.starts_with(' '))).then_some(name)
+}
+
+/// Whether `line` ends a section: the next `## [` heading, or the first link
+/// reference definition (`[label]: <url>`) at the bottom, as release.yml
+/// reads the notes.
+fn ends_section(line: &str) -> bool {
+    line.starts_with("## [")
+        || line
+            .strip_prefix('[')
+            .and_then(|l| l.split_once("]: "))
+            .is_some_and(|(label, _)| !label.is_empty() && !label.contains(']'))
+}
+
+/// `Err` naming every `## [x.y.z]` section, other than `version`'s own, whose
+/// `vx.y.z` is not among `tags` (`git tag --list 'v*'`): a section drafted for
+/// a release that never happened. Releasing under another number would leave
+/// it behind, and its entries out of the published notes.
+fn check_sections_are_tagged(changelog: &str, tags: &[&str], version: &str) -> Result<(), String> {
+    let untagged: Vec<&str> = changelog
+        .lines()
+        .filter_map(section_version)
+        .filter(|v| *v != version && !tags.iter().any(|t| t.strip_prefix('v') == Some(*v)))
+        .collect();
+    if untagged.is_empty() {
+        return Ok(());
+    }
+    let missing: Vec<String> = untagged
+        .iter()
+        .map(|v| format!("`## [{v}]` has no tag v{v}"))
+        .collect();
+    Err(format!(
+        "{}: drafted for a release that never happened. Fold the entries into \
+         [Unreleased] and drop the section (`git fetch --tags` first if the tag \
+         exists only on the remote)",
+        missing.join("; ")
+    ))
+}
+
+/// The changelog with a `## [<version>]` section: its non-empty `[Unreleased]`
+/// section renamed (under a new, empty `[Unreleased]`) and the link
+/// references at the bottom updated. A section drafted for the version is
+/// kept as it is, but only while `[Unreleased]` is empty: the release notes
+/// are that one section, so entries left under `[Unreleased]` would be
+/// missing from them.
 fn release_changelog(changelog: &str, version: &str) -> Result<String, String> {
     let heading = format!("## [{version}]");
-    let is_heading = |line: &str| line.starts_with("## [");
-    if changelog
-        .lines()
-        .any(|l| l == heading || l.starts_with(&format!("{heading} ")))
-    {
+    let lines: Vec<&str> = changelog.lines().collect();
+    let start = lines.iter().position(|l| *l == "## [Unreleased]");
+    let has_unreleased_entries = start.is_some_and(|start| {
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| !ends_section(l))
+            .any(|l| !l.trim().is_empty())
+    });
+    if lines.iter().any(|l| section_version(l) == Some(version)) {
+        if has_unreleased_entries {
+            return Err(format!(
+                "both `{heading}` and [Unreleased] have entries, and the release notes \
+                 would be `{heading}` alone: move the [Unreleased] entries into it"
+            ));
+        }
         return Ok(changelog.to_string());
     }
-    let lines: Vec<&str> = changelog.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| *l == "## [Unreleased]")
-        .ok_or_else(|| format!("neither a `{heading}` nor a `## [Unreleased]` section"))?;
-    let body = lines[start + 1..]
-        .iter()
-        .take_while(|l| !is_heading(l) && !l.starts_with("[Unreleased]: "));
-    if body.clone().all(|l| l.trim().is_empty()) {
+    let start =
+        start.ok_or_else(|| format!("neither a `{heading}` nor a `## [Unreleased]` section"))?;
+    if !has_unreleased_entries {
         return Err("the [Unreleased] section is empty: nothing to release".into());
     }
 
@@ -354,11 +417,24 @@ mod tests {
     }
 
     #[test]
-    fn changelog_with_the_section_is_kept() {
-        assert_eq!(
-            release_changelog(CHANGELOG_FIXTURE, "0.1.0").unwrap(),
-            CHANGELOG_FIXTURE
-        );
+    fn changelog_with_the_section_and_unreleased_entries_is_refused() {
+        // The notes would be `## [0.1.0]` alone, without "a bug".
+        let err = release_changelog(CHANGELOG_FIXTURE, "0.1.0").unwrap_err();
+        assert!(err.contains("[Unreleased]"), "{err}");
+        let titled = CHANGELOG_FIXTURE.replace("## [0.1.0]\n", "## [0.1.0] — First\n");
+        assert!(release_changelog(&titled, "0.1.0").is_err());
+    }
+
+    #[test]
+    fn changelog_with_a_drafted_section_and_empty_unreleased_is_kept() {
+        let drafted = "# Changelog\n\n## [Unreleased]\n\n## [0.2.0] — Drafted\n\n\
+                       - a feature\n\n## [0.1.0]\n\nFirst.\n\n\
+                       [Unreleased]: https://github.com/o/r/compare/v0.2.0...HEAD\n\
+                       [0.2.0]: https://github.com/o/r/releases/tag/v0.2.0\n";
+        assert_eq!(release_changelog(drafted, "0.2.0").unwrap(), drafted);
+        // No [Unreleased] section at all.
+        let bare = "# Changelog\n\n## [0.2.0]\n\n- a feature\n";
+        assert_eq!(release_changelog(bare, "0.2.0").unwrap(), bare);
     }
 
     #[test]
@@ -366,5 +442,45 @@ mod tests {
         let empty = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0]\n\nFirst.\n";
         assert!(release_changelog(empty, "0.2.0").is_err());
         assert!(release_changelog("# Changelog\n", "0.2.0").is_err());
+        // Link references directly below [Unreleased] are not entries.
+        let links_only = "# Changelog\n\n## [Unreleased]\n\n\
+                          [Unreleased]: https://github.com/o/r/compare/v0.1.0...HEAD\n";
+        assert!(release_changelog(links_only, "0.2.0").is_err());
+    }
+
+    #[test]
+    fn untagged_release_section_is_refused() {
+        // `## [0.1.0]` was drafted, but no v0.1.0 tag exists.
+        let err = check_sections_are_tagged(CHANGELOG_FIXTURE, &[], "1.0.0").unwrap_err();
+        assert!(err.contains("`## [0.1.0]` has no tag v0.1.0"), "{err}");
+        let other_tags = ["v0.0.9", "v0.1.0-rc.1", "v0.1.00", "0.1.0"];
+        assert!(check_sections_are_tagged(CHANGELOG_FIXTURE, &other_tags, "1.0.0").is_err());
+        let titled = CHANGELOG_FIXTURE.replace("## [0.1.0]\n", "## [0.1.0] — First\n");
+        assert!(check_sections_are_tagged(&titled, &[], "1.0.0").is_err());
+
+        // Several: each untagged one is named, the tagged one is not.
+        let several = "## [Unreleased]\n\n## [0.3.0]\n\n## [0.2.0-rc.1]\n\n## [0.1.0]\n";
+        let err = check_sections_are_tagged(several, &["v0.1.0"], "1.0.0").unwrap_err();
+        assert!(err.contains("`## [0.3.0]` has no tag v0.3.0"), "{err}");
+        assert!(
+            err.contains("`## [0.2.0-rc.1]` has no tag v0.2.0-rc.1"),
+            "{err}"
+        );
+        assert!(!err.contains("v0.1.0"), "{err}");
+    }
+
+    #[test]
+    fn tagged_and_own_sections_pass_the_tag_check() {
+        assert!(check_sections_are_tagged(CHANGELOG_FIXTURE, &["v0.1.0"], "0.2.0").is_ok());
+        // The section of the version being released has no tag yet.
+        assert!(check_sections_are_tagged(CHANGELOG_FIXTURE, &[], "0.1.0").is_ok());
+        let several = "## [Unreleased]\n\n## [1.0.0-rc.1]\n\n## [0.1.0]\n";
+        assert!(check_sections_are_tagged(several, &["v0.1.0", "v1.0.0-rc.1"], "1.0.0").is_ok());
+        // Only version headings count: not [Unreleased], a link reference or
+        // other bracketed headings.
+        let other = "## [Unreleased]\n\n## [Notes]\n\n### [0.1.0]\n\n\
+                     [0.1.0]: https://github.com/o/r/releases/tag/v0.1.0\n";
+        assert!(check_sections_are_tagged(other, &[], "1.0.0").is_ok());
+        assert!(check_sections_are_tagged("# Changelog\n", &[], "1.0.0").is_ok());
     }
 }
