@@ -11,6 +11,12 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Changed
+
+- **License**: envisia-forge is now dual-licensed under the GNU AGPL v3
+  (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
+  choice.
+
 ## [0.1.0]
 
 First production release.

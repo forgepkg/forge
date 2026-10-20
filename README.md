@@ -147,3 +147,15 @@ the user password).
   `docs/superpowers/plans/`.
 
 Run `cargo xtask help` for the complete command list.
+
+## License
+
+envisia-forge is dual-licensed. You may use, modify and distribute it under
+either of:
+
+- the **GNU Affero General Public License, version 3** — see
+  [LICENSE](./LICENSE) (SPDX `AGPL-3.0-only`); or
+- the **envisia license**, a separate agreement with envisia for use on terms
+  other than the AGPL's.
+
+The SPDX expression for the project is `AGPL-3.0-only OR LicenseRef-envisia`.
