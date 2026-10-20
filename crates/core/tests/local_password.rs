@@ -28,6 +28,7 @@ use forge_core::auth::login_throttle::{LoginThrottle, MAX_USERNAME_BYTES};
 use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential};
 use forge_core::auth::token::{
     generate_token_secret, hash_token, BasicAuthSource, PrincipalSource, SourceOutcome,
+    TokenHeaderSource,
 };
 use forge_core::auth::Principal;
 use forge_db::token_dao::{self, NewToken};
@@ -564,6 +565,53 @@ async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
         0,
         "a local account's password never reaches the upstream"
     );
+}
+
+/// Review 2026-10-20 L3: a token lookup that fails (pool exhausted, short
+/// acquire timeout) has not ruled out a live token. It is `Unavailable` (503),
+/// not "not a token": the secret never runs through the password chain, whose
+/// credential-forwarding realm would send it upstream.
+#[tokio::test]
+async fn token_lookup_error_is_unavailable_and_never_reaches_the_password_chain() {
+    // A closed pool fails every query, like an exhausted one.
+    let pool = common::pool().await;
+    pool.close().await;
+    let secret = generate_token_secret();
+    assert!(forge_core::auth::verify_token(&pool, &secret)
+        .await
+        .is_err());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        TokenHeaderSource::HEADER,
+        HeaderValue::from_str(&secret).unwrap(),
+    );
+    assert_eq!(
+        TokenHeaderSource::new(pool.clone())
+            .resolve(&headers, ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(upstream)]));
+    let throttle = Arc::new(LoginThrottle::default());
+    let src = BasicAuthSource::with_chain(pool, Some(chain)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header("nuget-user", &secret), ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "an unchecked token is never forwarded as a password"
+    );
+    assert_eq!(throttle.tracked(), 0, "nor counted as a failed password");
 }
 
 #[tokio::test]

@@ -358,7 +358,9 @@ the IdP identity to an `app_user`. The cookie is `__Host-forge_session`
 `forge_session` on an http development setup; a request carrying the session
 cookie twice is treated as signed out. Ordinary NuGet clients authenticate
 with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
-keys after logging in (`POST /auth/tokens`). A validated workload JWT may
+keys after logging in (`POST /auth/tokens`). When the database cannot say
+whether a presented token or session is valid, the request is answered `503`,
+not `401`, and a Basic secret is then not tried as a password. A validated workload JWT may
 instead be supplied as the Basic password, `X-NuGet-ApiKey`, or
 `Authorization: Bearer` for the direct-token publishing flow.
 
