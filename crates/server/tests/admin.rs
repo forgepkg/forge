@@ -760,6 +760,60 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
     );
 }
 
+/// L5: `PATCH /admin/tokens/{id}/scope` needs the `scope` key. `{}` (what
+/// `JSON.stringify({scope: undefined})` sends) is refused with 400 instead of
+/// clearing the scope, which would widen the token to its owner's full reach;
+/// only an explicit `"scope": null` clears it.
+#[tokio::test]
+async fn token_scope_patch_clears_only_on_explicit_null() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    let created: Value = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(
+            &json!({"name": format!("narrow{}", common::unique()), "scope": {"actions": ["read"]}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = created["id"].as_i64().unwrap();
+    let patch = |body: Value| {
+        client
+            .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let stored = || async {
+        forge_db::token_dao::find_token_by_id(&srv.pool, token_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .scope
+    };
+
+    let resp = patch(json!({})).await.unwrap();
+    assert_eq!(resp.status(), 400, "an empty body must not clear the scope");
+    assert_eq!(stored().await, Some(json!({"actions": ["read"]})));
+
+    let resp = patch(json!({"scope": {"actions": ["read", "write"]}}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(stored().await, Some(json!({"actions": ["read", "write"]})));
+
+    let resp = patch(json!({"scope": null})).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(stored().await, None, "an explicit null clears the scope");
+}
+
 /// Deleting a **proxy** repository that has cached packages must decrement the
 /// referenced blobs' ref-counts (enqueuing outbox deletes at zero) so S3 objects
 /// can be reclaimed — a raw FK cascade would orphan the blob references. The

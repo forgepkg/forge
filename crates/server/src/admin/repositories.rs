@@ -24,7 +24,7 @@ use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::db_error;
+use super::{db_error, double_option};
 use crate::state::AppState;
 
 /// Public, password-free view of a repository (REDACTED secrets).
@@ -165,17 +165,6 @@ pub struct UpdatedRepoView {
     /// `true` iff `remote_url` moved to another origin without a new
     /// `upstream_password`, and stored credentials were removed.
     pub upstream_credentials_dropped: bool,
-}
-
-/// Deserialize a field that distinguishes *absent* (`None`, through
-/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
-/// (`Some(Some(v))`).
-fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(de).map(Some)
 }
 
 /// The longest accepted repository name.

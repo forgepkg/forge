@@ -277,3 +277,14 @@ pub(crate) fn db_error(e: sqlx::Error) -> Response {
     tracing::error!(error = %e, "admin db error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
+
+/// Deserialize a field that distinguishes *absent* (`None`, through
+/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
+/// (`Some(Some(v))`).
+pub(crate) fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(de).map(Some)
+}
