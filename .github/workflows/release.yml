@@ -15,8 +15,10 @@ name: Release
 # image. Every third-party action is pinned to a full commit SHA (the tag it
 # was resolved from is in the trailing comment); Dependabot keeps them current.
 #
-# Guard rails: the tag must equal the workspace version in Cargo.toml and the
-# web/package.json version, and must point at a commit on the default branch.
+# Guard rails: the tag must equal the workspace version in Cargo.toml, the
+# web/package.json version and the image tag of the Kubernetes base
+# (deploy/kubernetes/base), and must point at a commit on the default branch.
+# `cargo xtask release <version>` sets all three and creates the tag.
 on:
   push:
     tags: ["v*.*.*"]
@@ -45,15 +47,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check tag matches the workspace and web versions
+      - name: Check tag matches the workspace, web and Kubernetes versions
         id: version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)
           web_version=$(node -p "require('./web/package.json').version")
-          echo "tag=$tag cargo=$cargo_version web=$web_version"
-          if [ "$tag" != "$cargo_version" ] || [ "$tag" != "$web_version" ]; then
-            echo "::error::tag v$tag does not match Cargo.toml ($cargo_version) / web/package.json ($web_version)"
+          k8s_version=$(sed -n 's/^ *newTag: *//p' deploy/kubernetes/base/kustomization.yaml)
+          echo "tag=$tag cargo=$cargo_version web=$web_version kubernetes=$k8s_version"
+          if [ "$tag" != "$cargo_version" ] || [ "$tag" != "$web_version" ] || [ "$tag" != "$k8s_version" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml ($cargo_version) / web/package.json ($web_version) / deploy/kubernetes/base ($k8s_version); cut releases with 'cargo xtask release $tag'"
             exit 1
           fi
           git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}" \

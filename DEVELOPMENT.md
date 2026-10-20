@@ -467,6 +467,8 @@ Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 
 Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
 
+Release: `release <version> [--no-tag]` (see [Releasing](#releasing)).
+
 ## Single-container Docker image
 
 The root `Dockerfile` is a multi-stage build that packages the TanStack Router
@@ -491,6 +493,31 @@ cargo xtask docker-run         # run the image against the compose db + s3 on :8
 `docker-run` composes `docker-compose.yml` (db + versitygw) with
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
 http://localhost:8421.
+
+## Releasing
+
+A `v<version>` tag on the default branch publishes the release: the release
+workflow (`.github/workflows/release.yml`) builds, signs and pushes
+`ghcr.io/schmitch/forge:<version>` and creates the GitHub release from the
+matching `CHANGELOG.md` section. It refuses a tag unless the workspace
+version (`Cargo.toml`), `web/package.json` and the image tag of the
+Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) all equal it.
+
+`cargo xtask release` makes those edits and the tag in one step:
+
+```bash
+cargo xtask release 0.2.0          # on an up-to-date, clean main
+git push --atomic origin main v0.2.0
+```
+
+It sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
+--workspace`), `web/package.json` and the Kubernetes base, renames
+`## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0]` (keeping a section that
+already exists) and updates the links at its bottom, commits
+`release: v0.2.0`, and creates the annotated tag. It pushes nothing. When
+`main` only takes pull requests, run it with `--no-tag` on a branch, merge the
+pull request, and tag the merge commit (`git tag -a v0.2.0 -m v0.2.0
+<commit>`).
 
 ### Upgrade boundary for migration 0011
 

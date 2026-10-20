@@ -6,6 +6,7 @@
 //! output; a non-zero child exit makes `xtask` exit non-zero too.
 
 mod proc;
+mod release;
 
 use proc::{Cmd, RunningCmd};
 use std::env;
@@ -77,6 +78,8 @@ fn main() -> ExitCode {
         // Docker image (Dockerfile lands in phase 2; thin wrappers now)
         "docker-build" => docker_build(),
         "docker-run" => docker_run(),
+        // Release
+        "release" => release::release(rest),
         other => {
             eprintln!("xtask: unknown command `{other}`\n");
             print_help();
@@ -144,6 +147,13 @@ Docker image (single container: web SPA + Rust server):
                 pnpm builds the SPA, cargo builds forge-server release).
   docker-run    Run the built image against the dev Postgres + versitygw
                 (docker-compose.yml + docker-compose.app.yml), API + SPA on :8421.
+
+Release:
+  release <version> [--no-tag]
+                Set <version> in Cargo.toml/Cargo.lock, web/package.json and the
+                Kubernetes base's image tag, turn CHANGELOG.md's [Unreleased] into
+                its section, commit, and tag v<version> (default branch only).
+                --no-tag: commit only, for a release pull request. Never pushes.
 
   help          Show this help.
 "#

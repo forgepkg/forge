@@ -180,6 +180,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ── Kubernetes manifests (deploy/kubernetes) ──────────────────────────────
+  # Builds every overlay, and the base with each component, and validates the
+  # output against the Kubernetes schemas. Both tools are pinned by checksum.
+  kubernetes:
+    name: kubernetes
+    runs-on: ubuntu-latest
+    env:
+      KUSTOMIZE_VERSION: "5.7.1"
+      KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
+      KUBECONFORM_VERSION: "0.7.0"
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kustomize + kubeconform
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o kustomize.tgz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          printf '%s  kustomize.tgz\n%s  kubeconform.tgz\n' "$KUSTOMIZE_SHA256" "$KUBECONFORM_SHA256" | sha256sum -c -
+          tar -xzf kustomize.tgz -C bin kustomize
+          tar -xzf kubeconform.tgz -C bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build and validate
+        run: .github/scripts/kustomize-check.sh 1.33.0
+
   # ── Frontend (TanStack Router SPA in web/) ─────────────────────────────────
   # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
   # output (web/dist/) is what the Rust server serves via ServeDir; building here

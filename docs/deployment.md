@@ -17,6 +17,11 @@ CI publishing without stored API keys see
 Forge is a single stateless process. The API, the NuGet feed and the web UI
 share one port (`8421`), so one upstream on the reverse proxy is enough.
 
+On Kubernetes, start from the kustomize manifests in
+[`deploy/kubernetes`](../deploy/kubernetes/README.md): they set the probes,
+the shutdown timing and the security context described below, and pin the
+image to the release they were tagged with.
+
 ## Image
 
 ```bash

@@ -31,9 +31,11 @@ forge.toml
 *.local
 .DS_Store
 
-# Docs / compose / the Dockerfile itself aren't needed inside the build.
+# Docs / compose / Kubernetes manifests / the Dockerfile itself aren't needed
+# inside the build (deploy/ may hold an overlay's local forge.env secrets).
 *.md
 docs
+deploy
 docker-compose*.yml
 Dockerfile
 .dockerignore

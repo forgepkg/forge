@@ -1,0 +1,129 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: forge-s3
+  labels:
+    app.kubernetes.io/name: forge-s3
+    app.kubernetes.io/component: object-store
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: forge-s3
+    app.kubernetes.io/component: object-store
+  ports:
+    - name: s3
+      port: 8422
+      targetPort: s3
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: forge-s3
+  labels:
+    app.kubernetes.io/name: forge-s3
+    app.kubernetes.io/component: object-store
+spec:
+  serviceName: forge-s3
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forge-s3
+      app.kubernetes.io/component: object-store
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: forge-s3
+        app.kubernetes.io/component: object-store
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        # The image defaults to root; the posix backend only needs to own /data.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: versitygw
+          image: versity/versitygw:v1.4.1
+          args: ["--port", ":8422", "--health", "/health", "posix", "/data"]
+          env:
+            - name: ROOT_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: forge-env
+                  key: FORGE_S3__ACCESS_KEY
+            - name: ROOT_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: forge-env
+                  key: FORGE_S3__SECRET_KEY
+          ports:
+            - name: s3
+              containerPort: 8422
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: s3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: s3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    # Needs a filesystem with user extended attributes (ext4, xfs).
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Only Forge reaches the gateway (where the CNI enforces NetworkPolicy).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: forge-s3
+  labels:
+    app.kubernetes.io/name: forge-s3
+    app.kubernetes.io/component: object-store
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: forge-s3
+      app.kubernetes.io/component: object-store
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: forge
+              app.kubernetes.io/component: server
+      ports:
+        - port: 8422
+          protocol: TCP
