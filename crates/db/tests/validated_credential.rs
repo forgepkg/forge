@@ -28,6 +28,11 @@ use common::{pool, unique};
 
 const PROVIDER: &str = "upstream-basic";
 
+/// `sweep_expired` deletes every expired row in the shared database, so one
+/// test's sweep can reap the expired row another test is about to sweep and
+/// count. The tests that sweep hold this lock for their whole body.
+static SWEEP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn new_verdict(username: &str, hmac: &str, verdict: bool, ttl_secs: i64) -> NewVerdict {
     NewVerdict {
         provider_id: PROVIDER.to_string(),
@@ -158,6 +163,7 @@ async fn revoke_by_username_deletes_verdicts() {
 
 #[tokio::test]
 async fn sweep_expired_reaps_only_expired() {
+    let _sweep = SWEEP.lock().await;
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
@@ -507,6 +513,7 @@ async fn singleflight_lease_revocation_lapse_and_release() {
 /// the in-flight winner and invite a duplicate forward).
 #[tokio::test]
 async fn sweep_expired_keeps_live_claims() {
+    let _sweep = SWEEP.lock().await;
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
