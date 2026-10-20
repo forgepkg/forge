@@ -34,7 +34,10 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// S3 / versitygw object store.
     pub s3: S3Config,
-    /// Authentication / anonymous-access policy.
+    /// Authentication / anonymous-access policy. Every key has a default, so
+    /// the section may be left out (e.g. an install configured through
+    /// `FORGE_*` variables without any `FORGE_AUTH__*`).
+    #[serde(default)]
     pub auth: AuthConfig,
     /// Optional Redis L2 cache.
     #[serde(default)]
@@ -378,6 +381,17 @@ pub struct AuthConfig {
     #[serde(default)]
     pub password_verify_concurrency: usize,
 }
+
+impl Default for AuthConfig {
+    /// Every key at its serde default, as for an empty `[auth]` table.
+    fn default() -> Self {
+        serde_json::from_value(serde_json::json!({})).expect("every auth key has a default")
+    }
+}
+
+/// Longest accepted session lifetime (10 years): longer ones overflow the
+/// duration arithmetic and are a configuration mistake anyway.
+const MAX_SESSION_TTL_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
 fn default_credential_forward_max_concurrent() -> usize {
     forge_core::auth::DEFAULT_MAX_CONCURRENT_FORWARDS
@@ -1649,6 +1663,25 @@ impl Config {
     /// Validate cross-cutting invariants that serde cannot express.
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
+        self.validate_public_base_url()?;
+        // The DNS-rebinding guard's host list, checked before migrations run
+        // rather than when the router is built.
+        crate::middleware::principal::allowed_hosts(
+            &self.public_base_url(),
+            &self.server.allowed_hosts,
+        )
+        .map_err(|e| ConfigError::Invalid(format!("server.allowed_hosts: {e}")))?;
+        let (idle, absolute) = self.session_ttls();
+        for (name, ttl) in [
+            ("session_idle_ttl_seconds", idle),
+            ("session_absolute_ttl_seconds", absolute),
+        ] {
+            if !(1..=MAX_SESSION_TTL_SECONDS).contains(&ttl) {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.{name} must be between 1 and {MAX_SESSION_TTL_SECONDS} (10 years), got {ttl}"
+                )));
+            }
+        }
         // Eagerly validate the anon policy + trusted CIDRs so a bad value fails
         // at startup rather than mid-request.
         self.anon_policy()?;
@@ -2132,6 +2165,31 @@ impl Config {
         (idle, absolute)
     }
 
+    /// `server.public_base_url` must be an absolute http(s) URL with a host
+    /// and without query or fragment: it builds every absolute `@id` in NuGet
+    /// responses, the same-origin and allowlist host checks, and the cookie
+    /// security decision.
+    fn validate_public_base_url(&self) -> Result<(), ConfigError> {
+        let raw = &self.server.public_base_url;
+        let invalid =
+            |why: &str| ConfigError::Invalid(format!("server.public_base_url {raw:?} {why}"));
+        let url = url::Url::parse(raw.trim()).map_err(|e| {
+            invalid(&format!(
+                "is not an absolute URL ({e}), e.g. https://nuget.example.com"
+            ))
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(invalid("must use http or https"));
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return Err(invalid("must name a host"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid("must not have a query or fragment"));
+        }
+        Ok(())
+    }
+
     /// Public base URL with any trailing slash removed.
     pub fn public_base_url(&self) -> String {
         self.server
@@ -2604,6 +2662,54 @@ mod tests {
         let toml = minimal_with_oidc("").replace("client_id = \"abc-123\"", "client_id = \"\"");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("oidc.client_id"), "{err}");
+    }
+
+    #[test]
+    fn public_base_url_must_be_an_absolute_http_url() {
+        for bad in [
+            "nuget.example.com",
+            "ftp://nuget.example.com",
+            "https://nuget.example.com/?x=1",
+            "https://nuget.example.com/#top",
+            "",
+        ] {
+            let toml = MINIMAL.replace("https://forge.example.com/", bad);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains("server.public_base_url"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["http://localhost:8421", "https://nuget.example.com/feeds/"] {
+            let toml = MINIMAL.replace("https://forge.example.com/", good);
+            Config::from_figment(fig_from_toml(&toml)).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn session_ttls_must_be_positive_and_bounded() {
+        for (key, value) in [
+            ("session_idle_ttl_seconds", "0"),
+            ("session_absolute_ttl_seconds", "0"),
+            ("session_idle_ttl_seconds", "18446744073709551615"),
+        ] {
+            let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{key} = {value}"));
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(key), "{key} = {value}: {err}");
+        }
+    }
+
+    #[test]
+    fn auth_section_may_be_left_out_and_allowed_hosts_are_checked_early() {
+        let toml = MINIMAL.replace("[auth]", "");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("no [auth] table");
+        assert_eq!(cfg.auth.anonymous_mode, "off");
+        let toml = MINIMAL.replace(
+            "public_base_url = \"https://forge.example.com/\"",
+            "public_base_url = \"https://forge.example.com/\"\nallowed_hosts = [\"https://bad/\"]",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("server.allowed_hosts"), "{err}");
     }
 
     #[test]
