@@ -623,3 +623,52 @@ async fn search_pages_over_ids_with_a_selector() {
     let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
     assert_eq!(ids, ["Pkg.2", "Pkg.4"]);
 }
+
+/// #81: a registration index above the inline limit needs only versions, and
+/// a page only its own versions' entries; both agree with `registration`.
+#[tokio::test]
+async fn registration_versions_and_entries_agree_with_registration() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for (n, (version, listed)) in [("1.0.0", true), ("1.10.0", false), ("1.9.0", true)]
+        .into_iter()
+        .enumerate()
+    {
+        seed_version(
+            &pool,
+            &mut blobs,
+            repo.id,
+            "Reg.Pkg",
+            "reg.pkg",
+            version,
+            listed,
+            &format!("r{n}"),
+        )
+        .await;
+    }
+    let h = hosted(&pool, blobs);
+    let full = h.registration(&repo.name, "reg.pkg").await.unwrap();
+    let versions = h
+        .registration_versions(&repo.name, "reg.pkg")
+        .await
+        .unwrap();
+    assert_eq!(
+        versions,
+        full.iter().map(|e| e.version.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(versions, ["1.0.0", "1.9.0", "1.10.0"]);
+    let mut some = h
+        .registration_entries(&repo.name, "reg.pkg", &["1.10.0".into(), "9.9.9".into()])
+        .await
+        .unwrap();
+    assert_eq!(some.len(), 1);
+    let entry = some.remove(0);
+    let expected = full.iter().find(|e| e.version == "1.10.0").unwrap();
+    assert_eq!(entry.version, expected.version);
+    assert_eq!(entry.listed, expected.listed);
+    assert_eq!(
+        entry.package_hash_sha512_base64,
+        expected.package_hash_sha512_base64
+    );
+}

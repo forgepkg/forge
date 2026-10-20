@@ -412,6 +412,66 @@ pub async fn list_registration_rows(
     .await
 }
 
+/// Every version of `name` in `repository_id` with its publication time and
+/// the size of its asset at `nupkg_path` (`None` without one): what a package
+/// detail page shows per version, in one query.
+pub async fn version_sizes(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    nupkg_path: &str,
+) -> sqlx::Result<Vec<(String, chrono::DateTime<chrono::Utc>, Option<i64>)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT c.version, c.created_at, a.size AS "size?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
+        WHERE c.repository_id = $1 AND c.name = $2
+        "#,
+        repository_id,
+        name,
+        nupkg_path,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.version, r.created_at, r.size))
+        .collect())
+}
+
+/// [`list_registration_rows`] for `versions` (normalized) only: a
+/// registration page loads its own versions' summaries, not every version's.
+pub async fn list_registration_rows_for_versions(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+    nupkg_path: &str,
+) -> sqlx::Result<Vec<RegistrationRow>> {
+    if versions.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        RegistrationRow,
+        r#"
+        SELECT
+            c.id, c.original_id, c.version, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
+        WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3::text[])
+        ORDER BY c.id
+        "#,
+        repository_id,
+        name,
+        versions,
+        nupkg_path,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// One version's registration data (see [`list_registration_rows`]).
 pub async fn find_registration_row(
     pool: &PgPool,

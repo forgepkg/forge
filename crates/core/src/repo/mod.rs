@@ -434,6 +434,38 @@ pub trait RepoReadOps: Send + Sync {
     async fn registration(&self, repo: &str, id: &str)
         -> Result<Vec<RegistrationEntry>, RepoError>;
 
+    /// The versions [`Self::registration`] lists for `id` (including
+    /// unlisted), ascending by version precedence, without their metadata:
+    /// what a registration index needs when it does not inline its leaves.
+    /// The default derives them from [`Self::registration`]; backends that
+    /// can list the versions alone override it.
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .map(|e| e.version)
+            .collect())
+    }
+
+    /// The registration entries of `id` for `versions` (normalized), in no
+    /// particular order; versions it does not have are left out. What a
+    /// registration page needs. The default filters [`Self::registration`];
+    /// backends that can load a few versions directly override it.
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .filter(|e| versions.iter().any(|v| v.eq_ignore_ascii_case(&e.version)))
+            .collect())
+    }
+
     /// The registration entry of one `(id, version)` — what a registration
     /// leaf or catalog document needs. The default scans
     /// [`Self::registration`]; backends that can look one version up directly
@@ -632,6 +664,25 @@ impl RepoReadOps for PackageFilteredReadOps {
             return Ok(None);
         }
         self.inner.registration_entry(repo, id, version).await
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.registration_versions(repo, id).await
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.registration_entries(repo, id, versions).await
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {

@@ -427,6 +427,40 @@ impl RepoReadOps for HostedRepo {
             .collect()
     }
 
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        // The same rows `registration` lists, without their metadata.
+        Ok(self
+            .list_versions(repo, id)
+            .await?
+            .into_iter()
+            .map(|v| v.version)
+            .collect())
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows = component_dao::list_registration_rows_for_versions(
+            &self.pool,
+            repo_id,
+            id,
+            versions,
+            NUPKG_ASSET_PATH,
+        )
+        .await?;
+        use futures_util::StreamExt;
+        futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
     async fn registration_entry(
         &self,
         repo: &str,
@@ -625,6 +659,23 @@ impl HostedWrite {
             (self.publish_policy.as_ref(), publish_context.as_ref())
         {
             policy.authorize(context).await?;
+        }
+
+        // A duplicate without redeploy is answered before anything reaches
+        // S3: a CI job that re-pushes an unchanged version with
+        // `--skip-duplicate` on every build would otherwise upload it each
+        // time. The check in the transaction below stays the authority (a
+        // concurrent first push).
+        if !repo_row.allow_redeploy
+            && component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
+                .await
+                .map_err(RepoError::from)?
+                .is_some()
+        {
+            return Err(WriteError::Conflict {
+                id: parsed.original_id.clone(),
+                version: parsed.version.clone(),
+            });
         }
 
         // Authorization succeeded: the staged bytes may now be promoted into

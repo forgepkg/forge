@@ -250,6 +250,26 @@ async fn duplicate_without_redeploy_is_conflict() {
         .await
         .expect_err("duplicate must conflict");
     assert!(matches!(err, WriteError::Conflict { .. }));
+
+    // #81: a duplicate with other bytes is refused before its blob is stored.
+    let id = unique_id();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let blobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM blob")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let err = w
+        .store_upload(&repo, &make_nupkg_variant(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect_err("duplicate must conflict");
+    assert!(matches!(err, WriteError::Conflict { .. }));
+    let blobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM blob")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(blobs_after, blobs_before, "nothing reached the blob store");
 }
 
 /// Simultaneous *first* pushes of one (id, version): the duplicate check cannot

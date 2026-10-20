@@ -966,6 +966,56 @@ impl RepoReadOps for GroupRepo {
         Ok(merged)
     }
 
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+        // The versions `registration` merges: the union over serving members.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut merged: Vec<String> = Vec::new();
+        let mut failures = MemberFailures::default();
+        for m in &members {
+            match m.ops.registration_versions(&m.repo.name, id).await {
+                Ok(versions) => {
+                    failures.ok();
+                    merged.extend(versions.into_iter().filter(|v| seen.insert(v.clone())));
+                }
+                Err(e) => failures.failed(&m.repo.name, e),
+            }
+        }
+        failures.into_merged_result(merged.is_empty())?;
+        merged.sort_by(|a, b| self.compare_versions(a, b));
+        Ok(merged)
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+        // Highest-priority member first, as in `registration`.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut merged: Vec<RegistrationEntry> = Vec::new();
+        let mut failures = MemberFailures::default();
+        for m in &members {
+            match m.ops.registration_entries(&m.repo.name, id, versions).await {
+                Ok(entries) => {
+                    failures.ok();
+                    merged.extend(
+                        entries
+                            .into_iter()
+                            .filter(|e| seen.insert(e.version.clone())),
+                    );
+                }
+                Err(e) => failures.failed(&m.repo.name, e),
+            }
+        }
+        failures.into_merged_result(merged.is_empty())?;
+        Ok(merged)
+    }
+
     async fn registration_entry(
         &self,
         repo: &str,
