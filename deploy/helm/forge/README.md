@@ -6,8 +6,9 @@ set the same probes, shutdown timing and `restricted` security context; read
 [docs/deployment.md](../../../docs/deployment.md) for what every Forge setting
 means.
 
-Each release publishes the chart to GitHub Container Registry as an OCI
-artifact, with the same version as the image:
+Each release publishes the chart to GitHub Packages as an OCI artifact,
+[`oci://ghcr.io/schmitch/charts/forge`](https://github.com/schmitch/forge/pkgs/container/charts%2Fforge),
+with the same version as the image:
 
 ```bash
 helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
@@ -19,7 +20,8 @@ helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
 The chart's `appVersion` is the release it belongs to, and the image tag
 defaults to it. The release workflow also writes the digest of the image it
 built and signed into the published chart (the `forge.envisia.de/image-digest`
-annotation in `Chart.yaml`), so a published chart deploys exactly that image:
+annotation in `Chart.yaml`), so a published chart deploys exactly that image
+([`ghcr.io/schmitch/forge`](https://github.com/schmitch/forge/pkgs/container/forge)):
 
 ```
 ghcr.io/schmitch/forge:1.0.0@sha256:…

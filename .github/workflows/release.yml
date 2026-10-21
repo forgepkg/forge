@@ -497,10 +497,15 @@ jobs:
             echo "  --certificate-github-workflow-sha ${GITHUB_SHA} \\"
             echo "  --certificate-github-workflow-trigger push"
           }
+          # The packages' pages; both are linked to this repository through
+          # their org.opencontainers.image.source.
+          packages="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container"
           {
             cat release-notes.md
             echo
             echo "### Image"
+            echo
+            echo "[\`${IMAGE}\`](${packages}/${IMAGE##*/}) on GitHub Packages."
             echo
             echo "Built from commit ${GITHUB_SHA}, which \`${GITHUB_REF_NAME}\` points to. The \`cosign verify\` commands below accept only a signature by this repository's release workflow for that tag and that commit."
             echo
@@ -512,6 +517,7 @@ jobs:
             echo
             echo "### Helm chart"
             echo
+            echo "[\`oci://${CHART_REPO}/forge\`](${packages}/${CHART_REPO##*/}%2Fforge) on GitHub Packages."
             echo "Deploys exactly the image above (by digest)."
             echo
             echo '```'

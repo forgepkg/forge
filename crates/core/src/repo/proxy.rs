@@ -1153,7 +1153,7 @@ impl ProxyRepo {
         // registration and search (stored with the component, like a push).
         let parsed = {
             let format = self.format.clone();
-            let path = staged.temp_path.to_path_buf();
+            let path = staged.read_path();
             tokio::task::spawn_blocking(move || {
                 let mut file = std::fs::File::open(&path)?;
                 Ok::<_, std::io::Error>(format.parse_upload(&mut file).map(|parsed| {

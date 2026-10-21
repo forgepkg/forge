@@ -25,9 +25,12 @@ use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{
+    BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
+};
 use aws_sdk_s3::Client;
 
 use crate::blob_cache::BlobCache;
@@ -120,6 +123,8 @@ const S3_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 pub struct BlobStore {
     client: Client,
     bucket: String,
+    /// The configured region, which a created bucket is placed in.
+    region: String,
     multipart_threshold: u64,
     conditional_writes: ConditionalWrites,
     /// Sticky latch for [`ConditionalWrites::Auto`]: set once the backend
@@ -143,7 +148,7 @@ impl BlobStore {
 
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(cfg.region))
+            .region(Region::new(cfg.region.clone()))
             .endpoint_url(cfg.endpoint)
             .credentials_provider(creds)
             .force_path_style(cfg.force_path_style)
@@ -165,6 +170,7 @@ impl BlobStore {
         Self {
             client: Client::from_conf(s3_config),
             bucket: cfg.bucket,
+            region: cfg.region,
             multipart_threshold: cfg.multipart_threshold,
             conditional_writes: cfg.conditional_writes,
             conditional_unsupported: Arc::new(AtomicBool::new(false)),
@@ -251,7 +257,13 @@ impl BlobStore {
     /// Create the bucket if it does not already exist.
     ///
     /// versitygw's posix backend needs the bucket directory to exist before any
-    /// object operation. Treats an already-existing bucket as success.
+    /// object operation. A bucket that already exists and that these
+    /// credentials can reach is success. A new bucket is created in the
+    /// configured region: outside `us-east-1`, AWS refuses a `CreateBucket`
+    /// without that `LocationConstraint` (versitygw and MinIO ignore it). A
+    /// name another account owns (`BucketAlreadyExists`, and still not
+    /// reachable) is an error that names the bucket; counting it as created
+    /// let the server start with `/readyz` failing for no stated reason.
     pub async fn ensure_bucket(&self) -> Result<(), S3Error> {
         self.admit()?;
         // Fast path: bucket already there.
@@ -260,24 +272,34 @@ impl BlobStore {
         if head.is_ok() {
             return Ok(());
         }
-        let created = self
-            .client
-            .create_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await;
+        let mut create = self.client.create_bucket().bucket(&self.bucket);
+        if let Some(config) = create_bucket_configuration(&self.region) {
+            create = create.create_bucket_configuration(config);
+        }
+        let created = create.send().await;
         self.observe(&created);
-        match created {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Tolerate races / "already owned by you".
-                let msg = format!("{e:?}");
-                if msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists") {
+        let err = match created {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        match err.as_service_error() {
+            // Ours already (a concurrent start created it).
+            Some(CreateBucketError::BucketAlreadyOwnedByYou(_)) => Ok(()),
+            // Taken, by another account unless these credentials can reach
+            // it now (some backends answer this to a concurrent create).
+            Some(CreateBucketError::BucketAlreadyExists(_)) => {
+                let reachable = self.client.head_bucket().bucket(&self.bucket).send().await;
+                self.observe(&reachable);
+                if reachable.is_ok() {
                     Ok(())
                 } else {
-                    Err(self.error(e))
+                    Err(bucket_taken(&self.bucket))
                 }
             }
+            _ => Err(match self.error(err) {
+                S3Error::S3(e) => S3Error::S3(format!("create S3 bucket {:?}: {e}", self.bucket)),
+                unavailable => unavailable,
+            }),
         }
     }
 
@@ -577,6 +599,8 @@ impl BlobStore {
             Err(e) => {
                 if is_not_found(&e) {
                     Ok(())
+                } else if e.code() == Some("AccessDenied") {
+                    Err(delete_denied(key))
                 } else {
                     Err(self.error(e))
                 }
@@ -593,6 +617,17 @@ impl BlobStore {
         }
         Ok(())
     }
+}
+
+/// The error for a delete S3 refused with `AccessDenied`: says what the
+/// credentials lack, since the consequence (a blob whose bytes can never be
+/// stored again) shows up far from the cause.
+fn delete_denied(key: &str) -> S3Error {
+    S3Error::S3(format!(
+        "S3 refused to delete {key} (AccessDenied): Forge's credentials need s3:DeleteObject \
+         on the bucket's objects; until then the blob stays reserved for deletion and \
+         storing the same bytes again fails (see the deployment guide's S3 permissions)"
+    ))
 }
 
 /// Aborts an in-progress multipart upload unless [disarmed](Self::disarm).
@@ -760,9 +795,63 @@ where
     msg.contains("NotFound") || msg.contains("NoSuchKey") || msg.contains("status: 404")
 }
 
+/// The `CreateBucketConfiguration` that places a new bucket in `region`:
+/// none for `us-east-1` (AWS refuses that constraint, it is the default) or
+/// an unset region, the region as `LocationConstraint` otherwise.
+fn create_bucket_configuration(region: &str) -> Option<CreateBucketConfiguration> {
+    let region = region.trim();
+    if region.is_empty() || region == "us-east-1" {
+        return None;
+    }
+    Some(
+        CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(region))
+            .build(),
+    )
+}
+
+/// The error for a bucket name that another account owns.
+fn bucket_taken(bucket: &str) -> S3Error {
+    S3Error::S3(format!(
+        "S3 bucket {bucket:?} already exists and belongs to another account \
+         (BucketAlreadyExists): choose another s3.bucket, or create the bucket \
+         and grant these credentials access to it"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_bucket_is_created_in_the_configured_region() {
+        for region in ["us-east-1", "", " "] {
+            assert!(create_bucket_configuration(region).is_none(), "{region:?}");
+        }
+        for region in ["eu-central-1", "ap-southeast-2"] {
+            let config = create_bucket_configuration(region).expect(region);
+            assert_eq!(
+                config
+                    .location_constraint()
+                    .map(BucketLocationConstraint::as_str),
+                Some(region)
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_delete_says_which_permission_is_missing() {
+        let err = delete_denied("blobs/sha256/aa/bb/x").to_string();
+        assert!(err.contains("blobs/sha256/aa/bb/x"), "{err}");
+        assert!(err.contains("s3:DeleteObject"), "{err}");
+    }
+
+    #[test]
+    fn a_bucket_another_account_owns_is_an_error_naming_it() {
+        let err = bucket_taken("forge-blobs").to_string();
+        assert!(err.contains("\"forge-blobs\""), "{err}");
+        assert!(err.contains("another account"), "{err}");
+    }
 
     /// A store that never talks to a network (the client is only built, not
     /// used) — enough to exercise the conditional-writes decision logic.

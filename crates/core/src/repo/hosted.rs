@@ -638,7 +638,7 @@ impl HostedWrite {
         //    never re-parse the manifest) is computed here too.
         let (parsed, manifest_summary) = {
             let format = self.format.clone();
-            let path = staged_nupkg.temp_path.to_path_buf();
+            let path = staged_nupkg.read_path();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = std::fs::metadata(&path) {
                     return Err(WriteError::Repo(RepoError::Storage(format!(

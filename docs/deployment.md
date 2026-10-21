@@ -392,11 +392,15 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   or NFSv3 with `lockd`; not a mount with `nolock` or `local_lock`):
   otherwise one instance's startup can remove another's files mid-request.
   Where locks do not work at all, a killed process's files are removed once
-  idle for an hour instead. On a host shared with other users, point
-  `server.staging_dir` at a directory only Forge's user can write: Forge does
-  not check the directory's owner or permissions, and another user can create
-  the default one under the system temp directory first. (The container image
-  and the Kubernetes manifests are not affected.)
+  idle for an hour instead. The staging directory must belong to Forge's
+  user and must not be writable by group or others (unless it is sticky,
+  like `/tmp`); Forge refuses to start otherwise, and creates a missing one,
+  and each process's subdirectory, with mode `0700`. A staged file is read
+  back through the handle it was written with, never by its name. On a host
+  shared with other users, point `server.staging_dir` at a directory of
+  Forge's own: another user could create the default one under the system
+  temp directory first, and Forge then refuses to start. (The container
+  image and the Kubernetes manifests are not affected.)
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.

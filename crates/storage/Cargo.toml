@@ -26,7 +26,8 @@ futures-util = { workspace = true }
 
 # statvfs(2) for the blob cache's disk-sized limit.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+# `process`: the effective user id the staging directory must belong to.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
