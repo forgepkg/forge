@@ -187,7 +187,9 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err(format!(
-            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from              A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit              (the name is part of the feed URL)"
+            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from \
+             A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit \
+             (the name is part of the feed URL)"
         ));
     }
     if name.eq_ignore_ascii_case("new") {
@@ -881,4 +883,17 @@ async fn hard_delete(
 /// Whether a `sqlx::Error` is a Postgres unique-violation (23505).
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_name_error_reads_as_one_sentence() {
+        let msg = validate_repo_name("bad name").unwrap_err();
+        assert!(!msg.contains("  "), "{msg}");
+        assert!(msg.contains("characters from A-Z"), "{msg}");
+        assert!(validate_repo_name("nuget-hosted.v3_x").is_ok());
+    }
 }
