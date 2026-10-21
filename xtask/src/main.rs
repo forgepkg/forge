@@ -150,13 +150,16 @@ Docker image (single container: web SPA + Rust server):
 
 Release:
   release <version> [--no-tag]
-                Set <version> in Cargo.toml/Cargo.lock, web/package.json and the
-                Kubernetes base's image tag, turn CHANGELOG.md's [Unreleased] into
-                its section, commit, and tag v<version> (default branch only).
+                Set <version> in Cargo.toml/Cargo.lock, web/package.json, the
+                Kubernetes base's image tag and the Helm chart, turn CHANGELOG.md's
+                [Unreleased] into its section and commit on release-<version>
+                (HEAD must be origin/main). Then, with `gh`: open a pull request,
+                wait for its CI run, merge it, wait for the merge commit's CI run
+                on main, tag the merge commit v<version> and push the tag. When
+                main already carries <version>, tags main's head once its CI passed.
                 Refuses a changelog with an untagged version section, or with
                 entries under [Unreleased] next to a drafted <version> section.
-                --no-tag: commit only, for a release pull request (tag the merge
-                commit once its CI is green). Never pushes.
+                --no-tag: only commit, on the current branch; never pushes.
 
   help          Show this help.
 "#
