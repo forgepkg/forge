@@ -14,8 +14,10 @@ import { routeTree } from '~/routeTree.gen'
 
 /**
  * Package-detail screen (plan §Phase 3 testing): renders versions + dependency
- * groups; a delayed proxy version shows the delay badge; a 404 renders the
- * not-found empty state. Drives the real route tree + `usePackageDetail`.
+ * groups; a delayed proxy version shows the delay badge; a proxy labels the
+ * time column "Cached" (when Forge downloaded it), a hosted repository
+ * "Published"; a 404 renders the not-found empty state. Drives the real
+ * route tree + `usePackageDetail`.
  */
 
 const anonMe: Me = {
@@ -156,6 +158,39 @@ describe('PackageDetail', () => {
     // The available version shows the available badge, not delayed.
     const stableRow = within(table).getByText('13.0.3').closest('tr') as HTMLElement
     expect(within(stableRow).getByText('available')).toBeInTheDocument()
+  })
+
+  it('labels the time column "Cached" on a proxy', async () => {
+    mockApi(() => jsonResponse(proxyDetail))
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    const cached = screen.getByRole('columnheader', { name: 'Cached' })
+    expect(cached).toHaveAttribute(
+      'title',
+      'When Forge first downloaded this version from the upstream',
+    )
+    expect(screen.queryByRole('columnheader', { name: 'Published' })).toBeNull()
+  })
+
+  it('labels the time column "Published" on a hosted repository', async () => {
+    mockApi(() =>
+      jsonResponse({
+        ...proxyDetail,
+        repo: 'internal',
+        repo_kind: 'hosted',
+        versions: proxyDetail.versions.map((v) => ({ ...v, delay_status: null })),
+      }),
+    )
+
+    await renderDetail('/packages/internal/newtonsoft.json')
+
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    expect(
+      screen.getByRole('columnheader', { name: 'Published' }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('columnheader', { name: 'Cached' })).toBeNull()
   })
 
   it('renders a not-found empty state on 404', async () => {

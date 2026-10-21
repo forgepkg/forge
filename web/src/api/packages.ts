@@ -61,7 +61,10 @@ export interface DetailVersion {
   listed: boolean
   /** `.nupkg` byte size, if a stored asset is known (null when not cached). */
   size: number | null
-  /** Publish / first-seen time (`component.created_at`), if known. */
+  /**
+   * When the version reached Forge (`component.created_at`), if known: the
+   * push time on a hosted repository, the first download on a proxy.
+   */
   published_at: string | null
   /** Proxy package-delay status (`null` for hosted / group versions). */
   delay_status: DelayStatus | null

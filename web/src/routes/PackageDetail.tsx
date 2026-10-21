@@ -81,7 +81,7 @@ function PackageDetailPage() {
           </div>
         ) : (
           <div className="mt-3">
-            <VersionTable versions={pkg.versions} />
+            <VersionTable versions={pkg.versions} repoKind={pkg.repo_kind} />
           </div>
         )}
       </div>
