@@ -263,7 +263,8 @@ pub struct CallbackQuery {
     pub error_description: Option<String>,
 }
 
-/// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target.
+/// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target
+/// (or, when the sign-in is refused, to the login page with an error code).
 ///
 /// The browser must present the pre-auth flow cookie set by
 /// `GET /auth/oidc/login` (login-CSRF defense); it is cleared on every outcome.
@@ -285,6 +286,40 @@ async fn oidc_callback(
         }
     }
     resp
+}
+
+/// Why an OIDC sign-in was refused, as the SPA's login page names it.
+#[derive(Debug, Clone, Copy)]
+enum LoginFailure {
+    /// The callback did not validate (state, binding, code exchange, token),
+    /// or the IdP answered with an error such as a cancelled sign-in.
+    OidcFailed,
+    /// The token was valid but the user may not sign in: the realm's required
+    /// claims are missing, auto-provisioning is off, or the account is
+    /// inactive.
+    NotPermitted,
+}
+
+impl LoginFailure {
+    fn code(self) -> &'static str {
+        match self {
+            LoginFailure::OidcFailed => "oidc_failed",
+            LoginFailure::NotPermitted => "not_permitted",
+        }
+    }
+}
+
+/// Send a refused OIDC sign-in back to the SPA's login page,
+/// `/login?error=<code>`, which explains it and offers to try again. The
+/// browser arrives at the callback straight from the IdP, so a bare text
+/// body left the user on a dead end. The code is generic: the IdP's
+/// `error_description` is never passed on (it is only logged, bounded).
+fn login_failed(failure: LoginFailure) -> Response {
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, format!("/login?error={}", failure.code()))],
+    )
+        .into_response()
 }
 
 /// The callback proper; [`oidc_callback`] wraps it to clear the flow cookie.
@@ -318,7 +353,7 @@ async fn oidc_callback_inner(
             // supplied `error_description`: bounded and `?`-escaped, so it
             // cannot forge log lines or flood the log.
             tracing::warn!(error = ?bounded_for_log(&e.to_string()), "oidc callback failed");
-            return (StatusCode::BAD_REQUEST, "oidc login failed").into_response();
+            return login_failed(LoginFailure::OidcFailed);
         }
     };
 
@@ -328,7 +363,7 @@ async fn oidc_callback_inner(
             issuer = %validated.issuer,
             "oidc login refused: the token does not carry the realm's required claims"
         );
-        return (StatusCode::FORBIDDEN, "login not permitted").into_response();
+        return login_failed(LoginFailure::NotPermitted);
     }
 
     let mapped = map_claims(&validated.claims, &rt.mapping);
@@ -336,7 +371,7 @@ async fn oidc_callback_inner(
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(error = %e, "oidc user resolution failed");
-            return (StatusCode::FORBIDDEN, "login not permitted").into_response();
+            return login_failed(LoginFailure::NotPermitted);
         }
     };
     if mapped.admin_managed {

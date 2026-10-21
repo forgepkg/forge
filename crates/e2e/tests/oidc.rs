@@ -147,6 +147,14 @@ async fn callback(srv: &TestServer, state: &str) -> reqwest::Response {
 
 /// Whether a response set a `forge_session` cookie (the flow cookie is always
 /// cleared on the callback, so "no Set-Cookie at all" is not the signal).
+/// Whether a callback was refused: a refused sign-in is sent back to the
+/// login page with a generic error code instead of answering 400.
+fn refused_to_login_page(resp: &reqwest::Response) -> bool {
+    resp.status() == 302
+        && resp.headers().get("location").and_then(|v| v.to_str().ok())
+            == Some("/login?error=oidc_failed")
+}
+
 fn sets_session_cookie(resp: &reqwest::Response) -> bool {
     resp.headers()
         .get_all("set-cookie")
@@ -203,9 +211,9 @@ async fn unknown_and_replayed_state_rejected() {
     let idp = MockOidc::start(CLIENT_ID).await;
     let srv = start_oidc_stack(&idp).await;
 
-    // Never-issued state → 400 (no oidc_flow row).
+    // Never-issued state → refused (no oidc_flow row).
     let resp = callback(&srv, "never-issued-state").await;
-    assert_eq!(resp.status(), 400, "unknown state rejected");
+    assert!(refused_to_login_page(&resp), "unknown state rejected");
     assert!(!sets_session_cookie(&resp));
 
     // A once-used state cannot be replayed (the row is consumed single-use).
@@ -214,11 +222,13 @@ async fn unknown_and_replayed_state_rejected() {
         .await;
     let first = callback(&srv, &state).await;
     assert_eq!(first.status(), 302, "first callback succeeds");
-    // Replay the same state → the flow row is gone → 400.
+    assert!(sets_session_cookie(&first), "first callback succeeds");
+    // Replay the same state → the flow row is gone → refused.
     idp.set_next_id_token(idp.id_claims("sub-bob", "bob", &nonce, json!([])))
         .await;
     let replay = callback(&srv, &state).await;
-    assert_eq!(replay.status(), 400, "replayed state rejected");
+    assert!(refused_to_login_page(&replay), "replayed state rejected");
+    assert!(!sets_session_cookie(&replay));
 }
 
 #[tokio::test]
@@ -231,7 +241,7 @@ async fn nonce_mismatch_rejected() {
     idp.set_next_id_token(idp.id_claims("sub-carol", "carol", "not-the-nonce", json!([])))
         .await;
     let resp = callback(&srv, &state).await;
-    assert_eq!(resp.status(), 400, "nonce mismatch rejected");
+    assert!(refused_to_login_page(&resp), "nonce mismatch rejected");
     assert!(!sets_session_cookie(&resp));
 }
 
@@ -354,7 +364,10 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
     let (state, nonce) = begin_login(&srv).await;
     idp.set_next_id_token(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
         .await;
-    assert_eq!(callback(&srv, &state).await.status(), 302, "warm-up login");
+    assert!(
+        sets_session_cookie(&callback(&srv, &state).await),
+        "warm-up login"
+    );
 
     // The IdP rotates its signing key (publishes only the new "k2" in JWKS).
     idp.rotate_key("k2").await;
@@ -364,9 +377,8 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
     idp.set_next_id_token(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
         .await;
     let resp = callback(&srv, &state).await;
-    assert_eq!(
-        resp.status(),
-        302,
+    assert!(
+        resp.status() == 302 && sets_session_cookie(&resp),
         "token signed with the rotated key validates (kid-miss refetch)"
     );
 
@@ -375,9 +387,8 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
     idp.set_next_id_token_with_unknown_key(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
         .await;
     let resp = callback(&srv, &state).await;
-    assert_eq!(
-        resp.status(),
-        400,
+    assert!(
+        refused_to_login_page(&resp),
         "token signed by an unknown/retired key is rejected"
     );
 }
