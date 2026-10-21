@@ -33,8 +33,11 @@ use axum::routing::post;
 use axum::Router;
 use chrono::{DateTime, Utc};
 use forge_core::auth::{generate_workload_key, is_workload_key, workload_key_sha256, Principal};
+use forge_db::trusted_publish_audit_dao;
 use forge_db::workload_api_key_dao::{self, NewWorkloadApiKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 
 use super::wif::{ExchangeRefusal, WorkloadIdentitySource};
 use crate::state::AppState;
@@ -186,7 +189,7 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     };
 
     let api_key = generate_workload_key();
-    let stored = workload_api_key_dao::insert(
+    let stored = store_key(
         &state.pool,
         NewWorkloadApiKey {
             key_sha256: &workload_key_sha256(&api_key),
@@ -203,8 +206,8 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     )
     .await;
     let expires = match stored {
-        Ok(Some(expires)) => expires,
-        Ok(None) => {
+        Ok(Stored::Issued(expires)) => expires,
+        Ok(Stored::Replayed) => {
             tracing::warn!(
                 realm_id,
                 role_id,
@@ -213,6 +216,17 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             return refused(
                 StatusCode::UNAUTHORIZED,
                 "this token was already exchanged; request a new one from the CI job",
+            );
+        }
+        Ok(Stored::RealmChanged) => {
+            tracing::warn!(
+                realm_id,
+                role_id,
+                "workload realm or role changed during the token exchange"
+            );
+            return refused(
+                StatusCode::UNAUTHORIZED,
+                "the workload identity realm changed during the exchange; try again",
             );
         }
         Err(e) => {
@@ -237,6 +251,42 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         Json(ExchangeResponse { api_key, expires }),
     )
         .into_response()
+}
+
+/// What [`store_key`] did.
+enum Stored {
+    Issued(DateTime<Utc>),
+    /// The token was exchanged before.
+    Replayed,
+    /// The realm was disabled, deleted or edited (or the role deleted)
+    /// since the token was verified against it.
+    RealmChanged,
+}
+
+/// Store `new` while holding the realm and role rows, and only while the
+/// realm still has the issuer and configuration the token was verified
+/// under. A realm change waits for this transaction and then revokes the
+/// key (`workload_api_key_dao::revoke_realm`), or lands first and no key is
+/// issued: a key never outlives the change, whatever the realm later
+/// becomes.
+async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<Stored> {
+    let mut tx = pool.begin().await?;
+    let Some(identity) =
+        trusted_publish_audit_dao::lock_identity_snapshot(&mut tx, new.realm_id, new.role_id)
+            .await?
+    else {
+        return Ok(Stored::RealmChanged);
+    };
+    let issuer: [u8; 32] = Sha256::digest(identity.issuer.trim_end_matches('/').as_bytes()).into();
+    let config = super::workload_identity_config_sha256(&identity.realm_config).ok();
+    if issuer != *new.issuer_sha256 || config.as_ref() != Some(new.config_sha256) {
+        return Ok(Stored::RealmChanged);
+    }
+    let Some(expires) = workload_api_key_dao::insert(&mut tx, new).await? else {
+        return Ok(Stored::Replayed);
+    };
+    tx.commit().await?;
+    Ok(Stored::Issued(expires))
 }
 
 #[cfg(test)]

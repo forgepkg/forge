@@ -1153,6 +1153,8 @@ struct MockRegistry {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     down: AtomicBool,
     corrupt: AtomicBool,
+    /// Answer every blob `HEAD` with 200, whether the blob exists or not.
+    lie_on_head: AtomicBool,
     manifest_gets: AtomicUsize,
     blob_gets: AtomicUsize,
     token_requests: AtomicUsize,
@@ -1257,6 +1259,9 @@ impl MockRegistry {
                     .into_response()
             }
             Some(forge_oci::path::Endpoint::Blob { digest, .. }) => {
+                if head && self.lie_on_head.load(Ordering::SeqCst) {
+                    return StatusCode::OK.into_response();
+                }
                 let Some(mut body) = self.blobs.lock().unwrap().get(&digest).cloned() else {
                     return StatusCode::NOT_FOUND.into_response();
                 };
@@ -1433,6 +1438,68 @@ async fn proxies_cache_verify_and_serve_stale_tags() {
 }
 
 #[tokio::test]
+async fn a_proxy_links_only_blobs_its_own_upstream_served() {
+    let srv = common::start().await;
+    let oci = admin_oci(&srv).await;
+
+    // A private image in a hosted repository.
+    let hosted = repo_name("private");
+    create_repo(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let secret = b"private layer bytes".to_vec();
+    oci.push_image(&format!("{hosted}/team/app"), "1", "amd64", &secret)
+        .await;
+
+    let mock = MockRegistry::start().await;
+    let shared = b"layer shared upstream".to_vec();
+    mock.put_blob(&shared);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret"
+        }),
+    )
+    .await;
+
+    // An upstream that claims every blob gets nothing Forge holds for
+    // another repository: the blob is fetched (and is not there).
+    mock.lie_on_head.store(true, Ordering::SeqCst);
+    let resp = oci
+        .get(&format!("{proxy}/x"), &format!("blobs/{}", sha(&secret)))
+        .await;
+    assert_eq!(resp.status(), 404);
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM oci_blob_link l JOIN repository r ON r.id = l.repository_id \
+         WHERE r.name = $1",
+    )
+    .bind(&proxy)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(linked, 0, "nothing linked into the proxy");
+    mock.lie_on_head.store(false, Ordering::SeqCst);
+
+    // A layer this proxy already fetched is linked into another of its
+    // images without a second download.
+    let path = format!("blobs/{}", sha(&shared));
+    let resp = oci.get(&format!("{proxy}/library/a"), &path).await;
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), shared.as_slice());
+    let gets = mock.blob_gets.load(Ordering::SeqCst);
+    let resp = oci.get(&format!("{proxy}/library/b"), &path).await;
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), shared.as_slice());
+    assert_eq!(
+        mock.blob_gets.load(Ordering::SeqCst),
+        gets,
+        "linked, not fetched"
+    );
+}
+
+#[tokio::test]
 async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     let srv = common::start().await;
     let mock = MockRegistry::start().await;
@@ -1497,6 +1564,27 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     );
     let resp = oci.get(&format!("{group}/public/app"), "manifests/2").await;
     assert_eq!(resp.headers()["docker-content-digest"], ours.as_str());
+
+    // The guard holds for a caller who cannot read the hosted member: it gets
+    // nothing, never the proxy's image of the same name.
+    let (user, token, uid) = user_with_token(&srv).await;
+    grant(&srv, uid, &group, &["read"]).await;
+    grant(&srv, uid, &proxy, &["read"]).await;
+    let dev = Oci::new(&srv, Some((user, token)));
+    assert_eq!(
+        dev.get(&format!("{group}/public/app"), "manifests/1")
+            .await
+            .status(),
+        404
+    );
+    mock.put("other/app", "1", OCI_MANIFEST, &manifest);
+    assert_eq!(
+        dev.get(&format!("{group}/other/app"), "manifests/1")
+            .await
+            .status(),
+        200,
+        "what no owner has still comes from the proxy"
+    );
 }
 
 // ── Admin API ───────────────────────────────────────────────────────────────

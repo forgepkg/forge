@@ -278,12 +278,27 @@ async fn insert_link_row(
     Ok(inserted.rows_affected() == 1)
 }
 
-/// A committed CAS blob by its SHA-256 (for linking content Forge already
-/// stores), with its object key and size.
-pub async fn committed_blob(pool: &PgPool, sha256: &str) -> sqlx::Result<Option<(String, i64)>> {
+/// A committed CAS blob by its SHA-256 that another image of the same
+/// repository already links, with its object key and size. Only such a blob
+/// may be linked on an upstream's word alone: a proxy's links hold content
+/// its own upstream served and Forge verified, whereas the rest of the CAS
+/// (other repositories' layers and manifests, packages of other formats)
+/// never came from that upstream.
+pub async fn blob_linked_in_repository(
+    pool: &PgPool,
+    repository_id: i64,
+    sha256: &str,
+) -> sqlx::Result<Option<(String, i64)>> {
     let row = sqlx::query!(
-        "SELECT s3_key, size FROM blob WHERE sha256 = $1 AND state = 'committed'",
+        r#"
+        SELECT b.s3_key, b.size
+        FROM oci_blob_link l
+        JOIN blob b ON b.sha256 = l.blob_sha256
+        WHERE l.blob_sha256 = $1 AND l.repository_id = $2 AND b.state = 'committed'
+        LIMIT 1
+        "#,
         sha256,
+        repository_id,
     )
     .fetch_optional(pool)
     .await?;
@@ -345,6 +360,33 @@ pub async fn lock_links(
     )
     .fetch_all(&mut **tx)
     .await
+}
+
+/// Lock a link of an image (`FOR UPDATE`) before deleting it: a manifest
+/// push holds the links it names `FOR SHARE` ([`lock_links`]), so a
+/// [`link_referenced`] check that follows (in a statement of its own) sees
+/// every manifest that committed while this waited. `false` when the image
+/// has no such link.
+pub async fn lock_link(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    image: &str,
+    digest: &str,
+) -> sqlx::Result<bool> {
+    let locked = sqlx::query_scalar!(
+        r#"
+        SELECT 1 AS "one!"
+        FROM oci_blob_link
+        WHERE repository_id = $1 AND image = $2 AND digest = $3
+        FOR UPDATE
+        "#,
+        repository_id,
+        image,
+        digest,
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
 }
 
 /// Whether a manifest of the image names blob `digest`.

@@ -634,11 +634,15 @@ impl Registry {
         let path = format!("/v2/{local}/blobs/{digest}");
         let pool = &self.inner.pool;
 
-        // Content the CAS already holds (a layer shared with another image)
-        // is linked once the upstream confirms this image has it, without
-        // downloading it again.
+        // A layer another image of this proxy already holds (served by this
+        // upstream and verified when it was fetched) is linked once the
+        // upstream confirms this image has it, without downloading it again.
+        // Anything else in the CAS is fetched and verified like a new blob:
+        // the upstream's HEAD must never reach content it did not serve.
         if digest.algorithm() == crate::digest::Algorithm::Sha256 {
-            if let Some((_, size)) = oci_dao::committed_blob(pool, digest.hex()).await? {
+            if let Some((_, size)) =
+                oci_dao::blob_linked_in_repository(pool, repo.id, digest.hex()).await?
+            {
                 let head = upstream
                     .send(Method::HEAD, &path, &scope, None, RequestClass::Metadata)
                     .await?;

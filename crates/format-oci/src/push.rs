@@ -6,6 +6,7 @@
 //! docker, podman and containerd send) that chunk already is the blob and is
 //! linked as is; only multi-chunk uploads are assembled into a new blob.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 
 use axum::body::Body;
@@ -591,8 +592,12 @@ impl Registry {
         let stored = self.inner.cas.commit(staged).await?;
 
         let mut tx = self.inner.pool.begin().await?;
-        let linked = oci_dao::lock_links(&mut tx, t.repo.id, &t.image, &required_blobs).await?;
-        if let Some(missing) = required_blobs.iter().find(|d| !linked.contains(d)) {
+        let linked: HashSet<String> =
+            oci_dao::lock_links(&mut tx, t.repo.id, &t.image, &required_blobs)
+                .await?
+                .into_iter()
+                .collect();
+        if let Some(missing) = required_blobs.iter().find(|d| !linked.contains(*d)) {
             return Err(OciError::new(
                 StatusCode::BAD_REQUEST,
                 Code::ManifestBlobUnknown,
@@ -601,9 +606,12 @@ impl Registry {
             .with_detail(serde_json::json!({ "digest": missing })));
         }
         if !children.is_empty() {
-            let present =
-                oci_dao::existing_manifests(&mut tx, t.repo.id, &t.image, &children).await?;
-            if let Some(missing) = children.iter().find(|d| !present.contains(d)) {
+            let present: HashSet<String> =
+                oci_dao::existing_manifests(&mut tx, t.repo.id, &t.image, &children)
+                    .await?
+                    .into_iter()
+                    .collect();
+            if let Some(missing) = children.iter().find(|d| !present.contains(*d)) {
                 return Err(OciError::new(
                     StatusCode::BAD_REQUEST,
                     Code::ManifestBlobUnknown,
@@ -650,24 +658,9 @@ impl Registry {
                 TagWrite::Created | TagWrite::Moved { .. } | TagWrite::Unchanged => {}
             }
         }
-        if let Some(recorder) = &self.inner.recorder {
-            let policy = recorder.for_repository(&t.repo);
-            let context = PublishAuthorizationContext {
-                principal: ctx.caller.principal,
-                action: PackageMutation::Publish,
-                package_id: t.image.clone(),
-                package_version: tags.first().cloned().unwrap_or_else(|| digest.to_string()),
-            };
-            policy
-                .record_in_transaction(&context, &mut tx)
-                .await
-                .map_err(|e| match e {
-                    WriteError::ForbiddenPackage { .. } => {
-                        OciError::denied("the workload identity may no longer publish here")
-                    }
-                    other => OciError::internal("publish record", other),
-                })?;
-        }
+        let version = tags.first().cloned().unwrap_or_else(|| digest.to_string());
+        self.record_mutation(ctx, t, PackageMutation::Publish, version, &mut tx)
+            .await?;
         tx.commit().await?;
 
         let mut response = StatusCode::CREATED.into_response();
@@ -814,10 +807,13 @@ impl Registry {
                 .await?
             }
         };
-        tx.commit().await?;
         if !deleted {
             return Err(OciError::manifest_unknown(reference.as_str()));
         }
+        let version = reference.as_str().to_string();
+        self.record_mutation(ctx, t, PackageMutation::Delete, version, &mut tx)
+            .await?;
+        tx.commit().await?;
         Ok(StatusCode::ACCEPTED.into_response())
     }
 
@@ -825,6 +821,11 @@ impl Registry {
         let t = ctx.serving();
         let digest = parse_digest(digest)?;
         let mut tx = self.inner.pool.begin().await?;
+        // Lock first, check after: a manifest naming the blob that commits
+        // while this waits for the lock is seen by the check.
+        if !oci_dao::lock_link(&mut tx, t.repo.id, &t.image, digest.as_str()).await? {
+            return Err(OciError::blob_unknown(digest.as_str()));
+        }
         if oci_dao::link_referenced(&mut *tx, t.repo.id, &t.image, digest.as_str()).await? {
             return Err(OciError::new(
                 StatusCode::CONFLICT,
@@ -836,11 +837,47 @@ impl Registry {
         let deleted =
             oci_dao::delete_link(&mut tx, t.repo.id, &t.image, digest.as_str(), self.grace())
                 .await?;
-        tx.commit().await?;
         if !deleted {
             return Err(OciError::blob_unknown(digest.as_str()));
         }
+        let version = digest.to_string();
+        self.record_mutation(ctx, t, PackageMutation::Delete, version, &mut tx)
+            .await?;
+        tx.commit().await?;
         Ok(StatusCode::ACCEPTED.into_response())
+    }
+
+    /// Run a change of an image past the repository's publish policy in the
+    /// change's transaction: a workload's pushes and deletes go to the
+    /// trusted-publishing ledger, and fail when its realm or role changed
+    /// since the request was authenticated.
+    async fn record_mutation(
+        &self,
+        ctx: &RequestCtx,
+        t: &Target,
+        action: PackageMutation,
+        version: String,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> OciResult<()> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        let context = PublishAuthorizationContext {
+            principal: ctx.caller.principal,
+            action,
+            package_id: t.image.clone(),
+            package_version: version,
+        };
+        recorder
+            .for_repository(&t.repo)
+            .record_in_transaction(&context, tx)
+            .await
+            .map_err(|e| match e {
+                WriteError::ForbiddenPackage { .. } => {
+                    OciError::denied("the workload identity may no longer change this repository")
+                }
+                other => OciError::internal("publish record", other),
+            })
     }
 
     /// Store a manifest fetched from a proxy's upstream (no reference

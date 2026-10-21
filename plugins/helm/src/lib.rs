@@ -28,6 +28,7 @@ mod chart;
 mod semver;
 mod tar;
 mod upstream;
+mod yaml;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

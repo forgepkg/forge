@@ -133,27 +133,22 @@ pub struct ParsedManifest {
     pub annotations: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// The first descriptor of each digest, in order. In linear time: a 4 MiB
+/// manifest names tens of thousands of descriptors.
+fn first_of_each<'a>(descriptors: impl Iterator<Item = &'a Descriptor>) -> Vec<&'a Descriptor> {
+    let mut seen = std::collections::HashSet::new();
+    descriptors.filter(|d| seen.insert(&d.digest)).collect()
+}
+
 impl ParsedManifest {
     /// Blobs this manifest references (config first, then layers), each once.
     pub fn blob_references(&self) -> Vec<&Descriptor> {
-        let mut out: Vec<&Descriptor> = Vec::new();
-        for d in self.config.iter().chain(self.layers.iter()) {
-            if !out.iter().any(|seen| seen.digest == d.digest) {
-                out.push(d);
-            }
-        }
-        out
+        first_of_each(self.config.iter().chain(self.layers.iter()))
     }
 
     /// The child manifests of an index, each once.
     pub fn manifest_references(&self) -> Vec<&Descriptor> {
-        let mut out: Vec<&Descriptor> = Vec::new();
-        for d in &self.manifests {
-            if !out.iter().any(|seen| seen.digest == d.digest) {
-                out.push(d);
-            }
-        }
-        out
+        first_of_each(self.manifests.iter())
     }
 
     /// Total size of the layers (the compressed image size).

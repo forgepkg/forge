@@ -10,11 +10,12 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
+use forge_core::auth::Principal;
 use forge_core::repo::PublishPolicy;
 use forge_crypto::service::EnvelopeService;
 use forge_crypto::{AeadBinding, ExposeSecret, PlaintextSecret};
-use forge_db::authz_dao;
 use forge_db::model::Repository;
+use forge_db::{authz_dao, workload_api_key_dao};
 use forge_oci::token::TokenKeys;
 use sha2::Digest;
 use sqlx::PgPool;
@@ -38,6 +39,39 @@ pub(crate) struct LedgerRecorder;
 impl forge_oci::PublishRecorder for LedgerRecorder {
     fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy> {
         crate::dispatch::workload_ledger_policy(repository)
+    }
+}
+
+/// Registry tokens of a workload stand only while their realm and key do.
+pub(crate) struct WorkloadLiveness {
+    pub realms: Arc<crate::auth::RealmAuth>,
+    pub pool: PgPool,
+}
+
+#[async_trait::async_trait]
+impl forge_oci::WorkloadCheck for WorkloadLiveness {
+    async fn still_valid(&self, principal: &Principal) -> Result<bool, String> {
+        let Principal::Workload {
+            realm_id,
+            issuer_sha256,
+            config_sha256,
+            jti_sha256,
+            ..
+        } = *principal
+        else {
+            return Ok(true);
+        };
+        let snapshot = self.realms.snapshot().await.map_err(|e| e.to_string())?;
+        if !crate::auth::realm_current(&snapshot, realm_id, &config_sha256) {
+            return Ok(false);
+        }
+        let Some(jti_sha256) = jti_sha256 else {
+            return Ok(true);
+        };
+        workload_api_key_dao::redemption_ended(&self.pool, &issuer_sha256, &jti_sha256)
+            .await
+            .map(|ended| !ended)
+            .map_err(|e| e.to_string())
     }
 }
 
