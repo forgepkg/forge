@@ -2,7 +2,6 @@
 //! axum server (with optional peer instances sharing the same DB + S3 + Redis).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
