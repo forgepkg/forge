@@ -1738,3 +1738,54 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     .unwrap();
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
 }
+
+#[tokio::test]
+async fn anonymous_pulls_where_the_repository_allows_them() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            anonymous_mode: "all".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let open = repo_name("dock");
+    let closed = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": open, "kind": "hosted", "format": "docker", "anonymous_read": true}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": closed, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let admin = admin_oci(&srv).await;
+    let digest = admin
+        .push_image(&format!("{open}/app"), "1", "amd64", b"public layer")
+        .await;
+    admin
+        .push_image(&format!("{closed}/app"), "1", "amd64", b"private layer")
+        .await;
+
+    // `docker pull` without login: challenge, anonymous token, pull.
+    let anonymous = Oci::new(&srv, None);
+    let resp = anonymous.get(&format!("{open}/app"), "manifests/1").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["docker-content-digest"], digest.as_str());
+    // The anonymous token grants nothing on a closed repository, and never
+    // a push.
+    let resp = anonymous.get(&format!("{closed}/app"), "manifests/1").await;
+    assert_eq!(resp.status(), 401);
+    let resp = anonymous
+        .put_manifest(
+            &format!("{open}/app"),
+            "2",
+            OCI_MANIFEST,
+            &image(b"{}", &[]),
+        )
+        .await;
+    assert_eq!(resp.status(), 401);
+}

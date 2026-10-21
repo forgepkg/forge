@@ -247,21 +247,7 @@ impl Registry {
     /// serves that repository at the registry root.
     async fn site(&self, host: Option<String>) -> OciResult<Site> {
         let public = &self.inner.config.public_base_url;
-        let public_host = url::Url::parse(public)
-            .ok()
-            .and_then(|u| {
-                u.host_str().map(|h| match u.port() {
-                    Some(p) => format!("{h}:{p}"),
-                    None => h.to_string(),
-                })
-            })
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let scheme = if public.starts_with("https://") {
-            "https"
-        } else {
-            "http"
-        };
+        let (scheme, public_host) = registry_origin(public);
         let host = host.map(|h| h.to_ascii_lowercase());
         let host_repo = match &host {
             Some(h) if *h != public_host => {
@@ -272,7 +258,10 @@ impl Registry {
         };
         let (service, realm) = match (&host, &host_repo) {
             (Some(h), Some(_)) => (h.clone(), format!("{scheme}://{h}/v2/token")),
-            _ => (public_host.clone(), format!("{public}/v2/token")),
+            _ => (
+                public_host.clone(),
+                format!("{scheme}://{public_host}/v2/token"),
+            ),
         };
         Ok(Site {
             service,
@@ -581,6 +570,28 @@ impl Registry {
         )
         .with_header(header::WWW_AUTHENTICATE, site.challenge(None, None)))
     }
+}
+
+/// The scheme and `host[:port]` of `public_base_url`: where the registry
+/// lives. Docker clients always talk to `/v2/` at the root of a host, so a
+/// path in the URL plays no part.
+pub fn registry_origin(public_base_url: &str) -> (&'static str, String) {
+    let scheme = if public_base_url.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let host = url::Url::parse(public_base_url)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{h}:{p}"),
+                None => h.to_string(),
+            })
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (scheme, host)
 }
 
 /// The host a request reached (`Host`, or the HTTP/2 authority).

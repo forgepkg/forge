@@ -25,7 +25,7 @@ mod pull;
 mod push;
 mod service;
 
-pub use service::{PublishRecorder, Registry, RegistryConfig, RegistryParts};
+pub use service::{registry_origin, PublishRecorder, Registry, RegistryConfig, RegistryParts};
 
 /// `repository.format` of registry repositories.
 pub const FORMAT: &str = forge_db::model::DOCKER_FORMAT;

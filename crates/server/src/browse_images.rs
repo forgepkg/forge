@@ -111,15 +111,7 @@ pub struct ImageDetail {
 
 /// The registry host of the server (`host[:port]` of `public_base_url`).
 fn registry_host(state: &AppState) -> String {
-    url::Url::parse(&state.config.public_base_url())
-        .ok()
-        .and_then(|u| {
-            u.host_str().map(|h| match u.port() {
-                Some(p) => format!("{h}:{p}"),
-                None => h.to_string(),
-            })
-        })
-        .unwrap_or_default()
+    forge_oci::registry_origin(&state.config.public_base_url()).1
 }
 
 /// Where `repo`'s images are pulled from: its own host, or

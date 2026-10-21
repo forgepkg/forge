@@ -50,16 +50,8 @@ pub(crate) fn amend_registry_rejection(public_base_url: &str, response: Response
     {
         return response;
     }
-    let service = url::Url::parse(public_base_url)
-        .ok()
-        .and_then(|u| {
-            u.host_str().map(|h| match u.port() {
-                Some(p) => format!("{h}:{p}"),
-                None => h.to_string(),
-            })
-        })
-        .unwrap_or_default();
-    let challenge = format!("Bearer realm=\"{public_base_url}/v2/token\",service=\"{service}\"");
+    let (scheme, service) = forge_oci::registry_origin(public_base_url);
+    let challenge = format!("Bearer realm=\"{scheme}://{service}/v2/token\",service=\"{service}\"");
     let body = serde_json::json!({
         "errors": [{ "code": "UNAUTHORIZED", "message": "invalid credentials" }]
     })
