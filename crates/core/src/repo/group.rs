@@ -54,7 +54,8 @@
 //!   reserved prefixes and owners to what its members serve. Reading an inner
 //!   group through an outer one is therefore never less protective than
 //!   reading it directly, whatever the outer group's settings. A leaf reached
-//!   along several paths serves an id if one visible path admits it.
+//!   along several paths serves an id if one visible path admits it, also
+//!   when another path to the same inner group is guarded.
 //! * **Degraded members** — a member that errors (e.g. an unreachable proxy
 //!   upstream) is logged and skipped; the group still answers from the
 //!   remaining members, so a public-feed outage never breaks restores of
@@ -62,7 +63,10 @@
 //!   member answered: when a member failed and the answer would be empty (no
 //!   versions, no registration, no such exact version), the group returns the
 //!   error, so clients and downstream proxies retry rather than cache a
-//!   not-found. Search errors only when *every* member fails.
+//!   not-found. Search errors only when *every* member fails. An offline
+//!   hosted member and an offline nested group are such failing members: the
+//!   group serves nothing through them (an offline nested group is not
+//!   descended into), while an offline proxy still serves what it cached.
 //!
 //! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
 //! a group** (nested groups). Resolution first loads each readable group node
@@ -84,7 +88,7 @@
 //! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
 //! stable pre-order walk. For a concrete package id, selectors are evaluated
 //! while walking and a repeated group is expanded only when reached at a
-//! strictly shallower depth. A repeated leaf is queried once at its first
+//! strictly shallower depth or under other active guards. A repeated leaf is queried once at its first
 //! package-visible sighting. Search also queries each unique leaf once and uses
 //! the same package-specific walk to select the highest-priority winner.
 //! Members answer search **unenriched** ([`RepoReadOps::search_unenriched`]);
@@ -275,7 +279,7 @@ impl GroupGraph {
     fn serving_leaves(&self, package_id: &str, id: &IdGuards<'_>) -> Vec<i64> {
         let key = crate::format::lower_invariant(package_id);
         let mut path = HashSet::from([self.root_id]);
-        let mut best_group_depth = HashMap::from([(self.root_id, 0)]);
+        let mut best_group_depth = HashMap::from([((self.root_id, Vec::new()), 0)]);
         let mut seen_leaves = HashSet::new();
         let mut out = Vec::new();
         self.walk_visible(
@@ -309,7 +313,7 @@ impl GroupGraph {
         let mut path = HashSet::new();
         path.insert(self.root_id);
         let mut best_group_depth = HashMap::new();
-        best_group_depth.insert(self.root_id, 0);
+        best_group_depth.insert((self.root_id, Vec::new()), 0);
         let mut seen_leaves = HashSet::new();
         let mut out = Vec::new();
         self.walk_visible(
@@ -342,8 +346,13 @@ impl GroupGraph {
 
     /// Pre-order walk of the visible leaves below `group_id`. With `guards`,
     /// a leaf is only emitted if the owner set of every group on the path
-    /// whose guard is active for the id (`required`) contains it; a leaf left
-    /// out is not marked seen, so another path may still admit it.
+    /// whose guard is active for the id (`required`, by group id) contains
+    /// it; a leaf left out is not marked seen, so another path may still
+    /// admit it. For the same reason a group already walked is walked again
+    /// when reached under other active guards: a diamond's unguarded path
+    /// must not be skipped because a guarded one reached the group first. An
+    /// offline nested group is emitted as a leaf whatever the guards: it
+    /// serves nothing, it only makes a miss non-authoritative.
     #[allow(clippy::too_many_arguments)]
     fn walk_visible<'g>(
         &'g self,
@@ -351,9 +360,9 @@ impl GroupGraph {
         depth: u32,
         package_id: &str,
         guards: Option<&IdGuards<'_>>,
-        required: &mut Vec<&'g HashSet<i64>>,
+        required: &mut Vec<(i64, &'g HashSet<i64>)>,
         path: &mut HashSet<i64>,
-        best_group_depth: &mut HashMap<i64, u32>,
+        best_group_depth: &mut HashMap<(i64, Vec<i64>), u32>,
         seen_leaves: &mut HashSet<i64>,
         out: &mut Vec<i64>,
     ) {
@@ -366,14 +375,14 @@ impl GroupGraph {
         };
         let active = guards.and_then(|id| self.guard_active(group_id, id));
         if let Some(owners) = active {
-            required.push(owners);
+            required.push((group_id, owners));
         }
         for member in members {
             if !member.filter.allows(package_id) {
                 continue;
             }
 
-            if member.repo.kind() == RepoKind::Group {
+            if is_descended_group(&member.repo) {
                 if path.contains(&member.repo.id) {
                     if !self.cycle_logged.swap(true, Ordering::Relaxed) {
                         tracing::error!(
@@ -385,13 +394,16 @@ impl GroupGraph {
                 }
 
                 let next_depth = depth + 1;
+                let mut guarded_by: Vec<i64> = required.iter().map(|(id, _)| *id).collect();
+                guarded_by.sort_unstable();
+                let visit = (member.repo.id, guarded_by);
                 if best_group_depth
-                    .get(&member.repo.id)
+                    .get(&visit)
                     .is_some_and(|seen_depth| *seen_depth <= next_depth)
                 {
                     continue;
                 }
-                best_group_depth.insert(member.repo.id, next_depth);
+                best_group_depth.insert(visit, next_depth);
                 path.insert(member.repo.id);
                 self.walk_visible(
                     member.repo.id,
@@ -405,9 +417,10 @@ impl GroupGraph {
                     out,
                 );
                 path.remove(&member.repo.id);
-            } else if required
-                .iter()
-                .all(|owners| owners.contains(&member.repo.id))
+            } else if (member.repo.kind() == RepoKind::Group
+                || required
+                    .iter()
+                    .all(|(_, owners)| owners.contains(&member.repo.id)))
                 && seen_leaves.insert(member.repo.id)
             {
                 out.push(member.repo.id);
@@ -585,7 +598,10 @@ impl GroupRepo {
                 }
                 let filter = self.authz.package_filter(&self.principal, member).await;
 
-                if member.kind() == RepoKind::Group {
+                // An offline nested group is not descended into: it stands
+                // in the graph as one failing member, like an offline hosted
+                // one, so nothing below it is served through this group.
+                if is_descended_group(member) {
                     if discovered_groups.insert(member.id) {
                         queue.push_back((member.id, depth + 1));
                     }
@@ -611,10 +627,11 @@ impl GroupRepo {
         }))
     }
 
-    /// The read ops of `member`: an offline hosted member fails every read
+    /// The read ops of `member`: an offline hosted member, or an offline
+    /// nested group (which the graph does not descend into), fails every read
     /// ([`OfflineMember`]); an offline proxy still serves what it cached.
     fn member_ops(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
-        if !member.online && member.kind() == RepoKind::Hosted {
+        if is_offline_member(member) {
             return Ok(Arc::new(OfflineMember(member.name.clone())));
         }
         self.factory.ops_for(member)
@@ -1055,14 +1072,22 @@ impl RepoReadOps for GroupRepo {
     }
 }
 
-/// The hosted leaves that own ids in `group_id` ([`GroupGuard::owners`]):
-/// those of its flagged members, or of all its members when it flags none. A
-/// nested group contributes its own owners, so its flags still count when it
-/// is read through an outer group. A group already on the current descent
-/// (a cycle a raw database write could create) contributes nothing.
-/// The read ops of an offline hosted member: every read fails as
-/// temporarily unavailable, so the group treats it as a failing member
-/// (clients retry rather than cache a miss) instead of serving it.
+/// Whether `member` is switched off for maintenance and serves nothing in a
+/// group: an offline hosted member or an offline nested group. An offline
+/// proxy still serves what it cached.
+fn is_offline_member(member: &Repository) -> bool {
+    !member.online && member.kind() != RepoKind::Proxy
+}
+
+/// Whether a group walk descends into `member`: an online nested group. An
+/// offline one is a leaf of the readable graph that fails every read.
+fn is_descended_group(member: &Repository) -> bool {
+    member.kind() == RepoKind::Group && member.online
+}
+
+/// The read ops of an offline hosted or nested group member: every read
+/// fails as temporarily unavailable, so the group treats it as a failing
+/// member (clients retry rather than cache a miss) instead of serving it.
 struct OfflineMember(String);
 
 impl OfflineMember {
@@ -1108,6 +1133,11 @@ impl RepoReadOps for OfflineMember {
     }
 }
 
+/// The hosted leaves that own ids in `group_id` ([`GroupGuard::owners`]):
+/// those of its flagged members, or of all its members when it flags none. A
+/// nested group contributes its own owners, so its flags still count when it
+/// is read through an outer group. A group already on the current descent
+/// (a cycle a raw database write could create) contributes nothing.
 fn group_owners(
     group_id: i64,
     adjacency: &HashMap<i64, Vec<Repository>>,
