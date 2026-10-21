@@ -368,8 +368,11 @@ jobs:
           # floating docker/buildkit-syft-scanner:stable-1); bump it by hand.
           attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Built from scratch, no BuildKit cache: a tag reads the default
+          # branch's cache scope, which every CI job on main can write, so a
+          # cached layer would let code CI runs (test dependencies, tools)
+          # into the signed release image.
+          no-cache: true
 
       # The image of this run, or the one an earlier run pushed and signed.
       - name: Sign the image digest (keyless) and verify the signature

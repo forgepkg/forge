@@ -10,8 +10,11 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
-Fixes for the findings of the 1.0.0 release review. The 1.0.0 known
-limitations still apply, except where an entry below says otherwise.
+The Docker / OCI registry, format plugins (Helm built in, NuGet ported to
+one), the trusted-publishing token exchange, short-lived S3 credentials and a
+local blob cache, and the fixes for the findings of the 1.0.0 release review.
+The 1.0.0 known limitations still apply, except where an entry below says
+otherwise.
 
 ### Upgrade notes
 

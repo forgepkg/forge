@@ -248,8 +248,9 @@ password: `docker login localhost:8421 -u admin`, then
 
 Formats other than NuGet come from format plugins, crates in
 [`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)).
-Helm is built in: create a repository with `"format": "helm"` (hosted or group;
-plugin formats have no proxies). It is served under `/repository/<name>/`, e.g.
+Helm is built in: create a repository with `"format": "helm"` (hosted, proxy or
+group; a plugin format has proxies when it implements the upstream side). It is
+served under `/repository/<name>/`, e.g.
 `helm repo add local http://localhost:8421/repository/charts`.
 
 To run a plugin as a WebAssembly component instead:
