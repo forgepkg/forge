@@ -49,6 +49,7 @@ async-trait = { workspace = true }
 # Basic credential when a workload presents its id_token as the password.
 base64 = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }
 url = { workspace = true }

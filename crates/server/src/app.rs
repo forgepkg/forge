@@ -141,6 +141,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // login and sessions exist independent of OIDC; the `/auth/oidc/*`
         // endpoints answer 404 themselves when no enabled oidc realm exists.
         .merge(auth_router())
+        // Trusted publishing: a CI job's OIDC token for a short-lived API key
+        // (`POST /api/v2/token`, nuget.org's path and shape).
+        .merge(crate::auth::token_exchange_router())
         // The Docker / OCI registry: clients always talk to `/v2/` at the
         // host root; the registry resolves repositories from the name (or
         // the host) itself.
@@ -260,7 +263,7 @@ async fn response_policy(
 ) -> axum::response::Response {
     let path = req.uri().path();
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
-    let api = under("/admin") || under("/auth") || under("/browse");
+    let api = under("/admin") || under("/auth") || under("/browse") || under("/api");
     let feed = feeds.iter().any(|mount| under(mount));
     let registry = under("/v2");
     let headers = req.headers();

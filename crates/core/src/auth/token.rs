@@ -415,6 +415,15 @@ impl PrincipalSource for BasicAuthSource {
         if secret.is_empty() {
             return SourceOutcome::Invalid;
         }
+        // The workload-identity username (`oidc`) and workload API keys belong
+        // to the workload-identity source, which claims them first. Should one
+        // reach this source anyway it is refused here: never a user token,
+        // never a password, never forwarded upstream.
+        let reserved = forge_db::username::canonical_username(&username)
+            .is_ok_and(|name| forge_db::username::is_reserved_username(&name));
+        if reserved || super::workload_key::is_workload_key(&secret) {
+            return SourceOutcome::Invalid;
+        }
 
         // Try the secret as a token first (unchanged from slice 1, runs ahead
         // of the password chain). A token Forge issued is never a password,

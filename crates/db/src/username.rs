@@ -21,12 +21,34 @@
 //! letter width, drop soft hyphens, ...). [`may_alias_upstream`] names the
 //! forms such a directory could map onto another account; they are never
 //! forwarded.
+//!
+//! Some canonical names are [reserved](RESERVED_USERNAMES) for protocol use:
+//! no account is ever created or provisioned under one
+//! ([`canonical_account_username`]), and no password login is attempted for
+//! one.
 
 use unicode_normalization::UnicodeNormalization;
 
 /// Longest accepted username, in bytes of its canonical form (the login
 /// throttle keys on it, so it must stay bounded).
 pub const MAX_USERNAME_BYTES: usize = 256;
+
+/// The HTTP Basic username a CI workload presents with its OIDC token or an
+/// exchanged workload API key (trusted publishing). Basic `oidc:<secret>` is
+/// only ever checked as a workload credential, never as an account login.
+pub const WORKLOAD_USERNAME: &str = "oidc";
+
+/// Canonical names Forge keeps for itself. No account may hold one, so a
+/// name with a protocol meaning can never also sign in someone (or be
+/// forwarded to an upstream directory as their login):
+///
+/// * [`WORKLOAD_USERNAME`] (`oidc`): the workload-identity Basic username.
+pub const RESERVED_USERNAMES: &[&str] = &[WORKLOAD_USERNAME];
+
+/// Whether the canonical `name` is one of the [`RESERVED_USERNAMES`].
+pub fn is_reserved_username(name: &str) -> bool {
+    RESERVED_USERNAMES.contains(&name)
+}
 
 /// Why a username was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -44,6 +66,10 @@ pub enum InvalidUsername {
     /// ([`canonical_password_username`]).
     #[error("username must not contain ':'")]
     Colon,
+    /// One of the [`RESERVED_USERNAMES`], refused for a new account
+    /// ([`canonical_account_username`]).
+    #[error("username is reserved")]
+    Reserved,
 }
 
 /// The canonical form of `raw` (see the [module docs](self)).
@@ -76,6 +102,25 @@ pub fn canonical_password_username(raw: &str) -> Result<String, InvalidUsername>
     let canonical = canonical_username(raw)?;
     if canonical.contains(':') {
         return Err(InvalidUsername::Colon);
+    }
+    Ok(canonical)
+}
+
+/// The canonical name for a **new** account: [`canonical_password_username`]
+/// when the account signs in with a password (`with_password`), else
+/// [`canonical_username`]; either way a [reserved](RESERVED_USERNAMES) name is
+/// refused. Lookups of existing rows keep using [`canonical_username`].
+pub fn canonical_account_username(
+    raw: &str,
+    with_password: bool,
+) -> Result<String, InvalidUsername> {
+    let canonical = if with_password {
+        canonical_password_username(raw)?
+    } else {
+        canonical_username(raw)?
+    };
+    if is_reserved_username(&canonical) {
+        return Err(InvalidUsername::Reserved);
     }
     Ok(canonical)
 }
@@ -199,6 +244,34 @@ mod tests {
         assert_eq!(
             canonical_password_username(" "),
             Err(InvalidUsername::Empty)
+        );
+    }
+
+    #[test]
+    fn new_accounts_refuse_reserved_names_in_any_spelling() {
+        for raw in ["oidc", "OIDC", " Oidc "] {
+            for with_password in [true, false] {
+                assert_eq!(
+                    canonical_account_username(raw, with_password),
+                    Err(InvalidUsername::Reserved),
+                    "{raw:?}"
+                );
+            }
+            // A lookup still canonicalizes it (logins refuse it elsewhere).
+            assert_eq!(canonical_username(raw).unwrap(), WORKLOAD_USERNAME);
+        }
+        assert_eq!(
+            canonical_account_username(" Alice ", true).unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            canonical_account_username("oidc-2", false).unwrap(),
+            "oidc-2"
+        );
+        // The password rules still apply first.
+        assert_eq!(
+            canonical_account_username("oidc:x", true),
+            Err(InvalidUsername::Colon)
         );
     }
 

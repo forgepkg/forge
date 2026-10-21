@@ -31,7 +31,8 @@
 //!    ([`forge_db::username::canonical_username`]: trimmed, NFC, lowercased),
 //!    so every provider — including an upstream that receives it — sees the
 //!    one spelling Forge maps to an account. An invalid username (empty,
-//!    control characters) is rejected without consulting any provider.
+//!    control characters) is rejected without consulting any provider, and
+//!    so is a reserved one ([`forge_db::username::RESERVED_USERNAMES`]).
 //! 5. No provider authenticated and none rejected/was-unavailable (all
 //!    [`AuthOutcome::Skip`] or an empty chain) → [`ChainOutcome::NoCredentials`]:
 //!    the password path simply had nothing to say, and the caller falls back to
@@ -104,6 +105,11 @@ impl Chain {
         let Ok(username) = forge_db::username::canonical_username(cred.username) else {
             return ChainOutcome::Rejected;
         };
+        // A reserved name (the workload-identity `oidc`) is no account's
+        // login: no provider is asked, so it is never forwarded upstream.
+        if forge_db::username::is_reserved_username(&username) {
+            return ChainOutcome::Rejected;
+        }
         let cred = &PasswordCredential {
             username: &username,
             password: cred.password,
@@ -464,6 +470,29 @@ mod tests {
             chain.authenticate(&cred("alice", "pw")).await,
             ChainOutcome::NoCredentials
         );
+    }
+
+    #[tokio::test]
+    async fn reserved_username_is_rejected_before_any_provider() {
+        let (local, local_calls) =
+            StubProvider::new("local-password", AuthSource::Local, AuthOutcome::Skip);
+        let (upstream, upstream_calls) = StubProvider::new(
+            "upstream-basic",
+            AuthSource::UpstreamBasic,
+            authed("oidc", AuthSource::UpstreamBasic),
+        );
+        let chain = Chain::new(vec![Box::new(local), Box::new(upstream)]);
+
+        for username in ["oidc", " OIDC "] {
+            assert_eq!(
+                chain.authenticate(&cred(username, "a-jwt-or-key")).await,
+                ChainOutcome::Rejected,
+                "{username:?}"
+            );
+        }
+        // Never looked up locally, never forwarded upstream.
+        assert_eq!(local_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

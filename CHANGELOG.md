@@ -72,6 +72,10 @@ limitations still apply, except where an entry below says otherwise.
   can publish. Existing realms keep the value they were saved with; to
   use the new default, clear the field in the realm form (or drop the key
   from the config) and save.
+- Migration 0034 adds the `workload_api_key` table for the trusted-publishing
+  token exchange; it changes no existing data. `/api/v2/token` is a new
+  route, so a reverse proxy that only forwards known prefixes needs `/api`.
+  ([#169](https://github.com/schmitch/forge/issues/169))
 
 ### Features
 
@@ -144,6 +148,25 @@ limitations still apply, except where an entry below says otherwise.
   the kustomize component `s3-workload-identity` mounts one. See
   [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#short-lived-s3-credentials).
   ([#60](https://github.com/schmitch/forge/issues/60))
+- **Trusted-publishing token exchange**: `POST /api/v2/token` (nuget.org's
+  path and request/response shape, so `NuGet/login` works with
+  `token-service-url`) exchanges a CI job's OIDC token, validated by a
+  `workload_identity` realm, for a short-lived workload API key
+  (`forge_wif.…`). Each token is redeemed once (its `jti` is required), the
+  key lives for the realm's new `api_key_ttl_seconds` (default an hour)
+  whatever the token's lifetime, it authorizes and is audited as the
+  token's workload, and any edit or disabling of the realm revokes its keys.
+  `dotnet nuget push --source <feed>/v3/<repo>/package --no-service-endpoint
+  --api-key <key>` publishes with the key alone; restore takes it as the
+  Basic password of the username `oidc`.
+  ([#169](https://github.com/schmitch/forge/issues/169))
+- **Reserved account names**: `oidc` is the workload-identity Basic
+  username. Basic `oidc:<secret>` is only ever checked as a workload
+  credential (an OIDC token or a workload key), never as a user token or a
+  password and never forwarded to a credential-forwarding upstream, and no
+  account can be created, bootstrapped or provisioned under the name (an
+  OIDC login whose username claim is `oidc` gets `oidc-2`).
+  ([#169](https://github.com/schmitch/forge/issues/169))
 
 ### Fixed
 

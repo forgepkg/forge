@@ -2210,8 +2210,8 @@ impl Config {
         self.validate_auth_providers()?;
         if let Some(ba) = &self.auth.bootstrap_admin {
             // A local password account: its name must be one a password
-            // login accepts (no `:`).
-            forge_core::auth::canonical_password_username(&ba.username)
+            // login accepts (no `:`) and not a reserved protocol name.
+            forge_core::auth::canonical_account_username(&ba.username, true)
                 .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
         }
         match self.auth.login_mode.as_str() {

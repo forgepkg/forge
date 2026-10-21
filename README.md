@@ -179,7 +179,8 @@ docker pull localhost:8421/docker-hosted/team/alpine:3.20
   proxy, group), naming and host-based routing, `docker login`, retention and
   garbage collection.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
-  workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers.
+  workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
+  and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).
 - **[Format plugins](./docs/format-plugins.md)** — further package formats
   (Helm charts), built in or as sandboxed WebAssembly components: design,
   operation, and writing one.

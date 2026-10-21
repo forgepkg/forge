@@ -17,6 +17,8 @@
 //!   auth does not hammer the upstream. Plaintext is never stored; fail-closed.
 //! * [`login_throttle`] — per `(client IP, username)` password-failure lockout
 //!   shared by the browser login and the wire Basic password path.
+//! * [`workload_key`] — the short-lived API keys the trusted-publishing token
+//!   exchange issues for CI workloads.
 
 pub mod authz;
 pub mod chain;
@@ -29,6 +31,7 @@ pub mod provider;
 pub mod session_source;
 pub mod token;
 pub mod upstream_basic;
+pub mod workload_key;
 
 pub use authz::Authz;
 pub use chain::{
@@ -61,5 +64,11 @@ pub use token::{
     PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
+pub use workload_key::{
+    generate_workload_key, is_workload_key, workload_key_sha256, WORKLOAD_KEY_PREFIX,
+};
 // Canonical usernames live with the DAOs that enforce them.
-pub use forge_db::username::{canonical_password_username, canonical_username, InvalidUsername};
+pub use forge_db::username::{
+    canonical_account_username, canonical_password_username, canonical_username,
+    is_reserved_username, InvalidUsername, WORKLOAD_USERNAME,
+};

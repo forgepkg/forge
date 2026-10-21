@@ -92,6 +92,7 @@ describe('list fields', () => {
           },
         ],
         allowed_authorized_parties: ['a,b'],
+        api_key_ttl_seconds: 900,
         identity_claims: ['pipeline_id', 'runner_id'],
       },
     ],
@@ -112,6 +113,7 @@ describe('workload identity config', () => {
       max_token_age_seconds: '',
       allowed_authorized_parties: '',
       positive_cache_seconds: '',
+      api_key_ttl_seconds: '',
       identity_claims,
     }) as unknown as RealmFormValues
 
@@ -120,5 +122,9 @@ describe('workload identity config', () => {
       identity_claims: ['pipeline_id', 'runner_id'],
     })
     expect(toRealmConfig(values(' '))).not.toHaveProperty('identity_claims')
+  })
+
+  it('omits a blank exchanged-key lifetime so the server default applies', () => {
+    expect(toRealmConfig(values(''))).not.toHaveProperty('api_key_ttl_seconds')
   })
 })

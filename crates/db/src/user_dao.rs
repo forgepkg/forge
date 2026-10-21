@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use sqlx::PgPool;
 
 use crate::model::AppUser;
-use crate::username::{canonical_password_username, canonical_username};
+use crate::username::{canonical_account_username, canonical_username};
 
 /// The canonical form of a username used as a lookup key, or `None` when it
 /// can never name an account (empty, control characters, oversized).
@@ -46,17 +46,14 @@ impl NewUser {
 /// Insert a user, returning the persisted row.
 ///
 /// The username is stored in its canonical form
-/// ([`crate::username::canonical_username`]); an invalid one is refused with
+/// ([`crate::username::canonical_username`]); an invalid or
+/// [reserved](crate::username::RESERVED_USERNAMES) one is refused with
 /// [`sqlx::Error::InvalidArgument`] (callers validate first to answer 400).
 /// An account with a local password must also have a name a password login
-/// accepts ([`canonical_password_username`]: no `:`).
+/// accepts ([`crate::username::canonical_password_username`]: no `:`).
 pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
-    let username = if new.password_hash.is_some() {
-        canonical_password_username(&new.username)
-    } else {
-        canonical_username(&new.username)
-    }
-    .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    let username = canonical_account_username(&new.username, new.password_hash.is_some())
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
     sqlx::query_as!(
         AppUser,
         r#"
@@ -102,9 +99,11 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 ///   caller denies.
 ///
 /// The unique constraint on `username` makes the `ON CONFLICT` path race-safe
-/// across instances. The username is canonicalized first; an invalid one, or
-/// one containing `:` (the upstream verified the part before the colon, see
-/// [`canonical_password_username`]), provisions nothing (`None` ⇒ deny).
+/// across instances. The username is canonicalized first; an invalid one, a
+/// [reserved](crate::username::RESERVED_USERNAMES) one, or one containing `:`
+/// (the upstream verified the part before the colon, see
+/// [`crate::username::canonical_password_username`]), provisions nothing
+/// (`None` ⇒ deny).
 pub async fn provision_upstream_user(
     pool: &PgPool,
     username: &str,
@@ -137,7 +136,7 @@ pub async fn provision_upstream_user_tracked<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let Ok(username) = canonical_password_username(username) else {
+    let Ok(username) = canonical_account_username(username, true) else {
         return Ok(None);
     };
     let row = sqlx::query!(

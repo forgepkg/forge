@@ -357,9 +357,9 @@ fn spawn_cred_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
     })
 }
 
-/// Spawn the auth reaper loop: each tick deletes expired/used `oidc_flow` rows
-/// and revoked/expired `session` rows. Pure `DELETE`s — no advisory locks; safe
-/// to run concurrently on every instance.
+/// Spawn the auth reaper loop: each tick deletes expired/used `oidc_flow` rows,
+/// revoked/expired `session` rows and spent `workload_api_key` rows. Pure
+/// `DELETE`s — no advisory locks; safe to run concurrently on every instance.
 fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -374,6 +374,15 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
                 Err(e) => tracing::error!(error = %e, "session reap failed"),
+            }
+            // Exchanged workload keys whose CI token has expired as well
+            // (until then the row records the token's redemption).
+            match forge_db::workload_api_key_dao::reap_expired(&pool).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::debug!(reaped = n, "auth reaper deleted expired workload API keys")
+                }
+                Err(e) => tracing::error!(error = %e, "workload API key reap failed"),
             }
             // Networks no sign-in came from for longer than the login
             // throttle remembers them.

@@ -370,12 +370,17 @@ async fn finalize(
 /// Find a free username, suffixing `-2`, `-3`, … on collision so auto-provision
 /// never fails the unique constraint. (Only reached when there is no existing
 /// `(issuer, subject)` link, so a collision means a *different* account
-/// already owns the base name and was not linked.)
+/// already owns the base name and was not linked.) A
+/// [reserved](forge_db::username::RESERVED_USERNAMES) base name is never
+/// free, so an IdP user called `oidc` becomes `oidc-2`.
 async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveError> {
-    if user_dao::find_user_by_username(pool, base)
-        .await
-        .map_err(|e| ResolveError::Db(e.to_string()))?
-        .is_none()
+    let reserved = forge_db::username::canonical_username(base)
+        .is_ok_and(|canonical| forge_db::username::is_reserved_username(&canonical));
+    if !reserved
+        && user_dao::find_user_by_username(pool, base)
+            .await
+            .map_err(|e| ResolveError::Db(e.to_string()))?
+            .is_none()
     {
         return Ok(base.to_string());
     }
