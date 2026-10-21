@@ -46,6 +46,9 @@ jsonwebtoken = { workspace = true }
 # Networking / SSRF guard
 ipnet = { workspace = true }
 reqwest = { workspace = true }
+# The outbound proxy selection reqwest's `system-proxy` feature uses, so the
+# proxy metadata guard knows which upstream URLs a proxy will resolve.
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 url = { workspace = true }
 # Proxy upstream bodies: spooled (memory → temp file) metadata and streamed
 # `.nupkg` downloads into the CAS.

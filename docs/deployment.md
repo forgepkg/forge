@@ -400,6 +400,15 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.
+- **Outbound proxy.** Proxy repositories send upstream traffic through
+  `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the
+  host. Forge never sends an upstream request, or follows a redirect, to a
+  link-local or cloud-metadata address (`169.254.0.0/16`, `fe80::/10`,
+  `metadata.google.internal`, …). Through an outbound proxy the proxy
+  resolves the host name, so Forge resolves it first and refuses it when any
+  of its addresses is such a target. A name that resolves differently for
+  the proxy than for Forge, or that only the proxy can resolve, still gets
+  through: block those addresses on the proxy too.
 
 ### Redis is a trust boundary
 
