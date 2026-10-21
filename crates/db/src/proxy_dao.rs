@@ -81,10 +81,12 @@ pub async fn upsert_cached_versions(
             END,
             confirmed = true,
             upstream_missing = false,
+            missing_since = NULL,
             metadata_refreshed_at = now()
         WHERE proxy_cached_version.not_found
            OR NOT proxy_cached_version.confirmed
            OR proxy_cached_version.upstream_missing
+           OR proxy_cached_version.missing_since IS NOT NULL
         "#,
         repository_id,
         name,
@@ -101,23 +103,46 @@ pub async fn upsert_cached_versions(
 /// names again is un-flagged, and the package-level negative-cache marker
 /// (`version = '*'`) is dropped, since the package evidently exists. Returns
 /// how many rows changed.
+///
+/// A version is flagged only once it is missing from a listing at least
+/// `confirm_after_secs` (the metadata TTL) after the first listing that left
+/// it out (`missing_since`): an upstream may serve a partial listing during
+/// an incident, such as a Forge group with one member down, and one such
+/// listing must not hide the versions for a whole TTL.
 pub async fn reconcile_listing(
     pool: &PgPool,
     repository_id: i64,
     name: &str,
     versions: &[String],
+    confirm_after_secs: i64,
 ) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
     let flagged = sqlx::query!(
         r#"
-        UPDATE proxy_cached_version
-        SET upstream_missing = NOT (version = ANY($3::text[]))
-        WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
-          AND upstream_missing IS DISTINCT FROM NOT (version = ANY($3::text[]))
+        WITH seen AS (
+            SELECT id,
+                   CASE WHEN version = ANY($3::text[]) THEN NULL
+                        ELSE coalesce(missing_since, now()) END AS missing_since
+            FROM proxy_cached_version
+            WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
+        ), next AS (
+            SELECT id, missing_since,
+                   coalesce(missing_since <= now() - make_interval(secs => $4), false)
+                       AS upstream_missing
+            FROM seen
+        )
+        UPDATE proxy_cached_version p
+        SET missing_since = next.missing_since,
+            upstream_missing = next.upstream_missing
+        FROM next
+        WHERE p.id = next.id
+          AND (p.missing_since IS DISTINCT FROM next.missing_since
+               OR p.upstream_missing IS DISTINCT FROM next.upstream_missing)
         "#,
         repository_id,
         name,
         versions,
+        confirm_after_secs as f64,
     )
     .execute(&mut *tx)
     .await?
@@ -268,6 +293,7 @@ pub async fn reset_for_new_upstream(
         SET not_found = false,
             not_found_at = NULL,
             upstream_missing = false,
+            missing_since = NULL,
             metadata_refreshed_at = NULL
         WHERE repository_id = $1
         "#,

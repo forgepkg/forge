@@ -771,14 +771,23 @@ impl ProxyRepo {
 
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
-                // upstream) and drop a stale package-level not-found marker.
+                // upstream; still missing one metadata TTL after the first
+                // listing that left them out, since one partial listing is no
+                // deletion) and drop a stale package-level not-found marker.
                 // An empty listing retires nothing: a feed answers 404 for a
                 // package without versions, so an empty 200 is a degraded
                 // upstream (an offline or partially synced mirror), not a
                 // deletion of every version, downloaded ones included.
                 proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
                 if !versions.is_empty() {
-                    proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                    proxy_dao::reconcile_listing(
+                        &self.pool,
+                        repo.id,
+                        lower_id,
+                        &versions,
+                        Self::metadata_ttl(repo).num_seconds(),
+                    )
+                    .await?;
                 }
                 Ok(true)
             }

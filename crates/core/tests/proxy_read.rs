@@ -1417,7 +1417,8 @@ async fn planted_not_found_marker_is_cleared_by_a_later_listing() {
 }
 
 /// H3 follow-up: a version deleted upstream (e.g. a malicious release pulled
-/// from nuget.org) leaves the listings at the next refresh, instead of
+/// from nuget.org) leaves the listings once a refresh at least one metadata
+/// TTL after the first listing without it confirms the deletion, instead of
 /// reappearing every `not_found_ttl`; it comes back if the upstream lists it
 /// again.
 #[tokio::test]
@@ -1433,7 +1434,24 @@ async fn versions_deleted_upstream_leave_the_listings() {
     );
 
     mock.unpublish("contoso.lib", "2.1.0");
-    // A fresh cache stands in for an expired metadata TTL.
+    // A fresh cache stands in for an expired metadata TTL. One listing
+    // without the version is no deletion yet (it may be partial)...
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.1.0"],
+        "one listing without the version does not retire it"
+    );
+    // ...one a metadata TTL (600 s) later is.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET missing_since = missing_since - interval '11 minutes' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+           AND missing_since IS NOT NULL",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
     let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1465,6 +1483,56 @@ async fn versions_deleted_upstream_leave_the_listings() {
         ["1.0.0", "2.1.0"],
         "listed again, visible again"
     );
+}
+
+/// An upstream that serves a partial listing for a while (a Forge group
+/// whose proxy member's upstream is briefly down answers with its other
+/// members' versions) retires nothing: the versions it left out stay listed,
+/// and once the upstream lists them again nothing is pending.
+#[tokio::test]
+async fn a_partial_listing_during_an_upstream_incident_retires_nothing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0", "3.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+
+    // The incident: only 1.0.0 is listed.
+    mock.unpublish("contoso.lib", "2.0.0");
+    mock.unpublish("contoso.lib", "3.0.0");
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+    assert_eq!(
+        searched_versions(&px, &repo, "contoso").await,
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+
+    // Recovered by the next refresh: nothing is left pending, so a later
+    // partial listing starts counting afresh.
+    mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    mock.publish("contoso.lib", "3.0.0", make_nupkg("Contoso.Lib", "3.0.0"));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM proxy_cached_version \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+           AND (missing_since IS NOT NULL OR upstream_missing)",
+    )
+    .bind(&repo)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 0);
 }
 
 /// Search applies every listing condition (prerelease, SemVer 2.0.0, the
