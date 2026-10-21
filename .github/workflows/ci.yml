@@ -183,8 +183,18 @@ jobs:
       - name: cargo build --workspace
         run: cargo build --workspace
       - name: cargo test --workspace
+        id: tests
         # forge-e2e feature is intentionally excluded here — unit tests only.
+        # Each test binary runs through test-timings-runner.sh, which adds
+        # every test's duration to its result line and records it for the
+        # job summary below.
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
+          FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
         run: cargo test --workspace
+      - name: Test timings (job summary)
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
 
       # sqlx cache drift guard (A1). Runs migrations against the live Postgres
       # service, then verifies the committed .sqlx/ dir matches the current
@@ -449,7 +459,15 @@ jobs:
           docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
 
       - name: Run e2e tests (forge-e2e feature)
+        id: tests
+        # Per-test timings for the job summary, as in the test job.
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
+          FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
         run: cargo test --workspace --features forge-e2e
+      - name: Test timings (job summary)
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ────
   # Boots Postgres + versitygw via docker compose, builds the SPA + server, and

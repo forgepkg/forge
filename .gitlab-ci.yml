@@ -147,6 +147,7 @@ test:
     POSTGRES_PASSWORD: forge
     DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
     FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
+    FORGE_TEST_TIMINGS: "$CI_PROJECT_DIR/.test-timings"
   cache:
     <<: *cargo-cache
   before_script:
@@ -158,13 +159,18 @@ test:
     - rustup target add wasm32-wasip2
     - cargo build --workspace
     # forge-e2e feature is intentionally excluded here — unit tests only.
-    - cargo test --workspace
+    # Each test binary runs through test-timings-runner.sh, which adds every
+    # test's duration to its result line and records it for after_script.
+    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace
     # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
     # the committed .sqlx/ cache matches the current queries + schema.
     - cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
     - export PATH="$CARGO_HOME/bin:$PATH"
     - SQLX_OFFLINE= sqlx migrate run --source migrations
     - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
+  after_script:
+    # The slowest test binaries and tests (GitHub puts them in the job summary).
+    - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
 
 # ── Container image (build only; releases push from release.yml) ─────────
 # Builds the production Dockerfile on every change so a broken image is
@@ -265,6 +271,7 @@ e2e:
     - *dind-service
   variables:
     <<: *dind-variables
+    FORGE_TEST_TIMINGS: "$CI_PROJECT_DIR/.test-timings"
   cache:
     <<: *cargo-cache
   before_script:
@@ -278,7 +285,10 @@ e2e:
     - docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
   script:
     - rustup target add wasm32-wasip2
-    - cargo test --workspace --features forge-e2e
+    # Per-test timings, as in the test job.
+    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace --features forge-e2e
+  after_script:
+    - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
 
 # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ──────
 # Boots Postgres + versitygw via docker compose on the dind daemon, builds the

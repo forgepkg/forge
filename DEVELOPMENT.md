@@ -522,6 +522,23 @@ export FORGE_TEST_REDIS_URL=redis://127.0.0.1:6379    # an empty, dedicated Redi
 cargo test -p forge-server
 ```
 
+**Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
+tests in their job summary (GitLab: at the end of the job log). Every result
+line in the log carries its test's duration (`test foo ... ok <1.234s>`).
+Locally, run any `cargo test` through the same runner, then summarize:
+
+```bash
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
+export FORGE_TEST_TIMINGS=$(mktemp -d)
+cargo test --workspace
+.github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS"
+```
+
+The test build leaves the workspace crates unoptimized but optimizes the
+dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
+`[profile.dev.package.*]`): the mock IdPs generate RSA keys, and every test
+server hashes its bootstrap admin password.
+
 ## Resetting & troubleshooting
 
 - `cargo xtask down` stops the containers but **keeps** the Postgres volume. To
