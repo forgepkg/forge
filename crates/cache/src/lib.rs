@@ -225,14 +225,52 @@ fn tcp_settings() -> redis::io::tcp::TcpSettings {
         .set_keepalive(keepalive)
 }
 
+/// The most tags whose barriers an instance keeps ([`TagVersions`]). Real
+/// invalidations name few distinct tags; anything that can publish to Redis
+/// can name endless ones, and every instance kept them all.
+pub(crate) const MAX_TAGS: usize = 100_000;
+
 /// Locally observed tag generations. Redis is authoritative when configured;
 /// pub/sub eagerly advances this map so L1 lookups need no Redis round-trip.
-#[derive(Clone, Default)]
+///
+/// The map holds at most [`MAX_TAGS`] tags. A barrier cannot simply be
+/// forgotten (an L1 entry stamped before the invalidation it records would
+/// pass as current again), so at the cap the whole L1 is emptied first and
+/// the map starts over: what is cached afterwards is stamped afresh.
+#[derive(Clone)]
 pub(crate) struct TagVersions {
     inner: Arc<Mutex<HashMap<String, u64>>>,
+    /// The L1 the barriers guard, emptied when the map is reset.
+    l1: L1,
+    cap: usize,
 }
 
 impl TagVersions {
+    pub(crate) fn new(l1: L1) -> Self {
+        Self::with_cap(l1, MAX_TAGS)
+    }
+
+    pub(crate) fn with_cap(l1: L1, cap: usize) -> Self {
+        TagVersions {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            l1,
+            cap,
+        }
+    }
+
+    /// Make room for `tag` in `versions`: at the cap, empty the L1 and forget
+    /// every barrier (see the type docs).
+    fn make_room(&self, versions: &mut HashMap<String, u64>, tag: &str) {
+        if versions.len() >= self.cap && !versions.contains_key(tag) {
+            tracing::warn!(
+                max_tags = self.cap,
+                "cache tag barriers reached their cap; emptying the local cache and starting over"
+            );
+            self.l1.invalidate_all();
+            versions.clear();
+        }
+    }
+
     pub(crate) fn current(&self, tag: &str) -> u64 {
         self.inner
             .lock()
@@ -283,6 +321,7 @@ impl TagVersions {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for stamp in stamps {
+            self.make_room(&mut versions, &stamp.tag);
             let current = versions.entry(stamp.tag.clone()).or_default();
             if stamp.generation > MAX_GENERATION {
                 tracing::warn!(
@@ -309,6 +348,7 @@ impl TagVersions {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.make_room(&mut versions, tag);
         let current = versions.entry(tag.to_string()).or_default();
         let next = current.saturating_add(1);
         if generation > MAX_GENERATION {
@@ -358,11 +398,14 @@ impl Cache {
     /// `l1_max_capacity` bounds the number of entries held in process.
     pub fn l1_only(l1_max_capacity: u64) -> Self {
         Cache {
-            inner: Arc::new(Inner {
-                l1: L1::new(l1_max_capacity),
-                l2: None,
-                backplane: None,
-                tag_versions: TagVersions::default(),
+            inner: Arc::new({
+                let l1 = L1::new(l1_max_capacity);
+                Inner {
+                    tag_versions: TagVersions::new(l1.clone()),
+                    l1,
+                    l2: None,
+                    backplane: None,
+                }
             }),
         }
     }
@@ -386,7 +429,7 @@ impl Cache {
         timeouts: RedisTimeouts,
     ) -> Result<Self, CacheError> {
         let l1 = L1::new(l1_max_capacity);
-        let tag_versions = TagVersions::default();
+        let tag_versions = TagVersions::new(l1.clone());
         if redis_url.starts_with("rediss://") {
             install_tls_crypto_provider();
         }
@@ -881,4 +924,48 @@ fn entry_tags(ns: &str, key: &str, custom: &[String]) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// #126: forged invalidations naming ever new tags keep the barrier map
+    /// at its cap. At the cap the L1 is emptied before the barriers are
+    /// forgotten, so no entry stamped before a forgotten barrier is served
+    /// again, and a real invalidation still applies afterwards.
+    #[tokio::test]
+    async fn tag_barriers_stay_bounded_and_flush_the_l1_at_the_cap() {
+        let cache = Cache::l1_only(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read = || {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            async move {
+                cache
+                    .get_or_try_insert_local::<usize, _, _, ()>(
+                        "ns",
+                        "key",
+                        Duration::from_secs(600),
+                        || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(read().await, 0);
+        assert_eq!(read().await, 0, "cached");
+
+        let versions = &cache.inner.tag_versions;
+        for i in 0..1_000_000 {
+            versions.observe_invalidation(&format!("forged-{i}"), 1);
+        }
+        assert!(versions.inner.lock().unwrap().len() <= MAX_TAGS);
+        assert_eq!(read().await, 1, "the L1 was emptied at the cap");
+        assert_eq!(read().await, 1, "and caches again");
+
+        cache.invalidate_ns("ns").await;
+        assert_eq!(read().await, 2, "a real invalidation still applies");
+    }
 }
