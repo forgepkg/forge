@@ -40,11 +40,13 @@ import { Select } from '~/components/catalyst/select'
  *  - **local** → no config; only name + enabled are editable (built-in realm)
  *
  * On **create** the kind is selectable (local is built-in and cannot be
- * created); on **edit** it is fixed and shown read-only. Secrets follow the
- * RepositoryForm `upstream_password` pattern: never seeded from the (redacted)
- * GET, placeholder shows "set to replace" when `<key>_set` is true, and a
- * blank field keeps the stored secret on edit — except that the server drops
- * a stored OIDC client secret when the issuer or client ID changes, so the
+ * created); on **edit** it is fixed and shown read-only, and saving a realm
+ * people sign in with (local, OIDC, credential forwarding) as disabled asks
+ * first, as the realm list's toggle does. Secrets follow the RepositoryForm
+ * `upstream_password` pattern: never seeded from the (redacted) GET,
+ * placeholder shows "set to replace" when `<key>_set` is true, and a blank
+ * field keeps the stored secret on edit — except that the server drops a
+ * stored OIDC client secret when the issuer or client ID changes, so the
  * form then warns and requires a new one.
  *
  * `PATCH` replaces the whole config, so every field is sent on each save.
@@ -135,6 +137,24 @@ export interface RealmFormProps {
   onSubmit: (values: RealmFormValues) => void
   /** Cancel affordance (navigates back to the list). */
   onCancel: () => void
+}
+
+/**
+ * What stops working when a realm people sign in with is disabled: the text
+ * of the confirmation the realm list and the edit form show before sending
+ * the disable. `null` for a kind that needs none (workload identity).
+ */
+export function disableRealmWarning(kind: RealmKind, name: string): string | null {
+  switch (kind) {
+    case 'local':
+      return `Disabling ${name} stops every password login: browser sign-in and NuGet clients sending a password over Basic. API tokens keep working.`
+    case 'oidc':
+      return `Disabling ${name} stops sign-in through its identity provider: people who use it can no longer sign in to Forge. API tokens keep working.`
+    case 'credential_forwarding':
+      return `Disabling ${name} stops the logins it checks against its upstream: NuGet clients sending those passwords over Basic, and browser sign-in with them. API tokens keep working.`
+    default:
+      return null
+  }
 }
 
 /** A string list as one entry per line (entries may contain commas). */
@@ -258,6 +278,14 @@ export function RealmForm({
     seedRealmFormValues(existing),
   )
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [confirmDisable, setConfirmDisable] = useState(false)
+
+  // Saving a realm people sign in with as disabled ends their logins, so the
+  // save waits for an explicit confirmation, as the list's toggle does.
+  const disableWarning =
+    mode === 'edit' && existing?.enabled && !values.enabled
+      ? disableRealmWarning(existing.kind, existing.name)
+      : null
 
   // The server keeps a stored client secret only while the issuer and client
   // ID stay the same (it must not reach another IdP), so after changing
@@ -376,6 +404,16 @@ export function RealmForm({
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!validate()) return
+    if (disableWarning) {
+      setConfirmDisable(true)
+      return
+    }
+    onSubmit(values)
+  }
+
+  function saveConfirmed() {
+    setConfirmDisable(false)
+    if (!validate()) return
     onSubmit(values)
   }
 
@@ -466,7 +504,10 @@ export function RealmForm({
       <CheckboxField>
         <Checkbox
           checked={values.enabled}
-          onChange={(c) => set('enabled', c)}
+          onChange={(c) => {
+            set('enabled', c)
+            setConfirmDisable(false)
+          }}
         />
         <Label>Enabled (used for sign-in / credential checks)</Label>
       </CheckboxField>
@@ -1184,18 +1225,41 @@ export function RealmForm({
         </p>
       )}
 
-      <div className="flex items-center gap-3">
-        <Button type="submit" disabled={submitting}>
-          {submitting
-            ? 'Saving…'
-            : mode === 'create'
-              ? 'Create realm'
-              : 'Save changes'}
-        </Button>
-        <Button type="button" outline onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
+      {confirmDisable && disableWarning ? (
+        <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6">
+          <p className="text-amber-700 dark:text-amber-400">{disableWarning}</p>
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              color="red"
+              onClick={saveConfirmed}
+              disabled={submitting}
+            >
+              Disable and save
+            </Button>
+            <Button
+              type="button"
+              outline
+              onClick={() => setConfirmDisable(false)}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center gap-3">
+          <Button type="submit" disabled={submitting}>
+            {submitting
+              ? 'Saving…'
+              : mode === 'create'
+                ? 'Create realm'
+                : 'Save changes'}
+          </Button>
+          <Button type="button" outline onClick={onCancel}>
+            Cancel
+          </Button>
+        </div>
+      )}
     </form>
   )
 }

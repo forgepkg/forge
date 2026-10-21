@@ -11,7 +11,7 @@
 //!     302s to the validated relative target; the cookie authenticates
 //!     `GET /admin/me` (proving `SessionCookieSource` is wired into the
 //!     principal chain);
-//!   * an unknown `state` is rejected (400);
+//!   * an unknown `state` is rejected (302 to `/login?error=oidc_failed`);
 //!   * `POST /auth/logout` clears the cookie + revokes the session (CSRF
 //!     enforced), after which the cookie no longer authenticates;
 //!   * an IdP whose issuer ends in `/` (Auth0-style) completes the login
@@ -183,6 +183,16 @@ fn no_redirect_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client")
+}
+
+/// A refused callback answers 302 to the SPA's login page with a generic
+/// error code (never a bare text body, never the IdP's error detail).
+fn assert_login_error(resp: &reqwest::Response, code: &str) {
+    assert_eq!(resp.status(), 302, "refused sign-in redirects");
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some(format!("/login?error={code}").as_str())
+    );
 }
 
 /// Peek the nonce stored on a live `oidc_flow` row (without consuming it).
@@ -506,7 +516,7 @@ async fn callback_rejects_unknown_state() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "unknown state is rejected");
+    assert_login_error(&resp, "oidc_failed");
     assert!(resp.headers().get("set-cookie").is_none());
 }
 
@@ -543,7 +553,7 @@ async fn callback_from_another_browser_is_rejected() {
             req = req.header("cookie", c);
         }
         let resp = req.send().await.unwrap();
-        assert_eq!(resp.status(), 400, "unbound callback rejected");
+        assert_login_error(&resp, "oidc_failed");
         assert!(resp
             .headers()
             .get_all("set-cookie")
@@ -860,8 +870,9 @@ async fn auth_routes_absent_when_oidc_disabled() {
 }
 
 /// The realm's allow-gate: a token that does not carry an allowed value of a
-/// required claim (here: another tenant of a multi-tenant app) is refused
-/// with 403 and no session; an allowed one signs in.
+/// required claim (here: another tenant of a multi-tenant app) is refused —
+/// sent back to the login page with `not_permitted` and no session; an
+/// allowed one signs in.
 #[tokio::test]
 async fn required_claims_gate_the_callback() {
     let _serial = SERIAL.lock().await;
@@ -880,7 +891,7 @@ async fn required_claims_gate_the_callback() {
     )
     .await;
 
-    for (tid, expected) in [("tenant-b", 403), ("tenant-a", 302)] {
+    for (tid, allowed) in [("tenant-b", false), ("tenant-a", true)] {
         let n = common::unique();
         let resp = no_redirect_client()
             .get(format!("{}/auth/oidc/login", srv.base_url))
@@ -909,13 +920,16 @@ async fn required_claims_gate_the_callback() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), expected, "tid = {tid}");
+        if !allowed {
+            assert_login_error(&resp, "not_permitted");
+        }
+        assert_eq!(resp.status(), 302, "tid = {tid}");
         let sets_session = resp
             .headers()
             .get_all("set-cookie")
             .iter()
             .any(|v| v.to_str().unwrap_or("").starts_with("forge_session="));
-        assert_eq!(sets_session, expected == 302, "tid = {tid}");
+        assert_eq!(sets_session, allowed, "tid = {tid}");
     }
 }
 
