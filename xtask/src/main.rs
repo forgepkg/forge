@@ -717,13 +717,15 @@ const PLUGINS: &str = "plugins";
 /// wasm build never invalidates the host's).
 const PLUGINS_TARGET: &str = "target/plugins";
 
-/// The plugin directories (`plugins/<id>/` with a `plugin.toml`), sorted.
+/// The plugin directories with a component build (`plugins/<id>/` whose
+/// `plugin.toml` names a `component`), sorted. A plugin without one is built
+/// in only.
 fn plugin_dirs() -> Result<Vec<std::path::PathBuf>, String> {
     let mut dirs: Vec<_> = std::fs::read_dir(PLUGINS)
         .map_err(|e| format!("read {PLUGINS}/: {e}"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|dir| dir.join("plugin.toml").is_file())
+        .filter(|dir| dir.join("plugin.toml").is_file() && plugin_component(dir).is_ok())
         .collect();
     dirs.sort();
     Ok(dirs)

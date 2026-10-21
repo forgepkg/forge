@@ -24,6 +24,8 @@ mod types;
 
 #[cfg(feature = "component")]
 pub mod component;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use std::cmp::Ordering;
 use std::io::{Read, Seek};

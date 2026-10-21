@@ -1,0 +1,28 @@
+[package]
+name = "forge-format-nuget"
+# The plugin's own version: keep it equal to `version` in plugin.toml.
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "NuGet V3 feeds for Forge, as a format plugin"
+
+# Built into the server only, for now: the `zip` reader's `typed-path`
+# dependency needs nightly Rust on wasm32-wasip2, so there is no `component`
+# feature (and no `component` in plugin.toml) yet.
+
+[dependencies]
+forge-plugin-api = { path = "../../crates/plugin-api" }
+
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ZIP archive reading (.nupkg is a zip); default features keep deflate support.
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+# Namespace-insensitive XML parsing of the .nuspec manifest.
+quick-xml = { version = "0.42" }
+
+[dev-dependencies]
+forge-plugin-api = { path = "../../crates/plugin-api", features = ["testing"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }

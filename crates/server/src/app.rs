@@ -22,7 +22,6 @@ use crate::admin::admin_router;
 use crate::auth::auth_router;
 use crate::browse::browse_router;
 use crate::config::Config;
-use crate::dispatch::dispatch;
 use crate::me::me_router;
 use crate::me_tokens::me_tokens_router;
 use crate::middleware::{attach_principal, PrincipalLayer};
@@ -104,10 +103,9 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/admin/...` — admin REST API (admin-only).
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
-/// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
-/// * `{mount}/{repo}/...` — repositories of plugin formats, under each
-///   format's mount (`/repository` unless its plugin names another;
-///   [`crate::plugins`]).
+/// * `{mount}/{repo}/...` — repositories, under their format's mount (NuGet:
+///   `/v3`; Helm and other plugins: `/repository` unless their plugin names
+///   another), each served by its format's plugin ([`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).
 ///
@@ -143,20 +141,15 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // login and sessions exist independent of OIDC; the `/auth/oidc/*`
         // endpoints answer 404 themselves when no enabled oidc realm exists.
         .merge(auth_router())
-        // Everything under /v3/{repo} is handled by the dispatcher (which builds
-        // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
-        // /DELETE; the dispatcher enforces authz per method.
-        .route("/v3/{repo}", any(dispatch))
-        .route("/v3/{repo}/{*rest}", any(dispatch))
         // The Docker / OCI registry: clients always talk to `/v2/` at the
         // host root; the registry resolves repositories from the name (or
         // the host) itself.
         .route("/v2", any(crate::registry::registry))
         .route("/v2/", any(crate::registry::registry))
         .route("/v2/{*rest}", any(crate::registry::registry));
-    // Repositories of plugin formats, each served by its format's plugin
-    // under the format's mount (`crate::plugins`); like `/v3`,
-    // authorization is per method.
+    // Repositories, each served by its format's plugin under the format's
+    // mount (`crate::plugins`; NuGet at `/v3`). `any` covers
+    // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
     for mount in mounts.iter() {
         app = app
             .route(&format!("{mount}/{{repo}}"), any(crate::plugins::dispatch))
@@ -244,7 +237,8 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
-/// * feed responses (`/v3/...`, and the mounts of plugin formats, `feeds`)
+/// * feed responses (under the formats' mounts, `feeds`: `/v3/...`,
+///   `/repository/...`)
 ///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
@@ -267,7 +261,7 @@ async fn response_policy(
     let path = req.uri().path();
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse");
-    let feed = under("/v3") || feeds.iter().any(|mount| under(mount));
+    let feed = feeds.iter().any(|mount| under(mount));
     let registry = under("/v2");
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)

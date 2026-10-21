@@ -147,17 +147,17 @@ export interface UpdateRepo {
 }
 
 /**
- * An installed package format (`FormatView` of `GET /admin/formats`): NuGet,
- * the built-in format plugins, and every loaded WebAssembly plugin.
+ * An installed package format (`FormatView` of `GET /admin/formats`): the
+ * built-in format plugins (NuGet, Helm) and every loaded WebAssembly plugin.
  */
 export interface FormatView {
   /** The format id (`RepoView.format`). */
   id: string
   /** Display name. */
   name: string
-  /** Built into the server (NuGet, the built-in plugins) rather than a WebAssembly plugin. */
+  /** Built into the server rather than a WebAssembly plugin. */
   builtin: boolean
-  /** The repository kinds it supports (plugins: hosted and group). */
+  /** The repository kinds it supports (proxy only with a host-side upstream, e.g. NuGet). */
   kinds: RepoKind[]
   /** Where its repositories are served: `{mount}/{repository}`. */
   mount: string

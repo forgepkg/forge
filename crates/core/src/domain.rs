@@ -64,7 +64,7 @@ pub enum FormatError {
     #[error("malformed manifest: {0}")]
     MalformedManifest(String),
     /// A version string could not be normalized.
-    #[error("invalid version {value:?}: {reason}")]
+    #[error("{}", invalid_version(.value, .reason))]
     InvalidVersion {
         /// The offending raw version string.
         value: String,
@@ -74,6 +74,16 @@ pub enum FormatError {
     /// Underlying I/O failure while reading the package.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// The text of [`FormatError::InvalidVersion`]: a format plugin's reason
+/// names the version itself, so it comes without the value.
+fn invalid_version(value: &str, reason: &str) -> String {
+    if value.is_empty() {
+        format!("invalid version: {reason}")
+    } else {
+        format!("invalid version {value:?}: {reason}")
+    }
 }
 
 impl fmt::Display for ParsedUpload {

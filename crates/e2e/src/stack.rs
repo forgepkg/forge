@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use forge_nuget::NugetFormat;
 use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
@@ -585,7 +584,6 @@ impl StackBuilder {
             .await
             .expect("seed auth realms");
 
-        let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
         let cache = match &redis {
             Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
                 .await
@@ -595,8 +593,8 @@ impl StackBuilder {
         let registry_keys = forge_server::registry::load_token_keys(&config, &pool, None)
             .await
             .expect("registry token key");
-        let state = AppState::new(pool.clone(), store, cache, nuget, config)
-            .with_registry_keys(registry_keys);
+        let state =
+            AppState::new(pool.clone(), store, cache, config).with_registry_keys(registry_keys);
         let layer = principal_layer(&state).expect("principal layer");
 
         let worker_handles = if self.spawn_workers {

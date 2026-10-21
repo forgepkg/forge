@@ -6,13 +6,13 @@ members = [
     "crates/cache",
     "crates/core",
     "crates/crypto",
-    "crates/format-nuget",
     "crates/plugin-api",
     "crates/plugin",
     "crates/format-oci",
     "crates/server",
     "crates/e2e",
     "plugins/helm",
+    "plugins/nuget",
     "xtask",
 ]
 

@@ -1,0 +1,20 @@
+# A Forge format plugin: NuGet V3 feeds (see plugins/README.md).
+[plugin]
+id = "nuget"
+name = "NuGet"
+version = "1.0.0"
+api = "0.2.0"
+description = "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual Studio; proxies of nuget.org and other V3 feeds."
+mount = "/v3"
+kinds = ["hosted", "proxy", "group"]
+
+# Proxies speak the NuGet V3 upstream protocol, which the host implements.
+[proxy]
+upstream = "nuget-v3"
+
+# The asset names and content types NuGet has always stored.
+[assets]
+package = "package.nupkg"
+package_type = "application/octet-stream"
+manifest = "package.nuspec"
+manifest_type = "application/xml"

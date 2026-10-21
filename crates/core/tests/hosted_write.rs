@@ -20,10 +20,15 @@ use forge_core::repo::{
     SearchParams, WriteError, NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH,
 };
 use forge_db::repository_dao::{self, NewRepository};
-use forge_nuget::NugetFormat;
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    forge_plugin::PluginFormat::nuget(Default::default())
+}
 
 const MAX_UPLOAD: u64 = 64 * 1024 * 1024;
 
@@ -129,7 +134,7 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
 async fn writer(pool: &PgPool, cas: Cas, cache: Arc<dyn CacheInvalidator>) -> HostedWrite {
     HostedWrite::new(
         pool.clone(),
-        Arc::new(NugetFormat::new()),
+        Arc::new(nuget()),
         cas,
         cache,
         Duration::seconds(0),
@@ -137,16 +142,12 @@ async fn writer(pool: &PgPool, cas: Cas, cache: Arc<dyn CacheInvalidator>) -> Ho
 }
 
 fn reader(pool: &PgPool, store: BlobStore) -> HostedRepo {
-    HostedRepo::new(
-        pool.clone(),
-        Arc::new(NugetFormat::new()),
-        Arc::new(StoreFetch(store)),
-    )
-    // Downloads are written in batches; write them soon in tests.
-    .with_download_tally(DownloadTally::with_interval(
-        pool.clone(),
-        std::time::Duration::from_millis(20),
-    ))
+    HostedRepo::new(pool.clone(), Arc::new(nuget()), Arc::new(StoreFetch(store)))
+        // Downloads are written in batches; write them soon in tests.
+        .with_download_tally(DownloadTally::with_interval(
+            pool.clone(),
+            std::time::Duration::from_millis(20),
+        ))
 }
 
 async fn seed_repo(pool: &PgPool, allow_redeploy: bool) -> String {

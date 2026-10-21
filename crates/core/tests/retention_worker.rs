@@ -28,11 +28,16 @@ use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::{blob_dao, proxy_dao, retention_dao};
-use forge_nuget::NugetFormat;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{pool, unique};
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    forge_plugin::PluginFormat::nuget(Default::default())
+}
 
 fn config() -> RetentionConfig {
     RetentionConfig {
@@ -46,7 +51,7 @@ fn config() -> RetentionConfig {
 fn worker(pool: &PgPool, config: RetentionConfig) -> RetentionWorker {
     RetentionWorker::new(
         pool.clone(),
-        Arc::new(NugetFormat::new()) as Arc<dyn Format>,
+        Arc::new(nuget()) as Arc<dyn Format>,
         Arc::new(NoopCacheInvalidator),
         config,
     )
@@ -825,12 +830,8 @@ async fn claim_and_evaluate(
                 },
             )
             .collect();
-    let decisions = forge_core::retention::evaluate::evaluate(
-        &NugetFormat::default(),
-        Utc::now(),
-        &policy,
-        &candidates,
-    );
+    let decisions =
+        forge_core::retention::evaluate::evaluate(&nuget(), Utc::now(), &policy, &candidates);
     (claimed, run_id, policy, decisions)
 }
 
@@ -841,7 +842,7 @@ async fn apply_fenced(
     policy: &forge_core::retention::model::RetentionPolicy,
     decisions: &[forge_core::retention::evaluate::Decision],
 ) -> retention_dao::RunSummary {
-    let format = NugetFormat::default();
+    let format = nuget();
     let ctx = forge_core::retention::apply::ApplyContext {
         pool,
         repository_id: claimed.repository_id,

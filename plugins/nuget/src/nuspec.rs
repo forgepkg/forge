@@ -1,4 +1,4 @@
-//! `.nupkg` (zip) and `.nuspec` (XML) parsing into a [`ParsedUpload`].
+//! `.nupkg` (zip) and `.nuspec` (XML) parsing into a [`ParsedNupkg`].
 //!
 //! A `.nupkg` is an OPC zip. We locate the single top-level `*.nuspec`
 //! manifest, read it under strict zip-bomb limits, and parse it
@@ -7,21 +7,22 @@
 //!
 //! Only the manifest is decompressed; the `<id>`, `<version>`, and
 //! `<dependencies>` groups are extracted. The raw manifest bytes are carried in
-//! [`ParsedUpload::nuspec_bytes`] so the server can store and re-serve them.
+//! [`ParsedNupkg::nuspec_bytes`] so the server can store and re-serve them.
 
 use std::cell::Cell;
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::Rc;
 
-use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
-use forge_core::format::ReadSeek;
+use forge_plugin_api::PackageSource as ReadSeek;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::model::{NupkgError, NupkgLimits};
+use crate::model::{
+    Dependency, DependencyGroup, FormatError, NupkgError, NupkgLimits, ParsedNupkg as ParsedUpload,
+};
 use crate::version;
 
-/// Parse a `.nupkg` from a seekable reader into a [`ParsedUpload`].
+/// Parse a `.nupkg` from a seekable reader into a [`ParsedNupkg`].
 pub fn parse_nupkg(
     file: &mut dyn ReadSeek,
     limits: &NupkgLimits,
@@ -105,10 +106,25 @@ pub fn validate_package_id(id: &str) -> Result<(), FormatError> {
 /// Lowercase a package id for case-insensitive lookups, matching NuGet's
 /// `ToLowerInvariant()`: ids may contain non-ASCII letters (see
 /// [`validate_package_id`]), so this lowers every letter (`Ünicode.Lib` →
-/// `ünicode.lib`), character by character like .NET
-/// ([`forge_core::format::lower_invariant`]).
+/// `ünicode.lib`), character by character with the simple (1:1) Unicode
+/// mapping, like .NET: no context rules (a final `Σ` lowers to `σ`, not
+/// `ς`) and no expansions. `char::to_lowercase` is already context-free; its
+/// only multi-character result is `İ` (U+0130), whose simple mapping is a
+/// plain `i`.
 pub fn lower_id(id: &str) -> String {
-    forge_core::format::lower_invariant(id.trim())
+    id.trim()
+        .chars()
+        .map(|c| {
+            if c == '\u{130}' {
+                return 'i';
+            }
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) => l,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 /// Display metadata of a `.nuspec`, for registration catalog entries and

@@ -20,11 +20,11 @@ forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
-forge-nuget = { path = "../format-nuget" }
 forge-plugin = { path = "../plugin" }
 # Built-in format plugins (plugins/<id>/), linked in.
 forge-format-helm = { path = "../../plugins/helm" }
 forge-oci = { path = "../format-oci" }
+forge-format-nuget = { path = "../../plugins/nuget" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -74,7 +74,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 reqwest = { workspace = true, features = ["multipart", "query"] }
-forge-nuget = { path = "../format-nuget" }
+forge-format-nuget = { path = "../../plugins/nuget" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }

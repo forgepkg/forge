@@ -22,7 +22,7 @@
 
 use std::cmp::Ordering;
 
-use forge_core::domain::FormatError;
+use crate::model::FormatError;
 
 /// Maximum length of a published version, as written and normalized (the
 /// limit nuget.org applies). Without it a multi-kilobyte prerelease label

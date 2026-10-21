@@ -5,10 +5,8 @@
 use std::fs::File;
 use std::path::PathBuf;
 
-use forge_core::domain::FormatError;
-use forge_core::format::Format;
-use forge_nuget::model::NupkgLimits;
-use forge_nuget::NugetFormat;
+use forge_format_nuget::{Nuget, NupkgLimits};
+use forge_plugin_api::{FormatError, FormatPlugin};
 
 fn fixture(name: &str) -> File {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -19,9 +17,9 @@ fn fixture(name: &str) -> File {
 
 #[test]
 fn parses_grouped_dependency_package() {
-    let fmt = NugetFormat::new();
+    let fmt = Nuget::default();
     let mut f = fixture("sample.lib.1.0.0.nupkg");
-    let parsed = fmt.parse_upload(&mut f).expect("parse sample.lib");
+    let parsed = fmt.parse_package(&mut f).expect("parse sample.lib");
 
     assert_eq!(parsed.original_id, "Sample.Lib");
     assert_eq!(parsed.id, "sample.lib");
@@ -29,16 +27,16 @@ fn parses_grouped_dependency_package() {
     assert_eq!(parsed.version_original, "1.02.3");
     assert_eq!(parsed.version, "1.2.3");
     assert!(parsed.listed);
-    assert!(!parsed.nuspec_bytes.is_empty());
+    assert!(!parsed.manifest.is_empty());
     // nuspec_bytes round-trip the actual manifest (A4).
-    let text = String::from_utf8(parsed.nuspec_bytes.clone()).unwrap();
+    let text = String::from_utf8(parsed.manifest.clone()).unwrap();
     assert!(text.contains("<id>Sample.Lib</id>"));
 
-    assert_eq!(parsed.deps.len(), 2);
+    assert_eq!(parsed.dependencies.len(), 2);
     let net8 = parsed
-        .deps
+        .dependencies
         .iter()
-        .find(|g| g.target_framework.as_deref() == Some("net8.0"))
+        .find(|g| g.target.as_deref() == Some("net8.0"))
         .expect("net8.0 group");
     assert_eq!(net8.dependencies.len(), 2);
     assert_eq!(net8.dependencies[0].id, "Newtonsoft.Json");
@@ -46,9 +44,9 @@ fn parses_grouped_dependency_package() {
     assert_eq!(net8.dependencies[1].id, "Serilog");
 
     let netstd = parsed
-        .deps
+        .dependencies
         .iter()
-        .find(|g| g.target_framework.as_deref() == Some("netstandard2.0"))
+        .find(|g| g.target.as_deref() == Some("netstandard2.0"))
         .expect("netstandard2.0 group");
     assert_eq!(netstd.dependencies.len(), 1);
 }
@@ -56,20 +54,20 @@ fn parses_grouped_dependency_package() {
 #[test]
 fn parses_second_namespace_with_flat_deps_and_prerelease() {
     // Different xmlns (A3) + flat dependencies + prerelease normalization.
-    let fmt = NugetFormat::new();
+    let fmt = Nuget::default();
     let mut f = fixture("other.package.2.0.0-beta.1.nupkg");
-    let parsed = fmt.parse_upload(&mut f).expect("parse other.package");
+    let parsed = fmt.parse_package(&mut f).expect("parse other.package");
 
     assert_eq!(parsed.original_id, "Other.Package");
     assert_eq!(parsed.id, "other.package");
     assert_eq!(parsed.version_original, "2.0.0-Beta.1");
     assert_eq!(parsed.version, "2.0.0-beta.1");
 
-    assert_eq!(parsed.deps.len(), 1);
-    assert_eq!(parsed.deps[0].target_framework, None);
-    assert_eq!(parsed.deps[0].dependencies.len(), 1);
+    assert_eq!(parsed.dependencies.len(), 1);
+    assert_eq!(parsed.dependencies[0].target, None);
+    assert_eq!(parsed.dependencies[0].dependencies.len(), 1);
     assert_eq!(
-        parsed.deps[0].dependencies[0].id,
+        parsed.dependencies[0].dependencies[0].id,
         "Microsoft.Extensions.Logging"
     );
 }
@@ -81,10 +79,10 @@ fn parses_second_namespace_with_flat_deps_and_prerelease() {
 /// per-entry size/ratio caps applied to every entry.)
 #[test]
 fn large_compressible_payload_entry_is_accepted() {
-    let fmt = NugetFormat::new();
+    let fmt = Nuget::default();
     let mut f = fixture("zip-bomb.nupkg");
     let parsed = fmt
-        .parse_upload(&mut f)
+        .parse_package(&mut f)
         .expect("a large payload entry is not a bomb for the manifest reader");
     assert_eq!(parsed.id, "sample.lib");
 }
@@ -105,8 +103,8 @@ fn rejects_nuspec_bomb() {
     zw.write_all(nuspec.as_bytes()).unwrap();
     let mut cur = std::io::Cursor::new(zw.finish().unwrap().into_inner());
 
-    let err = NugetFormat::new()
-        .parse_upload(&mut cur)
+    let err = Nuget::default()
+        .parse_package(&mut cur)
         .expect_err("nuspec bomb must be rejected");
     match err {
         FormatError::InvalidPackage(msg) => {
@@ -124,7 +122,7 @@ fn small_total_budget_also_rejects_bomb() {
         max_total_uncompressed: 4 * 1024 * 1024,
         ..NupkgLimits::default()
     };
-    let fmt = NugetFormat::with_limits(limits);
+    let fmt = Nuget::with_limits(limits);
     let mut f = fixture("zip-bomb.nupkg");
-    assert!(fmt.parse_upload(&mut f).is_err());
+    assert!(fmt.parse_package(&mut f).is_err());
 }

@@ -61,9 +61,10 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
 forge-db = { path = "../db" }
-# dev-only cycle (forge-nuget depends on forge-core); Cargo permits this for the
-# version-ordering Format impl used by the hosted-read integration tests.
-forge-nuget = { path = "../format-nuget" }
+# NuGet, the format most integration tests use: the built-in plugin and its
+# Format (a dev-only cycle through forge-plugin, which Cargo permits).
+forge-format-nuget = { path = "../../plugins/nuget" }
+forge-plugin = { path = "../plugin" }
 argon2 = { workspace = true, features = ["password-hash"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }

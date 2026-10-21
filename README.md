@@ -46,19 +46,18 @@ A Cargo workspace of small crates plus the web SPA:
 | `storage` | `forge-storage` | CAS over S3, blob outbox / GC reconciler. |
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
-| `format-nuget` | `forge-nuget` | NuGet V3 protocol + `.nupkg`/`.nuspec` parsing. |
 | `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait, its WIT twin and the component glue. |
 | `plugin` | `forge-plugin` | The host side of format plugins: built-in and WebAssembly plugins (Wasmtime) behind one trait. |
-| `server` | `forge-server` | Axum HTTP server: NuGet feed, Docker registry, format-plugin repositories, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
-| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `helm`. |
+| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), `helm`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
-**Single-origin serving.** `forge-server` mounts the NuGet feed (`/v3`), the
-Docker / OCI registry (`/v2`), the
-admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
+**Single-origin serving.** `forge-server` mounts each format plugin's feed
+(NuGet at `/v3`, Helm at `/repository`), the Docker / OCI registry (`/v2`),
+the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
 the same origin with relative URLs; no routing proxy is required (production
 still puts a TLS-terminating proxy in front — see

@@ -13,6 +13,9 @@
 //! mount = "/repository"     # optional: served at {mount}/{repository}/…
 //! kinds = ["hosted", "group"] # optional: the repository kinds it supports
 //!
+//! [proxy]                   # optional: proxy repositories, through an
+//! upstream = "nuget-v3"     # upstream protocol the host implements
+//!
 //! [assets]                  # optional: how its files are stored
 //! package = "package"
 //! package_type = "application/octet-stream"
@@ -35,10 +38,10 @@ use crate::PluginError;
 /// The `forge:format` contract versions this host implements.
 pub const SUPPORTED_APIS: &[&str] = &[forge_plugin_api::API];
 
-/// Format ids a plugin can never take: the built-in formats, and names the
-/// server routes or reserves.
+/// Format ids a plugin can never take: the built-in Docker registry's, and
+/// names the server routes or reserves. (A built-in plugin's id, such as
+/// NuGet's, is taken by that plugin: see the server's registry.)
 const RESERVED_IDS: &[&str] = &[
-    "nuget",
     "docker",
     "v2",
     "v3",
@@ -52,7 +55,7 @@ const RESERVED_IDS: &[&str] = &[
 pub const DEFAULT_MOUNT: &str = "/repository";
 
 /// Mounts a plugin can never take: the server's own routes, the web UI's
-/// pages, NuGet's feed and the Docker registry.
+/// pages and the Docker registry.
 const RESERVED_MOUNTS: &[&str] = &[
     "admin",
     "api",
@@ -70,7 +73,6 @@ const RESERVED_MOUNTS: &[&str] = &[
     "tokens",
     "users",
     "v2",
-    "v3",
     "version",
 ];
 
@@ -94,10 +96,27 @@ pub struct Manifest {
     pub mount: String,
     /// The repository kinds the format supports.
     pub kinds: Vec<RepositoryKind>,
+    /// The upstream protocol its proxy repositories speak, when it has any.
+    pub proxy: Option<Upstream>,
     /// How a version's files are stored.
     pub assets: Assets,
     /// Requested limits as a component (`None` → the host default).
     pub limits: RequestedLimits,
+}
+
+/// An upstream protocol the host implements for proxy repositories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum Upstream {
+    /// A NuGet V3 feed (service index, flat container, registration,
+    /// search), serving `.nupkg` packages with `.nuspec` manifests.
+    #[serde(rename = "nuget-v3")]
+    NugetV3,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProxy {
+    upstream: Upstream,
 }
 
 /// The `[assets]` table: the names (within a version) and content types of
@@ -140,6 +159,7 @@ struct RawManifest {
     plugin: RawPlugin,
     #[serde(default)]
     assets: Assets,
+    proxy: Option<RawProxy>,
     #[serde(default)]
     limits: RequestedLimits,
 }
@@ -187,9 +207,10 @@ impl Manifest {
         }
         let mount = p.mount.unwrap_or_else(|| DEFAULT_MOUNT.to_string());
         validate_mount(&mount)?;
+        let proxy = raw.proxy.map(|p| p.upstream);
         let kinds = match p.kinds {
             None => vec![RepositoryKind::Hosted, RepositoryKind::Group],
-            Some(kinds) => parse_kinds(&kinds)?,
+            Some(kinds) => parse_kinds(&kinds, proxy.is_some())?,
         };
         validate_assets(&raw.assets)?;
         Ok(Manifest {
@@ -201,6 +222,7 @@ impl Manifest {
             component,
             mount,
             kinds,
+            proxy,
             assets: raw.assets,
             limits: raw.limits,
         })
@@ -238,22 +260,23 @@ pub fn validate_mount(mount: &str) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// The `kinds` of a manifest: some of `hosted` and `group`, each once.
-/// Proxies need an upstream protocol, which a plugin cannot provide yet.
-fn parse_kinds(kinds: &[String]) -> Result<Vec<RepositoryKind>, PluginError> {
+/// The `kinds` of a manifest: some of `hosted`, `proxy` and `group`, each
+/// once. A proxy needs an upstream protocol (`[proxy]`).
+fn parse_kinds(kinds: &[String], has_upstream: bool) -> Result<Vec<RepositoryKind>, PluginError> {
     let mut parsed = Vec::new();
     for kind in kinds {
         let kind = match kind.as_str() {
             "hosted" => RepositoryKind::Hosted,
             "group" => RepositoryKind::Group,
+            "proxy" if has_upstream => RepositoryKind::Proxy,
             "proxy" => {
                 return Err(PluginError::Manifest(
-                    "kind \"proxy\" is not available to format plugins yet".into(),
+                    "kind \"proxy\" needs an upstream protocol ([proxy] upstream)".into(),
                 ))
             }
             other => {
                 return Err(PluginError::Manifest(format!(
-                    "unknown repository kind {other:?} (hosted, group)"
+                    "unknown repository kind {other:?} (hosted, proxy, group)"
                 )))
             }
         };
@@ -361,7 +384,6 @@ mod tests {
             "Helm",
             "1helm",
             "helm_charts",
-            "nuget",
             "docker",
             "v2",
             "v3",
@@ -413,13 +435,22 @@ mod tests {
         assert_eq!(m.assets.manifest_type, "application/yaml");
 
         for mount in [
-            "charts", "/", "/c", "/Charts", "/a/b", "/admin", "/v2", "/v3", "/manage",
+            "charts", "/", "/c", "/Charts", "/a/b", "/admin", "/v2", "/manage",
         ] {
             assert!(
                 with(&format!("mount = {mount:?}"), "").is_err(),
                 "{mount:?} accepted"
             );
         }
+        // A proxy needs an upstream protocol.
+        let m = with(
+            "kinds = [\"hosted\", \"proxy\"]",
+            "[proxy]\nupstream = \"nuget-v3\"\n",
+        )
+        .unwrap();
+        assert_eq!(m.kinds, [RepositoryKind::Hosted, RepositoryKind::Proxy]);
+        assert_eq!(m.proxy, Some(Upstream::NugetV3));
+        assert!(with("", "[proxy]\nupstream = \"maven\"\n").is_err());
         for kinds in [
             "[]",
             "[\"proxy\"]",

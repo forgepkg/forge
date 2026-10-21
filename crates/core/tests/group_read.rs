@@ -35,8 +35,13 @@ use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::user_dao::{self, NewUser};
-use forge_nuget::NugetFormat;
 use sqlx::PgPool;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    forge_plugin::PluginFormat::nuget(Default::default())
+}
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.
 #[derive(Default, Clone)]
@@ -68,7 +73,7 @@ impl MemberOpsFactory for HostedFactory {
     fn ops_for(&self, _member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         Ok(Arc::new(HostedRepo::new(
             self.pool.clone(),
-            Arc::new(NugetFormat::new()),
+            Arc::new(nuget()),
             Arc::new(self.blobs.clone()),
         )))
     }
@@ -1182,7 +1187,7 @@ fn mixed_group_repo(
     });
     let authz = Authz::new(pool.clone(), Cache::l1_only(16));
     GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
-        .with_format(Arc::new(NugetFormat::new()))
+        .with_format(Arc::new(nuget()))
 }
 
 /// An unreachable proxy member must not break restores of packages another
@@ -1762,7 +1767,7 @@ impl MemberOpsFactory for CountingBlobsFactory {
     fn ops_for(&self, _member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         Ok(Arc::new(HostedRepo::new(
             self.pool.clone(),
-            Arc::new(NugetFormat::new()),
+            Arc::new(nuget()),
             Arc::new(self.blobs.clone()),
         )))
     }
@@ -1812,7 +1817,7 @@ async fn group_search_enriches_only_the_final_page() {
         authz,
         TEST_MAX_DEPTH,
     )
-    .with_format(Arc::new(NugetFormat::new()));
+    .with_format(Arc::new(nuget()));
 
     let result = g
         .search(

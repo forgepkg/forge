@@ -1,6 +1,6 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: NuGet, Docker, the built-in format plugins, and every
-//! loaded WebAssembly plugin.
+//! repositories of: the built-in format plugins (NuGet, Helm), Docker, and
+//! every loaded WebAssembly plugin.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
@@ -16,18 +16,18 @@ pub struct FormatView {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Whether the format is built into the server (NuGet, Docker and the
-    /// built-in plugins) rather than loaded as a WebAssembly plugin.
+    /// Whether the format is built into the server (Docker and the built-in
+    /// plugins) rather than loaded as a WebAssembly plugin.
     pub builtin: bool,
     /// The repository kinds it supports.
     pub kinds: Vec<&'static str>,
     /// Where its repositories are served: `{mount}/{repository}` (for
     /// Docker, `/v2/{repository}/{image}`, or a repository's own host).
     pub mount: String,
-    /// Plugin version (plugins only).
+    /// The plugin's version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Plugin description (plugins only).
+    /// The plugin's description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// SHA-256 of the plugin's component (WebAssembly plugins only).
@@ -35,33 +35,11 @@ pub struct FormatView {
     pub sha256: Option<String>,
 }
 
-/// `GET /admin/formats`
+/// `GET /admin/formats`: NuGet first, then Docker, then the other formats
+/// by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
-    let nuget = state.formats.nuget().id();
-    let mut formats = vec![
-        FormatView {
-            id: nuget.to_string(),
-            name: "NuGet".into(),
-            builtin: true,
-            kinds: kinds(nuget),
-            mount: "/v3".into(),
-            version: None,
-            description: None,
-            sha256: None,
-        },
-        FormatView {
-            id: DOCKER_FORMAT.to_string(),
-            name: "Docker / OCI".into(),
-            builtin: true,
-            kinds: kinds(DOCKER_FORMAT),
-            mount: "/v2".into(),
-            version: None,
-            description: None,
-            sha256: None,
-        },
-    ];
-    formats.extend(state.formats.plugins().map(|plugin| {
+    let view = |plugin: &forge_plugin::Plugin| {
         let manifest = plugin.manifest();
         FormatView {
             id: plugin.id().to_string(),
@@ -73,6 +51,21 @@ pub async fn list(State(state): State<AppState>) -> Response {
             description: manifest.description.clone(),
             sha256: plugin.sha256().map(str::to_string),
         }
-    }));
+    };
+    let mut plugins: Vec<_> = state.formats.plugins().collect();
+    plugins.sort_by_key(|p| p.id());
+    let (nuget, others): (Vec<_>, Vec<_>) = plugins.into_iter().partition(|p| p.id() == "nuget");
+    let mut formats: Vec<FormatView> = nuget.into_iter().map(|p| view(p)).collect();
+    formats.push(FormatView {
+        id: DOCKER_FORMAT.to_string(),
+        name: "Docker / OCI".into(),
+        builtin: true,
+        kinds: kinds(DOCKER_FORMAT),
+        mount: "/v2".into(),
+        version: None,
+        description: None,
+        sha256: None,
+    });
+    formats.extend(others.into_iter().map(|p| view(p)));
     Json(formats).into_response()
 }

@@ -446,9 +446,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // The format must be installed: NuGet, Docker or a loaded format plugin
-    // (`GET /admin/formats`), and support the kind. It is fixed for the
-    // repository's lifetime.
+    // The format must be installed: Docker, a built-in format plugin (NuGet,
+    // Helm) or a loaded WebAssembly one (`GET /admin/formats`), and support
+    // the kind. It is fixed for the repository's lifetime.
     let Some(kinds) = state.formats.kinds(&body.format) else {
         let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
@@ -456,8 +456,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             body.format
         ));
     };
-    // NuGet and Docker serve every kind (each speaks its own upstream
-    // protocol); a plugin format serves the kinds its plugin names.
+    // Docker serves every kind; a plugin format serves the kinds its plugin
+    // names (NuGet's all three).
     if !kinds.contains(&kind.as_str()) {
         return bad_request(format!(
             "{kind} repositories are not available for format {:?}",
