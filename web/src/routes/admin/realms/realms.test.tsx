@@ -20,12 +20,14 @@ import { routeTree } from '~/routeTree.gen'
  *  - the list renders realms in priority order with kind badges and hides the
  *    delete affordance for the built-in local realm;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;
- *  - the enabled toggle PATCHes the realm; disabling `local` asks first and
- *    a server refusal (409) is shown with its reason;
+ *  - the enabled toggle PATCHes the realm; disabling a realm people sign in
+ *    with (local, OIDC, credential forwarding) asks first, and a server
+ *    refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
  *    invalid) and POSTs the parsed config when valid;
- *  - the edit form sends list values containing commas back unchanged, and
- *    requires a new client secret once the issuer or client ID changes.
+ *  - the edit form sends list values containing commas back unchanged,
+ *    requires a new client secret once the issuer or client ID changes, and
+ *    asks before saving a sign-in realm as disabled.
  */
 
 const adminMe: Me = {
@@ -267,12 +269,12 @@ describe('admin realms list', () => {
     ).toBe(false)
   })
 
-  it('disabling another realm does not ask', async () => {
-    let patched: { id: number; body: unknown } | null = null
+  it('asks before disabling an OIDC realm; sends nothing until confirmed', async () => {
+    const patches: Array<{ id: number; body: unknown }> = []
     mockApi({
       realms: threeRealms,
       onPatch: (id, body) => {
-        patched = { id, body }
+        patches.push({ id, body })
         return json(realm({ id: 5, kind: 'oidc', enabled: false }))
       },
     })
@@ -280,14 +282,57 @@ describe('admin realms list', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    await u.click(
-      await screen.findByRole('checkbox', { name: 'corp-sso enabled' }),
-    )
+    const toggle = await screen.findByRole('checkbox', { name: 'corp-sso enabled' })
+    await u.click(toggle)
+
+    const row = toggle.closest('tr')!
+    expect(
+      within(row).getByText(/stops sign-in through its identity provider/),
+    ).toHaveTextContent('people who use it can no longer sign in to Forge')
+    expect(toggle).toBeChecked()
+
+    await u.click(within(row).getByRole('button', { name: 'Cancel' }))
+    expect(within(row).queryByText(/stops sign-in/)).toBeNull()
+    expect(patches).toEqual([])
+
+    await u.click(toggle)
+    expect(patches).toEqual([])
+    await u.click(within(row).getByRole('button', { name: 'Disable' }))
 
     await waitFor(() =>
-      expect(patched).toEqual({ id: 5, body: { enabled: false } }),
+      expect(patches).toEqual([{ id: 5, body: { enabled: false } }]),
     )
-    expect(screen.queryByText(/stops every password login/)).toBeNull()
+  })
+
+  it('asks before disabling a credential-forwarding realm', async () => {
+    mockApi({
+      realms: [
+        realm({ id: 1, kind: 'local', name: 'local', priority: 0 }),
+        realm({
+          id: 3,
+          kind: 'credential_forwarding',
+          name: 'legacy-auth',
+          priority: 1,
+          config: { url: 'https://auth.example.com/check', key_pepper_set: true },
+        }),
+      ],
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'legacy-auth enabled' })
+    await u.click(toggle)
+
+    const row = toggle.closest('tr')!
+    expect(
+      within(row).getByText(/stops the logins it checks against its upstream/),
+    ).toHaveTextContent('NuGet clients sending those passwords over Basic')
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+      ),
+    ).toBe(false)
   })
 
   it('shows the server refusal after disabling local is confirmed', async () => {
@@ -750,6 +795,67 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
         client_secret: 'new-s3cret',
       },
     })
+  })
+
+  it('asks before saving local disabled; sends nothing until confirmed', async () => {
+    const local = realm({ id: 1, kind: 'local', name: 'local' })
+    const patches: unknown[] = []
+    mockApi({
+      realms: [local],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json({ ...local, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/1')
+
+    await u.click(await screen.findByRole('checkbox', { name: /Enabled/ }))
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(screen.getByText(/stops every password login/)).toBeInTheDocument()
+    expect(patches).toEqual([])
+
+    // Cancel keeps the form as it is and sends nothing.
+    await u.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
+    expect(screen.getByRole('checkbox', { name: /Enabled/ })).not.toBeChecked()
+    expect(patches).toEqual([])
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await u.click(screen.getByRole('button', { name: 'Disable and save' }))
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ name: 'local', enabled: false }]),
+    )
+  })
+
+  it('asks before saving an OIDC realm disabled', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json({ ...corpSso, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    await u.click(await screen.findByRole('checkbox', { name: /Enabled/ }))
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(
+      screen.getByText(/stops sign-in through its identity provider/),
+    ).toBeInTheDocument()
+    expect(patched).toBeNull()
+
+    await u.click(screen.getByRole('button', { name: 'Disable and save' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toMatchObject({ name: 'corp-sso', enabled: false })
   })
 
   it('requires a new client secret after the client ID changes', async () => {

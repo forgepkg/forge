@@ -23,6 +23,7 @@ import {
 } from '~/components/catalyst/table'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import { disableRealmWarning } from '~/components/RealmForm'
 
 export const Route = createFileRoute('/_app/manage/realms')({
   component: RealmsList,
@@ -33,9 +34,10 @@ export const Route = createFileRoute('/_app/manage/realms')({
  * (lower = tried/listed first) with up/down reordering (the full new id order
  * is PUT to `/admin/realms/order`), an enable/disable toggle, edit links, and
  * delete-with-confirm. The built-in `local` realm cannot be deleted — only
- * disabled, and disabling it asks first: every password login stops. The
- * server refuses (409) a disable or delete that would leave no enabled realm
- * to sign in with interactively (local or OIDC); its reason is shown inline.
+ * disabled. Disabling a realm people sign in with (local, OIDC, credential
+ * forwarding) asks first and says whose logins stop. The server refuses (409)
+ * a disable or delete that would leave no enabled realm to sign in with
+ * interactively (local or OIDC); its reason is shown inline.
  */
 function RealmsList() {
   const realms = useRealms()
@@ -155,12 +157,13 @@ function RealmRow({
   onConfirmDelete: () => void
 }) {
   const update = useUpdateRealm(realm.id)
-  // Disabling `local` ends every password login, in the browser and over
-  // NuGet Basic, so it waits for an explicit confirmation.
+  // Disabling a realm people sign in with ends their logins (in the browser,
+  // over NuGet Basic, or both), so it waits for an explicit confirmation.
+  const disableWarning = disableRealmWarning(realm.kind, realm.name)
   const [confirmDisable, setConfirmDisable] = useState(false)
 
   function toggle(checked: boolean) {
-    if (!checked && realm.kind === 'local') {
+    if (!checked && disableWarning) {
       setConfirmDisable(true)
       return
     }
@@ -220,13 +223,9 @@ function RealmRow({
           />
           {realm.enabled ? 'enabled' : 'disabled'}
         </span>
-        {confirmDisable && (
+        {confirmDisable && disableWarning && (
           <div className="mt-1 max-w-xs space-y-1 text-sm/6 whitespace-normal">
-            <p className="text-zinc-700 dark:text-zinc-300">
-              Disabling {realm.name} stops every password login: browser
-              sign-in and NuGet clients sending a password over Basic. API
-              tokens keep working.
-            </p>
+            <p className="text-zinc-700 dark:text-zinc-300">{disableWarning}</p>
             <span className="flex items-center gap-2">
               <button
                 type="button"
