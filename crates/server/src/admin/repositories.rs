@@ -187,7 +187,9 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err(format!(
-            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from              A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit              (the name is part of the feed URL)"
+            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from \
+             A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit \
+             (the name is part of the feed URL)"
         ));
     }
     if name.eq_ignore_ascii_case("new") {
@@ -621,6 +623,15 @@ pub async fn update(
         Err(e) => return db_error(e),
     };
 
+    // #65: what the proxy learned from its previous upstream (not-found
+    // markers, listings, the package-delay clock) must not decide for the new
+    // one.
+    if existing.kind() == RepoKind::Proxy && updated.remote_url != existing.remote_url {
+        if let Err(e) = forge_db::proxy_dao::reset_for_new_upstream(&mut tx, updated.id).await {
+            return db_error(e);
+        }
+    }
+
     // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
     // so switching the flag off must also remove the grant migration 0007
     // synthesized from it, or the repository stays anonymously readable.
@@ -651,8 +662,11 @@ pub async fn update(
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
+    // Not only the anonymous principal reads through the anonymous role: a
+    // user or workload assigned that role holds its grants too, cached under
+    // its own key. Drop every cached set (as other grant mutations do).
     if anonymous_revoked {
-        forge_core::authz::invalidate_anonymous(&state.cache).await;
+        forge_core::authz::invalidate_all(&state.cache).await;
     }
     if credentials_dropped {
         tracing::warn!(
@@ -755,11 +769,11 @@ async fn delete_repository_locked(
     kind: RepoKind,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
-    // A proxy delete locks the repository row before its cached versions,
-    // while a concurrent cache fill or retention eviction holds a cached
-    // version and then needs the repository row: Postgres resolves that
-    // deadlock by aborting one side. The whole transaction rolled back, so
-    // retrying the delete is safe.
+    // A proxy delete locks its cached versions before the repository row,
+    // the order a cache fill or retention eviction takes them in (see
+    // `proxy_dao::lock_cached_versions`). A version a fill creates between
+    // the two locks can still deadlock; Postgres then aborts one side. The
+    // whole transaction rolled back, so retrying the delete is safe.
     let mut attempt = 0;
     loop {
         match delete_repository_once(state, repo_id, kind, grace).await {
@@ -781,6 +795,11 @@ async fn delete_repository_once(
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
     let mut tx = state.pool.begin().await?;
+    if kind != RepoKind::Hosted {
+        // Before the repository row: an in-flight first download holds its
+        // cached version and then needs the repository row.
+        forge_db::proxy_dao::lock_cached_versions(&mut *tx, repo_id).await?;
+    }
     if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
         return Ok(RepoDelete::NotFound);
     }
@@ -869,4 +888,17 @@ async fn hard_delete(
 /// Whether a `sqlx::Error` is a Postgres unique-violation (23505).
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_name_error_reads_as_one_sentence() {
+        let msg = validate_repo_name("bad name").unwrap_err();
+        assert!(!msg.contains("  "), "{msg}");
+        assert!(msg.contains("characters from A-Z"), "{msg}");
+        assert!(validate_repo_name("nuget-hosted.v3_x").is_ok());
+    }
 }

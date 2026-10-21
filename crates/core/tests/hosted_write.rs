@@ -250,6 +250,38 @@ async fn duplicate_without_redeploy_is_conflict() {
         .await
         .expect_err("duplicate must conflict");
     assert!(matches!(err, WriteError::Conflict { .. }));
+
+    // #81: a duplicate with other bytes is refused before its blob is stored.
+    // (Looked up by content hash: other tests add blobs concurrently.)
+    let id = unique_id();
+    let first = make_nupkg(&id, "1.0.0");
+    let duplicate = make_nupkg_variant(&id, "1.0.0");
+    let stored = |bytes: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM blob WHERE sha256 = encode(sha256($1), 'hex')",
+            )
+            .bind(bytes)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    w.store_upload(&repo, &first[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    assert_eq!(
+        stored(first).await,
+        1,
+        "a published package's blob is found"
+    );
+    let err = w
+        .store_upload(&repo, &duplicate[..], MAX_UPLOAD)
+        .await
+        .expect_err("duplicate must conflict");
+    assert!(matches!(err, WriteError::Conflict { .. }));
+    assert_eq!(stored(duplicate).await, 0, "nothing reached the blob store");
 }
 
 /// Simultaneous *first* pushes of one (id, version): the duplicate check cannot
@@ -423,6 +455,17 @@ async fn unlist_hides_from_search_but_keeps_downloadable_and_relist_restores() {
 
     // Relisting an unknown version → NotFound.
     let nf = w.relist(&repo, "Sample.Lib", "9.9.9").await.unwrap();
+    assert_eq!(nf, DeleteOutcome::NotFound);
+    // A version that does not parse was never published: NotFound (404),
+    // not an invalid-package error (400), for unlist, delete and relist.
+    for hard in [false, true] {
+        let nf = w
+            .delete_component(&repo, "Sample.Lib", "notaversion", hard)
+            .await
+            .unwrap();
+        assert_eq!(nf, DeleteOutcome::NotFound);
+    }
+    let nf = w.relist(&repo, "Sample.Lib", "notaversion").await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
 
     // Relist restores search visibility.
@@ -645,4 +688,80 @@ async fn hard_delete_removes_rows_and_decrefs_blobs() {
     // Deleting an unknown version → NotFound.
     let nf = w.delete_component(&repo, &id, "1.0.0", true).await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
+}
+
+/// The `.nupkg` download counter of `(repo_id, lower, version)`.
+async fn download_count(pool: &PgPool, repo_id: i64, lower: &str, version: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT a.download_count FROM asset a JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3 AND a.path = $4",
+    )
+    .bind(repo_id)
+    .bind(lower)
+    .bind(version)
+    .bind(NUPKG_ASSET_PATH)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// #74: a `HEAD` on a `.nupkg` is not a download, and a redeploy keeps the
+/// version's download count (retention and search read it).
+#[tokio::test]
+async fn head_is_not_a_download_and_a_redeploy_keeps_the_count() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let r = reader(&pool, store);
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    // The bump is spawned off the response path: wait for it.
+    let settled = |expected: i64| {
+        let pool = pool.clone();
+        let lower = lower.clone();
+        async move {
+            for _ in 0..100 {
+                if download_count(&pool, repo_id, &lower, "1.0.0").await == expected {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    };
+
+    for _ in 0..3 {
+        assert!(r
+            .resolve_nupkg_head(&repo, &lower, "1.0.0")
+            .await
+            .unwrap()
+            .is_some());
+    }
+    assert!(r
+        .resolve_nupkg(&repo, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(settled(1).await, "one GET, no HEADs");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(download_count(&pool, repo_id, &lower, "1.0.0").await, 1);
+
+    w.store_upload(&repo, &make_nupkg_variant(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("redeploy");
+    assert_eq!(
+        download_count(&pool, repo_id, &lower, "1.0.0").await,
+        1,
+        "the redeployed version keeps its count"
+    );
 }

@@ -42,7 +42,7 @@ use chrono::{DateTime, Duration, Utc};
 use forge_core::auth::principal::Principal;
 use forge_core::repo::SearchParams;
 use forge_db::model::{RepoKind, Repository};
-use forge_db::{asset_dao, component_dao, repository_dao};
+use forge_db::{component_dao, repository_dao};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
@@ -438,21 +438,24 @@ pub async fn package_detail(
         dependency_groups_by_version.insert(entry.version.clone(), mapped);
     }
 
-    // Per-version size / published_at from the local component row when present.
+    // Per-version size / published_at from the local component rows when
+    // present (one query for every version, not two per version).
+    let local: std::collections::HashMap<String, (DateTime<Utc>, Option<i64>)> =
+        component_dao::version_sizes(&state.pool, repo.id, &lower, NUPKG_ASSET_PATH)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "browse: version sizes lookup failed");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(version, created_at, size)| (version, (created_at, size)))
+            .collect();
     let mut detail_versions = Vec::with_capacity(versions.len() + delayed.len());
     for v in &versions {
-        let (size, published_at) =
-            match component_dao::find_component(&state.pool, repo.id, &lower, &v.version).await {
-                Ok(Some(comp)) => {
-                    let size = asset_dao::find_asset(&state.pool, comp.id, NUPKG_ASSET_PATH)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|a| a.size);
-                    (size, Some(comp.created_at))
-                }
-                _ => (None, None),
-            };
+        let (size, published_at) = match local.get(&v.version) {
+            Some((created_at, size)) => (*size, Some(*created_at)),
+            None => (None, None),
+        };
 
         // A version returned by `list_versions` on a proxy has already cleared
         // the delay window (the ops gate it), so it is `Available`. We still
@@ -512,7 +515,8 @@ async fn delayed_proxy_versions(
     .fetch_all(&state.pool)
     .await?;
 
-    let now = Utc::now();
+    // `first_seen_at` is on the database's clock.
+    let now = forge_db::db_now(&state.pool).await?;
     let delay = Duration::seconds(i64::from(repo.package_delay_seconds));
     let mut out = Vec::new();
     for row in rows {

@@ -280,7 +280,7 @@ impl AuthProvider for LocalPasswordProvider {
                 // A DB error is an infrastructure failure: fail closed, never
                 // grant — but let the chain decide the wire verdict.
                 tracing::warn!(error = %e, "local-password user lookup failed");
-                return AuthOutcome::Unavailable;
+                return AuthOutcome::Failed;
             }
         };
 

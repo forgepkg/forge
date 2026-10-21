@@ -326,7 +326,7 @@ async fn blob_upsert_pending_returns_true_then_false() {
     assert_eq!(blob.size, 123);
 }
 
-/// The aftermath of the pre-0.1.0 concurrent hard-delete race: a blob left
+/// The aftermath of the pre-release concurrent hard-delete race: a blob left
 /// `deleting` with `ref_count` 0 that an asset still names. Neither the outbox
 /// nor a re-push of the same bytes may delete its object (a re-push used to
 /// take the stale reservation over and delete the object every 60 s); the
@@ -1188,14 +1188,27 @@ async fn user_and_token_round_trip() {
     assert_eq!(by_hash.id, token.id);
     assert_eq!(by_hash.user_id, user.id);
 
-    token_dao::touch_last_used(pool, token.id)
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
         .await
-        .expect("touch");
+        .expect("touch"));
     let touched = token_dao::find_token_by_hash(pool, &hash)
         .await
         .expect("by hash")
         .expect("present");
     assert!(touched.last_used_at.is_some());
+    // Throttled: a second use within the interval writes nothing...
+    assert!(!token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
+    // ...and one after it does.
+    sqlx::query("UPDATE token SET last_used_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(token.id)
+        .execute(pool)
+        .await
+        .expect("backdate");
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
 }
 
 #[tokio::test]

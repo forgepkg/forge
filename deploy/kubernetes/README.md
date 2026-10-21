@@ -29,7 +29,7 @@ The base pins the image to the release it belongs to:
 ```yaml
 images:
   - name: ghcr.io/schmitch/forge
-    newTag: 0.1.0
+    newTag: 1.0.0
 ```
 
 `cargo xtask release <version>` rewrites that `newTag` in the same commit as
@@ -40,9 +40,9 @@ of one `ref`:
 
 ```yaml
 resources:
-  - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v0.1.0
+  - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v1.0.0
 components:
-  - https://github.com/schmitch/forge//deploy/kubernetes/components/redis?ref=v0.1.0
+  - https://github.com/schmitch/forge//deploy/kubernetes/components/redis?ref=v1.0.0
 ```
 
 To follow `:latest` instead, add `components/image-latest`. Nothing restarts

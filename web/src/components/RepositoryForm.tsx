@@ -258,7 +258,12 @@ export function RepositoryForm({
             checked={values.online}
             onChange={(c) => set('online', c)}
           />
-          <Label>Online (serve requests)</Label>
+          <Label>Online</Label>
+          <Description>
+            {isProxy
+              ? 'Offline, the proxy serves only packages it has already cached and never contacts the upstream.'
+              : 'Offline, the repository answers every feed request with 503 (a maintenance window); in a group it counts as a failing member.'}
+          </Description>
         </CheckboxField>
         <CheckboxField>
           <Checkbox
@@ -312,7 +317,10 @@ export function RepositoryForm({
                 invalid={!!errors.package_delay_seconds}
               />
               <Description>
-                Newly discovered upstream versions stay hidden for this long.
+                New upstream releases stay hidden for this long after the
+                upstream published them (or, when the upstream does not say
+                when, after this proxy first saw them). Older versions are
+                served at once.
               </Description>
               {errors.package_delay_seconds && (
                 <ErrorMessage role="alert">

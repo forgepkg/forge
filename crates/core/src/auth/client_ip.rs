@@ -12,14 +12,19 @@
 //! The client IP is the **socket peer** unless the peer is itself a trusted
 //! proxy. When the peer is trusted, we walk `X-Forwarded-For` **right-to-left**,
 //! dropping trusted hops, and take the first untrusted address. A malformed XFF
-//! (any unparsable entry we reach) collapses to the peer. We never trust XFF
-//! from an untrusted peer.
+//! (an empty or unparsable entry we reach) leaves the client **unknown**: its
+//! key is the peer's address, but it never matches the anonymous allowlist,
+//! because the peer is the proxy and its address says nothing about the
+//! client. We never trust XFF from an untrusted peer.
 //!
 //! A request may carry several `X-Forwarded-For` header lines (a proxy may add
 //! its hop as a new line rather than extending the one the client sent);
 //! [`forwarded_for`] joins them in order so the walk sees every hop. Reading
 //! only the first line would hand the client-written line to the walk and let
-//! it pick its own address.
+//! it pick its own address. Each hop is decoded on its own: a proxy such as
+//! nginx (`$proxy_add_x_forwarded_for`) appends the real client to the line
+//! the client sent, so a byte the client wrote must spoil only its own hop,
+//! never the one appended to its right.
 //!
 //! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, as a dual-stack listener
 //! reports IPv4 peers) are canonicalized to plain IPv4 before every CIDR check
@@ -31,21 +36,43 @@ use std::net::IpAddr;
 use http::HeaderMap;
 use ipnet::IpNet;
 
-/// Every `X-Forwarded-For` header line of `headers`, in order, joined with
-/// `,` — the input [`resolve_client_ip`] expects. `None` when there is none.
+/// Every hop of every `X-Forwarded-For` header line of `headers`, in order,
+/// joined with `,` — the input [`resolve_client_ip`] expects. `None` when
+/// there is none.
 ///
-/// A line that is not visible ASCII is kept as an unparsable hop, so the walk
-/// treats the header as malformed if it gets that far (and ignores it if an
-/// untrusted hop to its right already decided).
+/// The raw bytes are split at `,` before they are decoded: a hop that is not
+/// visible ASCII is kept as an unparsable hop, so the walk treats the header
+/// as malformed if it gets that far (and ignores it if an untrusted hop to its
+/// right already decided). Decoding a whole line instead would let one byte
+/// the client wrote hide the address a proxy appended to the same line.
 pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
     let mut lines = headers.get_all("x-forwarded-for").iter().peekable();
     lines.peek()?;
     Some(
         lines
-            .map(|v| v.to_str().unwrap_or("_"))
+            .flat_map(|v| v.as_bytes().split(|b| *b == b','))
+            .map(|hop| {
+                std::str::from_utf8(hop)
+                    .ok()
+                    .filter(|s| s.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)))
+                    .unwrap_or("_")
+            })
             .collect::<Vec<_>>()
             .join(","),
     )
+}
+
+/// The effective client of a request ([`resolve_client`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedClient {
+    /// The address to key the client by (lockout, rate limits, audit). For an
+    /// unknown client this is the socket peer.
+    pub ip: IpAddr,
+    /// `false` when a trusted peer forwarded a malformed `X-Forwarded-For`
+    /// (an empty or unparsable hop reached by the walk): the client's address
+    /// is unknown, and `ip` is the proxy's. Such a client must not be granted
+    /// anything by address ([`AnonPolicy::allows_client`]).
+    pub known: bool,
 }
 
 /// Resolve the effective client IP.
@@ -61,47 +88,68 @@ pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 /// * If `peer` **is** trusted, split XFF on commas and walk **right-to-left**,
 ///   skipping addresses that are themselves trusted; the first untrusted,
 ///   parseable address wins.
-/// * If we exhaust XFF (all hops trusted, or it is empty/absent) → `peer`.
-/// * If we encounter a non-empty but **unparseable** hop before finding an
-///   untrusted address → treat as malformed → `peer`.
+/// * If we exhaust XFF (all hops trusted, or it is absent) → `peer`.
+/// * If we encounter an empty or **unparseable** hop before finding an
+///   untrusted address → treat as malformed → `peer`, but see
+///   [`resolve_client`]: such a client is unknown and must never be granted
+///   anything by address.
+///
+/// A hop may carry a port (`198.51.100.5:4711`, `[2001:db8::1]:4711`), as
+/// some proxies (Azure Application Gateway) write it.
 ///
 /// The peer and every hop are canonicalized (IPv4-mapped IPv6 → IPv4) before
 /// the CIDR checks, and the returned address is canonical too.
 pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
+    resolve_client(peer, xff, trusted).ip
+}
+
+/// [`resolve_client_ip`], also reporting whether the client's address could
+/// be determined ([`ResolvedClient::known`]).
+pub fn resolve_client(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> ResolvedClient {
     let peer = peer.to_canonical();
+    let known = |ip| ResolvedClient { ip, known: true };
     if !ip_in_any(peer, trusted) {
-        return peer;
+        return known(peer);
     }
 
     let Some(xff) = xff else {
-        return peer;
+        return known(peer);
     };
 
     // Walk right-to-left. The right-most entry is the hop closest to us.
     for raw in xff.split(',').rev() {
-        let entry = raw.trim();
-        if entry.is_empty() {
-            // An empty segment is malformed; stop and fall back to peer.
-            return peer;
-        }
-        match entry.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
-            Ok(ip) => {
+        match parse_hop(raw.trim()) {
+            Some(ip) => {
                 if ip_in_any(ip, trusted) {
                     // Another trusted hop; keep walking left.
                     continue;
                 }
                 // First untrusted, parseable address: this is the client.
-                return ip;
+                return known(ip);
             }
-            Err(_) => {
-                // Malformed hop → treat the whole XFF as untrustworthy.
-                return peer;
+            None => {
+                // Empty or malformed hop → the whole XFF is untrustworthy, and
+                // the peer (a proxy) is not the client either.
+                return ResolvedClient {
+                    ip: peer,
+                    known: false,
+                };
             }
         }
     }
 
-    // All hops were trusted (or XFF empty) → the peer is the client.
-    peer
+    // All hops were trusted → the peer is the client.
+    known(peer)
+}
+
+/// One `X-Forwarded-For` hop as a canonical address: a bare address, or one
+/// with a port (`a.b.c.d:port`, `[v6]:port`). `None` when it is neither.
+fn parse_hop(entry: &str) -> Option<IpAddr> {
+    entry
+        .parse::<IpAddr>()
+        .or_else(|_| entry.parse::<std::net::SocketAddr>().map(|sa| sa.ip()))
+        .ok()
+        .map(|ip| ip.to_canonical())
 }
 
 fn ip_in_any(ip: IpAddr, nets: &[IpNet]) -> bool {
@@ -128,6 +176,22 @@ impl AnonPolicy {
             AnonPolicy::All => true,
             AnonPolicy::Allowlist(nets) => ip_in_any(ip, nets),
         }
+    }
+
+    /// The policy for a request from `client`: an unknown client
+    /// ([`ResolvedClient::known`] `false`) gets no allowlist grant, whatever
+    /// the proxy's own address is.
+    pub fn for_client(&self, client: ResolvedClient) -> &AnonPolicy {
+        match self {
+            AnonPolicy::Allowlist(_) if !client.known => &AnonPolicy::Off,
+            policy => policy,
+        }
+    }
+
+    /// Whether an unauthenticated request from `client` may be served
+    /// anonymously ([`Self::for_client`]).
+    pub fn allows_client(&self, client: ResolvedClient) -> bool {
+        self.for_client(client).allows(client.ip)
     }
 
     /// Build an [`AnonPolicy::Allowlist`] from configuration tokens.
@@ -279,6 +343,98 @@ mod tests {
         let trusted = nets(&["10.0.0.0/8"]);
         let got = resolve_client_ip(ip("10.0.0.1"), Some("not-an-ip"), &trusted);
         assert_eq!(got, ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn malformed_or_empty_hop_leaves_the_client_unknown() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        for xff in ["not-an-ip", "198.51.100.5, ", ",10.0.0.9", ""] {
+            let got = resolve_client(ip("10.0.0.1"), Some(xff), &trusted);
+            assert_eq!(
+                got,
+                ResolvedClient {
+                    ip: ip("10.0.0.1"),
+                    known: false
+                },
+                "{xff:?}"
+            );
+        }
+        // Absent, or every hop trusted: the trusted peer itself is the client.
+        assert!(resolve_client(ip("10.0.0.1"), None, &trusted).known);
+        assert!(resolve_client(ip("10.0.0.1"), Some("10.0.0.2"), &trusted).known);
+        // An untrusted peer is always known.
+        assert!(resolve_client(ip("203.0.113.9"), Some("junk"), &trusted).known);
+    }
+
+    #[test]
+    fn unknown_client_is_never_allowlisted() {
+        let allow = AnonPolicy::allowlist_from_tokens(["private"]).unwrap();
+        let unknown = ResolvedClient {
+            ip: ip("10.0.0.1"),
+            known: false,
+        };
+        assert!(allow.allows(unknown.ip));
+        assert!(!allow.allows_client(unknown));
+        assert_eq!(allow.for_client(unknown), &AnonPolicy::Off);
+        assert!(allow.allows_client(ResolvedClient {
+            known: true,
+            ..unknown
+        }));
+        // `off` and `all` do not depend on the address at all.
+        assert!(AnonPolicy::All.allows_client(unknown));
+        assert!(!AnonPolicy::Off.allows_client(unknown));
+    }
+
+    #[test]
+    fn hops_with_a_port_parse() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), Some("198.51.100.5:4711"), &trusted),
+            ip("198.51.100.5")
+        );
+        assert_eq!(
+            resolve_client_ip(
+                ip("10.0.0.1"),
+                Some("[2001:db8::1]:4711, 10.0.0.9:80"),
+                &trusted
+            ),
+            ip("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_hop_does_not_hide_the_hop_a_proxy_appended_to_its_line() {
+        // nginx `$proxy_add_x_forwarded_for`: "<client's value>, <real client>"
+        // on ONE line. A byte the client wrote spoils only its own hop.
+        let trusted = nets(&["10.0.0.0/8"]);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            http::HeaderValue::from_bytes(b"\xff, 198.51.100.5").unwrap(),
+        );
+        let xff = forwarded_for(&headers);
+        assert_eq!(xff.as_deref(), Some("_, 198.51.100.5"));
+        let got = resolve_client(ip("10.0.0.1"), xff.as_deref(), &trusted);
+        assert_eq!(
+            got,
+            ResolvedClient {
+                ip: ip("198.51.100.5"),
+                known: true
+            }
+        );
+        let allow = AnonPolicy::allowlist_from_tokens(["private"]).unwrap();
+        assert!(!allow.allows_client(got));
+
+        // The proxy's own hop unreadable: the client is unknown, never the
+        // (allowlisted) proxy.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-for",
+            http::HeaderValue::from_bytes(b"198.51.100.5, \xfe").unwrap(),
+        );
+        let got = resolve_client(ip("10.0.0.1"), forwarded_for(&headers).as_deref(), &trusted);
+        assert!(!got.known);
+        assert!(!allow.allows_client(got));
     }
 
     #[test]

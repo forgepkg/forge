@@ -9,8 +9,9 @@
 //! Sub-modules:
 //! * [`repositories`] — repository CRUD (incl. proxy fields; `upstream_password`
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
-//!   nested-group members and duplicate priorities are rejected) and package
-//!   hard-delete (A12).
+//!   duplicate member priorities are rejected, nested groups only when they
+//!   would form a cycle or exceed the depth limit) and package hard-delete
+//!   (A12).
 //! * [`users`] — user CRUD with argon2id password hashing.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.

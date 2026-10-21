@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version p\n        SET first_seen_at = u.published\n        FROM unnest($3::text[], $4::timestamptz[]) AS u(version, published)\n        WHERE p.repository_id = $1 AND p.name = $2 AND p.version = u.version\n          AND p.confirmed AND u.published < p.first_seen_at\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "TextArray",
+        "TimestamptzArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b21a02610a7b650f5b06919be11a68d595d1dc244f0a40b869a0327c5f346665"
+}

@@ -211,6 +211,38 @@ fn page_json(base: &str, lower_id: &str, entries: &[RegistrationEntry], inline: 
     page
 }
 
+/// A page of the registration index that is not inlined: its bounds and
+/// URL over `versions` (ascending), no leaves.
+fn page_stub_json(base: &str, lower_id: &str, versions: &[String]) -> Value {
+    let lower = versions.first().map(String::as_str).unwrap_or("");
+    let upper = versions.last().map(String::as_str).unwrap_or("");
+    json!({
+        "@id": page_url(base, lower_id, lower, upper),
+        "@type": "catalog:CatalogPage",
+        "count": versions.len(),
+        "lower": lower,
+        "upper": upper,
+        "parent": format!("{base}/registration/{lower_id}/index.json"),
+    })
+}
+
+/// The registration index of a package with more than
+/// [`MAX_INLINED_LEAVES`] versions (ascending): pages of [`PAGE_SIZE`] that
+/// name only their bounds, so no version's metadata is loaded for it.
+pub fn paged_registration_json(ctx: &RouteContext, lower_id: &str, versions: &[String]) -> Value {
+    let base = ctx.base();
+    let pages: Vec<Value> = versions
+        .chunks(PAGE_SIZE)
+        .map(|chunk| page_stub_json(&base, lower_id, chunk))
+        .collect();
+    json!({
+        "@id": format!("{base}/registration/{lower_id}/index.json"),
+        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
+        "count": pages.len(),
+        "items": pages,
+    })
+}
+
 /// Build the registration index JSON for a package's versions (ascending):
 /// pages of [`PAGE_SIZE`], inlined up to [`MAX_INLINED_LEAVES`] versions.
 pub fn registration_json(
@@ -236,8 +268,8 @@ pub fn registration_json(
 /// [`PAGE_SIZE`]; versions pushed into its range since then can add more.
 pub const MAX_PAGE_LEAVES: usize = 4 * PAGE_SIZE;
 
-/// The registration page `lower..=upper` over `entries` (ascending), with
-/// its leaves: every version in that range by precedence.
+/// The versions of `versions` (ascending) in the registration page
+/// `lower..=upper`: every version in that range by precedence.
 ///
 /// The range decides, not the current chunking. A client fetches a page by
 /// the URL of an index it may have cached, and a push, a delete, a proxy
@@ -245,31 +277,38 @@ pub const MAX_PAGE_LEAVES: usize = 4 * PAGE_SIZE;
 /// index; NuGet clients fail the whole operation on a page 404. `None` (404)
 /// for an unknown id, bounds that are not versions, or a range over more
 /// than [`MAX_PAGE_LEAVES`] versions.
-pub fn registration_page_json(
-    ctx: &RouteContext,
-    lower_id: &str,
-    entries: &[RegistrationEntry],
+pub fn registration_page_versions<'v>(
+    versions: &'v [String],
     lower: &str,
     upper: &str,
-) -> Option<Value> {
-    if entries.is_empty() {
+) -> Option<&'v [String]> {
+    if versions.is_empty() {
         return None;
     }
     version::normalize(lower).ok()?;
     version::normalize(upper).ok()?;
-    let start = entries.partition_point(|e| version::compare(&e.version, lower).is_lt());
-    let end = entries.partition_point(|e| version::compare(&e.version, upper).is_le());
-    let in_range = entries.get(start..end.max(start))?;
-    if in_range.len() > MAX_PAGE_LEAVES {
-        return None;
-    }
+    let start = versions.partition_point(|v| version::compare(v, lower).is_lt());
+    let end = versions.partition_point(|v| version::compare(v, upper).is_le());
+    let in_range = versions.get(start..end.max(start))?;
+    (in_range.len() <= MAX_PAGE_LEAVES).then_some(in_range)
+}
+
+/// The registration page `lower..=upper` with its leaves, over the entries
+/// of the versions in that range ([`registration_page_versions`]).
+pub fn registration_page_json(
+    ctx: &RouteContext,
+    lower_id: &str,
+    in_range: &[RegistrationEntry],
+    lower: &str,
+    upper: &str,
+) -> Value {
     let base = ctx.base();
     let mut page = page_json(&base, lower_id, in_range, true);
     // The page answers for the bounds it was asked for.
     page["@id"] = json!(page_url(&base, lower_id, lower, upper));
     page["lower"] = json!(lower);
     page["upper"] = json!(upper);
-    Some(page)
+    page
 }
 
 /// Handler: `GET`/`HEAD` `/registration/{id}/index.json`.
@@ -277,6 +316,16 @@ pub async fn index(State(ctx): State<RouteContext>, Path(id): Path<String>) -> R
     let Some(lower) = package_id(&ctx, &id) else {
         return (StatusCode::NOT_FOUND, "registration not found").into_response();
     };
+    // A package with too many versions to inline gets an index of page
+    // bounds: its versions' metadata is not loaded at all.
+    let versions = match ctx.ops.registration_versions(&ctx.repo, &lower).await {
+        Ok(v) => v,
+        Err(e) => return repo_error_response(e),
+    };
+    if versions.len() > MAX_INLINED_LEAVES {
+        return render_blocking(move || Some(paged_registration_json(&ctx, &lower, &versions)))
+            .await;
+    }
     let entries = match ctx.ops.registration(&ctx.repo, &lower).await {
         Ok(e) => e,
         Err(e) => return repo_error_response(e),
@@ -302,12 +351,32 @@ pub async fn page(
     let Some(upper_version) = upper_file.strip_suffix(".json").map(str::to_string) else {
         return not_found();
     };
-    let entries = match ctx.ops.registration(&ctx.repo, &lower).await {
+    let versions = match ctx.ops.registration_versions(&ctx.repo, &lower).await {
+        Ok(v) => v,
+        Err(e) => return repo_error_response(e),
+    };
+    let Some(in_range) = registration_page_versions(&versions, &lower_version, &upper_version)
+    else {
+        return not_found();
+    };
+    // Only the page's versions are loaded.
+    let mut entries = match ctx
+        .ops
+        .registration_entries(&ctx.repo, &lower, in_range)
+        .await
+    {
         Ok(e) => e,
         Err(e) => return repo_error_response(e),
     };
+    entries.sort_by(|a, b| version::compare(&a.version, &b.version));
     render_blocking(move || {
-        registration_page_json(&ctx, &lower, &entries, &lower_version, &upper_version)
+        Some(registration_page_json(
+            &ctx,
+            &lower,
+            &entries,
+            &lower_version,
+            &upper_version,
+        ))
     })
     .await
 }

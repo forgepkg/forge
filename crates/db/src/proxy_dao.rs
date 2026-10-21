@@ -81,10 +81,12 @@ pub async fn upsert_cached_versions(
             END,
             confirmed = true,
             upstream_missing = false,
+            missing_since = NULL,
             metadata_refreshed_at = now()
         WHERE proxy_cached_version.not_found
            OR NOT proxy_cached_version.confirmed
            OR proxy_cached_version.upstream_missing
+           OR proxy_cached_version.missing_since IS NOT NULL
         "#,
         repository_id,
         name,
@@ -101,23 +103,46 @@ pub async fn upsert_cached_versions(
 /// names again is un-flagged, and the package-level negative-cache marker
 /// (`version = '*'`) is dropped, since the package evidently exists. Returns
 /// how many rows changed.
+///
+/// A version is flagged only once it is missing from a listing at least
+/// `confirm_after_secs` (the metadata TTL) after the first listing that left
+/// it out (`missing_since`): an upstream may serve a partial listing during
+/// an incident, such as a Forge group with one member down, and one such
+/// listing must not hide the versions for a whole TTL.
 pub async fn reconcile_listing(
     pool: &PgPool,
     repository_id: i64,
     name: &str,
     versions: &[String],
+    confirm_after_secs: i64,
 ) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
     let flagged = sqlx::query!(
         r#"
-        UPDATE proxy_cached_version
-        SET upstream_missing = NOT (version = ANY($3::text[]))
-        WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
-          AND upstream_missing IS DISTINCT FROM NOT (version = ANY($3::text[]))
+        WITH seen AS (
+            SELECT id,
+                   CASE WHEN version = ANY($3::text[]) THEN NULL
+                        ELSE coalesce(missing_since, now()) END AS missing_since
+            FROM proxy_cached_version
+            WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed
+        ), next AS (
+            SELECT id, missing_since,
+                   coalesce(missing_since <= now() - make_interval(secs => $4), false)
+                       AS upstream_missing
+            FROM seen
+        )
+        UPDATE proxy_cached_version p
+        SET missing_since = next.missing_since,
+            upstream_missing = next.upstream_missing
+        FROM next
+        WHERE p.id = next.id
+          AND (p.missing_since IS DISTINCT FROM next.missing_since
+               OR p.upstream_missing IS DISTINCT FROM next.upstream_missing)
         "#,
         repository_id,
         name,
         versions,
+        confirm_after_secs as f64,
     )
     .execute(&mut *tx)
     .await?
@@ -214,6 +239,160 @@ pub async fn prune_unconfirmed(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Record the upstream casing of package id `name` (`original_id`, as its
+/// registration names it) on its version rows. Writes only rows that hold
+/// another value. Returns how many rows changed.
+pub async fn record_original_id(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    original_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET original_id = $3
+        WHERE repository_id = $1 AND name = $2 AND version <> '*'
+          AND original_id IS DISTINCT FROM $3
+        "#,
+        repository_id,
+        name,
+        original_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Move the package-delay clock of confirmed `versions` of `name` back to
+/// when the upstream published them (`published`, pairwise):
+/// `first_seen_at` becomes the earlier of the two. Returns how many rows
+/// changed.
+pub async fn backdate_first_seen(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+    published: &[chrono::DateTime<chrono::Utc>],
+) -> sqlx::Result<u64> {
+    if versions.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version p
+        SET first_seen_at = u.published
+        FROM unnest($3::text[], $4::timestamptz[]) AS u(version, published)
+        WHERE p.repository_id = $1 AND p.name = $2 AND p.version = u.version
+          AND p.confirmed AND u.published < p.first_seen_at
+        "#,
+        repository_id,
+        name,
+        versions,
+        published,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// The id casing proxy search shows for each of `names` (lowercased ids):
+/// a downloaded version's manifest id (`component.original_id`, the newest
+/// one), else the casing recorded from the upstream registration. Names
+/// without either are left out.
+pub async fn original_ids(
+    pool: &PgPool,
+    repository_id: i64,
+    names: &[String],
+) -> sqlx::Result<Vec<(String, String)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT n.name AS "name!",
+               coalesce(
+                   (SELECT c.original_id FROM component c
+                    WHERE c.repository_id = $1 AND c.name = n.name
+                    ORDER BY c.created_at DESC, c.id DESC LIMIT 1),
+                   (SELECT p.original_id FROM proxy_cached_version p
+                    WHERE p.repository_id = $1 AND p.name = n.name
+                      AND p.original_id IS NOT NULL
+                    LIMIT 1)
+               ) AS "original_id?"
+        FROM unnest($2::text[]) AS n(name)
+        "#,
+        repository_id,
+        names,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| Some((r.name, r.original_id?)))
+        .collect())
+}
+
+/// Lock every cached-version row of a repository (`FOR UPDATE`, in id order),
+/// waiting for an in-flight first download or cache eviction that holds one.
+/// A repository delete takes these **before** the repository row: those
+/// writers hold a cached version and then need the repository row (the
+/// foreign-key lock of the component they insert), so taking the repository
+/// row first deadlocks with them.
+pub async fn lock_cached_versions<'e, E>(executor: E, repository_id: i64) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query!(
+        r#"
+        SELECT id FROM proxy_cached_version
+        WHERE repository_id = $1
+        ORDER BY id
+        FOR UPDATE
+        "#,
+        repository_id,
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(())
+}
+
+/// Forget what a proxy learned from its previous upstream, inside the
+/// transaction that changes its `remote_url`. Versions that were never
+/// downloaded (listing rows and the not-found markers, including the
+/// package-level `*` markers) are deleted, so the new upstream's listings start
+/// fresh rows and its versions wait out the package delay from their own first
+/// sighting. Downloaded versions stay cached, with their not-found and
+/// missing-upstream flags cleared and their metadata due for a refresh from
+/// the new upstream. Returns the number of deleted rows.
+pub async fn reset_for_new_upstream(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+) -> sqlx::Result<u64> {
+    let deleted = sqlx::query!(
+        r#"
+        DELETE FROM proxy_cached_version
+        WHERE repository_id = $1 AND NOT downloaded
+        "#,
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET not_found = false,
+            not_found_at = NULL,
+            upstream_missing = false,
+            missing_since = NULL,
+            metadata_refreshed_at = NULL
+        WHERE repository_id = $1
+        "#,
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(deleted)
 }
 
 /// Finalize a successful download of the row `id` inside the caller's

@@ -313,9 +313,12 @@ async fn apply_message(
             tag_capable_origins.insert(origin);
             // No namespace fence here (see module docs): barriers are
             // monotonic and every read/fill path re-validates against them.
-            // A forged, implausibly large generation only advances the
-            // barrier by one (see `TagVersions::observe`).
-            tag_versions.observe_one(tag, generation);
+            // Every tag message is an invalidation, also one whose
+            // generation is not above ours (the peer's restarted after Redis
+            // lost the key); a forged, implausibly large generation only
+            // advances the barrier by one (see
+            // `TagVersions::observe_invalidation`).
+            tag_versions.observe_invalidation(tag, generation);
         }
         "k" | "n" => {
             let (ns, tag) = if kind == "k" {

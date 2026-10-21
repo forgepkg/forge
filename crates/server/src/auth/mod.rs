@@ -61,6 +61,7 @@ mod realms;
 mod redirect;
 mod wif;
 
+pub(crate) use realms::normalize_endpoint_hosts;
 pub use realms::{
     forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config,
     OidcRealmRuntime, RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC,
@@ -105,7 +106,8 @@ impl OidcRuntime {
     ) -> anyhow::Result<Self> {
         let http = outbound_metadata_client(oidc.allow_private_issuer)
             .map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
-        let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache);
+        let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache)
+            .with_endpoint_hosts(oidc.endpoint_hosts.clone());
 
         let client = ClientParams {
             client_id: oidc.client_id.clone(),
@@ -826,6 +828,15 @@ async fn password_login(
             attempt.released();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
+        // Forge's own database failed: not a verdict on the credentials.
+        ChainOutcome::Failed => {
+            attempt.released();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable",
+            )
+                .into_response();
+        }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
             attempt.failed();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
@@ -841,7 +852,11 @@ async fn password_login(
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             attempt.released();
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable",
+            )
+                .into_response();
         }
     };
     attempt.succeeded();

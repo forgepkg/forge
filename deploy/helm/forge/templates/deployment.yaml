@@ -32,9 +32,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        # Roll the pods when the configuration or the chart's Secret changes.
+        # Roll the pods when the configuration or the chart's Secret
+        # (secretEnv, forge.secretEnvName) changes.
         checksum/config: {{ include "forge.config" . | sha256sum }}
-        checksum/secret: {{ toJson .Values.secretEnv | sha256sum }}
+        checksum/secret-env: {{ toJson .Values.secretEnv | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -115,11 +116,15 @@ spec:
           envFrom:
             {{- if .Values.secretEnv }}
             - secretRef:
-                name: {{ include "forge.fullname" . }}-env
+                name: {{ include "forge.secretEnvName" . }}
             {{- end }}
             {{- with .Values.existingSecret }}
+            {{- $existing := tpl . $ }}
+            {{- if eq $existing (include "forge.secretEnvName" $) }}
+            {{- fail (printf "existingSecret %q is the name of the Secret the chart creates from secretEnv; give your Secret another name" $existing) }}
+            {{- end }}
             - secretRef:
-                name: {{ tpl . $ }}
+                name: {{ $existing }}
             {{- end }}
             {{- with .Values.envFrom }}
             {{- toYaml . | nindent 12 }}

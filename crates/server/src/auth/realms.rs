@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use forge_cache::Cache;
 use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, CredKeyPepper, ForwardLimits, LocalPasswordProvider,
-    PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
+    AuthProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper, ForwardLimits,
+    LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_crypto::service::EnvelopeService;
@@ -70,7 +70,12 @@ pub const KIND_WORKLOAD_IDENTITY: &str = "workload_identity";
 /// `key_pepper` is a **secret**: write-only at the API layer ([`redact_config`]
 /// strips it / [`merge_secrets`] keeps the stored value when omitted) and
 /// redacted from `Debug`.
+///
+/// Unknown keys are refused, so a misspelled gate (`identity_pth`,
+/// `required_group`) never silently takes its permissive default. Stored rows
+/// are parsed with this type too: a field removed later must stay accepted.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredForwardRealmConfig {
     /// Upstream endpoint hit with the user's Basic credentials (http/https).
     pub url: String,
@@ -143,8 +148,10 @@ impl std::fmt::Debug for CredForwardRealmConfig {
 /// (`auth.session_*`).
 ///
 /// `client_secret` is a **secret** (write-only / redacted), like `key_pepper`
-/// above.
+/// above. Unknown keys are refused, as there (a misspelled `required_claims`
+/// would let every account of a multi-tenant issuer sign in).
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcRealmConfig {
     /// OIDC issuer URL (`https`, unless `allow_http_issuer` for dev IdPs).
     pub issuer: String,
@@ -199,6 +206,11 @@ pub struct OidcRealmConfig {
     /// the realm name.
     #[serde(default)]
     pub button_label: Option<String>,
+    /// Hosts besides the issuer's that the IdP's token, JWKS and
+    /// authorization endpoints may use (Google: `oauth2.googleapis.com`,
+    /// `www.googleapis.com`). Empty ⇒ the issuer's host only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for OidcRealmConfig {
@@ -268,9 +280,11 @@ pub fn secret_keys(kind: &str) -> &'static [&'static str] {
 
 /// Parse + validate a realm `config` document for `kind`. Returns a normalized
 /// document (kind-specific defaults filled) or a human-readable error. `local`
-/// accepts only an empty/no-op config; workload-identity documents are
-/// validated by the stricter WIF parser, which rejects unknown policy fields.
+/// accepts only an empty/no-op config; every other kind refuses unknown keys
+/// (the `<key>_set` markers of [`redact_config`], which a client may echo
+/// back, are dropped first).
 pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, String> {
+    let config = &without_secret_markers(kind, config);
     match kind {
         KIND_LOCAL => Ok(JsonValue::Object(Default::default())),
         KIND_CRED_FORWARD => {
@@ -296,8 +310,9 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
         KIND_OIDC => {
-            let cfg: OidcRealmConfig = serde_json::from_value(config.clone())
+            let mut cfg: OidcRealmConfig = serde_json::from_value(config.clone())
                 .map_err(|e| format!("invalid config: {e}"))?;
+            cfg.endpoint_hosts = normalize_endpoint_hosts(&cfg.endpoint_hosts)?;
             let issuer = url::Url::parse(cfg.issuer.trim())
                 .map_err(|e| format!("invalid issuer {:?}: {e}", cfg.issuer))?;
             match issuer.scheme() {
@@ -320,6 +335,40 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
         KIND_WORKLOAD_IDENTITY => super::wif::validate_workload_identity_config(config),
         other => Err(format!("unknown realm kind {other:?}")),
     }
+}
+
+/// `endpoint_hosts` lowercased and checked: each one a bare host name (no
+/// scheme, port, path or wildcard).
+pub(crate) fn normalize_endpoint_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
+    hosts
+        .iter()
+        .map(|raw| {
+            let host = raw.trim().to_ascii_lowercase();
+            let is_name = !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            let parses = url::Url::parse(&format!("https://{host}/"))
+                .is_ok_and(|url| url.host_str() == Some(host.as_str()));
+            if is_name && parses {
+                Ok(host)
+            } else {
+                Err(format!("endpoint_hosts: {raw:?} is not a host name"))
+            }
+        })
+        .collect()
+}
+
+/// `config` without the `<key>_set` markers [`redact_config`] puts in place of
+/// the secrets.
+fn without_secret_markers(kind: &str, config: &JsonValue) -> JsonValue {
+    let mut doc = config.clone();
+    if let JsonValue::Object(map) = &mut doc {
+        for key in secret_keys(kind) {
+            map.remove(&format!("{key}_set"));
+        }
+    }
+    doc
 }
 
 /// Strip secrets from a realm `config` for an API response: each secret key is
@@ -492,6 +541,14 @@ impl RealmAuth {
         }
     }
 
+    /// Use `limiter` for the local provider's argon2 verifications instead of
+    /// one sized by `auth.password_verify_concurrency` (a test holds its
+    /// permits to observe whether a verification runs).
+    pub fn with_password_limiter(mut self, limiter: Arc<PasswordHashLimiter>) -> Self {
+        self.password_limiter = limiter;
+        self
+    }
+
     /// Attach the secret-encryption service so encrypted realm secrets can be
     /// read (`None` ⇒ only plaintext realm configs are usable).
     pub fn with_envelope(mut self, envelope: Option<Arc<EnvelopeService>>) -> Self {
@@ -533,14 +590,14 @@ impl RealmAuth {
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
 
-        // Does an enabled credential-forwarding realm come after the local one?
-        // Then names the local store does not own go upstream next, and the
-        // local provider need not equalize their timing with a dummy hash.
-        let enabled: Vec<&_> = realms.iter().filter(|r| r.enabled).collect();
-        let forwarding_follows_local = enabled
-            .iter()
-            .position(|r| r.kind == KIND_LOCAL)
-            .is_some_and(|i| enabled[i + 1..].iter().any(|r| r.kind == KIND_CRED_FORWARD));
+        // Where the local provider goes, and whether a credential-forwarding
+        // provider was built after it. Then names the local store does not own
+        // go upstream next, and the local provider need not equalize their
+        // timing with a dummy hash. Decided from the providers actually built:
+        // a forwarding realm that is skipped (fail closed) makes no upstream
+        // call, so the local provider must pay the dummy hash itself.
+        let mut local_at: Option<usize> = None;
+        let mut forwarding_follows_local = false;
 
         for realm in realms.iter().filter(|r| r.enabled) {
             // The logical config (encrypted secrets merged in). A realm whose
@@ -553,18 +610,12 @@ impl RealmAuth {
                 }
             };
             match realm.kind.as_str() {
-                KIND_LOCAL => {
-                    providers.push(Box::new(
-                        LocalPasswordProvider::with_limiter(
-                            self.pool.clone(),
-                            self.password_limiter.clone(),
-                        )
-                        .forwarding_follows(forwarding_follows_local),
-                    ));
-                }
+                // Inserted once the loop knows what follows it.
+                KIND_LOCAL => local_at = local_at.or(Some(providers.len())),
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
                     Ok(p) => {
                         has_cred_forward = true;
+                        forwarding_follows_local |= local_at.is_some();
                         providers.push(p);
                     }
                     // One malformed row must not take down the other realms;
@@ -613,6 +664,19 @@ impl RealmAuth {
             }
         }
 
+        if let Some(at) = local_at {
+            providers.insert(
+                at,
+                Box::new(
+                    LocalPasswordProvider::with_limiter(
+                        self.pool.clone(),
+                        self.password_limiter.clone(),
+                    )
+                    .forwarding_follows(forwarding_follows_local),
+                ),
+            );
+        }
+
         let chain = if providers.is_empty() {
             None
         } else {
@@ -653,6 +717,15 @@ impl RealmAuth {
         // in the clear to a non-loopback host unless the realm says so.
         ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
             .map_err(|e| anyhow::anyhow!("url: {e}"))?;
+        if cfg.auto_provision && cfg.identity_path.trim().is_empty() {
+            tracing::warn!(
+                realm = %realm.name,
+                "credential-forwarding realm provisions accounts without identity_path: \
+                 an upstream that also accepts another spelling of a username \
+                 (DOMAIN\\user, user@domain) signs that spelling in as a new account, \
+                 which a deactivation of the usual name does not stop"
+            );
+        }
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
         // Never follows redirects: a 3xx is judged (as unavailable) by the
@@ -730,6 +803,7 @@ impl RealmAuth {
             admin_groups: cfg.admin_groups.clone(),
             admin_claim: cfg.admin_claim.clone(),
             required_claims: cfg.required_claims.clone(),
+            endpoint_hosts: cfg.endpoint_hosts.clone(),
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
@@ -759,13 +833,13 @@ impl RealmAuth {
 /// handling.
 #[async_trait::async_trait]
 impl ChainSource for RealmAuth {
-    async fn password_chain(&self) -> Option<Arc<Chain>> {
+    async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable> {
         match self.snapshot().await {
-            Ok(s) if s.wire_password_enabled => s.chain.clone(),
-            Ok(_) => None,
+            Ok(s) if s.wire_password_enabled => Ok(s.chain.clone()),
+            Ok(_) => Ok(None),
             Err(e) => {
                 tracing::error!(error = %e, "realm snapshot failed; password path denied");
-                None
+                Err(ChainUnavailable)
             }
         }
     }
@@ -933,6 +1007,8 @@ pub async fn seed_auth_realms(
             required_claims: o.required_claims.clone(),
             login_domains: Vec::new(),
             button_label: None,
+            endpoint_hosts: normalize_endpoint_hosts(&o.endpoint_hosts)
+                .map_err(anyhow::Error::msg)?,
         };
         let priority = auth_realm_dao::next_priority(pool).await?;
         apply_seed(
@@ -1104,6 +1180,65 @@ mod tests {
             &json!({"url": "https://x/s", "key_pepper": "p", "required_groups": ["g"]}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn realm_configs_refuse_unknown_keys_but_not_secret_markers() {
+        let cred = json!({"url": "https://nexus.internal/status", "key_pepper": "p"});
+        let oidc = json!({
+            "issuer": "https://login.microsoftonline.com/tid/v2.0",
+            "client_id": "cid",
+            "client_secret": "shh",
+        });
+        for (kind, base, typo) in [
+            (KIND_CRED_FORWARD, &cred, "identity_pth"),
+            (KIND_CRED_FORWARD, &cred, "required_group"),
+            (KIND_CRED_FORWARD, &cred, "autoprovision"),
+            (KIND_OIDC, &oidc, "required_claim"),
+            (KIND_OIDC, &oidc, "auto_provison"),
+        ] {
+            let mut config = base.clone();
+            config[typo] = json!("x");
+            let err = validate_config(kind, &config).expect_err(typo);
+            assert!(err.contains(&format!("unknown field `{typo}`")), "{err}");
+        }
+        // The redaction markers are dropped, not refused, and never stored.
+        let mut echoed = cred.clone();
+        echoed["key_pepper_set"] = json!(true);
+        let ok = validate_config(KIND_CRED_FORWARD, &echoed).expect("marker dropped");
+        assert!(ok.get("key_pepper_set").is_none());
+        let mut echoed = oidc.clone();
+        echoed["client_secret_set"] = json!(true);
+        assert!(validate_config(KIND_OIDC, &echoed).is_ok());
+    }
+
+    #[test]
+    fn oidc_endpoint_hosts_are_host_names_and_normalized() {
+        let mut config = json!({
+            "issuer": "https://accounts.google.com",
+            "client_id": "cid",
+            "client_secret": "shh",
+            "endpoint_hosts": [" OAuth2.googleapis.com ", "www.googleapis.com"],
+        });
+        let ok = validate_config(KIND_OIDC, &config).expect("valid");
+        assert_eq!(
+            ok["endpoint_hosts"],
+            json!(["oauth2.googleapis.com", "www.googleapis.com"])
+        );
+        for bad in [
+            "https://oauth2.googleapis.com",
+            "host:443",
+            "host/path",
+            "",
+            "*.googleapis.com",
+        ] {
+            config["endpoint_hosts"] = json!([bad]);
+            assert!(validate_config(KIND_OIDC, &config).is_err(), "{bad:?}");
+        }
+        // Absent stays absent in the stored document.
+        config.as_object_mut().unwrap().remove("endpoint_hosts");
+        let ok = validate_config(KIND_OIDC, &config).expect("valid");
+        assert!(ok.get("endpoint_hosts").is_none());
     }
 
     #[test]

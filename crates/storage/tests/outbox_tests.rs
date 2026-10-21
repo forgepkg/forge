@@ -217,7 +217,7 @@ async fn worker_skips_revived_blob() {
     store.delete(&key).await.unwrap();
 }
 
-/// Counter drift (the pre-0.1.0 double decrement could leave `ref_count = 0`
+/// Counter drift (the pre-release double decrement could leave `ref_count = 0`
 /// on a blob an asset still names) must never let the worker delete it: the
 /// reservation sees the asset, repairs the counter, and keeps the object.
 #[tokio::test]

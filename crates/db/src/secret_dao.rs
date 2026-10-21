@@ -303,8 +303,8 @@ pub async fn get_upstream_credential(
 /// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3).
 ///
 /// 1. Rows that already carry `_enc` **and** a leftover plaintext copy (rows
-///    backfilled by 0.1.0, which kept the plaintext) lose the plaintext: the
-///    envelope is the authoritative value on every read path.
+///    backfilled by pre-release builds, which kept the plaintext) lose the
+///    plaintext: the envelope is the authoritative value on every read path.
 /// 2. Up to `batch` rows whose plaintext column is set and whose `_enc` column
 ///    is still NULL are sealed; the plaintext is NULLed **in the same guarded
 ///    UPDATE** (guarded on the exact plaintext read and `_enc IS NULL`, and on
@@ -472,12 +472,40 @@ async fn reseal_if_due(
             );
             return Ok(None);
         }
+        Err(e) if is_blob_error(&e) => {
+            tracing::warn!(
+                table = binding.table,
+                row = binding.row_pk,
+                error = %e,
+                "sealed secret is unreadable; left as is (enter the secret again through the \
+                 admin API)"
+            );
+            return Ok(None);
+        }
         Err(e) => return Err(e.into()),
     };
     if !legacy && !envelope.needs_reseal(blob).await? {
         return Ok(None);
     }
     Ok(Some(envelope.seal(&plaintext, binding).await?))
+}
+
+/// Whether `e` concerns one stored blob (malformed, sealed under an unknown or
+/// revoked data key, unreadable) rather than the key hierarchy as a whole. A
+/// pass over many rows warns about such a row and leaves it, instead of
+/// failing for every other row, and every instance's startup with it.
+fn is_blob_error(e: &CryptoError) -> bool {
+    match e {
+        CryptoError::DecryptFailed
+        | CryptoError::MalformedEnvelope(_)
+        | CryptoError::UnsupportedFormatVersion(_)
+        | CryptoError::UnsupportedAlgorithm(_)
+        | CryptoError::NotUtf8 => true,
+        CryptoError::KeyNotFound { layer, .. } | CryptoError::KeyRevoked { layer, .. } => {
+            *layer == "dek"
+        }
+        _ => false,
+    }
 }
 
 /// Result of one [`reseal_upstream_passwords_batch`] call.
@@ -601,21 +629,35 @@ async fn scan_referenced_dek_versions(
         let Some(last) = rows.last() else { break };
         after_id = last.id;
         for row in &rows {
-            versions.insert(EnvelopeService::blob_dek_version(
-                &row.upstream_password_enc,
-            )?);
+            match EnvelopeService::blob_dek_version(&row.upstream_password_enc) {
+                Ok(version) => {
+                    versions.insert(version);
+                }
+                // No key version to protect can be read from it; one bad row
+                // must not stop every key's revocation.
+                Err(e) => {
+                    tracing::warn!(repository_id = row.id, error = %e, "unreadable upstream password envelope; skipped");
+                }
+            }
         }
         if rows.len() < 500 {
             break;
         }
     }
-    let realm_blobs = sqlx::query_scalar!(
-        r#"SELECT secrets_enc AS "secrets_enc!" FROM auth_realm WHERE secrets_enc IS NOT NULL"#,
+    let realm_blobs = sqlx::query!(
+        r#"SELECT id, secrets_enc AS "secrets_enc!" FROM auth_realm WHERE secrets_enc IS NOT NULL"#,
     )
     .fetch_all(&mut *conn)
     .await?;
-    for blob in &realm_blobs {
-        versions.insert(EnvelopeService::blob_dek_version(blob)?);
+    for row in &realm_blobs {
+        match EnvelopeService::blob_dek_version(&row.secrets_enc) {
+            Ok(version) => {
+                versions.insert(version);
+            }
+            Err(e) => {
+                tracing::warn!(realm_id = row.id, error = %e, "unreadable realm secrets envelope; skipped");
+            }
+        }
     }
     Ok(versions)
 }
@@ -972,10 +1014,19 @@ pub async fn backfill_realm_secrets(
         }
         let config = match realm_config(Some(envelope), &realm).await {
             Ok(config) => config,
-            Err(SecretDbError::Crypto(CryptoError::DecryptFailed)) => {
+            Err(SecretDbError::Crypto(e)) if is_blob_error(&e) => {
                 tracing::warn!(
                     realm_id = realm.id,
-                    "stored realm secrets do not decrypt; re-sealing them from the plaintext copy"
+                    error = %e,
+                    "stored realm secrets are unreadable; re-sealing them from the plaintext copy"
+                );
+                realm.config.clone()
+            }
+            Err(SecretDbError::RealmSecrets(_, why)) => {
+                tracing::warn!(
+                    realm_id = realm.id,
+                    why,
+                    "stored realm secrets are unreadable; re-sealing them from the plaintext copy"
                 );
                 realm.config.clone()
             }

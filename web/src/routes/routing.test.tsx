@@ -148,6 +148,9 @@ describe('app routing + admin gating', () => {
 
     expect(router.state.location.pathname).toBe('/manage')
     expect(await screen.findByText('Administration')).toBeInTheDocument()
+    // Only what the UI can manage; the rest is named as API-only.
+    expect(screen.queryByText(/admin flags|with retention/)).toBeNull()
+    expect(screen.getByText(/Retention, RBAC roles and grants/)).toBeInTheDocument()
   })
 
   it('refreshes the stored CSRF token from the live session on load', async () => {

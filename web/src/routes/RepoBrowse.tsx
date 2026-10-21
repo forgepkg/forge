@@ -171,6 +171,25 @@ function RepoBrowseResults({
     return <Text>Loading packages…</Text>
   }
 
+  // `skip` past the last result (an old bookmark, or packages deleted since):
+  // the repository is not empty, only this page is.
+  if (items.length === 0 && total > 0 && skip > 0) {
+    return (
+      <EmptyState title="No packages on this page">
+        There are {total} {total === 1 ? 'result' : 'results'}, all on earlier
+        pages.{' '}
+        <Link
+          from={Route.fullPath}
+          to="."
+          search={(prev) => ({ ...prev, skip: undefined })}
+          className="text-sky-600 hover:underline dark:text-sky-400"
+        >
+          Back to page 1
+        </Link>
+      </EmptyState>
+    )
+  }
+
   if (items.length === 0) {
     return (
       <EmptyState title="No packages found">

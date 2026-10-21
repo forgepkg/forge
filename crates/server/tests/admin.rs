@@ -2016,6 +2016,86 @@ async fn put_repo(srv: &common::TestServer, name: &str, body: Value) -> reqwest:
         .unwrap()
 }
 
+/// #65: changing a proxy's `remote_url` forgets what it learned from the
+/// previous upstream: versions never downloaded (and the not-found markers)
+/// are dropped, downloaded ones lose their not-found and missing flags. An
+/// update that keeps the URL leaves the rows alone.
+#[tokio::test]
+async fn repointing_a_proxy_resets_its_cached_version_rows() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let name = format!("repoint{}", common::unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://feed-a.example/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let seed = || async {
+        sqlx::query("DELETE FROM proxy_cached_version WHERE repository_id = $1")
+            .bind(id)
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_cached_version \
+                 (repository_id, name, version, listed, downloaded, not_found, not_found_at, \
+                  upstream_missing, metadata_refreshed_at) VALUES \
+             ($1, 'contoso.lib', '*', false, false, true, now(), false, NULL), \
+             ($1, 'contoso.lib', '1.0.0', true, false, false, NULL, false, now()), \
+             ($1, 'sample', '2.0.0', true, true, true, now(), true, now())",
+        )
+        .bind(id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    };
+    let rows = || async {
+        sqlx::query_as::<_, (String, String, bool, bool, bool)>(
+            "SELECT name, version, downloaded, not_found, upstream_missing \
+             FROM proxy_cached_version WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(id)
+        .fetch_all(&srv.pool)
+        .await
+        .unwrap()
+    };
+
+    seed().await;
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-a.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(rows().await.len(), 3, "the same URL keeps every row");
+
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-b.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        rows().await,
+        [(
+            "sample".to_string(),
+            "2.0.0".to_string(),
+            true,
+            false,
+            false
+        )],
+        "only the downloaded version stays, with its flags cleared"
+    );
+}
+
 /// M2: update body semantics — absent keeps, `null` clears (TTLs fall back to
 /// the default), a value sets.
 #[tokio::test]
@@ -2468,6 +2548,31 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
     with_priority["priority"] = json!(1);
     let resp = post("/admin/realms", with_priority).await.unwrap();
     assert_eq!(resp.status(), 422);
+    for (kind, config, typo) in [
+        (
+            "credential_forwarding",
+            json!({"url": "https://nexus.internal/status", "key_pepper": "p", "identity_pth": "login"}),
+            "identity_pth",
+        ),
+        (
+            "oidc",
+            json!({
+                "issuer": "https://login.example.com", "client_id": "forge",
+                "client_secret": "s", "required_claim": {"hd": ["corp.example"]}
+            }),
+            "required_claim",
+        ),
+    ] {
+        let resp = post(
+            "/admin/realms",
+            json!({"kind": kind, "name": format!("typo{typo}{s}"), "enabled": false, "config": config}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400, "{kind}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains(&format!("unknown field `{typo}`")), "{msg}");
+    }
     let resp = post("/admin/realms", realm).await.unwrap();
     assert_eq!(resp.status(), 201);
     let realm_url = format!(
@@ -2487,6 +2592,23 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
         patch(json!({"enabled": false})).await.unwrap().status(),
         200
     );
+    // A misspelled key inside `config` is refused too: a dropped
+    // `identity_path` let any token holder sign in as any account.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "identity_pth": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `identity_pth`"), "{msg}");
+    // The redaction marker a client echoes back is not an unknown field.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "key_pepper_set": true, "identity_path": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
     let resp = client
         .delete(&realm_url)
         .basic_auth(&u, Some(&p))
@@ -2992,4 +3114,87 @@ async fn hosted_repo_delete_refuses_inflight_publish() {
         "the published package survives"
     );
     assert_eq!(ref_count(&srv.pool, &sha).await, 1);
+}
+
+/// Deleting a proxy repository while a first download is being finalized:
+/// the download holds its cached-version row and then takes the foreign-key
+/// lock on the repository row (inserting the component). The delete used to
+/// lock the repository row first and then wait for the cached version, a
+/// lock cycle Postgres broke by aborting one side (a 500 for the download).
+/// It now waits for the cached versions first, so the download's
+/// foreign-key lock is granted at once.
+#[tokio::test]
+async fn deleting_a_proxy_waits_for_an_in_flight_download_instead_of_deadlocking() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("px{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://api.nuget.org/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repository WHERE name = $1")
+        .bind(&name)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO proxy_cached_version (repository_id, name, version) \
+         VALUES ($1, 'contoso.lib', '1.0.0')",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    // The download: holds its cached version...
+    let mut download = srv.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM proxy_cached_version WHERE repository_id = $1 FOR UPDATE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    // ...while the delete starts.
+    let delete = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{}/admin/repositories/{name}", srv.base_url);
+        async move {
+            client
+                .delete(url)
+                .basic_auth(&au, Some(&ap))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    // The delete waits: for the cached version (or, in the old lock order,
+    // holding the repository row, in the cascade to it).
+    common::wait_for_lock_wait(
+        &srv.pool,
+        &[
+            "%FROM proxy_cached_version%FOR UPDATE%",
+            "%DELETE FROM repository%",
+        ],
+    )
+    .await;
+    // The component insert's foreign-key lock, well before Postgres' 1 s
+    // deadlock check would break a cycle.
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM repository WHERE id = $1 FOR KEY SHARE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .expect("the download's foreign-key lock waited on the delete");
+    download.commit().await.unwrap();
+
+    assert_eq!(delete.await.unwrap(), 204);
 }

@@ -2,109 +2,17 @@
 
 All notable changes to envisia-forge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/). While the major version is 0, a
-minor release may contain breaking changes; each one is called out under
-**Upgrade notes**.
+[Semantic Versioning](https://semver.org/): breaking changes come only in a
+major release, and each one is called out under **Upgrade notes**.
 
 The release workflow publishes the section whose heading matches the tag
-(`## [0.1.0]` for `v0.1.0`) as the GitHub release notes.
+(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes.
 
 ## [Unreleased]
 
-### Added
-
-- **Kubernetes manifests** in `deploy/kubernetes`: a kustomize base for the
-  server, components for an Ingress or Gateway API HTTPRoute, in-cluster
-  Redis, PostgreSQL and S3 (versitygw), two replicas with a
-  PodDisruptionBudget, and following `:latest`; plus a production and an
-  evaluation overlay. The base pins the image to the release it is tagged
-  with.
-- **`cargo xtask release <version>`** sets the version in `Cargo.toml`,
-  `Cargo.lock`, `web/package.json` and the Kubernetes base, turns the
-  `[Unreleased]` changelog section into the release's, commits and tags. The
-  release workflow now also refuses a tag whose Kubernetes base names another
-  image version.
-- **Helm chart** in `deploy/helm/forge`, published with every release to
-  `oci://ghcr.io/schmitch/charts/forge` (same version as the image, signed
-  with cosign, and attached to the GitHub release). The published chart pulls
-  the release image by the digest the release workflow signed. Forge's whole
-  configuration is settable as `config` (rendered to `forge.toml`), secrets
-  through a chart-managed or existing Secret; routing through a Gateway API
-  HTTPRoute and an optional ListenerSet (plus a cert-manager Certificate);
-  PodDisruptionBudget, HorizontalPodAutoscaler, NetworkPolicy and
-  `extraObjects`; and optional in-cluster PostgreSQL, Redis and versitygw
-  dependencies. `cargo xtask release` also sets the chart's version and
-  `appVersion`, and the release workflow refuses a tag whose chart names
-  another version.
-
-### Changed
-
-- **License**: envisia-forge is now dual-licensed under the GNU AGPL v3
-  (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
-  choice.
-
-### Fixed
-
-- **Admin API**: retention policy, repository and realm request bodies
-  reject unknown fields (422 naming the field) instead of dropping them. A
-  misspelled field used to fall back to the unsafe default: a live policy
-  over every package, a public repository, or no reserved prefixes.
-- The last active administrator can no longer be deactivated, deleted or
-  lose the `admin` role: each answers 409. The check holds a lock on the
-  `admin` role, so two concurrent demotions cannot both pass.
-- `PATCH /admin/tokens/{id}/scope` with `{}` answers 400 instead of clearing
-  the token's scope; only an explicit `"scope": null` clears it.
-- **Realms**: a realm whose secrets no longer decrypt can be repaired with
-  `PATCH /admin/realms/{id}` carrying the secret again; an edit without it
-  answers 400 naming it instead of 500. The realm-secret backfill (at
-  startup and on key rotation) no longer overwrites a realm edited while it
-  runs, and re-seals a realm whose sealed secrets no longer decrypt from its
-  plaintext copy instead of failing the whole pass.
-- **Authentication**: a deactivated local account's password is refused by
-  the local realm, like a wrong password, and never forwarded to a
-  credential-forwarding realm. A database error while looking up a token or
-  session answers 503 instead of 401, and a token sent as the Basic password
-  is never tried as a password.
-- **Proxy**: changing a proxy's `remote_url` takes effect at once. The
-  previous upstream's service index, listings, manifests and registrations
-  are no longer used, and a failing new upstream is an error instead of a
-  silent fallback to the old index. A first download no longer answers 500
-  when the cleanup of unconfirmed versions removes its row mid-download.
-- **Groups** answer a failing member's error instead of 404 for a package
-  only that member could serve, such as a proxy whose upstream is briefly
-  unreachable, so clients retry instead of reporting NU1101 and a Forge
-  proxy in front of the group does not cache the miss.
-- **Search** without `semVerLevel=2.0.0` drops SemVer 2.0.0 versions before
-  paging, so pages are full and `totalHits` is exact. The web UI pages
-  through repositories with more than 20 packages: `/browse/packages`
-  reports the total number of matches instead of capping it at
-  `skip + take`.
-- **Retention** groups versions by package in one pass and evaluates on the
-  blocking pool, so a large repository's run or preview no longer stalls
-  the instance. Automatic runs of a repository are at least 60 s apart;
-  with both run intervals set to 0 it used to re-run back to back forever.
-- **Staging**: files a killed process left in the staging directory are
-  removed at the next start instead of after an hour, so a restart can no
-  longer use more than `max_staging_bytes` and fail uploads with 500.
-- **Cache backplane**: a forged `u64::MAX` tag generation published to
-  Redis can no longer stop every instance from applying later
-  invalidations.
-- **Releases**: the release workflow decides whether to move `:latest` and
-  `:<major>.<minor>` right before tagging, so an older release whose run
-  finishes last no longer moves them back. The GitLab pipeline passes again
-  and mirrors the GitHub CI, except for the Helm chart check.
-
-### Upgrade notes
-
-- Admin API clients that send fields the retention policy, repository or
-  realm endpoints do not know now get 422; remove those fields.
-- The retention worker never runs a repository automatically more often
-  than every 60 s, whatever `default_run_interval_seconds` and the policy's
-  `min_run_interval_seconds` say (0 is still accepted).
-
-## [0.1.0]
-
-First production release.
+First production release. envisia-forge is dual-licensed under the GNU AGPL
+v3 (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
+choice.
 
 ### Features
 
@@ -138,6 +46,37 @@ First production release.
   cross-instance invalidation.
 - **Release**: a signed container image with an SBOM and provenance
   attestation; see [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md).
+  The SBOM lists the Rust crates (the binary embeds its crate list with
+  `cargo-auditable`) and npm packages as well as the Debian packages, and
+  the image carries `LICENSE` and the third-party notices of the crates and
+  npm packages it ships in `/usr/share/doc/forge/`. A tag is released only
+  after CI, end-to-end tests included, passed for its commit.
+- **Kubernetes manifests** in `deploy/kubernetes`: a kustomize base for the
+  server, components for an Ingress or Gateway API HTTPRoute, in-cluster
+  Redis, PostgreSQL and S3 (versitygw), two replicas with a
+  PodDisruptionBudget, and following `:latest`; plus a production and an
+  evaluation overlay. The base pins the image to the release it is tagged
+  with.
+- **`cargo xtask release <version>`** sets the version in `Cargo.toml`,
+  `Cargo.lock`, `web/package.json` and the Kubernetes base, turns the
+  `[Unreleased]` changelog section into the release's, commits and tags. It
+  refuses a changelog whose release notes would leave entries out: a version
+  section without its tag, or a drafted section next to a non-empty
+  `[Unreleased]`. The release workflow refuses a tag whose Kubernetes base
+  names another image version, or whose `[Unreleased]` section still has
+  entries.
+- **Helm chart** in `deploy/helm/forge`, published with every release to
+  `oci://ghcr.io/schmitch/charts/forge` (same version as the image, signed
+  with cosign, and attached to the GitHub release). The published chart pulls
+  the release image by the digest the release workflow signed. Forge's whole
+  configuration is settable as `config` (rendered to `forge.toml`), secrets
+  through a chart-managed (`<fullname>-secret-env`) or existing Secret;
+  routing through a Gateway API HTTPRoute and an optional ListenerSet (plus
+  a cert-manager Certificate); PodDisruptionBudget, HorizontalPodAutoscaler,
+  NetworkPolicy and `extraObjects`; and optional in-cluster PostgreSQL,
+  Redis and versitygw dependencies. `cargo xtask release` also sets the chart's version and
+  `appVersion`, and the release workflow refuses a tag whose chart names
+  another version.
 
 ### Security
 
@@ -183,7 +122,11 @@ First production release.
 - `X-Forwarded-For` is read across all header lines, and IPv4-mapped IPv6
   peers match IPv4 CIDRs. Under `anonymous_mode = "allowlist"` the anonymous
   grant requires a `Host` matching `public_base_url` or `server.allowed_hosts`
-  (DNS-rebinding guard).
+  (DNS-rebinding guard). Hops are split before they are decoded, and a
+  malformed hop leaves the client unknown, never allowlisted: before, one
+  non-ASCII byte in the `X-Forwarded-For` a client sent made it resolve to
+  the trusted proxy's own address, which a `private` allowlist admits. Hops
+  with a port (`a.b.c.d:port`, `[v6]:port`) parse.
 - The proxy refuses upstream redirects and resolutions to link-local and
   cloud-metadata addresses, and serves an upstream `.nuspec` only if it names
   the requested package.
@@ -202,7 +145,9 @@ First production release.
   (the allowlist depends on the caller's network, which a signed-in user or
   token must not carry elsewhere).
 - Unknown and federated usernames take the same time in the password chain,
-  so response timing no longer reveals which upstream users exist.
+  so response timing no longer reveals which upstream users exist; also
+  while a credential-forwarding realm cannot be built (it is skipped, and
+  unknown names then pay the dummy password hash themselves).
 - Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
   (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
 - A cancelled admin key rotation can no longer leave the rotation lock held
@@ -231,14 +176,21 @@ First production release.
   (GitHub, Azure DevOps or GitLab personal access tokens); without it such an
   upstream lets any token holder sign in as any user. A success without the
   field fails closed. The docs now state that the upstream must bind the
-  username to the secret.
+  username to the secret. `identity_path` also keeps other spellings the
+  upstream accepts for one account (`DOMAIN\user`, `user@domain`) from
+  signing in as separate Forge accounts, which a deactivation does not stop;
+  an auto-provisioning realm without it logs a warning.
 - A username containing `:` is never forwarded to a credential-forwarding
   realm. The upstream splits Basic credentials at the first colon, so a form
   login as `mallory:abc` with the password `def` was checked upstream as
   `mallory` / `abc:def`. Forge then provisioned and signed in a separate,
   active account `mallory:abc`, which got around a deactivation of
   `mallory`. Form login answers such a name with the usual 401, and admin
-  user creation and `auth.bootstrap_admin.username` refuse it.
+  user creation and `auth.bootstrap_admin.username` refuse it. For the same
+  reason a name that Unicode compatibility normalization (NFKC) changes,
+  such as full-width letters, or that holds an invisible character such as
+  a soft hyphen, is never forwarded: a directory may fold it onto another
+  account.
 - Package ids in feed URLs are validated against the NuGet id grammar on
   every read and unlist/relist route (404 otherwise), and again before a
   proxy builds an upstream URL. A percent-encoded `..%2F`, `?` or `#` in an
@@ -279,19 +231,25 @@ First production release.
   public feeds): the manifest summary is stored at publish and when a proxy
   caches a package (migration 0024; older versions are summarized once and
   backfilled), a proxy reads every cached version's registration data in
-  one query, proxy search pages over package ids in SQL and loads versions
-  for the returned page only (an empty query used to load every cached
-  version of every package), the registration index
-  is paged (64 versions per page, inlined up to 128 versions, beyond that
-  served from `/registration/{id}/page/{lower}/{upper}.json`, which answers
-  with the versions in that range, so a page URL from a cached index keeps
-  working after a push or delete), hosted leaf and catalog documents look up
-  one version instead of all, rendering runs on
-  the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
-  rejects nesting deeper than 32 levels (it was quadratic in depth).
-- Proxy (completing the 0.1.0 "not found" marker fix): a version deleted
-  upstream leaves the listings at the next refresh (migration 0025) instead
-  of reappearing every `not_found_ttl`; the package-level not-found marker
+  one query, hosted and proxy search page over package ids in SQL and load
+  versions for the returned page only (an empty query used to load every
+  version of the repository), the registration index is paged (64 versions
+  per page, inlined up to 128 versions, beyond that served from
+  `/registration/{id}/page/{lower}/{upper}.json`, which answers with the
+  versions in that range, so a page URL from a cached index keeps working
+  after a push or delete) and loads manifest summaries only for the
+  versions it inlines or the page it serves, hosted leaf and catalog
+  documents look up one version instead of all, the browse API's package
+  page reads every version's size in one query, rendering runs on the
+  blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
+  rejects nesting deeper than 32 levels (it was quadratic in depth). A
+  duplicate push without `allow_redeploy` is refused with 409 before the
+  package is uploaded to storage.
+- Proxy: a version deleted upstream leaves the listings (migrations 0025
+  and 0030) instead of reappearing every `not_found_ttl`, once a refresh at
+  least one metadata TTL after the first listing without it confirms the
+  deletion, so a partial listing during an upstream incident (a Forge group
+  with a member down) retires nothing; the package-level not-found marker
   is pruned once expired and cleared by a download of the package; a 404
   never hides a version a listing confirmed after the request started; and
   inside the package-delay window the proxy no longer downloads a version
@@ -408,19 +366,26 @@ First production release.
   forwarding client ignores `HTTP(S)_PROXY`; and at most 1 MiB of a success
   body is read for `groups_path` / `identity_path` (larger answers fail
   closed).
-
 - Redis is a trust boundary for proxied content too: a proxy's upstream
   service index, manifests and registrations are cached in each instance's
   memory only. Before, a forged service index planted in Redis made other
   instances download packages from the forger's host, and the planted
   package then stayed cached.
 - Admin request bodies for grants, roles, role assignments, content
-  selectors, user creation and group members, and `POST /auth/tokens`,
-  refuse unknown fields. Before, a grant sent as `{"repository_id": 3, ...}`
-  (the shape the grant listing returns) ignored the id and granted the
-  action on **every** repository, a selector with a mistyped `include`
-  matched every package, and `/auth/tokens` dropped a `scope` and minted
-  an unscoped token. A grant now also takes `repository_id`.
+  selectors, user creation, group members, retention policies, repositories
+  and realms, and `POST /auth/tokens`, refuse unknown fields (422 naming the
+  field). Before, a grant sent as `{"repository_id": 3, ...}` (the shape the
+  grant listing returns) ignored the id and granted the action on **every**
+  repository, a selector with a mistyped `include` matched every package,
+  `/auth/tokens` dropped a `scope` and minted an unscoped token, and a
+  misspelled field fell back to the unsafe default: a live retention policy
+  over every package, a public repository, or no reserved prefixes. A grant
+  now also takes `repository_id`. A realm's `config` refuses unknown keys as
+  well (400 naming the key): a misspelled `identity_path`,
+  `required_claims` or `required_groups` turned that gate off, and a
+  misspelled `auto_provision: false` left provisioning on. A role assignment
+  naming both `role` and `role_id` answers 400 instead of silently using
+  `role_id`.
 - With `allow_redeploy` on, replacing an existing version needs the delete
   permission (and passes the delete selectors) as well as write, so a
   push-only token can no longer overwrite a released version.
@@ -465,13 +430,28 @@ First production release.
   package, or take a public id away from the proxy. An owner must be
   unflagged before it can be removed from the group or deleted, so a group
   never falls back to trusting every member unnoticed; the web UI marks
-  owners.
+  owners. A nested group keeps its own `prefer_hosted`, `reserved_prefixes`
+  and owners when it is read through an outer group, and an outer group
+  that flags it as an owner trusts the inner group's owners, not every
+  hosted repository inside it.
 - `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.10: certificate
   verification no longer accepts distrusted intermediates
   (RUSTSEC-2026-0382, RUSTSEC-2026-0383).
 - Credential-forwarding verdicts are cached in memory no longer than they
   live: a rejection for `negative_ttl`, and a verdict another instance wrote
   only for what its row has left (before, both for the positive TTL).
+- Turning a repository's `anonymous_read` off drops every cached
+  authorization set, so a user or workload holding the `anonymous` role
+  stops reading it at once instead of after the cache TTL.
+- An expired or revoked API token, or one of a deactivated user, sent as
+  the Basic password answers 401 and is never tried as a password. Before, a
+  credential-forwarding realm forwarded it upstream as a password on every
+  request of a client that still stored it.
+- A bearer token with a made-up `kid` (no valid signature needed) no longer
+  drops the issuer's cached signing keys on every instance: the refresh it
+  triggers fetches first and keeps the cached keys when the fetch fails, so
+  an outage of the IdP's key endpoint no longer stops trusted publishing
+  and OIDC logins.
 
 ### Fixed
 
@@ -522,8 +502,13 @@ First production release.
   looping requests; admin pages work on refresh and from bookmarks;
   `index.html` is never cached and assets are immutable; sign-out clears
   cached data; lockouts and realm errors are shown; Back works on repository
-  search; repository names are validated.
-
+  search; repository names are validated; disabling the `local` realm asks
+  for confirmation; group owners can be flagged and unflagged, and groups
+  nested, on the members screen; realm list fields are edited one entry per
+  line, so a value with a comma (an LDAP DN) survives a save, and a new OIDC
+  client secret is required when the issuer or client id changes; expired
+  tokens show as expired and token scopes are shown; a page past the last
+  search result says so instead of "no packages yet".
 - Retention `not_downloaded_for_days` counts a never-downloaded version
   from its publication (as proxy rules count from `first_seen_at`). It
   treated such a version as always cold, so a policy with this trigger
@@ -558,7 +543,8 @@ First production release.
 - Temp space for pushes and first-time proxy downloads is bounded per
   instance (`server.max_staging_bytes`, answered `503` with `Retry-After`
   when full), and files a killed process left in `server.staging_dir` are
-  removed at startup. Before, concurrent downloads of large packages could
+  removed at startup instead of after an hour, so a restart cannot use more
+  than the budget. Before, concurrent downloads of large packages could
   fill the disk and get the pod evicted.
 - The networks a username signed in from, which exempt the owner from that
   username's login backoff during a password spray, are stored in the
@@ -566,12 +552,108 @@ First production release.
   instance that saw the sign-in.
 - Leases, retry backoffs and staleness cutoffs are computed on the database's
   clock, so a skewed application clock no longer makes failing outbox rows
-  retry every poll or retention runs fail their own lease.
+  retry every poll or retention runs fail their own lease. So are a proxy's
+  package delay, not-found TTL and index freshness, the OIDC login flow's
+  expiry and session expiries: with the application clock ahead, a proxy
+  served a quarantined release early and negative caching stopped working;
+  with it 10 minutes behind, every OIDC login failed as "unknown or expired
+  state".
 - A staging directory on NFS is swept too (the sweep could not take a lock
   through a read-only file there), a lock that cannot be tried falls back to
   removing files idle for an hour instead of keeping them forever, and an
   instance whose staging subdirectory was removed under it stages in a new
-  one instead of failing every push and download until restarted.
+  one instead of failing every push and download until restarted. On a file
+  system without working file locks the server stages without one (with a
+  warning) instead of refusing to start, and on NFS a process directory is
+  removed after its lock is closed, so emptied directories no longer pile
+  up with a warning per restart.
+- The last active administrator can no longer be deactivated, deleted or
+  lose the `admin` role: each answers 409. The check holds a lock on the
+  `admin` role, so two concurrent demotions cannot both pass.
+- `PATCH /admin/tokens/{id}/scope` with `{}` answers 400 instead of clearing
+  the token's scope; only an explicit `"scope": null` clears it.
+- **Realms**: a realm whose secrets no longer decrypt can be repaired with
+  `PATCH /admin/realms/{id}` carrying the secret again; an edit without it
+  answers 400 naming it instead of 500. The realm-secret backfill (at
+  startup and on key rotation) no longer overwrites a realm edited while it
+  runs, and re-seals a realm whose sealed secrets no longer decrypt from its
+  plaintext copy instead of failing the whole pass. One malformed sealed
+  secret (a damaged envelope, a data key that is gone) no longer stops
+  every instance from starting or the rotation from revoking retired keys:
+  it is logged with its row and left alone. The last enabled realm people
+  sign in with (`local` or OIDC) can be neither disabled nor deleted (409);
+  one click on `local`'s Enabled switch used to lock every password login
+  out. A realm edit answers 409 instead of undoing a change committed
+  since it read the realm (another admin's edit, a reorder).
+- **Authentication**: a deactivated local account's password is refused by
+  the local realm, like a wrong password, and never forwarded to a
+  credential-forwarding realm. When Forge's own database fails (looking up
+  a token, session, user, cached upstream verdict, realm or workload role),
+  the request answers 503 instead of 401, so NuGet clients and CI jobs
+  retry instead of asking for new credentials.
+- **OIDC** realms take `endpoint_hosts` for identity providers that serve
+  their token and key endpoints on other hosts than the issuer's (Google,
+  AWS Cognito); their logins failed with 502.
+- **Proxy**: changing a proxy's `remote_url` takes effect at once. The
+  previous upstream's service index, listings, manifests and registrations
+  are no longer used, and a failing new upstream is an error instead of a
+  silent fallback to the old index. Its per-version state is reset in the
+  same transaction: versions never downloaded and not-found markers are
+  dropped, so the package delay counts from the new upstream's first
+  sighting; downloaded versions stay cached and are refreshed. A first
+  download no longer answers 500 when the cleanup of unconfirmed versions
+  removes its row mid-download.
+- **Proxy**: a service index without a `PackageBaseAddress` (a captive
+  portal, a gateway's error page) is an upstream failure. It no longer
+  replaces the last good index or makes every package not cached yet
+  answer 404.
+- **Proxy**: the package delay counts from the upstream publish time of a
+  listed version when the upstream registration states a plausible one,
+  instead of from the proxy's first sighting, so it holds back new releases
+  only: enabling it used to hide every version of every package the proxy
+  had not served before (on a fresh install, every restore failed for the
+  whole delay). Search shows a package id's own casing (`Newtonsoft.Json`,
+  migration 0031) instead of the lowercased one. A registration page or
+  leaf of a package with more than 640 versions carries its older
+  versions' dependencies, listing state and publish date. Deleting a proxy
+  while a first download is being stored no longer deadlocks (one side
+  answered 500).
+- **Groups** answer a failing member's error instead of 404 for a package
+  only that member could serve, such as a proxy whose upstream is briefly
+  unreachable, so clients retry instead of reporting NU1101 and a Forge
+  proxy in front of the group does not cache the miss.
+- The **Online** switch takes hosted and group repositories offline too
+  (every feed request answers 503 with `Retry-After`, after authorization);
+  before, only proxies read it. Inside a group an offline member fails like
+  an unreachable one.
+- **Search** without `semVerLevel=2.0.0` drops SemVer 2.0.0 versions before
+  paging, so pages are full and `totalHits` is exact. The web UI pages
+  through repositories with more than 20 packages: `/browse/packages`
+  reports the total number of matches instead of capping it at
+  `skip + take`.
+- Registration `dependencyGroups` list what NuGet reads: only direct
+  children of `<dependencies>` and of its groups, and flat dependencies
+  only when the manifest has no group.
+- A `HEAD` of a `.nupkg` no longer counts as a download (it kept packages
+  "warm" for retention), and a redeploy keeps the version's download count.
+  Unlisting, deleting or relisting a version that does not parse answers
+  404, not 400.
+- A token's `last_used_at` is written at most once a minute, so the
+  parallel requests of one restore no longer serialize on the token's row.
+- **Retention** groups versions by package in one pass and evaluates on the
+  blocking pool, so a large repository's run or preview no longer stalls
+  the instance. Automatic runs of a repository are at least 60 s apart;
+  with both run intervals set to 0 it used to re-run back to back forever.
+- **Cache backplane**: a forged `u64::MAX` tag generation published to
+  Redis can no longer stop every instance from applying later
+  invalidations, and an instance whose tag generations restarted low
+  (after Redis lost the tag's key) is no longer ignored by its peers, which
+  kept serving, for example, a revoked role until the cache TTL.
+- **Releases**: the release workflow decides whether to move `:latest` and
+  `:<major>.<minor>` right before tagging, so an older release whose run
+  finishes last no longer moves them back. CI runs for every commit on
+  `main` instead of being cancelled by the next push. The GitLab pipeline
+  passes again and mirrors the GitHub CI, except for the Helm chart check.
 
 ### Changed
 
@@ -597,11 +679,15 @@ First production release.
   archive limits. New endpoints: `PATCH /admin/users/{id}`,
   `PATCH /admin/repositories/{name}/members/{member}` (`owner`) and
   `GET`/`PUT /admin/settings/legacy-open-access`. Group members have an
-  `owner` field.
+  `owner` field, and OIDC realms (and the `[oidc]` seed) `endpoint_hosts`.
+- Startup validates `server.public_base_url` (an absolute http(s) URL with
+  a host and without query or fragment), `server.allowed_hosts` and the
+  session TTLs (1 second to 10 years). The `[auth]` table may be left out.
 
 ### Upgrade notes
 
-- This is the first release; install it on an empty database.
+- This is the first release; install it on an empty database. The other
+  notes concern installs that ran pre-release builds.
 - Installs that ran pre-release builds: on the first start, the legacy RBAC
   mapping runs once more. On a database that already had users when
   migration 0007 ran (`legacy_open_access = true`), that assigns the built-in
@@ -675,10 +761,22 @@ First production release.
 - On an https deployment the session and OIDC flow cookies are renamed
   `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
   more after the upgrade.
-
 - Automation calling the admin API must not send fields the endpoint does
-  not document (they are now refused with 422), and `POST /auth/tokens`
-  refuses a `scope` (use `POST /admin/me/tokens` for scoped tokens).
+  not document (they are now refused with 422, this includes the retention
+  policy, repository and realm endpoints), and `POST /auth/tokens` refuses
+  a `scope` (use `POST /admin/me/tokens` for scoped tokens).
+- A credential-forwarding or OIDC realm whose stored `config` holds a key
+  its kind does not know (a typo an earlier build accepted and ignored) is
+  skipped at startup, with an error naming the key, until it is edited
+  without that key. Check the log after upgrading.
+- The retention worker never runs a repository automatically more often
+  than every 60 s, whatever `default_run_interval_seconds` and the policy's
+  `min_run_interval_seconds` say (0 is still accepted).
+- A hosted or group repository saved with **Online** switched off, which
+  used to change nothing, answers 503 after the upgrade. Switch it back on.
+- Startup refuses a `server.public_base_url` without an http(s) scheme or
+  host, or with a query or fragment, an invalid `server.allowed_hosts`
+  entry, and session TTLs of 0 or above 10 years.
 - A CI token or workload role that redeploys existing versions needs the
   `delete` action on the repository as well as `write`.
 - Retention policies with `not_downloaded_for_days` select fewer versions
@@ -706,6 +804,15 @@ First production release.
   limit) and `server.staging_dir` to match your volume; a budget below the
   larger of those two limits plus `nuget.max_nuspec_bytes` is refused at
   startup.
+- Proxies with a package delay serve the versions they already list but
+  had held back although the upstream published them before the delay:
+  their delay is dated from the upstream publish time at the next listing
+  refresh. A version deleted upstream leaves a proxy's listings one
+  metadata TTL later than with pre-release builds.
+- Automation that disables or deletes the last enabled `local` or OIDC
+  realm gets 409, and a realm `PATCH` that races another change of the
+  realm gets 409: re-read the realm and send the change again.
+
 ### Known limitations
 
 - NuGet is the only package format.
@@ -721,6 +828,10 @@ First production release.
   Only the env/file root-key providers exist; AWS KMS is not supported yet.
 - A proxy fetches a new package version once per instance. Several instances
   that miss the same version at the same time each download it.
+- The package delay is dated from the upstream publish time only for the
+  versions in the newest 10 pages (640 versions on nuget.org) of a
+  package's upstream registration; older versions, and versions of an
+  upstream without a registration, count from the proxy's first sighting.
 - A group's search is capped at 1,000 results per member, so totals and
   paging are exact only below that.
 - A token whose scope lists a group's repository id reads through the group
@@ -755,5 +866,4 @@ First production release.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/forge/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/schmitch/forge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/schmitch/forge/commits/main

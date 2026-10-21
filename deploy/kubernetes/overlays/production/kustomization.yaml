@@ -5,9 +5,9 @@
 #
 #   resources:
 #     - namespace.yaml
-#     - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v0.1.0
+#     - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v1.0.0
 #   components:
-#     - https://github.com/schmitch/forge//deploy/kubernetes/components/ingress?ref=v0.1.0
+#     - https://github.com/schmitch/forge//deploy/kubernetes/components/ingress?ref=v1.0.0
 #     - …
 #
 # Secrets: copy forge.env.example to forge.env (git-ignored) and fill it in.

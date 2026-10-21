@@ -159,6 +159,12 @@ pub enum AuthOutcome {
     /// to a grant. If no provider authenticates, the chain surfaces that an
     /// `Unavailable` occurred so the caller can log/deny appropriately.
     Unavailable,
+    /// Forge's own store failed (a database error): nobody can decide this
+    /// credential right now, so the chain stops. Unlike an upstream outage,
+    /// which callers answer like a wrong password, this is answered as
+    /// "temporarily unavailable" (503) so clients retry instead of asking
+    /// for new credentials.
+    Failed,
 }
 
 /// An ordered authentication backend for username/password credentials.

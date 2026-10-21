@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT name AS \"name!\"\n        FROM component\n        WHERE repository_id = $1 AND listed\n          AND ($2 = '' OR strpos(name, $2) > 0)\n          AND ($3 OR strpos(version, '-') = 0)\n          AND ($4 OR version_original !~ '[+]|-.*[.]')\n        ORDER BY name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dafe68f2d905a92e21fc8bb5d1d5911c5e7b92c2d3cbeb369b39adc7364e7f00"
+}

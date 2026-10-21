@@ -25,10 +25,10 @@ use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::{
-    is_semver2, CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation,
-    PublishAuthorizationContext, PublishOutcome, PublishPolicy, RegistrationEntry, RepoError,
-    RepoReadOps, SearchHit, SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
-    NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
+    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
+    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
+    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
 /// Fetch raw bytes of a stored blob by its S3 object key.
@@ -79,11 +79,11 @@ impl HostedRepo {
     }
 
     /// Build one exact search result while applying package authorization
-    /// before paging. Hosted search currently loads its small Slice-1 corpus in
-    /// one query, so doing this here avoids reloading that corpus once per
-    /// selector page. With `enrich`, the returned page carries manifests and
-    /// download totals ([`Self::enrich_hits`]); a group searches its members
-    /// without and enriches only its own final page.
+    /// before paging: the ids that match are listed once, filtered by the
+    /// selector, counted and paged, and only the page's versions are loaded.
+    /// With `enrich`, the returned page carries manifests and download totals
+    /// ([`Self::enrich_hits`]); a group searches its members without and
+    /// enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -93,30 +93,52 @@ impl HostedRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let query = SearchQuery::parse(&params.q);
-        let comps = match query.prefilter() {
-            Some(sub) => {
-                component_dao::list_components_for_repo_matching(&self.pool, repo_id, sub).await?
-            }
-            None => component_dao::list_components_for_repo(&self.pool, repo_id).await?,
-        };
+        // Page over ids, not versions: the filters run in SQL, the selector
+        // and the query's terms on the (much shorter) id list, and versions
+        // are loaded for the returned page only.
+        let mut names: Vec<String> = component_dao::search_names(
+            &self.pool,
+            repo_id,
+            query.prefilter().unwrap_or(""),
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        .into_iter()
+        .filter(|name| filter.allows(name) && query.matches(name))
+        .collect();
+        // Byte order, as group results are ordered (SQL orders by the
+        // database collation, which may weigh punctuation differently).
+        names.sort_unstable();
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
 
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
-        for c in comps {
-            if !filter.allows(&c.name) || !query.matches(&c.name) {
-                continue;
-            }
+        use std::collections::HashMap;
+        let mut by_id: HashMap<String, Vec<forge_db::model::Component>> = HashMap::new();
+        for c in component_dao::search_versions(
+            &self.pool,
+            repo_id,
+            &page,
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        {
             by_id.entry(c.name.clone()).or_default().push(c);
         }
-
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, comps) in by_id {
-            let comps = self.sort_versions(comps);
-            let versions: Vec<VersionEntry> = comps
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
+        for name in &page {
+            let Some(comps) = by_id.remove(name) else {
+                // Changed between the two queries.
+                continue;
+            };
+            let versions: Vec<VersionEntry> = self
+                .sort_versions(comps)
                 .into_iter()
-                .filter(|c| c.listed)
-                .filter(|c| params.prerelease || !is_prerelease(&c.version))
-                .filter(|c| params.include_semver2 || !is_semver2(&c.version_original))
                 .map(|c| VersionEntry {
                     original_id: c.original_id,
                     version: c.version,
@@ -124,9 +146,6 @@ impl HostedRepo {
                     listed: c.listed,
                 })
                 .collect();
-            if versions.is_empty() {
-                continue;
-            }
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -135,17 +154,6 @@ impl HostedRepo {
                 ..Default::default()
             });
         }
-
-        hits.sort_by(|a, b| {
-            crate::format::lower_invariant(&a.original_id)
-                .cmp(&crate::format::lower_invariant(&b.original_id))
-        });
-        let total_hits = hits.len();
-        let mut hits: Vec<SearchHit> = hits
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
         if enrich {
             self.enrich_hits(repo_id, &mut hits).await?;
         }
@@ -283,9 +291,43 @@ impl HostedRepo {
     }
 }
 
-/// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
-fn is_prerelease(version: &str) -> bool {
-    version.contains('-')
+impl HostedRepo {
+    /// The `.nupkg` of `(id, version)` in `repo`, counted as a download when
+    /// `count` ([`RepoReadOps::resolve_nupkg`] / [`RepoReadOps::resolve_nupkg_head`]).
+    async fn locate_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        count: bool,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
+        else {
+            return Ok(None);
+        };
+        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
+        else {
+            return Ok(None);
+        };
+        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
+            return Ok(None);
+        };
+
+        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
+        // A resolved `.nupkg` is a download (a `HEAD` is not); bump
+        // asynchronously so a tracking write never blocks (or fails) the
+        // response. Non-authoritative — failures are logged, not propagated.
+        if count {
+            spawn_download_bump(self.pool.clone(), asset.id, comp.id);
+        }
+
+        Ok(Some(NupkgLocation {
+            blob_s3_key: blob.s3_key,
+            size: asset.size,
+            content_type: asset.content_type,
+        }))
+    }
 }
 
 /// Fire a best-effort download-tracking bump for a served hosted `.nupkg`,
@@ -329,30 +371,16 @@ impl RepoReadOps for HostedRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
-        let repo_id = self.repo_id(repo).await?;
-        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
-        else {
-            return Ok(None);
-        };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
-        else {
-            return Ok(None);
-        };
-        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
-            return Ok(None);
-        };
+        self.locate_nupkg(repo, id, version, true).await
+    }
 
-        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
-        // A resolved `.nupkg` is a download; bump asynchronously so a tracking
-        // write never blocks (or fails) the response. Non-authoritative —
-        // failures are logged, not propagated.
-        spawn_download_bump(self.pool.clone(), asset.id, comp.id);
-
-        Ok(Some(NupkgLocation {
-            blob_s3_key: blob.s3_key,
-            size: asset.size,
-            content_type: asset.content_type,
-        }))
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.locate_nupkg(repo, id, version, false).await
     }
 
     async fn resolve_nuspec(
@@ -390,6 +418,40 @@ impl RepoReadOps for HostedRepo {
             component_dao::list_registration_rows(&self.pool, repo_id, id, NUPKG_ASSET_PATH)
                 .await?;
         rows.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+        use futures_util::StreamExt;
+        futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        // The same rows `registration` lists, without their metadata.
+        Ok(self
+            .list_versions(repo, id)
+            .await?
+            .into_iter()
+            .map(|v| v.version)
+            .collect())
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows = component_dao::list_registration_rows_for_versions(
+            &self.pool,
+            repo_id,
+            id,
+            versions,
+            NUPKG_ASSET_PATH,
+        )
+        .await?;
         use futures_util::StreamExt;
         futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
             .buffered(16)
@@ -597,6 +659,23 @@ impl HostedWrite {
             (self.publish_policy.as_ref(), publish_context.as_ref())
         {
             policy.authorize(context).await?;
+        }
+
+        // A duplicate without redeploy is answered before anything reaches
+        // S3: a CI job that re-pushes an unchanged version with
+        // `--skip-duplicate` on every build would otherwise upload it each
+        // time. The check in the transaction below stays the authority (a
+        // concurrent first push).
+        if !repo_row.allow_redeploy
+            && component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
+                .await
+                .map_err(RepoError::from)?
+                .is_some()
+        {
+            return Err(WriteError::Conflict {
+                id: parsed.original_id.clone(),
+                version: parsed.version.clone(),
+            });
         }
 
         // Authorization succeeded: the staged bytes may now be promoted into
@@ -840,11 +919,26 @@ impl HostedWrite {
             .map_err(RepoError::from)?;
 
         // Capture the old blob shas, delete the asset rows, decref the old blobs.
+        // The `.nupkg`'s download counters carry over to the new row: a
+        // redeploy is the same version, and retention and search
+        // (`totalDownloads`) read them.
+        let mut downloads = None;
         for path in [NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH] {
             if let Some(old) = asset_dao::find_asset(&mut **tx, comp.id, path)
                 .await
                 .map_err(RepoError::from)?
             {
+                if path == NUPKG_ASSET_PATH {
+                    downloads = Some(
+                        sqlx::query!(
+                            r#"SELECT download_count, last_downloaded_at FROM asset WHERE id = $1"#,
+                            old.id
+                        )
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_err(RepoError::from)?,
+                    );
+                }
                 sqlx::query!(r#"DELETE FROM asset WHERE id = $1"#, old.id)
                     .execute(&mut **tx)
                     .await
@@ -882,6 +976,21 @@ impl HostedWrite {
             nuspec_size,
         )
         .await?;
+        if let Some(downloads) = downloads {
+            sqlx::query!(
+                r#"
+                UPDATE asset SET download_count = $3, last_downloaded_at = $4
+                WHERE component_id = $1 AND path = $2
+                "#,
+                comp.id,
+                NUPKG_ASSET_PATH,
+                downloads.download_count,
+                downloads.last_downloaded_at,
+            )
+            .execute(&mut **tx)
+            .await
+            .map_err(RepoError::from)?;
+        }
         Ok(true)
     }
 
@@ -949,7 +1058,11 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // A version that does not parse was never published: 404, as NuGet
+        // clients expect for an unknown version, not 400.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -1087,7 +1200,10 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // Unparsable: never published (404), as in `delete_component`.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }

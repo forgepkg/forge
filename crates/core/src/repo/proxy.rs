@@ -42,6 +42,11 @@
 //!   `now − first_seen_at ≥ package_delay_seconds`. Inside the window it is
 //!   omitted from enumeration/registration/search and direct download 404s. A
 //!   delay-gated 404 is **never** written to the not-found negative cache.
+//!   The delay quarantines new releases: when a listing refresh finds
+//!   versions inside it, `first_seen_at` is moved back to the upstream
+//!   registration's publish time of each listed version (a plausible one; see
+//!   `date_delay_from_upstream`), so a release published long ago is served
+//!   at its first sighting.
 //! * **Negative cache** — a genuine upstream 404 sets `not_found = true` +
 //!   `not_found_at = now()`, honored for `not_found_ttl_seconds` — by direct
 //!   downloads *and* listings; an expired marker hides nothing. An upstream
@@ -127,6 +132,13 @@ pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
+
+/// The earliest upstream publish time the package delay trusts
+/// (2010-01-01, before any NuGet feed): nuget.org reports unlisted versions as
+/// published in 1900.
+fn min_trusted_publish_time() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_262_304_000, 0).expect("valid timestamp")
+}
 
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
@@ -517,6 +529,14 @@ impl ProxyRepo {
         )
     }
 
+    /// The database's clock. Every time this module compares with is written
+    /// by Postgres (`first_seen_at`, `not_found_at`, `fetched_at`,
+    /// `metadata_refreshed_at`), so comparing it with the application's clock
+    /// would shift the package delay and the TTLs by the clock skew.
+    async fn db_now(&self) -> Result<DateTime<Utc>, RepoError> {
+        Ok(forge_db::db_now(&self.pool).await?)
+    }
+
     /// Whether a version with the given `first_seen_at` has cleared the proxy's
     /// package-delay window and may now be served/enumerated.
     fn delay_cleared(repo: &Repository, first_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -619,7 +639,7 @@ impl ProxyRepo {
                 (stored.remote_url == remote_url).then_some((stored.resources, idx.fetched_at))
             });
         if let Some((resources, fetched_at)) = &persisted {
-            if Utc::now() - *fetched_at < ttl {
+            if self.db_now().await? - *fetched_at < ttl {
                 return Ok(resources.clone());
             }
         }
@@ -652,6 +672,20 @@ impl ProxyRepo {
             }
         };
         let resources = UpstreamResources::from_service_index(&doc);
+        // An index without a package base address is not a NuGet V3 service
+        // index (a captive portal, a gateway's error page, a mistyped URL):
+        // an upstream failure, never stored over the last good index. Taken
+        // for an empty upstream, it would answer every id 404.
+        if resources.package_base_address.is_none() {
+            let e = RepoError::Storage(format!(
+                "upstream service index {remote_url} advertises no PackageBaseAddress"
+            ));
+            if let Some((resources, _)) = persisted {
+                tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
+                return Ok(resources);
+            }
+            return Err(e);
+        }
         let resources_json = serde_json::to_value(PersistedIndex {
             remote_url: remote_url.to_string(),
             resources: resources.clone(),
@@ -726,7 +760,9 @@ impl ProxyRepo {
     async fn refresh_versions(&self, repo: &Repository, lower_id: &str) -> Result<bool, RepoError> {
         let resources = Box::pin(self.resolve_upstream_index(repo)).await?;
         let Some(base) = resources.package_base_address else {
-            return Ok(true);
+            return Err(RepoError::Storage(
+                "upstream advertises no PackageBaseAddress".into(),
+            ));
         };
         let url = format!("{base}{lower_id}/index.json");
         match self.fetch_json(repo, &url).await? {
@@ -747,14 +783,26 @@ impl ProxyRepo {
 
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
-                // upstream) and drop a stale package-level not-found marker.
+                // upstream; still missing one metadata TTL after the first
+                // listing that left them out, since one partial listing is no
+                // deletion) and drop a stale package-level not-found marker.
                 // An empty listing retires nothing: a feed answers 404 for a
                 // package without versions, so an empty 200 is a degraded
                 // upstream (an offline or partially synced mirror), not a
                 // deletion of every version, downloaded ones included.
                 proxy_dao::upsert_cached_versions(&self.pool, repo.id, lower_id, &versions).await?;
                 if !versions.is_empty() {
-                    proxy_dao::reconcile_listing(&self.pool, repo.id, lower_id, &versions).await?;
+                    proxy_dao::reconcile_listing(
+                        &self.pool,
+                        repo.id,
+                        lower_id,
+                        &versions,
+                        Self::metadata_ttl(repo).num_seconds(),
+                    )
+                    .await?;
+                }
+                if repo.package_delay_seconds > 0 {
+                    self.date_delay_from_upstream(repo, lower_id).await;
                 }
                 Ok(true)
             }
@@ -801,8 +849,12 @@ impl ProxyRepo {
         lower_id: &str,
         version: &str,
     ) -> Result<bool, RepoError> {
-        let row = proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?;
-        Ok(row.is_some_and(|row| Self::not_found_live(repo, &row, Utc::now())))
+        let Some(row) =
+            proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
+        else {
+            return Ok(false);
+        };
+        Ok(Self::not_found_live(repo, &row, self.db_now().await?))
     }
 
     /// Write/refresh a genuine-404 negative-cache marker.
@@ -850,15 +902,16 @@ impl ProxyRepo {
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
         {
+            let now = self.db_now().await?;
             if row.downloaded {
-                if !Self::delay_cleared(repo, row.first_seen_at, Utc::now()) {
+                if !Self::delay_cleared(repo, row.first_seen_at, now) {
                     return Ok(None);
                 }
                 if let Some(loc) = self.local_nupkg(repo.id, lower_id, version).await? {
                     return Ok(Some(loc));
                 }
                 // Marked downloaded but the local copy is gone: re-fetch below.
-            } else if Self::not_found_live(repo, &row, Utc::now()) {
+            } else if Self::not_found_live(repo, &row, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
                 return Ok(None);
             }
@@ -911,12 +964,13 @@ impl ProxyRepo {
             let locked =
                 proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version)
                     .await?;
+            let now = forge_db::db_now(&mut *tx).await?;
 
             // Decide on the locked row, then release the lock before any
             // further query.
             tx.commit().await?;
             if locked.downloaded {
-                if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+                if !Self::delay_cleared(repo, locked.first_seen_at, now) {
                     return Ok(None);
                 }
                 // A racing caller already finished the fetch.
@@ -928,7 +982,7 @@ impl ProxyRepo {
                 // the missing copy (`first_seen_at` and confirmation stay).
                 tracing::info!(repo = %repo.name, id = %lower_id, %version, "cached proxy package is missing locally; fetching it again");
                 proxy_dao::mark_not_downloaded(&self.pool, locked.id).await?;
-            } else if Self::not_found_live(repo, &locked, Utc::now()) {
+            } else if Self::not_found_live(repo, &locked, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
                 return Ok(None);
             }
@@ -953,7 +1007,7 @@ impl ProxyRepo {
 
         // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
         let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
-        let requested_at = Utc::now();
+        let requested_at = self.db_now().await?;
         // §12.5: decrypt-on-use; the plaintext lives only inside this request
         // (and the zeroizing secret wrapper) — never in a log or model.
         let resp = {
@@ -1114,8 +1168,9 @@ impl ProxyRepo {
         // A racing caller finished while we were fetching. The blob we stored is
         // already on disk (CAS dedup); just roll back and serve the local copy.
         if locked.downloaded {
+            let now = forge_db::db_now(&mut *tx).await?;
             tx.rollback().await?;
-            if !Self::delay_cleared(repo, locked.first_seen_at, Utc::now()) {
+            if !Self::delay_cleared(repo, locked.first_seen_at, now) {
                 return Ok(None);
             }
             return self.local_nupkg(repo.id, lower_id, version).await;
@@ -1203,7 +1258,7 @@ impl ProxyRepo {
         }
 
         // Delay gate on the recorded first sighting.
-        if !Self::delay_cleared(repo, first_seen_at, Utc::now()) {
+        if !Self::delay_cleared(repo, first_seen_at, self.db_now().await?) {
             return Ok(None);
         }
         self.local_nupkg(repo.id, lower_id, version).await
@@ -1234,7 +1289,10 @@ impl ProxyRepo {
                 Some(first_seen) => Some(first_seen),
                 None => confirmed(&self.discover_versions(repo, lower_id).await?),
             };
-            Ok(first_seen.is_some_and(|at| Self::delay_cleared(repo, at, Utc::now())))
+            Ok(match first_seen {
+                Some(at) => Self::delay_cleared(repo, at, self.db_now().await?),
+                None => false,
+            })
         })
     }
 
@@ -1408,7 +1466,7 @@ impl ProxyRepo {
                     .await
                     .map_err(|e| e.to_string())?;
                 let Some(base) = resources.package_base_address else {
-                    return Ok(None);
+                    return Err("upstream advertises no PackageBaseAddress".to_string());
                 };
                 let url = format!("{base}{lower_id}/{version}/{lower_id}.nuspec");
                 let creds = self.credentials(repo).await.map_err(|e| e.to_string())?;
@@ -1691,14 +1749,17 @@ impl ProxyRepo {
         enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        let now = Utc::now();
+        let now = self.db_now().await?;
         // The `listable` conditions as bounds: past the delay window, and no
         // not-found marker younger than the TTL.
         let seen_before = now - Duration::seconds(i64::from(repo_row.package_delay_seconds));
         let marked_after = now - Self::not_found_ttl(&repo_row);
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
-        // The version regex is `is_semver2`: build metadata, or a `.` after a `-`.
+        // SemVer 2.0.0 for legacy clients: a `.` after a `-`. `version` is the
+        // normalized form, which never holds build metadata, so a version whose
+        // only SemVer 2.0.0 feature is `+metadata` is shown as its normalized
+        // form, which those clients read (hosted filters `version_original`).
         let names = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT name AS "name!"
@@ -1708,7 +1769,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '[+]|-.*[.]')
+              AND ($6 OR version !~ '-.*[.]')
             ORDER BY name
             "#,
             repo_row.id,
@@ -1745,7 +1806,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '[+]|-.*[.]')
+              AND ($6 OR version !~ '-.*[.]')
             "#,
             repo_row.id,
             &page,
@@ -1766,6 +1827,12 @@ impl ProxyRepo {
             });
         }
 
+        // The id as the package spells it (rows hold the lowercased one).
+        let original_ids: HashMap<String, String> =
+            proxy_dao::original_ids(&self.pool, repo_row.id, &page)
+                .await?
+                .into_iter()
+                .collect();
         let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
         for name in &page {
             let Some(mut versions) = by_id.remove(name) else {
@@ -1773,6 +1840,13 @@ impl ProxyRepo {
                 continue;
             };
             versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+            let original_id = original_ids
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            for v in &mut versions {
+                v.original_id.clone_from(&original_id);
+            }
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -1794,7 +1868,12 @@ impl ProxyRepo {
         use futures_util::StreamExt;
         let wanted: Vec<(String, String)> = hits
             .iter()
-            .map(|hit| (hit.original_id.clone(), hit.latest_version.clone()))
+            .map(|hit| {
+                (
+                    self.format.lower_id(&hit.original_id),
+                    hit.latest_version.clone(),
+                )
+            })
             .collect();
         let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
             .map(|(id, version)| async move {
@@ -1812,148 +1891,17 @@ impl ProxyRepo {
             hit.nuspec_bytes = manifest;
         }
     }
-}
-
-/// Concurrent local manifest reads while enriching one proxy search page.
-const SEARCH_ENRICH_CONCURRENCY: usize = 8;
-
-/// Fire a best-effort proxy download-tracking bump off the response hot path
-/// (slice 12.1 §3.7). Failures are logged, not propagated — the data only feeds
-/// retention's download-sensitive criteria and is non-authoritative.
-fn spawn_proxy_download_bump(pool: PgPool, repo_id: i64, name: String, version: String) {
-    tokio::spawn(async move {
-        if let Err(e) =
-            forge_db::download_dao::bump_proxy_download_by_name(&pool, repo_id, &name, &version)
-                .await
-        {
-            tracing::warn!(error = %e, repo_id, %name, %version, "proxy download tracking bump failed");
-        }
-    });
-}
-
-#[async_trait]
-impl RepoReadOps for ProxyRepo {
-    async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
-        let repo_row = self.proxy_repo(repo).await?;
-        let Some(lower) = self.upstream_id(id) else {
-            return Ok(Vec::new());
-        };
-
-        // Honor a still-valid genuine-404 negative cache for the whole id.
-        if self.negative_cached(&repo_row, &lower, "*").await? {
-            return Ok(Vec::new());
-        }
-
-        let rows = self.discover_versions(&repo_row, &lower).await?;
-        let now = Utc::now();
-        let mut versions: Vec<VersionEntry> = rows
-            .into_iter()
-            .filter(|r| Self::listable(&repo_row, r, now))
-            .map(|r| VersionEntry {
-                original_id: r.name.clone(),
-                version: r.version.clone(),
-                version_original: r.version.clone(),
-                listed: r.listed,
-            })
-            .collect();
-        versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
-        Ok(versions)
-    }
-
-    async fn resolve_nupkg(
+    /// The registration entries of `id`: every listable version, or only
+    /// those in `only` (normalized). The upstream registration is consulted
+    /// for the versions returned only, so a registration page or leaf fetches
+    /// just the upstream pages covering its own versions (an index of more
+    /// versions than [`MAX_REGISTRATION_PAGES`] upstream pages hold is paged,
+    /// never rendered whole).
+    async fn registration_of(
         &self,
         repo: &str,
         id: &str,
-        version: &str,
-    ) -> Result<Option<NupkgLocation>, RepoError> {
-        let repo_row = self.proxy_repo(repo).await?;
-        let Some(lower) = self.upstream_id(id) else {
-            return Ok(None);
-        };
-        let norm = self
-            .format
-            .normalize_version(version)
-            .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
-        let loc = Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await?;
-        if loc.is_some() {
-            // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
-            // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
-            // proxy "not pulled in X days" eviction) + mirror onto the parallel
-            // component/asset. Best-effort, off the hot path — never blocks or
-            // fails the download.
-            spawn_proxy_download_bump(self.pool.clone(), repo_row.id, lower, norm);
-        }
-        Ok(loc)
-    }
-
-    /// Serve the manifest of a proxied version: the locally stored `.nuspec`
-    /// once the package is cached, otherwise the upstream's flat-container
-    /// `.nuspec` (without downloading the whole package). Delay-gated and
-    /// negative-cached exactly like the version listing.
-    async fn resolve_nuspec(
-        &self,
-        repo: &str,
-        id: &str,
-        version: &str,
-    ) -> Result<Option<Vec<u8>>, RepoError> {
-        let repo_row = self.proxy_repo(repo).await?;
-        let Some(lower) = self.upstream_id(id) else {
-            return Ok(None);
-        };
-        let Ok(norm) = self.format.normalize_version(version) else {
-            return Ok(None);
-        };
-
-        if let Some(row) =
-            proxy_dao::get_cached_version(&self.pool, repo_row.id, &lower, &norm).await?
-        {
-            if !row.not_found && !Self::delay_cleared(&repo_row, row.first_seen_at, Utc::now()) {
-                return Ok(None);
-            }
-            if row.downloaded {
-                if let Some(bytes) = self.local_nuspec(repo_row.id, &lower, &norm).await? {
-                    return Ok(Some(bytes));
-                }
-            }
-        }
-
-        if self.negative_cached(&repo_row, &lower, "*").await? {
-            return Ok(None);
-        }
-        // The version must be known upstream (and past its delay window).
-        let known = Box::pin(self.discover_versions(&repo_row, &lower))
-            .await?
-            .into_iter()
-            .any(|r| r.version == norm && Self::listable(&repo_row, &r, Utc::now()));
-        if !known {
-            return Ok(None);
-        }
-        if repo_row.online {
-            if let Some(bytes) = Box::pin(self.upstream_nuspec(&repo_row, &lower, &norm)).await? {
-                return Ok(Some(bytes));
-            }
-        }
-        // Upstream serves no manifest (or we are offline): fall back to the
-        // package itself, which also caches the manifest locally.
-        if Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm))
-            .await?
-            .is_some()
-        {
-            return self.local_nuspec(repo_row.id, &lower, &norm).await;
-        }
-        Ok(None)
-    }
-
-    /// Registration entries of the listable versions. `listed`, `published`
-    /// and — for versions not downloaded yet — the dependency groups come from
-    /// the upstream registration when it is available ([`Self::upstream_registration`]);
-    /// the dependency groups are handed to the format layer as a manifest
-    /// synthesized by [`Format::synthesize_manifest`]. A downloaded version
-    /// serves its stored manifest and package hash.
-    async fn registration(
-        &self,
-        repo: &str,
-        id: &str,
+        only: Option<&[String]>,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let Some(lower) = self.upstream_id(id) else {
@@ -1965,21 +1913,18 @@ impl RepoReadOps for ProxyRepo {
         }
 
         let rows = self.discover_versions(&repo_row, &lower).await?;
-        let now = Utc::now();
+        let now = self.db_now().await?;
         let mut visible: Vec<forge_db::model::ProxyCachedVersion> = rows
             .into_iter()
             .filter(|r| Self::listable(&repo_row, r, now))
+            .filter(|r| {
+                only.is_none_or(|only| only.iter().any(|v| v.eq_ignore_ascii_case(&r.version)))
+            })
             .collect();
         visible.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
 
         let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
-        let mut upstream = self.upstream_registration(&repo_row, &lower, &wanted).await;
-        // Leaves naming another package are not this package's metadata.
-        upstream.retain(|_, leaf| {
-            leaf.id
-                .as_deref()
-                .is_none_or(|id| self.format.lower_id(id) == lower)
-        });
+        let upstream = self.upstream_leaves(&repo_row, &lower, &wanted).await;
 
         // Persist the upstream listing state so the flat index and search
         // report it too (best effort).
@@ -2000,14 +1945,28 @@ impl RepoReadOps for ProxyRepo {
         // versions: one query for all of them, with the manifest summary
         // stored at download. A version cached before summaries were stored
         // has its manifest read once (bounded concurrency) and backfilled.
-        let mut cached: HashMap<String, component_dao::RegistrationRow> =
-            component_dao::list_registration_rows(
-                &self.pool,
-                repo_row.id,
-                &lower,
-                NUPKG_ASSET_PATH,
-            )
-            .await?
+        let rows = match only {
+            None => {
+                component_dao::list_registration_rows(
+                    &self.pool,
+                    repo_row.id,
+                    &lower,
+                    NUPKG_ASSET_PATH,
+                )
+                .await?
+            }
+            Some(_) => {
+                component_dao::list_registration_rows_for_versions(
+                    &self.pool,
+                    repo_row.id,
+                    &lower,
+                    &wanted,
+                    NUPKG_ASSET_PATH,
+                )
+                .await?
+            }
+        };
+        let mut cached: HashMap<String, component_dao::RegistrationRow> = rows
             .into_iter()
             .map(|row| (row.version.clone(), row))
             .collect();
@@ -2077,6 +2036,287 @@ impl RepoReadOps for ProxyRepo {
             });
         }
         Ok(out)
+    }
+
+    /// [`Self::upstream_registration`] for `wanted`, without leaves that name
+    /// another package (they are not this package's metadata). Records the
+    /// package id's upstream casing for search (best effort).
+    async fn upstream_leaves(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        wanted: &[String],
+    ) -> HashMap<String, UpstreamLeaf> {
+        let mut upstream = self.upstream_registration(repo, lower_id, wanted).await;
+        upstream.retain(|_, leaf| {
+            leaf.id
+                .as_deref()
+                .is_none_or(|id| self.format.lower_id(id) == lower_id)
+        });
+        if let Some(original_id) = upstream.values().find_map(|leaf| leaf.id.as_deref()) {
+            if let Err(e) =
+                proxy_dao::record_original_id(&self.pool, repo.id, lower_id, original_id).await
+            {
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "recording the upstream id casing failed");
+            }
+        }
+        upstream
+    }
+
+    /// Date the package delay of `lower_id`'s versions still inside it from
+    /// when the upstream published them, instead of from their first
+    /// sighting here. The delay quarantines *new releases*: without this, a
+    /// version published years ago but first seen now (every version of a
+    /// package this proxy has not served before, all of them on a fresh
+    /// install) was hidden for the whole delay.
+    ///
+    /// Only a listed version's upstream publish time counts, and only a
+    /// plausible one: nuget.org reports unlisted versions as published in
+    /// 1900, which would let a release unlisted right after publishing skip
+    /// the quarantine, and a time in the future is ignored. Best effort: when
+    /// the upstream registration is unavailable, the first sighting stands.
+    async fn date_delay_from_upstream(&self, repo: &Repository, lower_id: &str) {
+        let result: Result<(), RepoError> = async {
+            let now = self.db_now().await?;
+            let pending: Vec<forge_db::model::ProxyCachedVersion> = self
+                .cached_rows(repo.id, lower_id)
+                .await?
+                .into_iter()
+                .filter(|r| !Self::delay_cleared(repo, r.first_seen_at, now))
+                .collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let wanted: Vec<String> = pending.iter().map(|r| r.version.clone()).collect();
+            let leaves = self.upstream_leaves(repo, lower_id, &wanted).await;
+            let (versions, published): (Vec<String>, Vec<DateTime<Utc>>) = pending
+                .iter()
+                .filter_map(|r| {
+                    let leaf = leaves.get(&r.version).filter(|leaf| leaf.listed)?;
+                    let at = leaf
+                        .published
+                        .filter(|at| *at >= min_trusted_publish_time() && *at <= now)?;
+                    (at < r.first_seen_at).then(|| (r.version.clone(), at))
+                })
+                .unzip();
+            proxy_dao::backdate_first_seen(&self.pool, repo.id, lower_id, &versions, &published)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "dating the package delay from the upstream failed");
+        }
+    }
+}
+
+/// Concurrent local manifest reads while enriching one proxy search page.
+const SEARCH_ENRICH_CONCURRENCY: usize = 8;
+
+/// Fire a best-effort proxy download-tracking bump off the response hot path
+/// (slice 12.1 §3.7). Failures are logged, not propagated — the data only feeds
+/// retention's download-sensitive criteria and is non-authoritative.
+fn spawn_proxy_download_bump(pool: PgPool, repo_id: i64, name: String, version: String) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            forge_db::download_dao::bump_proxy_download_by_name(&pool, repo_id, &name, &version)
+                .await
+        {
+            tracing::warn!(error = %e, repo_id, %name, %version, "proxy download tracking bump failed");
+        }
+    });
+}
+
+#[async_trait]
+impl RepoReadOps for ProxyRepo {
+    async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(Vec::new());
+        };
+
+        // Honor a still-valid genuine-404 negative cache for the whole id.
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(Vec::new());
+        }
+
+        let rows = self.discover_versions(&repo_row, &lower).await?;
+        let now = self.db_now().await?;
+        let mut versions: Vec<VersionEntry> = rows
+            .into_iter()
+            .filter(|r| Self::listable(&repo_row, r, now))
+            .map(|r| VersionEntry {
+                original_id: r.name.clone(),
+                version: r.version.clone(),
+                version_original: r.version.clone(),
+                listed: r.listed,
+            })
+            .collect();
+        versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+        Ok(versions)
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
+        let norm = self
+            .format
+            .normalize_version(version)
+            .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
+        let loc = Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await?;
+        if loc.is_some() {
+            // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
+            // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
+            // proxy "not pulled in X days" eviction) + mirror onto the parallel
+            // component/asset. Best-effort, off the hot path — never blocks or
+            // fails the download.
+            spawn_proxy_download_bump(self.pool.clone(), repo_row.id, lower, norm);
+        }
+        Ok(loc)
+    }
+
+    /// Like [`Self::resolve_nupkg`] (the package is cached on first sight), but
+    /// a `HEAD` is not a pull: nothing is stamped.
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
+        let norm = self
+            .format
+            .normalize_version(version)
+            .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
+        Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await
+    }
+
+    /// Serve the manifest of a proxied version: the locally stored `.nuspec`
+    /// once the package is cached, otherwise the upstream's flat-container
+    /// `.nuspec` (without downloading the whole package). Delay-gated and
+    /// negative-cached exactly like the version listing.
+    async fn resolve_nuspec(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(None);
+        };
+        let Ok(norm) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+
+        if let Some(row) =
+            proxy_dao::get_cached_version(&self.pool, repo_row.id, &lower, &norm).await?
+        {
+            if !row.not_found
+                && !Self::delay_cleared(&repo_row, row.first_seen_at, self.db_now().await?)
+            {
+                return Ok(None);
+            }
+            if row.downloaded {
+                if let Some(bytes) = self.local_nuspec(repo_row.id, &lower, &norm).await? {
+                    return Ok(Some(bytes));
+                }
+            }
+        }
+
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(None);
+        }
+        // The version must be known upstream (and past its delay window).
+        let rows = Box::pin(self.discover_versions(&repo_row, &lower)).await?;
+        let now = self.db_now().await?;
+        let known = rows
+            .into_iter()
+            .any(|r| r.version == norm && Self::listable(&repo_row, &r, now));
+        if !known {
+            return Ok(None);
+        }
+        if repo_row.online {
+            if let Some(bytes) = Box::pin(self.upstream_nuspec(&repo_row, &lower, &norm)).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        // Upstream serves no manifest (or we are offline): fall back to the
+        // package itself, which also caches the manifest locally.
+        if Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm))
+            .await?
+            .is_some()
+        {
+            return self.local_nuspec(repo_row.id, &lower, &norm).await;
+        }
+        Ok(None)
+    }
+
+    /// Registration entries of the listable versions. `listed`, `published`
+    /// and — for versions not downloaded yet — the dependency groups come from
+    /// the upstream registration when it is available ([`Self::upstream_registration`]);
+    /// the dependency groups are handed to the format layer as a manifest
+    /// synthesized by [`Format::synthesize_manifest`]. A downloaded version
+    /// serves its stored manifest and package hash.
+    async fn registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration_of(repo, id, None).await
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        // The listing alone: an index that does not inline its leaves needs
+        // no upstream registration.
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(Vec::new());
+        };
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(Vec::new());
+        }
+        let rows = self.discover_versions(&repo_row, &lower).await?;
+        let now = self.db_now().await?;
+        let mut versions: Vec<String> = rows
+            .into_iter()
+            .filter(|r| Self::listable(&repo_row, r, now))
+            .map(|r| r.version)
+            .collect();
+        versions.sort_by(|a, b| self.format.compare_versions(a, b));
+        Ok(versions)
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration_of(repo, id, Some(versions)).await
+    }
+
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration_of(repo, id, Some(&[version.to_string()]))
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {

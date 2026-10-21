@@ -1,26 +1,27 @@
 import type { MemberView } from '~/api/repositories'
-import { Badge } from '~/components/catalyst/badge'
+import { Checkbox } from '~/components/catalyst/checkbox'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 
 /**
- * Read-only ordered group-member list (plan §6, §Phase 4). Members are shown
- * sorted by descending priority — the highest-priority member wins ties per
- * slice-1 §7. Each row offers a remove action.
+ * Ordered group-member list (plan §6, §Phase 4). Members are shown sorted by
+ * descending priority — the highest-priority member wins ties per slice-1 §7.
+ * Each row offers an owner toggle and a remove action.
  *
- * **Reconciliation note:** slice-1's group API exposes only *add* (`POST .../members`
- * with a unique `priority`) and *remove* (`DELETE .../members/{member}`) — there
- * is **no** priority-update / reorder endpoint (`repository_dao` has
- * `add_group_member` / `remove_group_member` and no update). So this list does
- * not offer in-place reorder (which would require a priority-update call that
- * does not exist); changing a member's priority is expressed as remove + re-add
- * at the new priority via the add form. The priority is *displayed* here so the
- * winner ordering is visible, and the add form enforces uniqueness.
+ * **Reconciliation note:** the group API has *add* (`POST .../members` with a
+ * unique `priority`), *remove* (`DELETE .../members/{member}`) and an
+ * owner-only update (`PATCH .../members/{member}` `{"owner": bool}`) — there
+ * is **no** priority-update / reorder endpoint. So this list does not offer
+ * in-place reorder; changing a member's priority is expressed as remove +
+ * re-add at the new priority via the add form. The priority is *displayed*
+ * here so the winner ordering is visible, and the add form enforces
+ * uniqueness. A proxy cannot own package ids, so its toggle is disabled.
  */
 export interface PriorityListProps {
   members: MemberView[]
-  /** Disable the remove control while a mutation is in flight. */
+  /** Disable the row controls while a mutation is in flight. */
   busy: boolean
   onRemove: (member: string) => void
+  onToggleOwner: (member: string, owner: boolean) => void
 }
 
 /** Members sorted by descending priority (highest first = wins ties). */
@@ -28,7 +29,12 @@ export function sortByPriority(members: MemberView[]): MemberView[] {
   return [...members].sort((a, b) => b.priority - a.priority)
 }
 
-export function PriorityList({ members, busy, onRemove }: PriorityListProps) {
+export function PriorityList({
+  members,
+  busy,
+  onRemove,
+  onToggleOwner,
+}: PriorityListProps) {
   const ordered = sortByPriority(members)
 
   if (ordered.length === 0) {
@@ -57,17 +63,28 @@ export function PriorityList({ members, busy, onRemove }: PriorityListProps) {
               {m.name}
             </span>
             <RepoKindBadge kind={m.kind} />
-            {m.owner && (
-              <Badge color="emerald" title="Owns this group's package ids">
-                owner
-              </Badge>
-            )}
+          </span>
+          <span
+            className="ml-auto flex items-center gap-2 text-zinc-600 dark:text-zinc-400"
+            title={
+              m.kind === 'proxy'
+                ? 'A proxy member cannot own package ids'
+                : "Owns this group's package ids"
+            }
+          >
+            <Checkbox
+              checked={m.owner}
+              disabled={busy || (m.kind === 'proxy' && !m.owner)}
+              onChange={(owner) => onToggleOwner(m.name, owner)}
+              aria-label={`${m.name} owner`}
+            />
+            owner
           </span>
           <button
             type="button"
             disabled={busy}
             onClick={() => onRemove(m.name)}
-            className="ml-auto font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
+            className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
           >
             Remove
           </button>

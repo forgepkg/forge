@@ -143,10 +143,10 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 > **Admin UI paths:** the admin screens live under **`/manage/*`**
 > (`/manage/repositories`, `/manage/users/<id>`, `/manage/realms`, ...);
 > `/admin/*` belongs to the admin REST API, which is routed before the SPA
-> fallback. (Until 0.1.0 the UI shared `/admin/*`, so a refresh, bookmark or
-> deep link of an admin screen got raw JSON, a 404 or a 405.) A browser
-> navigation (`Sec-Fetch-Dest: document`, or an `Accept` preferring
-> `text/html`) to a former UI path such as `/admin/repositories?x=1` is
+> fallback. (Before the first release, 1.0.0, the UI shared `/admin/*`, so a
+> refresh, bookmark or deep link of an admin screen got raw JSON, a 404 or a
+> 405.) A browser navigation (`Sec-Fetch-Dest: document`, or an `Accept`
+> preferring `text/html`) to a former UI path such as `/admin/repositories?x=1` is
 > 302-redirected to `/manage/repositories?x=1`; API requests to `/admin/*` are
 > unchanged. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
 > `crates/server/tests/web_ui.rs`. In Vite dev (`:8420`) `/manage/*` is served
@@ -311,6 +311,16 @@ authenticated account (e.g. `login` for GitHub's `/user`): that name, in
 canonical form, must equal the username entered, or the login is rejected; a
 success without it fails closed.
 
+`identity_path` also matters for deactivation. A directory often accepts
+other spellings of one account (`CORP\mallory`, `mallory@corp`), and Forge
+provisions each spelling it forwards as an account of its own. Deactivating
+`mallory` then does not stop a login as `corp\mallory` unless the upstream
+names the account it authenticated (`identity_path`), or `auto_provision` is
+off, or the user is disabled in the directory too. Names a directory could
+fold onto another account by Unicode alone (full-width letters, a soft
+hyphen, zero-width characters) are never forwarded. Forge logs a warning for
+an auto-provisioning realm without `identity_path`.
+
 Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":
 true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the
@@ -414,6 +424,12 @@ identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the
 username when `email_verified` is true.
 
+The discovery document's token, JWKS and authorization endpoints must live on
+the issuer's host. An IdP that serves them elsewhere needs those hosts in the
+realm's `endpoint_hosts`: for Google (issuer `https://accounts.google.com`)
+`["oauth2.googleapis.com", "www.googleapis.com"]`; restrict it to your
+Workspace domain with `required_claims = {"hd": ["corp.example"]}`.
+
 ### Multi-instance / scale-out
 
 All ephemeral flow state (`state`/`nonce`/PKCE verifier/redirect) and all
@@ -500,6 +516,17 @@ and the static SPA on a single port (no Node in prod):
    the `migrations/` dir, and a baked secret-free base config at `/app/forge.toml`
    (migrations are also embedded into the binary via `sqlx::migrate!`).
 
+The runtime image carries `LICENSE` and the third-party notices of what it
+redistributes in `/usr/share/doc/forge/`: `THIRD-PARTY-RUST.txt` for the
+crates compiled into the binary (cargo-about, configured in
+`docker/licenses/about.toml`; a crate under a license missing from its
+`accepted` list fails the build) and `THIRD-PARTY-WEB.txt` for the npm
+packages the SPA ships (`pnpm licenses list --prod`, rendered by
+`docker/licenses/web-notices.mjs`). The binary is built with `cargo auditable`,
+so it embeds its crate list for SBOM generators and image scanners, and the
+`web` and `builder` stages declare `BUILDKIT_SBOM_SCAN_STAGE`, so the release's
+SBOM attestation covers the npm packages and crates, not just Debian's.
+
 ```bash
 cargo xtask docker-build       # docker build -t envisia-forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
@@ -519,23 +546,69 @@ image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
 Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
-`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it.
+`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
+unless the `[Unreleased]` section of `CHANGELOG.md` is empty (entries left
+there would be missing from the release notes).
 
-`cargo xtask release` makes those edits and the tag in one step:
+`main` only accepts commits whose required checks passed, so the release
+commit goes through a pull request and the tag goes on the merge commit; a
+direct `git push origin main v1.0.1` of the release commit is refused.
+`cargo xtask release <version> --no-tag` prepares the commit:
 
 ```bash
-cargo xtask release 0.2.0          # on an up-to-date, clean main
-git push --atomic origin main v0.2.0
+git switch -c release-1.0.1 origin/main   # clean and up to date
+cargo xtask release 1.0.1 --no-tag        # commits `release: v1.0.1`
+git push -u origin release-1.0.1          # open a pull request, merge it
 ```
 
-It sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
---workspace`), `web/package.json`, the Kubernetes base and the Helm chart, renames
-`## [Unreleased]` in `CHANGELOG.md` to `## [0.2.0]` (keeping a section that
-already exists) and updates the links at its bottom, commits
-`release: v0.2.0`, and creates the annotated tag. It pushes nothing. When
-`main` only takes pull requests, run it with `--no-tag` on a branch, merge the
-pull request, and tag the merge commit (`git tag -a v0.2.0 -m v0.2.0
-<commit>`).
+Then wait until CI on the merge commit is green, **including `e2e` and
+`web-e2e`**: they run only on `main`, after the merge, never on the pull
+request. Every push to `main` gets its own CI run, which a later push never
+cancels. The release workflow checks this as well: before it builds anything,
+it waits (up to an hour) for the tagged commit's CI run on `main` and fails
+unless every job of it passed. Tag that commit and push the tag:
+
+```bash
+git fetch origin
+git tag -a v1.0.1 -m v1.0.1 <merge commit>
+git push origin v1.0.1
+```
+
+The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart,
+renames `## [Unreleased]` in `CHANGELOG.md` to `## [1.0.1]` under a new, empty
+`[Unreleased]`, updates the links at its bottom, and commits
+`release: v1.0.1`. It pushes nothing. A `## [1.0.1]` section drafted ahead of
+time is kept as it is, but only while `[Unreleased]` is empty; with entries
+in both, the release is refused. It also refuses a changelog with a version
+section whose tag does not exist (a section drafted for a release that then
+got another number): fold its entries into `[Unreleased]` first. Run without
+`--no-tag` on a clean `main`, it also creates the annotated tag, for a
+repository whose `main` accepts direct pushes.
+
+**First release only.** GHCR creates a package of a user account as
+**private**, whatever the repository's visibility, and there is no REST API
+to change it. After the first release run, open each package's settings
+(profile → **Packages** → the package → **Package settings**) for
+`ghcr.io/schmitch/forge` (the image) and `ghcr.io/schmitch/charts/forge` (the
+chart):
+
+1. Under **Danger Zone → Change visibility**, make both **Public**.
+2. On the chart, under **Manage Actions access**, give the `schmitch/forge`
+   repository the **Write** role if it is not listed. Without it the next
+   release's `helm push` fails after the image tags have already moved.
+
+Both packages name the repository in `org.opencontainers.image.source`: the
+image through `docker/metadata-action`, the chart because `helm push` copies
+the first `sources` entry of `Chart.yaml` into that annotation.
+
+**After every release**, check that both can be pulled without credentials
+(Helm keeps its own registry login, so log out of both):
+
+```bash
+docker logout ghcr.io; helm registry logout ghcr.io
+docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
+```
 
 ### Upgrade boundary for migration 0011
 

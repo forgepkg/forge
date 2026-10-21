@@ -66,6 +66,7 @@
     },
     "secretEnv": {
       "type": "object",
+      "description": "FORGE_* secrets, stored in the Secret <fullname>-secret-env that the chart creates",
       "additionalProperties": {
         "type": [
           "string",
@@ -75,7 +76,8 @@
       }
     },
     "existingSecret": {
-      "type": "string"
+      "type": "string",
+      "description": "An existing Secret with FORGE_* secrets; any name but <fullname>-secret-env, the chart's own"
     },
     "env": {
       "type": "array"

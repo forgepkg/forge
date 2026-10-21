@@ -1,7 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import { Heading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
+import { Code, Text } from '~/components/catalyst/text'
 
 export const Route = createFileRoute('/_app/manage/')({
   component: AdminHome,
@@ -11,12 +11,12 @@ const SECTIONS = [
   {
     to: '/manage/repositories',
     title: 'Repositories',
-    description: 'Hosted, proxy, and group repositories with retention.',
+    description: 'Hosted, proxy, and group repositories; group members and owners.',
   },
   {
     to: '/manage/users',
     title: 'Users & tokens',
-    description: 'Accounts, admin flags, and per-user registry tokens.',
+    description: 'Create and delete accounts; issue and revoke their registry tokens.',
   },
   {
     to: '/manage/realms',
@@ -28,7 +28,8 @@ const SECTIONS = [
 /**
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. Links to the repositories, users (incl. per-user tokens), and
- * authentication-realm management screens.
+ * authentication-realm management screens, and names what only the `/admin`
+ * API manages (CHANGELOG "Known limitations").
  */
 function AdminHome() {
   return (
@@ -37,7 +38,8 @@ function AdminHome() {
         <Heading>Administration</Heading>
         <Text className="mt-1">
           Manage repositories, users and their API tokens, and authentication
-          realms.
+          realms. Retention, RBAC roles and grants, user deactivation and key
+          rotation have no screen yet; use the <Code>/admin</Code> API.
         </Text>
       </div>
       <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

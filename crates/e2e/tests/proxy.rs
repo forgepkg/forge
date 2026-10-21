@@ -292,6 +292,7 @@ async fn upstream_metadata_is_served_before_download() {
     assert!(nuspec.contains("<id>Meta.Lib</id>"), "{nuspec}");
     assert_eq!(mock.nuspec_hits(), 1);
 
+    mock.set_published("Meta.Lib", "1.0.0", "2026-01-01T00:00:00+00:00");
     let resp = get_v3(&srv, "px-meta", "registration/meta.lib/index.json").await;
     assert_eq!(resp.status(), 200);
     let reg: Value = resp.json().await.unwrap();

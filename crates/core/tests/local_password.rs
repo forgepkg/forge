@@ -322,9 +322,9 @@ async fn basic_no_authorization_header_is_no_credentials() {
 }
 
 #[tokio::test]
-async fn basic_revoked_token_falls_through_to_password_chain() {
-    // A revoked token used as the basic secret is not a valid token; the secret
-    // then runs as a password. If it isn't a valid password either → Invalid.
+async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
+    // A revoked token used as the basic secret is not a valid token, and a
+    // token Forge issued is never run through the password chain (#71).
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", false, true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
@@ -718,4 +718,87 @@ async fn oversized_basic_username_is_invalid_and_never_tracked() {
     );
     assert_eq!(throttle.tracked(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// #70: Forge's own database failing is "temporarily unavailable" (503), not
+/// "invalid credentials", so NuGet clients and CI jobs retry instead of asking
+/// for new credentials. An upstream outage still answers like a wrong
+/// password (upstream health stays in the logs).
+#[tokio::test]
+async fn database_failures_on_the_password_path_are_unavailable() {
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", false, true).await;
+
+    // The local provider on a failing database (a closed pool fails every
+    // query, like an exhausted one).
+    let closed = common::pool().await;
+    closed.close().await;
+    assert_eq!(
+        LocalPasswordProvider::new(closed)
+            .authenticate(&cred(&username, "pw"))
+            .await,
+        AuthOutcome::Failed
+    );
+
+    // A provider whose store failed stops the chain.
+    let (failed, _) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Failed,
+        Duration::ZERO,
+    );
+    let (later, later_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(failed), Box::new(later)]));
+    assert_eq!(
+        chain.authenticate(&cred("someone", "pw")).await,
+        ChainOutcome::Failed
+    );
+    assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+    let throttle = Arc::new(LoginThrottle::new(2, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    for _ in 0..3 {
+        assert_eq!(
+            src.resolve(&basic_header("someone", "pw"), ip()).await,
+            SourceOutcome::Unavailable
+        );
+    }
+    assert!(
+        !throttle.is_locked(ip(), "someone"),
+        "an outage is not a failed password"
+    );
+
+    // An upstream outage answers like a wrong password.
+    let (down, _) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Unavailable,
+        Duration::ZERO,
+    );
+    let src = BasicAuthSource::with_chain(
+        pool.clone(),
+        Some(Arc::new(Chain::new(vec![Box::new(down)]))),
+    );
+    assert_eq!(
+        src.resolve(&basic_header("someone", "pw"), ip()).await,
+        SourceOutcome::Invalid
+    );
+
+    // Realms that cannot be read.
+    struct Unreadable;
+    #[async_trait::async_trait]
+    impl forge_core::auth::ChainSource for Unreadable {
+        async fn password_chain(
+            &self,
+        ) -> Result<Option<Arc<Chain>>, forge_core::auth::ChainUnavailable> {
+            Err(forge_core::auth::ChainUnavailable)
+        }
+    }
+    let src = BasicAuthSource::with_source(pool.clone(), Arc::new(Unreadable));
+    assert_eq!(
+        src.resolve(&basic_header(&username, "pw"), ip()).await,
+        SourceOutcome::Unavailable
+    );
 }

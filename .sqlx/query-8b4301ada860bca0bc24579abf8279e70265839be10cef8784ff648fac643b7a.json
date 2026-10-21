@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version\n        SET not_found = false,\n            not_found_at = NULL,\n            upstream_missing = false,\n            missing_since = NULL,\n            metadata_refreshed_at = NULL\n        WHERE repository_id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b4301ada860bca0bc24579abf8279e70265839be10cef8784ff648fac643b7a"
+}

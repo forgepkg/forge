@@ -439,7 +439,9 @@ async fn prefer_hosted_shields_internal_id_from_anonymous_callers() {
         .await
         .unwrap();
     assert_eq!(search["totalHits"], 1);
-    assert_eq!(search["data"][0]["id"], "public.lib");
+    // Under the id's own casing (the cached manifest's), not the lowercased
+    // one the proxy's rows hold.
+    assert_eq!(search["data"][0]["id"], "Public.Lib");
     assert_eq!(search["data"][0]["description"], "generated test package");
 }
 

@@ -153,7 +153,10 @@ Release:
                 Set <version> in Cargo.toml/Cargo.lock, web/package.json and the
                 Kubernetes base's image tag, turn CHANGELOG.md's [Unreleased] into
                 its section, commit, and tag v<version> (default branch only).
-                --no-tag: commit only, for a release pull request. Never pushes.
+                Refuses a changelog with an untagged version section, or with
+                entries under [Unreleased] next to a drafted <version> section.
+                --no-tag: commit only, for a release pull request (tag the merge
+                commit once its CI is green). Never pushes.
 
   help          Show this help.
 "#

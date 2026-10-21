@@ -684,6 +684,60 @@ async fn forged_tag_generations_do_not_stop_later_invalidations() {
     }
 }
 
+/// #67: after Redis loses a tag's key (a restart without persistence, an LRU
+/// eviction) a fresh instance's generations restart low. Its invalidation
+/// must still reach peers whose barrier is higher: they used to keep the
+/// stale entry (e.g. a revoked admin set) until its TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidations_after_redis_lost_the_tag_still_reach_peers() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let ns = format!("restart-{}", std::process::id());
+    let read = |cache: &Cache, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.clone(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    // The key's generation climbs on both instances.
+    for _ in 0..3 {
+        a.invalidate(&ns, "verdict").await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let b_calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&b, &b_calls).await, 0);
+    assert_eq!(read(&b, &b_calls).await, 0, "cached");
+
+    // Redis loses the tag key; a new instance starts with a fresh map.
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg(format!("forge:cache:tag:@key:{ns}:verdict"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let c = connect(&url).await;
+    c.invalidate(&ns, "verdict").await;
+
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&b, &b_calls).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the fresh instance's invalidation was ignored"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// `rediss://` (TLS) URLs are supported, and an unreachable Redis does not
 /// keep a cache from being built (an instance can start during a Redis
 /// outage): connections are lazy, and reads fall back to the factory.

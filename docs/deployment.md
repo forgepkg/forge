@@ -27,7 +27,7 @@ below, and pin the image to the release they belong to.
 ## Image
 
 ```bash
-docker pull ghcr.io/<owner>/<repo>:0.1.0
+docker pull ghcr.io/<owner>/<repo>:1.0.0
 ```
 
 Release images are signed with keyless cosign and carry an SBOM and a
@@ -37,7 +37,7 @@ that release's tag:
 
 ```bash
 cosign verify ghcr.io/<owner>/<repo>@<digest> \
-  --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0 \
+  --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v1.0.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -75,7 +75,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin password (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` defaults to `admin`). Without it no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
-| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so anonymous-IP allowlists and the login lockout see one client. |
+| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
 password, `minioadmin` S3 keys). It logs a warning when `public_base_url` is
@@ -408,6 +408,36 @@ garbage collection decides when a blob may go.
 To restore: stop every Forge instance, restore PostgreSQL, restore the bucket
 as described above, then start Forge. Practise this before you need it.
 
+## Locked out of every realm (break-glass)
+
+The admin API and the web UI refuse (`409 Conflict`) to disable or delete a
+realm when no enabled realm people can sign in with interactively (`local` or
+OIDC) would remain. They cannot tell whether that realm works, though: with an
+enabled OIDC realm whose IdP is down or misconfigured, `local` can still be
+disabled, and then nobody can sign in. API tokens keep working, so restores
+and pushes continue. To turn the `local` realm back on:
+
+- **With an admin-scoped API token**, minted beforehand with
+  `{"scope": {"actions": ["admin"]}}` (keep one for this): look up the
+  realm's id, then enable it. The token can also go in the Basic password.
+
+  ```bash
+  curl -H "X-NuGet-ApiKey: $TOKEN" https://nuget.example.com/admin/realms
+  curl -H "X-NuGet-ApiKey: $TOKEN" -X PATCH https://nuget.example.com/admin/realms/<id> \
+    -H 'content-type: application/json' -d '{"enabled": true}'
+  ```
+
+- **With SQL**, when there is no such token:
+
+  ```sql
+  UPDATE auth_realm SET enabled = true WHERE kind = 'local';
+  ```
+
+  Every instance picks the change up within `auth.realm_cache_ttl_seconds`
+  (default 10 s); no restart is needed.
+
+Then sign in as a local administrator and fix or disable the broken realm.
+
 ## Upgrades
 
 - Read the [changelog](../CHANGELOG.md) for each version you skip over. A
@@ -417,6 +447,6 @@ as described above, then start Forge. Practise this before you need it.
   the database requires restoring the backup taken before the upgrade.
 - Back up (see above) before every upgrade.
 
-## Known limitations in 0.1.0
+## Known limitations
 
-See the "Known limitations" section of the [changelog](../CHANGELOG.md#010).
+See the "Known limitations" section of the [changelog](../CHANGELOG.md#known-limitations).

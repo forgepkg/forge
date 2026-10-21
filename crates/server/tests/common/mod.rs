@@ -608,3 +608,25 @@ pub fn make_nupkg_with_payload(id: &str, version: &str, payload_len: usize) -> V
     }
     zw.finish().unwrap().into_inner()
 }
+
+/// Wait until a database session is blocked on a lock while running a
+/// statement matching one of the SQL `LIKE` `patterns` (a request that
+/// reached the row another transaction holds). Panics after 10 s.
+pub async fn wait_for_lock_wait(pool: &PgPool, patterns: &[&str]) {
+    let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE ANY($1)",
+        )
+        .bind(&patterns)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no statement like {patterns:?} waited for a lock");
+}

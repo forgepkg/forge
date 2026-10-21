@@ -43,11 +43,16 @@ import { Select } from '~/components/catalyst/select'
  * created); on **edit** it is fixed and shown read-only. Secrets follow the
  * RepositoryForm `upstream_password` pattern: never seeded from the (redacted)
  * GET, placeholder shows "set to replace" when `<key>_set` is true, and a
- * blank field keeps the stored secret on edit.
+ * blank field keeps the stored secret on edit — except that the server drops
+ * a stored OIDC client secret when the issuer or client ID changes, so the
+ * form then warns and requires a new one.
  *
- * String-array fields (scopes, login domains, groups, status lists) are
- * comma-separated text inputs parsed on submit; status lists parse to numbers.
- * Blank numeric fields are omitted so the server defaults apply.
+ * `PATCH` replaces the whole config, so every field is sent on each save.
+ * String-array fields (scopes, login domains, groups, audiences, claim
+ * values) are edited one entry per line: a value may contain commas (an LDAP
+ * DN such as `CN=Forge Admins,OU=Groups,DC=corp`) and must survive a save
+ * unchanged. Status lists are comma-separated numbers. Blank numeric fields
+ * are omitted so the server defaults apply.
  */
 
 /** A draft mirrors the form fields; numbers/lists stay strings while editing. */
@@ -62,6 +67,7 @@ export interface RealmFormValues {
   client_id: string
   /** Newly-typed secret; blank ⇒ "leave unchanged" on edit / invalid on create. */
   client_secret: string
+  /** One scope per line. */
   scopes: string
   clock_skew_seconds: string
   allow_http_issuer: boolean
@@ -69,10 +75,14 @@ export interface RealmFormValues {
   email_claim: string
   display_name_claim: string
   link_existing_by_username: boolean
+  /** One group per line. */
   admin_groups: string
   admin_claim: string
+  /** One domain per line. */
   login_domains: string
-  /** One `claim = value, value` per line (parsed to a map on submit). */
+  /** One host per line. */
+  endpoint_hosts: string
+  /** One `claim = value` per line, a claim repeated per value (parsed to a map on submit). */
   required_claims: string
   button_label: string
   // credential_forwarding
@@ -82,6 +92,7 @@ export interface RealmFormValues {
   reject_status: string
   connect_timeout_ms: string
   request_timeout_ms: string
+  /** One group per line. */
   required_groups: string
   groups_path: string
   identity_path: string
@@ -94,17 +105,17 @@ export interface RealmFormValues {
   key_pepper: string
   // workload_identity (WIF). Reuses `issuer`, `allow_http_issuer`, and
   // `clock_skew_seconds` above since only one kind is active at a time.
-  /** Comma/newline-separated allowed audiences (parsed to string[] on submit). */
+  /** One allowed audience per line (parsed to string[] on submit). */
   allowed_audiences: string
-  /** Optional exact `azp` values for issuers that emit authorized-party claims. */
+  /** Optional exact `azp` values for issuers that emit authorized-party claims, one per line. */
   allowed_authorized_parties: string
-  /** Comma-separated extra identity claims (custom issuers). */
+  /** Extra identity claims (custom issuers), one per line. */
   identity_claims: string
   /** Maximum accepted token age and declared token lifetime. */
   max_token_age_seconds: string
   /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
   positive_cache_seconds: string
-  /** Ordered claim→role rules; anyOf is a comma-separated string per condition. */
+  /** Ordered claim→role rules; anyOf holds one value per line per condition. */
   wifRules: Array<{
     role: string
     conditions: Array<{ claim: string; anyOf: string }>
@@ -126,31 +137,44 @@ export interface RealmFormProps {
   onCancel: () => void
 }
 
-function joinList(list?: (string | number)[]): string {
+/** A string list as one entry per line (entries may contain commas). */
+function joinLines(list?: string[]): string {
+  return (list ?? []).join('\n')
+}
+
+/** Status codes as comma-separated text. */
+function joinNumbers(list?: number[]): string {
   return (list ?? []).join(', ')
 }
 
-/** `{ tid: ['a', 'b'] }` -> `tid = a, b` (one claim per line). */
+/** `{ tid: ['a', 'b'] }` -> `tid = a` and `tid = b`, one value per line. */
 export function formatClaimRules(rules?: Record<string, string[]>): string {
   return Object.entries(rules ?? {})
-    .map(([claim, values]) => `${claim} = ${values.join(', ')}`)
+    .flatMap(([claim, values]) => values.map((value) => `${claim} = ${value}`))
     .join('\n')
 }
 
-/** Parse `claim = value, value` lines into the `required_claims` map. */
+/**
+ * Parse `claim = value` lines into the `required_claims` map; a repeated
+ * claim collects its values. Only the first `=` separates, so a value may
+ * contain `=` and `,` (`groups = CN=Forge Users,OU=Groups,DC=corp`).
+ */
 export function parseClaimRules(raw: string): Record<string, string[]> {
   const rules: Record<string, string[]> = {}
-  for (const line of raw.split('\n')) {
+  for (const line of raw.split(/\r?\n/)) {
     const eq = line.indexOf('=')
     if (eq < 0) continue
     const claim = line.slice(0, eq).trim()
-    const values = parseList(line.slice(eq + 1))
-    if (claim !== '' && values.length > 0) rules[claim] = values
+    const value = line.slice(eq + 1).trim()
+    if (claim === '' || value === '') continue
+    const values = (rules[claim] ??= [])
+    if (!values.includes(value)) values.push(value)
   }
   return rules
 }
 
-function seed(existing?: RealmView): RealmFormValues {
+/** Form values for a new realm, or seeded from an existing one (edit). */
+export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
   const oidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
   const fwd = (
     existing?.kind === 'credential_forwarding' ? existing.config : {}
@@ -168,7 +192,7 @@ function seed(existing?: RealmView): RealmFormValues {
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
     client_secret: '',
-    scopes: joinList(oidc.scopes),
+    scopes: joinLines(oidc.scopes),
     clock_skew_seconds:
       existing?.kind === 'workload_identity'
         ? wif.clock_skew_seconds != null
@@ -185,18 +209,19 @@ function seed(existing?: RealmView): RealmFormValues {
     email_claim: oidc.email_claim ?? '',
     display_name_claim: oidc.display_name_claim ?? '',
     link_existing_by_username: oidc.link_existing_by_username ?? false,
-    admin_groups: joinList(oidc.admin_groups),
+    admin_groups: joinLines(oidc.admin_groups),
     admin_claim: oidc.admin_claim ?? '',
-    login_domains: joinList(oidc.login_domains),
+    login_domains: joinLines(oidc.login_domains),
+    endpoint_hosts: joinLines(oidc.endpoint_hosts),
     required_claims: formatClaimRules(oidc.required_claims),
     button_label: oidc.button_label ?? '',
     url: fwd.url ?? '',
     method: fwd.method ?? '',
-    success_status: joinList(fwd.success_status),
-    reject_status: joinList(fwd.reject_status),
+    success_status: joinNumbers(fwd.success_status),
+    reject_status: joinNumbers(fwd.reject_status),
     connect_timeout_ms: fwd.connect_timeout_ms != null ? String(fwd.connect_timeout_ms) : '',
     request_timeout_ms: fwd.request_timeout_ms != null ? String(fwd.request_timeout_ms) : '',
-    required_groups: joinList(fwd.required_groups),
+    required_groups: joinLines(fwd.required_groups),
     groups_path: fwd.groups_path ?? '',
     identity_path: fwd.identity_path ?? '',
     allow_http: fwd.allow_http ?? false,
@@ -204,9 +229,9 @@ function seed(existing?: RealmView): RealmFormValues {
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
     key_pepper: '',
-    allowed_audiences: joinList(wif.allowed_audiences),
-    allowed_authorized_parties: joinList(wif.allowed_authorized_parties),
-    identity_claims: joinList(wif.identity_claims),
+    allowed_audiences: joinLines(wif.allowed_audiences),
+    allowed_authorized_parties: joinLines(wif.allowed_authorized_parties),
+    identity_claims: joinLines(wif.identity_claims),
     max_token_age_seconds:
       wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
     positive_cache_seconds:
@@ -215,7 +240,7 @@ function seed(existing?: RealmView): RealmFormValues {
       role: rule.role ?? '',
       conditions: (rule.conditions ?? []).map((c) => ({
         claim: c.claim ?? '',
-        anyOf: joinList(c.any_of),
+        anyOf: joinLines(c.any_of),
       })),
     })),
   }
@@ -229,8 +254,21 @@ export function RealmForm({
   onSubmit,
   onCancel,
 }: RealmFormProps) {
-  const [values, setValues] = useState<RealmFormValues>(() => seed(existing))
+  const [values, setValues] = useState<RealmFormValues>(() =>
+    seedRealmFormValues(existing),
+  )
   const [errors, setErrors] = useState<Record<string, string>>({})
+
+  // The server keeps a stored client secret only while the issuer and client
+  // ID stay the same (it must not reach another IdP), so after changing
+  // either one the save needs a new secret.
+  const storedOidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
+  const secretWillDrop =
+    mode === 'edit' &&
+    values.kind === 'oidc' &&
+    hasStoredSecret(existing, 'client_secret_set') &&
+    (secretBinding(values.issuer) !== secretBinding(storedOidc.issuer ?? '') ||
+      secretBinding(values.client_id) !== secretBinding(storedOidc.client_id ?? ''))
 
   function set<K extends keyof RealmFormValues>(key: K, value: RealmFormValues[K]) {
     setValues((v) => ({ ...v, [key]: value }))
@@ -250,6 +288,9 @@ export function RealmForm({
       }
       if (mode === 'create' && values.client_secret === '') {
         next.client_secret = 'A client secret is required.'
+      } else if (secretWillDrop && values.client_secret === '') {
+        next.client_secret =
+          'Enter the client secret for the new issuer or client ID.'
       }
       if (!isBlankNumber(values.clock_skew_seconds)) {
         next.clock_skew_seconds = 'Clock skew must be a non-negative number.'
@@ -285,7 +326,7 @@ export function RealmForm({
       } else if (!isUrlIsh(values.issuer)) {
         next.issuer = 'The issuer must be a valid URL.'
       }
-      if (parseList(values.allowed_audiences).length === 0) {
+      if (parseLines(values.allowed_audiences).length === 0) {
         next.allowed_audiences = 'At least one allowed audience is required.'
       }
       if (!isBlankNumberInRange(values.clock_skew_seconds, 0, 300)) {
@@ -321,7 +362,7 @@ export function RealmForm({
           if (cond.claim.trim() === '') {
             next[`wifRule.${ri}.cond.${ci}.claim`] = 'A claim is required.'
           }
-          if (parseList(cond.anyOf).length === 0) {
+          if (parseLines(cond.anyOf).length === 0) {
             next[`wifRule.${ri}.cond.${ci}.anyOf`] =
               'At least one value is required.'
           }
@@ -475,16 +516,28 @@ export function RealmForm({
                 value={values.client_secret}
                 onChange={(v) => set('client_secret', v)}
                 stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
+                willDrop={secretWillDrop}
               />
             </div>
 
+            {secretWillDrop && values.client_secret === '' && (
+              <p
+                role="status"
+                className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
+              >
+                The issuer or client ID differs from the stored one. The stored
+                client secret will be dropped when you save, so enter the
+                client secret for the new issuer or client ID.
+              </p>
+            )}
+
             <Field>
               <Label>Scopes</Label>
-              <Input
-                type="text"
+              <Textarea
+                rows={3}
                 value={values.scopes}
                 onChange={(e) => set('scopes', e.target.value)}
-                placeholder="openid, profile, email"
+                placeholder={'openid\nprofile\nemail'}
               />
               <ListHint />
             </Field>
@@ -549,15 +602,30 @@ export function RealmForm({
 
             <Field>
               <Label>Login domains</Label>
-              <Input
-                type="text"
+              <Textarea
+                rows={2}
                 value={values.login_domains}
                 onChange={(e) => set('login_domains', e.target.value)}
-                placeholder="example.com, corp.example.com"
+                placeholder={'example.com\ncorp.example.com'}
               />
               <Description>
                 Email domains routed to this IdP by identifier-first login.
-                Comma-separated.
+                One per line.
+              </Description>
+            </Field>
+
+            <Field>
+              <Label>Endpoint hosts</Label>
+              <Textarea
+                rows={2}
+                value={values.endpoint_hosts}
+                onChange={(e) => set('endpoint_hosts', e.target.value)}
+                placeholder={'oauth2.googleapis.com\nwww.googleapis.com'}
+              />
+              <Description>
+                Hosts besides the issuer&apos;s that the IdP&apos;s token and
+                key endpoints may use (Google, AWS Cognito). One per line;
+                leave empty for most IdPs.
               </Description>
             </Field>
 
@@ -570,8 +638,9 @@ export function RealmForm({
                 placeholder="tid = 00000000-0000-0000-0000-000000000000"
               />
               <Description>
-                Only tokens carrying one of the listed values may sign in, one
-                claim per line (<span className="font-mono">claim = value, value</span>).
+                Only tokens carrying one of the listed values may sign in. One{' '}
+                <span className="font-mono">claim = value</span> per line;
+                repeat the claim for each further value.
                 Use it to restrict a multi-tenant app to your tenant
                 (<span className="font-mono">tid</span>) or a Google Workspace
                 domain (<span className="font-mono">hd</span>).
@@ -581,8 +650,8 @@ export function RealmForm({
             <div className="grid gap-4 sm:grid-cols-2">
               <Field>
                 <Label>Admin groups</Label>
-                <Input
-                  type="text"
+                <Textarea
+                  rows={2}
                   value={values.admin_groups}
                   onChange={(e) => set('admin_groups', e.target.value)}
                   placeholder="forge-admins"
@@ -725,8 +794,8 @@ export function RealmForm({
             <div className="grid gap-4 sm:grid-cols-3">
               <Field>
                 <Label>Required groups</Label>
-                <Input
-                  type="text"
+                <Textarea
+                  rows={2}
                   value={values.required_groups}
                   onChange={(e) => set('required_groups', e.target.value)}
                   placeholder="developers"
@@ -858,8 +927,8 @@ export function RealmForm({
 
             <Field>
               <Label>Allowed audiences</Label>
-              <Input
-                type="text"
+              <Textarea
+                rows={2}
                 value={values.allowed_audiences}
                 onChange={(e) => set('allowed_audiences', e.target.value)}
                 placeholder="https://forge.example.com"
@@ -915,29 +984,29 @@ export function RealmForm({
 
             <Field>
               <Label>Allowed authorized parties</Label>
-              <Input
-                type="text"
+              <Textarea
+                rows={2}
                 value={values.allowed_authorized_parties}
                 onChange={(e) => set('allowed_authorized_parties', e.target.value)}
                 placeholder="Optional azp values"
               />
               <Description>
                 Optional exact <code>azp</code> allowlist for issuers that emit
-                it. Leave blank for GitHub Actions and GitLab CI.
+                it, one per line. Leave blank for GitHub Actions and GitLab CI.
               </Description>
             </Field>
 
             <Field>
               <Label>Identity claims</Label>
-              <Input
-                type="text"
+              <Textarea
+                rows={2}
                 value={values.identity_claims}
                 onChange={(e) => set('identity_claims', e.target.value)}
                 placeholder="Optional, e.g. pipeline_id"
               />
               <Description>
-                Claims a custom CI issuer uses as a stable workload identity.
-                Each rule must pin one of them or a built-in identity claim
+                Claims a custom CI issuer uses as a stable workload identity,
+                one per line. Each rule must pin one of them or a built-in identity claim
                 (<code>sub</code>, <code>repository_id</code>,{' '}
                 <code>job_project_id</code>, …). Leave blank for GitHub Actions
                 and GitLab.
@@ -1060,8 +1129,8 @@ export function RealmForm({
                         </Field>
                         <Field>
                           <Label>Any of</Label>
-                          <Input
-                            type="text"
+                          <Textarea
+                            rows={2}
                             value={cond.anyOf}
                             onChange={(e) =>
                               setRule(ri, (r) => ({
@@ -1071,7 +1140,7 @@ export function RealmForm({
                                 ),
                               }))
                             }
-                            placeholder="acme/api, acme/web"
+                            placeholder={'acme/api\nacme/web'}
                             invalid={!!errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
                           />
                           <ListHint />
@@ -1139,20 +1208,26 @@ function hasStoredSecret(
   return config?.[flag] === true
 }
 
-/** Write-only secret input mirroring RepositoryForm's upstream-password UX. */
+/**
+ * Write-only secret input mirroring RepositoryForm's upstream-password UX.
+ * `willDrop`: the save discards the stored secret, so a new one is required.
+ */
 function SecretField({
   label,
   error,
   value,
   onChange,
   stored,
+  willDrop = false,
 }: {
   label: string
   error?: string
   value: string
   onChange: (value: string) => void
   stored: boolean
+  willDrop?: boolean
 }) {
+  const keepable = stored && !willDrop
   return (
     <Field>
       <Label>{label}</Label>
@@ -1161,13 +1236,15 @@ function SecretField({
         autoComplete="new-password"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={stored ? '•••••••• (set to replace)' : 'Required'}
+        placeholder={keepable ? '•••••••• (set to replace)' : 'Required'}
         invalid={!!error}
       />
       <Description>
-        {stored
+        {keepable
           ? 'A secret is stored. Leave blank to keep it; type a new one to replace it.'
-          : 'Write-only. The stored secret is never shown after saving.'}
+          : willDrop
+            ? 'Required: the stored secret is not kept for a new issuer or client ID.'
+            : 'Write-only. The stored secret is never shown after saving.'}
       </Description>
       {error && <ErrorMessage role="alert">{error}</ErrorMessage>}
     </Field>
@@ -1175,7 +1252,7 @@ function SecretField({
 }
 
 function ListHint() {
-  return <Description>Comma-separated.</Description>
+  return <Description>One per line.</Description>
 }
 
 /** "" or a parseable non-negative number. */
@@ -1194,7 +1271,7 @@ function isBlankNumberInRange(raw: string, min: number, max: number): boolean {
 
 /** "" or a comma-separated list of numbers. */
 function isBlankNumberList(raw: string): boolean {
-  return parseList(raw).every((s) => Number.isFinite(Number(s)))
+  return splitNumbers(raw).every((s) => Number.isFinite(Number(s)))
 }
 
 const GITHUB_ACTIONS_ISSUER = 'https://token.actions.githubusercontent.com'
@@ -1217,6 +1294,15 @@ const CONTEXT_ONLY_WIF_CLAIMS = new Set([
 ])
 
 function normalizedIssuer(raw: string): string {
+  return raw.trim().replace(/\/+$/, '')
+}
+
+/**
+ * An OIDC issuer or client ID as the server compares them when deciding
+ * whether a stored client secret still applies (trimmed, without trailing
+ * slashes).
+ */
+function secretBinding(raw: string): string {
   return raw.trim().replace(/\/+$/, '')
 }
 
@@ -1263,17 +1349,25 @@ function isUrlIsh(raw: string): boolean {
   }
 }
 
-/** Comma-separated text -> trimmed, non-empty entries. */
-export function parseList(raw: string): string[] {
+/**
+ * One entry per line -> trimmed, non-empty entries. Commas are kept: a value
+ * such as `CN=Forge Admins,OU=Groups,DC=corp` is one entry.
+ */
+export function parseLines(raw: string): string[] {
   return raw
-    .split(',')
+    .split(/\r?\n/)
     .map((s) => s.trim())
     .filter((s) => s !== '')
 }
 
+/** Comma- (or whitespace-) separated status codes -> non-empty entries. */
+function splitNumbers(raw: string): string[] {
+  return raw.split(/[\s,]+/).filter((s) => s !== '')
+}
+
 /** Comma-separated text -> numbers (status lists). */
 export function parseNumberList(raw: string): number[] {
-  return parseList(raw).map((s) => Number(s))
+  return splitNumbers(raw).map((s) => Number(s))
 }
 
 /** Empty string ⇒ undefined (server default); otherwise the parsed number. */
@@ -1299,7 +1393,7 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       allow_http_issuer: values.allow_http_issuer,
     }
     if (values.client_secret !== '') config.client_secret = values.client_secret
-    const scopes = parseList(values.scopes)
+    const scopes = parseLines(values.scopes)
     if (scopes.length > 0) config.scopes = scopes
     const skew = parseNumber(values.clock_skew_seconds)
     if (skew !== undefined) config.clock_skew_seconds = skew
@@ -1308,11 +1402,13 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.display_name_claim.trim() !== '') {
       config.display_name_claim = values.display_name_claim.trim()
     }
-    const adminGroups = parseList(values.admin_groups)
+    const adminGroups = parseLines(values.admin_groups)
     if (adminGroups.length > 0) config.admin_groups = adminGroups
     if (values.admin_claim.trim() !== '') config.admin_claim = values.admin_claim.trim()
-    const loginDomains = parseList(values.login_domains)
+    const loginDomains = parseLines(values.login_domains)
     if (loginDomains.length > 0) config.login_domains = loginDomains
+    const endpointHosts = parseLines(values.endpoint_hosts)
+    if (endpointHosts.length > 0) config.endpoint_hosts = endpointHosts
     const requiredClaims = parseClaimRules(values.required_claims)
     if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()
@@ -1332,7 +1428,7 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (connect !== undefined) config.connect_timeout_ms = connect
     const request = parseNumber(values.request_timeout_ms)
     if (request !== undefined) config.request_timeout_ms = request
-    const requiredGroups = parseList(values.required_groups)
+    const requiredGroups = parseLines(values.required_groups)
     if (requiredGroups.length > 0) config.required_groups = requiredGroups
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
     if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
@@ -1348,12 +1444,12 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
   if (values.kind === 'workload_identity') {
     const config: WorkloadIdentityConfig = {
       issuer: values.issuer.trim(),
-      allowed_audiences: parseList(values.allowed_audiences),
+      allowed_audiences: parseLines(values.allowed_audiences),
       allow_http_issuer: values.allow_http_issuer,
       rules: values.wifRules.map((rule) => {
         const conditions = rule.conditions.map((cond) => ({
           claim: cond.claim.trim(),
-          any_of: parseList(cond.anyOf),
+          any_of: parseLines(cond.anyOf),
         }))
         return { role: rule.role.trim(), conditions }
       }),
@@ -1362,13 +1458,13 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (skew !== undefined) config.clock_skew_seconds = skew
     const maxAge = parseNumber(values.max_token_age_seconds)
     if (maxAge !== undefined) config.max_token_age_seconds = maxAge
-    const authorizedParties = parseList(values.allowed_authorized_parties)
+    const authorizedParties = parseLines(values.allowed_authorized_parties)
     if (authorizedParties.length > 0) {
       config.allowed_authorized_parties = authorizedParties
     }
     const positiveCache = parseNumber(values.positive_cache_seconds)
     if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
-    const identityClaims = parseList(values.identity_claims)
+    const identityClaims = parseLines(values.identity_claims)
     if (identityClaims.length > 0) config.identity_claims = identityClaims
     return config
   }

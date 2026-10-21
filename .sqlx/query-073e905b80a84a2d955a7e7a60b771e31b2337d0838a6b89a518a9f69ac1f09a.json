@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, repository_id, name, original_id, version, version_original,\n            listed, created_at, updated_at\n        FROM component\n        WHERE repository_id = $1\n        ORDER BY name, id\n        ",
+  "query": "\n        SELECT\n            id, repository_id, name, original_id, version, version_original,\n            listed, created_at, updated_at\n        FROM component\n        WHERE repository_id = $1 AND name = ANY($2::text[]) AND listed\n          AND ($3 OR strpos(version, '-') = 0)\n          AND ($4 OR version_original !~ '[+]|-.*[.]')\n        ORDER BY name, id\n        ",
   "describe": {
     "columns": [
       {
@@ -105,7 +105,10 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8",
+        "TextArray",
+        "Bool",
+        "Bool"
       ]
     },
     "nullable": [
@@ -120,5 +123,5 @@
       false
     ]
   },
-  "hash": "67867c35afc3d218047552ee92a48ed0fd7215be4909549bb0c8b92940e33685"
+  "hash": "073e905b80a84a2d955a7e7a60b771e31b2337d0838a6b89a518a9f69ac1f09a"
 }

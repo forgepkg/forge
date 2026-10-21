@@ -231,12 +231,14 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
       const decision = await identify(trimmed)
       if (decision.mode === 'oidc_redirect' && decision.login_url) {
         assignLocation(oidcUrl(decision.login_url, redirect))
-        return // the browser is leaving; keep "submitting" until it does
+        // The browser is leaving: keep "submitting" (and Continue disabled)
+        // until it does, so a second click cannot start another flow.
+        return
       }
       setStep('password')
+      setSubmitting(false)
     } catch (err) {
       setError(signInErrorMessage(err))
-    } finally {
       setSubmitting(false)
     }
   }

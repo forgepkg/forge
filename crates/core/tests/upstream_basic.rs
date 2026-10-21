@@ -600,3 +600,35 @@ async fn identity_path_missing_from_the_response_fails_closed() {
         AuthOutcome::Unavailable
     ));
 }
+
+/// #69: a name a folding directory could map onto another account (full-width
+/// letters, a soft hyphen) is never forwarded: Forge would provision it as a
+/// new account and sign it in although the plain name is deactivated.
+#[tokio::test]
+async fn names_a_directory_could_fold_onto_another_account_are_not_forwarded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = make_provider(
+        config_for(format!("{}/status", server.uri())),
+        Duration::from_secs(60),
+    )
+    .await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+    for typed in [
+        "ｍａｌｌｏｒｙ",
+        "mal\u{00AD}lory",
+        "mal\u{200B}lory",
+        "ﬁona",
+    ] {
+        let canonical = forge_db::username::canonical_username(typed).unwrap();
+        assert_eq!(
+            chain.authenticate(&cred(&canonical, "pw")).await,
+            ChainOutcome::Rejected,
+            "{typed:?}"
+        );
+    }
+}

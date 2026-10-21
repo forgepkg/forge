@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT download_count, last_downloaded_at FROM asset WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "download_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "download_count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_downloaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "last_downloaded_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "fdc09c3bb20104cc295f071ce6939ceeb8cf4ad6f2ed2ce9a76edcb3f58de02a"
+}

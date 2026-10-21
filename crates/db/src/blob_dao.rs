@@ -490,7 +490,7 @@ async fn asset_references(
 }
 
 /// Cancel the deletion reservation of a blob that assets still name (the
-/// aftermath of the pre-0.1.0 concurrent hard-delete race): back to
+/// aftermath of the pre-release concurrent hard-delete race): back to
 /// `committed` with the true reference count. Its object may already be gone;
 /// the warning names the key to restore from backup if so.
 async fn cancel_referenced_deletion(

@@ -2048,3 +2048,173 @@ async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
         ["2.0.0"]
     );
 }
+
+/// A nested group keeps its own guards when it is read through an outer
+/// group, whatever the outer group's settings: its reserved prefixes, its
+/// owners and its prefer-hosted setting decide what its members serve, so
+/// nesting is never less protective than reading the inner group directly.
+#[tokio::test]
+async fn a_nested_group_keeps_its_guards_when_read_through_an_outer_group() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let releases = seed_member(&pool, false).await;
+    let dev = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await;
+    for (member, priority) in [(&proxy, 100), (&releases, 50), (&dev, 10)] {
+        repository_dao::add_group_member(&pool, inner.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    repository_dao::set_group_member_owner(&pool, inner.id, releases.id, true)
+        .await
+        .unwrap();
+    let outer = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 10)
+        .await
+        .unwrap();
+    for (group, config) in [
+        (
+            &inner,
+            r#"{"prefer_hosted": true, "reserved_prefixes": ["acme."]}"#,
+        ),
+        // The most permissive outer group: no guard of its own at all.
+        (&outer, r#"{"prefer_hosted": false}"#),
+    ] {
+        sqlx::query("UPDATE repository SET config = $2::jsonb WHERE id = $1")
+            .bind(group.id)
+            .bind(config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    seed_version(
+        &pool,
+        &mut blobs,
+        releases.id,
+        "Contoso.Lib",
+        "1.0.0",
+        "lib",
+    )
+    .await;
+    seed_version(&pool, &mut blobs, dev.id, "Contoso.Lib", "9.0.0", "dev-lib").await;
+    seed_version(&pool, &mut blobs, dev.id, "Sample", "1.0.0", "dev-sample").await;
+
+    for flag_inner_as_owner in [false, true] {
+        repository_dao::set_group_member_owner(&pool, outer.id, inner.id, flag_inner_as_owner)
+            .await
+            .unwrap();
+        let g = mixed_group_repo(
+            &pool,
+            blobs.clone(),
+            user(&pool).await,
+            shadowing_proxy(&proxy),
+        );
+        for group in [&inner.name, &outer.name] {
+            let why = format!("through {group}, inner flagged in outer: {flag_inner_as_owner}");
+            // `dev` cannot add a version to the owner's package.
+            assert_eq!(
+                sorted_versions(&g, group, "contoso.lib").await,
+                ["1.0.0"],
+                "{why}"
+            );
+            assert!(
+                g.resolve_nupkg(group, "contoso.lib", "9.0.0")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{why}"
+            );
+            // The proxy cannot serve an id under the inner reserved prefix.
+            assert!(
+                sorted_versions(&g, group, "acme.new").await.is_empty(),
+                "{why}"
+            );
+            assert!(
+                g.resolve_nupkg(group, "acme.new", "99.0.0")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{why}"
+            );
+            // `dev` cannot take a public id away from the proxy.
+            assert_eq!(
+                sorted_versions(&g, group, "sample").await,
+                ["1.0.0", "99.0.0"],
+                "{why}"
+            );
+            let hits = g
+                .search(
+                    group,
+                    &SearchParams {
+                        q: "contoso".into(),
+                        ..SearchParams::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .hits;
+            let lib = hits
+                .iter()
+                .find(|hit| hit.original_id.eq_ignore_ascii_case("contoso.lib"))
+                .expect("the owner's package is found");
+            assert_eq!(lib.latest_version, "1.0.0", "{why}");
+            assert_eq!(lib.versions.len(), 1, "{why}: {lib:?}");
+            let hits = g
+                .search(
+                    group,
+                    &SearchParams {
+                        q: "acme".into(),
+                        ..SearchParams::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .hits;
+            assert!(
+                !hits
+                    .iter()
+                    .any(|hit| hit.original_id.to_ascii_lowercase().starts_with("acme.")),
+                "{why}: {hits:?}"
+            );
+        }
+    }
+}
+
+/// #73: an offline hosted member is a failing member: what only it could
+/// serve is an error (clients retry), never a not-found; the other members
+/// still answer.
+#[tokio::test]
+async fn an_offline_hosted_member_fails_instead_of_serving() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let a = seed_member(&pool, false).await;
+    let b = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, a.id, 20)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, b.id, 10)
+        .await
+        .unwrap();
+    seed_version(&pool, &mut blobs, a.id, "Only.In.A", "1.0.0", "a").await;
+    seed_version(&pool, &mut blobs, b.id, "Only.In.B", "2.0.0", "b").await;
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, HashMap::new());
+    assert!(matches!(
+        g.list_versions(&group.name, "only.in.a").await,
+        Err(forge_core::repo::RepoError::Busy(_))
+    ));
+    assert!(g
+        .resolve_nupkg(&group.name, "only.in.a", "1.0.0")
+        .await
+        .is_err());
+    assert_eq!(
+        sorted_versions(&g, &group.name, "only.in.b").await,
+        ["2.0.0"]
+    );
+}

@@ -33,9 +33,12 @@ pub mod upstream_basic;
 pub use authz::Authz;
 pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
-    StaticChainSource,
+    ChainUnavailable, StaticChainSource,
 };
-pub use client_ip::{forwarded_for, resolve_client_ip, AllowlistParseError, AnonPolicy};
+pub use client_ip::{
+    forwarded_for, resolve_client, resolve_client_ip, AllowlistParseError, AnonPolicy,
+    ResolvedClient,
+};
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
     UpstreamVerdict, ValidatedCredentialCache, DEFAULT_FORWARD_TIMEOUT,
@@ -53,9 +56,9 @@ pub use session_source::{
     SECURE_SESSION_COOKIE, SESSION_COOKIE,
 };
 pub use token::{
-    generate_token_secret, hash_token, resolve_principal, resolve_principal_with_origin,
-    verify_password, verify_token, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal,
-    SourceOutcome, TokenHeaderSource,
+    check_token, generate_token_secret, hash_token, resolve_principal,
+    resolve_principal_with_origin, verify_password, verify_token, AuthError, BasicAuthSource,
+    PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
 // Canonical usernames live with the DAOs that enforce them.

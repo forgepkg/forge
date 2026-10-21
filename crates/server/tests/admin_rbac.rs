@@ -239,6 +239,17 @@ async fn grant_changes_decision_and_invalidates_cache() {
         .unwrap();
     assert_eq!(resp.status(), 201);
 
+    // #84: both `role` and `role_id` is refused, never silently resolved to
+    // one of them (here a name that differs from the id's role).
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "admin", "role_id": role_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
     // Assign the role to the user (targeted invalidation).
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
@@ -934,4 +945,72 @@ async fn signed_in_user_reads_anonymous_read_repo() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "scope still bounds the public reach");
+}
+
+/// #84: turning `anonymous_read` off drops the read grant for everyone who
+/// holds the `anonymous` role, also a user assigned it (cached under the
+/// user's own key), not only the anonymous principal.
+#[tokio::test]
+async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let repo = format!("anonrole{s}");
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": repo, "kind": "hosted", "anonymous_read": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // The anonymous role's read grant on the repository (what migration 0007
+    // synthesized for repositories that were anonymous-readable).
+    let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = client
+        .put(format!("{}/admin/roles/{anon_role}/grants", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"repository": repo, "action": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let username = format!("anonuser{s}");
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw-anon-role"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "anonymous"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let session = srv.login(&username, "pw-anon-role").await;
+    let index = format!("{}/v3/{repo}/index.json", srv.base_url);
+    let resp = session.apply(client.get(&index)).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "read through the anonymous role");
+
+    let resp = client
+        .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = session.apply(client.get(&index)).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "the cached grant is gone at once");
 }

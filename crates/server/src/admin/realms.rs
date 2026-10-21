@@ -242,30 +242,36 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
         }
     }
 
-    let priority = match auth_realm_dao::next_priority(&state.pool).await {
-        Ok(p) => p,
-        Err(e) => return db_error(e),
-    };
-    let new = NewAuthRealm {
-        kind: body.kind.clone(),
-        name: body.name.trim().to_string(),
-        enabled: body.enabled,
-        priority,
-        config,
-    };
-    let inserted = match secret_dao::insert_realm_with_secrets(
-        &state.pool,
-        state.envelope.as_deref(),
-        new,
-        secret_keys(&body.kind),
-    )
-    .await
-    {
-        Ok(r) => Ok(r),
-        Err(e) => match secret_db_error(e) {
-            Ok(db) => Err(db),
-            Err(resp) => return resp,
-        },
+    // Appended after the last realm. A concurrent create or reorder can take
+    // that priority first: then take the next one (a few times at most).
+    let mut attempt = 0;
+    let inserted = loop {
+        let priority = match auth_realm_dao::next_priority(&state.pool).await {
+            Ok(p) => p,
+            Err(e) => return db_error(e),
+        };
+        let new = NewAuthRealm {
+            kind: body.kind.clone(),
+            name: body.name.trim().to_string(),
+            enabled: body.enabled,
+            priority,
+            config: config.clone(),
+        };
+        match secret_dao::insert_realm_with_secrets(
+            &state.pool,
+            state.envelope.as_deref(),
+            new,
+            secret_keys(&body.kind),
+        )
+        .await
+        {
+            Ok(r) => break Ok(r),
+            Err(e) => match secret_db_error(e) {
+                Ok(db) if is_priority_violation(&db) && attempt < 3 => attempt += 1,
+                Ok(db) => break Err(db),
+                Err(resp) => return resp,
+            },
+        }
     };
     match inserted {
         Ok(r) => {
@@ -376,6 +382,9 @@ pub async fn update(
         }
     }
 
+    // The order is the reorder endpoint's: a PATCH keeps the priority it
+    // read, and the compare-and-set below refuses the write if a reorder (or
+    // any other change) landed since.
     let upd = AuthRealmUpdate {
         name: body
             .name
@@ -388,20 +397,10 @@ pub async fn update(
         priority: existing.priority,
         config,
     };
-    let updated = match secret_dao::update_realm_with_secrets(
-        &state.pool,
-        state.envelope.as_deref(),
-        id,
-        upd,
-        secret_keys(&existing.kind),
-    )
-    .await
-    {
+    let updated = match write_realm_update(&state, &existing, upd).await {
         Ok(r) => Ok(r),
-        Err(e) => match secret_db_error(e) {
-            Ok(db) => Err(db),
-            Err(resp) => return resp,
-        },
+        Err(RealmWriteError::Refused(resp)) => return resp,
+        Err(RealmWriteError::Db(e)) => Err(e),
     };
     match updated {
         Ok(Some(r)) => {
@@ -409,7 +408,16 @@ pub async fn update(
             tracing::info!(realm = %r.name, kind = %r.kind, enabled = r.enabled, "auth realm updated");
             Json(RealmView::from(&r)).into_response()
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
+        // The row changed between the read above and the write: re-storing
+        // the config read here would undo that change.
+        Ok(None) => match auth_realm_dao::find_realm_by_id(&state.pool, id).await {
+            Ok(Some(_)) => (StatusCode::CONFLICT, REALM_CHANGED).into_response(),
+            Ok(None) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
+            Err(e) => db_error(e),
+        },
+        Err(e) if is_priority_violation(&e) => {
+            (StatusCode::CONFLICT, REALM_CHANGED).into_response()
+        }
         Err(e) if is_wif_issuer_unique_violation(&e) => (
             StatusCode::CONFLICT,
             "an enabled workload identity realm already uses this issuer",
@@ -432,7 +440,9 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         Ok(Some(r)) if r.kind == KIND_LOCAL => {
             bad_request("the built-in local realm cannot be deleted; disable it instead")
         }
-        Ok(Some(r)) => match auth_realm_dao::delete_realm(&state.pool, id).await {
+        Ok(Some(r)) => match delete_realm_guarded(&r, &state).await {
+            Err(RealmWriteError::Refused(resp)) => resp,
+            Err(RealmWriteError::Db(e)) => db_error(e),
             Ok(true) => {
                 // The kind's next boot re-imports a still-present legacy block
                 // as a fresh row; a stale marker must not outlive this one.
@@ -443,11 +453,112 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
                 StatusCode::NO_CONTENT.into_response()
             }
             Ok(false) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
-            Err(e) => db_error(e),
         },
         Ok(None) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
         Err(e) => db_error(e),
     }
+}
+
+/// 409 body when a PATCH lost a race with another change of the realm.
+const REALM_CHANGED: &str =
+    "the realm was changed by another request since it was read; reload it and try again";
+
+/// 409 body when a change would leave nobody able to sign in interactively.
+const NO_SIGN_IN_LEFT: &str =
+    "no enabled realm to sign in with would remain (local or OIDC); enable another one first";
+
+/// Whether people sign in through `kind` interactively (browser login).
+fn is_interactive(kind: &str) -> bool {
+    kind == KIND_LOCAL || kind == KIND_OIDC
+}
+
+enum RealmWriteError {
+    /// The change is refused; the response says why.
+    Refused(Response),
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RealmWriteError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// When `realm` is an enabled interactive realm about to be disabled or
+/// deleted: lock the interactive realms ([`auth_realm_dao::lock_interactive_realms`])
+/// and refuse (409) unless another one stays enabled. Without one, password
+/// logins (browser and NuGet Basic) and OIDC logins all fail, and the admin UI
+/// is reachable again only with an admin-scoped token or SQL.
+async fn guard_last_interactive_realm(
+    conn: &mut sqlx::PgConnection,
+    realm: &AuthRealm,
+) -> Result<(), RealmWriteError> {
+    if !(realm.enabled && is_interactive(&realm.kind)) {
+        return Ok(());
+    }
+    let interactive = auth_realm_dao::lock_interactive_realms(conn).await?;
+    if interactive
+        .iter()
+        .any(|(id, enabled)| *id != realm.id && *enabled)
+    {
+        return Ok(());
+    }
+    Err(RealmWriteError::Refused(
+        (StatusCode::CONFLICT, NO_SIGN_IN_LEFT).into_response(),
+    ))
+}
+
+/// Write a PATCH as a compare-and-set against `existing` (the row the
+/// handler read and merged over): `Ok(None)` when it changed or is gone in
+/// between. Disabling the last enabled interactive realm is refused.
+async fn write_realm_update(
+    state: &AppState,
+    existing: &AuthRealm,
+    upd: AuthRealmUpdate,
+) -> Result<Option<AuthRealm>, RealmWriteError> {
+    let mut tx = state.pool.begin().await?;
+    if !upd.enabled {
+        guard_last_interactive_realm(&mut tx, existing).await?;
+    }
+    let row = match secret_dao::update_realm_with_secrets_if_unchanged(
+        &mut tx,
+        state.envelope.as_deref(),
+        existing,
+        upd,
+        secret_keys(&existing.kind),
+    )
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            return Err(
+                secret_db_error(e).map_or_else(RealmWriteError::Refused, RealmWriteError::Db)
+            )
+        }
+    };
+    if row.is_some() {
+        tx.commit().await?;
+    }
+    Ok(row)
+}
+
+/// Delete `realm`, unless it is the last enabled interactive realm.
+async fn delete_realm_guarded(
+    realm: &AuthRealm,
+    state: &AppState,
+) -> Result<bool, RealmWriteError> {
+    let mut tx = state.pool.begin().await?;
+    guard_last_interactive_realm(&mut tx, realm).await?;
+    let deleted = auth_realm_dao::delete_realm(&mut *tx, realm.id).await?;
+    tx.commit().await?;
+    Ok(deleted)
+}
+
+/// A unique violation of the realm order (`priority`), as opposed to the name.
+fn is_priority_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("auth_realm_priority_key"))
 }
 
 /// `PUT /admin/realms/order` — set the complete try-order. The body must list

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version\n        SET original_id = $3\n        WHERE repository_id = $1 AND name = $2 AND version <> '*'\n          AND original_id IS DISTINCT FROM $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a2a108c0c0ea592c693c9547038a6abdde4cd35a2cfb6a02b5b1f4a28e372325"
+}

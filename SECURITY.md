@@ -2,8 +2,9 @@
 
 ## Supported versions
 
-Security fixes go into the latest release. While the major version is 0, only
-the most recent minor release line (currently 0.1.x) receives them.
+Security fixes are released as a patch release of the most recent minor
+release line (currently 1.0.x). Older release lines do not receive them:
+upgrade to the latest release to stay supported.
 
 ## Reporting a vulnerability
 

@@ -758,7 +758,7 @@ async fn upstream_password_end_to_end() {
     let legacy = repository_dao::insert_repository(&pool, legacy)
         .await
         .unwrap();
-    // A row 0.1.0's backfill left behind: envelope written, plaintext kept.
+    // A row a pre-release backfill left behind: envelope written, plaintext kept.
     let mut leftover = NewRepository::proxy("crypt-leftover");
     leftover.upstream_password = Some("leftover-pw".to_string());
     let leftover = repository_dao::insert_repository(&pool, leftover)
@@ -1275,6 +1275,82 @@ async fn realm_backfill_reseals_an_undecryptable_realm_from_its_plaintext() {
     assert_eq!(config["client_secret"], "new-secret");
     assert_eq!(config["issuer"], "https://login.example/new/v2.0");
     auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
+/// #82: one malformed sealed secret (a botched restore, a manual edit) does
+/// not stop the passes over every row: the startup re-seal and backfill, and
+/// the key-reference scan behind DEK revocation, warn about it and go on.
+#[tokio::test]
+async fn a_malformed_sealed_secret_does_not_stop_the_sweeps() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("malformed-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+
+    let mut repo = NewRepository::proxy(format!("malformed{}", uuid::Uuid::new_v4().simple()));
+    repo.remote_url = Some("https://feed.example/v3/index.json".into());
+    let repo = repository_dao::insert_repository(&pool, repo)
+        .await
+        .unwrap();
+    let realm = secret_dao::insert_realm_with_secrets(
+        &pool,
+        Some(&envelope),
+        NewAuthRealm {
+            kind: "oidc".into(),
+            name: format!("malformed-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(2),
+            config: serde_json::json!({
+                "issuer": "https://login.example/v2.0",
+                "client_id": "forge",
+                "client_secret": "secret",
+            }),
+        },
+        realm_secret_keys("oidc"),
+    )
+    .await
+    .unwrap();
+    for blob in [&b"\x00"[..], &b"\x01\x02\x03"[..]] {
+        sqlx::query("UPDATE repository SET upstream_password_enc = $2 WHERE id = $1")
+            .bind(repo.id)
+            .bind(blob)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE auth_realm SET secrets_enc = $2 WHERE id = $1")
+            .bind(realm.id)
+            .bind(blob)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut after_id = 0;
+        loop {
+            let batch =
+                secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, after_id, 100)
+                    .await
+                    .expect("the upstream password sweep goes on");
+            match batch.next_after_id {
+                Some(next) => after_id = next,
+                None => break,
+            }
+        }
+        secret_dao::reseal_realm_secrets(&pool, &envelope)
+            .await
+            .expect("the realm re-seal goes on");
+        secret_dao::referenced_dek_versions(&pool)
+            .await
+            .expect("the reference scan goes on");
+        secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys)
+            .await
+            .expect("the realm backfill goes on");
+    }
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+    sqlx::query("DELETE FROM repository WHERE id = $1")
+        .bind(repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 /// The upstream password is bound to the origin of its row's `remote_url`

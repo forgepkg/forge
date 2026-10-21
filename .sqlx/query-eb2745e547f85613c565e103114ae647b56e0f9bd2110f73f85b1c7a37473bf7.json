@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, secrets_enc AS \"secrets_enc!\" FROM auth_realm WHERE secrets_enc IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "auth_realm",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "secrets_enc!",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "auth_realm",
+            "name": "secrets_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "eb2745e547f85613c565e103114ae647b56e0f9bd2110f73f85b1c7a37473bf7"
+}

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -24,7 +24,8 @@ import { routeTree } from '~/routeTree.gen'
  *  - delete-user invalidates the list, and a refused delete (409 for the last
  *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
- *    revoke removes the token (list invalidation reflecting `revoked_at`).
+ *    revoke removes the token (list invalidation reflecting `revoked_at`);
+ *    an expired token is not shown as active, and scopes are visible.
  */
 
 const adminMe: Me = {
@@ -195,6 +196,11 @@ describe('admin users', () => {
     await renderAt('/manage/users')
 
     await user_.type(await screen.findByLabelText('Username'), 'carol')
+    // A password manager must not offer the admin's own password here.
+    expect(screen.getByLabelText('Password')).toHaveAttribute(
+      'autocomplete',
+      'new-password',
+    )
     await user_.type(screen.getByLabelText('Password'), 'hunter2')
     await user_.click(screen.getByRole('checkbox', { name: 'Administrator' }))
     await user_.click(screen.getByRole('button', { name: 'Create user' }))
@@ -319,5 +325,43 @@ describe('admin tokens', () => {
 
     await waitFor(() => expect(revoked).toBe(5))
     expect(await screen.findByText('revoked')).toBeInTheDocument()
+  })
+
+  it('marks expired tokens and shows each token scope', async () => {
+    mockApi({
+      users: [user({ id: 2, username: 'alice' })],
+      tokens: [
+        token({ id: 5, name: 'old-ci', expires_at: '2000-01-01T00:00:00Z' }),
+        token({
+          id: 6,
+          name: 'ops',
+          scope: { actions: ['admin'] },
+        }),
+        token({
+          id: 7,
+          name: 'push',
+          expires_at: '2999-01-01T00:00:00Z',
+          scope: { actions: ['read', 'write'], repositories: [3, 4] },
+        }),
+      ],
+    })
+
+    await renderAt('/manage/users/2')
+
+    const row = async (name: string) =>
+      (await screen.findByText(name)).closest('tr')!
+    const oldCi = await row('old-ci')
+    expect(within(oldCi).getByText('expired')).toBeInTheDocument()
+    expect(within(oldCi).queryByText('active')).toBeNull()
+    expect(within(oldCi).getByText('unscoped')).toBeInTheDocument()
+
+    const ops = await row('ops')
+    expect(within(ops).getByText('admin')).toBeInTheDocument()
+    expect(within(ops).getByText('active')).toBeInTheDocument()
+
+    const push = await row('push')
+    expect(within(push).getByText('read, write')).toBeInTheDocument()
+    expect(within(push).getByText('2 repositories')).toBeInTheDocument()
+    expect(within(push).getByText('active')).toBeInTheDocument()
   })
 })

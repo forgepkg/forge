@@ -148,6 +148,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
 ///    cluster-wide cache invalidation), so a later reactivation re-validates
 ///    against the upstream instead of trusting a pre-deactivation verdict.
 ///
+/// For a credential-forwarding user, deactivation holds for the canonical
+/// username: an upstream that accepts another spelling of the same account
+/// (`DOMAIN\user`, `user@domain`) signs that spelling in as a new account
+/// unless the realm sets `identity_path` or turns `auto_provision` off.
+///
 /// API tokens are refused while the user is inactive but not revoked, so a
 /// reactivated user's tokens work again; revoke them individually
 /// (`DELETE /admin/tokens/{id}`) to kill them for good. Reactivation changes

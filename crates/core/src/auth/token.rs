@@ -34,6 +34,10 @@ use super::login_throttle::{username_for_log, AttemptRefused, LoginThrottle, MAX
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
 
+/// A token's `last_used_at` is written at most this often (seconds), so the
+/// parallel requests of one restore do not all write the token's row.
+const TOKEN_TOUCH_INTERVAL_SECS: i64 = 60;
+
 /// Hash a token secret into the lowercase-hex SHA-256 form stored in the DB.
 pub fn hash_token(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
@@ -55,16 +59,42 @@ pub fn generate_token_secret() -> String {
 /// expired nor revoked, and belongs to an active user; `Ok(None)` when the
 /// secret is not such a token. `Err` only on a database failure: the secret may
 /// still be a live token, so the caller must fail closed and must not treat it
-/// as anything else (e.g. a password). Best-effort updates `last_used_at`
-/// (failure there does not fail authentication).
+/// as anything else (e.g. a password). Best-effort updates `last_used_at`, at
+/// most once a minute (failure there does not fail authentication).
+/// [`check_token`] also tells an unusable token from a secret that is no token
+/// at all.
 pub async fn verify_token(pool: &PgPool, secret: &str) -> sqlx::Result<Option<UserPrincipal>> {
+    Ok(match check_token(pool, secret).await? {
+        TokenCheck::Live(up) => Some(up),
+        TokenCheck::Unusable | TokenCheck::Unknown => None,
+    })
+}
+
+/// What an API token secret is ([`check_token`]).
+#[derive(Debug)]
+pub enum TokenCheck {
+    /// A live token of an active user.
+    Live(UserPrincipal),
+    /// A token Forge issued that cannot be used now: expired, revoked, or
+    /// owned by an inactive (or deleted) user. It is still a secret, and a
+    /// deactivated user's tokens work again on reactivation, so it must not
+    /// be tried as anything else either (e.g. sent upstream as a password).
+    Unusable,
+    /// Not a token Forge issued.
+    Unknown,
+}
+
+/// [`verify_token`], telling a token that exists but cannot be used
+/// ([`TokenCheck::Unusable`]) from a secret that is no token
+/// ([`TokenCheck::Unknown`]).
+pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck> {
     let hash = hash_token(secret);
 
     let Some(token) = forge_db::token_dao::find_token_by_hash(pool, &hash)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "token lookup failed"))?
     else {
-        return Ok(None);
+        return Ok(TokenCheck::Unknown);
     };
 
     // Defense in depth: constant-time compare of stored vs recomputed hash.
@@ -77,35 +107,37 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> sqlx::Result<Option<Us
         .unwrap_u8()
         != 1
     {
-        return Ok(None);
+        return Ok(TokenCheck::Unknown);
     }
 
     let now = Utc::now();
     if let Some(exp) = token.expires_at {
         if exp <= now {
-            return Ok(None);
+            return Ok(TokenCheck::Unusable);
         }
     }
     if token.revoked_at.is_some() {
-        return Ok(None);
+        return Ok(TokenCheck::Unusable);
     }
 
     let Some(user) = forge_db::user_dao::find_user_by_id(pool, token.user_id)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "token user lookup failed"))?
     else {
-        return Ok(None);
+        return Ok(TokenCheck::Unusable);
     };
     if !user.active {
-        return Ok(None);
+        return Ok(TokenCheck::Unusable);
     }
 
-    // Best-effort touch; ignore errors.
-    if let Err(e) = forge_db::token_dao::touch_last_used(pool, token.id).await {
+    // Best-effort touch, at most once a minute per token; ignore errors.
+    if let Err(e) =
+        forge_db::token_dao::touch_last_used(pool, token.id, TOKEN_TOUCH_INTERVAL_SECS).await
+    {
         tracing::debug!(error = %e, token_id = token.id, "touch_last_used failed");
     }
 
-    Ok(Some(UserPrincipal {
+    Ok(TokenCheck::Live(UserPrincipal {
         user_id: user.id,
         token_id: Some(token.id),
         is_admin: user.is_admin,
@@ -385,18 +417,26 @@ impl PrincipalSource for BasicAuthSource {
         }
 
         // Try the secret as a token first (unchanged from slice 1, runs ahead
-        // of the password chain). A lookup that failed has not ruled out a
-        // live token: never run it through the password chain (a
-        // credential-forwarding realm would send it upstream), fail closed.
-        match verify_token(&self.pool, &secret).await {
-            Ok(Some(up)) => return SourceOutcome::Authenticated(Principal::from_user(up)),
-            Ok(None) => {}
+        // of the password chain). A token Forge issued is never a password,
+        // even one that cannot be used now, and a lookup that failed has not
+        // ruled out a live token: neither is run through the password chain
+        // (a credential-forwarding realm would send it upstream).
+        match check_token(&self.pool, &secret).await {
+            Ok(TokenCheck::Live(up)) => {
+                return SourceOutcome::Authenticated(Principal::from_user(up))
+            }
+            Ok(TokenCheck::Unusable) => return SourceOutcome::Invalid,
+            Ok(TokenCheck::Unknown) => {}
             Err(_) => return SourceOutcome::Unavailable,
         }
         // Then, if a password chain is configured, run the secret as a password
         // through the AuthProvider chain. The chain is re-resolved per attempt
         // so runtime realm edits (12.7) take effect without a restart.
-        if let Some(chain) = self.chain.password_chain().await {
+        let chain = match self.chain.password_chain().await {
+            Ok(chain) => chain,
+            Err(_) => return SourceOutcome::Unavailable,
+        };
+        if let Some(chain) = chain {
             // The lockout, the chain and the account lookup all key on the
             // canonical username, so `Alice`/`alice ` share one budget and
             // one account. A name that cannot be canonical is a bad login.
@@ -444,18 +484,20 @@ impl PrincipalSource for BasicAuthSource {
                             }
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
-                        // Vouched-for but no (active) app_user row, or a DB
-                        // error during mapping: fail closed. Basic creds were
-                        // presented, so this is an attempted-but-failed login
-                        // (Invalid → 401), never a downgrade to anonymous.
+                        // Vouched-for but no (active) app_user row: fail closed.
+                        // Basic creds were presented, so this is an
+                        // attempted-but-failed login (Invalid → 401), never a
+                        // downgrade to anonymous.
                         Ok(None) => {
                             attempt.failed();
                             return SourceOutcome::Invalid;
                         }
+                        // A DB error during mapping: denied too, but as
+                        // temporarily unavailable (503), so clients retry.
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
                             attempt.released();
-                            return SourceOutcome::Invalid;
+                            return SourceOutcome::Unavailable;
                         }
                     }
                 }
@@ -472,6 +514,12 @@ impl PrincipalSource for BasicAuthSource {
                 ChainOutcome::Unavailable => {
                     attempt.released();
                     return SourceOutcome::Invalid;
+                }
+                // Forge's own database failed: 503, so clients retry instead
+                // of asking for new credentials.
+                ChainOutcome::Failed => {
+                    attempt.released();
+                    return SourceOutcome::Unavailable;
                 }
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still

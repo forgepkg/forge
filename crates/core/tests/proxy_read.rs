@@ -78,6 +78,8 @@ struct MockState {
     /// `lower_id -> flat-container listing document` served instead of the
     /// corpus's.
     flat_index_override: Mutex<HashMap<String, serde_json::Value>>,
+    /// The service index served instead of the real one.
+    index_override: Mutex<Option<serde_json::Value>>,
     /// When set, a `.nupkg` request signals the first `Notify` on arrival and
     /// answers only once the second is notified (a slow download).
     hold_nupkg: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
@@ -114,6 +116,10 @@ struct MockUpstream {
 }
 
 impl MockUpstream {
+    /// Serve `doc` as the service index from now on.
+    fn override_index(&self, doc: serde_json::Value) {
+        *self.state.index_override.lock().unwrap() = Some(doc);
+    }
     fn index_hits(&self) -> usize {
         self.state.index_hits.load(Ordering::SeqCst)
     }
@@ -200,6 +206,9 @@ async fn serve_index(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     st.index_hits.fetch_add(1, Ordering::SeqCst);
+    if let Some(doc) = st.index_override.lock().unwrap().clone() {
+        return (StatusCode::OK, axum::Json(doc)).into_response();
+    }
     let body = serde_json::json!({
         "version": "3.0.0",
         "resources": [
@@ -357,6 +366,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         registrations: Mutex::default(),
         registration_pages: Mutex::default(),
         flat_index_override: Mutex::default(),
+        index_override: Mutex::default(),
         hold_nupkg: Mutex::default(),
     });
 
@@ -825,14 +835,242 @@ fn upstream_hits(mock: &MockUpstream) -> [usize; 6] {
     ]
 }
 
-/// Point proxy `repo` at another upstream (the admin update's write).
+/// Point proxy `repo` at another upstream, as the admin update does: the new
+/// URL, and in the same transaction the reset of what the proxy learned from
+/// the previous one.
 async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
-    sqlx::query("UPDATE repository SET remote_url = $2 WHERE name = $1")
-        .bind(repo)
+    let id = repo_id(pool, repo).await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE repository SET remote_url = $2 WHERE id = $1")
+        .bind(id)
         .bind(remote_url)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
+    forge_db::proxy_dao::reset_for_new_upstream(&mut tx, id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// #77: the package delay and the not-found TTL count on the database's
+/// clock, which writes `first_seen_at` and `not_found_at`. Here it runs an
+/// hour ahead of the application's.
+#[tokio::test]
+async fn proxy_delay_and_not_found_ttl_run_on_the_database_clock() {
+    let pool = common::pool_with_clock_ahead().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let backdate = |column: &'static str, minutes: i32, repo: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match column {
+                "first_seen_at" => {
+                    "UPDATE proxy_cached_version SET first_seen_at = now() - make_interval(mins => $2) \
+                     WHERE repository_id = (SELECT id FROM repository WHERE name = $1)"
+                }
+                _ => {
+                    "UPDATE proxy_cached_version SET not_found_at = now() - make_interval(mins => $2) \
+                     WHERE repository_id = (SELECT id FROM repository WHERE name = $1)"
+                }
+            };
+            sqlx::query(sql)
+                .bind(repo)
+                .bind(minutes)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // A 30-minute delay. (A column default reads the real clock, not the
+    // skewed `now()`, so the first sighting is stamped explicitly.)
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 1800, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    px.list_versions(&repo, "Contoso.Lib").await.unwrap();
+    backdate("first_seen_at", 0, repo.clone()).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(
+        px.list_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap()
+            .is_empty(),
+        "just seen: inside the delay"
+    );
+    // First seen 31 minutes ago on the database's clock.
+    backdate("first_seen_at", 31, repo.clone()).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "past the delay on the database's clock"
+    );
+
+    // A 10-minute not-found TTL, marked 11 minutes ago.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Fabrikam.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    mock.state
+        .packages
+        .lock()
+        .unwrap()
+        .extend(corpus_of("Fabrikam.Lib", &["2.0.0"]));
+    backdate("not_found_at", 11, repo.clone()).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Fabrikam.Lib").await.unwrap()),
+        ["2.0.0"],
+        "the marker expired on the database's clock"
+    );
+}
+
+/// #76: a service index without `PackageBaseAddress` (a captive portal, a
+/// gateway's error page) is an upstream failure. It never replaces the last
+/// good index, and without one the proxy errors instead of answering every id
+/// with an authoritative "not found".
+#[tokio::test]
+async fn service_index_without_a_package_base_address_is_an_upstream_failure() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let id = repo_id(&pool, &repo).await;
+    let stale = || async {
+        sqlx::query(
+            "UPDATE proxy_upstream_index SET fetched_at = now() - interval '2 hours' \
+             WHERE repository_id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    };
+
+    // A good index first, then the upstream answers an empty one.
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    mock.override_index(serde_json::json!({"version": "3.0.0", "resources": []}));
+    stale().await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "New.Lib").await.unwrap()),
+        Vec::<String>::new(),
+        "the stale good index is still used: the upstream says New.Lib is unknown"
+    );
+    let stored = forge_db::proxy_dao::get_upstream_index(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        stored.resources["package_base_address"].is_string(),
+        "the empty index was not stored: {:?}",
+        stored.resources
+    );
+    assert!(
+        px.resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+            .await
+            .unwrap()
+            .is_some(),
+        "downloads keep going to the last good package base address"
+    );
+
+    // No good index at all: an error, never an empty answer.
+    let fresh = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    fresh.override_index(serde_json::json!({}));
+    let repo = make_proxy(&pool, &format!("{}/index.json", fresh.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(px.list_versions(&repo, "Contoso.Lib").await.is_err());
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .is_err());
+    assert!(
+        forge_db::proxy_dao::get_upstream_index(&pool, repo_id(&pool, &repo).await)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// #65: a repointed proxy forgets the previous upstream's per-version state.
+/// A package-level not-found marker the old upstream caused does not keep
+/// answering 404 for the new one, and a version the old upstream listed long
+/// ago waits out the package delay again before the new upstream's bytes are
+/// served.
+#[tokio::test]
+async fn repointed_proxy_forgets_the_previous_upstreams_markers_and_delay_clock() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+
+    // Not-found marker.
+    let old = start_mock(corpus_of("Other.Lib", &["1.0.0"])).await;
+    let new = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", old.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    repoint(&pool, &repo, &format!("{}/index.json", new.base)).await;
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the old upstream's not-found marker must not hide the new upstream's package"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+
+    // Package delay: the old upstream listed 1.0.0 two hours ago, past the
+    // one-hour delay; the new upstream's 1.0.0 is a different package.
+    let old = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let new = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", old.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo_id(&pool, &repo).await)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the old upstream's version cleared the delay"
+    );
+    repoint(&pool, &repo, &format!("{}/index.json", new.base)).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(
+        px.list_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the new upstream's version waits out the delay"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(new.nupkg_hits(), 0, "nothing downloaded inside the delay");
 }
 
 /// #13: repointing a proxy (`remote_url`) takes effect at once. Nothing more
@@ -919,9 +1157,11 @@ async fn repointed_proxy_never_fetches_from_the_previous_upstream() {
                 .is_err(),
             "stale: {stale}"
         );
+        // 2.0.0 was downloaded; 1.0.0 was only listed by the previous
+        // upstream, which the proxy no longer asks for it (#65).
         assert_eq!(
             versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
-            ["1.0.0", "2.0.0"],
+            ["2.0.0"],
             "versions cached locally are still served (stale: {stale})"
         );
     }
@@ -1177,7 +1417,8 @@ async fn planted_not_found_marker_is_cleared_by_a_later_listing() {
 }
 
 /// H3 follow-up: a version deleted upstream (e.g. a malicious release pulled
-/// from nuget.org) leaves the listings at the next refresh, instead of
+/// from nuget.org) leaves the listings once a refresh at least one metadata
+/// TTL after the first listing without it confirms the deletion, instead of
 /// reappearing every `not_found_ttl`; it comes back if the upstream lists it
 /// again.
 #[tokio::test]
@@ -1193,7 +1434,24 @@ async fn versions_deleted_upstream_leave_the_listings() {
     );
 
     mock.unpublish("contoso.lib", "2.1.0");
-    // A fresh cache stands in for an expired metadata TTL.
+    // A fresh cache stands in for an expired metadata TTL. One listing
+    // without the version is no deletion yet (it may be partial)...
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.1.0"],
+        "one listing without the version does not retire it"
+    );
+    // ...one a metadata TTL (600 s) later is.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET missing_since = missing_since - interval '11 minutes' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+           AND missing_since IS NOT NULL",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
     let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1225,6 +1483,56 @@ async fn versions_deleted_upstream_leave_the_listings() {
         ["1.0.0", "2.1.0"],
         "listed again, visible again"
     );
+}
+
+/// An upstream that serves a partial listing for a while (a Forge group
+/// whose proxy member's upstream is briefly down answers with its other
+/// members' versions) retires nothing: the versions it left out stay listed,
+/// and once the upstream lists them again nothing is pending.
+#[tokio::test]
+async fn a_partial_listing_during_an_upstream_incident_retires_nothing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0", "3.0.0"])).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+
+    // The incident: only 1.0.0 is listed.
+    mock.unpublish("contoso.lib", "2.0.0");
+    mock.unpublish("contoso.lib", "3.0.0");
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+    assert_eq!(
+        searched_versions(&px, &repo, "contoso").await,
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+
+    // Recovered by the next refresh: nothing is left pending, so a later
+    // partial listing starts counting afresh.
+    mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    mock.publish("contoso.lib", "3.0.0", make_nupkg("Contoso.Lib", "3.0.0"));
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0", "3.0.0"]
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM proxy_cached_version \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1) \
+           AND (missing_since IS NOT NULL OR upstream_missing)",
+    )
+    .bind(&repo)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 0);
 }
 
 /// Search applies every listing condition (prerelease, SemVer 2.0.0, the
@@ -1963,6 +2271,157 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
     px.registration(&repo, "Contoso.Lib").await.unwrap();
     assert_eq!(mock.registration_page_hits(), 10, "pages are cached");
     assert_eq!(mock.registration_hits(), 1);
+
+    // A registration page or leaf asks for its own versions only, so the
+    // old versions get their pages too: no package is too long for its
+    // oldest versions' dependencies, listing state and publish date.
+    let old = px
+        .registration_entries(&repo, "Contoso.Lib", &["1.0.0".into(), "2.0.0".into()])
+        .await
+        .unwrap();
+    assert_eq!(old.len(), 2);
+    assert!(old.iter().all(|e| e.nuspec_bytes.is_some()), "{old:?}");
+    assert_eq!(mock.registration_page_hits(), 12);
+    let leaf = px
+        .registration_entry(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .expect("leaf");
+    assert!(leaf.nuspec_bytes.is_some());
+    // The versions alone (an index that does not inline its leaves) need no
+    // upstream registration at all.
+    assert_eq!(
+        px.registration_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap(),
+        versions
+    );
+    assert_eq!(mock.registration_page_hits(), 12);
+    assert_eq!(mock.registration_hits(), 1);
+}
+
+/// Proxy search answers with the package id as the package spells it, not
+/// the lowercased one the cache rows hold: from a downloaded version's
+/// manifest, else from the upstream registration.
+#[tokio::test]
+async fn proxy_search_shows_the_ids_original_casing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = corpus_of("Contoso.Downloaded", &["1.0.0"]);
+    corpus.extend(corpus_of("Contoso.Registered", &["1.0.0"]));
+    corpus.extend(corpus_of("Contoso.Listed", &["1.0.0"]));
+    let mock = start_mock(corpus).await;
+    mock.set_registration(
+        "contoso.registered",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "1.0.0", "count": 1,
+            "items": [ { "catalogEntry": {
+                "id": "Contoso.Registered", "version": "1.0.0", "listed": true
+            } } ]
+        } ] }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(px
+        .resolve_nupkg(&repo, "contoso.downloaded", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    px.registration(&repo, "contoso.registered").await.unwrap();
+    px.list_versions(&repo, "contoso.listed").await.unwrap();
+
+    let params = forge_core::repo::SearchParams {
+        q: "contoso".into(),
+        skip: 0,
+        take: 20,
+        prerelease: true,
+        include_semver2: true,
+    };
+    let ids: Vec<String> = px
+        .search(&repo, &params)
+        .await
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|h| h.original_id)
+        .collect();
+    // Known neither way: the lowercased id, as before.
+    assert_eq!(
+        ids,
+        ["Contoso.Downloaded", "contoso.listed", "Contoso.Registered"]
+    );
+}
+
+/// The package delay quarantines new releases: a version the upstream
+/// published long ago is served at its first sighting (every version of a
+/// package the proxy has not served before, all of them on a fresh install),
+/// while a recent release waits out the delay. Only a listed version's
+/// plausible publish time counts: nuget.org dates unlisted versions 1900.
+#[tokio::test]
+async fn the_package_delay_counts_from_the_upstream_publish_time() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of(
+        "Contoso.Lib",
+        &["1.0.0", "2.0.0", "3.0.0", "4.0.0"],
+    ))
+    .await;
+    let five_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    mock.set_registration(
+        "contoso.lib",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "4.0.0", "count": 4,
+            "items": [
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "1.0.0", "listed": true,
+                                    "published": "2020-02-03T04:05:06+00:00" } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "2.0.0", "listed": true,
+                                    "published": five_minutes_ago } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "3.0.0", "listed": false,
+                                    "published": "1900-01-01T00:00:00+00:00" } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "4.0.0", "listed": true,
+                                    "published": tomorrow } }
+            ]
+        } ] }),
+    );
+    // A one-hour delay.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "only the old release is out of quarantine"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    for version in ["2.0.0", "3.0.0", "4.0.0"] {
+        assert!(
+            px.resolve_nupkg(&repo, "Contoso.Lib", version)
+                .await
+                .unwrap()
+                .is_none(),
+            "{version} is still inside the delay"
+        );
+    }
+
+    // The recent release clears the delay an hour after it was published,
+    // the others an hour after their first sighting.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = first_seen_at - interval '56 minutes' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1)",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"]
+    );
 }
 
 /// M11: without an upstream registration the flat-container view is served

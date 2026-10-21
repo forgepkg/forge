@@ -502,3 +502,85 @@ async fn health_endpoints() {
     assert_eq!(body["checks"]["database"], true);
     assert_eq!(body["checks"]["object_store"], true);
 }
+
+/// #73: an offline hosted or group repository answers every feed request with
+/// 503 (pushes included); an offline proxy still serves locally (here its
+/// service index). Unauthorized callers still get 401, not the 503.
+#[tokio::test]
+async fn offline_hosted_and_group_repositories_answer_503() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let hosted = format!("offh{s}");
+    let group = format!("offg{s}");
+    let proxy = format!("offp{s}");
+    for body in [
+        serde_json::json!({"name": hosted, "kind": "hosted"}),
+        serde_json::json!({"name": group, "kind": "group"}),
+        serde_json::json!({"name": proxy, "kind": "proxy",
+                           "remote_url": "https://api.nuget.org/v3/index.json"}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{body}");
+    }
+    let index = |repo: &str| format!("{}/v3/{repo}/index.json", srv.base_url);
+    for repo in [&hosted, &group, &proxy] {
+        let resp = client
+            .get(index(repo))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{repo} online");
+        let resp = client
+            .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"online": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    for repo in [&hosted, &group] {
+        let resp = client
+            .get(index(repo))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503, "{repo} offline");
+        assert!(resp.headers().contains_key("retry-after"));
+        let resp = client.get(index(repo)).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "{repo}: authorization first");
+    }
+    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&format!("Off.Pkg{s}"), "1.0.0"))
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{hosted}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", srv.admin_token().await)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "no push into an offline repository");
+    let resp = client
+        .get(index(&proxy))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "an offline proxy serves what it has locally"
+    );
+}

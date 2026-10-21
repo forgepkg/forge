@@ -10,7 +10,7 @@ Each release publishes the chart to GitHub Container Registry as an OCI
 artifact, with the same version as the image:
 
 ```bash
-helm install forge oci://ghcr.io/schmitch/charts/forge --version 0.1.0 \
+helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
   --namespace forge --create-namespace --values my-values.yaml
 ```
 
@@ -22,7 +22,7 @@ built and signed into the published chart (the `forge.envisia.de/image-digest`
 annotation in `Chart.yaml`), so a published chart deploys exactly that image:
 
 ```
-ghcr.io/schmitch/forge:0.1.0@sha256:…
+ghcr.io/schmitch/forge:1.0.0@sha256:…
 ```
 
 Setting `image.tag` or `image.digest` replaces that pin. Upgrading Forge is
@@ -39,8 +39,8 @@ them like this:
 | --- | --- |
 | `config` | `forge.toml` in a ConfigMap, loaded through `FORGE_CONFIG`. Any key of [forge.toml.example](../../../forge.toml.example), as YAML, nested by section. |
 | `host` | `server.public_base_url` (`https://<host>`), and the default host of the HTTPRoute, the ListenerSet listener and the Certificate. |
-| `secretEnv` | A Secret the chart creates, loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY`, … |
-| `existingSecret` | An existing Secret loaded with `envFrom` (External Secrets, Sealed Secrets, SOPS, …). |
+| `secretEnv` | A Secret the chart creates (`<fullname>-secret-env`), loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY`, … |
+| `existingSecret` | An existing Secret loaded with `envFrom` (External Secrets, Sealed Secrets, SOPS, …); it wins over `secretEnv` for a key in both. Any name but the chart's own `<fullname>-secret-env`. |
 | `env`, `envFrom` | Further variables; `valueFrom` reads single Secret keys. They win over the chart's own. |
 
 Environment variables override `forge.toml`. Keep secrets out of `config`:
@@ -66,7 +66,7 @@ config:
     root:
       provider: env                     # secret encryption at rest
 
-existingSecret: forge-env               # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
+existingSecret: forge-credentials       # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
                                         # FORGE_S3__SECRET_KEY, FORGE_ROOT_KEY,
                                         # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 redis:
@@ -182,7 +182,7 @@ Evaluation install, everything in the cluster:
 
 ```bash
 password=$(openssl rand -hex 12); echo "admin password: $password"
-helm install forge oci://ghcr.io/schmitch/charts/forge --version 0.1.0 \
+helm install forge oci://ghcr.io/schmitch/charts/forge --version 1.0.0 \
   --namespace forge-eval --create-namespace \
   --set postgresql.enabled=true --set versitygw.enabled=true \
   --set secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD="$password"
