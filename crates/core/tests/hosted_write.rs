@@ -252,24 +252,36 @@ async fn duplicate_without_redeploy_is_conflict() {
     assert!(matches!(err, WriteError::Conflict { .. }));
 
     // #81: a duplicate with other bytes is refused before its blob is stored.
+    // (Looked up by content hash: other tests add blobs concurrently.)
     let id = unique_id();
-    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+    let first = make_nupkg(&id, "1.0.0");
+    let duplicate = make_nupkg_variant(&id, "1.0.0");
+    let stored = |bytes: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM blob WHERE sha256 = encode(sha256($1), 'hex')",
+            )
+            .bind(bytes)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    w.store_upload(&repo, &first[..], MAX_UPLOAD)
         .await
         .expect("publish");
-    let blobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM blob")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    assert_eq!(
+        stored(first).await,
+        1,
+        "a published package's blob is found"
+    );
     let err = w
-        .store_upload(&repo, &make_nupkg_variant(&id, "1.0.0")[..], MAX_UPLOAD)
+        .store_upload(&repo, &duplicate[..], MAX_UPLOAD)
         .await
         .expect_err("duplicate must conflict");
     assert!(matches!(err, WriteError::Conflict { .. }));
-    let blobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM blob")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(blobs_after, blobs_before, "nothing reached the blob store");
+    assert_eq!(stored(duplicate).await, 0, "nothing reached the blob store");
 }
 
 /// Simultaneous *first* pushes of one (id, version): the duplicate check cannot
