@@ -2075,16 +2075,24 @@ impl ProxyRepo {
         let mut out = Vec::with_capacity(visible.len());
         for r in visible {
             let leaf = upstream.get(&r.version);
-            let (hash, summary, local) = match cached.remove(&r.version) {
-                Some(row) if r.downloaded => {
-                    let (summary, local) = match row.manifest_summary {
-                        Some(summary) => (Some(summary), None),
-                        None => manifests.remove(&r.version).unwrap_or_default(),
-                    };
-                    (row.package_hash_sha512_base64, summary, local)
-                }
-                _ => (None, None, None),
-            };
+            let (hash, sha256, size, summary, local, version_original) =
+                match cached.remove(&r.version) {
+                    Some(row) if r.downloaded => {
+                        let (summary, local) = match row.manifest_summary {
+                            Some(summary) => (Some(summary), None),
+                            None => manifests.remove(&r.version).unwrap_or_default(),
+                        };
+                        (
+                            row.package_hash_sha512_base64,
+                            row.package_sha256,
+                            row.package_size,
+                            summary,
+                            local,
+                            Some(row.version_original),
+                        )
+                    }
+                    _ => (None, None, None, None, None, None),
+                };
             let original_id = leaf
                 .and_then(|l| l.id.clone())
                 .unwrap_or_else(|| r.name.clone());
@@ -2106,8 +2114,11 @@ impl ProxyRepo {
             out.push(RegistrationEntry {
                 original_id,
                 version: r.version.clone(),
+                version_original: version_original.unwrap_or_else(|| r.version.clone()),
                 listed: leaf.map_or(r.listed, |l| l.listed),
                 package_hash_sha512_base64: hash,
+                package_sha256: sha256,
+                package_size: size,
                 nuspec_bytes,
                 manifest_summary: summary,
                 // Only the upstream registration knows the publish time (the

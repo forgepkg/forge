@@ -358,7 +358,7 @@ async fn load_candidate_components_returns_components_with_nupkg_blob() {
     .await
     .unwrap();
 
-    let cands = retention_dao::load_candidate_components(&pool, repo.id)
+    let cands = retention_dao::load_candidate_components(&pool, repo.id, "package.nupkg")
         .await
         .expect("load");
     assert_eq!(cands.len(), 1);

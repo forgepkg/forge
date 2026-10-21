@@ -36,7 +36,7 @@ use crate::middleware::principal_of;
 use crate::state::AppState;
 
 /// `Retry-After` (seconds) of an offline repository's 503.
-const OFFLINE_RETRY_AFTER_SECS: &str = "60";
+pub(crate) const OFFLINE_RETRY_AFTER_SECS: &str = "60";
 
 /// Whether `repo` is switched off for maintenance and so serves nothing: an
 /// offline hosted or group repository. An offline proxy still serves what it
@@ -58,7 +58,7 @@ pub(crate) fn offline_response() -> Response {
 }
 
 /// RBAC action corresponding to one NuGet protocol request.
-fn action_for_method(method: &Method) -> Action {
+pub(crate) fn action_for_method(method: &Method) -> Action {
     match *method {
         Method::PUT | Method::POST => Action::Write,
         Method::DELETE => Action::Delete,
@@ -90,7 +90,7 @@ async fn route_context(
     replace_filter: PackageFilter,
 ) -> Option<RouteContext> {
     let kind = repo.kind();
-    let format = state.formats.for_repository(repo);
+    let format = state.formats.nuget();
     let ops = state.read_ops_for(repo, principal).await.ok()?;
     let protocol_mutations_allowed = principal_allows_protocol_mutations(&principal);
 
@@ -127,7 +127,7 @@ async fn route_context(
 /// package clients. A session/password principal is intentionally insufficient:
 /// otherwise adding an unrelated `Authorization` header to a cookie-authenticated
 /// request would turn that browser session into a package publishing credential.
-fn principal_allows_protocol_mutations(principal: &Principal) -> bool {
+pub(crate) fn principal_allows_protocol_mutations(principal: &Principal) -> bool {
     matches!(
         principal,
         Principal::Workload { .. }
@@ -190,6 +190,12 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     // window). Answered after authorization.
     if offline_serves_nothing(&repo) {
         return offline_response();
+    }
+    // `/v3` is the NuGet feed. A repository of another format is served by
+    // that format's own protocol (`/repository/{repo}`), never read or
+    // written as NuGet.
+    if repo.format != state.formats.nuget().id() {
+        return (StatusCode::NOT_FOUND, "not a NuGet repository").into_response();
     }
     let package_filter = state
         .authz
@@ -258,7 +264,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
 
 /// Map an authorization denial to the right status: unauthenticated → 401 (send
 /// credentials), authenticated-but-forbidden → 403, anonymous-denied → 401.
-fn authz_denied(principal: &Principal) -> Response {
+pub(crate) fn authz_denied(principal: &Principal) -> Response {
     match principal {
         // An authenticated identity (user or WIF workload) that is nonetheless
         // denied by RBAC → 403.
@@ -301,12 +307,12 @@ use std::sync::Arc;
 
 /// Bridges the object-safe [`RepoWriteOps`] trait (which takes a boxed
 /// [`UploadReader`]) to [`HostedWrite`]'s generic `store_upload<R>`.
-struct HostedWriteAdapter {
+pub(crate) struct HostedWriteAdapter {
     inner: HostedWrite,
 }
 
 impl HostedWriteAdapter {
-    fn new(
+    pub(crate) fn new(
         state: &AppState,
         format: Arc<dyn Format>,
         repository_id: i64,

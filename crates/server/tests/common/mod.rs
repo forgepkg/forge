@@ -187,6 +187,7 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
     let web_assets_dir = opts.web_assets_dir.as_deref();
     let oidc_block = opts.oidc_block.as_deref();
     let crypto_block = opts.crypto_block.as_deref();
+    let plugins_block = opts.plugins_block.as_deref();
     let public_base_url = opts
         .public_base_url
         .as_deref()
@@ -237,12 +238,14 @@ poll_interval_seconds = 1
 {web}
 {oidc}
 {crypto}
+{plugins}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
         secret = S3_SECRET,
         oidc = oidc_block.unwrap_or(""),
         crypto = crypto_block.unwrap_or(""),
+        plugins = plugins_block.unwrap_or(""),
     )
 }
 
@@ -290,6 +293,9 @@ pub struct ServerOpts {
     pub public_base_url: Option<String>,
     /// Extra raw TOML lines for the `[server]` section (e.g. timeouts).
     pub server_extra: Option<String>,
+    /// When set, this raw TOML is appended as the `[plugins]` section, and the
+    /// format plugins it lists are loaded.
+    pub plugins_block: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -303,6 +309,7 @@ impl Default for ServerOpts {
             crypto_block: None,
             public_base_url: None,
             server_extra: None,
+            plugins_block: None,
         }
     }
 }
@@ -349,7 +356,11 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let state = AppState::new(pool.clone(), store, cache, nuget, config).with_envelope(envelope);
+    let plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
+    let state = AppState::new(pool.clone(), store, cache, nuget, config)
+        .with_envelope(envelope)
+        .with_plugins(plugins)
+        .expect("install format plugins");
     let layer = principal_layer(&state).expect("principal layer");
 
     let workers = if opts.spawn_workers {

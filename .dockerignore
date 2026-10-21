@@ -4,6 +4,7 @@
 
 # Rust build artifacts (the builder stage runs its own `cargo build`).
 /target
+/plugins/*/target
 **/*.rs.bk
 
 # Node / pnpm (the web build stage runs `pnpm install` fresh from the lockfile).

@@ -14,6 +14,7 @@
 //! * [`MemberFactory`] implements [`forge_core::repo::group::MemberOpsFactory`]
 //!   by branching on a member repository's `kind`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ use forge_core::repo::{
     CacheInvalidator, NoopCacheInvalidator, NupkgLocation, PackageFilteredReadOps, RepoError,
     RepoReadOps,
 };
+use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
@@ -52,8 +54,8 @@ pub struct AppState {
     /// Authorization decision service (§12.4 seam): every read/write/admin gate
     /// routes through this.
     pub authz: Authz,
-    /// Package-format registry. Slice 1 ships a single NuGet format; the map is
-    /// keyed by `Format::id()` so additional formats slot in without a refactor.
+    /// Package-format registry, keyed by `Format::id()`: the built-in NuGet
+    /// format plus any loaded format plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -84,27 +86,88 @@ pub struct AppState {
     pub downloads: Arc<DownloadTally>,
 }
 
-/// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
+/// Format registry: maps a format id (the `repository.format` column) to its
+/// [`Format`]. NuGet is built in; every other format comes from a format
+/// plugin loaded at startup ([`FormatRegistry::with_format`]).
 pub struct FormatRegistry {
     nuget: Arc<dyn Format>,
+    formats: BTreeMap<String, Arc<dyn Format>>,
+    /// The protocol side of each plugin format, by format id.
+    plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
 }
 
 impl FormatRegistry {
-    /// Build a registry from the NuGet format implementation.
+    /// A registry holding the built-in NuGet format only.
     pub fn new(nuget: Arc<dyn Format>) -> Self {
-        FormatRegistry { nuget }
+        let mut formats = BTreeMap::new();
+        formats.insert(nuget.id().to_string(), nuget.clone());
+        FormatRegistry {
+            nuget,
+            formats,
+            plugins: BTreeMap::new(),
+        }
     }
 
-    /// Resolve the format for a repository by its `format` column. Slice 1 only
-    /// knows `"nuget"`; any other value falls back to it (no other formats
-    /// exist yet).
-    pub fn for_repository(&self, _repo: &Repository) -> Arc<dyn Format> {
-        self.nuget.clone()
+    /// Add `format` under its [`Format::id`]. An id that is already taken
+    /// (NuGet's included) is refused: a plugin never shadows another format.
+    pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
+        let id = format.id().to_string();
+        if self.formats.contains_key(&id) {
+            return Err(format!("format {id:?} is already registered"));
+        }
+        self.formats.insert(id, format);
+        Ok(self)
+    }
+
+    /// Add a format plugin: its [`Format`] and its client protocol.
+    pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
+        let format = Arc::new(forge_plugin::PluginFormat::new(plugin.clone()));
+        self = self.with_format(format)?;
+        self.plugins.insert(plugin.id().to_string(), plugin);
+        Ok(self)
+    }
+
+    /// The format with id `id`, if installed.
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Format>> {
+        self.formats.get(id).cloned()
+    }
+
+    /// The plugin serving format `id`, if it is a plugin format.
+    pub fn plugin(&self, id: &str) -> Option<Arc<forge_plugin::Plugin>> {
+        self.plugins.get(id).cloned()
+    }
+
+    /// The loaded format plugins, by format id.
+    pub fn plugins(&self) -> impl Iterator<Item = &Arc<forge_plugin::Plugin>> {
+        self.plugins.values()
+    }
+
+    /// The installed format ids, sorted.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.formats.keys().map(String::as_str)
+    }
+
+    /// Resolve the format for a repository by its `format` column. A format
+    /// that is not installed is an error ([`RepoError::FormatUnavailable`]),
+    /// never a fallback to another format: a repository is only ever read and
+    /// written by the format that created it.
+    pub fn for_repository(&self, repo: &Repository) -> Result<Arc<dyn Format>, RepoError> {
+        self.get(&repo.format)
+            .ok_or_else(|| RepoError::FormatUnavailable(repo.format.clone()))
     }
 
     /// The NuGet format.
     pub fn nuget(&self) -> Arc<dyn Format> {
         self.nuget.clone()
+    }
+}
+
+/// [`FormatResolver`] over the shared registry (the retention worker's view).
+pub struct RegistryResolver(pub Arc<FormatRegistry>);
+
+impl FormatResolver for RegistryResolver {
+    fn resolve(&self, id: &str) -> Option<Arc<dyn Format>> {
+        self.0.get(id)
     }
 }
 
@@ -198,6 +261,18 @@ impl AppState {
         self
     }
 
+    /// Install the loaded format plugins (see [`crate::plugins::load`]). A
+    /// plugin whose format id is taken (NuGet, or another plugin) is an
+    /// error.
+    pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
+        let mut registry = FormatRegistry::new(self.formats.nuget());
+        for plugin in plugins {
+            registry = registry.with_plugin(plugin)?;
+        }
+        self.formats = Arc::new(registry);
+        Ok(self)
+    }
+
     /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`NupkgBytes`).
     pub fn blob_bytes(&self) -> Arc<BlobBytes> {
         Arc::new(BlobBytes {
@@ -223,7 +298,7 @@ impl AppState {
         repo: &Repository,
         principal: Principal,
     ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
-        let format = self.formats.for_repository(repo);
+        let format = self.formats.for_repository(repo)?;
         let filter = self.authz.package_filter(&principal, repo).await;
         let inner: Arc<dyn RepoReadOps> = match repo.kind() {
             RepoKind::Hosted => Arc::new(
@@ -355,7 +430,7 @@ pub struct MemberFactory {
 
 impl MemberOpsFactory for MemberFactory {
     fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
-        let format = self.formats.for_repository(member);
+        let format = self.formats.for_repository(member)?;
         match member.kind() {
             RepoKind::Hosted => Ok(Arc::new(
                 HostedRepo::new(

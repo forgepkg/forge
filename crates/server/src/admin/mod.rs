@@ -38,6 +38,7 @@ pub mod blob_cache;
 pub mod content_selectors;
 pub mod crypto;
 pub mod effective;
+pub mod formats;
 pub mod grants;
 pub mod members;
 pub mod realms;
@@ -156,6 +157,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .put(repositories::update)
                 .delete(repositories::delete),
         )
+        .route("/formats", get(formats::list))
         .route(
             "/repositories/{name}/packages/{id}/{version}",
             axum::routing::delete(repositories::hard_delete_package),
@@ -281,6 +283,18 @@ pub(crate) async fn hash_password(password: String) -> Result<String, Response> 
 pub(crate) fn db_error(e: sqlx::Error) -> Response {
     tracing::error!(error = %e, "admin db error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+/// The **503** answer for a repository whose format is not installed (a
+/// format plugin missing from the configuration): it cannot be read or
+/// changed until the format is back.
+pub(crate) fn format_unavailable(e: forge_core::repo::RepoError) -> Response {
+    tracing::warn!(error = %e, "repository format unavailable");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the repository's format is not installed on this server",
+    )
+        .into_response()
 }
 
 /// The **409** answer to a change refused by the last-admin guard

@@ -268,6 +268,11 @@ pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
             "temporarily unavailable, try again later",
         )
             .into_response(),
+        RepoError::FormatUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repository format unavailable",
+        )
+            .into_response(),
     }
 }
 

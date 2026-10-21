@@ -156,7 +156,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         supervise("retention", move || {
             RetentionWorker::new(
                 state.pool.clone(),
-                state.formats.nuget(),
+                crate::state::RegistryResolver(state.formats.clone()),
                 state.cache_invalidator(),
                 RetentionConfig {
                     poll_interval: state.config.retention.poll_interval(),
@@ -423,9 +423,15 @@ async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
+        // Proxies speak the NuGet V3 upstream protocol; no other format has
+        // proxy repositories (the admin API refuses them).
+        let format = match state.formats.for_repository(&repo) {
+            Ok(format) if format.id() == "nuget" => format,
+            _ => continue,
+        };
         // Same wiring as request-time reads: shared upstream client and the
         // envelope service, so credentialed upstreams refresh too.
-        let proxy = state.proxy_repo(state.formats.for_repository(&repo));
+        let proxy = state.proxy_repo(format);
         if let Err(e) = proxy.resolve_upstream_index(&repo).await {
             tracing::warn!(error = %e, repo = %repo.name, "proxy upstream refresh failed");
         }

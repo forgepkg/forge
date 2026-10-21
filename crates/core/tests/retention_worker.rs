@@ -46,7 +46,7 @@ fn config() -> RetentionConfig {
 fn worker(pool: &PgPool, config: RetentionConfig) -> RetentionWorker {
     RetentionWorker::new(
         pool.clone(),
-        Arc::new(NugetFormat::new()),
+        Arc::new(NugetFormat::new()) as Arc<dyn Format>,
         Arc::new(NoopCacheInvalidator),
         config,
     )
@@ -701,7 +701,7 @@ async fn panicking_run_is_recorded_as_failed_and_its_heartbeat_stops() {
 
     let w = RetentionWorker::new(
         pool.clone(),
-        Arc::new(PanickingFormat),
+        Arc::new(PanickingFormat) as Arc<dyn Format>,
         Arc::new(NoopCacheInvalidator),
         short_lease_config(),
     );
@@ -809,21 +809,22 @@ async fn claim_and_evaluate(
     tx.commit().await.unwrap();
     let policy: forge_core::retention::model::RetentionPolicy =
         serde_json::from_value(claimed.policy.clone()).unwrap();
-    let candidates: Vec<_> = retention_dao::load_candidate_components(pool, repo_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(
-            |(r, _)| forge_core::retention::evaluate::CandidateComponent {
-                component_id: r.component_id,
-                package_name: r.name,
-                version: r.version,
-                listed: r.listed,
-                created_at: r.created_at,
-                last_downloaded_at: r.last_downloaded_at,
-            },
-        )
-        .collect();
+    let candidates: Vec<_> =
+        retention_dao::load_candidate_components(pool, repo_id, forge_core::repo::NUPKG_ASSET_PATH)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(
+                |(r, _)| forge_core::retention::evaluate::CandidateComponent {
+                    component_id: r.component_id,
+                    package_name: r.name,
+                    version: r.version,
+                    listed: r.listed,
+                    created_at: r.created_at,
+                    last_downloaded_at: r.last_downloaded_at,
+                },
+            )
+            .collect();
     let decisions = forge_core::retention::evaluate::evaluate(
         &NugetFormat::default(),
         Utc::now(),

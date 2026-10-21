@@ -643,7 +643,7 @@ async fn responses_carry_browser_hardening_headers_and_version_is_exposed() {
 }
 
 #[tokio::test]
-async fn repository_formats_other_than_nuget_are_rejected() {
+async fn repository_formats_that_are_not_installed_are_rejected() {
     let srv = common::start().await;
     let (admin, password) = srv.admin_basic();
     let resp = srv

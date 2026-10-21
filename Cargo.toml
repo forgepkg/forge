@@ -7,6 +7,7 @@ members = [
     "crates/core",
     "crates/crypto",
     "crates/format-nuget",
+    "crates/plugin",
     "crates/server",
     "crates/e2e",
     "xtask",
@@ -14,6 +15,10 @@ members = [
 
 # One version for the whole product: every crate inherits it, so a release
 # bumps it here once (and `web/package.json` to match).
+# Format plugins are WebAssembly components with workspaces of their own
+# (built for `wasm32-wasip2`, see plugins/README.md).
+exclude = ["plugins"]
+
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
@@ -152,3 +157,18 @@ tempfile = { version = "3" }
 
 # Date/time (shared with forge-db's model types)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# WebAssembly runtime for format plugins (forge-plugin). 48 is a Wasmtime LTS
+# release (security fixes for two years) and the newest that builds with the
+# pinned toolchain. Only what the host uses: the component model compiled by
+# Cranelift, no WAT text parser, no GC proposals, no profiling or debugging.
+wasmtime = { version = "48.0.7", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "component-model",
+    "std",
+    "parallel-compilation",
+] }
+# WASI 0.2 for plugin components (a Rust guest's std imports it); the host
+# grants no filesystem, network or environment.
+wasmtime-wasi = { version = "48.0.7", default-features = false, features = ["p2"] }

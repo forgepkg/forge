@@ -1,8 +1,9 @@
 //! Hosted-repository read operations (spec §6, §7 "Hosted").
 //!
 //! Reads are served entirely from local data: `repository` → `component` →
-//! `asset` → `blob`. The `.nupkg` is located via the [`NUPKG_ASSET_PATH`]
-//! asset; the derived `.nuspec` via [`NUSPEC_ASSET_PATH`]. Version ordering and
+//! `asset` → `blob`. The package (the `.nupkg` for NuGet) is located via the
+//! format's [`Format::package_asset_path`] asset; the derived manifest (the
+//! `.nuspec`) via [`Format::manifest_asset_path`]. Version ordering and
 //! prerelease detection are delegated to the repository's [`Format`].
 //!
 //! Byte-level access to stored blobs (needed to serve `.nuspec` and to feed
@@ -28,8 +29,7 @@ use crate::repo::downloads::DownloadTally;
 use crate::repo::{
     CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
     PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
-    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
-    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
 };
 
 /// Fetch raw bytes of a stored blob.
@@ -266,8 +266,11 @@ impl HostedRepo {
         Ok(RegistrationEntry {
             original_id: row.original_id,
             version: row.version,
+            version_original: row.version_original,
             listed: row.listed,
             package_hash_sha512_base64: row.package_hash_sha512_base64,
+            package_sha256: row.package_sha256,
+            package_size: row.package_size,
             nuspec_bytes,
             manifest_summary,
             published: Some(row.created_at),
@@ -291,7 +294,8 @@ impl HostedRepo {
     /// The stored `.nuspec` of a component, if any.
     async fn nuspec_of_component(&self, component_id: i64) -> Result<Option<Vec<u8>>, RepoError> {
         let Some(asset) =
-            asset_dao::find_asset(&self.pool, component_id, NUSPEC_ASSET_PATH).await?
+            asset_dao::find_asset(&self.pool, component_id, self.format.manifest_asset_path())
+                .await?
         else {
             return Ok(None);
         };
@@ -317,7 +321,8 @@ impl HostedRepo {
         else {
             return Ok(None);
         };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.package_asset_path()).await?
         else {
             return Ok(None);
         };
@@ -389,7 +394,8 @@ impl RepoReadOps for HostedRepo {
         else {
             return Ok(None);
         };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUSPEC_ASSET_PATH).await?
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.manifest_asset_path()).await?
         else {
             return Ok(None);
         };
@@ -409,9 +415,13 @@ impl RepoReadOps for HostedRepo {
         // One query for every version's listing state, hash and stored
         // manifest summary; only versions published before summaries were
         // stored need their manifest fetched (once — see `entry_of_row`).
-        let mut rows =
-            component_dao::list_registration_rows(&self.pool, repo_id, id, NUPKG_ASSET_PATH)
-                .await?;
+        let mut rows = component_dao::list_registration_rows(
+            &self.pool,
+            repo_id,
+            id,
+            self.format.package_asset_path(),
+        )
+        .await?;
         rows.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
         use futures_util::StreamExt;
         futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
@@ -444,7 +454,7 @@ impl RepoReadOps for HostedRepo {
             repo_id,
             id,
             versions,
-            NUPKG_ASSET_PATH,
+            self.format.package_asset_path(),
         )
         .await?;
         use futures_util::StreamExt;
@@ -468,7 +478,7 @@ impl RepoReadOps for HostedRepo {
             repo_id,
             id,
             version,
-            NUPKG_ASSET_PATH,
+            self.format.package_asset_path(),
         )
         .await?
         {
@@ -630,10 +640,12 @@ impl HostedWrite {
             let format = self.format.clone();
             let path = staged_nupkg.temp_path.to_path_buf();
             tokio::task::spawn_blocking(move || {
-                let mut file = std::fs::File::open(&path).map_err(|e| {
-                    WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
-                })?;
-                let parsed = format.parse_upload(&mut file).map_err(WriteError::from)?;
+                if let Err(e) = std::fs::metadata(&path) {
+                    return Err(WriteError::Repo(RepoError::Storage(format!(
+                        "reopen temp upload: {e}"
+                    ))));
+                }
+                let parsed = format.parse_upload_file(&path).map_err(WriteError::from)?;
                 let summary = format.manifest_summary(&parsed.nuspec_bytes);
                 Ok::<_, WriteError>((parsed, summary))
             })
@@ -918,12 +930,13 @@ impl HostedWrite {
         // redeploy is the same version, and retention and search
         // (`totalDownloads`) read them.
         let mut downloads = None;
-        for path in [NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH] {
+        let package_path = self.format.package_asset_path();
+        for path in [package_path, self.format.manifest_asset_path()] {
             if let Some(old) = asset_dao::find_asset(&mut **tx, comp.id, path)
                 .await
                 .map_err(RepoError::from)?
             {
-                if path == NUPKG_ASSET_PATH {
+                if path == package_path {
                     downloads = Some(
                         sqlx::query!(
                             r#"SELECT download_count, last_downloaded_at FROM asset WHERE id = $1"#,
@@ -978,7 +991,7 @@ impl HostedWrite {
                 WHERE component_id = $1 AND path = $2
                 "#,
                 comp.id,
-                NUPKG_ASSET_PATH,
+                package_path,
                 downloads.download_count,
                 downloads.last_downloaded_at,
             )
@@ -989,7 +1002,8 @@ impl HostedWrite {
         Ok(true)
     }
 
-    /// Insert the canonical `.nupkg` and `.nuspec` asset rows for a component.
+    /// Insert the package and manifest asset rows (the `.nupkg` and `.nuspec`
+    /// for NuGet) for a component, at the format's asset paths.
     #[allow(clippy::too_many_arguments)]
     async fn insert_assets_in_tx(
         &self,
@@ -1007,8 +1021,8 @@ impl HostedWrite {
             &mut **tx,
             NewAsset {
                 component_id,
-                path: NUPKG_ASSET_PATH.to_string(),
-                content_type: NUPKG_CONTENT_TYPE.to_string(),
+                path: self.format.package_asset_path().to_string(),
+                content_type: self.format.package_content_type().to_string(),
                 blob_sha256: nupkg_sha.to_string(),
                 size: nupkg_size,
                 sha512_base64: Some(nupkg_hash512.to_string()),
@@ -1021,8 +1035,8 @@ impl HostedWrite {
             &mut **tx,
             NewAsset {
                 component_id,
-                path: NUSPEC_ASSET_PATH.to_string(),
-                content_type: NUSPEC_CONTENT_TYPE.to_string(),
+                path: self.format.manifest_asset_path().to_string(),
+                content_type: self.format.manifest_content_type().to_string(),
                 blob_sha256: nuspec_sha.to_string(),
                 size: nuspec_size,
                 sha512_base64: None,

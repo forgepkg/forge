@@ -137,6 +137,18 @@ pub async fn add(
     if member.id == group.id {
         return (StatusCode::BAD_REQUEST, "a group cannot contain itself").into_response();
     }
+    // A group serves one protocol: every member is of the group's format
+    // (a repository's format never changes, so checking here suffices).
+    if member.format != group.format {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "member format {:?} differs from the group's format {:?}",
+                member.format, group.format
+            ),
+        )
+            .into_response();
+    }
     if body.owner {
         if let Some(resp) = owner_kind_error(&member) {
             return resp;

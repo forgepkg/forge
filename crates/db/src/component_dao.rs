@@ -379,10 +379,15 @@ pub struct RegistrationRow {
     pub id: i64,
     pub original_id: String,
     pub version: String,
+    pub version_original: String,
     pub listed: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub manifest_summary: Option<serde_json::Value>,
     pub package_hash_sha512_base64: Option<String>,
+    /// SHA-256 (lowercase hex) of the package asset's blob.
+    pub package_sha256: Option<String>,
+    /// Byte size of the package asset.
+    pub package_size: Option<i64>,
 }
 
 /// Every version of `name` with its registration data, in one query (the
@@ -397,8 +402,9 @@ pub async fn list_registration_rows(
         RegistrationRow,
         r#"
         SELECT
-            c.id, c.original_id, c.version, c.listed, c.created_at,
-            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
         WHERE c.repository_id = $1 AND c.name = $2
@@ -456,8 +462,9 @@ pub async fn list_registration_rows_for_versions(
         RegistrationRow,
         r#"
         SELECT
-            c.id, c.original_id, c.version, c.listed, c.created_at,
-            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3::text[])
@@ -484,8 +491,9 @@ pub async fn find_registration_row(
         RegistrationRow,
         r#"
         SELECT
-            c.id, c.original_id, c.version, c.listed, c.created_at,
-            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3

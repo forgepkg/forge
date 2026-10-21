@@ -239,9 +239,13 @@ pub async fn search_packages(
     let mut total = 0usize;
     let mut all: Vec<BrowseItem> = Vec::new();
     for repo in readable {
+        // A misconfigured repo (e.g. nested group, or a format that is not
+        // installed) is skipped, not fatal.
+        let Ok(format) = state.formats.for_repository(repo) else {
+            continue;
+        };
         let ops = match state.read_ops_for(repo, principal).await {
             Ok(o) => o,
-            // A misconfigured repo (e.g. nested group) is skipped, not fatal.
             Err(_) => continue,
         };
         let params = SearchParams {
@@ -262,10 +266,7 @@ pub async fn search_packages(
                     all.push(BrowseItem {
                         repo: repo.name.clone(),
                         repo_kind: repo.kind.clone(),
-                        id: state
-                            .formats
-                            .for_repository(repo)
-                            .lower_id(&hit.original_id),
+                        id: format.lower_id(&hit.original_id),
                         original_id: hit.original_id,
                         latest_version: hit.latest_version,
                         listed: true,
@@ -386,7 +387,10 @@ pub async fn package_detail(
         return offline_response();
     }
 
-    let format = state.formats.for_repository(&repo);
+    let format = match state.formats.for_repository(&repo) {
+        Ok(format) => format,
+        Err(e) => return read_err(e),
+    };
     let lower = format.lower_id(&id);
     if !state
         .authz
@@ -578,6 +582,11 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
         RepoError::Busy(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response()
         }
+        RepoError::FormatUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the repository's format is not installed on this server",
+        )
+            .into_response(),
         other => {
             tracing::error!(error = %other, "browse read error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()

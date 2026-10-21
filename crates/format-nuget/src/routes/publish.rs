@@ -67,7 +67,7 @@ fn require_write_credentials(ctx: &RouteContext, headers: &HeaderMap) -> Option<
 pub const MAX_MULTIPART_PREAMBLE_BYTES: usize = 64 * 1024;
 
 /// The `boundary` parameter of a `multipart/form-data` content type.
-fn multipart_boundary(content_type: &str) -> Option<String> {
+pub fn multipart_boundary(content_type: &str) -> Option<String> {
     content_type.split(';').skip(1).find_map(|param| {
         let (name, value) = param.split_once('=')?;
         name.trim()
@@ -80,7 +80,7 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 /// Pass `body` through unchanged, but fail it (setting `overrun`) once
 /// [`MAX_MULTIPART_PREAMBLE_BYTES`] have gone by without the first part's
 /// headers being complete.
-fn preamble_guard(
+pub fn preamble_guard(
     body: impl Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     boundary: &str,
     overrun: Arc<AtomicBool>,
