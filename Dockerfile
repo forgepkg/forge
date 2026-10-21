@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # ─────────────────────────────────────────────────────────────────────────────
 # envisia-forge — single-image build.
@@ -18,6 +18,12 @@
 #
 # Build:  docker build -t envisia-forge:latest .   (or `cargo xtask docker-build`)
 # Run:    see the `runtime` stage footer for required FORGE_* env vars.
+#
+# The syntax line pins the Dockerfile frontend by digest (1.7, the same one
+# for every builder, whatever frontend its BuildKit has built in); Dependabot
+# does not update it, so bump tag and digest by hand. The base images below
+# are pinned the same way, and .github/scripts/image-pin-check.sh (CI) fails
+# on any reference without a digest.
 # ─────────────────────────────────────────────────────────────────────────────
 
 

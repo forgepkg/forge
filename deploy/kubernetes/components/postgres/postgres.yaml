@@ -48,7 +48,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: postgres
-          image: postgres:17
+          # Pinned by digest; Dependabot bumps tag and digest together.
+          image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
           env:
             - name: POSTGRES_DB
               value: forge

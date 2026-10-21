@@ -46,7 +46,8 @@ config:
   #   max_upload_bytes: 536870912
   # auth:
   #   # The pod network of your gateway / ingress controller, so Forge sees the
-  #   # real client IP (anonymous-IP allowlists, login lockout).
+  #   # real client IP (anonymous-IP allowlists, login lockout). Admit only
+  #   # the gateway with networkPolicy.from.
   #   trusted_proxy_cidrs: [10.0.0.0/8]
   # s3:
   #   endpoint: https://s3.eu-central-1.amazonaws.com
@@ -75,6 +76,15 @@ secretEnv: {}
 #   FORGE_S3__SECRET_KEY: <secret key>
 #   FORGE_ROOT_KEY: <openssl rand -base64 32>
 #   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: <first start only>
+
+# A change of secretEnv rolls the pods through a pod annotation that holds
+# its SHA-256 salted with a random value, so the annotation (which anyone who
+# can read the pods sees) cannot be tested against guessed secrets. The salt
+# is generated on install and kept in the Secret <fullname>-checksum-salt
+# (looked up in the cluster). Tools that render without a cluster (Argo CD,
+# `helm template`) would generate a new one, and roll the pods, on every
+# render: set one here for them (`openssl rand -hex 16`).
+secretEnvChecksumSalt: ""
 
 # An existing Secret loaded with envFrom (the same keys as secretEnv), for
 # secrets managed elsewhere: External Secrets, Sealed Secrets, SOPS, ...
@@ -244,7 +254,7 @@ service:
 # keep the upstream idle timeout below server.header_read_timeout_seconds
 # (150 s): Envoy and Istio default to one hour, which makes the proxy reuse
 # connections Forge is closing (502). List the gateway's pod network in
-# config.auth.trusted_proxy_cidrs.
+# config.auth.trusted_proxy_cidrs, and its namespace in networkPolicy.from.
 httpRoute:
   enabled: false
   apiVersion: gateway.networking.k8s.io/v1
@@ -336,10 +346,20 @@ autoscaling:
   behavior: {}
 
 # A NetworkPolicy for the Forge pods (enforced where the CNI supports it).
+# Forge believes the X-Forwarded-For header of every peer in
+# config.auth.trusted_proxy_cidrs, usually the whole pod network: without a
+# policy any pod in the cluster can reach the Service with a forged client
+# address, past the login lockout and the anonymous-IP allowlist. List the
+# pods that proxy to Forge (your gateway's data plane or ingress controller)
+# in `from`.
 networkPolicy:
-  enabled: false
-  # Peers (NetworkPolicyPeer objects) allowed to reach the http port, e.g. the
-  # gateway's namespace; empty allows every source.
+  # null: rendered as soon as `from` lists a peer.
+  enabled: null
+  # Peers (NetworkPolicyPeer objects) allowed to reach the http port, e.g.
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: gateway-system
+  # Empty allows every source.
   from: []
   # Further ingress rules.
   extraIngress: []
@@ -366,7 +386,8 @@ extraObjects: []
 # Generated passwords are kept across upgrades (looked up in the cluster) and
 # survive `helm uninstall` with the data. Tools that render without a cluster
 # (Argo CD, `helm template`) generate a new one on every render: set
-# auth.password or auth.existingSecret there.
+# auth.password or auth.existingSecret there (and, for Redis with
+# auth.password, auth.checksumSalt).
 
 # PostgreSQL 17 StatefulSet; sets FORGE_DATABASE__URL.
 postgresql:

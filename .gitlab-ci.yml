@@ -166,8 +166,10 @@ docker:
     - docker build --build-arg FORGE_GIT_SHA="$CI_COMMIT_SHA" .
 
 # ── Kubernetes manifests (deploy/kubernetes) ──────────────────────────────
-# Builds every overlay, and the base with each component, and validates the
-# output against the Kubernetes schemas. Both tools are pinned by checksum.
+# Checks that every image reference (Dockerfile, deploy/, the workflows) is
+# pinned by digest, builds every overlay, and the base with each component,
+# and validates the output against the Kubernetes schemas. Both tools are
+# pinned by checksum.
 # Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
 # chart (.github/scripts/helm-check.sh, Helm built with `go install`), which
 # needs a pinned Go image here.
@@ -188,6 +190,7 @@ kubernetes:
     - tar -xzf "$tools/kubeconform.tgz" -C "$tools" kubeconform
     - export PATH="$tools:$PATH"
   script:
+    - .github/scripts/image-pin-check.sh
     - .github/scripts/kustomize-check.sh 1.33.0
 
 # ── Frontend (TanStack Router SPA in web/) ───────────────────────────────────

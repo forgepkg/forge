@@ -8,7 +8,9 @@ fullnameOverride: ""
 image:
   registry: docker.io
   repository: library/redis
-  tag: 7.4-alpine
+  # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
+  # Dependabot bumps together with the tag; `digest`, when set, replaces it.
+  tag: 7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -22,6 +24,14 @@ auth:
   # An existing Secret holding the password instead of the chart's.
   existingSecret: ""
   secretKey: password
+  # A change of auth.password restarts Redis through a pod annotation that
+  # holds its SHA-256 salted with a random value, so the annotation (which
+  # anyone who can read the pods sees) cannot be tested against guesses. The
+  # salt is generated on install and kept in the chart's Secret (key
+  # checksum-salt). Tools that render without a cluster (Argo CD, `helm
+  # template`) would generate a new one, and restart Redis, on every render:
+  # set one here for them (`openssl rand -hex 16`).
+  checksumSalt: ""
 
 service:
   type: ClusterIP

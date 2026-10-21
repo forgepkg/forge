@@ -527,6 +527,15 @@ so it embeds its crate list for SBOM generators and image scanners, and the
 `web` and `builder` stages declare `BUILDKIT_SBOM_SCAN_STAGE`, so the release's
 SBOM attestation covers the npm packages and crates, not just Debian's.
 
+Every image the build and the deployment use is pinned by digest
+(`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Redis
+and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
+fails on a reference without one; Forge's own image is exempt, since the
+release pins it. Dependabot bumps the base images and the `deploy/` images;
+the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
+are bumped by hand (tag and digest, from the registry's index of the tag).
+
 ```bash
 cargo xtask docker-build       # docker build -t envisia-forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
@@ -624,6 +633,29 @@ is, but only while `[Unreleased]` is empty; with entries in both, the release
 is refused. It also refuses a changelog with a version section whose tag does
 not exist (a section drafted for a release that then got another number):
 fold its entries into `[Unreleased]` first.
+
+**A failed release run** can simply be re-run. It never builds a version
+twice: a new build would have another digest, and pushing it would move the
+version's tags and overwrite its chart. The image and chart that the failed
+attempt already pushed are reused instead, once their signatures show that a
+release run of the tagged commit made them. Anything else it finds under the
+version (an image or chart not signed that way, a chart without its image)
+stops the run with a message saying what to delete, and so does a version
+that already has a GitHub release: publish further changes as a new version.
+
+**Protect the release tags.** A release's signatures name the release
+workflow at its tag and the commit the tag pointed to, and the published
+`cosign verify` commands check both. A tag that can be moved, or deleted and
+pushed again, would still start a release run of another commit under the
+same name, so protect `refs/tags/v*` with tag rulesets (repository
+**Settings → Rules → Rulesets**), which cannot be set from this repository's
+files:
+
+1. a ruleset targeting `refs/tags/v*` with **Restrict creations**, whose
+   bypass list holds only the maintainers who cut releases;
+2. a second ruleset targeting `refs/tags/v*` with **Restrict updates** and
+   **Restrict deletions** and an empty bypass list, so nobody moves or
+   deletes a release tag.
 
 **First release only.** GHCR creates a package of a user account as
 **private**, whatever the repository's visibility, and there is no REST API

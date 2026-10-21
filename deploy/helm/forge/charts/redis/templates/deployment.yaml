@@ -20,8 +20,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        # A changed auth.password or existingSecret restarts Redis.
-        checksum/auth: {{ toJson .Values.auth | sha256sum }}
+        # A changed auth.password or existingSecret restarts Redis; the
+        # password is hashed with a salt (forge-redis.authChecksum).
+        checksum/auth: {{ include "forge-redis.authChecksum" . }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

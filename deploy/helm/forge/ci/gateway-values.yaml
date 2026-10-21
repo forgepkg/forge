@@ -1,5 +1,5 @@
 # CI: an HTTPRoute on an existing Gateway listener, a LoadBalancer Service,
-# and a pinned image digest.
+# a pinned image digest, and a NetworkPolicy turned on by its `from` alone.
 httpRoute:
   enabled: true
   parentRefs:
@@ -10,6 +10,13 @@ httpRoute:
 config:
   server:
     public_base_url: https://forge.example.com
+  auth:
+    trusted_proxy_cidrs: [10.0.0.0/8]
+networkPolicy:
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gateway-system
 service:
   type: LoadBalancer
   loadBalancerSourceRanges: [10.0.0.0/8]

@@ -14,11 +14,17 @@ name: Release
 # Order of operations: the image is pushed BY DIGEST (untagged), the digest is
 # signed and the signature verified, and only then are the tags attached
 # (`docker buildx imagetools create`), so no tag ever points at an unsigned
-# image. The floating tags are decided right before they are attached, against
+# image. Every signature is checked, here and by the `cosign verify` commands
+# in the release notes, against this workflow at the release's tag AND the
+# tagged commit (and the push trigger): the identity alone names only the
+# tag, which a moved or re-created tag would share with another commit (so
+# protect refs/tags/v* with a ruleset; DEVELOPMENT.md, Releasing). The
+# floating tags are decided right before they are attached, against
 # the tags that exist by then, so an overlapping run for an older tag that
 # finishes last cannot move them back. Every third-party action is pinned to a
 # full commit SHA (the tag it was resolved from is in the trailing comment);
-# Dependabot keeps them current.
+# Dependabot keeps them current. The build's helpers (BuildKit, the SBOM
+# generator, the Dockerfile frontend) are pinned by digest as well.
 #
 # Guard rails: the tag must point at a commit on the default branch whose CI
 # run (ci.yml) passed, e2e and web-e2e included (the `ci` job waits for it).
@@ -26,6 +32,12 @@ name: Release
 # version, the image tag of the Kubernetes base (deploy/kubernetes/base) and
 # the Helm chart's version and appVersion. `cargo xtask release <version>`
 # sets all of them.
+#
+# Re-runs never build a version twice (a new build has another digest, and
+# would move the version's tags and overwrite its chart): a version whose
+# GitHub release exists is refused before anything is pushed, and the image
+# and chart that an earlier, failed run of the tag pushed are reused once
+# their signatures show a release run of this commit made them.
 on:
   push:
     tags: ["v*.*.*"]
@@ -133,6 +145,11 @@ jobs:
       contents: write # create the GitHub release
       packages: write # push to ghcr.io
       id-token: write # keyless cosign signing + provenance
+    env:
+      # The signer of this release's signatures: this workflow at the tag.
+      # Every `cosign verify` also pins the commit (GITHUB_SHA, the commit the
+      # tag points to) and the push trigger.
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -194,13 +211,127 @@ jobs:
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/helm" lint --strict --with-subcharts "$CHART_DIR"
 
+      # BuildKit pinned by digest; the action's default is the floating
+      # moby/buildkit:buildx-stable-1. Dependabot does not see it: bump tag and
+      # digest by hand, together with ci.yml's docker job.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # A re-run must not build this version again: a new build gets another
+      # digest, and pushing it would move the version's tags and overwrite its
+      # chart. So a version that has a GitHub release is refused before
+      # anything is pushed, and an image or chart that an earlier, failed run
+      # of this tag pushed is reused as it is, once its signature shows that a
+      # release run of this commit made it.
+      - name: Find what an earlier run of this release published
+        id: published
+        shell: bash # -eo pipefail: a failing command fails the step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}")
+          case "$release" in
+            404) ;;
+            200)
+              echo "::error::${GITHUB_REF_NAME} is already released; publish further changes as a new version"
+              exit 1 ;;
+            *)
+              echo "::error::looking up the GitHub release of ${GITHUB_REF_NAME} answered HTTP $release"
+              exit 1 ;;
+          esac
+
+          # "<HTTP status> <digest>" of a tag on ghcr.io. Not published: 404,
+          # and 401/403, which GHCR may answer for a package that does not
+          # exist yet; a package this token cannot read it cannot push to
+          # either, so the push below would fail without overwriting
+          # anything. Any other answer stops the run.
+          manifest() { # <repository> <tag>
+            local response token
+            response=$(curl -sS --retry 3 -w '\n%{http_code}' -u "${REGISTRY_USER}:${REGISTRY_PASSWORD}" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:$1:pull") || return 1
+            case "${response##*$'\n'}" in
+              200) token=$(jq -r '.token' <<< "${response%$'\n'*}") || return 1 ;;
+              401|403) echo "${response##*$'\n'}"; return 0 ;;
+              *) echo "token-${response##*$'\n'}"; return 0 ;;
+            esac
+            curl -sS --retry 3 -o /dev/null --head -w '%{http_code} %header{docker-content-digest}' \
+              -H "Authorization: Bearer ${token}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/$1/manifests/$2"
+          }
+          published() { # <reference> <status> [digest]: whether it exists
+            case "$2" in
+              200)
+                [ -n "${3:-}" ] || { echo "::error::$1 exists, but ghcr.io named no digest"; exit 1; } ;;
+              401|403|404)
+                echo "$1 is not published yet"
+                return 1 ;;
+              *)
+                echo "::error::looking up $1 on ghcr.io answered '$2'"
+                exit 1 ;;
+            esac
+          }
+          signed_by_this_commit() { # <reference@digest>: the release notes' check
+            cosign verify "$1" \
+              --certificate-identity "${IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-sha "${GITHUB_SHA}" \
+              --certificate-github-workflow-trigger push > /dev/null
+          }
+
+          lookup=$(manifest "${IMAGE#ghcr.io/}" "$VERSION")
+          read -r status image_digest <<< "$lookup"
+          if published "${IMAGE}:${VERSION}" "$status" "$image_digest"; then
+            if ! signed_by_this_commit "${IMAGE}@${image_digest}"; then
+              echo "::error::${IMAGE}:${VERSION} ($image_digest) exists, but no release run of $GITHUB_SHA signed it: find out who pushed it before you delete it and re-run"
+              exit 1
+            fi
+            echo "${IMAGE}:${VERSION} ($image_digest) was pushed and signed by an earlier run of this release: reusing it"
+            echo "image-digest=$image_digest" >> "$GITHUB_OUTPUT"
+          else
+            image_digest=""
+          fi
+
+          # The chart push below uses this login too.
+          printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          lookup=$(manifest "${CHART_REPO#ghcr.io/}/forge" "$VERSION")
+          read -r status chart_digest <<< "$lookup"
+          if published "${CHART_REPO}/forge:${VERSION}" "$status" "$chart_digest"; then
+            if [ -z "$image_digest" ]; then
+              echo "::error::chart ${CHART_REPO}/forge:${VERSION} exists, but image ${IMAGE}:${VERSION} does not: find out who pushed the chart before you delete it and re-run"
+              exit 1
+            fi
+            if ! signed_by_this_commit "${CHART_REPO}/forge@${chart_digest}"; then
+              echo "::error::chart ${CHART_REPO}/forge:${VERSION} ($chart_digest) exists, but no release run of $GITHUB_SHA signed it (did an earlier run fail to sign it?): delete that version of the chart package on GitHub, then re-run"
+              exit 1
+            fi
+            mkdir -p "$RUNNER_TEMP/chart"
+            helm pull "oci://${CHART_REPO}/forge" --version "$VERSION" --destination "$RUNNER_TEMP/chart" 2>&1 | tee helm-pull.log
+            package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
+            pulled=$(sed -n 's/^Digest: *//p' helm-pull.log)
+            pinned=$(helm show chart "$package" | sed -n 's/^  forge\.envisia\.de\/image-digest: *//p' | tr -d '"')
+            if [ "$pulled" != "$chart_digest" ] || [ "$pinned" != "$image_digest" ]; then
+              echo "::error::chart ${CHART_REPO}/forge:${VERSION} pulled as '$pulled' (expected $chart_digest) pins image '$pinned' (expected $image_digest)"
+              exit 1
+            fi
+            echo "chart ${CHART_REPO}/forge:${VERSION} ($chart_digest) was pushed and signed by an earlier run of this release: reusing it"
+            echo "chart-digest=$chart_digest" >> "$GITHUB_OUTPUT"
+            echo "chart-package=$package" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Image metadata
         id: meta
@@ -219,9 +350,10 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
       # Push the image untagged (by digest only); the tags are attached after
-      # the digest is signed.
+      # the digest is signed. Skipped when an earlier run pushed it.
       - name: Build and push by digest
         id: build
+        if: steps.published.outputs.image-digest == ''
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -232,23 +364,28 @@ jobs:
             FORGE_VERSION=${{ steps.version.outputs.version }}
           # Covers the crates and npm packages too: the Dockerfile has its web
           # and builder stages scanned, and the binary embeds its crate list.
-          sbom: true
+          # The SBOM generator is pinned by digest (`sbom: true` would run the
+          # floating docker/buildkit-syft-scanner:stable-1); bump it by hand.
+          attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
           provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
+      # The image of this run, or the one an earlier run pushed and signed.
       - name: Sign the image digest (keyless) and verify the signature
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
+          REUSED: ${{ steps.published.outputs.image-digest != '' }}
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          if [ "$REUSED" != true ]; then
+            cosign sign --yes "${IMAGE}@${DIGEST}"
+          fi
           # The exact command published in the release notes must succeed.
           cosign verify "${IMAGE}@${DIGEST}" \
             --certificate-identity "${IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
+            --certificate-github-workflow-trigger push > /dev/null
 
       # Which floating tags this release may move: `latest` only for the
       # highest non-prerelease version and `<major>.<minor>` only for the
@@ -266,9 +403,11 @@ jobs:
           git fetch --force --tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
           .github/scripts/release-channels.sh "$VERSION" "origin/${DEFAULT_BRANCH}" | tee -a "$GITHUB_OUTPUT"
 
+      # Attaching them again to the digest they already name (a re-run) changes
+      # nothing.
       - name: Attach the tags to the signed digest
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
           VERSION: ${{ steps.version.outputs.version }}
           LATEST: ${{ steps.channels.outputs.latest }}
@@ -294,21 +433,27 @@ jobs:
       # The packaged chart records the signed digest (Chart.yaml annotation
       # forge.envisia.de/image-digest), so it deploys exactly this image while
       # image.tag and image.digest are left unset. The checkout itself keeps
-      # the annotation empty.
+      # the annotation empty. A chart an earlier run pushed and signed is
+      # used as pulled.
       - name: Package the Helm chart, pinned to the signed image digest
         id: chart
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
           VERSION: ${{ steps.version.outputs.version }}
+          PUBLISHED: ${{ steps.published.outputs.chart-package }}
         run: |
-          annotation='  forge.envisia.de/image-digest:'
-          if [ "$(grep -cx "${annotation} \"\"" "$CHART_DIR/Chart.yaml")" != 1 ]; then
-            echo "::error::$CHART_DIR/Chart.yaml needs exactly one empty '${annotation# }' annotation"
-            exit 1
+          if [ -n "$PUBLISHED" ]; then
+            package="$PUBLISHED"
+          else
+            annotation='  forge.envisia.de/image-digest:'
+            if [ "$(grep -cx "${annotation} \"\"" "$CHART_DIR/Chart.yaml")" != 1 ]; then
+              echo "::error::$CHART_DIR/Chart.yaml needs exactly one empty '${annotation# }' annotation"
+              exit 1
+            fi
+            sed -i "s|^${annotation} \"\"\$|${annotation} \"${DIGEST}\"|" "$CHART_DIR/Chart.yaml"
+            helm package "$CHART_DIR" --destination "$RUNNER_TEMP/chart"
+            package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
           fi
-          sed -i "s|^${annotation} \"\"\$|${annotation} \"${DIGEST}\"|" "$CHART_DIR/Chart.yaml"
-          helm package "$CHART_DIR" --destination "$RUNNER_TEMP/chart"
-          package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
           rendered=$(helm template forge "$package" --show-only templates/deployment.yaml | sed -n 's/^ *image: *//p' | tr -d '"')
           if [ "$rendered" != "${IMAGE}:${VERSION}@${DIGEST}" ]; then
             echo "::error::the packaged chart deploys '$rendered', not ${IMAGE}:${VERSION}@${DIGEST}"
@@ -316,15 +461,14 @@ jobs:
           fi
           echo "package=$package" >> "$GITHUB_OUTPUT"
 
+      # Logged in to ghcr.io by "Find what an earlier run of this release
+      # published".
       - name: Push the chart, sign its digest (keyless) and verify the signature
         id: chart-push
+        if: steps.published.outputs.chart-digest == ''
         env:
           PACKAGE: ${{ steps.chart.outputs.package }}
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
         run: |
-          printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io --username "$REGISTRY_USER" --password-stdin
           helm push "$PACKAGE" "oci://${CHART_REPO}" 2>&1 | tee helm-push.log
           digest=$(sed -n 's/^Digest: *//p' helm-push.log)
           if [ -z "$digest" ]; then
@@ -334,27 +478,36 @@ jobs:
           cosign sign --yes "${CHART_REPO}/forge@${digest}"
           cosign verify "${CHART_REPO}/forge@${digest}" \
             --certificate-identity "${IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
+            --certificate-github-workflow-trigger push > /dev/null
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          CHART_DIGEST: ${{ steps.chart-push.outputs.digest }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
+          CHART_DIGEST: ${{ steps.published.outputs.chart-digest || steps.chart-push.outputs.digest }}
           PACKAGE: ${{ steps.chart.outputs.package }}
         run: |
+          verify() { # <reference>: the command that checks its signature
+            echo "cosign verify $1 \\"
+            echo "  --certificate-identity ${IDENTITY} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-github-workflow-sha ${GITHUB_SHA} \\"
+            echo "  --certificate-github-workflow-trigger push"
+          }
           {
             cat release-notes.md
             echo
             echo "### Image"
             echo
+            echo "Built from commit ${GITHUB_SHA}, which \`${GITHUB_REF_NAME}\` points to. The \`cosign verify\` commands below accept only a signature by this repository's release workflow for that tag and that commit."
+            echo
             echo '```'
             echo "docker pull ${IMAGE}:${{ steps.version.outputs.version }}"
             echo "# digest: ${DIGEST}"
-            echo "cosign verify ${IMAGE}@${DIGEST} \\"
-            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            verify "${IMAGE}@${DIGEST}"
             echo '```'
             echo
             echo "### Helm chart"
@@ -364,9 +517,7 @@ jobs:
             echo '```'
             echo "helm install forge oci://${CHART_REPO}/forge --version ${{ steps.version.outputs.version }}"
             echo "# digest: ${CHART_DIGEST}"
-            echo "cosign verify ${CHART_REPO}/forge@${CHART_DIGEST} \\"
-            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            verify "${CHART_REPO}/forge@${CHART_DIGEST}"
             echo '```'
           } > release-body.md
           prerelease=""

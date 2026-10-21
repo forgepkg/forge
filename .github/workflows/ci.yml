@@ -105,9 +105,11 @@ jobs:
     services:
       # Postgres is provisioned here so we can run `cargo sqlx prepare --check`
       # against a live DB to catch drift between migrations/ and the committed
-      # .sqlx/ cache. Unit tests themselves use SQLX_OFFLINE=true.
+      # .sqlx/ cache. Unit tests themselves use SQLX_OFFLINE=true. Pinned by
+      # digest; Dependabot does not see workflow images, so bump it with
+      # deploy/kubernetes/components/postgres.
       postgres:
-        image: postgres:17
+        image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -174,7 +176,10 @@ jobs:
     needs: [fmt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The BuildKit release.yml builds with (pinned by digest; keep in step).
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - name: Build image (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -186,11 +191,13 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
-  # Builds every overlay, and the base with each component; lints and renders
-  # the chart with each of its ci/ values files; and validates the output
-  # against the Kubernetes schemas. kustomize and kubeconform are pinned by
-  # checksum, Helm is built from its pinned Go module (verified by the Go
-  # checksum database; keep HELM_VERSION in step with release.yml).
+  # Checks that every image reference (Dockerfile, deploy/, the workflows) is
+  # pinned by digest; builds every overlay, and the base with each component;
+  # lints and renders the chart with each of its ci/ values files; and
+  # validates the output against the Kubernetes schemas. kustomize and
+  # kubeconform are pinned by checksum, Helm is built from its pinned Go
+  # module (verified by the Go checksum database; keep HELM_VERSION in step
+  # with release.yml).
   kubernetes:
     name: kubernetes
     runs-on: ubuntu-latest
@@ -202,6 +209,8 @@ jobs:
       HELM_VERSION: v4.3.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image references are pinned by digest
+        run: .github/scripts/image-pin-check.sh
       - name: Install kustomize + kubeconform
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
@@ -311,6 +320,9 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-
 
       # Pre-pull the images the testcontainers harness uses (deterministic).
+      # By tag, not digest: the harness names them by tag in its code
+      # (crates/e2e), so a digest here would not decide what it runs
+      # (.github/scripts/image-pin-check.sh leaves `docker pull` alone).
       - name: Pre-pull container images
         run: |
           docker pull postgres:17
@@ -358,6 +370,7 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+      # By tag, like the e2e job: web/e2e names them by tag.
       - name: Pre-pull container images
         run: |
           docker pull postgres:17

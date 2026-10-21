@@ -1,0 +1,24 @@
+# A NetworkPolicy that admits only your ingress controller or gateway to
+# Forge (where the CNI enforces NetworkPolicy).
+#
+# Forge believes the X-Forwarded-For header of every peer in
+# FORGE_AUTH__TRUSTED_PROXY_CIDRS. That range is usually the whole pod
+# network, so without this policy any pod in the cluster can call the forge
+# Service with a forged client address, past the login lockout and the
+# anonymous-IP allowlist. Use it whenever an overlay sets
+# FORGE_AUTH__TRUSTED_PROXY_CIDRS.
+#
+# The namespace it admits, `ingress-nginx`, is a placeholder: patch
+# spec.ingress[0].from to the pods that proxy to Forge (the ingress
+# controller's namespace, or your Gateway implementation's data plane, e.g.
+# envoy-gateway-system for Envoy Gateway), as overlays/production does, and
+# add any other peer that needs direct access (a metrics scraper).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: envisia-forge
+
+resources:
+  - networkpolicy.yaml

@@ -47,6 +47,16 @@ Environment variables override `forge.toml`. Keep secrets out of `config`:
 the chart warns when it finds one there. The chart sets `server.bind` from
 `containerPort`, and a key set to `null` in `config` removes a chart default.
 
+A change of `config` or `secretEnv` rolls the pods through pod annotations.
+Anyone who can read the pods can read those, and a plain hash of a password
+can be tested against guesses, so `secretEnv` is hashed with a random salt
+that the chart generates on install and keeps in the Secret
+`<fullname>-checksum-salt` (looked up in the cluster on every upgrade).
+Tools that render without a cluster (Argo CD, `helm template`) cannot look
+it up and would roll the pods on every render: set `secretEnvChecksumSalt`
+there (`openssl rand -hex 16`). A change inside `existingSecret` rolls
+nothing; restart the pods yourself.
+
 A production setup with an external PostgreSQL and S3 and a Redis in the
 cluster:
 
@@ -55,9 +65,8 @@ host: forge.example.com
 replicaCount: 2
 
 # Only the gateway may reach Forge: every address in trusted_proxy_cidrs
-# chooses the client IP Forge sees.
+# chooses the client IP Forge sees. Listing a peer turns the policy on.
 networkPolicy:
-  enabled: true
   from:
     - namespaceSelector:
         matchLabels:
@@ -100,6 +109,17 @@ Turn on secret encryption at rest (`config.crypto` and `FORGE_ROOT_KEY`)
 before you configure proxy repositories or auth realms, and keep the root key
 with your backups. Every other value is documented in
 [values.yaml](values.yaml).
+
+Forge believes the `X-Forwarded-For` header of every peer in
+`trusted_proxy_cidrs`, which on Kubernetes is usually the whole pod network.
+Without a NetworkPolicy any pod in the cluster can call the Service with a
+forged client address and get past the login lockout and the anonymous-IP
+allowlist. List the pods that proxy to Forge (the namespace of your gateway's
+data plane or ingress controller) in `networkPolicy.from`, and the chart
+renders the policy (`networkPolicy.enabled` is null by default, which means
+"on as soon as `from` lists a peer"; `false` turns it off). The CNI must
+enforce NetworkPolicy. The install notes warn while trusted proxies are set
+without it.
 
 ## Routing: HTTPRoute and ListenerSet
 
@@ -179,13 +199,21 @@ Each one only accepts connections from this release's Forge pods (a
 NetworkPolicy), and every value is listed in
 `charts/<name>/values.yaml`; set them under the dependency's key.
 
+Their images are pinned by digest: `image.tag` is `<tag>@sha256:…` (the
+multi-arch index), which Dependabot bumps together with the tag. A digest in
+`image.digest` replaces the pinned one; a plain `image.tag` such as `"16"`
+pulls by tag.
+
 Passwords are generated on install and kept across upgrades by looking up the
 existing Secret; the PostgreSQL and S3 Secrets also survive `helm uninstall`
 together with their volumes. Tools that render without a cluster (Argo CD,
 `helm template`) cannot look them up and would generate new ones on every
 render: set `auth.password` (or `auth.existingSecret`) there. Passwords are
 pasted into Forge's connection URLs unescaped, so use URL-safe values
-(`openssl rand -hex 24`).
+(`openssl rand -hex 24`). Redis restarts when `redis.auth.password` changes,
+through a pod annotation salted like Forge's (the salt is kept in the Redis
+Secret): with `redis.auth.password` in Argo CD, set
+`redis.auth.checksumSalt` too.
 
 Evaluation install, everything in the cluster:
 
@@ -204,8 +232,9 @@ Open http://localhost:8421 and sign in as `admin` with that password.
 ## Checking changes
 
 CI lints the chart and renders it with the default values and each file in
-[ci/](ci), validates the output with kubeconform, and parses every rendered
-`forge.toml`. Locally, with `helm`, `kubeconform` and `python3` on your PATH:
+[ci/](ci), validates the output with kubeconform, parses every rendered
+`forge.toml`, and checks that the pod annotations hashing secrets are
+salted. Locally, with `helm`, `kubeconform` and `python3` on your PATH:
 
 ```bash
 .github/scripts/helm-check.sh 1.33.0
