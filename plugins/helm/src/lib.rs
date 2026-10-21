@@ -269,6 +269,8 @@ fn search_page(skip: u32) -> Query {
         skip,
         take: PAGE,
         prerelease: true,
+        semver2: true,
+        upstream: false,
     })
 }
 

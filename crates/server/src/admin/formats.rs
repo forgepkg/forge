@@ -23,7 +23,7 @@ pub struct FormatView {
     pub kinds: Vec<&'static str>,
     /// Where its repositories are served: `{mount}/{repository}` (for
     /// Docker, `/v2/{repository}/{image}`, or a repository's own host).
-    pub mount: &'static str,
+    pub mount: String,
     /// Plugin version (plugins only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -37,7 +37,7 @@ pub struct FormatView {
 
 /// `GET /admin/formats`
 pub async fn list(State(state): State<AppState>) -> Response {
-    let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default().to_vec();
+    let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let nuget = state.formats.nuget().id();
     let mut formats = vec![
         FormatView {
@@ -45,7 +45,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
             name: "NuGet".into(),
             builtin: true,
             kinds: kinds(nuget),
-            mount: "/v3",
+            mount: "/v3".into(),
             version: None,
             description: None,
             sha256: None,
@@ -55,7 +55,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
             name: "Docker / OCI".into(),
             builtin: true,
             kinds: kinds(DOCKER_FORMAT),
-            mount: "/v2",
+            mount: "/v2".into(),
             version: None,
             description: None,
             sha256: None,
@@ -68,7 +68,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
             name: manifest.name.clone(),
             builtin: plugin.is_builtin(),
             kinds: kinds(plugin.id()),
-            mount: crate::plugins::MOUNT,
+            mount: manifest.mount.clone(),
             version: Some(manifest.version.clone()),
             description: manifest.description.clone(),
             sha256: plugin.sha256().map(str::to_string),

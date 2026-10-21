@@ -33,7 +33,7 @@ pub use types::*;
 
 /// The `forge:format` WIT package version this crate implements: what a
 /// plugin built against it declares as `api` in its `plugin.toml`.
-pub const API: &str = "0.1.0";
+pub const API: &str = "0.2.0";
 
 /// The `plugin.toml` of the crate this is expanded in: how a built-in plugin
 /// hands the server its id and name (`pub const PLUGIN_TOML: &str =
@@ -145,11 +145,20 @@ macro_rules! __wit_conversions {
             $crate::__record!(p, Request { method: into, path: into, query: into, headers: into });
             $crate::__record!(p, Response { status: into, headers: into, body: into });
             $crate::__record!(p, PackageRef { id: into, version: into });
-            $crate::__record!(p, SearchQuery { text: into, skip: into, take: into, prerelease: into });
+            $crate::__record!(p, PackageVersions { id: into, versions: into });
+            $crate::__record!(p, SearchQuery {
+                text: into,
+                skip: into,
+                take: into,
+                prerelease: into,
+                semver2: into,
+                upstream: into,
+            });
             $crate::__variant!(p, Query {} {
                 Versions: into,
                 Packages: into,
                 Package: into,
+                PackagesOf: into,
                 Manifest: into,
                 Search: into,
             });
@@ -175,6 +184,7 @@ macro_rules! __wit_conversions {
                 latest_version: into,
                 versions: vec,
                 summary: into,
+                total_downloads: into,
             });
             $crate::__record!(p, SearchResult { total: into, hits: vec });
             $crate::__variant!(p, Answer {} {
@@ -185,7 +195,7 @@ macro_rules! __wit_conversions {
                 Search: into,
             });
             $crate::__record!(p, Loaded { query: into, answer: into });
-            $crate::__variant!(p, Upload { Body } { MultipartField: into });
+            $crate::__variant!(p, Upload { Body, FirstPart } { MultipartField: into });
             $crate::__record!(p, PublishRequest { upload: into, done: into });
             $crate::__record!(p, ChangeRequest { target: into, done: into });
             $crate::__variant!(p, Action {} {

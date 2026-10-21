@@ -18,7 +18,7 @@ A plugin runs one of two ways, and the server cannot tell them apart:
   run in a sandbox. This is how formats that are not part of Forge are added
   without rebuilding it.
 
-> **Status: preview.** The plugin contract is `forge:format@0.1.0`. It may
+> **Status: preview.** The plugin contract is `forge:format@0.2.0`. It may
 > change before 1.x of the contract; a plugin declares the contract version it
 > was built for, and the server refuses one it does not implement.
 
@@ -51,7 +51,7 @@ The pieces:
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, the same contract as WIT ([`wit/format.wit`](../crates/plugin-api/wit/format.wit)), and, behind its `component` feature, the glue that exports a plugin as a component (`export_component!`). Depends on nothing but `std`. |
 | [`plugins/<id>`](../plugins) | One crate per plugin, implementing `FormatPlugin`. |
 | [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, built in or WebAssembly), the Wasmtime runtime whose `WasmPlugin` implements `FormatPlugin` by calling into a component, and `PluginFormat`, which adapts any plugin to Forge's `Format` seam. |
-| [`forge-server`](../crates/server/src/plugins.rs) | The built-in plugins (`plugins::builtin`), loading the configured components, and the `/repository/{repo}/...` dispatcher. |
+| [`forge-server`](../crates/server/src/plugins.rs) | The built-in plugins (`plugins::builtin`), loading the configured components, and the `{mount}/{repo}/...` dispatcher. |
 
 The trait mirrors the WIT world one to one: a component exports exactly the
 trait's methods, and the host turns a loaded component back into a
@@ -67,13 +67,16 @@ runs Helm both ways and checks that every answer matches.
 | Identity | Calls the format for every id and version it sees | `canonical_id`, `validate_id`, `normalize_version`, `compare_versions` |
 | Publishing | Streams the upload to a staging file, enforces `max_upload_bytes`, authorizes against the package selector, stores the blob content-addressed, writes the version in one transaction, records trusted-publishing provenance | `parse_package`: reads the staged file (a component through a lent reader), returns id, version, manifest, dependencies |
 | Reads | Runs the queries the plugin asks for through the same read path as NuGet. Package selectors, group membership, prefer-hosted and reserved prefixes all apply | `handle` decides what a request is; `render` turns the loaded data into the response body |
-| Downloads | Streams the blob from S3, counts the download, answers `HEAD` without touching S3 | Names the version (`download`) |
-| Unlist, relist, delete | Hosted write path, with the same permissions and selectors as NuGet | Names the version and the success response |
+| Downloads | Streams the blob from S3, counts the download, answers `HEAD` without touching S3, and a single `Range` when the local blob cache is on | Names the version (`download`) |
+| Unlist, relist, delete | Hosted write path, with the same permissions and selectors as NuGet; a package outside the caller's selector answers 404, like an unknown one | Names the version and the success response |
 | Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of plugin repositories just works |
 | Retention | Evaluates policies, ordering versions with the plugin's `compare_versions` | Nothing more |
 
-A request to a plugin repository is served under
-`/repository/{repo}/...`; NuGet keeps `/v3/{repo}/...`. The dispatcher
+A request to a plugin repository is served under its format's mount,
+`{mount}/{repo}/...`: `/repository` unless the plugin's `plugin.toml` names
+another (see [Writing a plugin](#writing-a-plugin)); NuGet keeps
+`/v3/{repo}/...`. A repository is served under its own format's mount only.
+The dispatcher
 ([`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs)) handles it
 in this order:
 
@@ -104,18 +107,22 @@ Its queries are targeted:
 | --- | --- |
 | `versions(id)` | Every version of a package |
 | `packages(id)` | Every version with its metadata: publish time, SHA-256, SHA-512, size, the stored manifest summary |
+| `packages-of(id, versions)` | Some versions with their metadata (a page of a long listing) |
 | `package(id, version)` | One version with its metadata |
 | `manifest(id, version)` | The manifest stored at publish |
-| `search(text, skip, take, prerelease)` | Matching packages with their versions |
+| `search(text, skip, take, prerelease, semver2, upstream)` | Matching packages with their versions, the latest version's summary and the download total |
 
 Prerelease filtering is the host's, and its rule is that a normalized version
-is a prerelease when it contains a `-`.
+is a prerelease when it contains a `-`; `semver2` adds SemVer 2.0.0 versions
+(dotted prerelease labels, build metadata). Publish times are RFC 3339 in UTC
+with milliseconds. A `take` of 0 is the default page (20).
 
 ### Manifest summaries and the web UI
 
 At publish, Forge stores the JSON object the plugin's `manifest_summary`
 returns with the version. `render` gets it back as `summary`, so a listing
-never re-reads manifests. The web UI's package detail reads two keys from it,
+never re-reads manifests (for a version stored before summaries were, the
+host asks `manifest_summary` of its stored manifest). The web UI's package detail reads two keys from it,
 if present: `description`, and `dependency_groups` (the same shape as
 NuGet's).
 
@@ -124,9 +131,9 @@ NuGet's).
 `GET /admin/formats` lists every format the server can create repositories
 of: NuGet and Docker, the built-in plugins (`builtin: true`), and the loaded
 WebAssembly plugins (with the `sha256` of their component), each with the
-repository kinds it supports and where its repositories are served. The web UI's *New
-repository* form offers them. Plugin formats support **hosted** and
-**group** repositories; proxies are NuGet-only for now.
+repository kinds it supports and where its repositories are served. The web
+UI's *New repository* form offers them. Plugin formats support **hosted**
+and **group** repositories; only NuGet and Docker have proxies for now.
 
 Helm is built in, so a Helm repository needs no setup beyond creating it:
 
@@ -289,6 +296,31 @@ impl FormatPlugin for MyFormat {
 component = ["forge-plugin-api/component"]
 ```
 
+```toml
+# plugin.toml
+[plugin]
+id = "example"                 # the format id repositories are created with
+name = "Example packages"
+version = "0.1.0"
+api = "0.2.0"                  # the forge:format contract
+component = "forge_format_example.wasm"   # the component build's file
+mount = "/repository"          # optional: served at {mount}/{repo}/…
+kinds = ["hosted", "group"]    # optional: the repository kinds it serves
+
+[assets]                       # optional: how a version's files are stored
+package = "package"
+package_type = "application/octet-stream"
+manifest = "manifest"
+manifest_type = "application/octet-stream"
+
+[limits]                       # optional, as a component (see above)
+timeout_ms = 2000
+```
+
+A mount is `/` and one lowercase word; the server's own paths (`/admin`,
+`/auth`, `/browse`, `/v2`, `/v3`, the web UI's pages, …) are reserved.
+Proxies are not yet among the kinds a plugin can serve.
+
 Then either:
 
 - **build it in**: add the crate to `forge-server`'s dependencies and to
@@ -350,8 +382,6 @@ to lift them:
 - **Prerelease is "contains a `-`".** This is right for SemVer formats; a
   format with another rule (PEP 440's `1.0a1`) needs a contract function
   for it.
-- **Whole downloads only.** Plugin downloads do not answer `Range` requests
-  yet (NuGet's do with the local blob cache).
 - **Listings are bounded.** A response may load at most 2,048 answers, so the
   Helm index covers at most about 2,000 charts.
 

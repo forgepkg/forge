@@ -59,10 +59,11 @@ limitations still apply, except where an entry below says otherwise.
 ### Features
 
 - **Format plugins** (preview): further package formats, served under
-  `/repository/{repo}/` with the same storage, RBAC and package selectors,
-  hosted and group repositories, retention and audit log as NuGet. A plugin
+  `/repository/{repo}/` (or a mount the plugin names) with the same
+  storage, RBAC and package selectors, hosted and group repositories,
+  retention, ranged downloads and audit log as NuGet. A plugin
   is a crate implementing one contract (`forge-plugin-api`'s
-  `FormatPlugin`, mirrored by the `forge:format@0.1.0` WIT package) and
+  `FormatPlugin`, mirrored by the `forge:format@0.2.0` WIT package) and
   runs either built into the server or as a WebAssembly component run by
   Wasmtime. Components are loaded from `[plugins]` only when pinned by
   SHA-256, and each call runs with fuel, memory and time limits and no WASI
@@ -210,9 +211,9 @@ limitations still apply, except where an entry below says otherwise.
   past the metadata guard; block those addresses on the proxy as well.
 - Format plugins have no proxy repositories, receive no request bodies
   other than the published package (which must be the whole body or one
-  multipart part), accept only Basic credentials, serve whole package
-  downloads (no `Range` requests), and treat a version with a `-` as a
-  prerelease; a response of a plugin may load at most 2,048 query answers.
+  multipart part), accept only Basic credentials, and treat a version with
+  a `-` as a prerelease; a response of a plugin may load at most 2,048
+  query answers.
 - A docker proxy downloads a blob completely and verifies it before it
   answers, so a client waits for a large layer's first fetch; concurrent
   pulls of one layer share a download per instance only. A registry upload

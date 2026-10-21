@@ -1,6 +1,7 @@
 //! Format plugins: the built-in ones, loading the WebAssembly ones at
-//! startup, and serving the repositories of their formats under
-//! `/repository/{repo}/...` (see `docs/format-plugins.md`).
+//! startup, and serving the repositories of their formats under each
+//! format's mount, `{mount}/{repo}/...` (`/repository` unless its
+//! `plugin.toml` names another; see `docs/format-plugins.md`).
 //!
 //! The dispatcher does what [`crate::dispatch`] does for the NuGet feed —
 //! resolve the repository, authorize the request's action (GET/HEAD read,
@@ -15,7 +16,7 @@
 //!   apply, and an id the format does not accept is unknown. A request may
 //!   load at most [`MAX_QUERIES`] answers in at most [`MAX_ROUNDS`] rounds.
 //! * **Downloads** are streamed from the blob store and counted, exactly as
-//!   NuGet's.
+//!   NuGet's, answering a single `Range` when the blob source serves ranges.
 //! * **Publishing, unlisting, relisting and deleting** go through the hosted
 //!   write path (CAS staging, size cap, selector and redeploy policy,
 //!   trusted-publishing audit), and only when the request's method was
@@ -43,6 +44,7 @@ use forge_core::repo::{
 };
 use forge_db::model::Repository;
 use forge_db::repository_dao;
+use forge_nuget::routes::flat::{byte_range, ByteRange};
 use forge_nuget::routes::NupkgBytes;
 use forge_plugin::api::{
     self as protocol, Action, Answer, ChangeRequest, FormatPlugin, Loaded, PackageInfo, PackageRef,
@@ -54,14 +56,15 @@ use tokio_util::io::StreamReader;
 
 use crate::config::PluginsConfig;
 use crate::dispatch::{
-    action_for_method, authz_denied, principal_allows_protocol_mutations, HostedWriteAdapter,
-    OFFLINE_RETRY_AFTER_SECS,
+    action_for_method, authz_denied, offline_response, offline_serves_nothing,
+    principal_allows_protocol_mutations, HostedWriteAdapter,
 };
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Where plugin-format repositories are served.
-pub const MOUNT: &str = "/repository";
+/// Where a plugin format's repositories are served unless its
+/// `plugin.toml` names another mount.
+pub const MOUNT: &str = forge_plugin::manifest::DEFAULT_MOUNT;
 
 /// The most rounds of queries one request may load.
 pub const MAX_ROUNDS: usize = 4;
@@ -148,22 +151,25 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
     response
 }
 
-/// `(repository name, rest of the path)` of a `/repository/{repo}/...` path;
-/// the rest starts with `/`.
-fn split_path(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix(MOUNT)?.strip_prefix('/')?;
-    let (name, rest) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, "/"),
-    };
-    (!name.is_empty()).then_some((name, rest))
+/// `(mount, repository name, rest of the path)` of a `{mount}/{repo}/...`
+/// path, for one of `mounts`; the rest starts with `/`.
+fn split_path<'p>(path: &'p str, mounts: &[&str]) -> Option<(&'p str, &'p str, &'p str)> {
+    mounts.iter().find_map(|mount| {
+        let rest = path.strip_prefix(mount)?.strip_prefix('/')?;
+        let (name, rest) = match rest.find('/') {
+            Some(i) => rest.split_at(i),
+            None => (rest, "/"),
+        };
+        (!name.is_empty()).then(|| (&path[..mount.len()], name, rest))
+    })
 }
 
 async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let principal = principal_of(&req);
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let Some((repo_name, rest)) = split_path(uri.path()) else {
+    let mounts = state.formats.mounts();
+    let Some((mount, repo_name, rest)) = split_path(uri.path(), &mounts) else {
         return (StatusCode::NOT_FOUND, "repository not found").into_response();
     };
 
@@ -191,13 +197,8 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     if !allowed {
         return authz_denied(&principal);
     }
-    if !repo.online {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, OFFLINE_RETRY_AFTER_SECS)],
-            "repository is offline",
-        )
-            .into_response();
+    if offline_serves_nothing(&repo) {
+        return offline_response();
     }
     let Some(plugin) = state.formats.plugin(&repo.format) else {
         return if state.formats.is_installed(&repo.format) {
@@ -212,6 +213,10 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
                 .into_response()
         };
     };
+    // Each format is served under its own mount only.
+    if plugin.manifest().mount != mount {
+        return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
+    }
     let format = match state.formats.for_repository(&repo) {
         Ok(format) => format,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
@@ -233,7 +238,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
         base_url: format!(
-            "{}{MOUNT}/{}",
+            "{}{mount}/{}",
             state.config.public_base_url().trim_end_matches('/'),
             repo.name
         ),
@@ -253,9 +258,11 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let ctx = Ctx {
         state: &state,
         repo: &repo,
+        mount,
         principal,
         permission,
         head: method == Method::HEAD,
+        headers: req.headers().clone(),
         plugin: plugin.implementation().clone(),
         format,
         ops,
@@ -290,10 +297,14 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
 struct Ctx<'a> {
     state: &'a AppState,
     repo: &'a Repository,
+    /// The format's mount (`/repository`).
+    mount: &'a str,
     principal: Principal,
     /// What the request's method was authorized for.
     permission: Permission,
     head: bool,
+    /// The request's headers, for a download's `Range`.
+    headers: axum::http::HeaderMap,
     plugin: Arc<dyn FormatPlugin>,
     format: Arc<dyn Format>,
     ops: Arc<dyn RepoReadOps>,
@@ -425,7 +436,7 @@ impl Ctx<'_> {
                     .registration(repo, &id)
                     .await?
                     .into_iter()
-                    .map(package_info)
+                    .map(|entry| self.package_info(entry))
                     .collect(),
                 None => Vec::new(),
             }),
@@ -434,22 +445,43 @@ impl Ctx<'_> {
                     .ops
                     .registration_entry(repo, &id, &version)
                     .await?
-                    .map(package_info),
+                    .map(|entry| self.package_info(entry)),
                 None => None,
+            }),
+            Query::PackagesOf(set) => Answer::Packages(match self.id(&set.id) {
+                Some(id) => {
+                    // Versions that do not normalize are not the package's.
+                    let versions: Vec<String> = set
+                        .versions
+                        .iter()
+                        .filter_map(|v| self.format.normalize_version(v).ok())
+                        .collect();
+                    let mut entries = if versions.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.ops.registration_entries(repo, &id, &versions).await?
+                    };
+                    entries.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+                    entries
+                        .into_iter()
+                        .map(|entry| self.package_info(entry))
+                        .collect()
+                }
+                None => Vec::new(),
             }),
             Query::Manifest(target) => Answer::Manifest(match self.package(target) {
                 Some((id, version)) => self.ops.resolve_nuspec(repo, &id, &version).await?,
                 None => None,
             }),
             Query::Search(search) => {
+                // The read ops clamp `take` (0 is the default page).
                 let params = SearchParams {
                     q: search.text.clone(),
                     skip: search.skip as usize,
-                    take: (search.take as usize).clamp(1, SearchParams::MAX_TAKE),
+                    take: search.take as usize,
                     prerelease: search.prerelease,
-                    include_semver2: true,
-                    // Plugin formats have no proxies: only what Forge holds.
-                    include_upstream: false,
+                    include_semver2: search.semver2,
+                    include_upstream: search.upstream,
                 };
                 let result = self.ops.search(repo, &params).await?;
                 Answer::Search(protocol::SearchResult {
@@ -470,7 +502,11 @@ impl Ctx<'_> {
                                     listed: v.listed,
                                 })
                                 .collect(),
-                            summary: hit.manifest_summary.map(|s| s.to_string()),
+                            summary: self
+                                .summary(hit.manifest_summary, hit.nuspec_bytes.as_deref()),
+                            total_downloads: hit
+                                .total_downloads
+                                .and_then(|n| u64::try_from(n).ok()),
                         })
                         .collect(),
                 })
@@ -496,17 +532,77 @@ impl Ctx<'_> {
             Ok(None) => return (StatusCode::NOT_FOUND, "package not found").into_response(),
             Err(e) => return repo_error(e),
         };
-        let headers = [
-            (header::CONTENT_TYPE, location.content_type.clone()),
-            (header::CONTENT_LENGTH, location.size.to_string()),
-        ];
-        if self.head {
-            return (StatusCode::OK, headers).into_response();
+        let size = u64::try_from(location.size).unwrap_or(0);
+        let blobs = self.state.blob_bytes();
+        let ranges = blobs.serves_ranges();
+        let mut headers = axum::http::HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&location.content_type) {
+            headers.insert(header::CONTENT_TYPE, value);
         }
-        match self.state.blob_bytes().open(&location, None).await {
-            Ok(stream) => (StatusCode::OK, headers, Body::from_stream(stream)).into_response(),
+        if ranges {
+            headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
+        let requested = if ranges && !self.head {
+            byte_range(&self.headers, size)
+        } else {
+            ByteRange::Full
+        };
+        let (status, range) = match requested {
+            ByteRange::Full => (StatusCode::OK, None),
+            ByteRange::Partial(range) => {
+                headers.insert(
+                    header::CONTENT_RANGE,
+                    numeric_header(format!("bytes {}-{}/{size}", range.start, range.end - 1)),
+                );
+                (StatusCode::PARTIAL_CONTENT, Some(range))
+            }
+            ByteRange::Unsatisfiable => {
+                headers.insert(
+                    header::CONTENT_RANGE,
+                    numeric_header(format!("bytes */{size}")),
+                );
+                return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
+            }
+        };
+        let length = range.as_ref().map_or(size, |r| r.end - r.start);
+        headers.insert(header::CONTENT_LENGTH, numeric_header(length.to_string()));
+        // A HEAD needs the headers only; don't open (or bill) a GET for it.
+        if self.head {
+            return (status, headers).into_response();
+        }
+        match blobs.open(&location, range).await {
+            Ok(stream) => (status, headers, Body::from_stream(stream)).into_response(),
             Err(e) => repo_error(e),
         }
+    }
+
+    /// A version's metadata as the plugin sees it.
+    fn package_info(&self, entry: RegistrationEntry) -> PackageInfo {
+        PackageInfo {
+            summary: self.summary(entry.manifest_summary, entry.nuspec_bytes.as_deref()),
+            original_id: entry.original_id,
+            version: entry.version,
+            version_original: entry.version_original,
+            listed: entry.listed,
+            published: entry
+                .published
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, false)),
+            sha256: entry.package_sha256,
+            sha512: entry.package_hash_sha512_base64,
+            size: entry.package_size.and_then(|s| u64::try_from(s).ok()),
+        }
+    }
+
+    /// The manifest summary stored with a version, or, for a version
+    /// published before summaries were stored, the one its manifest gives.
+    fn summary(
+        &self,
+        stored: Option<serde_json::Value>,
+        manifest: Option<&[u8]>,
+    ) -> Option<String> {
+        stored
+            .or_else(|| manifest.and_then(|m| self.format.manifest_summary(m)))
+            .map(|s| s.to_string())
     }
 
     /// Whether this request may change packages: a hosted repository, a
@@ -571,7 +667,13 @@ impl Ctx<'_> {
         let flags = UploadFlags::default();
         let reader = match &publish.upload {
             Upload::Body => body_reader(req.into_body()),
-            Upload::MultipartField(name) => match multipart_reader(req, name, limit, &flags) {
+            Upload::MultipartField(name) => {
+                match multipart_reader(req, Some(name), limit, &flags) {
+                    Ok(reader) => reader,
+                    Err(response) => return response,
+                }
+            }
+            Upload::FirstPart => match multipart_reader(req, None, limit, &flags) {
                 Ok(reader) => reader,
                 Err(response) => return response,
             },
@@ -604,7 +706,12 @@ impl Ctx<'_> {
         if let Err(response) = self.may_change(needed, what) {
             return response;
         }
-        let Some((id, version)) = self.package(&change.target) else {
+        // A package outside the caller's selector answers like an unknown
+        // one, as for NuGet.
+        let Some((id, version)) = self
+            .package(&change.target)
+            .filter(|(id, _)| self.package_filter.allows(id))
+        else {
             return (StatusCode::NOT_FOUND, "package not found").into_response();
         };
         let writer = self.writer();
@@ -665,7 +772,7 @@ impl Ctx<'_> {
     /// percent-encoded (URL parsers resolve `%2e%2e` like `..`), and no
     /// backslashes (which browsers read as `/`).
     fn within_repository(&self, location: &str) -> bool {
-        within(location, &self.repo.name, &self.target.base_url)
+        within(location, self.mount, &self.repo.name, &self.target.base_url)
     }
 }
 
@@ -692,11 +799,11 @@ fn body_reader(body: Body) -> UploadReader {
     Box::new(StreamReader::new(stream))
 }
 
-/// The multipart part named `field` as the package, streamed: the parts
-/// before it are skipped, never buffered.
+/// The multipart part named `field` (the first part for `None`) as the
+/// package, streamed: the parts before it are skipped, never buffered.
 fn multipart_reader(
     req: Request<Body>,
-    field: &str,
+    field: Option<&str>,
     limit: u64,
     flags: &UploadFlags,
 ) -> Result<UploadReader, Response> {
@@ -725,7 +832,7 @@ fn multipart_reader(
             .per_field(limit.saturating_add(1)),
     );
     let mut multipart = multer::Multipart::with_constraints(guarded, boundary, constraints);
-    let field = field.to_string();
+    let field = field.map(str::to_string);
     let flags = flags.clone();
     let stream = async_stream::try_stream! {
         let too_large = |e: multer::Error| {
@@ -736,7 +843,7 @@ fn multipart_reader(
         };
         let mut found = false;
         while let Some(mut part) = multipart.next_field().await.map_err(too_large)? {
-            if part.name() != Some(field.as_str()) {
+            if field.as_deref().is_some_and(|field| part.name() != Some(field)) {
                 // Skip a part before the package, chunk by chunk.
                 while part.chunk().await.map_err(too_large)?.is_some() {}
                 continue;
@@ -758,8 +865,8 @@ fn multipart_reader(
 }
 
 /// See [`Ctx::within_repository`].
-fn within(location: &str, repo: &str, base_url: &str) -> bool {
-    let path_prefix = format!("{MOUNT}/{repo}/");
+fn within(location: &str, mount: &str, repo: &str, base_url: &str) -> bool {
+    let path_prefix = format!("{mount}/{repo}/");
     let absolute_prefix = format!("{base_url}/");
     let lower = location.to_ascii_lowercase();
     (location.starts_with(&path_prefix) || location.starts_with(&absolute_prefix))
@@ -770,20 +877,9 @@ fn within(location: &str, repo: &str, base_url: &str) -> bool {
         && !location.contains('\\')
 }
 
-fn package_info(entry: RegistrationEntry) -> PackageInfo {
-    PackageInfo {
-        original_id: entry.original_id,
-        version: entry.version,
-        version_original: entry.version_original,
-        listed: entry.listed,
-        published: entry
-            .published
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        sha256: entry.package_sha256,
-        sha512: entry.package_hash_sha512_base64,
-        size: entry.package_size.and_then(|s| u64::try_from(s).ok()),
-        summary: entry.manifest_summary.map(|s| s.to_string()),
-    }
+/// A header value of ASCII digits and punctuation.
+fn numeric_header(value: String) -> HeaderValue {
+    HeaderValue::from_str(&value).expect("ASCII header value")
 }
 
 /// A plugin returned an action the request's method was not authorized for
@@ -854,20 +950,33 @@ mod tests {
 
     #[test]
     fn splits_repository_paths() {
+        let mounts = ["/repository", "/charts"];
+        let split = |path| split_path(path, &mounts);
         assert_eq!(
-            split_path("/repository/charts/index.yaml"),
-            Some(("charts", "/index.yaml"))
+            split("/repository/charts/index.yaml"),
+            Some(("/repository", "charts", "/index.yaml"))
         );
-        assert_eq!(split_path("/repository/charts"), Some(("charts", "/")));
-        assert_eq!(split_path("/repository/charts/"), Some(("charts", "/")));
         assert_eq!(
-            split_path("/repository/charts/api/charts/x/1.0.0"),
-            Some(("charts", "/api/charts/x/1.0.0"))
+            split("/repository/charts"),
+            Some(("/repository", "charts", "/"))
         );
-        assert_eq!(split_path("/repository/"), None);
-        assert_eq!(split_path("/repository"), None);
-        assert_eq!(split_path("/repositoryx/a"), None);
-        assert_eq!(split_path("/v3/charts"), None);
+        assert_eq!(
+            split("/repository/charts/"),
+            Some(("/repository", "charts", "/"))
+        );
+        assert_eq!(
+            split("/repository/charts/api/charts/x/1.0.0"),
+            Some(("/repository", "charts", "/api/charts/x/1.0.0"))
+        );
+        assert_eq!(
+            split("/charts/stable/index.yaml"),
+            Some(("/charts", "stable", "/index.yaml"))
+        );
+        assert_eq!(split("/repository/"), None);
+        assert_eq!(split("/repository"), None);
+        assert_eq!(split("/repositoryx/a"), None);
+        assert_eq!(split("/chartsx/a"), None);
+        assert_eq!(split("/v3/charts"), None);
     }
 
     #[test]
@@ -877,7 +986,7 @@ mod tests {
             "/repository/charts/index.yaml",
             "https://forge.example.com/repository/charts/charts/x/1.0.0/x-1.0.0.tgz",
         ] {
-            assert!(within(ok, "charts", base), "{ok}");
+            assert!(within(ok, "/repository", "charts", base), "{ok}");
         }
         for bad in [
             "https://evil.example.com/",
@@ -889,7 +998,7 @@ mod tests {
             "/repository/charts/x\\..\\..\\admin",
             "/admin",
         ] {
-            assert!(!within(bad, "charts", base), "{bad}");
+            assert!(!within(bad, "/repository", "charts", base), "{bad}");
         }
     }
 }

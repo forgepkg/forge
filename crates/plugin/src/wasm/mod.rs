@@ -551,7 +551,7 @@ mod tests {
             id = "demo"
             name = "Demo"
             version = "0.1.0"
-            api = "0.1.0"
+            api = "0.2.0"
             component = "demo.wasm"
             "#,
         )

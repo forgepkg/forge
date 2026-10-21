@@ -8,6 +8,7 @@ use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload}
 use forge_core::format::{Format, ReadSeek};
 use forge_plugin_api::{self as api, FormatPlugin};
 
+use crate::manifest::Assets;
 use crate::Plugin;
 
 /// A format plugin, built in or WebAssembly, as a [`Format`]: what the
@@ -15,6 +16,7 @@ use crate::Plugin;
 pub struct PluginFormat {
     id: &'static str,
     plugin: Arc<dyn FormatPlugin>,
+    assets: Assets,
 }
 
 impl PluginFormat {
@@ -23,6 +25,7 @@ impl PluginFormat {
         PluginFormat {
             id: plugin.id(),
             plugin: plugin.implementation().clone(),
+            assets: plugin.manifest().assets.clone(),
         }
     }
 }
@@ -70,6 +73,22 @@ fn parsed_upload(parsed: api::ParsedPackage) -> ParsedUpload {
 impl Format for PluginFormat {
     fn id(&self) -> &'static str {
         self.id
+    }
+
+    fn package_asset_path(&self) -> &str {
+        &self.assets.package
+    }
+
+    fn package_content_type(&self) -> &str {
+        &self.assets.package_type
+    }
+
+    fn manifest_asset_path(&self) -> &str {
+        &self.assets.manifest
+    }
+
+    fn manifest_content_type(&self) -> &str {
+        &self.assets.manifest_type
     }
 
     fn parse_upload(&self, mut file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {

@@ -21,7 +21,7 @@
 // Versioning: a plugin is built against one version of this package and
 // declares it in its plugin.toml (`api`). A host supports a fixed set of
 // versions; changing anything in this file means a new package version.
-package forge:format@0.1.0;
+package forge:format@0.2.0;
 
 /// Types shared by the interfaces below.
 interface types {
@@ -171,13 +171,27 @@ interface protocol {
         version: string,
     }
 
+    /// Some versions of one package.
+    record package-versions {
+        id: string,
+        versions: list<string>,
+    }
+
     record search-query {
-        /// Free text; empty matches every package.
+        /// Free text; empty matches every package. `packageid:x` and `id:x`
+        /// match an id exactly; several terms must all match.
         text: string,
         skip: u32,
-        /// Clamped by the host to 1000.
+        /// The page size: 0 means the default (20), more than 1000 is 1000.
         take: u32,
+        /// Include prerelease versions.
         prerelease: bool,
+        /// Include SemVer 2.0.0 versions (dotted prerelease labels, build
+        /// metadata).
+        semver2: bool,
+        /// Let a proxy repository forward the search to its upstream, so
+        /// packages it has not cached yet are found too.
+        upstream: bool,
     }
 
     /// Data the plugin can ask for. Package ids are canonical, versions
@@ -191,6 +205,9 @@ interface protocol {
         packages(string),
         /// One version with its metadata.
         %package(package-ref),
+        /// Some versions of a package with their metadata, ascending;
+        /// versions it does not have are left out.
+        packages-of(package-versions),
         /// The manifest stored with one version.
         manifest(package-ref),
         /// The packages matching a search.
@@ -210,7 +227,8 @@ interface protocol {
         version: string,
         version-original: string,
         listed: bool,
-        /// When the version was published into the repository (RFC 3339).
+        /// When the version was published into the repository: RFC 3339 in
+        /// UTC with milliseconds (2026-10-21T12:00:00.000+00:00).
         published: option<string>,
         /// The package's SHA-256, lowercase hex.
         sha256: option<string>,
@@ -229,6 +247,9 @@ interface protocol {
         versions: list<version-info>,
         /// The summary of the latest version.
         summary: option<string>,
+        /// Downloads of the package, all versions, when the repository counts
+        /// them.
+        total-downloads: option<u64>,
     }
 
     record search-result {
@@ -239,6 +260,7 @@ interface protocol {
 
     variant answer {
         versions(list<version-info>),
+        /// The answer to `packages` and to `packages-of`.
         packages(list<package-info>),
         %package(option<package-info>),
         manifest(option<list<u8>>),
@@ -255,8 +277,11 @@ interface protocol {
     variant upload {
         /// The request body is the package.
         body,
-        /// The package is the multipart/form-data file part of this name.
+        /// The package is the multipart/form-data part of this name.
         multipart-field(string),
+        /// The package is the first part of a multipart/form-data body,
+        /// whatever its name.
+        first-part,
     }
 
     /// A publish, unlist, relist or delete, and the response when it succeeds.
