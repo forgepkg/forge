@@ -6,7 +6,6 @@
 mod common;
 
 use std::io::Write;
-use std::sync::Arc;
 
 use common::{start_with, unique, ServerOpts, TestServer};
 use reqwest::StatusCode;
@@ -593,8 +592,7 @@ fn a_component_cannot_take_a_builtin_format_id() {
         &forge_plugin::HostLimits::default(),
     )
     .unwrap();
-    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(forge_nuget::NugetFormat::default());
-    let err = forge_server::state::FormatRegistry::new(nuget)
+    let err = forge_server::state::FormatRegistry::new(Default::default())
         .with_plugin(plugin)
         .err()
         .expect("helm is taken");

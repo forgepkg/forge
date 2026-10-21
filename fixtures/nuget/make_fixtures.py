@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the NuGet `.nupkg` test fixtures used by `crates/format-nuget`.
+"""Generate the NuGet `.nupkg` test fixtures used by `plugins/nuget`.
 
 A `.nupkg` is just an OPC zip whose root contains a `<id>.nuspec` manifest. We
 build small, deterministic archives here so the parsing tests have real (not

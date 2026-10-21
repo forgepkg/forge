@@ -23,6 +23,7 @@ mod format;
 pub mod manifest;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod upstream;
 pub mod wasm;
 
 use std::path::Path;

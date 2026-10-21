@@ -434,6 +434,43 @@ async fn downloads_answer_a_range() {
     let resp = get("bytes=0-1,4-5").await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().len(), 21);
+    // A HEAD ignores the range and advertises support.
+    let resp = srv
+        .client()
+        .head(&url)
+        .basic_auth(&creds.0, Some(&creds.1))
+        .header("range", "bytes=11-14")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["accept-ranges"], "bytes");
+    assert_eq!(resp.headers()["content-length"], "21");
+}
+
+/// Without the local blob cache, downloads ignore a `Range` and advertise
+/// none.
+#[tokio::test]
+async fn downloads_ignore_a_range_without_the_blob_cache() {
+    let srv = start_probe(None).await;
+    let creds = credentials(&srv).await;
+    let repo = probe_repo(&srv).await;
+    assert_eq!(
+        upload(&srv, &repo, &creds, "Demo 1.0.0\n0123456789").await,
+        StatusCode::CREATED
+    );
+    let resp = srv
+        .client()
+        .get(format!("{}/probe/{repo}/files/demo/1.0.0", srv.base_url))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .header("range", "bytes=11-14")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp.headers().contains_key("accept-ranges"));
+    assert!(!resp.headers().contains_key("content-range"));
+    assert_eq!(resp.bytes().await.unwrap().len(), 21);
 }
 
 #[tokio::test]

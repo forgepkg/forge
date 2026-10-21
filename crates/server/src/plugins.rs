@@ -29,6 +29,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::feed::{byte_range, ByteRange, PackageBytes};
 use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -44,8 +45,6 @@ use forge_core::repo::{
 };
 use forge_db::model::Repository;
 use forge_db::repository_dao;
-use forge_nuget::routes::flat::{byte_range, ByteRange};
-use forge_nuget::routes::NupkgBytes;
 use forge_plugin::api::{
     self as protocol, Action, Answer, ChangeRequest, FormatPlugin, Loaded, PackageInfo, PackageRef,
     PublishRequest, Query, Rendered, Upload,
@@ -88,6 +87,7 @@ pub const PASSED_REQUEST_HEADERS: &[&str] = &[
 
 /// Response headers a plugin may set. `location` only within its repository.
 pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
+    "allow",
     "cache-control",
     "content-disposition",
     "content-language",
@@ -98,17 +98,18 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 ];
 
 /// The format plugins built into this server: crates under `plugins/<id>/`,
-/// linked in. Always installed, like NuGet.
-pub fn builtin() -> Vec<Arc<Plugin>> {
-    static BUILTIN: std::sync::OnceLock<Vec<Arc<Plugin>>> = std::sync::OnceLock::new();
-    BUILTIN
-        .get_or_init(|| {
-            vec![
-                Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm)
-                    .expect("plugins/helm/plugin.toml is valid"),
-            ]
-        })
-        .clone()
+/// linked in and always installed. NuGet reads archives under
+/// `nuget_limits` (`[nuget]`).
+pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
+    vec![
+        Plugin::builtin(
+            forge_format_nuget::PLUGIN_TOML,
+            forge_format_nuget::Nuget::with_limits(nuget_limits),
+        )
+        .expect("plugins/nuget/plugin.toml is valid"),
+        Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm)
+            .expect("plugins/helm/plugin.toml is valid"),
+    ]
 }
 
 /// Load the WebAssembly plugins `config` lists, each from `<dir>/<id>`,
@@ -147,7 +148,7 @@ pub fn load(config: &PluginsConfig) -> anyhow::Result<Vec<Arc<Plugin>>> {
 /// Axum handler mounted at `/repository/{repo}` (and everything under it).
 pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Response {
     let mut response = dispatch_request(state, req).await;
-    forge_nuget::routes::harden_response_headers(response.headers_mut());
+    crate::feed::harden_response_headers(response.headers_mut());
     response
 }
 
@@ -685,7 +686,7 @@ impl Ctx<'_> {
             }
             Err(_) if flags.preamble.load(Ordering::Relaxed) => (
                 StatusCode::BAD_REQUEST,
-                "multipart body: no part headers within the first 64 KiB",
+                "multipart body: no package part within the first 64 KiB",
             )
                 .into_response(),
             Err(_) if flags.missing.load(Ordering::Relaxed) => (
@@ -811,15 +812,16 @@ fn multipart_reader(
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .and_then(forge_nuget::routes::publish::multipart_boundary)
+        .and_then(crate::feed::multipart_boundary)
     else {
+        // As axum's multipart extractor answers (NuGet's push always has).
         return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "expected a multipart/form-data body",
+            StatusCode::BAD_REQUEST,
+            "Invalid `boundary` for `multipart/form-data` request",
         )
             .into_response());
     };
-    let guarded = forge_nuget::routes::publish::preamble_guard(
+    let guarded = crate::feed::preamble_guard(
         req.into_body().into_data_stream(),
         &boundary,
         flags.preamble.clone(),
@@ -899,8 +901,11 @@ fn plugin_failed(repo: &Repository, e: &dyn std::fmt::Display) -> Response {
 
 fn repo_error(e: RepoError) -> Response {
     match e {
-        RepoError::RepoNotFound(_) | RepoError::WrongKind { .. } => {
+        RepoError::RepoNotFound(_) => {
             (StatusCode::NOT_FOUND, "repository not found").into_response()
+        }
+        RepoError::WrongKind { .. } => {
+            (StatusCode::NOT_FOUND, "unsupported for repository").into_response()
         }
         RepoError::Busy(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -924,20 +929,20 @@ fn write_error(e: WriteError) -> Response {
     match e {
         WriteError::TooLarge { limit } => (
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("package exceeds the limit of {limit} bytes"),
+            format!("upload exceeds limit of {limit} bytes"),
         )
             .into_response(),
         WriteError::Conflict { id, version } => (
             StatusCode::CONFLICT,
-            format!("{id} {version} already exists"),
+            format!("package {id} {version} already exists"),
         )
             .into_response(),
         WriteError::InvalidPackage(e) => {
             (StatusCode::BAD_REQUEST, format!("invalid package: {e}")).into_response()
         }
-        WriteError::ForbiddenPackage { id } => (
+        WriteError::ForbiddenPackage { .. } => (
             StatusCode::FORBIDDEN,
-            format!("not allowed to change package {id}"),
+            "package is outside the authorized scope",
         )
             .into_response(),
         WriteError::Repo(e) => repo_error(e),

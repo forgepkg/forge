@@ -8,12 +8,10 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use forge_nuget::NugetFormat;
 use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
@@ -365,14 +363,13 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .expect("seed auth realms");
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
-    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let mut plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
     plugins.extend(opts.extra_plugins.iter().cloned());
     let registry_keys =
         forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
             .await
             .expect("registry token key");
-    let state = AppState::new(pool.clone(), store, cache, nuget, config)
+    let state = AppState::new(pool.clone(), store, cache, config)
         .with_envelope(envelope)
         .with_registry_keys(registry_keys)
         .with_plugins(plugins)

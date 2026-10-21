@@ -2,11 +2,11 @@
 //!
 //! Slice 1 implements the **hosted** read path here (Phase 6); proxy and group
 //! read paths arrive in later phases. The neutral DTOs in this module are the
-//! contract between the storage-backed implementations and the protocol crates
-//! (`forge-nuget`): they are format-agnostic and carry exactly what a NuGet
-//! route handler needs to render Appendix A JSON, **plus** the raw `.nuspec`
-//! bytes so the format layer can extract dependency groups itself (keeping
-//! `forge-core` free of NuGet-specific manifest parsing).
+//! contract between the storage-backed implementations and the format plugins
+//! (served by the server's plugin dispatcher): they are format-agnostic and
+//! carry exactly what a feed needs to render Appendix A JSON, **plus** the raw
+//! manifest bytes so the format layer can extract dependency groups itself
+//! (keeping `forge-core` free of NuGet-specific manifest parsing).
 
 pub mod downloads;
 pub mod group;

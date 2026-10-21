@@ -69,8 +69,10 @@ limitations still apply, except where an entry below says otherwise.
   SHA-256, and each call runs with fuel, memory and time limits and no WASI
   capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
   `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
-  listing. `GET /admin/formats` lists the installed formats; the web UI
-  offers them when creating a repository. See
+  listing. **NuGet** is a built-in plugin too (`plugins/nuget`), served at
+  `/v3/{repo}/` by the same dispatcher with the same paths, responses and
+  proxy behaviour as before. `GET /admin/formats` lists the installed
+  formats; the web UI offers them when creating a repository. See
   [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
 - **Docker / OCI registry** under `/v2/` (OCI Distribution Spec v1.1,
   passing its conformance suite), for container images, Helm charts and

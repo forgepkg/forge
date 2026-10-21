@@ -10,7 +10,7 @@
 //! implementations:
 //!
 //! * [`BlobBytes`] implements both [`forge_core::repo::hosted::BlobFetch`] and
-//!   [`forge_nuget::routes::NupkgBytes`] over a [`forge_storage::BlobStore`].
+//!   [`crate::feed::PackageBytes`] over a [`forge_storage::BlobStore`].
 //! * [`MemberFactory`] implements [`forge_core::repo::group::MemberOpsFactory`]
 //!   by branching on a member repository's `kind`.
 
@@ -54,8 +54,8 @@ pub struct AppState {
     /// Authorization decision service (§12.4 seam): every read/write/admin gate
     /// routes through this.
     pub authz: Authz,
-    /// Package-format registry, keyed by `Format::id()`: the NuGet format,
-    /// the built-in format plugins, and any loaded WebAssembly plugins.
+    /// Package-format registry, keyed by `Format::id()`: the built-in format
+    /// plugins (NuGet, Helm) and any loaded WebAssembly plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -93,33 +93,33 @@ pub struct AppState {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`]. NuGet, Docker and the built-in format plugins
-/// ([`crate::plugins::builtin`]) are always there; WebAssembly plugins are
-/// added at startup ([`FormatRegistry::with_plugin`]).
+/// [`Format`] and its plugin. The built-in format plugins
+/// ([`crate::plugins::builtin`]: NuGet, Helm) and Docker are always there;
+/// WebAssembly plugins are added at startup ([`FormatRegistry::with_plugin`]).
 ///
 /// Docker ([`DOCKER_FORMAT`]) is installed but has no [`Format`]: its
 /// repositories hold images (manifests and blobs), not package versions, and
 /// are served by the registry under `/v2` ([`crate::registry`]), so none of
 /// the package seams (parsing, version order, the read ops) apply to them.
 pub struct FormatRegistry {
-    nuget: Arc<dyn Format>,
     formats: BTreeMap<String, Arc<dyn Format>>,
-    /// Every plugin format (built in or WebAssembly), by format id: its
+    /// Every format's plugin (built in or WebAssembly), by format id: its
     /// client protocol.
     plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
+    /// How `.nupkg` archives and upstream `.nuspec`s are read (`[nuget]`).
+    nuget_limits: forge_format_nuget::NupkgLimits,
 }
 
 impl FormatRegistry {
-    /// A registry holding NuGet and the built-in format plugins.
-    pub fn new(nuget: Arc<dyn Format>) -> Self {
-        let mut formats = BTreeMap::new();
-        formats.insert(nuget.id().to_string(), nuget.clone());
+    /// A registry holding the built-in format plugins, NuGet reading
+    /// archives under `nuget_limits`.
+    pub fn new(nuget_limits: forge_format_nuget::NupkgLimits) -> Self {
         let mut registry = FormatRegistry {
-            nuget,
-            formats,
+            formats: BTreeMap::new(),
             plugins: BTreeMap::new(),
+            nuget_limits,
         };
-        for plugin in crate::plugins::builtin() {
+        for plugin in crate::plugins::builtin(nuget_limits) {
             registry = registry
                 .with_plugin(plugin)
                 .expect("built-in format ids are distinct");
@@ -133,9 +133,8 @@ impl FormatRegistry {
     pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
         let id = format.id().to_string();
         if self.is_installed(&id) {
-            let built_in = id == self.nuget.id()
-                || id == DOCKER_FORMAT
-                || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
+            let built_in =
+                id == DOCKER_FORMAT || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
             return Err(if built_in {
                 format!("format {id:?} is built into this server")
             } else {
@@ -149,7 +148,13 @@ impl FormatRegistry {
     /// Add a format plugin: its [`Format`] and its client protocol. Its id
     /// must be free: a WebAssembly plugin never replaces a built-in format.
     pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
-        let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
+        let mut format = forge_plugin::PluginFormat::new(&plugin);
+        if plugin.manifest().proxy == Some(forge_plugin::manifest::Upstream::NugetV3) {
+            format = format.with_upstream(Arc::new(forge_plugin::upstream::NugetV3::new(
+                self.nuget_limits,
+            )));
+        }
+        let format = Arc::new(format);
         self = self.with_format(format)?;
         self.plugins.insert(plugin.id().to_string(), plugin);
         Ok(self)
@@ -197,10 +202,10 @@ impl FormatRegistry {
     }
 
     /// The repository kinds format `id` supports, `None` when it is not
-    /// installed. NuGet and Docker have proxies (each speaks its own upstream
-    /// protocol); a format plugin serves the kinds its `plugin.toml` names.
+    /// installed. Docker has every kind; a format plugin serves the kinds its
+    /// `plugin.toml` names (NuGet's all three).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
-        if id == DOCKER_FORMAT || id == self.nuget.id() {
+        if id == DOCKER_FORMAT {
             return Some(vec!["hosted", "proxy", "group"]);
         }
         let plugin = self.plugins.get(id)?;
@@ -226,11 +231,6 @@ impl FormatRegistry {
         self.get(&repo.format)
             .ok_or_else(|| RepoError::FormatUnavailable(repo.format.clone()))
     }
-
-    /// The NuGet format.
-    pub fn nuget(&self) -> Arc<dyn Format> {
-        self.nuget.clone()
-    }
 }
 
 /// [`FormatResolver`] over the shared registry (the retention worker's view).
@@ -249,13 +249,7 @@ impl AppState {
     /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
     /// from the `auth_realm` table on demand (12.7). The session service and
     /// cookie security bit are config-derived and shared by every login path.
-    pub fn new(
-        pool: PgPool,
-        blob_store: BlobStore,
-        cache: Cache,
-        nuget: Arc<dyn Format>,
-        config: Config,
-    ) -> Self {
+    pub fn new(pool: PgPool, blob_store: BlobStore, cache: Cache, config: Config) -> Self {
         let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
             .unwrap_or_else(|e| {
                 // main() already created the directory at startup; this only
@@ -303,7 +297,7 @@ impl AppState {
             cas,
             cache,
             authz,
-            formats: Arc::new(FormatRegistry::new(nuget)),
+            formats: Arc::new(FormatRegistry::new(config.nuget.limits())),
             config,
             realms,
             sessions,
@@ -368,9 +362,9 @@ impl AppState {
 
     /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
     /// next to the built-in formats. A plugin whose format id is taken
-    /// (NuGet, a built-in plugin, or another plugin) is an error.
+    /// (a built-in plugin, or another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
-        let mut registry = FormatRegistry::new(self.formats.nuget());
+        let mut registry = FormatRegistry::new(self.config.nuget.limits());
         for plugin in plugins {
             registry = registry.with_plugin(plugin)?;
         }
@@ -378,7 +372,7 @@ impl AppState {
         Ok(self)
     }
 
-    /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`NupkgBytes`).
+    /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`PackageBytes`).
     pub fn blob_bytes(&self) -> Arc<BlobBytes> {
         Arc::new(BlobBytes {
             store: self.blob_store.clone(),
@@ -458,7 +452,7 @@ impl AppState {
 
 /// Reads blobs through the blob store (and its local cache, when enabled):
 /// whole small metadata blobs (`BlobFetch`, the `.nuspec`) and streamed
-/// packages (`NupkgBytes`).
+/// packages (`PackageBytes`).
 pub struct BlobBytes {
     store: BlobStore,
 }
@@ -491,12 +485,12 @@ impl BlobFetch for BlobBytes {
 }
 
 #[async_trait]
-impl forge_nuget::routes::NupkgBytes for BlobBytes {
+impl crate::feed::PackageBytes for BlobBytes {
     async fn open(
         &self,
         loc: &NupkgLocation,
         range: Option<std::ops::Range<u64>>,
-    ) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+    ) -> Result<crate::feed::BlobByteStream, RepoError> {
         let blob = BlobRef {
             sha256: &loc.blob_sha256,
             s3_key: &loc.blob_s3_key,
@@ -598,7 +592,7 @@ mod tests {
 
     #[test]
     fn docker_is_installed_without_a_package_format() {
-        let registry = FormatRegistry::new(Arc::new(Named("nuget")));
+        let registry = FormatRegistry::new(Default::default());
         assert!(registry.is_installed(DOCKER_FORMAT));
         assert!(registry.get(DOCKER_FORMAT).is_none());
         assert_eq!(
@@ -620,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_plugin_cannot_take_dockers_id() {
-        let registry = FormatRegistry::new(Arc::new(Named("nuget")));
+        let registry = FormatRegistry::new(Default::default());
         let err = registry
             .with_format(Arc::new(Named("docker")))
             .err()

@@ -287,7 +287,7 @@ async fn serve_nupkg(
 /// The registration `dependencyGroups` of a package's manifest.
 fn dependency_groups_json(nupkg: &[u8]) -> serde_json::Value {
     let groups = nuspec_of(nupkg)
-        .and_then(|n| forge_nuget::nuspec::dependency_groups_from_nuspec(&n).ok())
+        .and_then(|n| forge_format_nuget::nuspec::dependency_groups_from_nuspec(&n).ok())
         .unwrap_or_default();
     serde_json::Value::Array(
         groups

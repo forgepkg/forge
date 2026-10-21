@@ -458,7 +458,7 @@ pub async fn package_detail(
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
     for entry in &registration {
-        let groups = forge_nuget::nuspec::summary_of(
+        let groups = forge_format_nuget::nuspec::summary_of(
             entry.manifest_summary.as_ref(),
             entry.nuspec_bytes.as_deref(),
         )

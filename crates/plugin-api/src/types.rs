@@ -107,6 +107,25 @@ pub struct Request {
 }
 
 impl Request {
+    /// A request for `target` (a path, optionally with `?query`) without
+    /// headers.
+    pub fn new(method: &str, target: &str) -> Self {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        Request {
+            method: method.to_ascii_uppercase(),
+            path: path.to_string(),
+            query: query.to_string(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Add a header (`name` lowercase).
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers
+            .push((name.to_ascii_lowercase(), value.to_string()));
+        self
+    }
+
     /// The first value of header `name` (lowercase).
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers

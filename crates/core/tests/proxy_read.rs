@@ -42,10 +42,15 @@ use forge_cache::Cache;
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::RepoReadOps;
 use forge_db::repository_dao::{self, NewRepository};
-use forge_nuget::NugetFormat;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    forge_plugin::PluginFormat::nuget(Default::default())
+}
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────
 
@@ -485,7 +490,7 @@ async fn make_proxy(
 }
 
 fn proxy_repo(pool: &PgPool, cas: forge_storage::Cas, cache: Cache) -> ProxyRepo {
-    ProxyRepo::new(pool.clone(), Arc::new(NugetFormat::new()), cas, cache)
+    ProxyRepo::new(pool.clone(), Arc::new(nuget()), cas, cache)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -2278,7 +2283,7 @@ async fn registration_uses_upstream_metadata_for_versions_not_downloaded() {
         reg[1].published,
         Some("2026-05-01T10:00:00Z".parse().unwrap())
     );
-    let groups = forge_nuget::nuspec::dependency_groups_from_nuspec(
+    let groups = forge_format_nuget::nuspec::dependency_groups_from_nuspec(
         reg[1].nuspec_bytes.as_deref().expect("dependency groups"),
     )
     .unwrap();
@@ -2355,7 +2360,7 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
         .collect();
     assert_eq!(with_deps.len(), 10);
     assert!(!with_deps.contains(&"1.0.0") && !with_deps.contains(&"2.0.0"));
-    let newest = forge_nuget::nuspec::dependency_groups_from_nuspec(
+    let newest = forge_format_nuget::nuspec::dependency_groups_from_nuspec(
         reg[11].nuspec_bytes.as_deref().unwrap(),
     )
     .unwrap();

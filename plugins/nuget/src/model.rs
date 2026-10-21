@@ -1,7 +1,117 @@
-//! NuGet-specific limits and error types used while parsing `.nupkg` archives.
+//! NuGet's limits, errors and parsed-package types.
+//!
+//! They mirror the format-neutral types Forge stores, and convert into the
+//! plugin contract's at the [`forge_plugin_api::FormatPlugin`] boundary.
 
-use forge_core::domain::FormatError;
 use thiserror::Error;
+
+/// What a `.nupkg` declares about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedNupkg {
+    /// The lowercased id.
+    pub id: String,
+    /// The id exactly as the `.nuspec` writes it.
+    pub original_id: String,
+    /// The normalized version.
+    pub version: String,
+    /// The version exactly as the `.nuspec` writes it.
+    pub version_original: String,
+    /// Whether the version is listed.
+    pub listed: bool,
+    /// The raw `.nuspec` bytes.
+    pub nuspec_bytes: Vec<u8>,
+    /// The dependency groups.
+    pub deps: Vec<DependencyGroup>,
+}
+
+/// The dependencies of one target framework (`None`: any framework). Its
+/// JSON shape is the one Forge stores in manifest summaries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DependencyGroup {
+    /// The target framework moniker, or `None` for the framework-agnostic group.
+    pub target_framework: Option<String>,
+    /// Dependencies in this group.
+    pub dependencies: Vec<Dependency>,
+}
+
+/// A single dependency on another package.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Dependency {
+    /// The dependency's package id.
+    pub id: String,
+    /// The version range, verbatim; `None` when the `.nuspec` gives none.
+    pub range: Option<String>,
+}
+
+/// Why a package, a manifest, an id or a version was refused.
+#[derive(Debug, Error)]
+pub enum FormatError {
+    /// The bytes are not a valid package.
+    #[error("invalid package: {0}")]
+    InvalidPackage(String),
+    /// A required manifest entry (the `.nuspec`) was missing.
+    #[error("missing manifest: {0}")]
+    MissingManifest(String),
+    /// The manifest was present but could not be parsed.
+    #[error("malformed manifest: {0}")]
+    MalformedManifest(String),
+    /// A version string could not be normalized.
+    #[error("invalid version {value:?}: {reason}")]
+    InvalidVersion {
+        /// The offending raw version string.
+        value: String,
+        /// Human-readable explanation.
+        reason: String,
+    },
+    /// Underlying I/O failure while reading the package.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<FormatError> for forge_plugin_api::FormatError {
+    fn from(e: FormatError) -> Self {
+        use forge_plugin_api::FormatError as E;
+        match e {
+            FormatError::InvalidPackage(m) => E::InvalidPackage(m),
+            FormatError::MissingManifest(m) => E::MissingManifest(m),
+            FormatError::MalformedManifest(m) => E::MalformedManifest(m),
+            FormatError::InvalidVersion { value, reason } => {
+                E::InvalidVersion(format!("{value:?}: {reason}"))
+            }
+            FormatError::Io(e) => E::Internal(format!("io error: {e}")),
+        }
+    }
+}
+
+impl From<DependencyGroup> for forge_plugin_api::DependencyGroup {
+    fn from(g: DependencyGroup) -> Self {
+        forge_plugin_api::DependencyGroup {
+            target: g.target_framework,
+            dependencies: g
+                .dependencies
+                .into_iter()
+                .map(|d| forge_plugin_api::Dependency {
+                    id: d.id,
+                    range: d.range,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<ParsedNupkg> for forge_plugin_api::ParsedPackage {
+    fn from(p: ParsedNupkg) -> Self {
+        forge_plugin_api::ParsedPackage {
+            id: p.id,
+            original_id: p.original_id,
+            version: p.version,
+            version_original: p.version_original,
+            listed: p.listed,
+            manifest: p.nuspec_bytes,
+            dependencies: p.deps.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 
 /// Zip-bomb / resource-exhaustion defenses applied while reading a `.nupkg`.
 ///

@@ -1093,9 +1093,9 @@ impl Default for NugetConfig {
 }
 
 impl NugetConfig {
-    /// The limits handed to [`forge_nuget::NugetFormat::with_limits`].
-    pub fn limits(&self) -> forge_nuget::model::NupkgLimits {
-        forge_nuget::model::NupkgLimits {
+    /// The limits handed to [`forge_format_nuget::Nuget::with_limits`].
+    pub fn limits(&self) -> forge_format_nuget::NupkgLimits {
+        forge_format_nuget::NupkgLimits {
             max_entries: self.max_entries,
             max_central_directory_bytes: self.max_central_directory_bytes,
             max_total_uncompressed: self.max_total_uncompressed_bytes,
@@ -1233,19 +1233,19 @@ fn default_docker_sweep_interval_seconds() -> u64 {
 }
 
 fn default_nuget_max_entries() -> usize {
-    forge_nuget::model::NupkgLimits::default().max_entries
+    forge_format_nuget::NupkgLimits::default().max_entries
 }
 fn default_nuget_max_central_directory_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_central_directory_bytes
+    forge_format_nuget::NupkgLimits::default().max_central_directory_bytes
 }
 fn default_nuget_max_total_uncompressed_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_total_uncompressed
+    forge_format_nuget::NupkgLimits::default().max_total_uncompressed
 }
 fn default_nuget_max_nuspec_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_nuspec_bytes
+    forge_format_nuget::NupkgLimits::default().max_nuspec_bytes
 }
 fn default_nuget_max_nuspec_compression_ratio() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_nuspec_compression_ratio
+    forge_format_nuget::NupkgLimits::default().max_nuspec_compression_ratio
 }
 
 /// `plugins.*` — WebAssembly format plugins.
@@ -2684,7 +2684,7 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
         assert_eq!(
             cfg.nuget.limits(),
-            forge_nuget::model::NupkgLimits::default()
+            forge_format_nuget::NupkgLimits::default()
         );
         assert_eq!(cfg.nuget.max_nuspec_bytes, 1024 * 1024);
 

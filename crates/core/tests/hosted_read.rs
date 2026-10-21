@@ -16,8 +16,13 @@ use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::{blob_dao, model::Repository};
-use forge_nuget::NugetFormat;
 use sqlx::PgPool;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    forge_plugin::PluginFormat::nuget(Default::default())
+}
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.
 #[derive(Default, Clone)]
@@ -38,7 +43,7 @@ impl BlobFetch for StubBlobs {
 
 /// Build a `HostedRepo` over the pool with NuGet ordering and the stub blobs.
 fn hosted(pool: &PgPool, blobs: StubBlobs) -> HostedRepo {
-    HostedRepo::new(pool.clone(), Arc::new(NugetFormat::new()), Arc::new(blobs))
+    HostedRepo::new(pool.clone(), Arc::new(nuget()), Arc::new(blobs))
 }
 
 /// Insert a committed blob (pending → commit_and_incref) and return its sha.

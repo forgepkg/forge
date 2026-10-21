@@ -1839,7 +1839,8 @@ dependencies = [
  "forge-cache",
  "forge-crypto",
  "forge-db",
- "forge-nuget",
+ "forge-format-nuget",
+ "forge-plugin",
  "forge-storage",
  "futures-util",
  "globset",
@@ -1923,7 +1924,7 @@ dependencies = [
  "forge-cache",
  "forge-core",
  "forge-db",
- "forge-nuget",
+ "forge-format-nuget",
  "forge-server",
  "forge-storage",
  "futures-util",
@@ -1956,25 +1957,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-nuget"
+name = "forge-format-nuget"
 version = "1.0.0"
 dependencies = [
- "async-stream",
- "async-trait",
- "axum",
- "base64 0.23.1",
- "bytes",
- "chrono",
- "forge-core",
- "futures-util",
- "http-body-util",
+ "forge-plugin-api",
  "quick-xml",
  "serde",
  "serde_json",
  "thiserror",
- "tokio",
- "tokio-util",
- "tower",
  "zip",
 ]
 
@@ -2016,6 +2006,7 @@ dependencies = [
  "flate2",
  "forge-core",
  "forge-format-helm",
+ "forge-format-nuget",
  "forge-plugin",
  "forge-plugin-api",
  "hex",
@@ -2056,7 +2047,7 @@ dependencies = [
  "forge-crypto",
  "forge-db",
  "forge-format-helm",
- "forge-nuget",
+ "forge-format-nuget",
  "forge-oci",
  "forge-plugin",
  "forge-storage",

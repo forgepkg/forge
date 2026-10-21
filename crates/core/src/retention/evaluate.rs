@@ -418,7 +418,7 @@ mod tests {
 
     /// A self-contained [`Format`] for the evaluator's pure unit tests.
     ///
-    /// We deliberately do **not** depend on `forge-nuget` here: pulling it in as
+    /// We deliberately do **not** depend on `forge-format-nuget` here: pulling it in as
     /// a dev-dependency would create two copies of `forge-core` in the test
     /// graph (the cycle the lib's `tests/` integration crate tolerates but a
     /// `#[cfg(test)]` module cannot). Ordering only needs to be a correct
