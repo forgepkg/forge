@@ -145,7 +145,9 @@ choice.
   (the allowlist depends on the caller's network, which a signed-in user or
   token must not carry elsewhere).
 - Unknown and federated usernames take the same time in the password chain,
-  so response timing no longer reveals which upstream users exist.
+  so response timing no longer reveals which upstream users exist; also
+  while a credential-forwarding realm cannot be built (it is skipped, and
+  unknown names then pay the dummy password hash themselves).
 - Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
   (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
 - A cancelled admin key rotation can no longer leave the rotation lock held
@@ -243,8 +245,11 @@ choice.
   rejects nesting deeper than 32 levels (it was quadratic in depth). A
   duplicate push without `allow_redeploy` is refused with 409 before the
   package is uploaded to storage.
-- Proxy: a version deleted upstream leaves the listings at the next
-  refresh (migration 0025) instead of reappearing every `not_found_ttl`; the package-level not-found marker
+- Proxy: a version deleted upstream leaves the listings (migrations 0025
+  and 0030) instead of reappearing every `not_found_ttl`, once a refresh at
+  least one metadata TTL after the first listing without it confirms the
+  deletion, so a partial listing during an upstream incident (a Forge group
+  with a member down) retires nothing; the package-level not-found marker
   is pruned once expired and cleared by a download of the package; a 404
   never hides a version a listing confirmed after the request started; and
   inside the package-delay window the proxy no longer downloads a version
@@ -442,6 +447,11 @@ choice.
   the Basic password answers 401 and is never tried as a password. Before, a
   credential-forwarding realm forwarded it upstream as a password on every
   request of a client that still stored it.
+- A bearer token with a made-up `kid` (no valid signature needed) no longer
+  drops the issuer's cached signing keys on every instance: the refresh it
+  triggers fetches first and keeps the cached keys when the fetch fails, so
+  an outage of the IdP's key endpoint no longer stops trusted publishing
+  and OIDC logins.
 
 ### Fixed
 
@@ -492,7 +502,13 @@ choice.
   looping requests; admin pages work on refresh and from bookmarks;
   `index.html` is never cached and assets are immutable; sign-out clears
   cached data; lockouts and realm errors are shown; Back works on repository
-  search; repository names are validated.
+  search; repository names are validated; disabling the `local` realm asks
+  for confirmation; group owners can be flagged and unflagged, and groups
+  nested, on the members screen; realm list fields are edited one entry per
+  line, so a value with a comma (an LDAP DN) survives a save, and a new OIDC
+  client secret is required when the issuer or client id changes; expired
+  tokens show as expired and token scopes are shown; a page past the last
+  search result says so instead of "no packages yet".
 - Retention `not_downloaded_for_days` counts a never-downloaded version
   from its publication (as proxy rules count from `first_seen_at`). It
   treated such a version as always cold, so a policy with this trigger
@@ -564,7 +580,11 @@ choice.
   plaintext copy instead of failing the whole pass. One malformed sealed
   secret (a damaged envelope, a data key that is gone) no longer stops
   every instance from starting or the rotation from revoking retired keys:
-  it is logged with its row and left alone.
+  it is logged with its row and left alone. The last enabled realm people
+  sign in with (`local` or OIDC) can be neither disabled nor deleted (409);
+  one click on `local`'s Enabled switch used to lock every password login
+  out. A realm edit answers 409 instead of undoing a change committed
+  since it read the realm (another admin's edit, a reorder).
 - **Authentication**: a deactivated local account's password is refused by
   the local realm, like a wrong password, and never forwarded to a
   credential-forwarding realm. When Forge's own database fails (looking up
@@ -587,6 +607,17 @@ choice.
   portal, a gateway's error page) is an upstream failure. It no longer
   replaces the last good index or makes every package not cached yet
   answer 404.
+- **Proxy**: the package delay counts from the upstream publish time of a
+  listed version when the upstream registration states a plausible one,
+  instead of from the proxy's first sighting, so it holds back new releases
+  only: enabling it used to hide every version of every package the proxy
+  had not served before (on a fresh install, every restore failed for the
+  whole delay). Search shows a package id's own casing (`Newtonsoft.Json`,
+  migration 0031) instead of the lowercased one. A registration page or
+  leaf of a package with more than 640 versions carries its older
+  versions' dependencies, listing state and publish date. Deleting a proxy
+  while a first download is being stored no longer deadlocks (one side
+  answered 500).
 - **Groups** answer a failing member's error instead of 404 for a package
   only that member could serve, such as a proxy whose upstream is briefly
   unreachable, so clients retry instead of reporting NU1101 and a Forge
@@ -605,6 +636,10 @@ choice.
   only when the manifest has no group.
 - A `HEAD` of a `.nupkg` no longer counts as a download (it kept packages
   "warm" for retention), and a redeploy keeps the version's download count.
+  Unlisting, deleting or relisting a version that does not parse answers
+  404, not 400.
+- A token's `last_used_at` is written at most once a minute, so the
+  parallel requests of one restore no longer serialize on the token's row.
 - **Retention** groups versions by package in one pass and evaluates on the
   blocking pool, so a large repository's run or preview no longer stalls
   the instance. Automatic runs of a repository are at least 60 s apart;
@@ -769,6 +804,14 @@ choice.
   limit) and `server.staging_dir` to match your volume; a budget below the
   larger of those two limits plus `nuget.max_nuspec_bytes` is refused at
   startup.
+- Proxies with a package delay serve the versions they already list but
+  had held back although the upstream published them before the delay:
+  their delay is dated from the upstream publish time at the next listing
+  refresh. A version deleted upstream leaves a proxy's listings one
+  metadata TTL later than with pre-release builds.
+- Automation that disables or deletes the last enabled `local` or OIDC
+  realm gets 409, and a realm `PATCH` that races another change of the
+  realm gets 409: re-read the realm and send the change again.
 
 ### Known limitations
 
@@ -785,6 +828,10 @@ choice.
   Only the env/file root-key providers exist; AWS KMS is not supported yet.
 - A proxy fetches a new package version once per instance. Several instances
   that miss the same version at the same time each download it.
+- The package delay is dated from the upstream publish time only for the
+  versions in the newest 10 pages (640 versions on nuget.org) of a
+  package's upstream registration; older versions, and versions of an
+  upstream without a registration, count from the proxy's first sighting.
 - A group's search is capped at 1,000 results per member, so totals and
   paging are exact only below that.
 - A token whose scope lists a group's repository id reads through the group
