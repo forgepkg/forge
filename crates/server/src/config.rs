@@ -66,6 +66,10 @@ pub struct Config {
     /// built-in plugins (Helm) need no configuration.
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// Docker / OCI registry (`/v2`): size limits, registry tokens, upload
+    /// and blob-link expiry.
+    #[serde(default)]
+    pub docker: DockerConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -1127,6 +1131,107 @@ impl NugetConfig {
     }
 }
 
+/// `[docker]`: the Docker / OCI registry served under `/v2`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerConfig {
+    /// Largest blob (image layer) a push or a proxy download may carry.
+    /// Staged on disk while it arrives, so it counts towards
+    /// `server.max_staging_bytes` like `server.max_upload_bytes` does.
+    /// Default 1 GiB.
+    #[serde(default = "default_docker_max_blob_bytes")]
+    pub max_blob_bytes: u64,
+    /// Lifetime of a registry Bearer token from `/v2/token` (60–3600 s).
+    /// Default 300.
+    #[serde(default = "default_docker_token_ttl_seconds")]
+    pub token_ttl_seconds: u64,
+    /// Secret the registry tokens are signed with (at least 32 characters).
+    /// Unset: a random key is generated once and kept in the database (sealed
+    /// with `[crypto]` when that is enabled), shared by every instance.
+    #[serde(default)]
+    pub token_secret: Option<String>,
+    /// An upload session idle this long is abandoned and removed. Default
+    /// 24 h.
+    #[serde(default = "default_docker_upload_ttl_seconds")]
+    pub upload_ttl_seconds: u64,
+    /// A blob pushed into an image that no manifest of the image references
+    /// is released after this long unused (the time a client has between
+    /// pushing layers and pushing their manifest). Default 24 h, at least 1 h.
+    #[serde(default = "default_docker_unreferenced_blob_ttl_seconds")]
+    pub unreferenced_blob_ttl_seconds: u64,
+    /// How often expired uploads and unreferenced blob links are swept.
+    /// Default 300.
+    #[serde(default = "default_docker_sweep_interval_seconds")]
+    pub sweep_interval_seconds: u64,
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        DockerConfig {
+            max_blob_bytes: default_docker_max_blob_bytes(),
+            token_ttl_seconds: default_docker_token_ttl_seconds(),
+            token_secret: None,
+            upload_ttl_seconds: default_docker_upload_ttl_seconds(),
+            unreferenced_blob_ttl_seconds: default_docker_unreferenced_blob_ttl_seconds(),
+            sweep_interval_seconds: default_docker_sweep_interval_seconds(),
+        }
+    }
+}
+
+impl DockerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_blob_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "docker.max_blob_bytes must be greater than 0".into(),
+            ));
+        }
+        if !(60..=3600).contains(&self.token_ttl_seconds) {
+            return Err(ConfigError::Invalid(
+                "docker.token_ttl_seconds must be between 60 and 3600".into(),
+            ));
+        }
+        if self
+            .token_secret
+            .as_deref()
+            .is_some_and(|s| s.chars().count() < 32)
+        {
+            return Err(ConfigError::Invalid(
+                "docker.token_secret must be at least 32 characters (or unset to generate a key)"
+                    .into(),
+            ));
+        }
+        if self.upload_ttl_seconds == 0 || self.sweep_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "docker.upload_ttl_seconds and docker.sweep_interval_seconds must be greater than 0"
+                    .into(),
+            ));
+        }
+        if self.unreferenced_blob_ttl_seconds < 3600 {
+            return Err(ConfigError::Invalid(
+                "docker.unreferenced_blob_ttl_seconds must be at least 3600: a client needs time \
+                 between pushing an image's layers and its manifest"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_docker_max_blob_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_docker_token_ttl_seconds() -> u64 {
+    300
+}
+fn default_docker_upload_ttl_seconds() -> u64 {
+    24 * 3600
+}
+fn default_docker_unreferenced_blob_ttl_seconds() -> u64 {
+    24 * 3600
+}
+fn default_docker_sweep_interval_seconds() -> u64 {
+    300
+}
+
 fn default_nuget_max_entries() -> usize {
     forge_nuget::model::NupkgLimits::default().max_entries
 }
@@ -1633,6 +1738,7 @@ pub const SECRET_KEYS: &[&str] = &[
     "auth.bootstrap_admin.password",
     "auth.upstream_basic.cache.key_pepper",
     "oidc.client_secret",
+    "docker.token_secret",
 ];
 
 /// Whether an error at config key `path` must not echo its value: one of
@@ -1898,6 +2004,7 @@ impl Config {
         self.proxy.validate()?;
         self.nuget.validate()?;
         self.plugins.validate()?;
+        self.docker.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
         if self.server.max_upload_bytes == 0 {
@@ -1918,20 +2025,23 @@ impl Config {
             let needed = self.largest_staged_set();
             if budget < needed {
                 return Err(ConfigError::Invalid(format!(
-                    "server.max_staging_bytes ({budget}) must be at least the larger of \
-                     server.max_upload_bytes and proxy.max_package_bytes plus \
-                     nuget.max_nuspec_bytes ({needed}), or 0 for no limit"
+                    "server.max_staging_bytes ({budget}) must be at least the largest of \
+                     server.max_upload_bytes, proxy.max_package_bytes and \
+                     docker.max_blob_bytes plus nuget.max_nuspec_bytes ({needed}), or 0 \
+                     for no limit"
                 )));
             }
         }
         Ok(())
     }
 
-    /// The largest single item staged in the temp directory.
+    /// The largest single item staged in the temp directory: a package push
+    /// or download, or an image blob.
     fn largest_staged_item(&self) -> u64 {
         self.server
             .max_upload_bytes
             .max(self.proxy.max_package_bytes)
+            .max(self.docker.max_blob_bytes)
     }
 
     /// What one push or download stages at once at most: the package, and

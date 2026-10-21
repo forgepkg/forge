@@ -357,8 +357,13 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
     let plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
+    let registry_keys =
+        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
+            .await
+            .expect("registry token key");
     let state = AppState::new(pool.clone(), store, cache, nuget, config)
         .with_envelope(envelope)
+        .with_registry_keys(registry_keys)
         .with_plugins(plugins)
         .expect("install format plugins");
     let layer = principal_layer(&state).expect("principal layer");

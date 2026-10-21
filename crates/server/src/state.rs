@@ -84,6 +84,12 @@ pub struct AppState {
     /// Download counts of every hosted and proxy repository, written in
     /// batches (#119).
     pub downloads: Arc<DownloadTally>,
+    /// Signing keys of registry Bearer tokens (`/v2/token`). [`AppState::new`]
+    /// starts with a random per-process key; startup replaces it with the
+    /// install's shared one ([`crate::registry::load_token_keys`] via
+    /// [`AppState::with_registry_keys`]) so every instance accepts every
+    /// instance's tokens.
+    pub registry_keys: forge_oci::token::TokenKeys,
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
@@ -256,7 +262,41 @@ impl AppState {
             oidc_login_starts,
             envelope: None,
             upstream,
+            registry_keys: forge_oci::token::TokenKeys::new(vec![{
+                use rand::Rng;
+                let mut key = vec![0u8; 32];
+                rand::rng().fill_bytes(&mut key);
+                key
+            }]),
         }
+    }
+
+    /// Use `keys` to sign and verify registry tokens.
+    pub fn with_registry_keys(mut self, keys: forge_oci::token::TokenKeys) -> Self {
+        self.registry_keys = keys;
+        self
+    }
+
+    /// The Docker / OCI registry service, wired to this state.
+    pub fn registry(&self) -> forge_oci::Registry {
+        forge_oci::Registry::new(forge_oci::RegistryParts {
+            pool: self.pool.clone(),
+            cas: self.cas.clone(),
+            store: self.blob_store.clone(),
+            cache: self.cache.clone(),
+            authz: self.authz.clone(),
+            http: self.upstream.clone(),
+            envelope: self.envelope.clone(),
+            config: forge_oci::RegistryConfig {
+                public_base_url: self.config.public_base_url(),
+                max_blob_bytes: self.config.docker.max_blob_bytes,
+                token_ttl_seconds: self.config.docker.token_ttl_seconds,
+                delete_grace: self.config.outbox.grace(),
+                max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
+            },
+            keys: self.registry_keys.clone(),
+            recorder: Some(Arc::new(crate::registry::LedgerRecorder)),
+        })
     }
 
     /// Attach the secret-encryption envelope service (slice 12.5). Kept out of

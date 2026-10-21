@@ -18,6 +18,7 @@ pub mod external_identity_dao;
 pub mod ids;
 pub mod login_network_dao;
 pub mod model;
+pub mod oci_dao;
 pub mod oidc_flow_dao;
 pub mod outbox_dao;
 pub mod proxy_dao;

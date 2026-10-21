@@ -9,6 +9,7 @@ members = [
     "crates/format-nuget",
     "crates/plugin-api",
     "crates/plugin",
+    "crates/format-oci",
     "crates/server",
     "crates/e2e",
     "plugins/helm",

@@ -404,17 +404,50 @@ impl UpstreamHttp {
         class: RequestClass,
         auth: Option<&UpstreamAuth<'_>>,
     ) -> Result<reqwest::Response, UpstreamError> {
+        self.send(
+            reqwest::Method::GET,
+            url,
+            class,
+            reqwest::header::HeaderMap::new(),
+            auth,
+        )
+        .await
+    }
+
+    /// Issue `method` for `url` with extra request `headers` (an `Accept`
+    /// list, a registry's `Authorization: Bearer` token), under the same
+    /// metadata guard, redirect handling, deadline and origin-scoped Basic
+    /// `auth` as [`Self::get`]. An `Authorization` header in `headers` is
+    /// sent only to `url`'s origin: it is dropped once a redirect leaves it
+    /// (registries redirect blobs to a CDN or an object store).
+    pub async fn send(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        class: RequestClass,
+        mut headers: reqwest::header::HeaderMap,
+        auth: Option<&UpstreamAuth<'_>>,
+    ) -> Result<reqwest::Response, UpstreamError> {
         let timeout = match class {
             RequestClass::Metadata => self.config.metadata_timeout,
             RequestClass::Download => self.config.download_timeout,
         };
         let deadline = tokio::time::Instant::now() + timeout;
+        let origin = Origin::of(url);
+        let mut method = method;
         let mut hop = url.to_string();
         let mut hops = 0;
         loop {
             self.refuse_metadata_target(&hop).await?;
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let mut req = self.client.get(&hop).timeout(remaining);
+            if Origin::of(&hop) != origin {
+                headers.remove(reqwest::header::AUTHORIZATION);
+            }
+            let mut req = self
+                .client
+                .request(method.clone(), &hop)
+                .headers(headers.clone())
+                .timeout(remaining);
             if let Some(auth) = auth {
                 if auth.origin.is_some() && auth.origin == Origin::of(&hop) {
                     req = req.basic_auth(auth.username, Some(auth.password));
@@ -442,6 +475,11 @@ impl UpstreamHttp {
                 });
             }
             hops += 1;
+            // A 303 is answered with a GET; the other redirects keep the
+            // method (the registry sends only GET and HEAD).
+            if resp.status() == reqwest::StatusCode::SEE_OTHER && method != reqwest::Method::HEAD {
+                method = reqwest::Method::GET;
+            }
             tracing::debug!(from = %hop, to = %next, "following upstream redirect");
             hop = next.into();
         }

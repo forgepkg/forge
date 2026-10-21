@@ -18,8 +18,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
-use forge_db::component_dao;
-use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY};
+use forge_db::{component_dao, oci_dao};
+use forge_db::model::{
+    RepoKind, Repository, DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
+    NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_KEY,
+};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -50,6 +53,15 @@ pub struct RepoView {
     /// Group: id prefixes never served from a proxy member (see
     /// [`Repository::reserved_prefixes`]).
     pub reserved_prefixes: Vec<String>,
+    /// Docker: the host name this repository also answers on by itself
+    /// (see [`Repository::docker_host`]).
+    pub host: Option<String>,
+    /// Hosted docker: pushed tags may not be moved.
+    pub immutable_tags: bool,
+    /// Hosted docker with immutable tags: `latest` may still be moved.
+    pub latest_mutable: bool,
+    /// Docker group: the hosted member pushes to the group go to.
+    pub writable_member: Option<String>,
 }
 
 impl From<&Repository> for RepoView {
@@ -71,6 +83,10 @@ impl From<&Repository> for RepoView {
             allow_redeploy: r.allow_redeploy,
             prefer_hosted: r.prefer_hosted(),
             reserved_prefixes: r.reserved_prefixes(),
+            host: r.docker_host().map(str::to_string),
+            immutable_tags: r.immutable_tags(),
+            latest_mutable: r.immutable_tags() && r.latest_mutable(),
+            writable_member: r.writable_member().map(str::to_string),
         }
     }
 }
@@ -110,6 +126,19 @@ pub struct CreateRepo {
     /// Group only: id prefixes (e.g. `Acme.`) never served from a proxy member.
     #[serde(default)]
     pub reserved_prefixes: Option<Vec<String>>,
+    /// Docker only: a host name the repository answers on by itself
+    /// (host-based routing: `<host>/<image>` instead of `<server>/<repo>/<image>`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Hosted docker only: refuse to move an existing tag (default off).
+    #[serde(default)]
+    pub immutable_tags: Option<bool>,
+    /// Hosted docker only: with `immutable_tags`, `latest` may still move.
+    #[serde(default)]
+    pub latest_mutable: Option<bool>,
+    /// Docker group only: the hosted member a push to the group goes to.
+    #[serde(default)]
+    pub writable_member: Option<String>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -136,6 +165,9 @@ pub struct CreateRepo {
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
+/// * Docker options (`host`, `immutable_tags`, `latest_mutable`,
+///   `writable_member`) follow the same rules (`host` and `writable_member`:
+///   `null` clears) and are refused on NuGet repositories.
 /// * Unknown fields are rejected (a misspelled field would otherwise keep the
 ///   stored value).
 #[derive(Debug, Deserialize)]
@@ -159,6 +191,16 @@ pub struct UpdateRepo {
     pub prefer_hosted: Option<bool>,
     /// Group only; replaces the whole list (`[]` clears it).
     pub reserved_prefixes: Option<Vec<String>>,
+    /// Docker only; `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub host: Option<Option<String>>,
+    /// Hosted docker only.
+    pub immutable_tags: Option<bool>,
+    /// Hosted docker only.
+    pub latest_mutable: Option<bool>,
+    /// Docker group only; `null` clears it (pushes to the group are refused).
+    #[serde(default, deserialize_with = "double_option")]
+    pub writable_member: Option<Option<String>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -220,7 +262,7 @@ enum PasswordChange {
 }
 
 fn default_format() -> String {
-    "nuget".into()
+    NUGET_FORMAT.into()
 }
 fn default_true() -> bool {
     true
@@ -265,8 +307,9 @@ const MAX_RESERVED_PREFIXES: usize = 100;
 
 /// Validate and normalize a group's reserved id prefixes: each is a NuGet id
 /// prefix (`A-Z a-z 0-9 . _ -`, at most 100 bytes, an optional trailing `*`
-/// dropped), stored lowercase, deduplicated.
-fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
+/// dropped), stored lowercase, deduplicated. A docker group's prefixes are
+/// image-name prefixes and may contain `/` (a namespace such as `envisia/`).
+fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, String> {
     if raw.len() > MAX_RESERVED_PREFIXES {
         return Err(format!(
             "at most {MAX_RESERVED_PREFIXES} reserved_prefixes are allowed"
@@ -278,13 +321,19 @@ fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
         let prefix = prefix.strip_suffix('*').unwrap_or(prefix);
         let valid = !prefix.is_empty()
             && prefix.len() <= 100
-            && prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            && prefix.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') || (docker && b == b'/')
+            });
         if !valid {
-            return Err(format!(
-                "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
-            ));
+            return Err(if docker {
+                format!(
+                    "reserved_prefixes: {prefix:?} is not an image name prefix (letters, digits, '.', '_', '-', '/')"
+                )
+            } else {
+                format!(
+                    "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+                )
+            });
         }
         let prefix = prefix.to_ascii_lowercase();
         if !out.contains(&prefix) {
@@ -292,6 +341,52 @@ fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Validate and normalize a docker repository's `host`: a lowercase DNS name
+/// (no port, no scheme) other than the server's own public host.
+fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, String> {
+    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.len() > 253 || !host.contains('.') || !host.split('.').all(label_ok) {
+        return Err(format!(
+            "invalid host {raw:?}: give a DNS name such as docker.example.com (no scheme or port)"
+        ));
+    }
+    let public_host = url::Url::parse(public_base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    if public_host.as_deref() == Some(host.as_str()) {
+        return Err(
+            "host must differ from the server's own host (repositories are reachable there by path)"
+                .into(),
+        );
+    }
+    Ok(host)
+}
+
+/// A docker group's `writable_member`: an existing hosted docker repository.
+async fn validate_writable_member(state: &AppState, name: &str) -> Result<String, Response> {
+    match repository_dao::find_repository_by_name(&state.pool, name).await {
+        Ok(Some(r)) if r.is_docker() && r.kind() == RepoKind::Hosted => Ok(r.name),
+        Ok(_) => Err(bad_request(format!(
+            "writable_member {name:?} must be a hosted docker repository (and a member of the group)"
+        ))),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// The unique violation of a docker host already in use.
+fn is_host_conflict(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("repository_docker_host_idx"))
 }
 
 /// Reject negative or absurd proxy timings. A negative TTL made every
@@ -349,9 +444,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // The format must be installed: the built-in NuGet or a loaded format
-    // plugin. It is fixed for the repository's lifetime.
-    if state.formats.get(&body.format).is_none() {
+    // The format must be installed: the built-in NuGet or Docker, or a
+    // loaded format plugin. It is fixed for the repository's lifetime.
+    let docker = body.format == DOCKER_FORMAT;
+    if !docker && state.formats.get(&body.format).is_none() {
         let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
             "unsupported format {:?}: available formats are {available:?}",
@@ -359,13 +455,39 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         ));
     }
     let parsed_kind = RepoKind::from(kind.as_str());
-    // Proxies speak the NuGet V3 upstream protocol; format plugins serve
-    // hosted and group repositories only.
-    if parsed_kind == RepoKind::Proxy && body.format != state.formats.nuget().id() {
+    // Proxies speak the NuGet V3 or the registry upstream protocol; format
+    // plugins serve hosted and group repositories only.
+    if parsed_kind == RepoKind::Proxy && !docker && body.format != state.formats.nuget().id() {
         return bad_request(format!(
             "proxy repositories are not available for format {:?}",
             body.format
         ));
+    }
+    let docker_config = match docker_options(
+        &state,
+        docker,
+        parsed_kind,
+        &body.name,
+        DockerOptions {
+            host: body.host.clone().map(Some),
+            immutable_tags: body.immutable_tags,
+            latest_mutable: body.latest_mutable,
+            writable_member: body.writable_member.clone().map(Some),
+        },
+        &serde_json::Map::new(),
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
+    if docker && body.package_delay_seconds != 0 {
+        return bad_request("package_delay_seconds is not supported for docker repositories");
+    }
+    if docker && body.allow_redeploy {
+        return bad_request(
+            "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
+        );
     }
 
     // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
@@ -385,7 +507,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if body.reserved_prefixes.is_some() && parsed_kind != RepoKind::Group {
         return bad_request("reserved_prefixes is only valid for group repositories");
     }
-    let reserved_prefixes = match body.reserved_prefixes.as_deref().map(normalize_prefixes) {
+    let reserved_prefixes = match body
+        .reserved_prefixes
+        .as_deref()
+        .map(|p| normalize_prefixes(p, docker))
+    {
         Some(Err(msg)) => return bad_request(&msg),
         Some(Ok(prefixes)) => Some(prefixes),
         None => None,
@@ -397,7 +523,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     ) {
         return resp;
     }
-    let mut config = json!({});
+    let mut config = serde_json::Value::Object(docker_config);
     if parsed_kind == RepoKind::Group {
         config[PREFER_HOSTED_KEY] = json!(body.prefer_hosted.unwrap_or(true));
         if let Some(prefixes) = reserved_prefixes {
@@ -437,6 +563,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     };
     let repo = match repository_dao::insert_repository(&mut *tx, new).await {
         Ok(r) => r,
+        Err(e) if is_host_conflict(&e) => {
+            return (
+                StatusCode::CONFLICT,
+                "another docker repository already answers on this host",
+            )
+                .into_response()
+        }
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
@@ -465,6 +598,93 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         Ok(None) => db_error(sqlx::Error::RowNotFound),
         Err(e) => db_error(e),
     }
+}
+
+/// The docker options of a create or update request (`None`: not sent;
+/// `Some(None)`: cleared).
+struct DockerOptions {
+    host: Option<Option<String>>,
+    immutable_tags: Option<bool>,
+    latest_mutable: Option<bool>,
+    writable_member: Option<Option<String>>,
+}
+
+impl DockerOptions {
+    fn any(&self) -> bool {
+        self.host.is_some()
+            || self.immutable_tags.is_some()
+            || self.latest_mutable.is_some()
+            || self.writable_member.is_some()
+    }
+}
+
+/// Validate the docker options against the repository's format and kind
+/// and merge them into `existing` (its stored config object). Returns the
+/// config object to store.
+#[allow(clippy::result_large_err)]
+async fn docker_options(
+    state: &AppState,
+    docker: bool,
+    kind: RepoKind,
+    name: &str,
+    options: DockerOptions,
+    existing: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    let mut config = existing.clone();
+    if !docker {
+        if options.any() {
+            return Err(bad_request(
+                "host, immutable_tags, latest_mutable and writable_member are only valid for docker repositories",
+            ));
+        }
+        return Ok(config);
+    }
+    if !forge_oci::reference::valid_name_component(name) {
+        return Err(bad_request(format!(
+            "invalid docker repository name {name:?}: image names start with it, so use \
+             lowercase letters and digits, separated by '.', '_', '__' or '-'"
+        )));
+    }
+    if (options.immutable_tags.is_some() || options.latest_mutable.is_some())
+        && kind != RepoKind::Hosted
+    {
+        return Err(bad_request(
+            "immutable_tags and latest_mutable are only valid for hosted repositories",
+        ));
+    }
+    if options.writable_member.is_some() && kind != RepoKind::Group {
+        return Err(bad_request(
+            "writable_member is only valid for group repositories",
+        ));
+    }
+    match options.host {
+        Some(Some(host)) => {
+            let host = normalize_docker_host(&host, &state.config.public_base_url())
+                .map_err(bad_request)?;
+            config.insert(DOCKER_HOST_KEY.into(), json!(host));
+        }
+        Some(None) => {
+            config.remove(DOCKER_HOST_KEY);
+        }
+        None => {}
+    }
+    if let Some(immutable) = options.immutable_tags {
+        config.insert(IMMUTABLE_TAGS_KEY.into(), json!(immutable));
+    }
+    if let Some(latest) = options.latest_mutable {
+        config.insert(LATEST_MUTABLE_KEY.into(), json!(latest));
+    }
+    match options.writable_member {
+        Some(Some(member)) => {
+            let member = validate_writable_member(state, &member).await?;
+            config.insert(WRITABLE_MEMBER_KEY.into(), json!(member));
+        }
+        Some(None) => {
+            config.remove(WRITABLE_MEMBER_KEY);
+        }
+        None => {}
+    }
+    Ok(config)
 }
 
 /// Seal `password` under the active DEK and store it on `repo_id`
@@ -531,7 +751,35 @@ pub async fn update(
         }
     }
 
-    let mut config = existing.config.clone();
+    let docker = existing.is_docker();
+    let final_name = body.name.clone().unwrap_or_else(|| existing.name.clone());
+    if docker && body.package_delay_seconds.is_some_and(|d| d != 0) {
+        return bad_request("package_delay_seconds is not supported for docker repositories");
+    }
+    if docker && body.allow_redeploy == Some(true) {
+        return bad_request(
+            "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
+        );
+    }
+    let stored_config = existing.config.as_object().cloned().unwrap_or_default();
+    let mut config = match docker_options(
+        &state,
+        docker,
+        existing.kind(),
+        &final_name,
+        DockerOptions {
+            host: body.host.clone(),
+            immutable_tags: body.immutable_tags,
+            latest_mutable: body.latest_mutable,
+            writable_member: body.writable_member.clone(),
+        },
+        &stored_config,
+    )
+    .await
+    {
+        Ok(config) => serde_json::Value::Object(config),
+        Err(resp) => return resp,
+    };
     if let Some(prefer_hosted) = body.prefer_hosted {
         if existing.kind() != RepoKind::Group {
             return bad_request("prefer_hosted is only valid for group repositories");
@@ -545,7 +793,7 @@ pub async fn update(
         if existing.kind() != RepoKind::Group {
             return bad_request("reserved_prefixes is only valid for group repositories");
         }
-        let prefixes = match normalize_prefixes(prefixes) {
+        let prefixes = match normalize_prefixes(prefixes, docker) {
             Ok(prefixes) => prefixes,
             Err(msg) => return bad_request(&msg),
         };
@@ -626,6 +874,13 @@ pub async fn update(
     let updated = match repository_dao::update_repository(&mut *tx, existing.id, upd).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) if is_host_conflict(&e) => {
+            return (
+                StatusCode::CONFLICT,
+                "another docker repository already answers on this host",
+            )
+                .into_response()
+        }
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
@@ -741,6 +996,11 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(RepoDelete::HasPackages) if existing.is_docker() => (
+            StatusCode::CONFLICT,
+            "repository still has images; delete their manifests first",
+        )
+            .into_response(),
         Ok(RepoDelete::HasPackages) => (
             StatusCode::CONFLICT,
             "repository still has packages; hard-delete them first",
@@ -818,9 +1078,12 @@ async fn delete_repository_once(
     }
 
     if kind == RepoKind::Hosted {
-        // Hosted repos may still own (non-reproducible) components; require them
-        // gone first so the deletion is an explicit admin action.
-        if component_dao::repository_has_components(&mut *tx, repo_id).await? {
+        // Hosted repos may still own (non-reproducible) components or image
+        // manifests; require them gone first so the deletion is an explicit
+        // admin action.
+        if component_dao::repository_has_components(&mut *tx, repo_id).await?
+            || oci_dao::repository_has_images(&mut *tx, repo_id).await?
+        {
             return Ok(RepoDelete::HasPackages);
         }
     } else {
@@ -829,6 +1092,9 @@ async fn delete_repository_once(
         // before the cascade could drop them unaccounted.
         component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
+    // Image rows (a proxy's cache; a hosted repository's leftover blobs and
+    // upload sessions) release their blob references before the cascade.
+    oci_dao::purge_repository(&mut tx, repo_id, grace).await?;
 
     let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;
@@ -855,6 +1121,13 @@ pub async fn hard_delete_package(
         return (
             StatusCode::BAD_REQUEST,
             "hard delete is only supported for hosted repositories",
+        )
+            .into_response();
+    }
+    if repo.is_docker() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",
         )
             .into_response();
     }

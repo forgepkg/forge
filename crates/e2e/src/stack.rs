@@ -592,7 +592,11 @@ impl StackBuilder {
                 .expect("connect redis L2"),
             None => Cache::l1_only(config.cache.l1_max_capacity),
         };
-        let state = AppState::new(pool.clone(), store, cache, nuget, config);
+        let registry_keys = forge_server::registry::load_token_keys(&config, &pool, None)
+            .await
+            .expect("registry token key");
+        let state = AppState::new(pool.clone(), store, cache, nuget, config)
+            .with_registry_keys(registry_keys);
         let layer = principal_layer(&state).expect("principal layer");
 
         let worker_handles = if self.spawn_workers {

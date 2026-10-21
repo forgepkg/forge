@@ -334,20 +334,89 @@ fn upstream_err(e: UpstreamError) -> RepoError {
 }
 
 /// Decrypted upstream Basic credentials, held only for one request.
-struct Credentials {
+pub struct Credentials {
     origin: Option<Origin>,
     username: String,
     password: forge_crypto::PlaintextSecret,
 }
 
 impl Credentials {
-    fn auth(&self) -> UpstreamAuth<'_> {
+    /// The credentials, scoped to the origin of the `remote_url` they were
+    /// stored for.
+    pub fn auth(&self) -> UpstreamAuth<'_> {
         UpstreamAuth {
             origin: self.origin.clone(),
             username: &self.username,
             password: self.password.expose_secret(),
         }
     }
+
+    /// The credentials scoped to `origin` instead: a registry's token service
+    /// named by the upstream's own authentication challenge (Docker Hub's
+    /// `auth.docker.io` for `registry-1.docker.io`).
+    pub fn auth_for(&self, origin: Origin) -> UpstreamAuth<'_> {
+        UpstreamAuth {
+            origin: Some(origin),
+            username: &self.username,
+            password: self.password.expose_secret(),
+        }
+    }
+}
+
+/// Resolve the upstream password for the outbound Basic header — the
+/// **single sanctioned decrypt site** of the proxy credential (plan §2.4),
+/// shared by every format's proxy: an encrypted row decrypts through
+/// `forge_db::secret_dao` (re-reading the row so the AAD binds to fresh data,
+/// its `remote_url` origin included); a not-yet-backfilled row falls back to
+/// the legacy plaintext column. Returns the password with the `remote_url` it
+/// belongs to. Fail closed: an encrypted blob without a configured envelope
+/// service is an error, not an anonymous fetch.
+async fn upstream_password(
+    pool: &PgPool,
+    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    repo: &Repository,
+) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
+    match (&repo.upstream_password_enc, envelope) {
+        (Some(_), Some(envelope)) => {
+            forge_db::secret_dao::get_upstream_credential(pool, envelope, repo.id)
+                .await
+                .map(|found| found.map(|p| (p.secret, p.remote_url)))
+                .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
+        }
+        (Some(_), None) => Err(RepoError::Storage(
+            "repository stores an encrypted upstream password but secret encryption is not \
+             configured (missing [crypto] config)"
+                .into(),
+        )),
+        (None, _) => Ok(repo.upstream_password.clone().map(|password| {
+            (
+                forge_crypto::PlaintextSecret::from(password),
+                repo.remote_url.clone(),
+            )
+        })),
+    }
+}
+
+/// The Basic credentials for `repo`'s upstream, if both a username and a
+/// password are configured. They are attached only to the origin of the
+/// `remote_url` the password was read (and, encrypted, bound) with, which
+/// may be newer than the cached `repo` row.
+pub async fn upstream_credentials(
+    pool: &PgPool,
+    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    repo: &Repository,
+) -> Result<Option<Credentials>, RepoError> {
+    let Some(username) = repo.upstream_username.clone() else {
+        return Ok(None);
+    };
+    let Some((password, remote_url)) = upstream_password(pool, envelope, repo).await? else {
+        return Ok(None);
+    };
+    Ok(Some(Credentials {
+        origin: remote_url.as_deref().and_then(Origin::of),
+        username,
+        password,
+    }))
 }
 
 /// Key of an in-flight first-time `.nupkg` fetch: `(repository id, lowercase
@@ -461,55 +530,10 @@ impl ProxyRepo {
         self
     }
 
-    /// Resolve the upstream password for the outbound Basic header — the
-    /// **single sanctioned decrypt site** of the proxy credential (plan §2.4):
-    /// an encrypted row decrypts through `forge_db::secret_dao` (re-reading the
-    /// row so the AAD binds to fresh data, its `remote_url` origin included);
-    /// a not-yet-backfilled row falls back to the legacy plaintext column.
-    /// Returns the password with the `remote_url` it belongs to. Fail closed:
-    /// an encrypted blob without a configured envelope service is an error,
-    /// not an anonymous fetch.
-    async fn upstream_password(
-        &self,
-        repo: &Repository,
-    ) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
-        match (&repo.upstream_password_enc, &self.envelope) {
-            (Some(_), Some(envelope)) => {
-                forge_db::secret_dao::get_upstream_credential(&self.pool, envelope, repo.id)
-                    .await
-                    .map(|found| found.map(|p| (p.secret, p.remote_url)))
-                    .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
-            }
-            (Some(_), None) => Err(RepoError::Storage(
-                "repository stores an encrypted upstream password but secret encryption is not \
-                 configured (missing [crypto] config)"
-                    .into(),
-            )),
-            (None, _) => Ok(repo.upstream_password.clone().map(|password| {
-                (
-                    forge_crypto::PlaintextSecret::from(password),
-                    repo.remote_url.clone(),
-                )
-            })),
-        }
-    }
-
-    /// The Basic credentials for `repo`'s upstream, if both a username and a
-    /// password are configured. They are attached only to the origin of the
-    /// `remote_url` the password was read (and, encrypted, bound) with, which
-    /// may be newer than the cached `repo` row.
+    /// The Basic credentials for `repo`'s upstream (see
+    /// [`upstream_credentials`]).
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RepoError> {
-        let Some(username) = repo.upstream_username.clone() else {
-            return Ok(None);
-        };
-        let Some((password, remote_url)) = self.upstream_password(repo).await? else {
-            return Ok(None);
-        };
-        Ok(Some(Credentials {
-            origin: remote_url.as_deref().and_then(Origin::of),
-            username,
-            password,
-        }))
+        upstream_credentials(&self.pool, self.envelope.as_ref(), repo).await
     }
 
     /// GET an upstream JSON document with the proxy's credentials. `None` on

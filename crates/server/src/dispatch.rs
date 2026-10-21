@@ -160,14 +160,15 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     };
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        Ok(Some(r)) => r,
+        // A docker repository is served under `/v2`, not as a NuGet feed.
+        Ok(Some(r)) if r.format == forge_db::model::NUGET_FORMAT => r,
         // Answer an unknown name exactly like a repository the caller may
         // not read, so repository names cannot be enumerated; only a global
         // admin (who can list them anyway) learns that it does not exist.
-        Ok(None) if state.authz.is_global_admin(&principal).await => {
+        Ok(_) if state.authz.is_global_admin(&principal).await => {
             return (StatusCode::NOT_FOUND, "repository not found").into_response();
         }
-        Ok(None) => return authz_denied(&principal),
+        Ok(_) => return authz_denied(&principal),
         Err(e) => {
             tracing::error!(error = %e, repo = %repo_name, "repo lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -338,6 +339,19 @@ impl HostedWriteAdapter {
         .with_mutation_filter(package_filter);
         HostedWriteAdapter { inner }
     }
+}
+
+/// The trusted-publishing ledger policy of a registry push to `repository`:
+/// a workload's manifest push is recorded (and re-validated against the
+/// current realm) like a package publish. Selectors are checked by the
+/// registry itself, so this policy allows every image.
+pub(crate) fn workload_ledger_policy(repository: &Repository) -> Arc<dyn PublishPolicy> {
+    Arc::new(SelectorPublishPolicy {
+        filter: PackageFilter::AllowAll,
+        replace_filter: PackageFilter::AllowAll,
+        repository_id: repository.id,
+        repository_name: repository.name.clone(),
+    })
 }
 
 /// Request-scoped publication policy. The canonical package id is available

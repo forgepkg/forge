@@ -25,5 +25,6 @@ pub mod s3;
 
 pub use blob_cache::{BlobCache, BlobCacheConfig, BlobCacheStats, BlobStream, CacheLimit};
 pub use cas::{Cas, CasError, StagedBlob, Staging, StoredBlob};
+pub use aws_sdk_s3::primitives::ByteStream;
 pub use read::BlobRef;
 pub use s3::{BlobStore, ConditionalWrites, S3Config, S3Error};

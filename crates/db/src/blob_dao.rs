@@ -478,15 +478,24 @@ pub async fn reserve_dangling_delete(
     .await
 }
 
-/// How many assets name the blob (under the caller's blob row lock).
+/// How many rows name the blob (under the caller's blob row lock): package
+/// assets, and the Docker/OCI image links, manifests and upload chunks, each
+/// of which holds one reference.
 async fn asset_references(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sha256: &str,
 ) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT count(*) FROM asset WHERE blob_sha256 = $1")
-        .bind(sha256)
-        .fetch_one(&mut **tx)
-        .await
+    sqlx::query_scalar(
+        r#"
+        SELECT (SELECT count(*) FROM asset WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_blob_link WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_manifest WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_upload_part WHERE blob_sha256 = $1)
+        "#,
+    )
+    .bind(sha256)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// Cancel the deletion reservation of a blob that assets still name (the

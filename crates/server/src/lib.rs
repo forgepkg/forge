@@ -21,6 +21,7 @@ pub mod me_tokens;
 pub mod middleware;
 pub mod object_store;
 pub mod plugins;
+pub mod registry;
 pub mod serve;
 pub mod state;
 pub mod web_ui;
