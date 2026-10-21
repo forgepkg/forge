@@ -55,6 +55,11 @@ limitations still apply, except where an entry below says otherwise.
   `server.max_staging_bytes` (four times the largest item) grows with it to
   4 GiB; size the staging volume for it.
   ([#40](https://github.com/schmitch/forge/issues/40))
+- The container image's baked `forge.toml` no longer holds the placeholder
+  `minioadmin` S3 keys. An image started without `FORGE_S3__ACCESS_KEY` /
+  `FORGE_S3__SECRET_KEY` (and without short-lived credentials) still
+  refuses to start, now with an error that names the missing keys.
+  ([#60](https://github.com/schmitch/forge/issues/60))
 
 ### Features
 
@@ -108,6 +113,22 @@ limitations still apply, except where an entry below says otherwise.
   and NuGet and Helm repositories show their `dotnet nuget` and `helm`
   commands (other plugin formats, their URL) like docker ones show theirs.
   ([#38](https://github.com/schmitch/forge/issues/38))
+- **Short-lived S3 credentials** from the platform's workload identity, so
+  no long-lived S3 key has to be stored or rotated. `s3.credentials`
+  (`FORGE_S3__CREDENTIALS`) is `static` (the default, `s3.access_key` /
+  `s3.secret_key` as before), `default_chain` (the AWS SDK chain: IRSA, EKS
+  Pod Identity, ECS task roles, EC2 instance profiles, `AWS_*` variables),
+  or `web_identity`: a token file exchanged with STS
+  `AssumeRoleWithWebIdentity` against AWS or MinIO / Ceph RGW
+  (`[s3.web_identity]`: `token_file`, `role_arn`, `sts_endpoint`,
+  `session_name`, `duration_seconds`). Credentials are refreshed before they
+  expire and the token file is read again on each refresh. A failed fetch
+  names the credential source and the STS error code, never the token. The
+  short-lived modes refuse S3 keys. The Helm chart has `s3.credentials` and
+  `s3.webIdentity` (with an optional projected service-account token), and
+  the kustomize component `s3-workload-identity` mounts one. See
+  [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#short-lived-s3-credentials).
+  ([#60](https://github.com/schmitch/forge/issues/60))
 
 ### Fixed
 
