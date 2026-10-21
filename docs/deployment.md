@@ -217,6 +217,12 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Cache-Control: private, no-store`, and feed responses carry
   `Vary: Authorization, Cookie, X-NuGet-ApiKey`: keep a caching proxy from
   overriding either.
+- With `anonymous_mode = "allowlist"`, do not let a shared cache store `/v3`
+  responses at all. Anonymous feed responses carry no `Cache-Control`, and
+  whether Forge serves one depends on the client's address, which the cache
+  does not key on: a cache that stores responses without caching headers
+  (Varnish's default does) would serve what an allowlisted client fetched to
+  a client outside the allowlist.
 - Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
   `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
   own timeouts at least as long for package pushes.

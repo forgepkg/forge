@@ -64,6 +64,8 @@ conditional_writes = "auto"     # (default: "auto")
 [auth]
 anonymous_mode = "off"          # (default: "off") off | allowlist | all
 # Tokens (loopback/private/local) or CIDRs; used only when anonymous_mode = "allowlist".
+# With "allowlist", keep shared HTTP caches from storing /v3 responses
+# (docs/deployment.md, "Reverse proxy").
 anonymous_ip_allowlist = ["loopback"]   # (default: [])
 # CIDRs of reverse proxies whose X-Forwarded-For is trusted.
 trusted_proxy_cidrs = []        # (default: [])
