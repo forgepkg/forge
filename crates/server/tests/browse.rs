@@ -338,6 +338,76 @@ async fn browse_repos_folder_root() {
     assert_eq!(names, sorted, "repo folder list is sorted by name");
 }
 
+/// `/browse/repos` names each repository's client URL under its format's
+/// mount, and `format` keeps one format's repositories.
+#[tokio::test]
+async fn browse_repos_by_format_with_client_urls() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let suffix = common::unique();
+    let created: Vec<(String, &str)> = vec![
+        (format!("nu{suffix}"), "nuget"),
+        (format!("charts{suffix}"), "helm"),
+        (format!("images{suffix}"), "docker"),
+    ];
+    for (name, format) in &created {
+        let resp = srv
+            .client()
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"name": name, "kind": "hosted", "format": format}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "create {format} repository");
+    }
+    let list = |query: &'static str| {
+        let srv = &srv;
+        let (u, p) = (u.clone(), p.clone());
+        async move {
+            let resp = srv
+                .client()
+                .get(format!("{}/browse/repos{query}", srv.base_url))
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let all = list("").await;
+    let entry = |name: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == json!(name))
+            .cloned()
+            .expect("listed")
+    };
+    let nuget = entry(&created[0].0);
+    assert_eq!(nuget["format"], "nuget");
+    assert_eq!(
+        nuget["url"],
+        format!("http://test.local/v3/{}", created[0].0)
+    );
+    let helm = entry(&created[1].0);
+    assert_eq!(helm["format"], "helm");
+    assert_eq!(
+        helm["url"],
+        format!("http://test.local/repository/{}", created[1].0)
+    );
+    let docker = entry(&created[2].0);
+    assert_eq!(docker["format"], "docker");
+    assert!(docker.get("url").is_none(), "{docker}");
+
+    let charts = list("?format=helm").await;
+    let charts = charts.as_array().unwrap();
+    assert!(charts.iter().all(|r| r["format"] == "helm"), "{charts:?}");
+    assert!(charts.iter().any(|r| r["name"] == json!(created[1].0)));
+    assert!(list("?format=npm").await.as_array().unwrap().is_empty());
+}
+
 /// A group repository merges its members: a package published into a hosted
 /// member is visible when browsing the group, with `repo_kind = group`.
 #[tokio::test]

@@ -37,6 +37,13 @@ export interface BrowseRepo {
    * `~/api/images`), not packages.
    */
   format: string
+  /**
+   * The address clients use for the repository (`<server><mount>/<name>`,
+   * e.g. `https://forge.example.com/v3/internal`), for the connect snippets.
+   * Absent for a docker repository (its registry comes with its images) and
+   * for a format this server does not have installed.
+   */
+  url?: string
 }
 
 /**
