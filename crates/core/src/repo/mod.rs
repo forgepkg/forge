@@ -56,8 +56,10 @@ pub enum RepoError {
     /// rather than overloading [`RepoError::RepoNotFound`].
     #[error("storage error: {0}")]
     Storage(String),
-    /// A local resource is exhausted for now (the temp-space budget for
-    /// staging uploads and downloads); the client should retry later → 503.
+    /// A resource is unavailable for now (the temp-space budget for staging
+    /// uploads and downloads is exhausted, a member repository is offline,
+    /// the object store is down while the local blob cache serves reads);
+    /// the client should retry later → 503.
     #[error("temporarily unavailable: {0}")]
     Busy(String),
 }
@@ -112,6 +114,7 @@ impl From<forge_storage::CasError> for WriteError {
             e @ forge_storage::CasError::StagingFull { .. } => {
                 WriteError::Repo(RepoError::Busy(e.to_string()))
             }
+            e if e.is_unavailable() => WriteError::Repo(RepoError::Busy(e.to_string())),
             other => WriteError::Repo(RepoError::Storage(other.to_string())),
         }
     }
@@ -177,6 +180,8 @@ pub struct VersionEntry {
 /// A package blob resolved for download (the `.nupkg`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NupkgLocation {
+    /// Content hash of the blob: its key in the local blob cache.
+    pub blob_sha256: String,
     /// S3 object key of the blob, for streaming from the [`forge_storage`]
     /// blob store.
     pub blob_s3_key: String,

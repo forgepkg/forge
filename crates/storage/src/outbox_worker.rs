@@ -127,7 +127,10 @@ async fn process_row(
             // still complete later. Keep the reservation fenced so no ingest
             // can reuse this incarnation; a later worker or ingest may take
             // over the stale reservation and finish it safely.
-            if let Err(error) = store.delete(&reservation.s3_key).await {
+            if let Err(error) = store
+                .delete_blob(&reservation.sha256, &reservation.s3_key)
+                .await
+            {
                 return Err(error.into());
             }
 

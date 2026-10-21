@@ -27,7 +27,8 @@ struct StubBlobs {
 
 #[async_trait]
 impl BlobFetch for StubBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let s3_key = &blob.s3_key;
         self.map
             .get(s3_key)
             .cloned()

@@ -26,11 +26,12 @@ use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{
-    CacheInvalidator, NoopCacheInvalidator, PackageFilteredReadOps, RepoError, RepoReadOps,
+    CacheInvalidator, NoopCacheInvalidator, NupkgLocation, PackageFilteredReadOps, RepoError,
+    RepoReadOps,
 };
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
-use forge_storage::{BlobStore, Cas};
+use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
 use crate::auth::RealmAuth;
@@ -269,47 +270,62 @@ impl AppState {
     }
 }
 
-/// Reads blobs from the S3 store: whole small metadata blobs (`BlobFetch`,
-/// the `.nuspec`) and streamed packages (`NupkgBytes`).
+/// Reads blobs through the blob store (and its local cache, when enabled):
+/// whole small metadata blobs (`BlobFetch`, the `.nuspec`) and streamed
+/// packages (`NupkgBytes`).
 pub struct BlobBytes {
     store: BlobStore,
 }
 
-impl BlobBytes {
-    async fn read_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        let stream = self.store.get(s3_key).await.map_err(|e| {
-            tracing::error!(error = %e, %s3_key, "s3 get failed");
-            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
-        })?;
-        let bytes = stream
-            .collect()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, %s3_key, "s3 body read failed");
-                RepoError::Storage(format!("read blob {s3_key}: {e}"))
-            })?
-            .into_bytes();
-        Ok(bytes.to_vec())
+/// A storage error as a [`RepoError`]: S3 being down is "try again later"
+/// (503), anything else a server error.
+fn storage_error(error: S3Error, s3_key: &str) -> RepoError {
+    if error.is_unavailable() {
+        tracing::warn!(error = %error, %s3_key, "object store unavailable; blob not in the local cache");
+        RepoError::Busy(format!("object store unavailable: {error}"))
+    } else {
+        tracing::error!(error = %error, %s3_key, "s3 get failed");
+        RepoError::Storage(format!("s3 get {s3_key}: {error}"))
     }
 }
 
 #[async_trait]
 impl BlobFetch for BlobBytes {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        self.read_all(s3_key).await
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let blob_ref = BlobRef {
+            sha256: &blob.sha256,
+            s3_key: &blob.s3_key,
+            size: u64::try_from(blob.size).unwrap_or(0),
+        };
+        self.store
+            .read_all(blob_ref)
+            .await
+            .map_err(|e| storage_error(e, &blob.s3_key))
     }
 }
 
 #[async_trait]
 impl forge_nuget::routes::NupkgBytes for BlobBytes {
-    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
-        let stream = self.store.get(s3_key).await.map_err(|e| {
-            tracing::error!(error = %e, %s3_key, "s3 get failed");
-            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
-        })?;
-        Ok(Box::pin(tokio_util::io::ReaderStream::new(
-            stream.into_async_read(),
-        )))
+    async fn open(
+        &self,
+        loc: &NupkgLocation,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+        let blob = BlobRef {
+            sha256: &loc.blob_sha256,
+            s3_key: &loc.blob_s3_key,
+            size: u64::try_from(loc.size).unwrap_or(0),
+        };
+        self.store
+            .open(blob, range)
+            .await
+            .map_err(|e| storage_error(e, &loc.blob_s3_key))
+    }
+
+    /// Ranges are served with the local blob cache only, so a server
+    /// without one answers downloads exactly as before it existed.
+    fn serves_ranges(&self) -> bool {
+        self.store.cache().is_some()
     }
 }
 

@@ -46,7 +46,8 @@ struct StubBlobs {
 
 #[async_trait]
 impl BlobFetch for StubBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let s3_key = &blob.s3_key;
         self.map
             .get(s3_key)
             .cloned()
@@ -1065,6 +1066,7 @@ impl RepoReadOps for FakeProxy {
             return Err(Self::err());
         }
         Ok(self.versions.contains(&version).then(|| NupkgLocation {
+            blob_sha256: format!("proxy-{version}"),
             blob_s3_key: format!("proxy/{version}"),
             size: 1,
             content_type: "application/octet-stream".into(),
@@ -1742,9 +1744,9 @@ struct CountingBlobs {
 
 #[async_trait]
 impl BlobFetch for CountingBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        self.inner.fetch_all(s3_key).await
+        self.inner.fetch_all(blob).await
     }
 }
 

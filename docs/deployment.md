@@ -314,7 +314,7 @@ server {
 | Endpoint | Use |
 | --- | --- |
 | `GET /healthz` | Liveness. Never touches a dependency. |
-| `GET /readyz` | Readiness. PostgreSQL and S3 are each checked with a 3 s deadline; the endpoint returns 503 with the failing check names. |
+| `GET /readyz` | Readiness. PostgreSQL and S3 are each checked with a 3 s deadline; the endpoint returns 503 with the failing check names. With the [local blob cache](#local-blob-cache), an unreachable S3 is not a failure: 200 with `"status": "degraded"` and `"object_store": "degraded"`. |
 | `GET /version` | The running version and revision. |
 
 The image has no shell tools such as `curl`. Use your orchestrator's HTTP
@@ -325,7 +325,9 @@ migrations, the bucket check, the bootstrap admin, the secret-encryption
 bootstrap and backfill. On the first start of a new version (migrations) or
 against a slow database this can take a while, and `/healthz` does not answer
 until then. Give the container a **startup probe** on `/healthz` with a
-generous budget, so the liveness probe does not restart it mid-migration:
+generous budget, so the liveness probe does not restart it mid-migration.
+(With the [local blob cache](#local-blob-cache), an unreachable S3 does not
+hold up the start: the bucket check is retried in the background.)
 
 ```yaml
 startupProbe:
@@ -419,6 +421,97 @@ Forge, `requirepass`/ACL credentials in the URL, not reachable from outside
 the deployment, and TLS when it crosses a network you do not control
 (`FORGE_REDIS__URL=rediss://user:password@redis.internal:6380`; the server
 verifies the certificate against the system trust store).
+
+## Local blob cache
+
+Optionally, Forge keeps a copy of the blobs it serves on a local disk. Hot
+downloads are then served without S3 (no request, no egress), and packages in
+the cache **keep resolving while S3 is unreachable**. S3 stays the source of
+truth: the cache only ever holds copies of objects S3 has, and since blobs are
+content-addressed and immutable, a copy needs no invalidation. The disk can be
+anything from an `emptyDir` to a dedicated or persistent volume.
+
+| Setting | Meaning |
+| --- | --- |
+| `FORGE_BLOB_CACHE__PATH` | The cache directory, e.g. `/var/cache/forge`. Unset (the default) = no cache. Each instance needs a directory of its own. |
+| `FORGE_BLOB_CACHE__MAX_BYTES` | `auto` (default): the size of the filesystem holding the path, minus `min_free_bytes`, minus `server.max_staging_bytes` when staging is on the same filesystem; re-read every minute, so a resized volume is picked up without a restart. Or a fixed number of bytes. |
+| `FORGE_BLOB_CACHE__MIN_FREE_BYTES` | Free space the cache always leaves on its filesystem, evicting instead of filling it, even when something else uses the disk too. Default: 5 % of the filesystem. On a shared disk with less free space than that, nothing is cached (logged as a warning at startup). |
+
+**How it fills.** A download looks in the cache first; a hit never contacts
+S3. A miss streams the blob from S3 to the client and into the cache at the
+same time; concurrent misses of one blob share that single S3 read. The copy
+is checked against the blob's SHA-256 and size before it joins the cache. A
+push or a first-time proxy download writes its staged file through to the
+cache once S3 has it (a hard link when staging shares the cache's
+filesystem, a copy otherwise), so freshly published packages are cached too.
+Package manifests (`.nuspec`) go through the cache as well. With the cache
+on, package downloads also answer `Range` requests.
+
+**Eviction** is first in, first out: over the limit, the blobs filled longest
+ago go first, however often they are read (a read changes nothing on disk).
+A file's modification time is its fill time, so the order survives a restart
+on a persistent volume. A blob that garbage collection deletes from S3 is
+dropped from the cache as well.
+
+**While S3 is down:**
+
+- Cached blobs are served as usual. Package metadata comes from PostgreSQL,
+  which is still required.
+- Uncached downloads, pushes and first-time proxy downloads answer `503` with
+  `Retry-After`. A circuit breaker makes them fail at once once S3 is known to
+  be down, instead of each waiting for the S3 timeout. Nothing is ever
+  acknowledged that exists only on one instance's disk.
+- `/readyz` answers 200 with `"object_store": "degraded"`, so instances stay
+  in the load balancer and serve what they have (a database failure is still
+  503).
+- An instance (re)started while S3 is unreachable starts anyway, serves its
+  cache, and retries the bucket check in the background.
+- When S3 is back, misses fill again and `/readyz` reports `ok`, without a
+  restart.
+
+**Robustness.** Any cache I/O error (a full disk, a read error, a file of the
+wrong size) is logged, the entry is dropped and the request continues from S3
+(or answers 503 while S3 is down): the cache never turns a servable request
+into an error. Blobs found at startup are checked against their hash on their
+first hit, so a file damaged while Forge was down is fetched again; partial
+fills a killed process left are removed at startup.
+
+**Statistics.** `GET /admin/blob-cache` (admin) reports the size against the
+effective limit (and whether it is `auto`), the hit ratio, bytes served from
+the cache, fills, fill failures, evictions and hits served while S3 was down.
+The same numbers are logged every ten minutes (`local blob cache`).
+
+**On Kubernetes** (see [deploy/kubernetes](../deploy/kubernetes/README.md#local-blob-cache)):
+
+- **`emptyDir`** with a `sizeLimit` and a fixed `max_bytes` below it — the
+  simplest option, and it works with any number of replicas. `statvfs` on an
+  `emptyDir` reports the node's filesystem, not the volume's `sizeLimit`, so
+  with `auto` the cache could outgrow the limit and get the pod evicted. The
+  cache goes with the pod: it bridges an S3 outage only while the pod keeps
+  running.
+- **A generic ephemeral volume** (`ephemeral.volumeClaimTemplate`) on a fast
+  StorageClass gives each pod a disk of its own where `auto` works; it is
+  deleted with the pod, too.
+- **A PersistentVolume** lets the cache survive pod restarts during an S3
+  outage. A ReadWriteOnce volume needs a single replica replaced with
+  `strategy: Recreate` (the `local-cache-persistent` component), or Forge as
+  a StatefulSet with a `volumeClaimTemplate` per pod.
+
+With the Helm chart, set `config.blob_cache` and mount the volume with
+`extraVolumes`/`extraVolumeMounts`:
+
+```yaml
+config:
+  blob_cache:
+    path: /var/cache/forge
+    max_bytes: 8589934592   # below the emptyDir sizeLimit
+extraVolumes:
+  - name: blob-cache
+    emptyDir: { sizeLimit: 10Gi }
+extraVolumeMounts:
+  - name: blob-cache
+    mountPath: /var/cache/forge
+```
 
 ## Backup and restore
 

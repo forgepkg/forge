@@ -32,7 +32,7 @@ use axum::Router;
 use forge_core::authz::PackageFilter;
 use forge_core::format::Format;
 use forge_core::repo::{RepoError, RepoKind};
-use forge_core::{RepoReadOps, RepoWriteOps};
+use forge_core::{NupkgLocation, RepoReadOps, RepoWriteOps};
 
 /// Default maximum accepted upload size (bytes) when the server does not
 /// override it. Mirrors a generous NuGet package size ceiling; the real limit
@@ -47,15 +47,27 @@ const MULTIPART_OVERHEAD_BYTES: u64 = 1024 * 1024;
 pub type BlobByteStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send>>;
 
-/// Stream the bytes of a stored `.nupkg` blob by its S3 object key.
+/// Stream the bytes of a stored `.nupkg` blob.
 ///
 /// Abstracted (like [`forge_core::repo::hosted::BlobFetch`]) so the route layer
 /// is independent of the S3 client and so handler tests can stub blob bytes.
 /// Packages are streamed to the client — never buffered whole in memory.
 #[async_trait]
 pub trait NupkgBytes: Send + Sync {
-    /// Open the blob at `s3_key` as a byte stream.
-    async fn open(&self, s3_key: &str) -> Result<BlobByteStream, RepoError>;
+    /// Open `range` of the blob at `loc` (all of it for `None`) as a byte
+    /// stream. A range is only asked for when [`Self::serves_ranges`].
+    async fn open(
+        &self,
+        loc: &NupkgLocation,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<BlobByteStream, RepoError>;
+
+    /// Whether [`Self::open`] serves byte ranges, so downloads answer `Range`
+    /// requests (`206`). Off by default: the server enables it with the
+    /// local blob cache, which serves ranges from the cached file.
+    fn serves_ranges(&self) -> bool {
+        false
+    }
 }
 
 /// Everything a NuGet route handler needs for one repository.

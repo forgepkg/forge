@@ -1140,17 +1140,22 @@ impl ProxyRepo {
         }
 
         // Promote into CAS (dedup applies across repos). S3 PUT — still NO tx.
-        let stored = self
-            .cas
-            .commit(staged)
-            .await
-            .map_err(|e| RepoError::Storage(format!("cas store upstream nupkg: {e}")))?;
+        // While S3 is down (the local blob cache serves what it has), the
+        // package cannot be stored: "try again later".
+        let stored = self.cas.commit(staged).await.map_err(|e| {
+            if e.is_unavailable() {
+                RepoError::Busy(e.to_string())
+            } else {
+                RepoError::Storage(format!("cas store upstream nupkg: {e}"))
+            }
+        })?;
         let nuspec = self
             .cas
             .store(Cursor::new(parsed.nuspec_bytes.clone()), max_bytes)
             .await
             .map_err(|e| match e {
                 e @ CasError::StagingFull { .. } => RepoError::Busy(e.to_string()),
+                e if e.is_unavailable() => RepoError::Busy(e.to_string()),
                 e => RepoError::Storage(format!("cas store upstream nuspec: {e}")),
             })?;
 
@@ -1370,6 +1375,7 @@ impl ProxyRepo {
             return Ok(None);
         };
         Ok(Some(NupkgLocation {
+            blob_sha256: blob.sha256,
             blob_s3_key: blob.s3_key,
             size: asset.size,
             content_type: asset.content_type,
@@ -1439,7 +1445,7 @@ impl ProxyRepo {
         let Some(blob) = blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
             return Ok(None);
         };
-        Ok(Some(blobs.fetch_all(&blob.s3_key).await?))
+        Ok(Some(blobs.fetch_all(&blob).await?))
     }
 
     /// Fetch the upstream `.nuspec` for a known, not-yet-downloaded version.

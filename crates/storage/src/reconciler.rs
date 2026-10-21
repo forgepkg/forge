@@ -66,7 +66,10 @@ pub async fn reconcile_orphans(
                 forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
                 _ => return Ok::<bool, anyhow::Error>(false),
             };
-            if let Err(error) = store.delete(&reservation.s3_key).await {
+            if let Err(error) = store
+                .delete_blob(&reservation.sha256, &reservation.s3_key)
+                .await
+            {
                 // The failed response may hide a delete that completes later.
                 // Retain the fence until a stale-reservation takeover so this
                 // object incarnation cannot be revived underneath it.
@@ -112,7 +115,10 @@ pub async fn reconcile_orphans(
                 forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
                 _ => return Ok::<bool, anyhow::Error>(false),
             };
-            if let Err(error) = store.delete(&reservation.s3_key).await {
+            if let Err(error) = store
+                .delete_blob(&reservation.sha256, &reservation.s3_key)
+                .await
+            {
                 // Preserve the reservation on an ambiguous failure; releasing
                 // it would allow a new reference to reuse a key that a delayed
                 // delete can still remove.

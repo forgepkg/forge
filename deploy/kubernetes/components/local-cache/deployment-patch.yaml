@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            - name: FORGE_BLOB_CACHE__PATH
+              value: /var/cache/forge
+            # 8 GiB, below the volume's sizeLimit: past the limit the pod
+            # would be evicted.
+            - name: FORGE_BLOB_CACHE__MAX_BYTES
+              value: "8589934592"
+          volumeMounts:
+            - name: blob-cache
+              mountPath: /var/cache/forge
+      volumes:
+        - name: blob-cache
+          emptyDir:
+            sizeLimit: 10Gi

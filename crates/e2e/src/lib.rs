@@ -14,6 +14,8 @@
 //! * [`MockUpstream`] — an in-process mock NuGet V3 upstream feed with per-
 //!   resource hit counters, for proxy scenarios.
 //! * [`make_nupkg`] — build a minimal valid `.nupkg` fixture.
+//! * [`S3Gate`] — a proxy in front of the shared S3 that counts requests and
+//!   can simulate an outage (local blob cache scenarios).
 //!
 //! Containers are shared per test-binary process (booted once, leaked so their
 //! async `Drop` never runs on a torn-down runtime) but every [`start_stack`]
@@ -25,11 +27,13 @@
 mod mock_basic_upstream;
 mod mock_oidc;
 mod mock_upstream;
+mod s3_gate;
 mod stack;
 
 pub use mock_basic_upstream::MockBasicUpstream;
 pub use mock_oidc::MockOidc;
 pub use mock_upstream::{MockUpstream, UpstreamPackage};
+pub use s3_gate::S3Gate;
 pub use stack::{
     make_nupkg, make_nupkg_with_desc, start_stack, AnonMode, StackBuilder, TestServer, S3_ACCESS,
     S3_BUCKET, S3_SECRET,

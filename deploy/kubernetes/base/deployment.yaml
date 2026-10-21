@@ -73,7 +73,9 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
-          # 503 while PostgreSQL or S3 is unreachable.
+          # 503 while PostgreSQL or S3 is unreachable. With the local blob
+          # cache (../components/local-cache*), an S3 outage keeps the pod
+          # ready (200, "degraded"): it serves what it has cached.
           readinessProbe:
             httpGet:
               path: /readyz

@@ -16,10 +16,12 @@
 //! fences delayed deletes after a fully garbage-collected blob is revived;
 //! legacy rows without the suffix remain readable.
 
+use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
@@ -28,22 +30,28 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 
+use crate::blob_cache::BlobCache;
+use crate::breaker::CircuitBreaker;
+
 /// Errors raised by the blob store.
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
     #[error("s3 error: {0}")]
     S3(String),
+    /// S3 cannot be reached: the circuit breaker is open, or the call failed
+    /// to connect, timed out or got a `5xx`. Only raised with the local blob
+    /// cache enabled ([`BlobStore::with_cache`]), where the caller answers
+    /// "try again later" instead of a server error.
+    #[error("object store unavailable: {0}")]
+    Unavailable(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
-impl<E, R> From<SdkError<E, R>> for S3Error
-where
-    E: std::fmt::Debug,
-    R: std::fmt::Debug,
-{
-    fn from(e: SdkError<E, R>) -> Self {
-        S3Error::S3(format!("{e:?}"))
+impl S3Error {
+    /// Whether S3 could not be reached ([`S3Error::Unavailable`]).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, S3Error::Unavailable(_))
     }
 }
 
@@ -119,6 +127,10 @@ pub struct BlobStore {
     /// `put_if_absent` uses HEAD-then-PUT for the rest of the process
     /// lifetime. Shared (`Arc`) so clones of the store learn the verdict too.
     conditional_unsupported: Arc<AtomicBool>,
+    /// The local blob cache in front of reads ([`Self::with_cache`]).
+    cache: Option<BlobCache>,
+    /// Fails calls fast while S3 is down; installed with the cache.
+    breaker: Option<Arc<CircuitBreaker>>,
 }
 
 /// S3's minimum part size for all but the final part of a multipart upload.
@@ -156,19 +168,84 @@ impl BlobStore {
             multipart_threshold: cfg.multipart_threshold,
             conditional_writes: cfg.conditional_writes,
             conditional_unsupported: Arc::new(AtomicBool::new(false)),
+            cache: None,
+            breaker: None,
         }
+    }
+
+    /// Put the local blob `cache` in front of reads ([`Self::open`]), write
+    /// uploads through to it, and evict what [`Self::delete_blob`] deletes.
+    /// Also installs a [`CircuitBreaker`]: while S3 is down, calls fail at
+    /// once with [`S3Error::Unavailable`] instead of waiting for a timeout,
+    /// and cached blobs are served as usual.
+    pub fn with_cache(self, cache: BlobCache) -> Self {
+        self.with_cache_and_breaker(cache, CircuitBreaker::default())
+    }
+
+    /// [`Self::with_cache`] with an explicitly tuned breaker (tests).
+    pub fn with_cache_and_breaker(mut self, cache: BlobCache, breaker: CircuitBreaker) -> Self {
+        self.cache = Some(cache);
+        self.breaker = Some(Arc::new(breaker));
+        self
+    }
+
+    /// The local blob cache, if enabled.
+    pub fn cache(&self) -> Option<&BlobCache> {
+        self.cache.as_ref()
+    }
+
+    /// Whether S3 is currently known to be down (the breaker is open).
+    pub fn is_unavailable(&self) -> bool {
+        self.breaker.as_ref().is_some_and(|b| b.is_open())
+    }
+
+    /// Fail fast while the breaker is open.
+    fn admit(&self) -> Result<(), S3Error> {
+        match &self.breaker {
+            Some(breaker) if !breaker.admit() => Err(S3Error::Unavailable(
+                "the object store is down (failing fast until it answers again)".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Report a call's outcome to the breaker.
+    fn observe<T, E>(&self, result: &Result<T, SdkError<E, HttpResponse>>) {
+        if let Some(breaker) = &self.breaker {
+            match result {
+                Err(e) if is_unreachable(e) => breaker.record_failure(),
+                _ => breaker.record_success(),
+            }
+        }
+    }
+
+    /// Convert an SDK error: [`S3Error::Unavailable`] when S3 could not be
+    /// reached and the breaker is installed.
+    fn error<E: std::fmt::Debug>(&self, e: SdkError<E, HttpResponse>) -> S3Error {
+        if self.breaker.is_some() && is_unreachable(&e) {
+            S3Error::Unavailable(format!("{e:?}"))
+        } else {
+            S3Error::S3(format!("{e:?}"))
+        }
+    }
+
+    /// Run one SDK call: report it to the breaker and convert its error.
+    async fn call<T, E: std::fmt::Debug>(
+        &self,
+        call: impl std::future::Future<Output = Result<T, SdkError<E, HttpResponse>>>,
+    ) -> Result<T, S3Error> {
+        let result = call.await;
+        self.observe(&result);
+        result.map_err(|e| self.error(e))
     }
 
     /// Readiness probe: the bucket is reachable with the configured
     /// credentials.
     pub async fn ping(&self) -> Result<(), S3Error> {
-        self.client
-            .head_bucket()
-            .bucket(&self.bucket)
-            .send()
+        self.admit()?;
+        self.call(self.client.head_bucket().bucket(&self.bucket).send())
             .await
             .map(|_| ())
-            .map_err(|e| S3Error::S3(format!("{e:?}")))
     }
 
     /// Create the bucket if it does not already exist.
@@ -176,24 +253,21 @@ impl BlobStore {
     /// versitygw's posix backend needs the bucket directory to exist before any
     /// object operation. Treats an already-existing bucket as success.
     pub async fn ensure_bucket(&self) -> Result<(), S3Error> {
+        self.admit()?;
         // Fast path: bucket already there.
-        if self
-            .client
-            .head_bucket()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .is_ok()
-        {
+        let head = self.client.head_bucket().bucket(&self.bucket).send().await;
+        self.observe(&head);
+        if head.is_ok() {
             return Ok(());
         }
-        match self
+        let created = self
             .client
             .create_bucket()
             .bucket(&self.bucket)
             .send()
-            .await
-        {
+            .await;
+        self.observe(&created);
+        match created {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Tolerate races / "already owned by you".
@@ -201,7 +275,7 @@ impl BlobStore {
                 if msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists") {
                     Ok(())
                 } else {
-                    Err(S3Error::S3(msg))
+                    Err(self.error(e))
                 }
             }
         }
@@ -209,20 +283,28 @@ impl BlobStore {
 
     /// Return whether an object exists at `key`.
     pub async fn head(&self, key: &str) -> Result<bool, S3Error> {
-        match self
+        self.admit()?;
+        self.head_object(key).await
+    }
+
+    /// [`Self::head`] without the breaker's admission (the caller's
+    /// operation was admitted already).
+    async fn head_object(&self, key: &str) -> Result<bool, S3Error> {
+        let result = self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
-        {
+            .await;
+        self.observe(&result);
+        match result {
             Ok(_) => Ok(true),
             Err(e) => {
                 if is_not_found(&e) {
                     Ok(false)
                 } else {
-                    Err(S3Error::S3(format!("{e:?}")))
+                    Err(self.error(e))
                 }
             }
         }
@@ -240,6 +322,7 @@ impl BlobStore {
     /// instead of HEAD-then-PUT, per [`ConditionalWrites`]; the two paths are
     /// observably identical, the conditional one just saves a round trip.
     pub async fn put_if_absent(&self, key: &str, path: &Path) -> Result<bool, S3Error> {
+        self.admit()?;
         let size = tokio::fs::metadata(path).await?.len();
 
         // Multipart bodies always take the HEAD-then-PUT path: `If-None-Match`
@@ -250,7 +333,7 @@ impl BlobStore {
         // uploaded. The dedup round-trip win matters for the high-volume
         // small-blob case, so large bodies stay on the simple path.
         if size >= self.multipart_threshold {
-            if self.head(key).await? {
+            if self.head_object(key).await? {
                 return Ok(false);
             }
             self.put_multipart(key, path, size).await?;
@@ -286,7 +369,7 @@ impl BlobStore {
             }
         }
 
-        if self.head(key).await? {
+        if self.head_object(key).await? {
             return Ok(false);
         }
         self.put_single(key, path).await?;
@@ -308,7 +391,7 @@ impl BlobStore {
     /// a real error.
     async fn put_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
         let body = body_from_path(path).await?;
-        match self
+        let result = self
             .client
             .put_object()
             .bucket(&self.bucket)
@@ -316,8 +399,9 @@ impl BlobStore {
             .if_none_match("*")
             .body(body)
             .send()
-            .await
-        {
+            .await;
+        self.observe(&result);
+        match result {
             Ok(_) => Ok(ConditionalPut::Uploaded),
             Err(e) => {
                 let msg = format!("{e:?}");
@@ -327,7 +411,7 @@ impl BlobStore {
                         Ok(ConditionalPut::Unsupported(S3Error::S3(msg)))
                     }
                     CondPutError::Conflict => Ok(ConditionalPut::Conflict),
-                    CondPutError::Other => Err(S3Error::S3(msg)),
+                    CondPutError::Other => Err(self.error(e)),
                 }
             }
         }
@@ -336,13 +420,15 @@ impl BlobStore {
     /// Single-shot unconditional PUT of `path` to `key`.
     async fn put_single(&self, key: &str, path: &Path) -> Result<(), S3Error> {
         let body = body_from_path(path).await?;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(body)
-            .send()
-            .await?;
+        self.call(
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(body)
+                .send(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -357,11 +443,13 @@ impl BlobStore {
     /// `AbortIncompleteMultipartUpload` lifecycle rule is for.
     async fn put_multipart(&self, key: &str, path: &Path, size: u64) -> Result<(), S3Error> {
         let create = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
+            .call(
+                self.client
+                    .create_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send(),
+            )
             .await?;
         let upload_id = create
             .upload_id()
@@ -390,14 +478,16 @@ impl BlobStore {
                     .map_err(|e| S3Error::S3(format!("multipart body slice: {e:?}")))?;
 
                 let part = self
-                    .client
-                    .upload_part()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(body)
-                    .send()
+                    .call(
+                        self.client
+                            .upload_part()
+                            .bucket(&self.bucket)
+                            .key(key)
+                            .upload_id(&upload_id)
+                            .part_number(part_number)
+                            .body(body)
+                            .send(),
+                    )
                     .await?;
 
                 completed_parts.push(
@@ -414,14 +504,16 @@ impl BlobStore {
             let completed = CompletedMultipartUpload::builder()
                 .set_parts(Some(completed_parts))
                 .build();
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(&upload_id)
-                .multipart_upload(completed)
-                .send()
-                .await?;
+            self.call(
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(completed)
+                    .send(),
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -442,37 +534,64 @@ impl BlobStore {
         }
     }
 
-    /// Fetch the object at `key` as a streaming [`ByteStream`].
+    /// Fetch the object at `key` as a streaming [`ByteStream`], straight
+    /// from S3 (reads of stored blobs go through [`Self::open`]).
     pub async fn get(&self, key: &str) -> Result<ByteStream, S3Error> {
-        let out = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await?;
+        self.get_range(key, None).await
+    }
+
+    /// Fetch `range` (all of it for `None`) of the object at `key`, straight
+    /// from S3. The range must be non-empty.
+    pub async fn get_range(
+        &self,
+        key: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<ByteStream, S3Error> {
+        self.admit()?;
+        let request = self.client.get_object().bucket(&self.bucket).key(key);
+        let request = match range {
+            Some(range) => request.range(format!(
+                "bytes={}-{}",
+                range.start,
+                range.end.saturating_sub(1)
+            )),
+            None => request,
+        };
+        let out = self.call(request.send()).await?;
         Ok(out.body)
     }
 
     /// Delete the object at `key`. Idempotent: a missing object is `Ok(())`.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
-        match self
+        self.admit()?;
+        let result = self
             .client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
-        {
+            .await;
+        self.observe(&result);
+        match result {
             Ok(_) => Ok(()),
             Err(e) => {
                 if is_not_found(&e) {
                     Ok(())
                 } else {
-                    Err(S3Error::S3(format!("{e:?}")))
+                    Err(self.error(e))
                 }
             }
         }
+    }
+
+    /// Delete the object at `key` holding the blob `sha256`, and drop the
+    /// blob from the local cache (garbage collection).
+    pub async fn delete_blob(&self, sha256: &str, key: &str) -> Result<(), S3Error> {
+        self.delete(key).await?;
+        if let Some(cache) = &self.cache {
+            cache.evict(sha256);
+        }
+        Ok(())
     }
 }
 
@@ -606,6 +725,21 @@ async fn body_from_path(path: &Path) -> Result<ByteStream, S3Error> {
             path.display()
         ))
     })
+}
+
+/// Whether an SDK error means S3 could not be reached: no connection, a
+/// timeout, an unreadable response, or a `5xx` other than `501` (a backend
+/// refusing a feature answered, so it is up).
+fn is_unreachable<E>(e: &SdkError<E, HttpResponse>) -> bool {
+    match e {
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) | SdkError::ResponseError(_) => {
+            true
+        }
+        SdkError::ServiceError(se) => {
+            matches!(se.raw().status().as_u16(), 500 | 502 | 503 | 504)
+        }
+        _ => false,
+    }
 }
 
 /// Whether an SDK error represents a 404 / NoSuchKey / NotFound.

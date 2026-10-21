@@ -1296,10 +1296,13 @@ struct StoreBlobs(forge_storage::BlobStore);
 
 #[async_trait::async_trait]
 impl forge_core::repo::hosted::BlobFetch for StoreBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, forge_core::repo::RepoError> {
+    async fn fetch_all(
+        &self,
+        blob: &forge_db::model::Blob,
+    ) -> Result<Vec<u8>, forge_core::repo::RepoError> {
         let body = self
             .0
-            .get(s3_key)
+            .get(&blob.s3_key)
             .await
             .map_err(|e| forge_core::repo::RepoError::Storage(e.to_string()))?;
         Ok(body

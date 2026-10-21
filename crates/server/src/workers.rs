@@ -39,6 +39,10 @@
 //!    reaper it only bounds growth — reads already treat expired rows as
 //!    misses.
 //!
+//! 6. **Blob cache maintenance** — only with `[blob_cache]`: re-reads the
+//!    cache's filesystem every minute, evicts down to the limit, and logs the
+//!    cache's statistics. Per instance, like the cache itself.
+//!
 //! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process, and runs under [`supervise`]: a loop that
@@ -78,6 +82,9 @@ pub struct WorkerHandles {
     /// [`crate::crypto::spawn_worker`]) — the documented exception to the
     /// no-advisory-locks slice-1 style, per the §12.5 plan.
     pub crypto_rotation: Option<JoinHandle<()>>,
+    /// Local blob cache maintenance (re-read the disk size, evict down to the
+    /// limit). Present only with `[blob_cache]`; per instance, like the cache.
+    pub blob_cache: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandles {
@@ -92,6 +99,9 @@ impl WorkerHandles {
         }
         self.cred_reaper.abort();
         if let Some(h) = &self.crypto_rotation {
+            h.abort();
+        }
+        if let Some(h) = &self.blob_cache {
             h.abort();
         }
     }
@@ -211,6 +221,17 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         _ => None,
     };
 
+    // Local blob cache (per instance): pick up a resized volume or a disk
+    // something else fills, and log the cache's statistics now and then.
+    let blob_cache = state.blob_store.cache().cloned().map(|cache| {
+        supervise("blob-cache", move || {
+            crate::object_store::spawn_maintenance(
+                cache.clone(),
+                crate::object_store::MAINTENANCE_INTERVAL,
+            )
+        })
+    });
+
     WorkerHandles {
         outbox,
         reconciler,
@@ -219,6 +240,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         auth_reaper,
         cred_reaper,
         crypto_rotation,
+        blob_cache,
     }
 }
 

@@ -83,7 +83,13 @@ struct StoreFetch(BlobStore);
 
 #[async_trait]
 impl BlobFetch for StoreFetch {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        self.fetch_key(&blob.s3_key).await
+    }
+}
+
+impl StoreFetch {
+    async fn fetch_key(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
         let body = self
             .0
             .get(s3_key)
@@ -207,7 +213,7 @@ async fn publish_creates_component_assets_and_invalidates_cache() {
     );
 
     // Restore the original bytes via the flat container.
-    let fetched = StoreFetch(store).fetch_all(&loc.blob_s3_key).await.unwrap();
+    let fetched = StoreFetch(store).fetch_key(&loc.blob_s3_key).await.unwrap();
     assert_eq!(fetched, fixture_bytes("sample.lib.1.0.0.nupkg"));
 
     // packageHash (SHA-512 base64) is recorded on the registration entry.

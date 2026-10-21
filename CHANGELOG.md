@@ -45,6 +45,18 @@ lists the required settings.
 - **Web UI**: browse, repository and package detail, self-service tokens, and
   administration of repositories, users, tokens and realms. It is served by
   the same process on the same origin.
+- **Local blob cache** (optional, `[blob_cache]`): a copy of downloaded and
+  pushed blobs on a local disk, sized from the disk (`max_bytes = "auto"`)
+  or fixed, with FIFO eviction that survives a restart. Hot downloads skip
+  S3, concurrent misses of one blob share a single S3 read, and cached
+  packages keep resolving while S3 is unreachable: uncached downloads and
+  pushes then answer 503 with `Retry-After` at once (a circuit breaker),
+  `/readyz` stays 200 and reports the object store `degraded`, and an
+  instance starts without S3. With the cache, package downloads also answer
+  `Range` requests. Statistics at `GET /admin/blob-cache`; Kubernetes
+  components `local-cache` (emptyDir) and `local-cache-persistent` (a
+  PersistentVolume). See
+  [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#local-blob-cache).
 - **Operations**: `/healthz`, `/readyz` and `/version`, graceful SIGTERM,
   supervised background workers, an audit log of every package change and
   admin action (the `forge::audit` log target), and an optional Redis L2

@@ -31,16 +31,16 @@ use crate::repo::{
     NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
 };
 
-/// Fetch raw bytes of a stored blob by its S3 object key.
+/// Fetch raw bytes of a stored blob.
 ///
 /// Implemented over `forge_storage::BlobStore` in the server wiring; abstracted
 /// here so `forge-core` does not depend on the S3 client and so tests can stub
 /// blob bytes.
 #[async_trait]
 pub trait BlobFetch: Send + Sync {
-    /// Read the entire blob at `s3_key` into memory. Used only for small
-    /// metadata blobs (the `.nuspec`).
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError>;
+    /// Read the entire `blob` into memory (from the local blob cache, or its
+    /// S3 object). Used only for small metadata blobs (the `.nuspec`).
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError>;
 }
 
 /// Storage-backed hosted read implementation.
@@ -285,7 +285,7 @@ impl HostedRepo {
             return Ok(None);
         };
         match forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? {
-            Some(blob) => Ok(Some(self.blobs.fetch_all(&blob.s3_key).await?)),
+            Some(blob) => Ok(Some(self.blobs.fetch_all(&blob).await?)),
             None => Ok(None),
         }
     }
@@ -323,6 +323,7 @@ impl HostedRepo {
         }
 
         Ok(Some(NupkgLocation {
+            blob_sha256: blob.sha256,
             blob_s3_key: blob.s3_key,
             size: asset.size,
             content_type: asset.content_type,
@@ -401,7 +402,7 @@ impl RepoReadOps for HostedRepo {
         let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
             return Ok(None);
         };
-        let bytes = self.blobs.fetch_all(&blob.s3_key).await?;
+        let bytes = self.blobs.fetch_all(&blob).await?;
         Ok(Some(bytes))
     }
 

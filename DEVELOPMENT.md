@@ -250,6 +250,7 @@ Key knobs:
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
+| `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
 | `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
 | `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it. `server.staging_dir` picks the directory. |
 | `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
@@ -259,7 +260,9 @@ Key knobs:
 
 `GET /healthz` is a dependency-free liveness probe; `GET /readyz` returns 200
 only when PostgreSQL and the object store answer within 3 s (503 with
-`{"checks":{"database":…,"object_store":…}}` otherwise). The server handles
+`{"checks":{"database":…,"object_store":…}}` otherwise). With `[blob_cache]`
+an unreachable object store is not a failure: 200 with `"status":"degraded"`
+and `"object_store":"degraded"`. The server handles
 SIGTERM (as sent by `docker stop` / Kubernetes): it stops accepting
 connections, drains in-flight requests, then stops the background workers.
 

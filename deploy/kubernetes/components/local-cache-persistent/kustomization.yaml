@@ -1,0 +1,24 @@
+# A local disk cache for blobs on a PersistentVolume, so it survives pod
+# restarts: an instance restarted during an S3 outage starts and serves the
+# packages its cache holds (FORGE_BLOB_CACHE__*, see ../local-cache).
+#
+# A ReadWriteOnce volume can be mounted by one pod at a time, so this runs a
+# single replica and replaces it with `strategy: Recreate` (the old pod is
+# gone before the new one mounts the volume; there is a short gap on every
+# rollout). Do not combine it with ../high-availability; several replicas
+# need ../local-cache, or a StatefulSet with a volumeClaimTemplate per pod.
+#
+# The cache sizes itself from the volume (max_bytes "auto", keeping 5 % of
+# it free). Set the size and, if you like, a fast storageClassName below.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: envisia-forge
+
+resources:
+  - persistentvolumeclaim.yaml
+
+patches:
+  - path: deployment-patch.yaml
