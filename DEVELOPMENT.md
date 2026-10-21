@@ -610,6 +610,15 @@ got another number): fold its entries into `[Unreleased]` first. Run without
 `--no-tag` on a clean `main`, it also creates the annotated tag, for a
 repository whose `main` accepts direct pushes.
 
+**A failed release run** can simply be re-run. It never builds a version
+twice: a new build would have another digest, and pushing it would move the
+version's tags and overwrite its chart. The image and chart that the failed
+attempt already pushed are reused instead, once their signatures show that a
+release run of the tagged commit made them. Anything else it finds under the
+version (an image or chart not signed that way, a chart without its image)
+stops the run with a message saying what to delete, and so does a version
+that already has a GitHub release: publish further changes as a new version.
+
 **Protect the release tags.** A release's signatures name the release
 workflow at its tag and the commit the tag pointed to, and the published
 `cosign verify` commands check both. A tag that can be moved, or deleted and
