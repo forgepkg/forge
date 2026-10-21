@@ -1604,6 +1604,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http",
+ "hyper-util",
  "ipnet",
  "jsonwebtoken",
  "rand 0.10.3",
