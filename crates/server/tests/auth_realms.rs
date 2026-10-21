@@ -622,3 +622,79 @@ async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
     assert_eq!(get(live).await, 401, "a deactivated owner's token");
     // Dropping `upstream` verifies it received no request.
 }
+
+/// A credential-forwarding realm that fails to build makes no upstream call,
+/// so the local provider in front of it must equalize an unknown username's
+/// timing with the dummy argon2 verification itself. Before, it skipped
+/// unknown names whenever a forwarding realm was *enabled*, so they were
+/// answered at once while known names took a full verification. A limiter
+/// with no free slot shows whether a verification was attempted: it answers
+/// unavailable instead of skipping.
+#[tokio::test]
+async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken() {
+    use figment::providers::Format as _;
+    use forge_core::auth::{ChainOutcome, PasswordCredential, PasswordHashLimiter};
+    use std::sync::Arc;
+
+    let pool = common::fresh_pool().await;
+    let config: forge_server::config::Config = forge_server::config::Config::from_figment(
+        figment::Figment::new().merge(figment::providers::Toml::string(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+            public_base_url = "http://test.local"
+            [database]
+            url = "postgres://forge:forge@localhost/forge"
+            [s3]
+            endpoint = "http://localhost:7070"
+            bucket = "forge"
+            access_key = "test"
+            secret_key = "test"
+            "#,
+        )),
+    )
+    .expect("valid config");
+    // Enabled after `local`, but plain http to a non-loopback host without
+    // `allow_http`: the snapshot skips it (fail closed).
+    let priority = forge_db::auth_realm_dao::next_priority(&pool)
+        .await
+        .unwrap();
+    forge_db::auth_realm_dao::insert_realm(
+        &pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: "broken-forward".into(),
+            enabled: true,
+            priority,
+            config: json!({"url": "http://nexus.invalid/status", "key_pepper": "p"}),
+        },
+    )
+    .await
+    .expect("insert realm");
+
+    let no_slot = Arc::new(PasswordHashLimiter::from_semaphore(
+        Arc::new(tokio::sync::Semaphore::new(0)),
+        std::time::Duration::from_millis(10),
+    ));
+    let realms = forge_server::auth::RealmAuth::new(
+        pool.clone(),
+        forge_cache::Cache::l1_only(100),
+        Arc::new(config),
+    )
+    .with_password_limiter(no_slot);
+    let snapshot = realms.snapshot().await.expect("snapshot");
+    let chain = snapshot.chain.as_ref().expect("local realm");
+    assert_eq!(chain.provider_ids().len(), 1, "{:?}", chain.provider_ids());
+
+    let outcome = chain
+        .authenticate(&PasswordCredential {
+            username: &format!("nobody-{}", common::unique()),
+            password: "whatever",
+            client_ip: "127.0.0.1".parse().unwrap(),
+        })
+        .await;
+    assert!(
+        matches!(outcome, ChainOutcome::Unavailable),
+        "the dummy verification was not attempted: {outcome:?}"
+    );
+}

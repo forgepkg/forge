@@ -541,6 +541,14 @@ impl RealmAuth {
         }
     }
 
+    /// Use `limiter` for the local provider's argon2 verifications instead of
+    /// one sized by `auth.password_verify_concurrency` (a test holds its
+    /// permits to observe whether a verification runs).
+    pub fn with_password_limiter(mut self, limiter: Arc<PasswordHashLimiter>) -> Self {
+        self.password_limiter = limiter;
+        self
+    }
+
     /// Attach the secret-encryption service so encrypted realm secrets can be
     /// read (`None` ⇒ only plaintext realm configs are usable).
     pub fn with_envelope(mut self, envelope: Option<Arc<EnvelopeService>>) -> Self {
@@ -582,14 +590,14 @@ impl RealmAuth {
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
 
-        // Does an enabled credential-forwarding realm come after the local one?
-        // Then names the local store does not own go upstream next, and the
-        // local provider need not equalize their timing with a dummy hash.
-        let enabled: Vec<&_> = realms.iter().filter(|r| r.enabled).collect();
-        let forwarding_follows_local = enabled
-            .iter()
-            .position(|r| r.kind == KIND_LOCAL)
-            .is_some_and(|i| enabled[i + 1..].iter().any(|r| r.kind == KIND_CRED_FORWARD));
+        // Where the local provider goes, and whether a credential-forwarding
+        // provider was built after it. Then names the local store does not own
+        // go upstream next, and the local provider need not equalize their
+        // timing with a dummy hash. Decided from the providers actually built:
+        // a forwarding realm that is skipped (fail closed) makes no upstream
+        // call, so the local provider must pay the dummy hash itself.
+        let mut local_at: Option<usize> = None;
+        let mut forwarding_follows_local = false;
 
         for realm in realms.iter().filter(|r| r.enabled) {
             // The logical config (encrypted secrets merged in). A realm whose
@@ -602,18 +610,12 @@ impl RealmAuth {
                 }
             };
             match realm.kind.as_str() {
-                KIND_LOCAL => {
-                    providers.push(Box::new(
-                        LocalPasswordProvider::with_limiter(
-                            self.pool.clone(),
-                            self.password_limiter.clone(),
-                        )
-                        .forwarding_follows(forwarding_follows_local),
-                    ));
-                }
+                // Inserted once the loop knows what follows it.
+                KIND_LOCAL => local_at = local_at.or(Some(providers.len())),
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
                     Ok(p) => {
                         has_cred_forward = true;
+                        forwarding_follows_local |= local_at.is_some();
                         providers.push(p);
                     }
                     // One malformed row must not take down the other realms;
@@ -660,6 +662,19 @@ impl RealmAuth {
                     tracing::error!(realm = %realm.name, kind = %other, "unknown realm kind skipped");
                 }
             }
+        }
+
+        if let Some(at) = local_at {
+            providers.insert(
+                at,
+                Box::new(
+                    LocalPasswordProvider::with_limiter(
+                        self.pool.clone(),
+                        self.password_limiter.clone(),
+                    )
+                    .forwarding_follows(forwarding_follows_local),
+                ),
+            );
         }
 
         let chain = if providers.is_empty() {
