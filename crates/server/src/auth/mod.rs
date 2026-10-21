@@ -127,6 +127,8 @@ impl OidcRuntime {
         let policy = ResolvePolicy {
             auto_provision: oidc.auto_provision,
             link_existing_by_username: oidc.link_existing_by_username,
+            // Set per login from the realms enabled then (oidc_callback).
+            provision_namespace: None,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");
         let sessions = SessionService::new(
@@ -367,7 +369,19 @@ async fn oidc_callback_inner(
     }
 
     let mapped = map_claims(&validated.claims, &rt.mapping);
-    let user = match resolve_user(&state.pool, &validated, &mapped, &rt.policy).await {
+    // While a credential-forwarding realm is enabled, its users' accounts
+    // appear on their first password login, so a new OIDC account must not
+    // take a bare name one of them may still claim: it is namespaced by the
+    // OIDC realm (`bob@entra`).
+    let mut policy = rt.policy.clone();
+    if snap
+        .realms
+        .iter()
+        .any(|r| r.enabled && r.kind == realms::KIND_CRED_FORWARD)
+    {
+        policy.provision_namespace = Some(orr.realm_name.clone());
+    }
+    let user = match resolve_user(&state.pool, &validated, &mapped, &policy).await {
         Ok(u) => u,
         Err(e) => {
             tracing::warn!(error = %e, "oidc user resolution failed");

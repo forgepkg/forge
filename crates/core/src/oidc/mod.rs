@@ -82,6 +82,13 @@ pub struct ResolvePolicy {
     /// with a local password, admin rights, a credential-forwarding origin or
     /// an existing IdP link (see [`resolve_user`]).
     pub link_existing_by_username: bool,
+    /// When set, an auto-provisioned account is named `{claim}@{namespace}`
+    /// instead of the bare username claim. The server sets it to the OIDC
+    /// realm's name while a credential-forwarding realm is enabled: a
+    /// forwarded user's account is created on their first password login, so
+    /// a bare claim (which users may choose at some IdPs) could take that
+    /// name first and lock the directory user out.
+    pub provision_namespace: Option<String>,
 }
 
 impl Default for ResolvePolicy {
@@ -89,6 +96,7 @@ impl Default for ResolvePolicy {
         Self {
             auto_provision: true,
             link_existing_by_username: false,
+            provision_namespace: None,
         }
     }
 }
@@ -175,7 +183,7 @@ pub async fn resolve_user(
 
     // 3. Auto-provision a fresh, password-less user, then link.
     if policy.auto_provision {
-        let user = match provision_oidc_user(pool, login, mapped).await? {
+        let user = match provision_oidc_user(pool, login, mapped, policy).await? {
             Provisioned::New(user) => {
                 finalize(pool, user, login, &identity_claims, mapped, true).await?
             }
@@ -226,10 +234,15 @@ async fn provision_oidc_user(
     pool: &PgPool,
     login: &ValidatedLogin,
     mapped: &MappedClaims,
+    policy: &ResolvePolicy,
 ) -> Result<Provisioned, ResolveError> {
+    let base = match &policy.provision_namespace {
+        Some(namespace) => format!("{}@{namespace}", mapped.username),
+        None => mapped.username.clone(),
+    };
     let mut attempt = 0;
     loop {
-        let username = unique_username(pool, &mapped.username).await?;
+        let username = unique_username(pool, &base).await?;
         let inserted = user_dao::insert_user(
             pool,
             NewUser {

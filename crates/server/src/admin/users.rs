@@ -29,6 +29,11 @@ pub struct UserView {
     pub username: String,
     pub is_admin: bool,
     pub active: bool,
+    /// How the account signs in: `local` (a Forge password), `oidc` (an
+    /// identity provider) or `upstream-basic` (a credential-forwarding
+    /// realm). Two accounts can look alike by name (`bob`, `bob@entra`); this
+    /// tells them apart before a grant goes to the wrong one.
+    pub auth_source: String,
 }
 
 impl From<&AppUser> for UserView {
@@ -38,6 +43,7 @@ impl From<&AppUser> for UserView {
             username: u.username.clone(),
             is_admin: u.is_admin,
             active: u.active,
+            auth_source: u.auth_source.clone(),
         }
     }
 }
