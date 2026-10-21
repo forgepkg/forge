@@ -22,6 +22,7 @@ use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
 use forge_core::format::Format;
 use forge_core::net::upstream::UpstreamHttp;
+use forge_core::repo::downloads::DownloadTally;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
@@ -77,6 +78,9 @@ pub struct AppState {
     /// Pooled, timeout- and size-bounded client for proxy upstream traffic,
     /// built once from `[proxy]` and shared by every proxy repository.
     pub upstream: UpstreamHttp,
+    /// Download counts of every hosted and proxy repository, written in
+    /// batches (#119).
+    pub downloads: Arc<DownloadTally>,
 }
 
 /// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
@@ -158,6 +162,7 @@ impl AppState {
         ));
 
         AppState {
+            downloads: DownloadTally::new(pool.clone()),
             pool,
             blob_store,
             cas,
@@ -220,11 +225,10 @@ impl AppState {
         let format = self.formats.for_repository(repo);
         let filter = self.authz.package_filter(&principal, repo).await;
         let inner: Arc<dyn RepoReadOps> = match repo.kind() {
-            RepoKind::Hosted => Arc::new(HostedRepo::new(
-                self.pool.clone(),
-                format,
-                self.blob_bytes(),
-            )),
+            RepoKind::Hosted => Arc::new(
+                HostedRepo::new(self.pool.clone(), format, self.blob_bytes())
+                    .with_download_tally(self.downloads.clone()),
+            ),
             RepoKind::Proxy => Arc::new(self.proxy_repo(format)),
             RepoKind::Group => Arc::new(
                 GroupRepo::new(
@@ -253,6 +257,7 @@ impl AppState {
         .with_envelope(self.envelope.clone())
         .with_http(self.upstream.clone())
         .with_blob_fetch(self.blob_bytes())
+        .with_download_tally(self.downloads.clone())
     }
 
     /// A member-ops factory for group resolution (hosted/proxy members only).
@@ -265,6 +270,7 @@ impl AppState {
             formats: self.formats.clone(),
             envelope: self.envelope.clone(),
             upstream: self.upstream.clone(),
+            downloads: self.downloads.clone(),
         }
     }
 }
@@ -327,19 +333,24 @@ pub struct MemberFactory {
     envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     /// Shared proxy upstream client.
     upstream: UpstreamHttp,
+    /// Shared download counts.
+    downloads: Arc<DownloadTally>,
 }
 
 impl MemberOpsFactory for MemberFactory {
     fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         let format = self.formats.for_repository(member);
         match member.kind() {
-            RepoKind::Hosted => Ok(Arc::new(HostedRepo::new(
-                self.pool.clone(),
-                format,
-                Arc::new(BlobBytes {
-                    store: self.blob_store.clone(),
-                }),
-            ))),
+            RepoKind::Hosted => Ok(Arc::new(
+                HostedRepo::new(
+                    self.pool.clone(),
+                    format,
+                    Arc::new(BlobBytes {
+                        store: self.blob_store.clone(),
+                    }),
+                )
+                .with_download_tally(self.downloads.clone()),
+            )),
             RepoKind::Proxy => Ok(Arc::new(
                 ProxyRepo::new(
                     self.pool.clone(),
@@ -351,7 +362,8 @@ impl MemberOpsFactory for MemberFactory {
                 .with_http(self.upstream.clone())
                 .with_blob_fetch(Arc::new(BlobBytes {
                     store: self.blob_store.clone(),
-                })),
+                }))
+                .with_download_tally(self.downloads.clone()),
             )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),

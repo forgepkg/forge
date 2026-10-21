@@ -145,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
     // supervised: a panicking loop is logged and restarted.
     let workers = workers::spawn_all(&state);
 
+    let downloads = state.downloads.clone();
     let app = build_router(state, layer);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -158,6 +159,8 @@ async fn main() -> anyhow::Result<()> {
     // step is idempotent / lease-fenced, so an interrupted pass is resumed by
     // the next instance.
     workers.abort();
+    // Download counts not written yet would be lost with the process.
+    downloads.write_pending().await;
     tracing::info!("forge-server stopped");
     Ok(())
 }

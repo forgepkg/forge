@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Duration;
+use forge_core::repo::downloads::DownloadTally;
 use forge_core::repo::hosted::{BlobFetch, HostedRepo, HostedWrite};
 use forge_core::repo::{
     CacheInvalidator, DeleteOutcome, NoopCacheInvalidator, PublishOutcome, RepoError, RepoReadOps,
@@ -135,6 +136,11 @@ fn reader(pool: &PgPool, store: BlobStore) -> HostedRepo {
         Arc::new(NugetFormat::new()),
         Arc::new(StoreFetch(store)),
     )
+    // Downloads are written in batches; write them soon in tests.
+    .with_download_tally(DownloadTally::with_interval(
+        pool.clone(),
+        std::time::Duration::from_millis(20),
+    ))
 }
 
 async fn seed_repo(pool: &PgPool, allow_redeploy: bool) -> String {
@@ -703,6 +709,70 @@ async fn download_count(pool: &PgPool, repo_id: i64, lower: &str, version: &str)
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+/// #119: downloads are counted in memory and written in batches, so a burst
+/// on one version neither queues one row update per download nor holds a
+/// pool connection per download: while another transaction holds the
+/// version's rows, a burst of downloads leaves the pool usable for other
+/// reads, and once the rows are free every download is counted.
+#[tokio::test]
+async fn a_download_burst_on_one_version_leaves_the_pool_usable() {
+    let pool = common::small_pool(4, std::time::Duration::from_secs(2)).await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, false).await;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let r = Arc::new(reader(&pool, store));
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // A transaction holding the version's asset row, as a slow writer would.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT a.id FROM asset a JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1 AND c.name = $2 FOR UPDATE",
+    )
+    .bind(repo_id)
+    .bind(&lower)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+
+    let downloads = 40;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..downloads {
+        let r = r.clone();
+        let (repo, lower) = (repo.clone(), lower.clone());
+        tasks.spawn(async move { r.resolve_nupkg(&repo, &lower, "1.0.0").await });
+    }
+    while let Some(served) = tasks.join_next().await {
+        assert!(served.unwrap().unwrap().is_some());
+    }
+    // Let the batched write start (and wait on the held row).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Other reads still get a connection.
+    let versions = r.list_versions(&repo, &lower).await.expect("pool usable");
+    assert_eq!(versions.len(), 1);
+
+    holder.commit().await.unwrap();
+    let mut counted = 0;
+    for _ in 0..100 {
+        counted = download_count(&pool, repo_id, &lower, "1.0.0").await;
+        if counted == downloads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(counted, downloads, "every download is counted");
 }
 
 /// #74: a `HEAD` on a `.nupkg` is not a download, and a redeploy keeps the

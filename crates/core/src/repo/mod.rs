@@ -8,6 +8,7 @@
 //! bytes so the format layer can extract dependency groups itself (keeping
 //! `forge-core` free of NuGet-specific manifest parsing).
 
+pub mod downloads;
 pub mod group;
 pub mod hosted;
 pub mod proxy;

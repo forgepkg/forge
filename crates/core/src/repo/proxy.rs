@@ -105,6 +105,7 @@ use crate::authz::PackageFilter;
 use crate::domain::{Dependency, DependencyGroup};
 use crate::format::Format;
 use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
+use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
@@ -367,6 +368,8 @@ pub struct ProxyRepo {
     /// blob fails the fetch (fail closed — never a silent unauthenticated
     /// request against a credentialed upstream).
     envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    /// Counts `.nupkg` downloads and writes them in batches.
+    downloads: Arc<DownloadTally>,
 }
 
 impl ProxyRepo {
@@ -381,8 +384,11 @@ impl ProxyRepo {
     }
 
     /// Build a proxy read facade over the process-wide default upstream client.
+    /// It counts downloads in a tally of its own unless it is given the
+    /// process's ([`Self::with_download_tally`]).
     pub fn new(pool: PgPool, format: Arc<dyn Format>, cas: Cas, cache: Cache) -> Self {
         ProxyRepo {
+            downloads: DownloadTally::new(pool.clone()),
             pool,
             format,
             cas,
@@ -397,6 +403,12 @@ impl ProxyRepo {
     /// traffic.
     pub fn with_http(mut self, http: UpstreamHttp) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Count downloads in `downloads`, shared with the other facades.
+    pub fn with_download_tally(mut self, downloads: Arc<DownloadTally>) -> Self {
+        self.downloads = downloads;
         self
     }
 
@@ -2113,20 +2125,6 @@ impl ProxyRepo {
 /// Concurrent local manifest reads while enriching one proxy search page.
 const SEARCH_ENRICH_CONCURRENCY: usize = 8;
 
-/// Fire a best-effort proxy download-tracking bump off the response hot path
-/// (slice 12.1 §3.7). Failures are logged, not propagated — the data only feeds
-/// retention's download-sensitive criteria and is non-authoritative.
-fn spawn_proxy_download_bump(pool: PgPool, repo_id: i64, name: String, version: String) {
-    tokio::spawn(async move {
-        if let Err(e) =
-            forge_db::download_dao::bump_proxy_download_by_name(&pool, repo_id, &name, &version)
-                .await
-        {
-            tracing::warn!(error = %e, repo_id, %name, %version, "proxy download tracking bump failed");
-        }
-    });
-}
-
 #[async_trait]
 impl RepoReadOps for ProxyRepo {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
@@ -2175,9 +2173,9 @@ impl RepoReadOps for ProxyRepo {
             // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
             // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
             // proxy "not pulled in X days" eviction) + mirror onto the parallel
-            // component/asset. Best-effort, off the hot path — never blocks or
-            // fails the download.
-            spawn_proxy_download_bump(self.pool.clone(), repo_row.id, lower, norm);
+            // component/asset. Best-effort, counted in memory and written in a
+            // batch — never blocks or fails the download.
+            self.downloads.count_proxy(repo_row.id, &lower, &norm);
         }
         Ok(loc)
     }

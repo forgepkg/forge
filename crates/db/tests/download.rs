@@ -104,18 +104,18 @@ async fn hosted_bump_increments_count_and_stamps_timestamps() {
     assert_eq!(asset_count_and_ts(&pool, asset_id).await, (0, false));
     assert!(!component_ts_set(&pool, comp_id).await);
 
-    download_dao::bump_hosted_download(&pool, asset_id, comp_id)
+    download_dao::bump_hosted_downloads(&pool, &[asset_id], &[comp_id], &[1])
         .await
         .expect("bump");
 
     assert_eq!(asset_count_and_ts(&pool, asset_id).await, (1, true));
     assert!(component_ts_set(&pool, comp_id).await);
 
-    // Idempotent in shape: a second bump increments to 2.
-    download_dao::bump_hosted_download(&pool, asset_id, comp_id)
+    // A batch adds its counts: three more downloads make 4.
+    download_dao::bump_hosted_downloads(&pool, &[asset_id], &[comp_id], &[3])
         .await
         .unwrap();
-    assert_eq!(asset_count_and_ts(&pool, asset_id).await.0, 2);
+    assert_eq!(asset_count_and_ts(&pool, asset_id).await.0, 4);
 }
 
 #[tokio::test]
@@ -181,12 +181,18 @@ async fn proxy_bump_by_name_stamps_cached_row_and_mirrors_onto_component() {
         .unwrap()
         .unwrap();
 
-    download_dao::bump_proxy_download_by_name(&pool, repo.id, "lib", "3.0.0")
-        .await
-        .expect("bump by name");
+    download_dao::bump_proxy_downloads_by_name(
+        &pool,
+        &[repo.id],
+        &["lib".to_string()],
+        &["3.0.0".to_string()],
+        &[2],
+    )
+    .await
+    .expect("bump by name");
 
     assert!(proxy_ts_set(&pool, cached.id).await);
-    assert_eq!(asset_count_and_ts(&pool, asset_id).await, (1, true));
+    assert_eq!(asset_count_and_ts(&pool, asset_id).await, (2, true));
     assert!(component_ts_set(&pool, comp_id).await);
 }
 

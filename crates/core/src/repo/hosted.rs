@@ -24,6 +24,7 @@ use sqlx::PgPool;
 use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
+use crate::repo::downloads::DownloadTally;
 use crate::repo::{
     CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
     PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
@@ -48,17 +49,27 @@ pub struct HostedRepo {
     pool: PgPool,
     format: Arc<dyn Format>,
     blobs: Arc<dyn BlobFetch>,
+    /// Counts `.nupkg` downloads and writes them in batches.
+    downloads: Arc<DownloadTally>,
 }
 
 impl HostedRepo {
     /// Build a hosted read facade over a pool, a package [`Format`], and a
-    /// blob-byte fetcher.
+    /// blob-byte fetcher. It counts downloads in a tally of its own unless it
+    /// is given the process's ([`Self::with_download_tally`]).
     pub fn new(pool: PgPool, format: Arc<dyn Format>, blobs: Arc<dyn BlobFetch>) -> Self {
         HostedRepo {
+            downloads: DownloadTally::new(pool.clone()),
             pool,
             format,
             blobs,
         }
+    }
+
+    /// Count downloads in `downloads`, shared with the other facades.
+    pub fn with_download_tally(mut self, downloads: Arc<DownloadTally>) -> Self {
+        self.downloads = downloads;
+        self
     }
 
     /// Resolve the repository row by name, erroring if missing.
@@ -315,11 +326,12 @@ impl HostedRepo {
         };
 
         // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
-        // A resolved `.nupkg` is a download (a `HEAD` is not); bump
-        // asynchronously so a tracking write never blocks (or fails) the
-        // response. Non-authoritative — failures are logged, not propagated.
+        // A resolved `.nupkg` is a download (a `HEAD` is not); it is counted
+        // in memory and written in a batch, so a tracking write never blocks
+        // (or fails) the response, and a burst on one version never queues
+        // on its rows. Non-authoritative — failures are logged.
         if count {
-            spawn_download_bump(self.pool.clone(), asset.id, comp.id);
+            self.downloads.count_hosted(asset.id, comp.id);
         }
 
         Ok(Some(NupkgLocation {
@@ -328,24 +340,6 @@ impl HostedRepo {
             content_type: asset.content_type,
         }))
     }
-}
-
-/// Fire a best-effort download-tracking bump for a served hosted `.nupkg`,
-/// off the response hot path (slice 12.1 §3.7).
-///
-/// Spawned so the tracking write — `asset.download_count` /
-/// `last_downloaded_at` + `component.last_downloaded_at` — never blocks the
-/// download response and a failure is logged rather than propagated. The data
-/// is non-authoritative (only feeds retention's download-sensitive criteria),
-/// so an occasional lost increment under load is acceptable.
-fn spawn_download_bump(pool: PgPool, asset_id: i64, component_id: i64) {
-    tokio::spawn(async move {
-        if let Err(e) =
-            forge_db::download_dao::bump_hosted_download(&pool, asset_id, component_id).await
-        {
-            tracing::warn!(error = %e, asset_id, component_id, "download tracking bump failed");
-        }
-    });
 }
 
 #[async_trait]
