@@ -53,6 +53,12 @@ hex = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
 
+# Signs the IAM API calls that make versitygw's STS trust the mock OIDC
+# issuer (the S3 web identity scenarios). Both are already in the build
+# through aws-sdk-s3.
+aws-sigv4 = "1.6"
+aws-credential-types = { workspace = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 sqlx = { workspace = true }
