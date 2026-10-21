@@ -48,7 +48,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: versitygw
-          image: versity/versitygw:v1.4.1
+          # Pinned by digest; Dependabot bumps tag and digest together.
+          image: versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f
           args: ["--port", ":8422", "--health", "/health", "posix", "/data"]
           env:
             - name: ROOT_ACCESS_KEY_ID

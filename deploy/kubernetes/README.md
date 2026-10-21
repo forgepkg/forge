@@ -53,7 +53,9 @@ only go forward, read the changelog before that happens.
 
 Release images are signed; the cosign command is in each GitHub release. If
 the GHCR package is not public, give the `forge` ServiceAccount an
-`imagePullSecrets` entry.
+`imagePullSecrets` entry. The images of the postgres, redis and s3-versitygw
+components are pinned by digest (`tag@sha256:…`); Dependabot proposes
+updates.
 
 ## Configuration and secrets
 

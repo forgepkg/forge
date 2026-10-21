@@ -527,6 +527,15 @@ so it embeds its crate list for SBOM generators and image scanners, and the
 `web` and `builder` stages declare `BUILDKIT_SBOM_SCAN_STAGE`, so the release's
 SBOM attestation covers the npm packages and crates, not just Debian's.
 
+Every image the build and the deployment use is pinned by digest
+(`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Redis
+and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
+fails on a reference without one; Forge's own image is exempt, since the
+release pins it. Dependabot bumps the base images and the `deploy/` images;
+the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
+are bumped by hand (tag and digest, from the registry's index of the tag).
+
 ```bash
 cargo xtask docker-build       # docker build -t envisia-forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421

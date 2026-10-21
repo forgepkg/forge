@@ -8,7 +8,9 @@ fullnameOverride: ""
 image:
   registry: docker.io
   repository: library/redis
-  tag: 7.4-alpine
+  # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
+  # Dependabot bumps together with the tag; `digest`, when set, replaces it.
+  tag: 7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
   digest: ""
   pullPolicy: IfNotPresent
 

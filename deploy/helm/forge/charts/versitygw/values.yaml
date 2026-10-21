@@ -8,7 +8,9 @@ fullnameOverride: ""
 image:
   registry: docker.io
   repository: versity/versitygw
-  tag: v1.4.1
+  # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
+  # Dependabot bumps together with the tag; `digest`, when set, replaces it.
+  tag: v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f
   digest: ""
   pullPolicy: IfNotPresent
 

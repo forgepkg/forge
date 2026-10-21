@@ -189,6 +189,11 @@ Each one only accepts connections from this release's Forge pods (a
 NetworkPolicy), and every value is listed in
 `charts/<name>/values.yaml`; set them under the dependency's key.
 
+Their images are pinned by digest: `image.tag` is `<tag>@sha256:…` (the
+multi-arch index), which Dependabot bumps together with the tag. A digest in
+`image.digest` replaces the pinned one; a plain `image.tag` such as `"16"`
+pulls by tag.
+
 Passwords are generated on install and kept across upgrades by looking up the
 existing Secret; the PostgreSQL and S3 Secrets also survive `helm uninstall`
 together with their volumes. Tools that render without a cluster (Argo CD,
