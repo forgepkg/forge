@@ -188,7 +188,7 @@ unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) unus
 sweep_interval_seconds        = 300         # (default: 300)
 
 [cache]
-l1_max_capacity = 10000         # (default: 10000)
+l1_max_capacity = 10000         # (default: 10000) entries; one over 16 KiB counts once per 16 KiB
 default_ttl_seconds = 30        # (default: 30)
 
 [blob_cache]

@@ -76,6 +76,10 @@ limitations still apply, except where an entry below says otherwise.
   token exchange; it changes no existing data. `/api/v2/token` is a new
   route, so a reverse proxy that only forwards known prefixes needs `/api`.
   ([#169](https://github.com/schmitch/forge/issues/169))
+- `cache.l1_max_capacity` counts an entry over 16 KiB once per started
+  16 KiB, so it bounds the in-process cache's memory as well as its entry
+  count (about 160 MiB of large entries at the default 10000). Small
+  entries count once, as before.
 
 ### Features
 

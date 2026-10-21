@@ -294,6 +294,11 @@ fn note_tag_capable(origins: &mut HashSet<u64>, origin: u64) {
     origins.insert(origin);
 }
 
+/// The longest invalidation message accepted. Forge's own name a namespace
+/// and a key, a hash or a URL; a longer message is forged, and is dropped
+/// before any of it is kept (as a tag barrier) or logged.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024;
+
 async fn apply_message(
     l2: &RedisL2,
     publisher: &redis::aio::ConnectionManager,
@@ -302,6 +307,13 @@ async fn apply_message(
     node_id: u64,
     payload: &str,
 ) {
+    if payload.len() > MAX_MESSAGE_BYTES {
+        tracing::warn!(
+            bytes = payload.len(),
+            "backplane: oversized message dropped"
+        );
+        return;
+    }
     let mut parts = payload.splitn(3, '|');
     let (Some(origin), Some(kind), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
         tracing::warn!(payload, "backplane: malformed message");

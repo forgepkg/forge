@@ -172,6 +172,11 @@ impl StoredEntry {
         self.lifetime
     }
 
+    /// About how much memory the entry holds (its value and tags).
+    pub(crate) fn weight_bytes(&self) -> usize {
+        self.value.len() + self.tags.iter().map(|t| t.tag.len() + 8).sum::<usize>()
+    }
+
     fn has_tags(&self, expected: &[String]) -> bool {
         self.format_version == ENTRY_FORMAT_VERSION
             && self.tags.len() == expected.len()
