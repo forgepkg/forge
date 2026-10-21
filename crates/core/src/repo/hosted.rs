@@ -1058,7 +1058,11 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // A version that does not parse was never published: 404, as NuGet
+        // clients expect for an unknown version, not 400.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -1196,7 +1200,10 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // Unparsable: never published (404), as in `delete_component`.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }

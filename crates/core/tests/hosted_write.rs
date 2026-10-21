@@ -444,6 +444,17 @@ async fn unlist_hides_from_search_but_keeps_downloadable_and_relist_restores() {
     // Relisting an unknown version → NotFound.
     let nf = w.relist(&repo, "Sample.Lib", "9.9.9").await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
+    // A version that does not parse was never published: NotFound (404),
+    // not an invalid-package error (400), for unlist, delete and relist.
+    for hard in [false, true] {
+        let nf = w
+            .delete_component(&repo, "Sample.Lib", "notaversion", hard)
+            .await
+            .unwrap();
+        assert_eq!(nf, DeleteOutcome::NotFound);
+    }
+    let nf = w.relist(&repo, "Sample.Lib", "notaversion").await.unwrap();
+    assert_eq!(nf, DeleteOutcome::NotFound);
 
     // Relist restores search visibility.
     let out = w.relist(&repo, "Sample.Lib", "1.2.3").await.unwrap();

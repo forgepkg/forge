@@ -1732,7 +1732,10 @@ impl ProxyRepo {
         let marked_after = now - Self::not_found_ttl(&repo_row);
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
-        // The version regex is `is_semver2`: build metadata, or a `.` after a `-`.
+        // SemVer 2.0.0 for legacy clients: a `.` after a `-`. `version` is the
+        // normalized form, which never holds build metadata, so a version whose
+        // only SemVer 2.0.0 feature is `+metadata` is shown as its normalized
+        // form, which those clients read (hosted filters `version_original`).
         let names = sqlx::query_scalar!(
             r#"
             SELECT DISTINCT name AS "name!"
@@ -1742,7 +1745,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '[+]|-.*[.]')
+              AND ($6 OR version !~ '-.*[.]')
             ORDER BY name
             "#,
             repo_row.id,
@@ -1779,7 +1782,7 @@ impl ProxyRepo {
               AND first_seen_at <= $3
               AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
               AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '[+]|-.*[.]')
+              AND ($6 OR version !~ '-.*[.]')
             "#,
             repo_row.id,
             &page,
