@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use forge_crypto::CryptoError;
-use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
+use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm, ReorderOutcome};
 use forge_db::model::AuthRealm;
 use forge_db::secret_dao::{self, SecretDbError};
 use serde::{Deserialize, Serialize};
@@ -576,8 +576,12 @@ pub async fn reorder(State(state): State<AppState>, Json(body): Json<ReorderReal
         return bad_request("order must list every realm id exactly once");
     }
 
+    // The reorder checks the order again under its lock: a realm created or
+    // deleted since the check above is a conflict (reload and retry), not a
+    // stale order applied over it. A lost race with another realm write is
+    // the same conflict.
     match auth_realm_dao::reorder_realms(&state.pool, &body.order).await {
-        Ok(()) => {
+        Ok(ReorderOutcome::Reordered) => {
             state.realms.invalidate().await;
             match auth_realm_dao::list_realms(&state.pool).await {
                 Ok(realms) => {
@@ -587,6 +591,21 @@ pub async fn reorder(State(state): State<AppState>, Json(body): Json<ReorderReal
                 Err(e) => db_error(e),
             }
         }
+        Ok(ReorderOutcome::Changed) => (StatusCode::CONFLICT, REALMS_CHANGED).into_response(),
+        Err(e) if is_lost_race(&e) => (StatusCode::CONFLICT, REALMS_CHANGED).into_response(),
         Err(e) => db_error(e),
     }
+}
+
+/// 409 body when the realm set changed under a reorder.
+const REALMS_CHANGED: &str =
+    "the realms were changed by another request since they were read; reload them and try again";
+
+/// A transaction that lost to a concurrent realm write: a deadlock
+/// (`40P01`), a serialization failure (`40001`), or the realm order's
+/// unique key taken at commit.
+fn is_lost_race(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if matches!(db.code().as_deref(), Some("40P01" | "40001")))
+        || is_priority_violation(e)
 }

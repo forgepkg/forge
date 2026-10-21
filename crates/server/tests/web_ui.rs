@@ -5,7 +5,8 @@
 //!   the SPA fallback;
 //! * unknown (client-side) paths fall back to `index.html` so TanStack Router
 //!   can resolve deep links — including the admin UI under `/manage/*` — but a
-//!   missing hashed asset under `/assets/` is a 404;
+//!   missing hashed asset under `/assets/` and an unknown path under an API
+//!   prefix are a 404;
 //! * `index.html` is `no-cache`, hashed assets are `immutable`;
 //! * a browser navigation to a former `/admin/...` UI path is 302-redirected
 //!   to `/manage/...`, while API requests to the same paths are untouched.
@@ -116,6 +117,35 @@ async fn spa_serving_and_api_precedence() {
         .expect("json");
     assert_eq!(me["is_admin"], serde_json::json!(true));
     assert_eq!(me["user"]["username"], serde_json::json!(u));
+
+    // 6. A path under an API prefix that no route matches is a 404, never the
+    //    SPA shell (a script calling a mistyped endpoint must not see 200).
+    for path in [
+        "/admin/does-not-exist",
+        "/admin/repositories/x/y/z/w",
+        "/auth/does-not-exist",
+        "/browse/does-not-exist",
+        "/v3",
+        "/v3/",
+    ] {
+        for authed in [false, true] {
+            let mut req = client.get(format!("{}{path}", server.base_url));
+            if authed {
+                req = req.basic_auth(&u, Some(&p));
+            }
+            let res = req.send().await.expect("GET unknown API path");
+            assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+            let body = res.text().await.expect("body");
+            assert!(!body.contains("forge-spa"), "{path}: {body}");
+        }
+    }
+    // A UI path that merely starts with the same letters is still the SPA.
+    let res = client
+        .get(format!("{}/administrator", server.base_url))
+        .send()
+        .await
+        .expect("GET /administrator");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
 /// The `Cache-Control` header of a response, as a string.

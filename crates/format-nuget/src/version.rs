@@ -24,6 +24,12 @@ use std::cmp::Ordering;
 
 use forge_core::domain::FormatError;
 
+/// Maximum length of a published version, as written and normalized (the
+/// limit nuget.org applies). Without it a multi-kilobyte prerelease label
+/// passed validation and failed the `(repository_id, name, version)` index
+/// insert in PostgreSQL, so the push answered 500 instead of 400.
+pub const MAX_VERSION_LENGTH: usize = 64;
+
 /// A parsed NuGet version, retaining enough structure to normalize and compare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NugetVersion {
@@ -157,13 +163,30 @@ impl NugetVersion {
     /// `int32`, numeric prerelease identifiers have no leading zero (NuGet
     /// keeps `rc.01` verbatim while Forge would normalize it to `rc.1`, so the
     /// package would live at a URL no client asks for), and build metadata is
-    /// dot-separated `[0-9A-Za-z-]` identifiers.
+    /// dot-separated `[0-9A-Za-z-]` identifiers. Neither the version as
+    /// written nor its normalized form may exceed [`MAX_VERSION_LENGTH`].
     pub fn validate_publishable(raw: &str) -> Result<(), FormatError> {
         let invalid = |reason: String| FormatError::InvalidVersion {
             value: raw.to_string(),
             reason,
         };
+        // The error names only the start of an oversized version.
+        let too_long = || {
+            let start: String = raw.trim().chars().take(MAX_VERSION_LENGTH).collect();
+            Err(FormatError::InvalidVersion {
+                value: format!("{start}…"),
+                reason: format!("longer than {MAX_VERSION_LENGTH} characters"),
+            })
+        };
+        // Before parsing, so an oversized label is not copied around first.
+        if raw.trim().len() > MAX_VERSION_LENGTH {
+            return too_long();
+        }
         let parsed = Self::parse(raw)?;
+        // Normalizing can lengthen a version (`1-x` → `1.0.0-x`).
+        if parsed.to_normalized_string().len() > MAX_VERSION_LENGTH {
+            return too_long();
+        }
         let max = i32::MAX as u64;
         if [parsed.major, parsed.minor, parsed.patch, parsed.revision]
             .iter()
@@ -410,5 +433,24 @@ mod tests {
     #[test]
     fn prerelease_compare_is_case_insensitive_via_normalization() {
         assert_eq!(ord("1.0.0-Beta", "1.0.0-beta"), Ordering::Equal);
+    }
+
+    #[test]
+    fn publishable_versions_are_at_most_64_characters() {
+        let label = |n: usize| format!("1.0.0-{}", "a".repeat(n));
+        // "1.0.0-" is 6 characters.
+        assert!(NugetVersion::validate_publishable(&label(58)).is_ok());
+        let err = NugetVersion::validate_publishable(&label(59)).unwrap_err();
+        assert!(err.to_string().contains("longer than 64"), "{err}");
+        assert!(NugetVersion::validate_publishable(&label(1000)).is_err());
+        // Build metadata counts as written, although normalizing drops it.
+        let meta = format!("1.0.0+{}", "b".repeat(59));
+        assert!(NugetVersion::validate_publishable(&meta).is_err());
+        // The normalized form counts too: `1-x` grows to `1.0.0-x`.
+        let short = format!("1-{}", "a".repeat(60));
+        assert_eq!(short.len(), 62);
+        assert!(NugetVersion::validate_publishable(&short).is_err());
+        // Upstream listings are not publishes: parsing stays lenient.
+        assert!(NugetVersion::parse(&label(1000)).is_ok());
     }
 }

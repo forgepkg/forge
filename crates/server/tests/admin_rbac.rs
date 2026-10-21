@@ -364,6 +364,22 @@ async fn rbac_bodies_reject_unknown_fields() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+    // `admin` on one repository delegates nothing (administration is
+    // global), so it is refused rather than stored, by name or by id.
+    for body in [
+        json!({"repository": repo, "action": "admin"}),
+        json!({"repository_id": repo_id, "action": "admin"}),
+    ] {
+        let resp = put(body).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("repository admin is not supported"), "{text}");
+    }
+    // The table refuses one written past the API as well.
+    let role_id = role["id"].as_i64().unwrap();
+    let direct =
+        forge_db::authz_dao::add_grant(&srv.pool, role_id, Some(repo_id), "admin", None).await;
+    assert!(direct.is_err(), "the CHECK constraint refuses it");
 
     let grants: Value = client
         .get(&grants_url)

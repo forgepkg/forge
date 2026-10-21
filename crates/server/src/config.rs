@@ -394,6 +394,12 @@ impl Default for AuthConfig {
 /// duration arithmetic and are a configuration mistake anyway.
 const MAX_SESSION_TTL_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
+/// Longest accepted worker and key-cache duration (100 years). Larger values
+/// panic in the duration arithmetic (chrono above about 9.2e15 seconds, moka
+/// TTLs above 1000 years, timestamps past year 262143) instead of failing
+/// validation, and are a configuration mistake anyway.
+const MAX_DURATION_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
+
 fn default_credential_forward_max_concurrent() -> usize {
     forge_core::auth::DEFAULT_MAX_CONCURRENT_FORWARDS
 }
@@ -1409,6 +1415,16 @@ impl CryptoConfig {
     }
 }
 
+/// Refuse a duration setting above [`MAX_DURATION_SECONDS`], naming the key.
+fn at_most_100_years(key: &str, seconds: i128) -> Result<(), ConfigError> {
+    if seconds > i128::from(MAX_DURATION_SECONDS) {
+        return Err(ConfigError::Invalid(format!(
+            "{key} must be at most {MAX_DURATION_SECONDS} (100 years), got {seconds}"
+        )));
+    }
+    Ok(())
+}
+
 fn default_crypto_algorithm() -> String {
     "aes-256-gcm".into()
 }
@@ -1835,6 +1851,16 @@ impl Config {
                 "retention.default_run_interval_seconds must not be negative".into(),
             ));
         }
+        for (key, seconds) in [
+            ("outbox.grace_seconds", self.outbox.grace_seconds),
+            (
+                "retention.default_run_interval_seconds",
+                self.retention.default_run_interval_seconds,
+            ),
+            ("retention.lease_seconds", self.retention.lease_seconds),
+        ] {
+            at_most_100_years(key, i128::from(seconds))?;
+        }
         positive(
             "groups.max_nesting_depth",
             self.groups.max_nesting_depth > 0,
@@ -1986,6 +2012,28 @@ impl Config {
         };
         if !crypto.enabled {
             return Ok(());
+        }
+
+        at_most_100_years(
+            "crypto.cache.unwrapped_key_ttl_secs",
+            i128::from(crypto.cache.unwrapped_key_ttl_secs),
+        )?;
+        for (key, days) in [
+            (
+                "crypto.rotation.dek_max_age_days",
+                crypto.rotation.dek_max_age_days,
+            ),
+            (
+                "crypto.rotation.kek_max_age_days",
+                crypto.rotation.kek_max_age_days,
+            ),
+        ] {
+            if i128::from(days) * 86_400 > i128::from(MAX_DURATION_SECONDS) {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} must be at most {} (100 years), got {days}",
+                    MAX_DURATION_SECONDS / 86_400
+                )));
+            }
         }
 
         forge_crypto::Algorithm::parse(&crypto.algorithm).map_err(|_| {
@@ -3454,6 +3502,41 @@ mod tests {
         );
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("crypto.algorithm"), "{err}");
+    }
+
+    /// Durations past the arithmetic's limits used to panic at startup or in
+    /// a worker loop; they fail validation instead, naming the key.
+    #[test]
+    fn oversized_durations_fail_validation_naming_the_key() {
+        let max = i64::MAX;
+        for (section, key) in [
+            ("outbox", "grace_seconds"),
+            ("retention", "default_run_interval_seconds"),
+            ("retention", "lease_seconds"),
+        ] {
+            let toml = format!("{MINIMAL}\n[{section}]\n{key} = {max}\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("{section}.{key}")),
+                "{err}"
+            );
+            let toml = format!("{MINIMAL}\n[{section}]\n{key} = 3153600000\n");
+            Config::from_figment(fig_from_toml(&toml)).expect("100 years is accepted");
+        }
+        for (section, key) in [
+            ("cache", "unwrapped_key_ttl_secs"),
+            ("rotation", "dek_max_age_days"),
+            ("rotation", "kek_max_age_days"),
+        ] {
+            let toml = format!(
+                "{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n[crypto.{section}]\n{key} = {max}\n"
+            );
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("crypto.{section}.{key}")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

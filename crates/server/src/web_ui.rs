@@ -35,6 +35,12 @@
 //! `/browse/...`) is always handled by its API router and never shadowed by the
 //! SPA. Only genuine UI paths fall through to the SPA.
 //!
+//! A path under those prefixes that no API route matches still reaches the
+//! fallback (`Router::nest` does not carry a nested router's own fallback),
+//! so the fallback answers it **404** itself ([`API_PREFIXES`]): a script
+//! calling a mistyped or removed endpoint, or an old tab calling a renamed
+//! one, gets an error, not `200` with `index.html`.
+//!
 //! The admin **UI** therefore lives under [`UI_ADMIN_PREFIX`] (`/manage/*`),
 //! not `/admin/*`: a UI route sharing the API's paths would answer a refresh,
 //! bookmark or deep link with raw JSON (or a 404/405). Links saved before the
@@ -56,6 +62,17 @@ use crate::config::WebConfig;
 
 /// Path prefix of the admin UI in the SPA (the admin REST API keeps `/admin`).
 pub const UI_ADMIN_PREFIX: &str = "/manage";
+
+/// The API and feed prefixes. No SPA route lives under them, so a path there
+/// that no API route matched answers 404 instead of `index.html`.
+pub const API_PREFIXES: [&str; 4] = ["/admin", "/auth", "/browse", "/v3"];
+
+/// Whether `path` is `prefix` itself or lies under it (`/admin`, `/admin/x`;
+/// not `/administrator`).
+pub fn is_under(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
 
 /// Vite's content-hashed output directory (`build.assetsDir`), as a URL prefix.
 const ASSETS_PREFIX: &str = "/assets/";
@@ -86,7 +103,8 @@ struct Spa {
 /// requests that matched no API route.
 ///
 /// * Real files are served as themselves (`/assets/app-*.js`).
-/// * A missing file under `/assets/` is a **404** (no SPA fallback).
+/// * A missing file under `/assets/` is a **404** (no SPA fallback), and so
+///   is every path under [`API_PREFIXES`].
 /// * Every other unknown path falls back to `index.html` (SPA history
 ///   fallback) so the client-side router (TanStack Router) resolves deep
 ///   links.
@@ -120,7 +138,11 @@ pub fn spa_service(cfg: &WebConfig) -> Router {
 /// Serve one SPA request: hashed assets without a fallback, everything else
 /// through the `index.html` history fallback, each with its `Cache-Control`.
 async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
-    if req.uri().path().starts_with(ASSETS_PREFIX) {
+    let path = req.uri().path();
+    if API_PREFIXES.iter().any(|prefix| is_under(path, prefix)) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    if path.starts_with(ASSETS_PREFIX) {
         let mut res = match spa.files.oneshot(req).await {
             Ok(res) => res.into_response(),
             Err(never) => match never {},

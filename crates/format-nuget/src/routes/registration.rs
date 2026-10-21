@@ -24,7 +24,7 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::repo::RegistrationEntry;
 use serde_json::{json, Value};
 
-use crate::routes::{package_id, repo_error_response, RouteContext};
+use crate::routes::{package_id, package_version, repo_error_response, RouteContext};
 use crate::{nuspec, version};
 
 /// Build the absolute `packageContent` URL for a `(lower_id, version)`.
@@ -403,10 +403,7 @@ async fn find_entry(
     let not_found = || (StatusCode::NOT_FOUND, "registration leaf not found").into_response();
     let lower = package_id(ctx, id).ok_or_else(not_found)?;
     let raw_version = file.strip_suffix(".json").ok_or_else(not_found)?;
-    let version = ctx
-        .format
-        .normalize_version(raw_version)
-        .map_err(|_| not_found())?;
+    let version = package_version(ctx, raw_version).ok_or_else(not_found)?;
     // One version, looked up directly (not every version of the package).
     let entry = ctx
         .ops

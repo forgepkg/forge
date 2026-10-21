@@ -902,3 +902,123 @@ async fn a_realm_patch_never_undoes_a_concurrent_change() {
     assert_eq!(realm["config"]["required_groups"], json!(["forge"]));
     assert_eq!(realm["name"], json!(name));
 }
+
+/// The realm ids a reorder must list, in their current order.
+async fn realm_order(srv: &common::TestServer) -> Vec<i64> {
+    let (admin, password) = srv.admin_basic();
+    let realms: Vec<Value> = srv
+        .client()
+        .get(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    realms.iter().map(|r| r["id"].as_i64().unwrap()).collect()
+}
+
+/// Send `PUT /admin/realms/order` in the background.
+fn spawn_reorder(
+    srv: &common::TestServer,
+    order: Vec<i64>,
+) -> tokio::task::JoinHandle<(reqwest::StatusCode, String)> {
+    let client = srv.client();
+    let url = format!("{}/admin/realms/order", srv.base_url);
+    let (admin, password) = srv.admin_basic();
+    tokio::spawn(async move {
+        let resp = client
+            .put(url)
+            .basic_auth(&admin, Some(&password))
+            .json(&json!({ "order": order }))
+            .send()
+            .await
+            .unwrap();
+        (resp.status(), resp.text().await.unwrap())
+    })
+}
+
+/// A realm created while a reorder runs used to take a priority the reorder
+/// also assigned, and the reorder answered 500 at commit. The reorder now
+/// waits for the create and answers 409 (its order no longer lists every
+/// realm). Its own database: it locks the realm table.
+#[tokio::test]
+async fn a_reorder_racing_a_realm_create_answers_409() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let order = realm_order(&srv).await;
+
+    // A realm create that has inserted but not committed...
+    let mut create = srv.pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO auth_realm (kind, name, enabled, priority, config) \
+         SELECT 'credential_forwarding', $1, false, max(priority) + 10, \
+                '{\"url\": \"https://nexus.invalid/status\"}'::jsonb \
+         FROM auth_realm",
+    )
+    .bind(format!("racer{}", common::unique()))
+    .execute(&mut *create)
+    .await
+    .unwrap();
+    // ...when the reorder of the realms it read starts.
+    let reorder = spawn_reorder(&srv, order.clone());
+    common::wait_for_lock_wait(&srv.pool, &["%LOCK TABLE auth_realm%"]).await;
+    create.commit().await.unwrap();
+
+    let (status, body) = reorder.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("reload"), "{body}");
+    // Nothing was reordered, and a current order goes through.
+    let now = realm_order(&srv).await;
+    assert_eq!(now[..order.len()], order[..]);
+    let (status, body) = spawn_reorder(&srv, now.into_iter().rev().collect())
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "{body}");
+}
+
+/// A reorder and a realm change that locks the interactive realms (as
+/// disabling an OIDC realm does) used to deadlock, and PostgreSQL aborted the
+/// reorder with a 500. The reorder now waits for the other change and then
+/// applies. Its own database: it locks the realm table.
+#[tokio::test]
+async fn a_reorder_waits_for_a_realm_change_instead_of_deadlocking() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(
+            &json!({"kind": "credential_forwarding", "name": format!("fwd{}", common::unique()),
+                      "enabled": false,
+                      "config": {"url": "https://nexus.invalid/status", "key_pepper": "p"}}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let order: Vec<i64> = realm_order(&srv).await.into_iter().rev().collect();
+
+    // Another change holds the interactive realms, as the last-realm guard
+    // takes them, and is about to update a realm...
+    let mut other = srv.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM auth_realm WHERE kind IN ('local', 'oidc') ORDER BY id FOR UPDATE")
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    let reorder = spawn_reorder(&srv, order.clone());
+    common::wait_for_lock_wait(&srv.pool, &["%LOCK TABLE auth_realm%"]).await;
+    // ...which it can still do while the reorder waits.
+    sqlx::query("UPDATE auth_realm SET updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    other.commit().await.unwrap();
+
+    let (status, body) = reorder.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(realm_order(&srv).await, order);
+}
