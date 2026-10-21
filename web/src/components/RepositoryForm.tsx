@@ -29,7 +29,9 @@ import { Select } from '~/components/catalyst/select'
  * Shared repository create/edit form (plan §Phase 4). Kind-conditional fields:
  *
  *  - **hosted** → `allow_redeploy` (NuGet) / `immutable_tags` +
- *                 `latest_mutable` (docker)
+ *                 `latest_mutable` (docker), and the upload limit
+ *                 (`max_upload_bytes`, entered in MiB; empty = the format's
+ *                 default)
  *  - **proxy**  → `remote_url`, `package_delay_seconds` (not docker),
  *                 metadata/not-found TTLs, and **write-only** upstream creds
  *                 (the password is never populated from a GET — slice-1
@@ -185,6 +187,8 @@ export interface RepoFormValues {
   latest_mutable: boolean
   /** Docker group: hosted member pushes go to; blank = pushes refused. */
   writable_member: string
+  /** Hosted: the upload limit in MiB; blank = the format's default. */
+  max_upload_mib: string
 }
 
 export interface RepositoryFormProps {
@@ -235,7 +239,23 @@ function seed(existing?: RepoView): RepoFormValues {
     immutable_tags: existing?.immutable_tags ?? false,
     latest_mutable: existing?.latest_mutable ?? false,
     writable_member: existing?.writable_member ?? '',
+    max_upload_mib:
+      existing?.max_upload_bytes != null ? bytesToMib(existing.max_upload_bytes) : '',
   }
+}
+
+const MIB = 1024 * 1024
+
+/** Bytes as MiB for the upload-limit field: whole MiB, or up to 6 decimals. */
+export function bytesToMib(bytes: number): string {
+  return String(Number((bytes / MIB).toFixed(6)))
+}
+
+/** The upload-limit field in bytes; `null` when blank or not a number. */
+export function mibToBytes(raw: string): number | null {
+  if (raw.trim() === '') return null
+  const mib = Number(raw)
+  return Number.isFinite(mib) ? Math.round(mib * MIB) : null
 }
 
 export function RepositoryForm({
@@ -287,6 +307,15 @@ export function RepositoryForm({
     if (values.format === DOCKER_FORMAT.id) {
       const hostError = validateDockerHost(values.host)
       if (hostError) next.host = hostError
+    }
+    if (values.kind === 'hosted' && values.max_upload_mib.trim() !== '') {
+      const bytes = mibToBytes(values.max_upload_mib)
+      const ceiling = format.max_upload_bytes_limit
+      if (bytes == null || bytes <= 0) {
+        next.max_upload_mib = 'The upload limit must be a positive number of MiB.'
+      } else if (ceiling != null && bytes > ceiling) {
+        next.max_upload_mib = `At most ${bytesToMib(ceiling)} MiB: larger pushes do not fit the server's staging space.`
+      }
     }
     setErrors(next)
     return Object.keys(next).length === 0
@@ -516,6 +545,39 @@ export function RepositoryForm({
               </CheckboxField>
             </CheckboxGroup>
           )}
+          <Field className="mt-6">
+            <Label>Maximum upload size (MiB)</Label>
+            <Input
+              type="number"
+              min={0}
+              step="any"
+              value={values.max_upload_mib}
+              onChange={(e) => set('max_upload_mib', e.target.value)}
+              placeholder={
+                format.default_max_upload_bytes != null
+                  ? `Default: ${bytesToMib(format.default_max_upload_bytes)}`
+                  : 'Server default'
+              }
+              invalid={!!errors.max_upload_mib}
+            />
+            <Description>
+              {isDocker
+                ? 'The largest layer (blob) a push to this repository may carry.'
+                : 'The largest package a push to this repository may carry.'}{' '}
+              Empty: the server default
+              {format.default_max_upload_bytes != null
+                ? ` (${bytesToMib(format.default_max_upload_bytes)} MiB)`
+                : ''}
+              .
+              {format.max_upload_bytes_limit != null &&
+                ` At most ${bytesToMib(format.max_upload_bytes_limit)} MiB.`}{' '}
+              The reverse proxy in front of Forge must allow request bodies
+              this large.
+            </Description>
+            {errors.max_upload_mib && (
+              <ErrorMessage role="alert">{errors.max_upload_mib}</ErrorMessage>
+            )}
+          </Field>
         </Fieldset>
       )}
 
@@ -814,6 +876,8 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     } else {
       body.allow_redeploy = values.allow_redeploy
     }
+    const maxUpload = mibToBytes(values.max_upload_mib)
+    if (maxUpload != null) body.max_upload_bytes = maxUpload
   }
   if (values.kind === 'group') {
     body.prefer_hosted = values.prefer_hosted
@@ -860,7 +924,9 @@ export function parsePrefixes(raw: string): string[] {
  *    only when a new one was typed (it is write-only, so blank = keep);
  *  - "Remove stored credentials" sends both as `null`;
  *  - a docker `host` / `writable_member` is sent when changed, `null` when
- *    emptied (removes it).
+ *    emptied (removes it);
+ *  - the upload limit is sent when changed, `null` when emptied (back to the
+ *    format's default).
  *
  * Changing `remote_url` to another origin without a new password makes the
  * server drop the stored credentials (the form warns about it).
@@ -897,6 +963,12 @@ export function toUpdateBody(
     if (latestMutable !== before.latest_mutable) {
       body.latest_mutable = latestMutable
     }
+  }
+  if (
+    values.kind === 'hosted' &&
+    values.max_upload_mib.trim() !== before.max_upload_mib.trim()
+  ) {
+    body.max_upload_bytes = mibToBytes(values.max_upload_mib)
   }
   if (docker && values.kind === 'group') {
     const member = values.writable_member.trim()

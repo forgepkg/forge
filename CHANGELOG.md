@@ -49,9 +49,9 @@ limitations still apply, except where an entry below says otherwise.
   ([#130](https://github.com/schmitch/forge/issues/130))
 - Migration 0033 adds the Docker / OCI registry's tables; it changes no
   existing data. To push images through a reverse proxy, allow request
-  bodies of `docker.max_blob_bytes` (1 GiB by default: docker sends a whole
-  layer in one request) on `/v2`, and serve `/v2` at the root of the host.
-  The shipped Ingress now allows 1 GiB. The default
+  bodies of a docker repository's upload limit (1 GiB by default: docker
+  sends a whole layer in one request) on `/v2`, and serve `/v2` at the root
+  of the host. The shipped Ingress now allows 1 GiB. The default
   `server.max_staging_bytes` (four times the largest item) grows with it to
   4 GiB; size the staging volume for it.
   ([#40](https://github.com/schmitch/forge/issues/40))
@@ -60,6 +60,13 @@ limitations still apply, except where an entry below says otherwise.
   `FORGE_S3__SECRET_KEY` (and without short-lived credentials) still
   refuses to start, now with an error that names the missing keys.
   ([#60](https://github.com/schmitch/forge/issues/60))
+- `server.max_upload_bytes` is deprecated: upload limits are now set per
+  hosted repository, in the web UI or the admin API. The setting still
+  works as the default of package repositories without a limit of their own,
+  and startup logs a warning while it is set; give the repositories that
+  need it their own limit, then remove it. A repository's limit may be at
+  most `server.max_staging_bytes` (less `nuget.max_nuspec_bytes`); raise the
+  staging budget first if a repository needs more.
 
 ### Features
 
@@ -105,11 +112,12 @@ limitations still apply, except where an entry below says otherwise.
   platforms and referrers. New `[docker]` settings; see
   [docs/docker.md](https://github.com/schmitch/forge/blob/main/docs/docker.md).
   ([#40](https://github.com/schmitch/forge/issues/40))
-- **Per-format upload limits**: `[plugins.max_upload_bytes]` gives a format
-  (NuGet, Helm or a WebAssembly plugin) a push limit of its own in place of
-  `server.max_upload_bytes`, counted in the default staging budget. An id no
-  installed format has fails startup.
-  ([#38](https://github.com/schmitch/forge/issues/38))
+- **Per-repository upload limits**: every hosted repository (NuGet, Helm,
+  docker or a WebAssembly plugin format) has its own upload limit, the
+  largest push it accepts (docker: per blob), editable as *Maximum upload
+  size* in the web UI and as `max_upload_bytes` in the admin API. Without
+  one, a repository accepts 512 MiB (docker 1 GiB per blob).
+  `docker.max_blob_bytes` now bounds proxy downloads only.
 - **Browse by format**: `GET /browse/repos` takes `format` and names each
   repository's client URL; the web UI's *Browse* screen filters by format,
   and NuGet and Helm repositories show their `dotnet nuget` and `helm`

@@ -632,6 +632,75 @@ async fn hosted_push_pull_tags_and_deletes() {
     );
 }
 
+/// A hosted docker repository's upload limit bounds every blob pushed to
+/// it, in one request or in chunks.
+#[tokio::test]
+async fn the_repository_upload_limit_bounds_blob_pushes() {
+    let srv = common::start().await;
+    let repo = repo_name("small");
+    let view = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker", "max_upload_bytes": 1024}),
+    )
+    .await;
+    assert_eq!(view["max_upload_bytes"], 1024);
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+
+    oci.push_blob(&name, &[1u8; 512]).await;
+    let big = vec![2u8; 2048];
+    let resp = oci
+        .request(
+            Method::POST,
+            &format!("/v2/{name}/blobs/uploads/"),
+            "pull,push",
+            &name,
+        )
+        .await
+        .query(&[("digest", sha(&big))])
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "SIZE_INVALID");
+
+    // In chunks: the second chunk takes the blob past the limit.
+    let auth = oci.bearer(&name, "pull,push").await;
+    let resp = oci
+        .client
+        .post(format!("{}/v2/{name}/blobs/uploads/", oci.base))
+        .header(AUTHORIZATION, &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let location = resp.headers()[LOCATION].to_str().unwrap().to_string();
+    let resp = oci
+        .client
+        .patch(format!("{}{location}", oci.base))
+        .header(AUTHORIZATION, &auth)
+        .header("content-range", "0-599")
+        .body(vec![3u8; 600])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let location = resp.headers()[LOCATION].to_str().unwrap().to_string();
+    let resp = oci
+        .client
+        .patch(format!("{}{location}", oci.base))
+        .header(AUTHORIZATION, &auth)
+        .header("content-range", "600-1199")
+        .body(vec![3u8; 600])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+}
+
 #[tokio::test]
 async fn bad_digests_and_out_of_order_chunks_are_refused() {
     let srv = common::start().await;

@@ -7,9 +7,9 @@ metadata:
     app.kubernetes.io/component: server
   annotations:
     # ingress-nginx spelling; other controllers ignore these. Pushes are up to
-    # the larger of server.max_upload_bytes (512 MiB) and docker.max_blob_bytes
-    # (1 GiB: docker sends a layer in one request) and slow; downloads are
-    # streamed.
+    # the largest repository upload limit (set in the web UI; by default
+    # 512 MiB, and 1 GiB per image layer: docker sends a layer in one request)
+    # and slow; downloads are streamed.
     nginx.ingress.kubernetes.io/proxy-body-size: 1g
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-buffering: "off"

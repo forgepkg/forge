@@ -29,7 +29,7 @@ for values in "$chart"/ci/*.yaml; do
   render "$(basename "$values" .yaml)" --values "$values"
 done
 # Numbers given with --set arrive as integers, not as YAML's floats.
-render set-flags --set config.server.max_upload_bytes=1048576 --set replicaCount=2
+render set-flags --set config.server.max_staging_bytes=8589934592 --set replicaCount=2
 rm -f "$work/lint.log"
 
 kubeconform -strict -summary -kubernetes-version "$k8s_version" \

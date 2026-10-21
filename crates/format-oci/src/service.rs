@@ -27,8 +27,12 @@ use crate::token::{self, Claims, TokenKeys};
 pub struct RegistryConfig {
     /// `server.public_base_url`, without a trailing `/`.
     pub public_base_url: String,
-    /// Largest blob (layer) a push or a proxy download may carry.
+    /// Largest blob (layer) a proxy downloads from its upstream.
     pub max_blob_bytes: u64,
+    /// Largest blob a push to a hosted repository may carry when the
+    /// repository has no upload limit of its own
+    /// ([`Repository::max_upload_bytes`]).
+    pub default_max_upload_bytes: u64,
     /// Lifetime of a registry Bearer token.
     pub token_ttl_seconds: u64,
     /// Outbox grace of released blob references.

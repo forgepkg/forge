@@ -496,15 +496,21 @@ async fn uploads_are_bounded_by_the_server_limit() {
 }
 
 #[tokio::test]
-async fn a_format_has_an_upload_limit_of_its_own() {
-    // Helm's limit admits a chart the server-wide limit refuses.
+async fn a_repository_has_an_upload_limit_of_its_own() {
+    // The repository's limit admits a chart the (deprecated) server-wide
+    // default refuses.
     let srv = start_helm(ServerOpts {
         server_extra: Some("max_upload_bytes = 1024".into()),
-        plugins_block: Some("[plugins.max_upload_bytes]\nhelm = 1048576\n".into()),
         ..Default::default()
     })
     .await;
-    let repo = helm_repo(&srv, false).await;
+    let name = format!("charts{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": name, "kind": "hosted", "format": "helm", "max_upload_bytes": 1048576 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
     let creds = credentials(&srv).await;
     // Digests compress poorly: the archive stays well above 1 KiB.
     let noise: String = (0u32..64)
@@ -517,14 +523,14 @@ async fn a_format_has_an_upload_limit_of_its_own() {
         .collect();
     let package = chart_with_values("big", "1.0.0", &noise);
     assert!(package.len() > 2048, "{}", package.len());
-    let resp = push(&srv, &repo, &creds, package).await;
+    let resp = push(&srv, &name, &creds, package).await;
     assert_eq!(
         resp.status(),
         StatusCode::CREATED,
         "{}",
         resp.text().await.unwrap()
     );
-    let resp = push(&srv, &repo, &creds, vec![0u8; 2 * 1024 * 1024]).await;
+    let resp = push(&srv, &name, &creds, vec![0u8; 2 * 1024 * 1024]).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         resp.text().await.unwrap(),

@@ -123,22 +123,27 @@ async fn push_trickled_byte_by_byte_is_accepted() {
     );
 }
 
-/// An upload past `server.max_upload_bytes` is refused with 413 and stores
-/// nothing.
+/// An upload past the repository's limit is refused with 413 and stores
+/// nothing; the limit is set and cleared through the admin API, live.
 #[tokio::test]
-async fn push_over_the_upload_limit_is_413() {
-    let srv = start_with(
-        common::fresh_pool().await,
-        ServerOpts {
-            server_extra: Some("max_upload_bytes = 4096".into()),
-            ..ServerOpts::default()
-        },
-    )
-    .await;
+async fn push_over_the_repository_upload_limit_is_413() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
     let repo = hosted_repo(&srv).await;
+    let set_limit = |limit: Value| {
+        srv.client()
+            .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({ "max_upload_bytes": limit }))
+            .send()
+    };
+    let resp = set_limit(json!(4096)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["max_upload_bytes"], 4096);
+
     let id = format!("Too.Large{}", unique());
     let nupkg = common::make_nupkg_with_payload(&id, "1.0.0", 64 * 1024);
-
     let resp = push(&srv, &repo, multipart_body(b"", &nupkg).into()).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
@@ -149,30 +154,114 @@ async fn push_over_the_upload_limit_is_413() {
         versions(&srv, &repo, &id.to_lowercase()).await.0,
         StatusCode::NOT_FOUND
     );
+
+    // Cleared, the format's default (512 MiB) applies again.
+    let resp = set_limit(Value::Null).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["max_upload_bytes"], Value::Null);
+    let resp = push(&srv, &repo, multipart_body(b"", &nupkg).into()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
-/// `plugins.max_upload_bytes.nuget` bounds NuGet pushes in place of
-/// `server.max_upload_bytes`.
+/// The deprecated `server.max_upload_bytes` is still the default of a
+/// repository without a limit of its own, and a repository's limit
+/// replaces it, larger or smaller.
 #[tokio::test]
-async fn nuget_pushes_follow_their_format_limit() {
+async fn the_deprecated_server_limit_is_only_a_default() {
     let srv = start_with(
         common::fresh_pool().await,
         ServerOpts {
-            plugins_block: Some("[plugins.max_upload_bytes]\nnuget = 4096\n".into()),
+            server_extra: Some("max_upload_bytes = 4096".into()),
             ..ServerOpts::default()
         },
     )
     .await;
-    let repo = hosted_repo(&srv).await;
-    let id = format!("Format.Limit{}", unique());
+    let (u, p) = srv.admin_basic();
+    let id = format!("Legacy.Limit{}", unique());
     let nupkg = common::make_nupkg_with_payload(&id, "1.0.0", 64 * 1024);
 
-    let resp = push(&srv, &repo, multipart_body(b"", &nupkg).into()).await;
+    let defaulted = hosted_repo(&srv).await;
+    let resp = push(&srv, &defaulted, multipart_body(b"", &nupkg).into()).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(
-        resp.text().await.unwrap(),
-        "upload exceeds limit of 4096 bytes"
-    );
+
+    let own = format!("nupub{}", unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "name": own, "kind": "hosted", "max_upload_bytes": 1048576 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = push(&srv, &own, multipart_body(b"", &nupkg).into()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// A repository upload limit is validated: hosted repositories only, more
+/// than 0, and no larger than a push can be staged; `/admin/formats` names
+/// the defaults and that ceiling.
+#[tokio::test]
+async fn repository_upload_limits_are_validated() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let create = |body: Value| {
+        srv.client()
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let formats: Value = srv
+        .client()
+        .get(format!("{}/admin/formats", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nuget = &formats[0];
+    assert_eq!(nuget["id"], "nuget");
+    assert_eq!(nuget["default_max_upload_bytes"], 512 * 1024 * 1024);
+    let docker = formats
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "docker")
+        .unwrap();
+    assert_eq!(docker["default_max_upload_bytes"], 1024 * 1024 * 1024);
+    let ceiling = nuget["max_upload_bytes_limit"].as_u64().expect("bounded");
+    assert_eq!(docker["max_upload_bytes_limit"], ceiling);
+
+    for (body, message) in [
+        (
+            json!({ "name": format!("z{}", unique()), "kind": "hosted", "max_upload_bytes": 0 }),
+            "greater than 0",
+        ),
+        (
+            json!({ "name": format!("z{}", unique()), "kind": "hosted",
+                    "max_upload_bytes": ceiling + 1 }),
+            "server.max_staging_bytes",
+        ),
+        (
+            json!({ "name": format!("z{}", unique()), "kind": "group", "max_upload_bytes": 4096 }),
+            "only valid for hosted repositories",
+        ),
+    ] {
+        let resp = create(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        assert!(resp.text().await.unwrap().contains(message), "{body}");
+    }
+    let name = format!("z{}", unique());
+    let resp = create(json!({ "name": name, "kind": "hosted", "max_upload_bytes": ceiling }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view: Value = resp.json().await.unwrap();
+    assert_eq!(view["max_upload_bytes"], ceiling);
 }
 
 /// NuGet pushes are `multipart/form-data`; a bare body is refused.

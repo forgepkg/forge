@@ -20,7 +20,8 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     RepoKind, Repository, DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
-    NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_KEY,
+    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
+    WRITABLE_MEMBER_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao};
@@ -62,6 +63,9 @@ pub struct RepoView {
     pub latest_mutable: bool,
     /// Docker group: the hosted member pushes to the group go to.
     pub writable_member: Option<String>,
+    /// Hosted: the largest push it accepts (for docker, the largest blob),
+    /// `None` for the default of its format (`GET /admin/formats`).
+    pub max_upload_bytes: Option<u64>,
 }
 
 impl From<&Repository> for RepoView {
@@ -87,6 +91,7 @@ impl From<&Repository> for RepoView {
             immutable_tags: r.immutable_tags(),
             latest_mutable: r.immutable_tags() && r.latest_mutable(),
             writable_member: r.writable_member().map(str::to_string),
+            max_upload_bytes: r.max_upload_bytes(),
         }
     }
 }
@@ -139,6 +144,10 @@ pub struct CreateRepo {
     /// Docker group only: the hosted member a push to the group goes to.
     #[serde(default)]
     pub writable_member: Option<String>,
+    /// Hosted only: the largest push it accepts, in bytes (for docker, the
+    /// largest blob). Absent: the default of its format.
+    #[serde(default)]
+    pub max_upload_bytes: Option<u64>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -168,6 +177,8 @@ pub struct CreateRepo {
 /// * Docker options (`host`, `immutable_tags`, `latest_mutable`,
 ///   `writable_member`) follow the same rules (`host` and `writable_member`:
 ///   `null` clears) and are refused on NuGet repositories.
+/// * `max_upload_bytes` (hosted only): `null` clears it, back to the default
+///   of the repository's format.
 /// * Unknown fields are rejected (a misspelled field would otherwise keep the
 ///   stored value).
 #[derive(Debug, Deserialize)]
@@ -201,6 +212,9 @@ pub struct UpdateRepo {
     /// Docker group only; `null` clears it (pushes to the group are refused).
     #[serde(default, deserialize_with = "double_option")]
     pub writable_member: Option<Option<String>>,
+    /// Hosted only; `null` clears it (the format's default applies).
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_upload_bytes: Option<Option<u64>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -391,6 +405,31 @@ fn is_host_conflict(e: &sqlx::Error) -> bool {
             && db.constraint() == Some("repository_docker_host_idx"))
 }
 
+/// Validate a repository upload limit for a repository of `kind`: hosted
+/// only, more than 0, and at most what a push can stage
+/// ([`crate::config::Config::max_repository_upload_bytes`]).
+#[allow(clippy::result_large_err)]
+fn validate_upload_limit(state: &AppState, kind: RepoKind, bytes: u64) -> Result<u64, Response> {
+    if kind != RepoKind::Hosted {
+        return Err(bad_request(
+            "max_upload_bytes is only valid for hosted repositories",
+        ));
+    }
+    if bytes == 0 {
+        return Err(bad_request("max_upload_bytes must be greater than 0"));
+    }
+    if let Some(ceiling) = state.config.max_repository_upload_bytes() {
+        if bytes > ceiling {
+            return Err(bad_request(format!(
+                "max_upload_bytes ({bytes}) is larger than a push can be staged ({ceiling} \
+                 bytes: server.max_staging_bytes less nuget.max_nuspec_bytes); raise \
+                 server.max_staging_bytes first"
+            )));
+        }
+    }
+    Ok(bytes)
+}
+
 /// Reject negative or absurd proxy timings. A negative TTL made every
 /// unconfirmed row prunable at once (racing in-flight downloads), and an
 /// unbounded not-found TTL let one request hide a package for years.
@@ -527,6 +566,12 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         return resp;
     }
     let mut config = serde_json::Value::Object(docker_config);
+    if let Some(bytes) = body.max_upload_bytes {
+        match validate_upload_limit(&state, parsed_kind, bytes) {
+            Ok(bytes) => config[MAX_UPLOAD_BYTES_KEY] = json!(bytes),
+            Err(resp) => return resp,
+        }
+    }
     if parsed_kind == RepoKind::Group {
         config[PREFER_HOSTED_KEY] = json!(body.prefer_hosted.unwrap_or(true));
         if let Some(prefixes) = reserved_prefixes {
@@ -804,6 +849,23 @@ pub async fn update(
             config = json!({});
         }
         config[RESERVED_PREFIXES_KEY] = json!(prefixes);
+    }
+    match body.max_upload_bytes {
+        Some(Some(bytes)) => match validate_upload_limit(&state, existing.kind(), bytes) {
+            Ok(bytes) => {
+                if !config.is_object() {
+                    config = json!({});
+                }
+                config[MAX_UPLOAD_BYTES_KEY] = json!(bytes);
+            }
+            Err(resp) => return resp,
+        },
+        Some(None) => {
+            if let Some(map) = config.as_object_mut() {
+                map.remove(MAX_UPLOAD_BYTES_KEY);
+            }
+        }
+        None => {}
     }
 
     // Stored credentials belong to the upstream origin they were entered for:

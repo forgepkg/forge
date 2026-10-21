@@ -7,6 +7,8 @@ import {
   DOCKER_FORMAT,
   NUGET_FORMAT,
   RepositoryForm,
+  bytesToMib,
+  mibToBytes,
   toCreateBody,
   toUpdateBody,
   validateDockerHost,
@@ -235,6 +237,7 @@ describe('RepositoryForm', () => {
       immutable_tags: false,
       latest_mutable: false,
       writable_member: null,
+      max_upload_bytes: null,
     }
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -312,6 +315,7 @@ const storedProxy: RepoView = {
   immutable_tags: false,
   latest_mutable: false,
   writable_member: null,
+  max_upload_bytes: null,
 }
 
 function renderEdit(existing: RepoView = storedProxy) {
@@ -815,3 +819,127 @@ function lastValuesOf(existing: RepoView): RepoFormValues {
   unmount()
   return lastValues(onSubmit)
 }
+
+describe('repository upload limit', () => {
+  const nuget: FormatView = {
+    ...NUGET_FORMAT,
+    default_max_upload_bytes: 512 * 1024 * 1024,
+    max_upload_bytes_limit: 4 * 1024 * 1024 * 1024,
+  }
+  const storedHosted: RepoView = {
+    ...storedProxy,
+    name: 'packages',
+    kind: 'hosted',
+    remote_url: null,
+    upstream_username: null,
+    has_upstream_password: false,
+    metadata_ttl_seconds: null,
+    not_found_ttl_seconds: null,
+    max_upload_bytes: 100 * 1024 * 1024,
+  }
+
+  it('converts between bytes and MiB', () => {
+    expect(bytesToMib(512 * 1024 * 1024)).toBe('512')
+    expect(bytesToMib(1536 * 1024)).toBe('1.5')
+    expect(mibToBytes('1.5')).toBe(1536 * 1024)
+    expect(mibToBytes(' ')).toBeNull()
+    expect(mibToBytes('lots')).toBeNull()
+  })
+
+  it('shows the default and sends a typed limit in bytes on create', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    expect(field).toHaveAttribute('placeholder', 'Default: 512')
+    await user.type(screen.getByLabelText('Name'), 'big-packages')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).not.toHaveProperty('max_upload_bytes')
+
+    await user.type(field, '2048')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      max_upload_bytes: 2048 * 1024 * 1024,
+    })
+  })
+
+  it('refuses a limit above what the server can stage, and a non-positive one', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    await user.type(screen.getByLabelText('Name'), 'too-big')
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    await user.type(field, '8192')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent('At most 4096 MiB')
+
+    await user.clear(field)
+    await user.type(field, '0')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent('positive number')
+  })
+
+  it('on edit, sends a changed limit, null for an emptied one, nothing when untouched', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="edit"
+        existing={storedHosted}
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    expect(field).toHaveValue(100)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({})
+
+    await user.clear(field)
+    await user.type(field, '250')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({
+      max_upload_bytes: 250 * 1024 * 1024,
+    })
+
+    await user.clear(field)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({
+      max_upload_bytes: null,
+    })
+  })
+
+  it('is not offered for proxies and groups', () => {
+    render(
+      <RepositoryForm
+        mode="edit"
+        existing={storedProxy}
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText('Maximum upload size (MiB)')).toBeNull()
+  })
+})

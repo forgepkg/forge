@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::authz::Action;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
-use forge_db::model::RepoKind;
+use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
 use forge_storage::BlobRef;
 use futures_util::{StreamExt, TryStreamExt};
@@ -141,6 +141,13 @@ impl Registry {
         self.inner.config.delete_grace
     }
 
+    /// The largest blob a push to `repo` may carry: its own upload limit,
+    /// else the registry's default.
+    fn blob_limit(&self, repo: &Repository) -> u64 {
+        repo.max_upload_bytes()
+            .unwrap_or(self.inner.config.default_max_upload_bytes)
+    }
+
     // ── Uploads ─────────────────────────────────────────────────────────────
 
     pub(crate) async fn start_upload(
@@ -174,10 +181,7 @@ impl Registry {
             let staged = self
                 .inner
                 .cas
-                .stage(
-                    body_reader(req.into_body()),
-                    self.inner.config.max_blob_bytes,
-                )
+                .stage(body_reader(req.into_body()), self.blob_limit(&t.repo))
                 .await?;
             if !digest.matches(&staged.sha256, &staged.sha512_base64) {
                 return Err(OciError::digest_invalid(
@@ -297,12 +301,14 @@ impl Registry {
     }
 
     /// Store one chunk of an upload. `expected_start` is where the chunk
-    /// must begin (the session's size when the request started).
+    /// must begin (the session's size when the request started); the whole
+    /// blob may be at most `max` bytes.
     async fn append_chunk(
         &self,
         upload: &UploadRow,
         range: Option<(i64, i64)>,
         body: Body,
+        max: u64,
     ) -> OciResult<UploadRow> {
         let out_of_order = |size: i64| {
             OciError::new(
@@ -317,7 +323,6 @@ impl Registry {
                 return Err(out_of_order(upload.size));
             }
         }
-        let max = self.inner.config.max_blob_bytes;
         let remaining = max.saturating_sub(upload.size.max(0) as u64);
         let staged = self
             .inner
@@ -377,7 +382,10 @@ impl Registry {
     ) -> OciResult<Response> {
         let upload = self.upload_of(ctx, id).await?;
         let range = content_range(req.headers())?;
-        let upload = self.append_chunk(&upload, range, req.into_body()).await?;
+        let max = self.blob_limit(&ctx.serving().repo);
+        let upload = self
+            .append_chunk(&upload, range, req.into_body(), max)
+            .await?;
         Ok(upload_accepted(
             StatusCode::ACCEPTED,
             &ctx.target.name,
@@ -399,7 +407,10 @@ impl Registry {
             .ok_or_else(|| OciError::digest_invalid("the digest query parameter is required"))?;
         let digest = parse_digest(&digest)?;
         let range = content_range(req.headers())?;
-        let upload = self.append_chunk(&upload, range, req.into_body()).await?;
+        let max = self.blob_limit(&t.repo);
+        let upload = self
+            .append_chunk(&upload, range, req.into_body(), max)
+            .await?;
         let pool = &self.inner.pool;
         let parts = oci_dao::upload_parts(pool, upload.id).await?;
 
@@ -459,10 +470,7 @@ impl Registry {
                 let staged = self
                     .inner
                     .cas
-                    .stage(
-                        StreamReader::new(Box::pin(chunks)),
-                        self.inner.config.max_blob_bytes,
-                    )
+                    .stage(StreamReader::new(Box::pin(chunks)), max)
                     .await?;
                 if staged.size as i64 != upload.size
                     || !digest.matches(&staged.sha256, &staged.sha512_base64)

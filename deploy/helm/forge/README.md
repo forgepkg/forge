@@ -203,10 +203,10 @@ The chart has no Ingress; it routes through the Gateway API.
   ```
 
 Request size limits and timeouts are implementation-specific: allow pushes of
-`server.max_upload_bytes` (512 MiB) and of image layers up to
-`docker.max_blob_bytes` (1 GiB), and keep the gateway's upstream idle timeout
-below `server.header_read_timeout_seconds` (150 s; Envoy and Istio default to
-one hour). Add the policy objects of your implementation (Envoy
+the largest repository upload limit (set per repository in the web UI; by
+default 512 MiB, and 1 GiB per image layer), and keep the gateway's upstream
+idle timeout below `server.header_read_timeout_seconds` (150 s; Envoy and
+Istio default to one hour). Add the policy objects of your implementation (Envoy
 Gateway `BackendTrafficPolicy`, …), or an Ingress if you need one, with
 `extraObjects`.
 
