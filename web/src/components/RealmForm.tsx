@@ -1009,12 +1009,13 @@ export function RealmForm({
                 max={86400}
                 value={values.max_token_age_seconds}
                 onChange={(e) => set('max_token_age_seconds', e.target.value)}
-                placeholder="3600"
+                placeholder="39600"
                 invalid={!!errors.max_token_age_seconds}
               />
               <Description>
                 Bounds both token age and declared lifetime. GitHub tokens are
-                normally 10 minutes; use the shortest value your CI jobs support.
+                normally 10 minutes; GitLab tokens last as long as the job
+                timeout. Use the shortest value your CI jobs support.
               </Description>
               {errors.max_token_age_seconds && (
                 <ErrorMessage role="alert">

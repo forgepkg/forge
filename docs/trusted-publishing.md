@@ -188,7 +188,7 @@ refs or a protected environment for release jobs:
   "issuer": "https://gitlab.com",
   "allowed_audiences": ["https://forge.example.com"],
   "clock_skew_seconds": 60,
-  "max_token_age_seconds": 3600,
+  "max_token_age_seconds": 39600,
   "positive_cache_seconds": 60,
   "rules": [
     {
@@ -202,6 +202,11 @@ refs or a protected environment for release jobs:
   ]
 }
 ```
+
+GitLab gives an ID token the job's timeout as its lifetime, so
+`max_token_age_seconds` must be at least the longest timeout of a job that
+publishes. The default, 39600 (11 hours), covers jobs up to 11 hours; set a
+lower value when your release jobs are shorter.
 
 Ask GitLab to mint an ID token with that exact audience:
 
