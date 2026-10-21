@@ -380,10 +380,11 @@ async fn login_lockout_is_429_with_retry_after() {
 
 /// `/admin/realms` CRUD: the seeded local realm is listed and protected,
 /// secrets are write-only (redacted to `<key>_set` markers), invalid configs
-/// are 400, and reorder demands the complete id set.
+/// are 400, and reorder demands the complete id set. Its own database, since
+/// the reorder rewrites every realm's row, also the ones other tests hold.
 #[tokio::test]
 async fn admin_realm_crud_with_write_only_secrets() {
-    let srv = common::start().await;
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
     let (admin, password) = srv.admin_basic();
     let client = srv.client();
     let name = format!("nexus{}", common::unique());
@@ -818,10 +819,11 @@ async fn the_last_interactive_realm_cannot_be_disabled_or_deleted() {
 /// A PATCH merges its body over the realm it read and writes the whole row
 /// back. A change committed in between (another admin's config edit, a
 /// reorder) used to be overwritten silently; the write is now a
-/// compare-and-set and the PATCH answers 409.
+/// compare-and-set and the PATCH answers 409. Its own database: the lock wait
+/// it waits for must be its own PATCH's, not another test's realm write.
 #[tokio::test]
 async fn a_realm_patch_never_undoes_a_concurrent_change() {
-    let srv = common::start().await;
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
     let (admin, password) = srv.admin_basic();
     let client = srv.client();
     let name = format!("nexus{}", common::unique());
