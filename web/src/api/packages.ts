@@ -1,3 +1,5 @@
+import { queryOptions } from '@tanstack/react-query'
+
 import { ApiError, httpClient } from '~/lib/httpClient'
 
 /**
@@ -29,6 +31,12 @@ export interface BrowseRepo {
    * cached, a hosted or group repository answers 503.
    */
   online: boolean
+  /**
+   * Repository format: `nuget`, `docker`, or a plugin format's id. A docker
+   * repository holds images, browsed through `/browse/images` (see
+   * `~/api/images`), not packages.
+   */
+  format: string
 }
 
 /**
@@ -159,6 +167,16 @@ function normalizeSearchKey(params: SearchParams) {
 export function fetchBrowseRepos(signal?: AbortSignal): Promise<BrowseRepo[]> {
   return httpClient.get<BrowseRepo[]>('/browse/repos', { signal })
 }
+
+/**
+ * Shared TanStack Query options for the browsable repositories. Reused by the
+ * `useBrowseRepos` hook and the repository screen's loader (which needs a
+ * repository's format before it renders), so both read one cache entry.
+ */
+export const browseReposQueryOptions = queryOptions<BrowseRepo[], ApiError>({
+  queryKey: pkgKeys.repos(),
+  queryFn: ({ signal }) => fetchBrowseRepos(signal),
+})
 
 /** Fetch a page of cross-repository search hits. */
 export function fetchPackages(

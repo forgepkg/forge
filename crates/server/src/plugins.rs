@@ -200,8 +200,9 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             .into_response();
     }
     let Some(plugin) = state.formats.plugin(&repo.format) else {
-        return if state.formats.get(&repo.format).is_some() {
-            // A built-in format has its own mount (NuGet: `/v3`).
+        return if state.formats.is_installed(&repo.format) {
+            // A built-in format has its own mount (NuGet: `/v3`, Docker:
+            // `/v2`).
             (StatusCode::NOT_FOUND, "repository is not served here").into_response()
         } else {
             (

@@ -192,8 +192,8 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         return offline_response();
     }
     // `/v3` is the NuGet feed. A repository of another format is served by
-    // that format's own protocol (`/repository/{repo}`), never read or
-    // written as NuGet.
+    // that format's own protocol (`/v2` for docker, `/repository/{repo}` for
+    // a format plugin), never read or written as NuGet.
     if repo.format != state.formats.nuget().id() {
         return (StatusCode::NOT_FOUND, "not a NuGet repository").into_response();
     }
@@ -338,6 +338,19 @@ impl HostedWriteAdapter {
         .with_mutation_filter(package_filter);
         HostedWriteAdapter { inner }
     }
+}
+
+/// The trusted-publishing ledger policy of a registry push to `repository`:
+/// a workload's manifest push is recorded (and re-validated against the
+/// current realm) like a package publish. Selectors are checked by the
+/// registry itself, so this policy allows every image.
+pub(crate) fn workload_ledger_policy(repository: &Repository) -> Arc<dyn PublishPolicy> {
+    Arc::new(SelectorPublishPolicy {
+        filter: PackageFilter::AllowAll,
+        replace_filter: PackageFilter::AllowAll,
+        repository_id: repository.id,
+        repository_name: repository.name.clone(),
+    })
 }
 
 /// Request-scoped publication policy. The canonical package id is available

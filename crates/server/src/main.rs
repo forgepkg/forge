@@ -136,8 +136,15 @@ async fn main() -> anyhow::Result<()> {
     let nuget: Arc<dyn forge_core::format::Format> =
         Arc::new(NugetFormat::with_limits(config.nuget.limits()));
     let plugins = forge_server::plugins::load(&config.plugins).context("load format plugins")?;
+    // Registry (`/v2`) tokens are signed with one key shared by every
+    // instance: docker.token_secret, or the install's generated key.
+    let registry_keys =
+        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
+            .await
+            .context("load the registry token key")?;
     let state = AppState::new(pool, blob_store, cache, nuget, config)
         .with_envelope(envelope)
+        .with_registry_keys(registry_keys)
         .with_plugins(plugins)
         .map_err(anyhow::Error::msg)
         .context("install format plugins")?;

@@ -18,12 +18,13 @@ import { routeTree } from '~/routeTree.gen'
  * Admin repositories screens (plan §Phase 4 testing), driven against the **real**
  * route tree + query hooks so the admin guard, routing, and mutations are all
  * exercised:
- *  - the list renders repositories;
- *  - create-hosted POSTs the right body to `/admin/repositories`;
+ *  - the list renders repositories with their format;
+ *  - create-hosted POSTs the right body to `/admin/repositories`, and a docker
+ *    create sends the format and docker options (no NuGet-only fields);
  *  - the group members editor prevents a duplicate priority before any request,
  *    toggles a member's owner flag, asks before removing a member or
  *    unflagging the last owner, explains a refused owner removal, and offers
- *    other groups as (nested) members.
+ *    other groups (of the same format) as (nested) members.
  */
 
 const adminMe: Me = {
@@ -49,6 +50,10 @@ function repo(over: Partial<RepoView>): RepoView {
     allow_redeploy: false,
     prefer_hosted: false,
     reserved_prefixes: [],
+    host: null,
+    immutable_tags: false,
+    latest_mutable: false,
+    writable_member: null,
     ...over,
   }
 }
@@ -234,6 +239,93 @@ describe('admin repositories', () => {
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toMatchObject({ name: 'charts', kind: 'hosted', format: 'helm' })
+  })
+
+  it('lists the format of each repository', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'hosted-1', kind: 'hosted' }),
+        repo({ id: 2, name: 'docker-hosted', kind: 'hosted', format: 'docker' }),
+      ],
+    })
+
+    await renderAt('/manage/repositories')
+
+    expect(
+      await screen.findByRole('columnheader', { name: 'Format' }),
+    ).toBeInTheDocument()
+    const dockerRow = screen.getByText('docker-hosted').closest('tr') as HTMLElement
+    expect(within(dockerRow).getByText('Docker')).toBeInTheDocument()
+    const nugetRow = screen.getByText('hosted-1').closest('tr') as HTMLElement
+    expect(within(nugetRow).getByText('NuGet')).toBeInTheDocument()
+  })
+
+  it('create-docker POSTs the format and docker options', async () => {
+    let posted: Record<string, unknown> | null = null
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+      ],
+      onCreate: (body) => {
+        posted = body as Record<string, unknown>
+        return json(repo({ ...(body as Partial<RepoView>) }), 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    const router = await renderAt('/manage/repositories/new')
+
+    await screen.findByRole('option', { name: 'Docker / OCI' })
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      name: 'docker-hosted',
+      kind: 'hosted',
+      format: 'docker',
+      anonymous_read: false,
+      online: true,
+      immutable_tags: true,
+      latest_mutable: false,
+    })
+    // On success the new repository's edit screen opens.
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(
+        '/manage/repositories/docker-hosted',
+      ),
+    )
+  })
+
+  it('create-docker surfaces the server refusal inline', async () => {
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+      ],
+      onCreate: () =>
+        new Response('another docker repository already answers on this host', {
+          status: 409,
+        }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/new')
+
+    await screen.findByRole('option', { name: 'Docker / OCI' })
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'another docker repository already answers on this host',
+    )
   })
 
   it('create blocks an invalid repository name before requesting', async () => {
@@ -576,6 +668,26 @@ describe('admin repositories', () => {
     await waitFor(() => expect(posted).toEqual({ member: 'outer', priority: 100 }))
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'adding this member would create a cycle in the group graph',
+    )
+  })
+
+  it('offers only repositories of the group\'s format as members', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'docker-group', kind: 'group', format: 'docker' }),
+        repo({ id: 2, name: 'docker-hosted', kind: 'hosted', format: 'docker' }),
+        repo({ id: 3, name: 'nuget-hosted', kind: 'hosted', format: 'nuget' }),
+      ],
+      members: [],
+    })
+
+    await renderAt('/manage/repositories/docker-group/members')
+
+    const select = await screen.findByLabelText('Repository')
+    await waitFor(() =>
+      expect(
+        Array.from((select as HTMLSelectElement).options).map((o) => o.value),
+      ).toEqual(['', 'docker-hosted']),
     )
   })
 

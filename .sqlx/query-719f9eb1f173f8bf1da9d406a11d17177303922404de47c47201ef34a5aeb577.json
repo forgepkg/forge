@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT p.seq, p.start_offset, p.size, p.blob_sha256, p.sha512_base64, b.s3_key\n        FROM oci_upload_part p\n        JOIN blob b ON b.sha256 = p.blob_sha256\n        WHERE p.upload_id = $1\n        ORDER BY p.seq\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "start_offset",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "start_offset"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "blob_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "sha512_base64",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "sha512_base64"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "s3_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "s3_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "719f9eb1f173f8bf1da9d406a11d17177303922404de47c47201ef34a5aeb577"
+}

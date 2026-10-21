@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.id, m.image, m.digest, m.created_at, m.untagged_since, m.last_pulled_at,\n               m.subject_digest,\n               ARRAY(SELECT r.digest FROM oci_manifest_ref r\n                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'\n                     ORDER BY r.digest) AS \"children!\"\n        FROM oci_manifest m\n        WHERE m.repository_id = $1\n        ORDER BY m.image, m.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "image",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "digest"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "untagged_since",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "untagged_since"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "last_pulled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "last_pulled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "subject_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "subject_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "children!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "8d7b8676174697d84aa2b7e61c83540b54055e370e9e394fbfe40b5d31756c2e"
+}

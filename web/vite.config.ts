@@ -46,6 +46,7 @@ export default defineConfig({
       '/admin': { target: apiTarget, changeOrigin: false },
       '/browse': { target: apiTarget, changeOrigin: false },
       '/v3': { target: apiTarget, changeOrigin: false },
+      '/v2': { target: apiTarget, changeOrigin: false },
       '/auth': { target: apiTarget, changeOrigin: false },
     },
   },

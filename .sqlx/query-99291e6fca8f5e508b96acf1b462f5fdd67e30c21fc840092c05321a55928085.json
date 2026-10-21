@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE oci_manifest\n        SET untagged_since = CASE\n                WHEN EXISTS (SELECT 1 FROM oci_tag WHERE manifest_id = $1) THEN NULL\n                ELSE coalesce(untagged_since, now())\n            END\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99291e6fca8f5e508b96acf1b462f5fdd67e30c21fc840092c05321a55928085"
+}

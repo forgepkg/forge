@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.image,\n               count(DISTINCT t.tag) AS \"tag_count!\",\n               count(DISTINCT m.id) AS \"manifest_count!\",\n               max(m.created_at) AS \"last_pushed_at!\"\n        FROM oci_manifest m\n        LEFT JOIN oci_tag t ON t.manifest_id = m.id\n        WHERE m.repository_id = $1 AND strpos(m.image, $2) > 0\n        GROUP BY m.image\n        ORDER BY m.image\n        OFFSET $3 LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tag_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "manifest_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_pushed_at!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b9b117c227462300168ca52eba060c1c0ac4864c331e56fbf6c46a8bf9780b4d"
+}

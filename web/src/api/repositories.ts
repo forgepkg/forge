@@ -16,6 +16,11 @@ import { httpClient } from '~/lib/httpClient'
  *    field keeps the stored value; the nullable proxy fields (credentials,
  *    TTLs) are cleared by an explicit `null`. `kind` / `format` are not
  *    updatable.
+ *  - Docker repositories (`format: "docker"`, served at `/v2/`) carry their
+ *    own options — `host`, `immutable_tags`, `latest_mutable`,
+ *    `writable_member` — which the server refuses on a NuGet repository (and
+ *    `package_delay_seconds` / `allow_redeploy` on a docker one). Both bodies
+ *    reject unknown fields.
  *  - `MemberView` / `AddMember` / `UpdateMember`
  *    (`crates/server/src/admin/members.rs`) drive the group editor; `priority`
  *    is unique within a group (a duplicate → 409). A member may itself be a
@@ -59,14 +64,27 @@ export interface RepoView {
   /**
    * Group: package id prefixes (lowercase, e.g. `acme.`) never served from a
    * proxy member, even before a hosted member has the id. Empty otherwise.
+   * A docker group's prefixes may name namespaces (`envisia/`).
    */
   reserved_prefixes: string[]
+  /**
+   * Docker: a DNS name (e.g. `docker.example.com`) the repository also
+   * answers on at the root (`<host>/<image>`). `null` when unset / NuGet.
+   */
+  host: string | null
+  /** Hosted docker: a pushed tag may not be moved to another manifest. */
+  immutable_tags: boolean
+  /** Hosted docker with `immutable_tags`: `latest` may still be moved. */
+  latest_mutable: boolean
+  /** Docker group: the hosted member a push to the group goes to. */
+  writable_member: string | null
 }
 
 /** `POST /admin/repositories` request body (`CreateRepo`). */
 export interface CreateRepo {
   name: string
   kind: RepoKind
+  /** A format id of `GET /admin/formats`; defaults to `nuget` server-side. */
   format?: string
   anonymous_read?: boolean
   online?: boolean
@@ -82,6 +100,15 @@ export interface CreateRepo {
   // Group fields:
   prefer_hosted?: boolean
   reserved_prefixes?: string[]
+  // Docker fields (refused for NuGet repositories):
+  /** Any docker kind: a DNS name the repository answers on by itself. */
+  host?: string
+  /** Hosted docker only. */
+  immutable_tags?: boolean
+  /** Hosted docker only (meaningful with `immutable_tags`). */
+  latest_mutable?: boolean
+  /** Docker group only: name of a hosted docker repository pushes go to. */
+  writable_member?: string
 }
 
 /**
@@ -91,7 +118,9 @@ export interface CreateRepo {
  * absent = keep, `null` = clear (a TTL reverts to the server default), a value
  * = set. Changing `remote_url` to a different origin without a new
  * `upstream_password` makes the server drop the stored credentials. `kind` /
- * `format` are identity columns and are not updatable.
+ * `format` are identity columns and are not updatable. The docker options
+ * follow the same rules (`host` / `writable_member`: `null` clears) and are a
+ * 400 on a NuGet repository.
  */
 export interface UpdateRepo {
   name?: string
@@ -107,6 +136,14 @@ export interface UpdateRepo {
   prefer_hosted?: boolean
   /** Replaces the whole list; `[]` clears it. */
   reserved_prefixes?: string[]
+  /** Docker only; `null` clears it. */
+  host?: string | null
+  /** Hosted docker only. */
+  immutable_tags?: boolean
+  /** Hosted docker only. */
+  latest_mutable?: boolean
+  /** Docker group only; `null` clears it (pushes to the group are refused). */
+  writable_member?: string | null
 }
 
 /**

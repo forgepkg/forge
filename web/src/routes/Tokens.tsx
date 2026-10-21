@@ -32,10 +32,11 @@ export const Route = createFileRoute('/_app/tokens')({
 /**
  * Self-service token management: every signed-in user can mint, list, and
  * revoke their **own** registry tokens here (`/admin/me/tokens` — not
- * admin-gated). Tokens authenticate NuGet clients against the feed; they
- * cannot be used to sign in to this UI. The plaintext is shown **once** via
- * `ShowOnceSecret`, held in transient component state, and never written into
- * a query cache.
+ * admin-gated). Tokens authenticate NuGet clients against the feed and Docker
+ * clients against the registry (`docker login`, the token as the password);
+ * they cannot be used to sign in to this UI. The plaintext is shown **once**
+ * via `ShowOnceSecret`, held in transient component state, and never written
+ * into a query cache.
  */
 function MyTokens() {
   const tokens = useMyTokens()
@@ -70,9 +71,10 @@ function MyTokens() {
         <Heading>Your tokens</Heading>
         <Text className="mt-1">
           Registry tokens authenticate NuGet clients (e.g.{' '}
-          <Code>dotnet restore</Code> / <Code>push</Code>) against the feed.
-          They cannot be used to sign in here. The secret is shown only at
-          creation time.
+          <Code>dotnet restore</Code> / <Code>push</Code>) against the feed,
+          and Docker clients: use one as the password of{' '}
+          <Code>docker login</Code>. They cannot be used to sign in here. The
+          secret is shown only at creation time.
         </Text>
       </div>
 
@@ -119,7 +121,7 @@ function MyTokens() {
         <Text>Loading tokens…</Text>
       ) : (tokens.data?.length ?? 0) === 0 ? (
         <EmptyState title="No tokens yet">
-          Create a token above to authenticate your NuGet client.
+          Create a token above to authenticate your NuGet or Docker client.
         </EmptyState>
       ) : (
         <Table striped>

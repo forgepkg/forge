@@ -33,7 +33,7 @@ use forge_core::repo::{
 };
 use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
-use forge_db::model::{RepoKind, Repository};
+use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
@@ -84,12 +84,23 @@ pub struct AppState {
     /// Download counts of every hosted and proxy repository, written in
     /// batches (#119).
     pub downloads: Arc<DownloadTally>,
+    /// Signing keys of registry Bearer tokens (`/v2/token`). [`AppState::new`]
+    /// starts with a random per-process key; startup replaces it with the
+    /// install's shared one ([`crate::registry::load_token_keys`] via
+    /// [`AppState::with_registry_keys`]) so every instance accepts every
+    /// instance's tokens.
+    pub registry_keys: forge_oci::token::TokenKeys,
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`]. NuGet and the built-in format plugins ([`crate::plugins::builtin`])
-/// are always there; WebAssembly plugins are added at startup
-/// ([`FormatRegistry::with_plugin`]).
+/// [`Format`]. NuGet, Docker and the built-in format plugins
+/// ([`crate::plugins::builtin`]) are always there; WebAssembly plugins are
+/// added at startup ([`FormatRegistry::with_plugin`]).
+///
+/// Docker ([`DOCKER_FORMAT`]) is installed but has no [`Format`]: its
+/// repositories hold images (manifests and blobs), not package versions, and
+/// are served by the registry under `/v2` ([`crate::registry`]), so none of
+/// the package seams (parsing, version order, the read ops) apply to them.
 pub struct FormatRegistry {
     nuget: Arc<dyn Format>,
     formats: BTreeMap<String, Arc<dyn Format>>,
@@ -117,12 +128,14 @@ impl FormatRegistry {
     }
 
     /// Add `format` under its [`Format::id`]. An id that is already taken
-    /// (NuGet's included) is refused: a plugin never shadows another format.
+    /// (NuGet's and Docker's included) is refused: a plugin never shadows
+    /// another format.
     pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
         let id = format.id().to_string();
-        if self.formats.contains_key(&id) {
-            let built_in =
-                id == self.nuget.id() || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
+        if self.is_installed(&id) {
+            let built_in = id == self.nuget.id()
+                || id == DOCKER_FORMAT
+                || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
             return Err(if built_in {
                 format!("format {id:?} is built into this server")
             } else {
@@ -157,9 +170,30 @@ impl FormatRegistry {
         self.plugins.values()
     }
 
+    /// Whether format `id` is installed: NuGet, Docker, or a format plugin.
+    pub fn is_installed(&self, id: &str) -> bool {
+        id == DOCKER_FORMAT || self.formats.contains_key(id)
+    }
+
     /// The installed format ids, sorted.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
-        self.formats.keys().map(String::as_str)
+        let mut ids: Vec<&str> = self.formats.keys().map(String::as_str).collect();
+        ids.push(DOCKER_FORMAT);
+        ids.sort_unstable();
+        ids.into_iter()
+    }
+
+    /// The repository kinds format `id` supports, `None` when it is not
+    /// installed. NuGet and Docker have proxies (each speaks its own upstream
+    /// protocol); format plugins serve hosted and group repositories only.
+    pub fn kinds(&self, id: &str) -> Option<&'static [&'static str]> {
+        const ALL: &[&str] = &["hosted", "proxy", "group"];
+        const NO_PROXY: &[&str] = &["hosted", "group"];
+        if id == DOCKER_FORMAT || id == self.nuget.id() {
+            Some(ALL)
+        } else {
+            self.formats.contains_key(id).then_some(NO_PROXY)
+        }
     }
 
     /// Resolve the format for a repository by its `format` column. A format
@@ -256,7 +290,41 @@ impl AppState {
             oidc_login_starts,
             envelope: None,
             upstream,
+            registry_keys: forge_oci::token::TokenKeys::new(vec![{
+                use rand::Rng;
+                let mut key = vec![0u8; 32];
+                rand::rng().fill_bytes(&mut key);
+                key
+            }]),
         }
+    }
+
+    /// Use `keys` to sign and verify registry tokens.
+    pub fn with_registry_keys(mut self, keys: forge_oci::token::TokenKeys) -> Self {
+        self.registry_keys = keys;
+        self
+    }
+
+    /// The Docker / OCI registry service, wired to this state.
+    pub fn registry(&self) -> forge_oci::Registry {
+        forge_oci::Registry::new(forge_oci::RegistryParts {
+            pool: self.pool.clone(),
+            cas: self.cas.clone(),
+            store: self.blob_store.clone(),
+            cache: self.cache.clone(),
+            authz: self.authz.clone(),
+            http: self.upstream.clone(),
+            envelope: self.envelope.clone(),
+            config: forge_oci::RegistryConfig {
+                public_base_url: self.config.public_base_url(),
+                max_blob_bytes: self.config.docker.max_blob_bytes,
+                token_ttl_seconds: self.config.docker.token_ttl_seconds,
+                delete_grace: self.config.outbox.grace(),
+                max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
+            },
+            keys: self.registry_keys.clone(),
+            recorder: Some(Arc::new(crate::registry::LedgerRecorder)),
+        })
     }
 
     /// Attach the secret-encryption envelope service (slice 12.5). Kept out of
@@ -476,5 +544,65 @@ impl MemberOpsFactory for MemberFactory {
                 kind: member.kind.clone(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_core::domain::{FormatError, ParsedUpload};
+    use forge_core::format::ReadSeek;
+
+    /// A format that only has an id.
+    struct Named(&'static str);
+
+    impl Format for Named {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn parse_upload(&self, _: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+            Err(FormatError::InvalidPackage("none".into()))
+        }
+        fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+            Ok(raw.to_string())
+        }
+        fn compare_versions(&self, a: &str, b: &str) -> std::cmp::Ordering {
+            a.cmp(b)
+        }
+        fn lower_id(&self, id: &str) -> String {
+            id.to_lowercase()
+        }
+    }
+
+    #[test]
+    fn docker_is_installed_without_a_package_format() {
+        let registry = FormatRegistry::new(Arc::new(Named("nuget")));
+        assert!(registry.is_installed(DOCKER_FORMAT));
+        assert!(registry.get(DOCKER_FORMAT).is_none());
+        assert_eq!(
+            registry.ids().collect::<Vec<_>>(),
+            ["docker", "helm", "nuget"]
+        );
+        assert_eq!(
+            registry.kinds(DOCKER_FORMAT),
+            Some(&["hosted", "proxy", "group"][..])
+        );
+        assert_eq!(
+            registry.kinds("nuget"),
+            Some(&["hosted", "proxy", "group"][..])
+        );
+        assert_eq!(registry.kinds("helm"), Some(&["hosted", "group"][..]));
+        assert_eq!(registry.kinds("npm"), None);
+        assert!(!registry.is_installed("npm"));
+    }
+
+    #[test]
+    fn a_plugin_cannot_take_dockers_id() {
+        let registry = FormatRegistry::new(Arc::new(Named("nuget")));
+        let err = registry
+            .with_format(Arc::new(Named("docker")))
+            .err()
+            .expect("refused");
+        assert!(err.contains("built into this server"), "{err}");
     }
 }

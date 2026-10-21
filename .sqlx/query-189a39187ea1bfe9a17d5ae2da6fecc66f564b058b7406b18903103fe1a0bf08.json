@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1\n            FROM oci_manifest m\n            JOIN oci_manifest_ref r ON r.manifest_id = m.id\n            WHERE m.repository_id = $1 AND m.image = $2\n              AND r.kind = 'blob' AND r.digest = $3\n        ) AS \"exists!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "189a39187ea1bfe9a17d5ae2da6fecc66f564b058b7406b18903103fe1a0bf08"
+}

@@ -47,6 +47,14 @@ limitations still apply, except where an entry below says otherwise.
 - The published `cosign verify` commands also pin the tagged commit and the
   push trigger; use the commands of the release you verify.
   ([#130](https://github.com/schmitch/forge/issues/130))
+- Migration 0033 adds the Docker / OCI registry's tables; it changes no
+  existing data. To push images through a reverse proxy, allow request
+  bodies of `docker.max_blob_bytes` (1 GiB by default: docker sends a whole
+  layer in one request) on `/v2`, and serve `/v2` at the root of the host.
+  The shipped Ingress now allows 1 GiB. The default
+  `server.max_staging_bytes` (four times the largest item) grows with it to
+  4 GiB; size the staging volume for it.
+  ([#40](https://github.com/schmitch/forge/issues/40))
 
 ### Features
 
@@ -63,6 +71,30 @@ limitations still apply, except where an entry below says otherwise.
   listing. `GET /admin/formats` lists the installed formats; the web UI
   offers them when creating a repository. See
   [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
+- **Docker / OCI registry** under `/v2/` (OCI Distribution Spec v1.1,
+  passing its conformance suite), for container images, Helm charts and
+  other OCI artifacts, as a native format next to NuGet (`"format":
+  "docker"`, listed by `GET /admin/formats`) with all three repository
+  kinds:
+  - **hosted**: monolithic, chunked and cross-repository-mount pushes,
+    deletes, the referrers API for cosign signatures and attestations, and
+    optional immutable tags (with a `latest` exception);
+  - **proxy**: a pull-through cache of Docker Hub (with its `library/`
+    names), GHCR, Quay or any distribution-spec registry, with upstream
+    credentials, tag re-validation by `HEAD` after `metadata_ttl_seconds`,
+    and stale serving while the upstream is down or rate limits;
+  - **group**: members by priority, pushes to a `writable_member`, and the
+    `prefer_hosted` / `reserved_prefixes` / owner guards of NuGet groups.
+
+  `docker login` goes through a Bearer token service (API tokens, passwords
+  where allowed, or a workload OIDC token), anonymous pulls follow the
+  repository's anonymous read, and repositories are addressed by path or by
+  an optional host name of their own. Image retention rules (keep the last N
+  tags, stale tags, untagged manifests) and a sweeper release layers only
+  when no image references them. The web UI lists images, tags, manifests,
+  platforms and referrers. New `[docker]` settings; see
+  [docs/docker.md](https://github.com/schmitch/forge/blob/main/docs/docker.md).
+  ([#40](https://github.com/schmitch/forge/issues/40))
 
 ### Fixed
 
@@ -143,6 +175,23 @@ limitations still apply, except where an entry below says otherwise.
   ([#132](https://github.com/schmitch/forge/issues/132)); the Helm
   checksum annotations are salted
   ([#133](https://github.com/schmitch/forge/issues/133)).
+- Docker registry tokens are HS256 JWTs bound to `public_base_url`, live
+  for `docker.token_ttl_seconds` (5 minutes), grant only the scopes the
+  caller held when they were issued, and are accepted under `/v2` only.
+  Every registry request is authorized again against current permissions
+  and content selectors, the user and API token behind a token must still
+  be active, and a browser session never pushes or deletes. The token
+  endpoint takes the same Basic credentials as the feeds, so it adds no new
+  password path. The signing key is `docker.token_secret`, or a generated
+  key kept in the database and sealed when `[crypto]` is enabled.
+- Registry digests are verified on every upload and every proxied blob and
+  manifest. Blobs are linked per image: knowing a layer digest grants no
+  read on another image's copy, and a mount needs read on the source image.
+  A docker proxy sends upstream credentials only to its `remote_url` origin
+  and the token realm the upstream's challenge names (over https when the
+  upstream is https), and drops `Authorization` on a redirect to another
+  host. Registry responses carry the feeds' hardening headers and
+  `Vary: Authorization, Cookie, Accept`.
 
 ### Documentation
 
@@ -164,6 +213,13 @@ limitations still apply, except where an entry below says otherwise.
   multipart part), accept only Basic credentials, serve whole package
   downloads (no `Range` requests), and treat a version with a `-` as a
   prerelease; a response of a plugin may load at most 2,048 query answers.
+- A docker proxy downloads a blob completely and verifies it before it
+  answers, so a client waits for a large layer's first fetch; concurrent
+  pulls of one layer share a download per instance only. A registry upload
+  of several chunks is assembled into a new blob when it finishes (one-chunk
+  uploads, what docker, podman and containerd send, are stored once). The
+  registry has no catalog API (`/v2/_catalog`) and no per-repository
+  connector ports.
 
 ## [1.0.0]
 

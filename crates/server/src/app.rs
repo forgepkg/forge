@@ -142,7 +142,13 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Repositories of plugin formats, each served by its format's plugin
         // (`crate::plugins`); like `/v3`, authorization is per method.
         .route("/repository/{repo}", any(crate::plugins::dispatch))
-        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch));
+        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch))
+        // The Docker / OCI registry: clients always talk to `/v2/` at the
+        // host root; the registry resolves repositories from the name (or
+        // the host) itself.
+        .route("/v2", any(crate::registry::registry))
+        .route("/v2/", any(crate::registry::registry))
+        .route("/v2/{*rest}", any(crate::registry::registry));
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
@@ -156,6 +162,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     }
 
     let hsts = state.cookie_secure;
+    let public_base_url = state.config.public_base_url();
     let server = state.config.server.clone();
     let app = app
         .layer(axum::middleware::from_fn_with_state(
@@ -165,7 +172,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, req, next)
+            response_policy(hsts, public_base_url.clone(), req, next)
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).
@@ -214,6 +221,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
 /// URL, so a shared cache never hands one caller's answer to another.
 const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 
+/// `Vary` of every registry (`/v2`) response.
+const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
+
 /// Response caching and transport policy:
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
@@ -222,7 +232,9 @@ const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 ///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
-///   someone else. Anonymous responses carry no `Cache-Control`; under
+///   someone else; registry responses (`/v2/...`) likewise, with
+///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
+///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`; under
 ///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
 ///   keep shared caches off `/v3`, since the allowlist decision is keyed on
 ///   the client address, which no cache varies on;
@@ -231,6 +243,7 @@ const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 /// The SPA keeps its own cache headers (hashed assets are immutable).
 async fn response_policy(
     hsts: bool,
+    public_base_url: String,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -238,13 +251,17 @@ async fn response_policy(
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse");
     let feed = under("/v3") || under(crate::plugins::MOUNT);
+    let registry = under("/v2");
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")
         || headers.contains_key(header::COOKIE);
     let mut resp = next.run(req).await;
+    if registry {
+        resp = crate::registry::amend_registry_rejection(&public_base_url, resp);
+    }
     let out = resp.headers_mut();
-    if api || (feed && credentials) {
+    if api || ((feed || registry) && credentials) {
         out.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
@@ -252,6 +269,9 @@ async fn response_policy(
     }
     if feed {
         out.append(header::VARY, HeaderValue::from_static(FEED_VARY));
+    }
+    if registry {
+        out.append(header::VARY, HeaderValue::from_static(REGISTRY_VARY));
     }
     if hsts && !out.contains_key(header::STRICT_TRANSPORT_SECURITY) {
         out.insert(

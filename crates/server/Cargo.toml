@@ -24,6 +24,7 @@ forge-nuget = { path = "../format-nuget" }
 forge-plugin = { path = "../plugin" }
 # Built-in format plugins (plugins/<id>/), linked in.
 forge-format-helm = { path = "../../plugins/helm" }
+forge-oci = { path = "../format-oci" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -59,6 +60,8 @@ futures-util = { workspace = true }
 async-stream = "0.3"
 bytes = "1"
 uuid = { workspace = true }
+# Registry token signing key generation.
+rand = { workspace = true }
 
 # Config: TOML + FORGE_* env overrides.
 figment = { version = "0.10", features = ["toml", "env"] }
@@ -70,7 +73,7 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-reqwest = { workspace = true, features = ["multipart"] }
+reqwest = { workspace = true, features = ["multipart", "query"] }
 forge-nuget = { path = "../format-nuget" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

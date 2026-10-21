@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO oci_manifest\n            (repository_id, image, digest, blob_sha256, media_type, artifact_type,\n             subject_digest, size, summary, untagged_since)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())\n        ON CONFLICT (repository_id, image, digest) DO NOTHING\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "86a33d3cb8717a2cc000501bdde0f2e19f03e5f97256bf3df3e8f660f1723c47"
+}

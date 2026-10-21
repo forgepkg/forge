@@ -19,6 +19,7 @@ import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as RepoBrowseRouteImport } from './routes/RepoBrowse'
+import { Route as ImageDetailRouteImport } from './routes/ImageDetail'
 import { Route as adminRealmsEditRouteImport } from './routes/admin/realms/Edit'
 import { Route as adminRealmsCreateRouteImport } from './routes/admin/realms/Create'
 import { Route as adminRepositoriesEditRouteImport } from './routes/admin/repositories/Edit'
@@ -76,6 +77,11 @@ const RepoBrowseRoute = RepoBrowseRouteImport.update({
   path: '/repos/$repo',
   getParentRoute: () => AppLayoutRoute,
 } as any)
+const ImageDetailRoute = ImageDetailRouteImport.update({
+  id: '/images/$repo/$',
+  path: '/images/$repo/$',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
 const adminRealmsEditRoute = adminRealmsEditRouteImport.update({
   id: '/realms/$realmId',
   path: '/realms/$realmId',
@@ -123,6 +129,7 @@ export interface FileRoutesByFullPath {
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
+  '/images/$repo/$': typeof ImageDetailRoute
   '/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/manage/realms/new': typeof adminRealmsCreateRoute
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -140,6 +147,7 @@ export interface FileRoutesByTo {
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
+  '/images/$repo/$': typeof ImageDetailRoute
   '/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/manage/realms/new': typeof adminRealmsCreateRoute
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -160,6 +168,7 @@ export interface FileRoutesById {
   '/_app/manage/repositories': typeof adminRepositoriesListRoute
   '/_app/manage/users': typeof adminUsersListRoute
   '/_app/repos/$repo': typeof RepoBrowseRoute
+  '/_app/images/$repo/$': typeof ImageDetailRoute
   '/_app/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/_app/manage/realms/new': typeof adminRealmsCreateRoute
   '/_app/manage/repositories/$repo': typeof adminRepositoriesEditRoute
@@ -180,6 +189,7 @@ export interface FileRouteTypes {
     | '/manage/repositories'
     | '/manage/users'
     | '/repos/$repo'
+    | '/images/$repo/$'
     | '/manage/realms/$realmId'
     | '/manage/realms/new'
     | '/manage/repositories/$repo'
@@ -197,6 +207,7 @@ export interface FileRouteTypes {
     | '/manage/repositories'
     | '/manage/users'
     | '/repos/$repo'
+    | '/images/$repo/$'
     | '/manage/realms/$realmId'
     | '/manage/realms/new'
     | '/manage/repositories/$repo'
@@ -216,6 +227,7 @@ export interface FileRouteTypes {
     | '/_app/manage/repositories'
     | '/_app/manage/users'
     | '/_app/repos/$repo'
+    | '/_app/images/$repo/$'
     | '/_app/manage/realms/$realmId'
     | '/_app/manage/realms/new'
     | '/_app/manage/repositories/$repo'
@@ -300,6 +312,13 @@ declare module '@tanstack/react-router' {
       path: '/repos/$repo'
       fullPath: '/repos/$repo'
       preLoaderRoute: typeof RepoBrowseRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/images/$repo/$': {
+      id: '/_app/images/$repo/$'
+      path: '/images/$repo/$'
+      fullPath: '/images/$repo/$'
+      preLoaderRoute: typeof ImageDetailRouteImport
       parentRoute: typeof AppLayoutRoute
     }
     '/_app/manage/realms/$realmId': {
@@ -389,6 +408,7 @@ interface AppLayoutRouteChildren {
   AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
   TokensRoute: typeof TokensRoute
   RepoBrowseRoute: typeof RepoBrowseRoute
+  ImageDetailRoute: typeof ImageDetailRoute
   PackageDetailRoute: typeof PackageDetailRoute
 }
 
@@ -397,6 +417,7 @@ const AppLayoutRouteChildren: AppLayoutRouteChildren = {
   AdminLayoutRoute: AdminLayoutRouteWithChildren,
   TokensRoute: TokensRoute,
   RepoBrowseRoute: RepoBrowseRoute,
+  ImageDetailRoute: ImageDetailRoute,
   PackageDetailRoute: PackageDetailRoute,
 }
 

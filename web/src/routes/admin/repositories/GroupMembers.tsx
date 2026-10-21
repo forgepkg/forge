@@ -31,10 +31,12 @@ export const Route = createFileRoute(
  * duplicate); the add form pre-empts that with client-side validation, and
  * still surfaces a server 409 inline if a race slips through. Groups may be
  * nested: the server refuses (409) a member that would create a cycle or
- * exceed the nesting depth, and that reason is shown inline. An owner cannot
- * be removed until it is unflagged. Removing a member, and unflagging the
- * last owner (the group then trusts every hosted member equally), wait for
- * an inline confirmation.
+ * exceed the nesting depth, and that reason is shown inline. Members share
+ * the group's format (a NuGet group holds NuGet repositories, a docker group
+ * docker ones; the server answers 400 otherwise), so only those are offered.
+ * An owner cannot be removed until it is unflagged. Removing a member, and
+ * unflagging the last owner (the group then trusts every hosted member
+ * equally), wait for an inline confirmation.
  */
 function GroupMembers() {
   const { repo: name } = Route.useParams()
@@ -44,13 +46,18 @@ function GroupMembers() {
   const remove = useRemoveMember(name)
   const update = useUpdateMember(name)
 
-  // Candidate members = every other repository (groups included) that is not
-  // already a member; the server guards cycles and the nesting depth.
+  // Candidate members = every other repository of the group's format (groups
+  // included) that is not already a member; the server guards cycles and the
+  // nesting depth.
   const allRepos = useRepositories()
+  const groupFormat = allRepos.data?.find((r) => r.name === name)?.format
   const memberNames = new Set((members.data ?? []).map((m) => m.name))
   const usedPriorities = new Set((members.data ?? []).map((m) => m.priority))
   const candidates = (allRepos.data ?? []).filter(
-    (r) => r.name !== name && !memberNames.has(r.name),
+    (r) =>
+      r.name !== name &&
+      !memberNames.has(r.name) &&
+      (groupFormat === undefined || r.format === groupFormat),
   )
 
   const [member, setMember] = useState('')
@@ -192,8 +199,8 @@ function GroupMembers() {
         )}
         {candidates.length === 0 && !allRepos.isLoading && (
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            No eligible repositories to add (every other repository is already
-            a member, and a group cannot contain itself).
+            No eligible repositories to add (every other repository of this
+            format is already a member, and a group cannot contain itself).
           </p>
         )}
       </form>

@@ -889,6 +889,23 @@ pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<
     Ok(())
 }
 
+/// Insert a `forge_setting` value unless the key exists. Returns whether this
+/// call inserted it (`false`: another writer was first; read theirs).
+pub async fn insert_setting_if_absent(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO forge_setting (key, value)
+        VALUES ($1, $2)
+        ON CONFLICT (key) DO NOTHING
+        "#,
+        key,
+        value,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Replace a `forge_setting` value only while it is still `expected`.
 /// Returns whether it was replaced (`false` when it changed or is gone).
 pub async fn replace_setting<'e, E>(

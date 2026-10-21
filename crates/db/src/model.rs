@@ -199,6 +199,72 @@ impl Repository {
     }
 }
 
+/// `repository.format` of NuGet repositories (the column default).
+pub const NUGET_FORMAT: &str = "nuget";
+
+/// `repository.format` of Docker / OCI registry repositories.
+pub const DOCKER_FORMAT: &str = "docker";
+
+/// `repository.config` key of [`Repository::docker_host`].
+pub const DOCKER_HOST_KEY: &str = "host";
+
+/// `repository.config` key of [`Repository::immutable_tags`].
+pub const IMMUTABLE_TAGS_KEY: &str = "immutable_tags";
+
+/// `repository.config` key of [`Repository::latest_mutable`].
+pub const LATEST_MUTABLE_KEY: &str = "latest_mutable";
+
+/// `repository.config` key of [`Repository::writable_member`].
+pub const WRITABLE_MEMBER_KEY: &str = "writable_member";
+
+impl Repository {
+    /// Whether this is a Docker / OCI registry repository.
+    pub fn is_docker(&self) -> bool {
+        self.format == DOCKER_FORMAT
+    }
+
+    /// Docker option (`config.host`): the host name this repository answers
+    /// on by itself (host-based routing), so its images keep short names.
+    pub fn docker_host(&self) -> Option<&str> {
+        self.config
+            .get(DOCKER_HOST_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Hosted docker option (`config.immutable_tags`, default off): a pushed
+    /// tag may not be moved to another manifest.
+    pub fn immutable_tags(&self) -> bool {
+        self.kind() == RepoKind::Hosted
+            && self
+                .config
+                .get(IMMUTABLE_TAGS_KEY)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+    }
+
+    /// Hosted docker option (`config.latest_mutable`, default off): with
+    /// immutable tags, `latest` may still be moved.
+    pub fn latest_mutable(&self) -> bool {
+        self.config
+            .get(LATEST_MUTABLE_KEY)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Docker group option (`config.writable_member`): the name of the hosted
+    /// member a push to the group goes to. `None`: pushes are refused.
+    pub fn writable_member(&self) -> Option<&str> {
+        if self.kind() != RepoKind::Group {
+            return None;
+        }
+        self.config
+            .get(WRITABLE_MEMBER_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.is_empty())
+    }
+}
+
 /// `repository.config` key of [`Repository::prefer_hosted`].
 pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
 

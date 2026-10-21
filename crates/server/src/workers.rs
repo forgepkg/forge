@@ -76,6 +76,9 @@ pub struct WorkerHandles {
     /// Expired-`validated_credential` / orphaned-tag reaper loop (slice 12.3).
     /// Always present: any credential-forwarding provider writes those tables.
     pub cred_reaper: JoinHandle<()>,
+    /// Docker registry sweeper: abandoned upload sessions and blob links no
+    /// manifest references any more.
+    pub registry_sweeper: JoinHandle<()>,
     /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
     /// when `[crypto]` is enabled and its rotation worker is not turned off.
     /// Cluster-coordinated via a Postgres advisory lock (see
@@ -98,6 +101,7 @@ impl WorkerHandles {
             h.abort();
         }
         self.cred_reaper.abort();
+        self.registry_sweeper.abort();
         if let Some(h) = &self.crypto_rotation {
             h.abort();
         }
@@ -200,6 +204,16 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
+    // Registry sweeper: idempotent per-row deletes under row locks, safe on
+    // every instance.
+    let registry_sweeper = {
+        let pool = state.pool.clone();
+        let docker = state.config.docker.clone();
+        supervise("registry-sweeper", move || {
+            spawn_registry_sweeper(pool.clone(), docker.clone(), grace)
+        })
+    };
+
     // Crypto rotation/backfill worker (slice 12.5): only when secret
     // encryption is enabled. One instance at a time performs a pass (advisory
     // lock); every step is idempotent/resumable so crashes are harmless.
@@ -239,9 +253,43 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         retention,
         auth_reaper,
         cred_reaper,
+        registry_sweeper,
         crypto_rotation,
         blob_cache,
     }
+}
+
+/// Sweep expired registry uploads and unreferenced blob links every
+/// `docker.sweep_interval_seconds`.
+fn spawn_registry_sweeper(
+    pool: sqlx::PgPool,
+    docker: crate::config::DockerConfig,
+    grace: chrono::Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker =
+            tokio::time::interval(Duration::from_secs(docker.sweep_interval_seconds.max(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match forge_oci::gc::sweep_once(
+                &pool,
+                chrono::Duration::seconds(docker.upload_ttl_seconds as i64),
+                chrono::Duration::seconds(docker.unreferenced_blob_ttl_seconds as i64),
+                grace,
+            )
+            .await
+            {
+                Ok(s) if s.uploads == 0 && s.links == 0 => {}
+                Ok(s) => tracing::info!(
+                    uploads = s.uploads,
+                    links = s.links,
+                    "registry sweep released expired uploads and unreferenced blobs"
+                ),
+                Err(e) => tracing::error!(error = %e, "registry sweep failed"),
+            }
+        }
+    })
 }
 
 /// Run a worker loop under supervision: `spawn` starts one instance; if it
@@ -423,8 +471,8 @@ async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        // Proxies speak the NuGet V3 upstream protocol; no other format has
-        // proxy repositories (the admin API refuses them).
+        // Only NuGet proxies keep an upstream index: docker proxies
+        // revalidate per tag, and format plugins have no proxies.
         let format = match state.formats.for_repository(&repo) {
             Ok(format) if format.id() == "nuget" => format,
             _ => continue,
