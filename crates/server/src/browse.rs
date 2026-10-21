@@ -252,6 +252,8 @@ pub async fn search_packages(
             // The web UI shows every version; only legacy NuGet clients
             // need SemVer 2.0.0 hidden.
             include_semver2: true,
+            // Browse lists what Forge holds, not a proxy upstream's catalog.
+            include_upstream: false,
         };
         match ops.search(&repo.name, &params).await {
             Ok(result) => {

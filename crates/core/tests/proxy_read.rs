@@ -86,6 +86,10 @@ struct MockState {
     /// When set, a `.nupkg` request signals the first `Notify` on arrival and
     /// answers only once the second is notified (a slow download).
     hold_nupkg: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// The search service's answer; `None` answers 404.
+    search: Mutex<Option<(StatusCode, serde_json::Value)>>,
+    /// The query strings the search service received.
+    search_queries: Mutex<Vec<String>>,
 }
 
 impl MockState {
@@ -210,6 +214,16 @@ impl MockUpstream {
         *self.state.hold_nupkg.lock().unwrap() = Some(gates.clone());
         gates
     }
+    /// Answer search requests with `status` and these results.
+    fn set_search(&self, status: StatusCode, data: Vec<serde_json::Value>, total_hits: usize) {
+        *self.state.search.lock().unwrap() = Some((
+            status,
+            serde_json::json!({ "totalHits": total_hits, "data": data }),
+        ));
+    }
+    fn search_queries(&self) -> Vec<String> {
+        self.state.search_queries.lock().unwrap().clone()
+    }
 }
 
 async fn serve_index(
@@ -232,6 +246,17 @@ async fn serve_index(
         ]
     });
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+async fn serve_search(State(st): State<Arc<MockState>>, uri: axum::http::Uri) -> impl IntoResponse {
+    st.search_queries
+        .lock()
+        .unwrap()
+        .push(uri.query().unwrap_or_default().to_string());
+    match st.search.lock().unwrap().clone() {
+        Some((status, doc)) => (status, axum::Json(doc)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn serve_flat_index(
@@ -395,10 +420,13 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         flat_index_override: Mutex::default(),
         index_override: Mutex::default(),
         hold_nupkg: Mutex::default(),
+        search: Mutex::default(),
+        search_queries: Mutex::default(),
     });
 
     let app = Router::new()
         .route("/index.json", get(serve_index))
+        .route("/query", get(serve_search))
         .route("/flat/{id}/index.json", get(serve_flat_index))
         .route("/flat/{id}/{version}/{file}", get(serve_nupkg))
         .route("/registration/{id}/index.json", get(serve_registration))
@@ -1623,6 +1651,7 @@ async fn search_applies_listing_conditions_and_pages_over_ids() {
             take,
             prerelease,
             include_semver2: true,
+            include_upstream: true,
         };
         let px = &px;
         let repo = repo.clone();
@@ -1681,6 +1710,7 @@ async fn search_applies_listing_conditions_and_pages_over_ids() {
             take,
             prerelease: true,
             include_semver2: false,
+            include_upstream: true,
         };
         let result = px.search(&repo, &params).await.unwrap();
         assert_eq!(result.total_hits, 2);
@@ -2400,6 +2430,7 @@ async fn proxy_search_shows_the_ids_original_casing() {
         take: 20,
         prerelease: true,
         include_semver2: true,
+        include_upstream: true,
     };
     let ids: Vec<String> = px
         .search(&repo, &params)
@@ -2504,6 +2535,262 @@ async fn registration_without_upstream_registration_keeps_the_flat_view() {
     assert!(reg[0].nuspec_bytes.is_none());
     assert!(reg[0].published.is_none());
     assert_eq!(mock.registration_hits(), 1);
+}
+
+// ── Upstream search (#112) ──────────────────────────────────────────────────
+
+/// One upstream search result: `id` listing `versions` (ascending), with
+/// metadata and URLs of the upstream's own.
+fn search_entry(id: &str, versions: &[&str]) -> serde_json::Value {
+    let lower = id.to_lowercase();
+    serde_json::json!({
+        "@id": format!("https://upstream.example/registration/{lower}/index.json"),
+        "@type": "Package",
+        "registration": format!("https://upstream.example/registration/{lower}/index.json"),
+        "id": id,
+        "version": versions.last().unwrap(),
+        "description": format!("{id} from upstream"),
+        "authors": ["Upstream Author"],
+        "totalDownloads": 42,
+        "versions": versions
+            .iter()
+            .map(|v| serde_json::json!({
+                "version": v,
+                "downloads": 1,
+                "@id": format!("https://upstream.example/registration/{lower}/{v}.json"),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn hit_versions(hit: &forge_core::repo::SearchHit) -> Vec<&str> {
+    hit.versions.iter().map(|v| v.version.as_str()).collect()
+}
+
+/// Record a `proxy_cached_version` row as the listing and download paths do.
+async fn record_version(
+    pool: &PgPool,
+    repo: &str,
+    name: &str,
+    version: &str,
+    first_seen_ago_secs: i64,
+    not_found: bool,
+) {
+    sqlx::query(
+        "INSERT INTO proxy_cached_version
+             (repository_id, name, version, first_seen_at, not_found, not_found_at)
+         VALUES ($1, $2, $3, now() - make_interval(secs => $4::float8), $5,
+                 CASE WHEN $5 THEN now() END)",
+    )
+    .bind(repo_id(pool, repo).await)
+    .bind(name)
+    .bind(version)
+    .bind(first_seen_ago_secs as f64)
+    .bind(not_found)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// #112: a proxy search reaches the upstream's search service, so a package
+/// nobody has restored yet is found. Parameters are forwarded, versions are
+/// filtered like local ones, malformed ids are dropped, and the answer is
+/// cached for the metadata TTL.
+#[tokio::test]
+async fn search_finds_packages_only_the_upstream_knows() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(HashMap::new()).await;
+    mock.set_search(
+        StatusCode::OK,
+        vec![
+            search_entry(
+                "Never.Restored",
+                &["1.0.0", "1.1.0", "2.0.0-beta", "2.0.0-beta.1"],
+            ),
+            search_entry("bad/id", &["1.0.0"]),
+        ],
+        1234,
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let params = forge_core::repo::SearchParams {
+        q: "never".into(),
+        take: 5,
+        ..Default::default()
+    };
+    let result = px.search(&repo, &params).await.unwrap();
+    assert_eq!(result.hits.len(), 1, "the malformed id is dropped");
+    let hit = &result.hits[0];
+    assert_eq!(hit.original_id, "Never.Restored");
+    assert_eq!(
+        hit_versions(hit),
+        ["1.0.0", "1.1.0"],
+        "no prereleases asked for"
+    );
+    assert_eq!(hit.latest_version, "1.1.0");
+    assert_eq!(hit.total_downloads, Some(42));
+    assert_eq!(
+        hit.manifest_summary.as_ref().unwrap()["metadata"]["description"],
+        "Never.Restored from upstream"
+    );
+    assert_eq!(
+        result.total_hits, 1233,
+        "the upstream's total, less the dropped id"
+    );
+
+    let queries = mock.search_queries();
+    assert_eq!(queries.len(), 1);
+    for part in [
+        "q=never",
+        "skip=0",
+        "take=5",
+        "prerelease=false",
+        "semVerLevel=2.0.0",
+    ] {
+        assert!(
+            queries[0].split('&').any(|p| p == part),
+            "{part} in {}",
+            queries[0]
+        );
+    }
+    px.search(&repo, &params).await.unwrap();
+    assert_eq!(
+        mock.search_queries().len(),
+        1,
+        "cached for the metadata TTL"
+    );
+
+    // Prereleases, with and without SemVer 2.0.0.
+    let legacy = forge_core::repo::SearchParams {
+        prerelease: true,
+        include_semver2: false,
+        ..params.clone()
+    };
+    let result = px.search(&repo, &legacy).await.unwrap();
+    assert_eq!(
+        hit_versions(&result.hits[0]),
+        ["1.0.0", "1.1.0", "2.0.0-beta"]
+    );
+    assert!(mock.search_queries()[1].contains("semVerLevel=1.0.0"));
+    let modern = forge_core::repo::SearchParams {
+        prerelease: true,
+        ..params
+    };
+    let result = px.search(&repo, &modern).await.unwrap();
+    assert_eq!(
+        hit_versions(&result.hits[0]),
+        ["1.0.0", "1.1.0", "2.0.0-beta", "2.0.0-beta.1"]
+    );
+
+    // Nothing is recorded or downloaded by a search.
+    assert_eq!(mock.flat_index_hits() + mock.nupkg_hits(), 0);
+}
+
+/// #112: when the upstream has no search service, or its search fails, the
+/// proxy searches its cached packages and answers.
+#[tokio::test]
+async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "sample.lib").await.unwrap()),
+        ["1.0.0"]
+    );
+
+    let params = forge_core::repo::SearchParams {
+        q: "sample".into(),
+        ..Default::default()
+    };
+    // The search service answers 404 (then 500): the cache answers, and for
+    // a minute after a failure the upstream search is not tried again.
+    for status in [None, Some(StatusCode::INTERNAL_SERVER_ERROR)] {
+        if let Some(status) = status {
+            mock.set_search(status, vec![search_entry("Other.Lib", &["1.0.0"])], 1);
+        }
+        let result = px.search(&repo, &params).await.unwrap();
+        assert_eq!(result.total_hits, 1);
+        assert_eq!(result.hits[0].original_id.to_lowercase(), "sample.lib");
+    }
+    assert_eq!(
+        mock.search_queries().len(),
+        1,
+        "backed off after the failure"
+    );
+
+    // An offline proxy never asks.
+    let offline = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, false).await;
+    mock.set_search(
+        StatusCode::OK,
+        vec![search_entry("Other.Lib", &["1.0.0"])],
+        1,
+    );
+    let result = px.search(&offline, &params).await.unwrap();
+    assert!(result.hits.is_empty());
+    assert_eq!(mock.search_queries().len(), 1);
+}
+
+/// #112: upstream hits honor the caller's package filter, live not-found
+/// markers (on a version or the whole id), and the package delay: a version
+/// the proxy has not recorded, or that is still inside the delay, is hidden.
+#[tokio::test]
+async fn upstream_search_hits_honour_markers_the_delay_and_the_package_filter() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(HashMap::new()).await;
+    mock.set_search(
+        StatusCode::OK,
+        vec![
+            search_entry("Marked.Lib", &["1.0.0", "2.0.0"]),
+            search_entry("Gone.Lib", &["1.0.0"]),
+            search_entry("Seen.Lib", &["1.0.0", "2.0.0"]),
+            search_entry("Fresh.Lib", &["1.0.0"]),
+            search_entry("Hidden.Lib", &["1.0.0"]),
+        ],
+        5,
+    );
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    let filter =
+        forge_core::authz::PackageFilter::Predicate(Arc::new(|id: &str| id != "Hidden.Lib"));
+    let params = forge_core::repo::SearchParams::default();
+
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    record_version(&pool, &repo, "marked.lib", "2.0.0", 0, true).await;
+    record_version(&pool, &repo, "gone.lib", "*", 0, true).await;
+    let result = px
+        .search_with_package_filter(&repo, &params, &filter)
+        .await
+        .unwrap();
+    let found: Vec<(&str, Vec<&str>)> = result
+        .hits
+        .iter()
+        .map(|hit| (hit.original_id.as_str(), hit_versions(hit)))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("Marked.Lib", vec!["1.0.0"]),
+            ("Seen.Lib", vec!["1.0.0", "2.0.0"]),
+            ("Fresh.Lib", vec!["1.0.0"]),
+        ]
+    );
+    assert_eq!(result.total_hits, 3);
+
+    // With a delay of an hour, only what the proxy saw over an hour ago.
+    let delayed = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    record_version(&pool, &delayed, "seen.lib", "1.0.0", 7200, false).await;
+    record_version(&pool, &delayed, "seen.lib", "2.0.0", 60, false).await;
+    let result = px.search(&delayed, &params).await.unwrap();
+    let found: Vec<(&str, Vec<&str>)> = result
+        .hits
+        .iter()
+        .map(|hit| (hit.original_id.as_str(), hit_versions(hit)))
+        .collect();
+    assert_eq!(found, [("Seen.Lib", vec!["1.0.0"])]);
 }
 
 /// L8: ids are lowercased like NuGet clients do (`ToLowerInvariant`), so a

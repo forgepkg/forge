@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT name, version, confirmed, first_seen_at, not_found, not_found_at\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND name = ANY($2::text[])\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "confirmed",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "confirmed"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "first_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "first_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "not_found",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "not_found"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "not_found_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "not_found_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ce43ad4b6e0da6846d7ee39609d560752a046a92b1aadacb4fe025ae8feafd47"
+}

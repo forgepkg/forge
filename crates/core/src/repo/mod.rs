@@ -349,6 +349,11 @@ pub struct SearchParams {
     /// such versions is neither a hit nor counted. The NuGet route sets it
     /// from `semVerLevel`; it defaults to `true`.
     pub include_semver2: bool,
+    /// Let a proxy forward the search to its upstream's search service, so
+    /// packages it has not cached yet are found too (see
+    /// [`proxy`](crate::repo::proxy)). The NuGet search route sets it; the
+    /// browse UI, which lists what Forge holds, does not. Defaults to `true`.
+    pub include_upstream: bool,
 }
 
 impl Default for SearchParams {
@@ -359,6 +364,7 @@ impl Default for SearchParams {
             take: SearchParams::DEFAULT_TAKE,
             prerelease: false,
             include_semver2: true,
+            include_upstream: true,
         }
     }
 }

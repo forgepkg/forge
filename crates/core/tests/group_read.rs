@@ -1820,6 +1820,7 @@ async fn group_search_enriches_only_the_final_page() {
                 take: 5,
                 prerelease: false,
                 include_semver2: true,
+                include_upstream: true,
             },
         )
         .await
