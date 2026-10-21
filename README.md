@@ -8,7 +8,7 @@ enterprise registry:
 - **proxy** — cache packages on demand from an upstream NuGet V3 feed —
   `api.nuget.org` or a private/custom feed (Azure Artifacts, GitHub Packages,
   Artifactory, Nexus, …) with Basic/PAT credentials — with an optional
-  publication delay.
+  publication delay that holds back new upstream releases.
 - **group** — fan a single feed URL out across several member repos by
   priority; tolerates a failing member and, by default, keeps public feeds
   from shadowing internal package ids (dependency-confusion guard).

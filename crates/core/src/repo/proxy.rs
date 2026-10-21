@@ -42,6 +42,11 @@
 //!   `now − first_seen_at ≥ package_delay_seconds`. Inside the window it is
 //!   omitted from enumeration/registration/search and direct download 404s. A
 //!   delay-gated 404 is **never** written to the not-found negative cache.
+//!   The delay quarantines new releases: when a listing refresh finds
+//!   versions inside it, `first_seen_at` is moved back to the upstream
+//!   registration's publish time of each listed version (a plausible one; see
+//!   `date_delay_from_upstream`), so a release published long ago is served
+//!   at its first sighting.
 //! * **Negative cache** — a genuine upstream 404 sets `not_found = true` +
 //!   `not_found_at = now()`, honored for `not_found_ttl_seconds` — by direct
 //!   downloads *and* listings; an expired marker hides nothing. An upstream
