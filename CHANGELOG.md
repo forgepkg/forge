@@ -67,6 +67,11 @@ limitations still apply, except where an entry below says otherwise.
   need it their own limit, then remove it. A repository's limit may be at
   most `server.max_staging_bytes` (less `nuget.max_nuspec_bytes`); raise the
   staging budget first if a repository needs more.
+- A workload identity realm's `max_token_age_seconds` defaults to 39600
+  (11 hours) instead of 3600, so GitLab jobs with a timeout over an hour
+  can publish. Existing realms keep the value they were saved with; to
+  use the new default, clear the field in the realm form (or drop the key
+  from the config) and save.
 
 ### Features
 

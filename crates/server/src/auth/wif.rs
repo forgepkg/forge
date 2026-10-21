@@ -50,11 +50,12 @@ fn default_clock_skew() -> u64 {
     60
 }
 
-/// Workload tokens are expected to be short lived. One hour accommodates
-/// GitLab jobs with a configured timeout while remaining far below a reusable
-/// long-lived credential; operators can explicitly raise it (up to one day).
+/// Workload tokens are expected to be short lived, but GitLab sets an ID
+/// token's lifetime to the job timeout. Eleven hours accommodates long-running
+/// jobs while staying below a reusable day-long credential; operators can
+/// lower it per realm, or raise it up to one day.
 fn default_max_token_age() -> u64 {
-    60 * 60
+    11 * 60 * 60
 }
 
 /// Cache only the expensive, positive cryptographic verdict. Claim rules and
@@ -852,7 +853,7 @@ mod tests {
         }))
         .expect("valid");
         assert_eq!(ok["clock_skew_seconds"], 60);
-        assert_eq!(ok["max_token_age_seconds"], 3600);
+        assert_eq!(ok["max_token_age_seconds"], 39600);
         assert_eq!(ok["positive_cache_seconds"], 60);
 
         // http issuer needs the dev opt-in.
