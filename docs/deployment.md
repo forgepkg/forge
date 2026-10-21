@@ -408,6 +408,36 @@ garbage collection decides when a blob may go.
 To restore: stop every Forge instance, restore PostgreSQL, restore the bucket
 as described above, then start Forge. Practise this before you need it.
 
+## Locked out of every realm (break-glass)
+
+The admin API and the web UI refuse (`409 Conflict`) to disable or delete a
+realm when no enabled realm people can sign in with interactively (`local` or
+OIDC) would remain. They cannot tell whether that realm works, though: with an
+enabled OIDC realm whose IdP is down or misconfigured, `local` can still be
+disabled, and then nobody can sign in. API tokens keep working, so restores
+and pushes continue. To turn the `local` realm back on:
+
+- **With an admin-scoped API token**, minted beforehand with
+  `{"scope": {"actions": ["admin"]}}` (keep one for this): look up the
+  realm's id, then enable it. The token can also go in the Basic password.
+
+  ```bash
+  curl -H "X-NuGet-ApiKey: $TOKEN" https://nuget.example.com/admin/realms
+  curl -H "X-NuGet-ApiKey: $TOKEN" -X PATCH https://nuget.example.com/admin/realms/<id> \
+    -H 'content-type: application/json' -d '{"enabled": true}'
+  ```
+
+- **With SQL**, when there is no such token:
+
+  ```sql
+  UPDATE auth_realm SET enabled = true WHERE kind = 'local';
+  ```
+
+  Every instance picks the change up within `auth.realm_cache_ttl_seconds`
+  (default 10 s); no restart is needed.
+
+Then sign in as a local administrator and fix or disable the broken realm.
+
 ## Upgrades
 
 - Read the [changelog](../CHANGELOG.md) for each version you skip over. A

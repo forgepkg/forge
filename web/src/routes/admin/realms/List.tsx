@@ -33,7 +33,9 @@ export const Route = createFileRoute('/_app/manage/realms')({
  * (lower = tried/listed first) with up/down reordering (the full new id order
  * is PUT to `/admin/realms/order`), an enable/disable toggle, edit links, and
  * delete-with-confirm. The built-in `local` realm cannot be deleted — only
- * disabled.
+ * disabled, and disabling it asks first: every password login stops. The
+ * server refuses (409) a disable or delete that would leave no enabled realm
+ * to sign in with interactively (local or OIDC); its reason is shown inline.
  */
 function RealmsList() {
   const realms = useRealms()
@@ -153,6 +155,24 @@ function RealmRow({
   onConfirmDelete: () => void
 }) {
   const update = useUpdateRealm(realm.id)
+  // Disabling `local` ends every password login, in the browser and over
+  // NuGet Basic, so it waits for an explicit confirmation.
+  const [confirmDisable, setConfirmDisable] = useState(false)
+
+  function toggle(checked: boolean) {
+    if (!checked && realm.kind === 'local') {
+      setConfirmDisable(true)
+      return
+    }
+    update.mutate({ enabled: checked })
+  }
+
+  function disableConfirmed() {
+    update.mutate(
+      { enabled: false },
+      { onSettled: () => setConfirmDisable(false) },
+    )
+  }
 
   return (
     <TableRow>
@@ -194,15 +214,41 @@ function RealmRow({
         <span className="flex items-center gap-2 text-zinc-600 dark:text-zinc-400">
           <Checkbox
             checked={realm.enabled}
-            disabled={update.isPending}
-            onChange={(checked) => update.mutate({ enabled: checked })}
+            disabled={update.isPending || confirmDisable}
+            onChange={toggle}
             aria-label={`${realm.name} enabled`}
           />
           {realm.enabled ? 'enabled' : 'disabled'}
         </span>
-        {/* The server can refuse a toggle (e.g. disabling the last realm an
-            admin can sign in with); the checkbox stays at the stored state,
-            so say why instead of silently snapping back. */}
+        {confirmDisable && (
+          <div className="mt-1 max-w-xs space-y-1 text-sm/6 whitespace-normal">
+            <p className="text-zinc-700 dark:text-zinc-300">
+              Disabling {realm.name} stops every password login: browser
+              sign-in and NuGet clients sending a password over Basic. API
+              tokens keep working.
+            </p>
+            <span className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={disableConfirmed}
+                disabled={update.isPending}
+                className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
+              >
+                {update.isPending ? 'Disabling…' : 'Disable'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDisable(false)}
+                className="text-zinc-500 hover:underline dark:text-zinc-400"
+              >
+                Cancel
+              </button>
+            </span>
+          </div>
+        )}
+        {/* The server refuses a toggle that would leave no enabled realm to
+            sign in with interactively (local or OIDC); the checkbox stays at
+            the stored state, so say why instead of silently snapping back. */}
         {update.isError && (
           <p
             role="alert"

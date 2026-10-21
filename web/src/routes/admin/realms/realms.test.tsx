@@ -20,7 +20,8 @@ import { routeTree } from '~/routeTree.gen'
  *  - the list renders realms in priority order with kind badges and hides the
  *    delete affordance for the built-in local realm;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;
- *  - the enabled toggle PATCHes the realm;
+ *  - the enabled toggle PATCHes the realm; disabling `local` asks first and
+ *    a server refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
  *    invalid) and POSTs the parsed config when valid.
  */
@@ -229,13 +230,14 @@ describe('admin realms list', () => {
     )
   })
 
-  it('shows the server error when the enabled toggle is refused', async () => {
+  it('asks before disabling local; cancelling sends nothing', async () => {
+    const patches: unknown[] = []
     mockApi({
       realms: threeRealms,
-      onPatch: () =>
-        new Response('cannot disable the last enabled password realm', {
-          status: 409,
-        }),
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(realm({ id: 1, enabled: false }))
+      },
     })
 
     const u = userEvent.setup()
@@ -245,11 +247,100 @@ describe('admin realms list', () => {
     await u.click(toggle)
 
     const row = toggle.closest('tr')!
-    expect(await within(row).findByRole('alert')).toHaveTextContent(
-      'Could not disable local: cannot disable the last enabled password realm',
+    expect(
+      within(row).getByText(/stops every password login/),
+    ).toHaveTextContent(
+      'browser sign-in and NuGet clients sending a password over Basic',
     )
-    // The checkbox still shows the stored state.
     expect(toggle).toBeChecked()
+
+    await u.click(within(row).getByRole('button', { name: 'Cancel' }))
+    expect(within(row).queryByText(/stops every password login/)).toBeNull()
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+      ),
+    ).toBe(false)
+  })
+
+  it('disabling another realm does not ask', async () => {
+    let patched: { id: number; body: unknown } | null = null
+    mockApi({
+      realms: threeRealms,
+      onPatch: (id, body) => {
+        patched = { id, body }
+        return json(realm({ id: 5, kind: 'oidc', enabled: false }))
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    await u.click(
+      await screen.findByRole('checkbox', { name: 'corp-sso enabled' }),
+    )
+
+    await waitFor(() =>
+      expect(patched).toEqual({ id: 5, body: { enabled: false } }),
+    )
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
+  })
+
+  it('shows the server refusal after disabling local is confirmed', async () => {
+    let patched: { id: number; body: unknown } | null = null
+    mockApi({
+      realms: threeRealms,
+      onPatch: (id, body) => {
+        patched = { id, body }
+        return new Response(
+          'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+          { status: 409 },
+        )
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    await u.click(toggle)
+    const row = toggle.closest('tr')!
+    await u.click(within(row).getByRole('button', { name: 'Disable' }))
+
+    await waitFor(() =>
+      expect(patched).toEqual({ id: 1, body: { enabled: false } }),
+    )
+    expect(await within(row).findByRole('alert')).toHaveTextContent(
+      'Could not disable local: no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+    )
+    // The checkbox still shows the stored state, and the question is gone.
+    expect(toggle).toBeChecked()
+    expect(within(row).queryByText(/stops every password login/)).toBeNull()
+  })
+
+  it('shows the server refusal when a delete would leave no sign-in realm', async () => {
+    mockApi({
+      realms: threeRealms,
+      onDelete: () =>
+        new Response(
+          'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+          { status: 409 },
+        ),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const row = (await screen.findByText('corp-sso')).closest('tr')!
+    await u.click(within(row).getByRole('button', { name: 'Delete' }))
+    await u.click(within(row).getByRole('button', { name: 'Confirm' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+    )
+    expect(screen.getByText('corp-sso')).toBeInTheDocument()
   })
 
   it('delete asks for confirmation then DELETEs', async () => {
