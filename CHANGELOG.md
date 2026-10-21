@@ -10,6 +10,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.0.0]
+
 First production release. envisia-forge is dual-licensed under the GNU AGPL
 v3 (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
 choice. Install it on an empty PostgreSQL database;
@@ -315,4 +317,5 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/forge/commits/main
+[Unreleased]: https://github.com/schmitch/forge/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/schmitch/forge/releases/tag/v1.0.0
