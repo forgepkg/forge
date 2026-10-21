@@ -25,7 +25,7 @@ const PROBE_TOML: &str = r#"
 id = "probe"
 name = "Probe"
 version = "0.0.1"
-api = "0.2.0"
+api = "0.3.0"
 mount = "/probe"
 kinds = ["hosted"]
 

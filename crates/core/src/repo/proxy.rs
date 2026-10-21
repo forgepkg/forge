@@ -430,12 +430,11 @@ impl ProxyRepo {
             .await
             .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?;
             fetched = back;
-            let wanted = match step
-                .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?
-            {
-                api::UpstreamStep::Done(answer) => return Ok(answer),
-                api::UpstreamStep::Fetch(wanted) => wanted,
-            };
+            let wanted =
+                match step.map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))? {
+                    api::UpstreamStep::Done(answer) => return Ok(answer),
+                    api::UpstreamStep::Fetch(wanted) => wanted,
+                };
             if wanted.is_empty() || fetched.len() + wanted.len() > MAX_UPSTREAM_FETCHES {
                 return Err(RepoError::Storage(format!(
                     "upstream protocol asked for {} fetches after {}",
@@ -474,7 +473,10 @@ impl ProxyRepo {
         let cached: Result<CachedFetch, Option<String>> = self
             .cache
             .get_or_try_insert_local(NS_UPSTREAM_FETCH, &key, ttl, || async {
-                let creds = self.credentials(repo).await.map_err(|e| Some(e.to_string()))?;
+                let creds = self
+                    .credentials(repo)
+                    .await
+                    .map_err(|e| Some(e.to_string()))?;
                 let auth = creds.as_ref().map(Credentials::auth);
                 match self.http.get_bytes(&fetch.url, auth.as_ref()).await {
                     Ok(Some(bytes)) => Ok(CachedFetch::Found(
@@ -2298,12 +2300,16 @@ impl ProxyRepo {
                 ))
             }
         };
-        let returned = page.hits.len();
+        let returned = page.hits.len().min(params.effective_take());
         let hits: Vec<UpstreamSearchHit> = page
             .hits
             .into_iter()
             .take(params.effective_take())
-            .filter(|hit| self.format.validate_id(&self.format.lower_id(&hit.id)).is_ok())
+            .filter(|hit| {
+                self.format
+                    .validate_id(&self.format.lower_id(&hit.id))
+                    .is_ok()
+            })
             .map(|hit| UpstreamSearchHit {
                 id: hit.id,
                 versions: hit.versions,

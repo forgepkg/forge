@@ -89,7 +89,10 @@ fn the_index_is_the_service_indexs_resources() {
     let UpstreamAnswer::Index(index) = done.answer else {
         panic!("{:?}", done.answer)
     };
-    assert_eq!(serde_json::from_str::<Resources>(&index).unwrap(), resources());
+    assert_eq!(
+        serde_json::from_str::<Resources>(&index).unwrap(),
+        resources()
+    );
 
     // Not a service index (a captive portal, an error page): a failure,
     // never an empty feed.
@@ -118,7 +121,10 @@ fn versions_are_the_flat_containers_normalized() {
     let listed = run(
         &remote,
         UpstreamOp::Versions("contoso.lib".into()),
-        &docs([(url.clone(), found(json!({ "versions": ["1.0", "2.0.0-Beta", "x"] })))]),
+        &docs([(
+            url.clone(),
+            found(json!({ "versions": ["1.0", "2.0.0-Beta", "x"] })),
+        )]),
     );
     assert_eq!(
         listed.answer,
@@ -305,7 +311,8 @@ fn dating_reads_the_catalog_of_unlisted_versions() {
 
 #[test]
 fn search_forwards_the_query_and_reads_the_hits() {
-    let url = "https://search.example/query?q=contoso&skip=0&take=2&prerelease=false&semVerLevel=2.0.0";
+    let url =
+        "https://search.example/query?q=contoso&skip=0&take=2&prerelease=false&semVerLevel=2.0.0";
     let page = found(json!({ "totalHits": 7, "data": [
         { "id": "Contoso.Lib", "version": "2.0.0",
           "versions": [ { "version": "2.0" }, { "version": "1.0.0" } ],

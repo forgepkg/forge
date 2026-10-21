@@ -2369,9 +2369,8 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
         .collect();
     assert_eq!(with_deps.len(), 10);
     assert!(!with_deps.contains(&"1.0.0") && !with_deps.contains(&"2.0.0"));
-    let newest =
-        forge_format_nuget::nuspec::summary_of(reg[11].manifest_summary.as_ref(), None)
-            .dependency_groups;
+    let newest = forge_format_nuget::nuspec::summary_of(reg[11].manifest_summary.as_ref(), None)
+        .dependency_groups;
     assert_eq!(newest[0].target_framework, None);
     assert_eq!(newest[0].dependencies[0].id, "Dep.12.0.0");
 

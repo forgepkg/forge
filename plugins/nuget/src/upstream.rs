@@ -586,11 +586,11 @@ fn search_url(service: &str, query: &SearchQuery) -> String {
         ("q", query.text.as_str()),
         ("skip", &query.skip.to_string()),
         ("take", &take.to_string()),
-        ("prerelease", if query.prerelease { "true" } else { "false" }),
         (
-            "semVerLevel",
-            if query.semver2 { "2.0.0" } else { "1.0.0" },
+            "prerelease",
+            if query.prerelease { "true" } else { "false" },
         ),
+        ("semVerLevel", if query.semver2 { "2.0.0" } else { "1.0.0" }),
     ]
     .map(|(k, v)| format!("{k}={}", form_encode(v)));
     let separator = match service.find('?') {

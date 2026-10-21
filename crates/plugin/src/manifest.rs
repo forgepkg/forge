@@ -421,11 +421,7 @@ mod tests {
         assert_eq!(m.kinds, [RepositoryKind::Hosted, RepositoryKind::Proxy]);
         // `[proxy]` (0.2's host-side upstream protocols) is gone.
         assert!(with("", "[proxy]\nupstream = \"nuget-v3\"\n").is_err());
-        for kinds in [
-            "[]",
-            "[\"mirror\"]",
-            "[\"hosted\", \"hosted\"]",
-        ] {
+        for kinds in ["[]", "[\"mirror\"]", "[\"hosted\", \"hosted\"]"] {
             assert!(
                 with(&format!("kinds = {kinds}"), "").is_err(),
                 "{kinds} accepted"
