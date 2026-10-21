@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
-import type { UserView } from '~/api/users'
+import { authSourceLabel, type UserView } from '~/api/users'
 import { useCreateUser, useDeleteUser, useUsers } from '~/queries/useUsers'
 import { Badge } from '~/components/catalyst/badge'
 import { Button } from '~/components/catalyst/button'
@@ -26,7 +26,9 @@ export const Route = createFileRoute('/_app/manage/users')({
 })
 
 /**
- * Admin users screen (plan §Phase 5). Lists every user with their admin / active
+ * Admin users screen (plan §Phase 5). Lists every user with how they sign in
+ * (password, identity provider, credential forwarding: look-alike usernames
+ * from different sources are different accounts) and their admin / active
  * flags, offers an inline create form (`CreateUser`), links each user to its
  * token-management screen, and deletes with a confirm step. Slice 1 has no
  * update-user endpoint, so there is no edit-in-place beyond create/delete + the
@@ -73,6 +75,7 @@ function UsersList() {
           <TableHead>
             <TableRow>
               <TableHeader>Username</TableHeader>
+              <TableHeader>Sign-in</TableHeader>
               <TableHeader>Role</TableHeader>
               <TableHeader>Status</TableHeader>
               <TableHeader>Actions</TableHeader>
@@ -140,6 +143,7 @@ function UserRow({
           {user.username}
         </button>
       </TableCell>
+      <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
       <TableCell className="text-zinc-500 dark:text-zinc-400">
         {user.is_admin ? 'admin' : 'reader'}
       </TableCell>

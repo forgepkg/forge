@@ -27,6 +27,25 @@ export interface UserView {
   username: string
   is_admin: boolean
   active: boolean
+  /**
+   * How the account signs in: `local` (Forge password), `oidc` (identity
+   * provider) or `upstream-basic` (credential-forwarding realm).
+   */
+  auth_source: string
+}
+
+const AUTH_SOURCE_LABELS: Record<string, string> = {
+  local: 'Password',
+  oidc: 'Identity provider',
+  'upstream-basic': 'Credential forwarding',
+}
+
+/**
+ * A user's `auth_source` for display. Look-alike usernames from different
+ * sources are different accounts; an unknown value is shown as sent.
+ */
+export function authSourceLabel(source: string): string {
+  return AUTH_SOURCE_LABELS[source] ?? source
 }
 
 /** `POST /admin/users` request body (`CreateUser`). */

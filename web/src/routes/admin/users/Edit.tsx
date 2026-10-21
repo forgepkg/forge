@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { CreatedToken, TokenView } from '~/api/tokens'
+import { authSourceLabel } from '~/api/users'
 import { useUsers } from '~/queries/useUsers'
 import {
   useCreateToken,
@@ -36,7 +37,8 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
  * the user's tokens (metadata only — the secret is never returned), issues new
  * tokens (the plaintext is shown **once** via `ShowOnceSecret`), and revokes
  * existing ones. The plaintext is held in transient component state and never
- * written into a query cache.
+ * written into a query cache. The header says how the user signs in, so a
+ * token is not issued to a look-alike account by mistake.
  */
 function UserTokens() {
   const { userId } = Route.useParams()
@@ -84,6 +86,14 @@ function UserTokens() {
         <Heading className="mt-1">
           Tokens{user ? ` — ${user.username}` : ''}
         </Heading>
+        {user && (
+          <Text className="mt-1">
+            Sign-in:{' '}
+            <span className="font-medium text-zinc-950 dark:text-white">
+              {authSourceLabel(user.auth_source)}
+            </span>
+          </Text>
+        )}
         <Text className="mt-1">
           API tokens authenticate this user against the registry. The secret is
           shown only at creation time.

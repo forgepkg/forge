@@ -19,8 +19,8 @@ import { routeTree } from '~/routeTree.gen'
  * Admin users + tokens screens (plan §Phase 5 testing), driven against the
  * **real** route tree + query hooks so the admin guard, routing, and mutations
  * are all exercised:
- *  - the users list renders users and create-user POSTs the right body + the
- *    list re-fetches (invalidation);
+ *  - the users list renders users with how each signs in, and create-user
+ *    POSTs the right body + the list re-fetches (invalidation);
  *  - delete-user invalidates the list, and a refused delete (409 for the last
  *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
@@ -40,6 +40,7 @@ function user(over: Partial<UserView>): UserView {
     username: 'alice',
     is_admin: false,
     active: true,
+    auth_source: 'local',
     ...over,
   }
 }
@@ -179,6 +180,31 @@ describe('admin users', () => {
     expect(screen.getByText('inactive')).toBeInTheDocument()
   })
 
+  it('shows how each user signs in, telling look-alike accounts apart', async () => {
+    mockApi({
+      users: [
+        user({ id: 2, username: 'alice', auth_source: 'upstream-basic' }),
+        user({ id: 3, username: 'alice@corp', auth_source: 'oidc' }),
+        user({ id: 4, username: 'root', auth_source: 'local' }),
+        user({ id: 5, username: 'svc', auth_source: 'scim' }),
+      ],
+    })
+
+    await renderAt('/manage/users')
+
+    await screen.findByText('alice@corp')
+    expect(screen.getByRole('columnheader', { name: 'Sign-in' })).toBeInTheDocument()
+    const signIn = (name: string) =>
+      within(screen.getByRole('button', { name }).closest('tr')!).getAllByRole(
+        'cell',
+      )[1]
+    expect(signIn('alice')).toHaveTextContent('Credential forwarding')
+    expect(signIn('alice@corp')).toHaveTextContent('Identity provider')
+    expect(signIn('root')).toHaveTextContent('Password')
+    // An unknown source is shown as sent.
+    expect(signIn('svc')).toHaveTextContent('scim')
+  })
+
   it('create-user POSTs the right body and re-fetches the list', async () => {
     let posted: unknown = null
     const usersAfter = [user({ id: 2, username: 'carol' })]
@@ -274,7 +300,7 @@ describe('admin tokens', () => {
 
   it('creates a token and shows the plaintext secret once', async () => {
     mockApi({
-      users: [user({ id: 2, username: 'alice' })],
+      users: [user({ id: 2, username: 'alice', auth_source: 'oidc' })],
       tokens: [],
       onCreateToken: (userId, body) =>
         json(
@@ -292,6 +318,11 @@ describe('admin tokens', () => {
     await screen.findByText('alice')
     await router.navigate({ to: '/manage/users/$userId', params: { userId: '2' } })
     await waitFor(() => expect(router.state.status).toBe('idle'))
+
+    // The header says how this user signs in.
+    expect(await screen.findByText(/^Sign-in:/)).toHaveTextContent(
+      'Sign-in: Identity provider',
+    )
 
     await u.type(await screen.findByLabelText('Token name'), 'ci-pipeline')
     await u.click(screen.getByRole('button', { name: 'Create token' }))
