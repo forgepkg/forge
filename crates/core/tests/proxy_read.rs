@@ -836,12 +836,12 @@ fn upstream_hits(mock: &MockUpstream) -> [usize; 6] {
 }
 
 /// Point proxy `repo` at another upstream, as the admin update does: the new
-/// URL, and in the same transaction the reset of what the proxy learned from
-/// the previous one.
+/// URL (bumping `updated_at`), and in the same transaction the reset of what
+/// the proxy learned from the previous one.
 async fn repoint(pool: &PgPool, repo: &str, remote_url: &str) {
     let id = repo_id(pool, repo).await;
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query("UPDATE repository SET remote_url = $2 WHERE id = $1")
+    sqlx::query("UPDATE repository SET remote_url = $2, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(remote_url)
         .execute(&mut *tx)
@@ -1071,6 +1071,39 @@ async fn repointed_proxy_forgets_the_previous_upstreams_markers_and_delay_clock(
         .unwrap()
         .is_none());
     assert_eq!(new.nupkg_hits(), 0, "nothing downloaded inside the delay");
+}
+
+/// #105: pointing a proxy back to its previous upstream within the metadata
+/// TTL lists that upstream's versions again. The repoint deleted the rows of
+/// the versions not downloaded yet, and the first period's "listing
+/// refreshed" marker (keyed by the upstream) used to be still valid, so the
+/// flat index stayed empty until the TTL ran out.
+#[tokio::test]
+async fn repointing_back_within_the_metadata_ttl_lists_the_versions_again() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let a = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0"])).await;
+    let b = start_mock(corpus_of("Other.Lib", &["1.0.0"])).await;
+    let a_url = format!("{}/index.json", a.base);
+    let repo = make_proxy(&pool, &a_url, 0, true).await;
+    // One cache across the repoints, as on a running instance.
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"]
+    );
+    repoint(&pool, &repo, &format!("{}/index.json", b.base)).await;
+    assert!(px
+        .list_versions(&repo, "Contoso.Lib")
+        .await
+        .unwrap()
+        .is_empty());
+    repoint(&pool, &repo, &a_url).await;
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"],
+        "the previous upstream's versions are listed again at once"
+    );
 }
 
 /// #13: repointing a proxy (`remote_url`) takes effect at once. Nothing more

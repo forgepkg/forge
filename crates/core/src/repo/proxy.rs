@@ -117,8 +117,9 @@ use crate::repo::{
 pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// Cache namespace marking a package's upstream version listing as fresh,
 /// keyed by `"{scope}/{lower_id}"`. In this and the namespaces below, `scope`
-/// is `"{repo}/{repo_id}/{remote_url digest}"`, so nothing cached from a
-/// previous upstream is used once a proxy is repointed.
+/// is `"{repo}/{repo_id}/{remote_url digest}/{updated_at}"`, so nothing
+/// cached from a previous upstream, or before a repoint, is used once a proxy
+/// is repointed.
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
 /// Cache namespace for upstream `.nuspec` documents of not-yet-downloaded
 /// versions, keyed by `"{scope}/{lower_id}/{version}"`.
@@ -499,12 +500,24 @@ impl ProxyRepo {
 
     /// The key prefix of everything cached from `repo`'s upstream: the
     /// repository (its id too, so a deleted-and-recreated repository starts
-    /// afresh) and a digest of its `remote_url`, so a repointed proxy never
-    /// serves what the previous upstream answered. A digest rather than the
-    /// URL itself keeps keys that append another URL unambiguous.
+    /// afresh), a digest of its `remote_url`, so a repointed proxy never
+    /// serves what the previous upstream answered, and the row's
+    /// `updated_at`, so every repoint starts afresh too. Repointing resets
+    /// what the proxy learned (`reset_for_new_upstream` deletes the listed
+    /// versions not downloaded yet); without the timestamp, pointing back to
+    /// an upstream within the metadata TTL found that upstream's "listing
+    /// refreshed" marker still valid and served the emptied listing until
+    /// it expired. A digest rather than the URL itself keeps keys that
+    /// append another URL unambiguous.
     fn upstream_scope(repo: &Repository) -> String {
         let digest = Sha256::digest(repo.remote_url.as_deref().unwrap_or_default());
-        format!("{}/{}/{}", repo.name, repo.id, hex::encode(&digest[..8]))
+        format!(
+            "{}/{}/{}/{}",
+            repo.name,
+            repo.id,
+            hex::encode(&digest[..8]),
+            repo.updated_at.timestamp_micros()
+        )
     }
 
     /// Cache key of the "listing refreshed" marker of `lower_id`.
