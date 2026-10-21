@@ -7,7 +7,10 @@
 # readability), as ci.yml pins its actions; nothing bumps them here, so do it
 # by hand. The images the test harnesses start themselves (postgres:17,
 # versity/versitygw:v1.4.1 and v1.9.0, redis) are named by tag in their
-# code, as on GitHub.
+# code, as on GitHub. Docker Hub images come through Google's mirror,
+# mirror.gcr.io (the same images under the same digests, without Docker Hub's
+# pull rate limit): by name here and in the harnesses, and the Dockerfile's
+# through the Docker-in-Docker daemon's registry mirror.
 #
 # The GitHub runners come with a Docker daemon; here the jobs that need one
 # (test, docker, e2e, web-e2e) get a Docker-in-Docker service, which needs a
@@ -41,7 +44,7 @@ stages:
 default:
   # Keep in lock-step with rust-toolchain.toml (same image as the Dockerfile's
   # builder stage).
-  image: rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+  image: mirror.gcr.io/library/rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
   # A newer commit on the same MR/branch cancels a still-running pipeline.
   interruptible: true
 
@@ -75,10 +78,11 @@ variables:
 # Docker-in-Docker, reached over TCP (no TLS inside the job's network). The
 # testcontainers harnesses take the host of a container's published ports
 # from DOCKER_HOST, so they connect to `docker` with no further settings.
+# Docker Hub pulls by its own name (the Dockerfile's) go through mirror.gcr.io.
 .dind-service: &dind-service
-  name: docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+  name: mirror.gcr.io/library/docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
   alias: docker
-  command: ["--tls=false"]
+  command: ["--tls=false", "--registry-mirror=https://mirror.gcr.io"]
 
 .dind-variables: &dind-variables
   DOCKER_HOST: "tcp://docker:2375"
@@ -99,7 +103,7 @@ clippy:
   stage: clippy
   needs: ["fmt"]
   services:
-    - name: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+    - name: mirror.gcr.io/library/postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
       alias: postgres
   variables:
     POSTGRES_DB: forge
@@ -186,7 +190,7 @@ test:
 docker:
   stage: build
   needs: ["fmt"]
-  image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+  image: mirror.gcr.io/library/docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
   services:
     - *dind-service
   variables:
@@ -232,7 +236,7 @@ kubernetes:
 web:
   stage: web
   needs: []
-  image: node:22-bookworm@sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8
+  image: mirror.gcr.io/library/node:22-bookworm@sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8
   variables:
     PNPM_HOME: "$CI_PROJECT_DIR/.pnpm-store"
   cache:
@@ -288,10 +292,10 @@ e2e:
     - apt-get update -qq && apt-get install -y -qq docker.io
     - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
     # Pre-pull the images the harness uses (faster, deterministic).
-    - docker pull postgres:17
-    - docker pull versity/versitygw:v1.4.1
-    - docker pull versity/versitygw:v1.9.0
-    - docker pull redis:5.0
+    - docker pull mirror.gcr.io/library/postgres:17
+    - docker pull mirror.gcr.io/versity/versitygw:v1.4.1
+    - docker pull mirror.gcr.io/versity/versitygw:v1.9.0
+    - docker pull mirror.gcr.io/library/redis:5.0
   script:
     - rustup target add wasm32-wasip2
     # Per-test timings, as in the test job.
@@ -329,8 +333,8 @@ web-e2e:
     # Ubuntu packages the compose v2 plugin (`docker compose`) as docker-compose-v2.
     - apt-get update -qq && apt-get install -y -qq docker.io docker-compose-v2 curl build-essential
     - timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
-    - docker pull postgres:17
-    - docker pull versity/versitygw:v1.4.1
+    - docker pull mirror.gcr.io/library/postgres:17
+    - docker pull mirror.gcr.io/versity/versitygw:v1.4.1
     # rustup installs into $CARGO_HOME (see `variables`), not ~/.cargo.
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
     - export PATH="$CARGO_HOME/bin:$PATH"

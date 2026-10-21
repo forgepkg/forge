@@ -34,6 +34,12 @@ permissions:
 # resolved from is in the trailing comment); Dependabot
 # (.github/dependabot.yml) proposes updates.
 
+# Docker Hub images come through Google's mirror, mirror.gcr.io (the same
+# images under the same digests, without Docker Hub's pull rate limit): the
+# service, job and pre-pulled images by name, as the testcontainers harnesses
+# name them in their code, and the Dockerfile's through BuildKit's registry
+# mirror (docker job).
+
 # Build caches. A repository's Actions caches share a 10 GB quota, and an
 # entry past it evicts the least recently used. So:
 #   - the cargo caches (Swatinem/rust-cache) hold the registry and the
@@ -84,7 +90,7 @@ jobs:
       # queries and schema. Pinned by digest; Dependabot does not see
       # workflow images, so bump it with deploy/kubernetes/components/postgres.
       postgres:
-        image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -223,10 +229,14 @@ jobs:
     needs: [fmt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The BuildKit release.yml builds with (pinned by digest; keep in step).
+      # The BuildKit release.yml builds with (pinned by digest; keep in step),
+      # which pulls the Dockerfile's Docker Hub images through mirror.gcr.io.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
-          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Build image (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -341,7 +351,7 @@ jobs:
     needs: [fmt]
     services:
       postgres:
-        image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -360,8 +370,8 @@ jobs:
       COSIGN_SHA256: 46dbdcb5467a3dfec2526923d0b3365e40c8d9dc00ec23d5aca3437449e8cbfd
       # The upstream registry the proxy repository caches, and buildx's
       # BuildKit, pinned like every other image.
-      FORGE_E2E_UPSTREAM_IMAGE: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
-      FORGE_E2E_BUILDKIT_IMAGE: moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      FORGE_E2E_UPSTREAM_IMAGE: mirror.gcr.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+      FORGE_E2E_BUILDKIT_IMAGE: mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
@@ -386,7 +396,7 @@ jobs:
       - name: Start the S3 gateway and pull the upstream registry image
         run: |
           docker run -d --name forge-e2e-s3 -p 7070:7070 \
-            versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f \
+            mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f \
             --port :7070 --access forge-e2e-key --secret forge-e2e-secret posix /tmp
           docker pull "$FORGE_E2E_UPSTREAM_IMAGE"
       - name: cargo build -p forge-server
@@ -452,10 +462,10 @@ jobs:
       # (.github/scripts/image-pin-check.sh leaves `docker pull` alone).
       - name: Pre-pull container images
         run: |
-          docker pull postgres:17
-          docker pull versity/versitygw:v1.4.1
-          docker pull versity/versitygw:v1.9.0
-          docker pull redis:5.0
+          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/versity/versitygw:v1.4.1
+          docker pull mirror.gcr.io/versity/versitygw:v1.9.0
+          docker pull mirror.gcr.io/library/redis:5.0
 
       - name: Run e2e tests (forge-e2e feature)
         id: tests
@@ -511,8 +521,8 @@ jobs:
       # By tag, like the e2e job: web/e2e names them by tag.
       - name: Pre-pull container images
         run: |
-          docker pull postgres:17
-          docker pull versity/versitygw:v1.4.1
+          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/versity/versitygw:v1.4.1
       - name: Install deps (frozen lockfile)
         run: pnpm install --frozen-lockfile
         working-directory: web

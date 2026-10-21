@@ -16,8 +16,8 @@
 #   FORGE_E2E_DATABASE_URL  (postgres://forge:forge@localhost:5432/forge)
 #   FORGE_E2E_S3_ENDPOINT   (http://localhost:7070), access/secret forge-e2e-key
 #   FORGE_E2E_UPSTREAM_PORT (5005: the registry:2 upstream of the proxy)
-#   FORGE_E2E_UPSTREAM_IMAGE (registry:2, that upstream's image)
-#   FORGE_E2E_BUILDKIT_IMAGE (moby/buildkit:buildx-stable-1, for buildx)
+#   FORGE_E2E_UPSTREAM_IMAGE (mirror.gcr.io/library/registry:2, that upstream's image)
+#   FORGE_E2E_BUILDKIT_IMAGE (mirror.gcr.io/moby/buildkit:buildx-stable-1, for buildx)
 set -euo pipefail
 
 server_bin="$(realpath "$1")"
@@ -25,8 +25,8 @@ results="$(mkdir -p "$2" && realpath "$2")"
 db_url="${FORGE_E2E_DATABASE_URL:-postgres://forge:forge@localhost:5432/forge}"
 s3_endpoint="${FORGE_E2E_S3_ENDPOINT:-http://localhost:7070}"
 upstream_port="${FORGE_E2E_UPSTREAM_PORT:-5005}"
-upstream_image="${FORGE_E2E_UPSTREAM_IMAGE:-registry:2}"
-buildkit_image="${FORGE_E2E_BUILDKIT_IMAGE:-moby/buildkit:buildx-stable-1}"
+upstream_image="${FORGE_E2E_UPSTREAM_IMAGE:-mirror.gcr.io/library/registry:2}"
+buildkit_image="${FORGE_E2E_BUILDKIT_IMAGE:-mirror.gcr.io/moby/buildkit:buildx-stable-1}"
 # The conformance runner of distribution-spec main (2026-08-31).
 conformance_rev=97274622c11112caa21efb8c52acca3c6b8fa7f1
 registry=localhost:8421

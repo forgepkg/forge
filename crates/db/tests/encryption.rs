@@ -49,6 +49,7 @@ async fn database_url() -> &'static str {
                 .with_db_name("forge")
                 .with_user("forge")
                 .with_password("forge")
+                .with_name("mirror.gcr.io/library/postgres")
                 .with_tag("17")
                 .start()
                 .await

@@ -60,7 +60,7 @@ async fn redis_url() -> String {
         return url.clone();
     }
 
-    let container = GenericImage::new("redis", "7")
+    let container = GenericImage::new("mirror.gcr.io/library/redis", "7")
         .with_exposed_port(REDIS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .start()

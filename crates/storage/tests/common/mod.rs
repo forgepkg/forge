@@ -47,6 +47,7 @@ async fn pg_endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -112,7 +113,7 @@ async fn s3_endpoint() -> &'static str {
     // (always present in the image) rather than `/data` (which the image does
     // not create). We wait for the "listening" banner on stdout, then retry
     // `ensure_bucket` below to absorb any residual startup lag.
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
