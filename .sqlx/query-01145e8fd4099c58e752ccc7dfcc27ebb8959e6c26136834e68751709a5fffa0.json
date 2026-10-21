@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT n.name AS \"name!\",\n               coalesce(\n                   (SELECT c.original_id FROM component c\n                    WHERE c.repository_id = $1 AND c.name = n.name\n                    ORDER BY c.created_at DESC, c.id DESC LIMIT 1),\n                   (SELECT p.original_id FROM proxy_cached_version p\n                    WHERE p.repository_id = $1 AND p.name = n.name\n                      AND p.original_id IS NOT NULL\n                    LIMIT 1)\n               ) AS \"original_id?\"\n        FROM unnest($2::text[]) AS n(name)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "original_id?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "01145e8fd4099c58e752ccc7dfcc27ebb8959e6c26136834e68751709a5fffa0"
+}
