@@ -123,22 +123,8 @@ mod tests {
             assert!(valid_name(ok), "{ok}");
         }
         for bad in [
-            "",
-            "/a",
-            "a/",
-            "a//b",
-            "A",
-            "a/B",
-            "a..b",
-            "a___b",
-            "-a",
-            "a-",
-            "a.",
-            "a/../b",
-            "a/./b",
-            "a%2fb",
-            "a b",
-            "a?b",
+            "", "/a", "a/", "a//b", "A", "a/B", "a..b", "a___b", "-a", "a-", "a.", "a/../b",
+            "a/./b", "a%2fb", "a b", "a?b",
         ] {
             assert!(!valid_name(bad), "{bad}");
         }

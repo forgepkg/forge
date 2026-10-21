@@ -144,15 +144,17 @@ impl std::str::FromStr for Digest {
 /// `component ::= [a-z0-9]+`, `separator ::= [+._-]`.
 fn valid_algorithm_grammar(s: &str) -> bool {
     !s.is_empty()
-        && s.split(['+', '.', '_', '-'])
-            .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        && s.split(['+', '.', '_', '-']).all(|c| {
+            !c.is_empty()
+                && c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
 }
 
 /// `encoded ::= [a-zA-Z0-9=_-]+`.
 fn valid_encoded_grammar(s: &str) -> bool {
     !s.is_empty()
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b'_' | b'-'))
 }
 

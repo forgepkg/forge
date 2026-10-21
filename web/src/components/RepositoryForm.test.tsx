@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { FormatView, RepoView } from '~/api/repositories'
@@ -8,6 +8,7 @@ import {
   RepositoryForm,
   toCreateBody,
   toUpdateBody,
+  validateDockerHost,
   validateRepoName,
   type RepoFormValues,
 } from './RepositoryForm'
@@ -18,7 +19,11 @@ import {
  *    hosted-only `allow_redeploy`, no proxy fields);
  *  - the proxy upstream password is **write-only**: never seeded from an
  *    existing repo's GET, and only sent when typed;
- *  - validation blocks an empty name and a proxy without a remote URL.
+ *  - validation blocks an empty name and a proxy without a remote URL;
+ *  - docker repositories: the format is chosen on create (read-only on edit),
+ *    the NuGet-only fields are hidden and never sent, the docker options are
+ *    sent only for docker (and only the ones the kind takes), and an edit
+ *    diffs them (an emptied host / writable member clears it with `null`).
  */
 
 const helm: FormatView = {
@@ -225,6 +230,10 @@ describe('RepositoryForm', () => {
       allow_redeploy: false,
       prefer_hosted: false,
       reserved_prefixes: [],
+      host: null,
+      immutable_tags: false,
+      latest_mutable: false,
+      writable_member: null,
     }
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -298,6 +307,10 @@ const storedProxy: RepoView = {
   allow_redeploy: false,
   prefer_hosted: false,
   reserved_prefixes: [],
+  host: null,
+  immutable_tags: false,
+  latest_mutable: false,
+  writable_member: null,
 }
 
 function renderEdit(existing: RepoView = storedProxy) {
@@ -479,3 +492,322 @@ describe('repository update body (M2)', () => {
     expect(screen.queryByText(/credentials will be dropped/)).toBeNull()
   })
 })
+
+/** The docker options an untouched NuGet body must never carry. */
+const DOCKER_FIELDS = ['host', 'immutable_tags', 'latest_mutable', 'writable_member']
+
+function renderCreate() {
+  const onSubmit = vi.fn()
+  render(
+    <RepositoryForm
+      mode="create"
+      submitting={false}
+      onSubmit={onSubmit}
+      onCancel={() => {}}
+    />,
+  )
+  return onSubmit
+}
+
+async function create(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: 'Create repository' }))
+}
+
+describe('docker repositories: create', () => {
+  it('a NuGet body sends format nuget and no docker fields', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.type(screen.getByLabelText('Name'), 'feed')
+    // A host typed while "Docker" was selected is dropped when switching back.
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+    await user.selectOptions(screen.getByLabelText('Format'), 'nuget')
+    expect(screen.queryByLabelText('Host')).toBeNull()
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({ name: 'feed', kind: 'hosted', format: 'nuget' })
+    for (const field of DOCKER_FIELDS) expect(body).not.toHaveProperty(field)
+  })
+
+  it('hosted docker: hides allow_redeploy, sends host + immutable tags + latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    expect(screen.queryByLabelText(/Allow redeploy/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+
+    // "Allow moving latest" is only available with immutable tags.
+    const latest = screen.getByLabelText(/Allow moving latest/)
+    expect(latest).toHaveAttribute('aria-disabled', 'true')
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    expect(latest).not.toHaveAttribute('aria-disabled')
+    await user.click(latest)
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toEqual({
+      name: 'docker-hosted',
+      kind: 'hosted',
+      format: 'docker',
+      anonymous_read: false,
+      online: true,
+      host: 'docker.example.com',
+      immutable_tags: true,
+      latest_mutable: true,
+    })
+  })
+
+  it('unticking immutable tags also clears latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByLabelText(/Allow moving latest/))
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    expect(screen.getByLabelText(/Allow moving latest/)).not.toBeChecked()
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      immutable_tags: false,
+      latest_mutable: false,
+    })
+  })
+
+  it('docker proxy: registry URL placeholder, no package delay, no empty host', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    expect(screen.queryByLabelText('Package delay (seconds)')).toBeNull()
+    const remote = screen.getByLabelText('Remote URL')
+    expect(remote).toHaveAttribute('placeholder', 'https://registry-1.docker.io')
+    await user.type(screen.getByLabelText('Name'), 'docker-hub')
+    await user.type(remote, 'https://registry-1.docker.io')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      name: 'docker-hub',
+      kind: 'proxy',
+      format: 'docker',
+      remote_url: 'https://registry-1.docker.io',
+    })
+    expect(body).not.toHaveProperty('package_delay_seconds')
+    expect(body).not.toHaveProperty('allow_redeploy')
+    for (const field of DOCKER_FIELDS) expect(body).not.toHaveProperty(field)
+  })
+
+  it('docker group: namespace prefixes and the writable member', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.getByText(/namespaces such as/)).toHaveTextContent('envisia/')
+    expect(screen.queryByLabelText(/Immutable tags/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'docker-group')
+    await user.type(screen.getByLabelText('Reserved prefixes'), 'envisia/')
+    await user.type(screen.getByLabelText('Writable member'), 'docker-hosted')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      kind: 'group',
+      format: 'docker',
+      prefer_hosted: true,
+      reserved_prefixes: ['envisia/'],
+      writable_member: 'docker-hosted',
+    })
+    expect(body).not.toHaveProperty('immutable_tags')
+    expect(body).not.toHaveProperty('host')
+  })
+
+  it('blocks an uppercase docker name and an invalid host inline', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'Docker-Hosted')
+    await user.type(screen.getByLabelText('Host'), 'https://docker.example.com')
+    await create(user)
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByText(/must be lowercase/)).toBeInTheDocument()
+    expect(screen.getByText(/Give a DNS name/)).toBeInTheDocument()
+  })
+})
+
+describe('docker repository names and hosts', () => {
+  it('requires a lowercase OCI name component for docker only', () => {
+    for (const ok of ['docker-hosted', 'a', 'my.repo', 'a__b', 'a--b', '0day']) {
+      expect(validateRepoName(ok, 'docker')).toBeNull()
+    }
+    expect(validateRepoName('Docker', 'docker')).toMatch(/lowercase/)
+    expect(validateRepoName('a..b', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('a___b', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('trailing-', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('new', 'docker')).toMatch(/"new" is reserved/)
+    // NuGet keeps its own (case-insensitive) rule.
+    expect(validateRepoName('Docker')).toBeNull()
+  })
+
+  it('accepts a DNS name as host and rejects schemes, ports and bare names', () => {
+    expect(validateDockerHost('')).toBeNull()
+    expect(validateDockerHost('docker.example.com')).toBeNull()
+    for (const bad of [
+      'https://docker.example.com',
+      'docker.example.com:5000',
+      'docker.example.com/path',
+      'localhost',
+      '-bad.example.com',
+    ]) {
+      expect(validateDockerHost(bad)).toMatch(/DNS name/)
+    }
+  })
+})
+
+/** A stored hosted docker repository with a host. */
+const storedDocker: RepoView = {
+  ...storedProxy,
+  id: 9,
+  name: 'docker-hosted',
+  format: 'docker',
+  kind: 'hosted',
+  remote_url: null,
+  upstream_username: null,
+  has_upstream_password: false,
+  metadata_ttl_seconds: null,
+  not_found_ttl_seconds: null,
+  host: 'docker.example.com',
+  immutable_tags: false,
+  latest_mutable: false,
+}
+
+describe('docker repositories: update body', () => {
+  it('shows the format read-only and sends nothing when untouched', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+
+    const format = screen.getByLabelText('Format') as HTMLInputElement
+    expect(format.readOnly).toBe(true)
+    expect(format).toHaveValue('Docker')
+    expect(screen.getByLabelText('Host')).toHaveValue('docker.example.com')
+    await save(user)
+
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({})
+  })
+
+  it('an emptied host is sent as null; a changed one as the value', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+    const host = screen.getByLabelText('Host')
+
+    await user.clear(host)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({ host: null })
+
+    await user.type(host, 'registry.example.com')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({
+      host: 'registry.example.com',
+    })
+  })
+
+  it('diffs immutable_tags / latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByLabelText(/Allow moving latest/))
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({
+      immutable_tags: true,
+      latest_mutable: true,
+    })
+
+    const immutable = { ...storedDocker, immutable_tags: true, latest_mutable: true }
+    expect(
+      toUpdateBody({ ...lastValues(onSubmit), immutable_tags: false }, immutable),
+    ).toEqual({ immutable_tags: false, latest_mutable: false })
+  })
+
+  it('a docker group sets and clears its writable member', async () => {
+    const group: RepoView = {
+      ...storedDocker,
+      name: 'docker-group',
+      kind: 'group',
+      host: null,
+      prefer_hosted: true,
+      writable_member: 'docker-hosted',
+    }
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(group)
+    const member = screen.getByLabelText('Writable member')
+    expect(member).toHaveValue('docker-hosted')
+
+    await user.clear(member)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), group)).toEqual({
+      writable_member: null,
+    })
+
+    await user.type(member, 'docker-releases')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), group)).toEqual({
+      writable_member: 'docker-releases',
+    })
+  })
+
+  it('never sends NuGet-only or docker-only fields across formats', () => {
+    // A docker proxy: changing the hidden delay value sends nothing.
+    const dockerProxy: RepoView = {
+      ...storedDocker,
+      kind: 'proxy',
+      remote_url: 'https://ghcr.io',
+      host: null,
+    }
+    const values = {
+      ...lastValuesOf(dockerProxy),
+      package_delay_seconds: '3600',
+      allow_redeploy: true,
+    }
+    expect(toUpdateBody(values, dockerProxy)).toEqual({})
+
+    // A NuGet repository: docker values never reach the body.
+    expect(
+      toUpdateBody(
+        {
+          ...lastValuesOf(storedProxy),
+          host: 'docker.example.com',
+          writable_member: 'x',
+          immutable_tags: true,
+        },
+        storedProxy,
+      ),
+    ).toEqual({})
+  })
+})
+
+/** The values an untouched edit of `existing` submits. */
+function lastValuesOf(existing: RepoView): RepoFormValues {
+  const onSubmit = vi.fn()
+  const { unmount } = render(
+    <RepositoryForm
+      mode="edit"
+      existing={existing}
+      submitting={false}
+      onSubmit={onSubmit}
+      onCancel={() => {}}
+    />,
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  unmount()
+  return lastValues(onSubmit)
+}

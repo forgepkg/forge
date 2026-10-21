@@ -80,8 +80,12 @@ impl OciError {
     }
 
     pub fn blob_unknown(digest: &str) -> Self {
-        Self::new(StatusCode::NOT_FOUND, Code::BlobUnknown, "blob unknown to registry")
-            .with_detail(serde_json::json!({ "digest": digest }))
+        Self::new(
+            StatusCode::NOT_FOUND,
+            Code::BlobUnknown,
+            "blob unknown to registry",
+        )
+        .with_detail(serde_json::json!({ "digest": digest }))
     }
 
     pub fn manifest_unknown(reference: &str) -> Self {
@@ -191,7 +195,10 @@ impl IntoResponse for OciError {
         let body = serde_json::json!({ "errors": [error] }).to_string();
         let mut response = (
             self.status,
-            [(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
             body,
         )
             .into_response();

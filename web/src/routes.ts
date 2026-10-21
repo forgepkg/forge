@@ -12,8 +12,11 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *     /login            -> Login.tsx            (user+password or realm login)
  *     layout 'app'      -> AppLayout.tsx        (login-gated nav shell)
  *       index           -> Browse.tsx           (folder view root: repositories)
- *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages + search)
+ *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages or images + search)
  *       /packages/...   -> PackageDetail.tsx    (versions + dependencies)
+ *       /images/$repo/$ -> ImageDetail.tsx      (docker image: tags + manifests;
+ *                                                the splat is the image name,
+ *                                                which may contain `/`)
  *       /tokens         -> Tokens.tsx           (self-service registry tokens)
  *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin)
  *
@@ -29,6 +32,7 @@ export const routes = rootRoute('root.tsx', [
     index('Browse.tsx'),
     route('/repos/$repo', 'RepoBrowse.tsx'),
     route('/packages/$repo/$id', 'PackageDetail.tsx'),
+    route('/images/$repo/$', 'ImageDetail.tsx'),
     route('/tokens', 'Tokens.tsx'),
     route('/manage', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),

@@ -208,13 +208,9 @@ impl Registry {
             }
             (Endpoint::UploadStart { .. }, &Method::POST) => self.start_upload(&ctx, req).await,
             (Endpoint::Upload { id, .. }, &Method::GET) => self.upload_status(&ctx, id).await,
-            (Endpoint::Upload { id, .. }, &Method::PATCH) => {
-                self.patch_upload(&ctx, id, req).await
-            }
+            (Endpoint::Upload { id, .. }, &Method::PATCH) => self.patch_upload(&ctx, id, req).await,
             (Endpoint::Upload { id, .. }, &Method::PUT) => self.finish_upload(&ctx, id, req).await,
-            (Endpoint::Upload { id, .. }, &Method::DELETE) => {
-                self.cancel_upload(&ctx, id).await
-            }
+            (Endpoint::Upload { id, .. }, &Method::DELETE) => self.cancel_upload(&ctx, id).await,
             (Endpoint::TagsList { .. }, &Method::GET) => {
                 self.tags_list(&ctx, req.uri().query().unwrap_or_default())
                     .await
@@ -288,7 +284,12 @@ impl Registry {
 
     /// The effective caller: a registry Bearer token's principal, else the
     /// middleware's.
-    async fn caller(&self, principal: Principal, headers: &HeaderMap, site: &Site) -> OciResult<Caller> {
+    async fn caller(
+        &self,
+        principal: Principal,
+        headers: &HeaderMap,
+        site: &Site,
+    ) -> OciResult<Caller> {
         let Some(bearer) = bearer_token(headers) else {
             return Ok(Caller {
                 principal,
@@ -317,7 +318,10 @@ impl Registry {
         let claims = token::verify(&self.inner.keys, bearer, &site.issuer, &site.service)
             .ok_or_else(invalid)?;
         let principal = claims.fp.to_principal(principal).ok_or_else(invalid)?;
-        let principal = self.refresh_principal(principal).await?.ok_or_else(invalid)?;
+        let principal = self
+            .refresh_principal(principal)
+            .await?
+            .ok_or_else(invalid)?;
         Ok(Caller {
             principal,
             claims: Some(claims),
@@ -399,7 +403,12 @@ impl Registry {
     /// Whether the caller may `action` the target's image: the repository
     /// permission and its content selectors, then a registry token's scope
     /// (checked against the name the client used).
-    pub(crate) async fn decide(&self, caller: &Caller, target: &Target, action: Action) -> Decision {
+    pub(crate) async fn decide(
+        &self,
+        caller: &Caller,
+        target: &Target,
+        action: Action,
+    ) -> Decision {
         if !self
             .rbac_allows(&caller.principal, &target.repo, &target.image, action)
             .await
@@ -482,9 +491,7 @@ impl Registry {
             .await
         {
             match &caller.claims {
-                Some(claims) if !claims_allow(claims, &target.name, action) => {
-                    Decision::NeedsScope
-                }
+                Some(claims) if !claims_allow(claims, &target.name, action) => Decision::NeedsScope,
                 _ => Decision::Allow,
             }
         } else {
@@ -497,7 +504,10 @@ impl Registry {
     }
 
     /// A group's writable member, if configured and a hosted docker member.
-    pub(crate) async fn writable_member(&self, group: &Repository) -> OciResult<Option<Repository>> {
+    pub(crate) async fn writable_member(
+        &self,
+        group: &Repository,
+    ) -> OciResult<Option<Repository>> {
         let Some(name) = group.writable_member() else {
             return Ok(None);
         };
@@ -524,13 +534,18 @@ impl Registry {
         match decision {
             Decision::NeedsScope => self.challenge_error(site, name, action, error),
             Decision::Deny if !authenticated => self.challenge_error(site, name, action, error),
-            _ => OciError::denied("requested access to the resource is denied").with_detail(
-                serde_json::json!({ "name": name, "action": scope_actions(action) }),
-            ),
+            _ => OciError::denied("requested access to the resource is denied")
+                .with_detail(serde_json::json!({ "name": name, "action": scope_actions(action) })),
         }
     }
 
-    fn challenge_error(&self, site: &Site, name: &str, action: Action, error: Option<&str>) -> OciError {
+    fn challenge_error(
+        &self,
+        site: &Site,
+        name: &str,
+        action: Action,
+        error: Option<&str>,
+    ) -> OciError {
         let scope = format!("repository:{name}:{}", scope_actions(action));
         OciError::new(
             StatusCode::UNAUTHORIZED,
@@ -538,7 +553,10 @@ impl Registry {
             "authentication required",
         )
         .with_detail(serde_json::json!({ "name": name, "action": scope_actions(action) }))
-        .with_header(header::WWW_AUTHENTICATE, site.challenge(Some(&scope), error))
+        .with_header(
+            header::WWW_AUTHENTICATE,
+            site.challenge(Some(&scope), error),
+        )
     }
 
     fn version_check(&self, caller: &Caller, site: &Site) -> OciResult<Response> {
@@ -772,7 +790,10 @@ mod tests {
     #[test]
     fn bearer_values() {
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer abc"));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer abc"),
+        );
         assert_eq!(bearer_token(&h), Some("abc"));
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
         assert_eq!(bearer_token(&h), None);

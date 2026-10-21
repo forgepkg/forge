@@ -205,13 +205,15 @@ fn descriptor(raw: RawDescriptor, what: &str) -> Result<Descriptor, ManifestErro
         .digest
         .as_deref()
         .ok_or_else(|| ManifestError::Invalid(format!("{what} has no digest")))?;
-    let digest = Digest::parse(digest)
-        .map_err(|e| ManifestError::Invalid(format!("{what}: {e}")))?;
+    let digest =
+        Digest::parse(digest).map_err(|e| ManifestError::Invalid(format!("{what}: {e}")))?;
     let size = raw
         .size
         .ok_or_else(|| ManifestError::Invalid(format!("{what} has no size")))?;
     if size < 0 {
-        return Err(ManifestError::Invalid(format!("{what} has a negative size")));
+        return Err(ManifestError::Invalid(format!(
+            "{what} has a negative size"
+        )));
     }
     Ok(Descriptor {
         media_type: raw.media_type.unwrap_or_default(),
@@ -226,11 +228,7 @@ fn descriptor(raw: RawDescriptor, what: &str) -> Result<Descriptor, ManifestErro
 
 /// The media type of a `Content-Type` header value, without parameters.
 pub fn base_media_type(content_type: &str) -> &str {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
+    content_type.split(';').next().unwrap_or_default().trim()
 }
 
 /// Parse `bytes` as a manifest. `content_type` is the request's
@@ -248,9 +246,9 @@ pub fn parse(bytes: &[u8], content_type: Option<&str>) -> Result<ParsedManifest,
     }
     let raw: RawManifest =
         serde_json::from_slice(bytes).map_err(|e| ManifestError::Json(e.to_string()))?;
-    let declared = content_type
-        .map(base_media_type)
-        .filter(|ct| !ct.is_empty() && *ct != "application/json" && *ct != "application/octet-stream");
+    let declared = content_type.map(base_media_type).filter(|ct| {
+        !ct.is_empty() && *ct != "application/json" && *ct != "application/octet-stream"
+    });
 
     let field = raw.media_type.as_deref().filter(|m| !m.is_empty());
     if let (Some(field), Some(declared)) = (field, declared) {
@@ -284,10 +282,7 @@ pub fn parse(bytes: &[u8], content_type: Option<&str>) -> Result<ParsedManifest,
         media::OCI_INDEX | media::DOCKER_MANIFEST_LIST => ManifestKind::Index,
         _ => ManifestKind::Image,
     };
-    let subject = raw
-        .subject
-        .map(|s| descriptor(s, "subject"))
-        .transpose()?;
+    let subject = raw.subject.map(|s| descriptor(s, "subject")).transpose()?;
 
     let (config, layers, manifests) = match kind {
         ManifestKind::Index => {
@@ -460,7 +455,11 @@ mod tests {
             parse(body.as_bytes(), Some(media::DOCKER_MANIFEST)),
             Err(ManifestError::Invalid(_))
         ));
-        assert!(parse(body.as_bytes(), Some(&format!("{}; charset=utf-8", media::OCI_MANIFEST))).is_ok());
+        assert!(parse(
+            body.as_bytes(),
+            Some(&format!("{}; charset=utf-8", media::OCI_MANIFEST))
+        )
+        .is_ok());
 
         let schema1 = serde_json::json!({"schemaVersion": 1, "name": "x", "tag": "y"}).to_string();
         assert!(matches!(
@@ -476,7 +475,10 @@ mod tests {
         .to_string();
         assert!(parse(bad_digest.as_bytes(), None).is_err());
 
-        assert!(matches!(parse(b"not json", None), Err(ManifestError::Json(_))));
+        assert!(matches!(
+            parse(b"not json", None),
+            Err(ManifestError::Json(_))
+        ));
     }
 
     #[test]

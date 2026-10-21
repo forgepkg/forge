@@ -12,11 +12,11 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt};
 use forge_core::authz::Action;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::RepoKind;
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
+use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
@@ -33,6 +33,18 @@ use crate::service::{location, Decision, Registry, RequestCtx, Target};
 /// Config blobs larger than this are not read for the platform summary.
 const MAX_CONFIG_SUMMARY_BYTES: i64 = 1024 * 1024;
 
+/// Refuse to commit a link whose blob turned out to be gone or being
+/// deleted: dropping the transaction rolls the link row back, so no link
+/// ever exists without its reference.
+pub(crate) fn require_linked(outcome: LinkOutcome) -> OciResult<()> {
+    match outcome {
+        LinkOutcome::BlobUnavailable => Err(OciError::unavailable(
+            "the blob is being removed from storage; retry the upload",
+        )),
+        LinkOutcome::Inserted | LinkOutcome::AlreadyLinked => Ok(()),
+    }
+}
+
 /// A request body as an `AsyncRead`.
 fn body_reader(body: Body) -> impl tokio::io::AsyncRead + Unpin + Send {
     StreamReader::new(body.into_data_stream().map_err(std::io::Error::other))
@@ -44,7 +56,11 @@ async fn read_body(body: Body, limit: usize) -> OciResult<Bytes> {
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
-            OciError::new(StatusCode::BAD_REQUEST, Code::ManifestInvalid, format!("reading the body: {e}"))
+            OciError::new(
+                StatusCode::BAD_REQUEST,
+                Code::ManifestInvalid,
+                format!("reading the body: {e}"),
+            )
         })?;
         if out.len() + chunk.len() > limit {
             return Err(OciError::too_large(limit as u64));
@@ -126,21 +142,27 @@ impl Registry {
 
     // ── Uploads ─────────────────────────────────────────────────────────────
 
-    pub(crate) async fn start_upload(&self, ctx: &RequestCtx, req: Request<Body>) -> OciResult<Response> {
+    pub(crate) async fn start_upload(
+        &self,
+        ctx: &RequestCtx,
+        req: Request<Body>,
+    ) -> OciResult<Response> {
         let t = ctx.serving();
         let name = &ctx.target.name;
         let query = req.uri().query().unwrap_or_default().to_string();
         let params: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
-        let param = |k: &str| params.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        let param = |k: &str| {
+            params
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
 
         if let Some(mount) = param("mount") {
             let digest = parse_digest(&mount)?;
-            if self
-                .mount(ctx, &digest, param("from").as_deref())
-                .await?
-            {
+            if self.mount(ctx, &digest, param("from").as_deref()).await? {
                 return Ok(blob_created(name, digest.as_str()));
             }
             // Not mountable: fall back to a regular upload session.
@@ -151,7 +173,10 @@ impl Registry {
             let staged = self
                 .inner
                 .cas
-                .stage(body_reader(req.into_body()), self.inner.config.max_blob_bytes)
+                .stage(
+                    body_reader(req.into_body()),
+                    self.inner.config.max_blob_bytes,
+                )
                 .await?;
             if !digest.matches(&staged.sha256, &staged.sha512_base64) {
                 return Err(OciError::digest_invalid(
@@ -169,7 +194,9 @@ impl Registry {
                 stored.size as i64,
                 stored.ingest_token,
             )
-            .await?;
+            .await
+            .map_err(OciError::from)
+            .and_then(require_linked)?;
             tx.commit().await?;
             return Ok(blob_created(name, digest.as_str()));
         }
@@ -189,7 +216,12 @@ impl Registry {
     /// Link `digest` into the target image without uploading it: from the
     /// image `from` the caller may read, or (without `from`) when the image
     /// already has it. `false` when it cannot be mounted.
-    async fn mount(&self, ctx: &RequestCtx, digest: &Digest, from: Option<&str>) -> OciResult<bool> {
+    async fn mount(
+        &self,
+        ctx: &RequestCtx,
+        digest: &Digest,
+        from: Option<&str>,
+    ) -> OciResult<bool> {
         let t = ctx.serving();
         let pool = &self.inner.pool;
         if oci_dao::find_link(pool, t.repo.id, &t.image, digest.as_str())
@@ -245,7 +277,11 @@ impl Registry {
 
     pub(crate) async fn upload_status(&self, ctx: &RequestCtx, id: &str) -> OciResult<Response> {
         let upload = self.upload_of(ctx, id).await?;
-        Ok(upload_accepted(StatusCode::NO_CONTENT, &ctx.target.name, &upload))
+        Ok(upload_accepted(
+            StatusCode::NO_CONTENT,
+            &ctx.target.name,
+            &upload,
+        ))
     }
 
     pub(crate) async fn cancel_upload(&self, ctx: &RequestCtx, id: &str) -> OciResult<Response> {
@@ -282,10 +318,15 @@ impl Registry {
         }
         let max = self.inner.config.max_blob_bytes;
         let remaining = max.saturating_sub(upload.size.max(0) as u64);
-        let staged = self.inner.cas.stage(body_reader(body), remaining).await.map_err(|e| match e {
-            forge_storage::CasError::TooLarge { .. } => OciError::too_large(max),
-            other => other.into(),
-        })?;
+        let staged = self
+            .inner
+            .cas
+            .stage(body_reader(body), remaining)
+            .await
+            .map_err(|e| match e {
+                forge_storage::CasError::TooLarge { .. } => OciError::too_large(max),
+                other => other.into(),
+            })?;
         if let Some((start, end)) = range {
             if staged.size as i64 != end - start + 1 {
                 return Err(OciError::new(
@@ -327,14 +368,28 @@ impl Registry {
         })
     }
 
-    pub(crate) async fn patch_upload(&self, ctx: &RequestCtx, id: &str, req: Request<Body>) -> OciResult<Response> {
+    pub(crate) async fn patch_upload(
+        &self,
+        ctx: &RequestCtx,
+        id: &str,
+        req: Request<Body>,
+    ) -> OciResult<Response> {
         let upload = self.upload_of(ctx, id).await?;
         let range = content_range(req.headers())?;
         let upload = self.append_chunk(&upload, range, req.into_body()).await?;
-        Ok(upload_accepted(StatusCode::ACCEPTED, &ctx.target.name, &upload))
+        Ok(upload_accepted(
+            StatusCode::ACCEPTED,
+            &ctx.target.name,
+            &upload,
+        ))
     }
 
-    pub(crate) async fn finish_upload(&self, ctx: &RequestCtx, id: &str, req: Request<Body>) -> OciResult<Response> {
+    pub(crate) async fn finish_upload(
+        &self,
+        ctx: &RequestCtx,
+        id: &str,
+        req: Request<Body>,
+    ) -> OciResult<Response> {
         let t = ctx.serving();
         let upload = self.upload_of(ctx, id).await?;
         let digest = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
@@ -347,7 +402,8 @@ impl Registry {
         let pool = &self.inner.pool;
         let parts = oci_dao::upload_parts(pool, upload.id).await?;
 
-        let mismatch = || OciError::digest_invalid("the uploaded content does not match the digest");
+        let mismatch =
+            || OciError::digest_invalid("the uploaded content does not match the digest");
         // The blob: the single chunk itself, or the chunks assembled.
         let mut tx;
         match parts.as_slice() {
@@ -402,7 +458,10 @@ impl Registry {
                 let staged = self
                     .inner
                     .cas
-                    .stage(StreamReader::new(Box::pin(chunks)), self.inner.config.max_blob_bytes)
+                    .stage(
+                        StreamReader::new(Box::pin(chunks)),
+                        self.inner.config.max_blob_bytes,
+                    )
                     .await?;
                 if staged.size as i64 != upload.size
                     || !digest.matches(&staged.sha256, &staged.sha512_base64)
@@ -427,7 +486,9 @@ impl Registry {
                     stored.size as i64,
                     stored.ingest_token,
                 )
-                .await?;
+                .await
+                .map_err(OciError::from)
+                .and_then(require_linked)?;
                 oci_dao::delete_upload(&mut tx, upload.id, self.grace()).await?;
                 tx.commit().await?;
                 return Ok(blob_created(&ctx.target.name, digest.as_str()));
@@ -452,14 +513,21 @@ impl Registry {
 
     // ── Manifests ───────────────────────────────────────────────────────────
 
-    pub(crate) async fn put_manifest(&self, ctx: &RequestCtx, reference: &str, req: Request<Body>) -> OciResult<Response> {
+    pub(crate) async fn put_manifest(
+        &self,
+        ctx: &RequestCtx,
+        reference: &str,
+        req: Request<Body>,
+    ) -> OciResult<Response> {
         let t = ctx.serving();
         let reference = parse_reference(reference)?;
         let mut tags: Vec<String> = Vec::new();
         if let Reference::Tag(tag) = &reference {
             tags.push(tag.clone());
         }
-        for (key, value) in url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()) {
+        for (key, value) in
+            url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
+        {
             if key == "tag" {
                 if !reference::valid_tag(&value) {
                     return Err(OciError::manifest_invalid(format!("invalid tag {value:?}")));
@@ -524,7 +592,8 @@ impl Registry {
             .with_detail(serde_json::json!({ "digest": missing })));
         }
         if !children.is_empty() {
-            let present = oci_dao::existing_manifests(&mut tx, t.repo.id, &t.image, &children).await?;
+            let present =
+                oci_dao::existing_manifests(&mut tx, t.repo.id, &t.image, &children).await?;
             if let Some(missing) = children.iter().find(|d| !present.contains(d)) {
                 return Err(OciError::new(
                     StatusCode::BAD_REQUEST,
@@ -561,7 +630,8 @@ impl Registry {
         let immutable = t.repo.immutable_tags();
         for tag in &tags {
             let may_move = !immutable || (tag == "latest" && t.repo.latest_mutable());
-            match oci_dao::set_tag(&mut tx, t.repo.id, &t.image, tag, manifest_id, may_move).await? {
+            match oci_dao::set_tag(&mut tx, t.repo.id, &t.image, tag, manifest_id, may_move).await?
+            {
                 TagWrite::Refused => {
                     return Err(OciError::denied(format!(
                         "tag {tag:?} already exists and tags are immutable in this repository"
@@ -637,13 +707,19 @@ impl Registry {
             stored.size as i64,
             stored.ingest_token,
         )
-        .await?;
+        .await
+        .map_err(OciError::from)
+        .and_then(require_linked)?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Display data of a manifest: platforms, layer total, annotations.
-    pub(crate) async fn manifest_summary(&self, t: &Target, parsed: &ParsedManifest) -> serde_json::Value {
+    pub(crate) async fn manifest_summary(
+        &self,
+        t: &Target,
+        parsed: &ParsedManifest,
+    ) -> serde_json::Value {
         let mut summary = serde_json::Map::new();
         match parsed.kind {
             ManifestKind::Index => {
@@ -657,11 +733,23 @@ impl Registry {
                 summary.insert("platforms".into(), serde_json::json!(platforms));
             }
             ManifestKind::Image => {
-                summary.insert("layers_size".into(), serde_json::json!(parsed.layers_size()));
+                summary.insert(
+                    "layers_size".into(),
+                    serde_json::json!(parsed.layers_size()),
+                );
                 summary.insert("layers".into(), serde_json::json!(parsed.layers.len()));
                 if let Some(config) = &parsed.config {
-                    summary.insert("config_media_type".into(), serde_json::json!(config.media_type));
-                    if is_image_config(&config.media_type) && config.size <= MAX_CONFIG_SUMMARY_BYTES {
+                    summary.insert(
+                        "config_media_type".into(),
+                        serde_json::json!(config.media_type),
+                    );
+                    summary.insert(
+                        "config_digest".into(),
+                        serde_json::json!(config.digest.as_str()),
+                    );
+                    if is_image_config(&config.media_type)
+                        && config.size <= MAX_CONFIG_SUMMARY_BYTES
+                    {
                         if let Some(platform) = self.config_platform(t, &config.digest).await {
                             summary.insert("platform".into(), serde_json::json!(platform.label()));
                         }
@@ -685,19 +773,32 @@ impl Registry {
         let link = oci_dao::find_link(&self.inner.pool, t.repo.id, &t.image, digest.as_str())
             .await
             .ok()??;
-        let bytes = self.read_manifest_bytes(&link.s3_key, link.size).await.ok()?;
+        let bytes = self
+            .read_manifest_bytes(&link.s3_key, link.size)
+            .await
+            .ok()?;
         config_platform(&bytes)
     }
 
-    pub(crate) async fn delete_manifest(&self, ctx: &RequestCtx, reference: &str) -> OciResult<Response> {
+    pub(crate) async fn delete_manifest(
+        &self,
+        ctx: &RequestCtx,
+        reference: &str,
+    ) -> OciResult<Response> {
         let t = ctx.serving();
         let reference = parse_reference(reference)?;
         let mut tx = self.inner.pool.begin().await?;
         let deleted = match &reference {
             Reference::Tag(tag) => oci_dao::delete_tag(&mut tx, t.repo.id, &t.image, tag).await?,
             Reference::Digest(digest) => {
-                oci_dao::delete_manifest(&mut tx, t.repo.id, &t.image, digest.as_str(), self.grace())
-                    .await?
+                oci_dao::delete_manifest(
+                    &mut tx,
+                    t.repo.id,
+                    &t.image,
+                    digest.as_str(),
+                    self.grace(),
+                )
+                .await?
             }
         };
         tx.commit().await?;
@@ -720,7 +821,8 @@ impl Registry {
             .with_detail(serde_json::json!({ "digest": digest.as_str() })));
         }
         let deleted =
-            oci_dao::delete_link(&mut tx, t.repo.id, &t.image, digest.as_str(), self.grace()).await?;
+            oci_dao::delete_link(&mut tx, t.repo.id, &t.image, digest.as_str(), self.grace())
+                .await?;
         tx.commit().await?;
         if !deleted {
             return Err(OciError::blob_unknown(digest.as_str()));
@@ -788,9 +890,9 @@ impl Registry {
 /// A manifest parse failure as the client sees it.
 fn manifest_error(e: ManifestError) -> OciError {
     match e {
-        ManifestError::UnsupportedMediaType(m) => OciError::manifest_invalid(format!(
-            "unsupported manifest media type {m:?}"
-        )),
+        ManifestError::UnsupportedMediaType(m) => {
+            OciError::manifest_invalid(format!("unsupported manifest media type {m:?}"))
+        }
         other => OciError::manifest_invalid(other.to_string()),
     }
 }
@@ -805,7 +907,10 @@ mod tests {
         assert_eq!(content_range(&h).unwrap(), None);
         h.insert(header::CONTENT_RANGE, HeaderValue::from_static("0-99"));
         assert_eq!(content_range(&h).unwrap(), Some((0, 99)));
-        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes 100-199/*"));
+        h.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 100-199/*"),
+        );
         assert_eq!(content_range(&h).unwrap(), Some((100, 199)));
         h.insert(header::CONTENT_RANGE, HeaderValue::from_static("9-1"));
         assert!(content_range(&h).is_err());

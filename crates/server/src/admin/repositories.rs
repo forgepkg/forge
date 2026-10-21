@@ -18,12 +18,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
-use forge_db::{component_dao, oci_dao};
 use forge_db::model::{
     RepoKind, Repository, DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
     NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
+use forge_db::{component_dao, oci_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -322,7 +322,9 @@ fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, Strin
         let valid = !prefix.is_empty()
             && prefix.len() <= 100
             && prefix.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') || (docker && b == b'/')
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'_' | b'-')
+                    || (docker && b == b'/')
             });
         if !valid {
             return Err(if docker {
@@ -893,6 +895,15 @@ pub async fn update(
     if existing.kind() == RepoKind::Proxy && updated.remote_url != existing.remote_url {
         if let Err(e) = forge_db::proxy_dao::reset_for_new_upstream(&mut tx, updated.id).await {
             return db_error(e);
+        }
+        // A docker proxy's tags name what the previous upstream served:
+        // the repointed proxy starts with an empty cache.
+        if existing.is_docker() {
+            if let Err(e) =
+                oci_dao::purge_repository(&mut tx, updated.id, state.config.outbox.grace()).await
+            {
+                return db_error(e);
+            }
         }
     }
 

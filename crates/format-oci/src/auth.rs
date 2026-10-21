@@ -18,7 +18,12 @@ use crate::service::{mutation_credential, Caller, Registry, Site};
 use crate::token::{self, Access, Claims, TokenPrincipal};
 
 impl Registry {
-    pub(crate) async fn token(&self, caller: &Caller, site: &Site, query: &str) -> OciResult<Response> {
+    pub(crate) async fn token(
+        &self,
+        caller: &Caller,
+        site: &Site,
+        query: &str,
+    ) -> OciResult<Response> {
         // A registry token is never a credential for another one: it would
         // let a short-lived token renew itself forever.
         let principal = if caller.claims.is_some() {
@@ -51,7 +56,9 @@ impl Registry {
 
         let mut access = Vec::new();
         for scope in scopes {
-            let granted = self.granted(&principal, site, &scope.name, &scope.actions).await;
+            let granted = self
+                .granted(&principal, site, &scope.name, &scope.actions)
+                .await;
             access.push(Access {
                 kind: "repository".into(),
                 name: scope.name,
@@ -107,7 +114,13 @@ impl Registry {
 
     /// The subset of `requested` actions the principal may perform on the
     /// repository `name`. An unknown repository grants nothing.
-    async fn granted(&self, principal: &Principal, site: &Site, name: &str, requested: &[String]) -> Vec<String> {
+    async fn granted(
+        &self,
+        principal: &Principal,
+        site: &Site,
+        name: &str,
+        requested: &[String],
+    ) -> Vec<String> {
         let Ok(Some(target)) = self.resolve(site, name).await else {
             return Vec::new();
         };
@@ -122,7 +135,9 @@ impl Registry {
         if (wants("push") || wants("delete")) && mutation_credential(principal) {
             let landing = match target.repo.kind() {
                 RepoKind::Hosted => Some(target.repo.clone()),
-                RepoKind::Group if readable => self.writable_member(&target.repo).await.ok().flatten(),
+                RepoKind::Group if readable => {
+                    self.writable_member(&target.repo).await.ok().flatten()
+                }
                 _ => None,
             };
             if let Some(landing) = landing {

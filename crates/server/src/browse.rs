@@ -88,6 +88,9 @@ pub struct BrowseRepo {
     /// repository is listed, but its packages answer 503 like its feed; an
     /// offline proxy still shows what it cached.
     pub online: bool,
+    /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
+    /// browsed through `/browse/images`.
+    pub format: String,
 }
 
 /// `GET /browse/repos` — the repositories the caller may read, sorted by name.
@@ -112,6 +115,7 @@ pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Reque
                 name: repo.name.clone(),
                 kind: repo.kind.clone(),
                 online: repo.online,
+                format: repo.format.clone(),
             });
         }
     }
@@ -208,6 +212,10 @@ pub async fn search_packages(
             if &repo.name != filter {
                 continue;
             }
+        }
+        // Package search covers NuGet; images are listed by /browse/images.
+        if repo.is_docker() {
+            continue;
         }
         if state.authz.can_read(&principal, repo).await {
             readable.push(repo);
@@ -367,13 +375,14 @@ pub async fn package_detail(
     }
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        Ok(Some(r)) => r,
+        // A docker repository holds images (`/browse/images`), not packages.
+        Ok(Some(r)) if !r.is_docker() => r,
         // An unknown name answers like an unreadable repository (no name
         // enumeration), except to a global admin.
-        Ok(None) if state.authz.is_global_admin(&principal).await => {
+        Ok(_) if state.authz.is_global_admin(&principal).await => {
             return (StatusCode::NOT_FOUND, "repository not found").into_response();
         }
-        Ok(None) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
+        Ok(_) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
         Err(e) => return db_error(e),
     };
 
@@ -602,4 +611,9 @@ pub fn browse_router() -> Router<AppState> {
         .route("/browse/repos", get(list_repos))
         .route("/browse/packages", get(search_packages))
         .route("/browse/packages/{repo}/{id}", get(package_detail))
+        .route("/browse/images", get(crate::browse_images::list_images))
+        .route(
+            "/browse/images/{repo}/{*image}",
+            get(crate::browse_images::image_detail),
+        )
 }

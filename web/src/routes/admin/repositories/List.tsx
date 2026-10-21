@@ -19,6 +19,7 @@ import {
   TableRow,
 } from '~/components/catalyst/table'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
+import { RepoFormatBadge } from '~/components/RepoFormatBadge'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
@@ -27,10 +28,10 @@ export const Route = createFileRoute('/_app/manage/repositories')({
 })
 
 /**
- * Admin repositories list (plan §Phase 4). Lists every repository with its kind,
- * online / anonymous-read flags, and links to edit / (for groups) members /
- * delete. Delete surfaces the server's conflict message inline (a hosted repo
- * with packages refuses deletion).
+ * Admin repositories list (plan §Phase 4). Lists every repository with its
+ * format (NuGet / Docker), kind, online / anonymous-read flags, and links to
+ * edit / (for groups) members / delete. Delete surfaces the server's conflict
+ * message inline (a hosted repo with packages refuses deletion).
  */
 function RepositoriesList() {
   const repos = useRepositories()
@@ -49,7 +50,8 @@ function RepositoriesList() {
         <div>
           <Heading>Repositories</Heading>
           <Text className="mt-1">
-            Create and manage hosted, proxy, and group repositories.
+            Create and manage hosted, proxy, and group repositories — NuGet
+            feeds and Docker registries.
           </Text>
         </div>
         <Button href="/manage/repositories/new">New repository</Button>
@@ -81,6 +83,7 @@ function RepositoriesList() {
           <TableHead>
             <TableRow>
               <TableHeader>Name</TableHeader>
+              <TableHeader>Format</TableHeader>
               <TableHeader>Kind</TableHeader>
               <TableHeader>Status</TableHeader>
               <TableHeader>Actions</TableHeader>
@@ -136,6 +139,9 @@ function RepoRow({
         >
           {repo.name}
         </button>
+      </TableCell>
+      <TableCell>
+        <RepoFormatBadge format={repo.format} />
       </TableCell>
       <TableCell>
         <RepoKindBadge kind={repo.kind} />

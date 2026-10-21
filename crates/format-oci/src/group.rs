@@ -41,8 +41,17 @@ impl Registry {
         let mut leaves = Vec::new();
         let mut owners = HashSet::new();
         let mut path = HashSet::from([group.id]);
-        self.walk(caller, group, image, depth, &mut path, &mut leaves, &mut owners, true)
-            .await?;
+        self.walk(
+            caller,
+            group,
+            image,
+            depth,
+            &mut path,
+            &mut leaves,
+            &mut owners,
+            true,
+        )
+        .await?;
 
         let reserved = group
             .reserved_prefixes()
@@ -105,8 +114,17 @@ impl Registry {
                             continue;
                         }
                         path.insert(member.id);
-                        self.walk(caller, &member, image, depth + 1, path, leaves, owners, member_owns)
-                            .await?;
+                        self.walk(
+                            caller,
+                            &member,
+                            image,
+                            depth + 1,
+                            path,
+                            leaves,
+                            owners,
+                            member_owns,
+                        )
+                        .await?;
                         path.remove(&member.id);
                     }
                     RepoKind::Hosted => {
@@ -134,7 +152,10 @@ impl Registry {
     ) -> OciResult<Option<ManifestHit>> {
         let mut failure: Option<OciError> = None;
         for member in self.serving_members(caller, group, image, depth).await? {
-            match self.manifest_from(caller, &member, image, reference, depth + 1).await {
+            match self
+                .manifest_from(caller, &member, image, reference, depth + 1)
+                .await
+            {
                 Ok(Some(hit)) => return Ok(Some(hit)),
                 Ok(None) => {}
                 Err(e) => {
@@ -156,7 +177,10 @@ impl Registry {
     ) -> OciResult<Option<BlobHit>> {
         let mut failure: Option<OciError> = None;
         for member in self.serving_members(caller, group, image, depth).await? {
-            match self.blob_from(caller, &member, image, digest, depth + 1).await {
+            match self
+                .blob_from(caller, &member, image, digest, depth + 1)
+                .await
+            {
                 Ok(Some(hit)) => return Ok(Some(hit)),
                 Ok(None) => {}
                 Err(e) => {
@@ -181,7 +205,10 @@ impl Registry {
         let mut failure: Option<OciError> = None;
         let mut tags: Vec<String> = Vec::new();
         for member in self.serving_members(caller, group, image, depth).await? {
-            match self.tags_from(caller, &member, image, last, limit, depth + 1).await {
+            match self
+                .tags_from(caller, &member, image, last, limit, depth + 1)
+                .await
+            {
                 Ok(Some(page)) => {
                     known = true;
                     tags.extend(page);
@@ -209,7 +236,10 @@ impl Registry {
     ) -> OciResult<Vec<ReferrerDescriptor>> {
         let mut out: Vec<ReferrerDescriptor> = Vec::new();
         for member in self.serving_members(caller, group, image, depth).await? {
-            match self.referrers_from(caller, &member, image, subject, depth + 1).await {
+            match self
+                .referrers_from(caller, &member, image, subject, depth + 1)
+                .await
+            {
                 Ok(found) => {
                     for r in found {
                         if !out.iter().any(|seen| seen.digest == r.digest) {

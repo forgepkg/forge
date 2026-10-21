@@ -56,9 +56,7 @@ pub fn parse(path: &str) -> Option<Endpoint> {
     }
     let segments: Vec<&str> = rest.split('/').collect();
     let n = segments.len();
-    let name = |upto: usize| -> Option<String> {
-        (upto > 0).then(|| segments[..upto].join("/"))
-    };
+    let name = |upto: usize| -> Option<String> { (upto > 0).then(|| segments[..upto].join("/")) };
     let last = segments[n - 1];
     let at = |i: usize| if i < n { segments[n - 1 - i] } else { "" };
 

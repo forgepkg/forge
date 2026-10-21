@@ -82,12 +82,18 @@ pub async fn purge_repository(
     )
     .fetch_all(&mut **tx)
     .await?;
-    sqlx::query!("DELETE FROM oci_upload WHERE repository_id = $1", repository_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query!("DELETE FROM oci_tag WHERE repository_id = $1", repository_id)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query!(
+        "DELETE FROM oci_upload WHERE repository_id = $1",
+        repository_id
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query!(
+        "DELETE FROM oci_tag WHERE repository_id = $1",
+        repository_id
+    )
+    .execute(&mut **tx)
+    .await?;
     shas.extend(
         sqlx::query_scalar!(
             "DELETE FROM oci_manifest WHERE repository_id = $1 RETURNING blob_sha256",
@@ -274,10 +280,7 @@ async fn insert_link_row(
 
 /// A committed CAS blob by its SHA-256 (for linking content Forge already
 /// stores), with its object key and size.
-pub async fn committed_blob(
-    pool: &PgPool,
-    sha256: &str,
-) -> sqlx::Result<Option<(String, i64)>> {
+pub async fn committed_blob(pool: &PgPool, sha256: &str) -> sqlx::Result<Option<(String, i64)>> {
     let row = sqlx::query!(
         "SELECT s3_key, size FROM blob WHERE sha256 = $1 AND state = 'committed'",
         sha256,
@@ -675,6 +678,59 @@ pub async fn set_manifest_summary(
     Ok(())
 }
 
+/// Record the platform of the image config `config_digest` on the image's
+/// manifests that name it and have none yet (a proxy caches a manifest
+/// before its config).
+pub async fn set_config_platform(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+    config_digest: &str,
+    platform: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE oci_manifest
+        SET summary = summary || jsonb_build_object('platform', $4::text)
+        WHERE repository_id = $1 AND image = $2
+          AND summary->>'config_digest' = $3
+          AND NOT summary ? 'platform'
+        "#,
+        repository_id,
+        image,
+        config_digest,
+        platform,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a manifest of the image names `config_digest` as its config and
+/// has no platform recorded yet.
+pub async fn config_needs_platform(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+    config_digest: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM oci_manifest
+            WHERE repository_id = $1 AND image = $2
+              AND summary->>'config_digest' = $3
+              AND NOT summary ? 'platform'
+        ) AS "exists!"
+        "#,
+        repository_id,
+        image,
+        config_digest,
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Which of `digests` are manifests of the image.
 pub async fn existing_manifests(
     tx: &mut Transaction<'_, Postgres>,
@@ -702,7 +758,9 @@ pub async fn existing_manifests(
 pub enum TagWrite {
     Created,
     /// The tag pointed at another manifest before.
-    Moved { previous: i64 },
+    Moved {
+        previous: i64,
+    },
     /// The tag already pointed at this manifest.
     Unchanged,
     /// The tag points at another manifest and may not be moved; nothing
@@ -802,7 +860,10 @@ pub async fn set_tag(
 }
 
 /// Set a manifest's `untagged_since` from whether any tag still points at it.
-async fn refresh_untagged(tx: &mut Transaction<'_, Postgres>, manifest_id: i64) -> sqlx::Result<()> {
+async fn refresh_untagged(
+    tx: &mut Transaction<'_, Postgres>,
+    manifest_id: i64,
+) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
         UPDATE oci_manifest
@@ -1057,6 +1118,8 @@ pub struct ManifestListing {
     pub created_at: DateTime<Utc>,
     pub last_pulled_at: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
+    /// An index's child manifests.
+    pub children: Vec<String>,
 }
 
 /// Every manifest of an image, newest first, with its tags.
@@ -1071,7 +1134,10 @@ pub async fn image_manifests(
         SELECT m.digest, m.media_type, m.artifact_type, m.subject_digest, m.size,
                m.summary, m.created_at, m.last_pulled_at,
                coalesce(array_agg(t.tag ORDER BY t.tag) FILTER (WHERE t.tag IS NOT NULL),
-                        '{}') AS "tags!"
+                        '{}') AS "tags!",
+               ARRAY(SELECT r.digest FROM oci_manifest_ref r
+                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!"
         FROM oci_manifest m
         LEFT JOIN oci_tag t ON t.manifest_id = m.id
         WHERE m.repository_id = $1 AND m.image = $2
@@ -1323,4 +1389,145 @@ pub async fn live_principal(
     .fetch_optional(pool)
     .await?;
     Ok(row.filter(|r| r.token_live).map(|r| r.is_admin))
+}
+
+// ── Retention ───────────────────────────────────────────────────────────────
+
+/// A tag, for retention.
+#[derive(Debug, Clone)]
+pub struct RetentionTag {
+    pub image: String,
+    pub tag: String,
+    pub manifest_id: i64,
+    pub digest: String,
+    pub updated_at: DateTime<Utc>,
+    pub last_pulled_at: Option<DateTime<Utc>>,
+}
+
+/// Every tag of a repository.
+pub async fn retention_tags(pool: &PgPool, repository_id: i64) -> sqlx::Result<Vec<RetentionTag>> {
+    sqlx::query_as!(
+        RetentionTag,
+        r#"
+        SELECT t.image, t.tag, t.manifest_id, m.digest, t.updated_at, m.last_pulled_at
+        FROM oci_tag t
+        JOIN oci_manifest m ON m.id = t.manifest_id
+        WHERE t.repository_id = $1
+        ORDER BY t.image, t.tag
+        "#,
+        repository_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// A manifest, for retention.
+#[derive(Debug, Clone)]
+pub struct RetentionManifest {
+    pub id: i64,
+    pub image: String,
+    pub digest: String,
+    pub created_at: DateTime<Utc>,
+    pub untagged_since: Option<DateTime<Utc>>,
+    pub last_pulled_at: Option<DateTime<Utc>>,
+    pub subject_digest: Option<String>,
+    /// An index's child manifests.
+    pub children: Vec<String>,
+}
+
+/// Every manifest of a repository.
+pub async fn retention_manifests(
+    pool: &PgPool,
+    repository_id: i64,
+) -> sqlx::Result<Vec<RetentionManifest>> {
+    sqlx::query_as!(
+        RetentionManifest,
+        r#"
+        SELECT m.id, m.image, m.digest, m.created_at, m.untagged_since, m.last_pulled_at,
+               m.subject_digest,
+               ARRAY(SELECT r.digest FROM oci_manifest_ref r
+                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!"
+        FROM oci_manifest m
+        WHERE m.repository_id = $1
+        ORDER BY m.image, m.id
+        "#,
+        repository_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete `tag` only if it still points at `manifest_id` (retention decided
+/// on that). `false`: it moved or is gone.
+pub async fn delete_tag_if(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    image: &str,
+    tag: &str,
+    manifest_id: i64,
+) -> sqlx::Result<bool> {
+    let current = sqlx::query_scalar!(
+        r#"
+        SELECT manifest_id FROM oci_tag
+        WHERE repository_id = $1 AND image = $2 AND tag = $3
+        FOR UPDATE
+        "#,
+        repository_id,
+        image,
+        tag,
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    if current != Some(manifest_id) {
+        return Ok(false);
+    }
+    delete_tag(tx, repository_id, image, tag).await
+}
+
+/// Delete an untagged manifest that no other manifest of its image lists as
+/// a child, re-checked under the row lock (a tag or an index pushed since
+/// retention decided keeps it). `false`: kept.
+pub async fn delete_untagged_manifest(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    manifest_id: i64,
+    grace: chrono::Duration,
+) -> sqlx::Result<bool> {
+    let Some(row) = sqlx::query!(
+        r#"
+        SELECT image, digest FROM oci_manifest
+        WHERE id = $1 AND repository_id = $2
+        FOR UPDATE
+        "#,
+        manifest_id,
+        repository_id,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let kept = sqlx::query_scalar!(
+        r#"
+        SELECT (EXISTS (SELECT 1 FROM oci_tag WHERE manifest_id = $1)
+             OR EXISTS (
+                 SELECT 1
+                 FROM oci_manifest p
+                 JOIN oci_manifest_ref r ON r.manifest_id = p.id
+                 WHERE p.repository_id = $2 AND p.image = $3 AND p.id <> $1
+                   AND r.kind = 'manifest' AND r.digest = $4
+             )) AS "kept!"
+        "#,
+        manifest_id,
+        repository_id,
+        row.image,
+        row.digest,
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if kept {
+        return Ok(false);
+    }
+    delete_locked_manifest(tx, manifest_id, grace).await
 }

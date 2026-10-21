@@ -222,6 +222,9 @@ impl RetentionWorker {
         run_id: uuid::Uuid,
     ) -> Result<RunSummary, WorkerError> {
         let kind = RepoKind::from(repo.kind.as_str());
+        if repo.format == forge_db::model::DOCKER_FORMAT {
+            return self.process_images(repo, kind, run_id).await;
+        }
 
         // Parse + validate the policy. A malformed or repo-kind-incoherent policy
         // is a configuration error: record it and reschedule (do not mutate).
@@ -371,6 +374,59 @@ impl RetentionWorker {
             }
         }
 
+        Ok(summary)
+    }
+
+    /// [`Self::process`] for a docker repository: image tags and manifests
+    /// (see [`crate::retention::images`]).
+    async fn process_images(
+        &self,
+        repo: &retention_dao::ClaimedRepo,
+        kind: RepoKind,
+        run_id: uuid::Uuid,
+    ) -> Result<RunSummary, WorkerError> {
+        use crate::retention::images;
+        let policy: images::ImageRetentionPolicy = serde_json::from_value(repo.policy.clone())
+            .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
+        images::validate_image_policy(&policy, kind)
+            .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
+        let now = forge_db::db_now(&self.pool).await?;
+        let secs = policy
+            .min_run_interval_seconds
+            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
+        let next_run_at = now
+            + Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+                .max(self.config.default_run_interval);
+        let mut summary = RunSummary::default();
+        if policy.enabled {
+            let (decisions, evaluated) =
+                images::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
+            summary = images::apply_images(
+                &self.pool,
+                repo.repository_id,
+                run_id,
+                &decisions,
+                self.config.delete_grace,
+                policy.dry_run_only,
+            )
+            .await?;
+            summary.evaluated = evaluated;
+        }
+        if !retention_dao::finish_run(
+            &self.pool,
+            repo.repository_id,
+            Some(run_id),
+            &summary,
+            next_run_at,
+        )
+        .await?
+        {
+            tracing::warn!(repo = %repo.name, %run_id, "retention lease lost before the run finished; another instance owns the schedule");
+        }
+        if let Err(e) = retention_dao::mark_repo_last_run(&self.pool, repo.repository_id, now).await
+        {
+            tracing::warn!(error = %e, repo = %repo.name, "failed to stamp retention_last_run_at");
+        }
         Ok(summary)
     }
 

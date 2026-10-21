@@ -170,8 +170,11 @@ async fn open_key(stored: &str, envelope: Option<&EnvelopeService>) -> anyhow::R
     let key = if let Some(plain) = stored.strip_prefix("plain:") {
         b64.decode(plain).context("decode the registry token key")?
     } else if let Some(sealed) = stored.strip_prefix("sealed:") {
-        let envelope = envelope.context("the registry token key is sealed but [crypto] is not configured")?;
-        let blob = b64.decode(sealed).context("decode the sealed registry token key")?;
+        let envelope =
+            envelope.context("the registry token key is sealed but [crypto] is not configured")?;
+        let blob = b64
+            .decode(sealed)
+            .context("decode the sealed registry token key")?;
         let opened = envelope
             .open(&blob, binding())
             .await

@@ -13,6 +13,7 @@
 
 pub mod apply;
 pub mod evaluate;
+pub mod images;
 pub mod model;
 pub mod worker;
 

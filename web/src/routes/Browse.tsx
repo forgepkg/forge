@@ -5,6 +5,7 @@ import { Badge } from '~/components/catalyst/badge'
 import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
+import { RepoFormatBadge } from '~/components/RepoFormatBadge'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 
@@ -14,9 +15,10 @@ export const Route = createFileRoute('/_app/')({
 
 /**
  * Browse root: the repositories the signed-in user may read, rendered as the
- * top level of the folder view (repository → packages → versions). Search is
- * per repository and lives on the repository screen, not here. An offline
- * repository carries an "offline" badge.
+ * top level of the folder view (repository → packages → versions, or for a
+ * docker repository: repository → images → tags). Each row shows the kind and
+ * the format. Search is per repository and lives on the repository screen,
+ * not here. An offline repository carries an "offline" badge.
  */
 function Browse() {
   const repos = useBrowseRepos()
@@ -26,7 +28,7 @@ function Browse() {
       <div>
         <Heading>Browse</Heading>
         <Text className="mt-1">
-          Open a repository to browse and search its packages.
+          Open a repository to browse and search its packages or images.
         </Text>
       </div>
 
@@ -57,6 +59,7 @@ function Browse() {
                   {repo.name}
                 </span>
                 <RepoKindBadge kind={repo.kind} />
+                <RepoFormatBadge format={repo.format} />
                 {repo.online === false && (
                   <Badge
                     color="zinc"

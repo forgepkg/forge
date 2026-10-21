@@ -5,9 +5,9 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures_util::future::BoxFuture;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, ManifestRow};
+use futures_util::future::BoxFuture;
 
 use crate::digest::{Digest, DigestError};
 use crate::error::{Code, OciError, OciResult};
@@ -102,9 +102,9 @@ pub(crate) fn parse_reference(raw: &str) -> OciResult<Reference> {
     Reference::parse(raw).map_err(|e| match e {
         ReferenceError::InvalidTag => OciError::manifest_invalid(format!("invalid tag {raw:?}"))
             .with_detail(serde_json::json!({ "reference": raw })),
-        ReferenceError::Digest(_) => parse_digest(raw).err().unwrap_or_else(|| {
-            OciError::digest_invalid(format!("invalid digest {raw:?}"))
-        }),
+        ReferenceError::Digest(_) => parse_digest(raw)
+            .err()
+            .unwrap_or_else(|| OciError::digest_invalid(format!("invalid digest {raw:?}"))),
     })
 }
 
@@ -233,16 +233,18 @@ impl Registry {
         }
         // A manifest is content too: some clients read one through the blob
         // endpoint.
-        Ok(oci_dao::find_manifest(pool, repo.id, image, digest.as_str())
-            .await?
-            .map(|m| BlobHit {
-                repository_id: repo.id,
-                image: image.to_string(),
-                digest: m.digest,
-                size: m.size,
-                s3_key: m.s3_key,
-                linked: false,
-            }))
+        Ok(
+            oci_dao::find_manifest(pool, repo.id, image, digest.as_str())
+                .await?
+                .map(|m| BlobHit {
+                    repository_id: repo.id,
+                    image: image.to_string(),
+                    digest: m.digest,
+                    size: m.size,
+                    s3_key: m.s3_key,
+                    linked: false,
+                }),
+        )
     }
 
     pub(crate) async fn local_tags(
@@ -288,7 +290,10 @@ impl Registry {
         if bytes.len() as i64 != size || bytes.len() > MAX_MANIFEST_BYTES {
             return Err(OciError::internal(
                 "manifest read",
-                format!("stored manifest {s3_key} has {} bytes, expected {size}", bytes.len()),
+                format!(
+                    "stored manifest {s3_key} has {} bytes, expected {size}",
+                    bytes.len()
+                ),
             ));
         }
         Ok(bytes)
@@ -372,7 +377,9 @@ impl Registry {
             _ => None,
         };
         let (status, length, body) = match (head, range) {
-            (true, Some((start, end))) => (StatusCode::PARTIAL_CONTENT, end - start + 1, Body::empty()),
+            (true, Some((start, end))) => {
+                (StatusCode::PARTIAL_CONTENT, end - start + 1, Body::empty())
+            }
             (true, None) => (StatusCode::OK, size, Body::empty()),
             (false, None) => {
                 let stream = self
@@ -390,7 +397,11 @@ impl Registry {
                     .get_range(&hit.s3_key, start, Some(end))
                     .await
                     .map_err(|e| OciError::internal("blob read", e))?;
-                (StatusCode::PARTIAL_CONTENT, end - start + 1, byte_stream_body(stream))
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    end - start + 1,
+                    byte_stream_body(stream),
+                )
             }
         };
         let mut response = (status, body).into_response();
@@ -457,7 +468,9 @@ impl Registry {
                     .append_pair("last", last)
                     .finish();
                 let link = format!("<{}?{next}>; rel=\"next\"", location(&t.name, "tags/list"));
-                response.headers_mut().insert(header::LINK, header_value(&link));
+                response
+                    .headers_mut()
+                    .insert(header::LINK, header_value(&link));
             }
         }
         Ok(response)

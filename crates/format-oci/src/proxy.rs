@@ -37,6 +37,7 @@ use crate::digest::Digest;
 use crate::error::{Code, OciError, OciResult};
 use crate::manifest::{self, media, MAX_MANIFEST_BYTES};
 use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor};
+use crate::push::require_linked;
 use crate::reference::{self, Reference};
 use crate::service::{Registry, Target};
 
@@ -56,6 +57,9 @@ const DEFAULT_TAG_TTL_SECS: i64 = 600;
 /// How long an upstream "not found" is remembered, unless the repository
 /// sets `not_found_ttl_seconds`.
 const DEFAULT_NOT_FOUND_TTL_SECS: u64 = 60;
+
+/// Largest blob read as a possible image config.
+const MAX_CONFIG_BYTES: i64 = 1024 * 1024;
 
 /// Largest upstream tag list or referrers document read.
 const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
@@ -142,7 +146,11 @@ fn parse_challenge(value: &str) -> Option<Challenge> {
     let mut rest = params.trim();
     while !rest.is_empty() {
         let (key, after) = rest.split_once('=')?;
-        let key = key.trim().trim_start_matches(',').trim().to_ascii_lowercase();
+        let key = key
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_ascii_lowercase();
         let after = after.trim_start();
         let (val, remaining) = if let Some(quoted) = after.strip_prefix('"') {
             let end = quoted.find('"')?;
@@ -262,7 +270,14 @@ impl Upstream<'_> {
         let key = self.token_key(scope);
         let cached = cached_token(&key);
         let response = self
-            .attempt(method.clone(), &url, accept, class, cached.as_deref(), false)
+            .attempt(
+                method.clone(),
+                &url,
+                accept,
+                class,
+                cached.as_deref(),
+                false,
+            )
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -402,9 +417,12 @@ impl Registry {
         let _: Result<bool, ()> = self
             .inner
             .cache
-            .get_or_try_insert_local("oci:upstream-nf", &key, Duration::from_secs(ttl), || async {
-                Ok(true)
-            })
+            .get_or_try_insert_local(
+                "oci:upstream-nf",
+                &key,
+                Duration::from_secs(ttl),
+                || async { Ok(true) },
+            )
             .await;
     }
 
@@ -425,7 +443,9 @@ impl Registry {
         let scope = format!("repository:{local}:pull");
         match reference {
             Reference::Digest(digest) => {
-                if let Some(row) = oci_dao::find_manifest(pool, repo.id, &local, digest.as_str()).await? {
+                if let Some(row) =
+                    oci_dao::find_manifest(pool, repo.id, &local, digest.as_str()).await?
+                {
                     return Ok(Some(ManifestHit::from_row(row)));
                 }
                 if !repo.online || self.negative_cached(repo, &local, digest.as_str()).await {
@@ -456,8 +476,9 @@ impl Registry {
                         "the upstream served a manifest that does not match its digest",
                     ));
                 }
-                let parsed = manifest::parse(&body, content_type.as_deref())
-                    .map_err(|_| OciError::unavailable("the upstream served an invalid manifest"))?;
+                let parsed = manifest::parse(&body, content_type.as_deref()).map_err(|_| {
+                    OciError::unavailable("the upstream served an invalid manifest")
+                })?;
                 let row = self
                     .store_proxied_manifest(&target, digest, &parsed, &body, None)
                     .await?;
@@ -482,7 +503,10 @@ impl Registry {
                 } else if self.negative_cached(repo, &local, tag).await {
                     return Ok(None);
                 }
-                match self.revalidate_tag(repo, &target, tag, &scope, &accept, cached.as_ref()).await {
+                match self
+                    .revalidate_tag(repo, &target, tag, &scope, &accept, cached.as_ref())
+                    .await
+                {
                     Ok(found) => Ok(found),
                     Err(e) => match cached {
                         Some(c) => {
@@ -514,7 +538,13 @@ impl Registry {
         let path = format!("/v2/{local}/manifests/{tag}");
         if let Some(c) = cached {
             let head = upstream
-                .send(Method::HEAD, &path, scope, Some(accept), RequestClass::Metadata)
+                .send(
+                    Method::HEAD,
+                    &path,
+                    scope,
+                    Some(accept),
+                    RequestClass::Metadata,
+                )
                 .await?;
             if head.status() == reqwest::StatusCode::NOT_FOUND {
                 self.remember_not_found(repo, local, tag).await;
@@ -539,7 +569,13 @@ impl Registry {
             // usefully: fetch the manifest.
         }
         let response = upstream
-            .send(Method::GET, &path, scope, Some(accept), RequestClass::Metadata)
+            .send(
+                Method::GET,
+                &path,
+                scope,
+                Some(accept),
+                RequestClass::Metadata,
+            )
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             self.remember_not_found(repo, local, tag).await;
@@ -607,11 +643,32 @@ impl Registry {
                     .await?;
                 if head.status().is_success() {
                     let mut tx = pool.begin().await?;
-                    match oci_dao::insert_link_existing(&mut tx, repo.id, &local, digest.as_str(), digest.hex(), size).await? {
+                    match oci_dao::insert_link_existing(
+                        &mut tx,
+                        repo.id,
+                        &local,
+                        digest.as_str(),
+                        digest.hex(),
+                        size,
+                    )
+                    .await?
+                    {
                         LinkOutcome::BlobUnavailable => tx.rollback().await?,
                         _ => {
                             tx.commit().await?;
-                            return self.hosted_blob(repo, &local, digest).await;
+                            let hit = self.hosted_blob(repo, &local, digest).await?;
+                            if let Some(hit) = &hit {
+                                self.backfill_platform(
+                                    repo,
+                                    &local,
+                                    digest,
+                                    hit.size,
+                                    Some(&hit.s3_key),
+                                    None,
+                                )
+                                .await;
+                            }
+                            return Ok(hit);
                         }
                     }
                 } else if head.status() == reqwest::StatusCode::NOT_FOUND {
@@ -647,6 +704,12 @@ impl Registry {
                 "the upstream served a blob that does not match its digest",
             ));
         }
+        // A small blob may be an image config (read while it is at hand).
+        let small = if staged.size <= MAX_CONFIG_BYTES as u64 {
+            tokio::fs::read(&staged.temp_path).await.ok()
+        } else {
+            None
+        };
         let stored = self.inner.cas.commit(staged).await?;
         let mut tx = pool.begin().await?;
         oci_dao::insert_link_ingested(
@@ -658,9 +721,58 @@ impl Registry {
             stored.size as i64,
             stored.ingest_token,
         )
-        .await?;
+        .await
+        .map_err(OciError::from)
+        .and_then(require_linked)?;
         tx.commit().await?;
+        if let Some(bytes) = small {
+            self.backfill_platform(repo, &local, digest, bytes.len() as i64, None, Some(bytes))
+                .await;
+        }
         self.hosted_blob(repo, &local, digest).await
+    }
+
+    /// A proxy caches a manifest before its config: once the config blob
+    /// `digest` is cached, its platform completes the summaries of the
+    /// image's manifests that name it. Best effort.
+    async fn backfill_platform(
+        &self,
+        repo: &Repository,
+        image: &str,
+        digest: &Digest,
+        size: i64,
+        s3_key: Option<&str>,
+        bytes: Option<Vec<u8>>,
+    ) {
+        if size > MAX_CONFIG_BYTES {
+            return;
+        }
+        let pool = &self.inner.pool;
+        match oci_dao::config_needs_platform(pool, repo.id, image, digest.as_str()).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "registry proxy: platform lookup failed");
+                return;
+            }
+        }
+        let bytes = match (bytes, s3_key) {
+            (Some(bytes), _) => bytes,
+            (None, Some(key)) => match self.read_manifest_bytes(key, size).await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(_) => return,
+            },
+            (None, None) => return,
+        };
+        let Some(platform) = manifest::config_platform(&bytes) else {
+            return;
+        };
+        if let Err(e) =
+            oci_dao::set_config_platform(pool, repo.id, image, digest.as_str(), &platform.label())
+                .await
+        {
+            tracing::warn!(error = %e, "registry proxy: recording an image platform failed");
+        }
     }
 
     pub(crate) async fn proxy_tags(
@@ -843,7 +955,10 @@ mod tests {
                 scope: None,
             })
         );
-        assert_eq!(parse_challenge(r#"Basic realm="x""#), Some(Challenge::Basic));
+        assert_eq!(
+            parse_challenge(r#"Basic realm="x""#),
+            Some(Challenge::Basic)
+        );
         assert_eq!(parse_challenge("Negotiate"), None);
         assert_eq!(parse_challenge("Bearer service=\"x\""), None);
     }
@@ -857,7 +972,10 @@ mod tests {
         repo.remote_url = Some("https://ghcr.io".into());
         assert_eq!(proxied_image(&repo, "nginx"), "nginx");
         assert_eq!(upstream_base("https://ghcr.io/v2/"), "https://ghcr.io");
-        assert_eq!(upstream_base("https://r.example/prefix/"), "https://r.example/prefix");
+        assert_eq!(
+            upstream_base("https://r.example/prefix/"),
+            "https://r.example/prefix"
+        );
     }
 
     fn test_repo() -> Repository {

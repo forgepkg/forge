@@ -12,6 +12,7 @@ pub mod admin;
 pub mod app;
 pub mod auth;
 pub mod browse;
+pub mod browse_images;
 pub mod config;
 pub mod crypto;
 pub mod dispatch;
