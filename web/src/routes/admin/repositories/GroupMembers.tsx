@@ -32,7 +32,9 @@ export const Route = createFileRoute(
  * still surfaces a server 409 inline if a race slips through. Groups may be
  * nested: the server refuses (409) a member that would create a cycle or
  * exceed the nesting depth, and that reason is shown inline. An owner cannot
- * be removed until it is unflagged.
+ * be removed until it is unflagged. Removing a member, and unflagging the
+ * last owner (the group then trusts every hosted member equally), wait for
+ * an inline confirmation.
  */
 function GroupMembers() {
   const { repo: name } = Route.useParams()

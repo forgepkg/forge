@@ -2218,3 +2218,161 @@ async fn an_offline_hosted_member_fails_instead_of_serving() {
         ["2.0.0"]
     );
 }
+
+/// #106: an offline nested group is a failing member of its outer group, like
+/// an offline hosted member: nothing below it is served through the outer
+/// group (it is not descended into), what only it could serve is an error,
+/// never a not-found, and the other members still answer. An id one of its
+/// hosted leaves owns does not fall back to a public proxy meanwhile.
+#[tokio::test]
+async fn an_offline_nested_group_fails_instead_of_serving() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let inner_leaf = seed_member(&pool, false).await;
+    let other = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, inner.id, inner_leaf.id, 10)
+        .await
+        .unwrap();
+    let outer = seed_group(&pool).await;
+    for (member, priority) in [(&inner, 30), (&other, 20), (&proxy, 10)] {
+        repository_dao::add_group_member(&pool, outer.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    set_prefer_hosted(&pool, &outer, true).await;
+    seed_version(&pool, &mut blobs, inner_leaf.id, "Only.Inner", "1.0.0", "i").await;
+    seed_version(&pool, &mut blobs, inner_leaf.id, "Sample", "1.0.0", "s").await;
+    seed_version(&pool, &mut blobs, other.id, "Only.Other", "2.0.0", "o").await;
+
+    let principal = user(&pool).await;
+    let read =
+        |blobs: StubBlobs| mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));
+    let g = read(blobs.clone());
+    assert_eq!(
+        sorted_versions(&g, &outer.name, "only.inner").await,
+        ["1.0.0"],
+        "online: served through the inner group"
+    );
+
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(inner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = read(blobs);
+    assert!(matches!(
+        g.list_versions(&outer.name, "only.inner").await,
+        Err(forge_core::repo::RepoError::Busy(_))
+    ));
+    assert!(g
+        .resolve_nupkg(&outer.name, "only.inner", "1.0.0")
+        .await
+        .is_err());
+    assert!(g.registration(&outer.name, "only.inner").await.is_err());
+    // The inner leaf's internal id is not handed to the public proxy.
+    assert!(g.list_versions(&outer.name, "sample").await.is_err());
+    assert!(g
+        .resolve_nupkg(&outer.name, "sample", "99.0.0")
+        .await
+        .is_err());
+    // The other members still answer.
+    assert_eq!(
+        sorted_versions(&g, &outer.name, "only.other").await,
+        ["2.0.0"]
+    );
+    let hits = g
+        .search(
+            &outer.name,
+            &SearchParams {
+                q: "only".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .hits;
+    let ids: Vec<String> = hits.iter().map(|h| h.original_id.to_lowercase()).collect();
+    assert_eq!(ids, ["only.other"], "{hits:?}");
+}
+
+/// #107: a leaf is served when one visible path admits it, also when the
+/// same inner group is reached along two paths of the same length and only
+/// the first path's group guards the id. Root → {A, B} → N → hosted leaf;
+/// A reserves `acme.` for its owners (which exclude N's leaf), B has no
+/// guard: `Acme.Lib` is served through the root and through B, not through
+/// A.
+#[tokio::test]
+async fn a_diamond_serves_what_its_unguarded_path_admits() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let leaf = seed_member(&pool, false).await;
+    let a_owner = seed_member(&pool, false).await;
+    let n = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, n.id, leaf.id, 10)
+        .await
+        .unwrap();
+    let a = seed_group(&pool).await;
+    let b = seed_group(&pool).await;
+    for (group, members) in [(&a, vec![(&n, 20), (&a_owner, 10)]), (&b, vec![(&n, 10)])] {
+        for (member, priority) in members {
+            repository_dao::add_group_member(&pool, group.id, member.id, priority)
+                .await
+                .unwrap();
+        }
+    }
+    repository_dao::set_group_member_owner(&pool, a.id, a_owner.id, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
+    )
+    .bind(a.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let root = seed_group(&pool).await;
+    // A first, so the walk reaches N through the guarded path first.
+    for (member, priority) in [(&a, 20), (&b, 10)] {
+        repository_dao::add_group_member(&pool, root.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    seed_version(&pool, &mut blobs, leaf.id, "Acme.Lib", "1.0.0", "leaf").await;
+
+    let g = group_repo(&pool, blobs, user(&pool).await);
+    for group in [&root, &b] {
+        assert_eq!(
+            sorted_versions(&g, &group.name, "acme.lib").await,
+            ["1.0.0"],
+            "through {}",
+            group.name
+        );
+        assert!(
+            g.resolve_nupkg(&group.name, "acme.lib", "1.0.0")
+                .await
+                .unwrap()
+                .is_some(),
+            "through {}",
+            group.name
+        );
+        let hits = g
+            .search(
+                &group.name,
+                &SearchParams {
+                    q: "acme".into(),
+                    ..SearchParams::default()
+                },
+            )
+            .await
+            .unwrap()
+            .hits;
+        assert_eq!(hits.len(), 1, "through {}: {hits:?}", group.name);
+    }
+    assert!(
+        sorted_versions(&g, &a.name, "acme.lib").await.is_empty(),
+        "A's guard keeps it from its non-owner"
+    );
+}
