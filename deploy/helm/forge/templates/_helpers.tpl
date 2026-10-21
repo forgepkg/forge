@@ -72,6 +72,43 @@ Secret created outside the release. */}}
 {{- printf "%s-secret-env" (include "forge.fullname" .) }}
 {{- end }}
 
+{{/* The Secret that keeps the salt of the checksum/secret-env annotation. */}}
+{{- define "forge.checksumSaltName" -}}
+{{- printf "%s-checksum-salt" (include "forge.fullname" .) }}
+{{- end }}
+
+{{/* The salt of the checksum/secret-env annotation: secretEnvChecksumSalt if
+set, else the one kept in the Secret forge.checksumSaltName (looked up in the
+cluster), else a new random one. Chosen once per render and cached in
+.Values, so the Secret and the annotation agree on the first install. */}}
+{{- define "forge.checksumSalt" -}}
+{{- if not (hasKey .Values "__checksumSalt") }}
+{{- $salt := .Values.secretEnvChecksumSalt }}
+{{- if not $salt }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (include "forge.checksumSaltName" .) }}
+{{- if and $existing $existing.data (hasKey $existing.data "salt") }}
+{{- $salt = $existing.data.salt | b64dec }}
+{{- else }}
+{{- $salt = randAlphaNum 32 }}
+{{- end }}
+{{- end }}
+{{- $_ := set .Values "__checksumSalt" (toString $salt) }}
+{{- end }}
+{{- index .Values "__checksumSalt" }}
+{{- end }}
+
+{{/* The checksum/secret-env pod annotation, which rolls the pods when
+secretEnv changes. Anyone who can read the pods can read it, and a plain hash
+of a password can be tested against guesses, so secretEnv is hashed with
+forge.checksumSalt. */}}
+{{- define "forge.secretEnvChecksum" -}}
+{{- if .Values.secretEnv }}
+{{- printf "%s\n%s" (include "forge.checksumSalt" .) (toJson .Values.secretEnv) | sha256sum }}
+{{- else }}
+{{- toJson .Values.secretEnv | sha256sum }}
+{{- end }}
+{{- end }}
+
 {{/* ── Image ────────────────────────────────────────────────────────────── */}}
 
 {{- define "forge.imageTag" -}}

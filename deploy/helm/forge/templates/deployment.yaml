@@ -33,9 +33,10 @@ spec:
         {{- end }}
       annotations:
         # Roll the pods when the configuration or the chart's Secret
-        # (secretEnv, forge.secretEnvName) changes.
+        # (secretEnv, forge.secretEnvName) changes; secretEnv is hashed with
+        # a salt (forge.secretEnvChecksum).
         checksum/config: {{ include "forge.config" . | sha256sum }}
-        checksum/secret-env: {{ toJson .Values.secretEnv | sha256sum }}
+        checksum/secret-env: {{ include "forge.secretEnvChecksum" . }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

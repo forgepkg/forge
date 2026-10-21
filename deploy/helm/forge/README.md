@@ -47,6 +47,16 @@ Environment variables override `forge.toml`. Keep secrets out of `config`:
 the chart warns when it finds one there. The chart sets `server.bind` from
 `containerPort`, and a key set to `null` in `config` removes a chart default.
 
+A change of `config` or `secretEnv` rolls the pods through pod annotations.
+Anyone who can read the pods can read those, and a plain hash of a password
+can be tested against guesses, so `secretEnv` is hashed with a random salt
+that the chart generates on install and keeps in the Secret
+`<fullname>-checksum-salt` (looked up in the cluster on every upgrade).
+Tools that render without a cluster (Argo CD, `helm template`) cannot look
+it up and would roll the pods on every render: set `secretEnvChecksumSalt`
+there (`openssl rand -hex 16`). A change inside `existingSecret` rolls
+nothing; restart the pods yourself.
+
 A production setup with an external PostgreSQL and S3 and a Redis in the
 cluster:
 
@@ -200,7 +210,10 @@ together with their volumes. Tools that render without a cluster (Argo CD,
 `helm template`) cannot look them up and would generate new ones on every
 render: set `auth.password` (or `auth.existingSecret`) there. Passwords are
 pasted into Forge's connection URLs unescaped, so use URL-safe values
-(`openssl rand -hex 24`).
+(`openssl rand -hex 24`). Redis restarts when `redis.auth.password` changes,
+through a pod annotation salted like Forge's (the salt is kept in the Redis
+Secret): with `redis.auth.password` in Argo CD, set
+`redis.auth.checksumSalt` too.
 
 Evaluation install, everything in the cluster:
 
@@ -219,8 +232,9 @@ Open http://localhost:8421 and sign in as `admin` with that password.
 ## Checking changes
 
 CI lints the chart and renders it with the default values and each file in
-[ci/](ci), validates the output with kubeconform, and parses every rendered
-`forge.toml`. Locally, with `helm`, `kubeconform` and `python3` on your PATH:
+[ci/](ci), validates the output with kubeconform, parses every rendered
+`forge.toml`, and checks that the pod annotations hashing secrets are
+salted. Locally, with `helm`, `kubeconform` and `python3` on your PATH:
 
 ```bash
 .github/scripts/helm-check.sh 1.33.0

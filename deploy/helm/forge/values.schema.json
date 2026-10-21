@@ -75,6 +75,10 @@
         ]
       }
     },
+    "secretEnvChecksumSalt": {
+      "type": "string",
+      "description": "Salt of the checksum/secret-env pod annotation; generated and kept in <fullname>-checksum-salt when empty"
+    },
     "existingSecret": {
       "type": "string",
       "description": "An existing Secret with FORGE_* secrets; any name but <fullname>-secret-env, the chart's own"

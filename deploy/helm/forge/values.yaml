@@ -77,6 +77,15 @@ secretEnv: {}
 #   FORGE_ROOT_KEY: <openssl rand -base64 32>
 #   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: <first start only>
 
+# A change of secretEnv rolls the pods through a pod annotation that holds
+# its SHA-256 salted with a random value, so the annotation (which anyone who
+# can read the pods sees) cannot be tested against guessed secrets. The salt
+# is generated on install and kept in the Secret <fullname>-checksum-salt
+# (looked up in the cluster). Tools that render without a cluster (Argo CD,
+# `helm template`) would generate a new one, and roll the pods, on every
+# render: set one here for them (`openssl rand -hex 16`).
+secretEnvChecksumSalt: ""
+
 # An existing Secret loaded with envFrom (the same keys as secretEnv), for
 # secrets managed elsewhere: External Secrets, Sealed Secrets, SOPS, ...
 # Both can be set (for a key in both, existingSecret's value wins). Any name
@@ -377,7 +386,8 @@ extraObjects: []
 # Generated passwords are kept across upgrades (looked up in the cluster) and
 # survive `helm uninstall` with the data. Tools that render without a cluster
 # (Argo CD, `helm template`) generate a new one on every render: set
-# auth.password or auth.existingSecret there.
+# auth.password or auth.existingSecret there (and, for Redis with
+# auth.password, auth.checksumSalt).
 
 # PostgreSQL 17 StatefulSet; sets FORGE_DATABASE__URL.
 postgresql:

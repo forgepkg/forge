@@ -2,8 +2,9 @@
 # Lint and render the Helm chart (deploy/helm/forge) and validate the output
 # (used by ci.yml): `helm lint --strict` and `helm template` with the default
 # values and with each file in the chart's ci/ directory, kubeconform against
-# the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), and
-# every rendered forge.toml parsed as TOML.
+# the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), every
+# rendered forge.toml parsed as TOML, and the pod annotations that roll the
+# pods on a secret change salted.
 #
 # Usage: helm-check.sh <kubernetes version, e.g. 1.33.0>
 # Needs helm, kubeconform and python3 (3.11+) on PATH.
@@ -90,3 +91,80 @@ for path in sys.argv[1:]:
 sys.exit(1 if failed else 0)
 EOF
 echo "forge.toml: every rendering parses" >&2
+
+# A secretEnv or Redis password change rolls the pods through a pod
+# annotation (checksum/secret-env, Redis's checksum/auth) that anyone who can
+# read the pods sees, so it must not be the plain SHA-256 of the secrets,
+# which can be tested against guesses. Render known secrets, once with a
+# generated salt and once with one set in the values, next to the plain JSON
+# the chart hashes (an extraObjects ConfigMap): each annotation must differ
+# from the plain hash and be the hash salted with the salt the chart keeps in
+# its Secret (the same value in one render).
+plain='[{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "plain-secrets"},
+  "data": {"secret-env": "{{ toJson .Values.secretEnv }}", "redis-auth": "{{ toJson .Values.redis.auth }}"}}]'
+for salt in "" check-salt; do
+  helm template forge "$chart" --namespace forge --kube-version "$k8s_version" \
+    --set redis.enabled=true \
+    --set-string secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=check-only \
+    --set-string redis.auth.password=check-only \
+    --set-string secretEnvChecksumSalt="$salt" --set-string redis.auth.checksumSalt="$salt" \
+    --set-json extraObjects="$plain" > "$work/salted-${salt:-generated}.yaml"
+done
+python3 - "$work/salted-generated.yaml" "$work/salted-check-salt.yaml" <<'EOF'
+import base64
+import hashlib
+import json
+import re
+import sys
+
+
+def find(documents, kind, name):
+    for document in documents:
+        if re.search(rf"^kind: {kind}$", document, re.M) and re.search(rf"^  name: {re.escape(name)}$", document, re.M):
+            return document
+    sys.exit(f"no {kind} {name}")
+
+
+def field(document, key):
+    match = re.search(rf"^ +{re.escape(key)}: (.+)$", document, re.M)
+    if not match:
+        sys.exit(f"no {key} in\n{document}")
+    value = match.group(1)
+    return value[1:-1] if value[0] in "'\"" else value
+
+
+def sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+failed = False
+for path, set_salt in zip(sys.argv[1:], ["", "check-salt"]):
+    documents = open(path, encoding="utf-8").read().split("\n---\n")
+    plain = find(documents, "ConfigMap", "plain-secrets")
+    env_json = field(plain, "secret-env")
+    auth_json = field(plain, "redis-auth")
+    salts = {
+        "checksum/secret-env": base64.b64decode(field(find(documents, "Secret", "forge-checksum-salt"), "salt")).decode(),
+        "checksum/auth": base64.b64decode(field(find(documents, "Secret", "forge-redis"), "checksum-salt")).decode(),
+    }
+    auth = {k: v for k, v in json.loads(auth_json).items() if k not in ("password", "checksumSalt")}
+    auth["password"] = sha256(salts["checksum/auth"] + "\n" + json.loads(auth_json)["password"])
+    cases = [
+        ("checksum/secret-env", "forge", env_json, sha256(salts["checksum/secret-env"] + "\n" + env_json)),
+        ("checksum/auth", "forge-redis", auth_json, sha256(json.dumps(auth, separators=(",", ":"), sort_keys=True))),
+    ]
+    for annotation, deployment, plain_json, salted in cases:
+        value = field(find(documents, "Deployment", deployment), annotation)
+        salt = salts[annotation]
+        if value == sha256(plain_json):
+            print(f"{path}: {annotation} is the plain SHA-256 of {plain_json}")
+            failed = True
+        if value != salted:
+            print(f"{path}: {annotation} is not the hash salted with the salt the chart keeps ({salt!r})")
+            failed = True
+        if set_salt and salt != set_salt or not set_salt and len(salt) < 32:
+            print(f"{path}: {annotation}: the chart keeps the salt {salt!r}, expected {set_salt or 'a generated one'}")
+            failed = True
+sys.exit(1 if failed else 0)
+EOF
+echo "checksum annotations: salted" >&2

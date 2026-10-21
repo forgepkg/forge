@@ -24,6 +24,14 @@ auth:
   # An existing Secret holding the password instead of the chart's.
   existingSecret: ""
   secretKey: password
+  # A change of auth.password restarts Redis through a pod annotation that
+  # holds its SHA-256 salted with a random value, so the annotation (which
+  # anyone who can read the pods sees) cannot be tested against guesses. The
+  # salt is generated on install and kept in the chart's Secret (key
+  # checksum-salt). Tools that render without a cluster (Argo CD, `helm
+  # template`) would generate a new one, and restart Redis, on every render:
+  # set one here for them (`openssl rand -hex 16`).
+  checksumSalt: ""
 
 service:
   type: ClusterIP
