@@ -12,13 +12,14 @@ deploy/kubernetes/
 ├── components/
 │   ├── ingress/             Ingress with TLS (ingress-nginx annotations for large, slow pushes)
 │   ├── httproute/           Gateway API HTTPRoute instead of an Ingress
+│   ├── network-policy/      only the ingress controller / gateway reaches Forge
 │   ├── redis/               in-cluster Redis (shared cache), password-protected
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
 │   ├── postgres/            in-cluster PostgreSQL 17 (evaluation / small installs)
 │   ├── s3-versitygw/        in-cluster S3 gateway on a PersistentVolume (evaluation / small installs)
 │   └── image-latest/        run :latest instead of the pinned release
 └── overlays/
-    ├── production/          external PostgreSQL + S3, Redis, two replicas, Ingress
+    ├── production/          external PostgreSQL + S3, Redis, two replicas, Ingress, NetworkPolicy
     └── evaluation/          everything in-cluster, no Ingress
 ```
 
@@ -102,6 +103,8 @@ adjust:
   `forge-tls` certificate Secret (or a cert-manager annotation);
 - `FORGE_AUTH__TRUSTED_PROXY_CIDRS`: the pod network of your ingress
   controller or gateway, so Forge sees the real client IP;
+- the namespace in the NetworkPolicy patch: that of your ingress controller
+  (or your gateway's data plane), the only pods that may reach Forge;
 - the S3 endpoint, region and bucket, and `forge.env`.
 
 Points that matter on Kubernetes:
@@ -122,14 +125,20 @@ Points that matter on Kubernetes:
 - **Reverse proxy.** Allow 512 MiB request bodies without buffering, and keep
   the proxy's upstream idle timeout below 150 s (Envoy and Istio default to
   one hour; see the httproute component).
+- **Who reaches Forge.** Forge believes the `X-Forwarded-For` of every peer
+  in `FORGE_AUTH__TRUSTED_PROXY_CIDRS`, usually the whole pod network, so any
+  other pod could call the Service with a forged client address and get past
+  the login lockout and the anonymous-IP allowlist. `components/network-policy`
+  admits only the ingress controller or gateway; use it whenever you set
+  trusted proxies (the CNI must enforce NetworkPolicy).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
 
 ## Checking changes
 
-CI renders every overlay, and the base with each component, and validates
-the output with kubeconform. Locally, with `kustomize` and `kubeconform` on
-your PATH:
+CI renders every overlay, and the base with each component, validates the
+output with kubeconform, and checks that an overlay with trusted proxies has
+the NetworkPolicy. Locally, with `kustomize` and `kubeconform` on your PATH:
 
 ```bash
 .github/scripts/kustomize-check.sh 1.33.0

@@ -32,6 +32,19 @@ WARNING: config.{{ . }} is a secret but config is stored in a ConfigMap. Move it
 to secretEnv (FORGE_{{ . | upper | replace "." "__" }}) or existingSecret.
 {{- end }}
 {{- end }}
+{{- $trusted := (default dict .Values.config.auth).trusted_proxy_cidrs }}
+{{- if hasKey .Values.secretEnv "FORGE_AUTH__TRUSTED_PROXY_CIDRS" }}{{ $trusted = true }}{{ end }}
+{{- range .Values.env }}
+{{- if eq (toString .name) "FORGE_AUTH__TRUSTED_PROXY_CIDRS" }}{{ $trusted = true }}{{ end }}
+{{- end }}
+{{- if and $trusted (not (and (include "forge.networkPolicyEnabled" .) .Values.networkPolicy.from)) }}
+
+WARNING: Forge believes X-Forwarded-For from every peer in
+auth.trusted_proxy_cidrs, but no NetworkPolicy restricts who reaches it: any
+pod in those ranges can claim any client address, past the login lockout and
+the anonymous-IP allowlist. List the pods that proxy to Forge (your gateway's
+data plane or ingress controller) in networkPolicy.from.
+{{- end }}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.redis.enabled) }}
 
 Several replicas share caches and invalidations through Redis: enable

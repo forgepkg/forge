@@ -3,7 +3,8 @@
 #
 # List the ingress controller's pod network in FORGE_AUTH__TRUSTED_PROXY_CIDRS,
 # or every request appears to come from the controller (anonymous-IP
-# allowlists and the login lockout then see a single client).
+# allowlists and the login lockout then see a single client), and add
+# ../network-policy so that nothing else in that range reaches Forge.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

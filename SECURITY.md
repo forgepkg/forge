@@ -32,7 +32,8 @@ The most important ones:
 
 - serve Forge only behind TLS, with an https `public_base_url`;
 - enable secret encryption at rest;
-- configure `trusted_proxy_cidrs` for your reverse proxies;
+- configure `trusted_proxy_cidrs` for your reverse proxies, and let nothing
+  else in those ranges reach Forge (on Kubernetes, a NetworkPolicy);
 - remove the bootstrap admin once real administrators exist, and its
   password from the environment;
 - verify release images before deploying them (`cosign verify` with the exact

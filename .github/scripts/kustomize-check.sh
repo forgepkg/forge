@@ -2,7 +2,9 @@
 # Render the Kubernetes manifests (deploy/kubernetes) and validate them (used
 # by ci.yml): every overlay, and the base with each component on its own, are
 # built with kustomize and checked with kubeconform against the Kubernetes
-# schemas (plus the Gateway API CRDs for the HTTPRoute).
+# schemas (plus the Gateway API CRDs for the HTTPRoute). An overlay that sets
+# FORGE_AUTH__TRUSTED_PROXY_CIDRS must also render the forge NetworkPolicy
+# (components/network-policy).
 #
 # Usage: kustomize-check.sh <kubernetes version, e.g. 1.33.0>
 # Needs kustomize and kubeconform on PATH.
@@ -63,3 +65,23 @@ kubeconform -strict -summary -kubernetes-version "$k8s_version" \
   -schema-location default \
   -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
   "$work"/*.yaml
+
+# Forge believes X-Forwarded-For from every peer in
+# FORGE_AUTH__TRUSTED_PROXY_CIDRS (usually the whole pod network), so an
+# overlay that sets it must keep the other pods away from Forge: a
+# NetworkPolicy named forge with a `from` restriction.
+failed=0
+for output in "$work"/overlay-*.yaml; do
+  grep -q 'FORGE_AUTH__TRUSTED_PROXY_CIDRS' "$output" || continue
+  if ! awk '
+    /^---$/ { if (policy && forge && from) found = 1; policy = forge = from = 0; next }
+    /^kind: NetworkPolicy$/ { policy = 1 }
+    /^  name: forge$/ { forge = 1 }
+    /^ *(- )?from:$/ { from = 1 }
+    END { if (policy && forge && from) found = 1; exit !found }
+  ' "$output"; then
+    echo "$(basename "$output" .yaml) sets FORGE_AUTH__TRUSTED_PROXY_CIDRS but renders no forge NetworkPolicy restricting who reaches Forge (components/network-policy)" >&2
+    failed=1
+  fi
+done
+exit "$failed"

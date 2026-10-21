@@ -75,7 +75,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin password (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` defaults to `admin`). Without it no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
-| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (the Helm chart's `networkPolicy`). |
+| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (see [Reverse proxy](#reverse-proxy): on Kubernetes the Helm chart's `networkPolicy.from`, the kustomize `network-policy` component). |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
 password, `minioadmin` S3 keys, and a secret still holding a `<…>` placeholder
@@ -200,6 +200,13 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
 - Terminate TLS and forward to `http://forge:8421`, preserving `Host`.
   Forward `X-Forwarded-For`, and list the proxy in
   `FORGE_AUTH__TRUSTED_PROXY_CIDRS`.
+- Let only the proxy reach Forge. Forge believes the `X-Forwarded-For` of
+  every peer in `trusted_proxy_cidrs`, so anything else that can connect from
+  those ranges can pick the client address the login lockout and the
+  anonymous-IP allowlist see. On Kubernetes the range is usually the whole
+  pod network: admit only the ingress controller or gateway with a
+  NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
+  `network-policy` component; the CNI must enforce it).
 - Allow large request bodies for `PUT /v3/{repo}/package` (package pushes).
   In nginx that is `client_max_body_size`. Match it to
   `FORGE_SERVER__MAX_UPLOAD_BYTES` if you raised that limit.

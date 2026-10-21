@@ -55,9 +55,8 @@ host: forge.example.com
 replicaCount: 2
 
 # Only the gateway may reach Forge: every address in trusted_proxy_cidrs
-# chooses the client IP Forge sees.
+# chooses the client IP Forge sees. Listing a peer turns the policy on.
 networkPolicy:
-  enabled: true
   from:
     - namespaceSelector:
         matchLabels:
@@ -100,6 +99,17 @@ Turn on secret encryption at rest (`config.crypto` and `FORGE_ROOT_KEY`)
 before you configure proxy repositories or auth realms, and keep the root key
 with your backups. Every other value is documented in
 [values.yaml](values.yaml).
+
+Forge believes the `X-Forwarded-For` header of every peer in
+`trusted_proxy_cidrs`, which on Kubernetes is usually the whole pod network.
+Without a NetworkPolicy any pod in the cluster can call the Service with a
+forged client address and get past the login lockout and the anonymous-IP
+allowlist. List the pods that proxy to Forge (the namespace of your gateway's
+data plane or ingress controller) in `networkPolicy.from`, and the chart
+renders the policy (`networkPolicy.enabled` is null by default, which means
+"on as soon as `from` lists a peer"; `false` turns it off). The CNI must
+enforce NetworkPolicy. The install notes warn while trusted proxies are set
+without it.
 
 ## Routing: HTTPRoute and ListenerSet
 

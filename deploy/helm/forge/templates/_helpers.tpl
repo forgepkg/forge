@@ -55,6 +55,16 @@ app.kubernetes.io/part-of: envisia-forge
 {{- end }}
 {{- end }}
 
+{{/* "true" when the chart renders its NetworkPolicy: networkPolicy.enabled,
+or, while that is null, as soon as networkPolicy.from lists a peer. */}}
+{{- define "forge.networkPolicyEnabled" -}}
+{{- $np := .Values.networkPolicy }}
+{{- if kindIs "invalid" $np.enabled }}
+{{- if $np.from }}true{{ end }}
+{{- else if $np.enabled }}true
+{{- end }}
+{{- end }}
+
 {{/* The Secret the chart creates from secretEnv. Reserved: existingSecret
 may not name it (deployment.yaml fails), or Helm would refuse to take over a
 Secret created outside the release. */}}
