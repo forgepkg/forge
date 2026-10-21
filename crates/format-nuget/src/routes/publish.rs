@@ -241,7 +241,9 @@ pub async fn unlist(
     if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
     }
-    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower)) {
+    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower))
+        || super::package_version(&ctx, &version).is_none()
+    {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
     unlist_version(&ctx, &id, &version).await
@@ -256,7 +258,9 @@ pub async fn relist(
     if let Some(resp) = require_write_credentials(&ctx, &headers) {
         return resp;
     }
-    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower)) {
+    if !super::package_id(&ctx, &id).is_some_and(|lower| ctx.package_filter.allows(&lower))
+        || super::package_version(&ctx, &version).is_none()
+    {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     }
     let Some(write) = ctx.write.clone() else {

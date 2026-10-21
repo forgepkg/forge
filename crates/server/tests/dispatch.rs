@@ -283,6 +283,64 @@ async fn hosted_publish_and_restore() {
     assert_eq!(downloaded.as_ref(), bytes.as_slice(), "round-trip bytes");
 }
 
+/// A version longer than NuGet's 64 characters is refused with 400 at push
+/// (it used to fail the database insert and answer 500), nothing is stored,
+/// and such a version in a request path answers 404.
+#[tokio::test]
+async fn push_of_an_overlong_version_is_400_and_stores_nothing() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("longver{}", common::unique());
+    let id = format!("Long.Ver{}", common::unique());
+    let lower = id.to_lowercase();
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let version = format!("1.0.0-{}", "a".repeat(1000));
+    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&id, &version))
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", srv.admin_token().await)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("longer than 64 characters"), "{body}");
+
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{lower}/index.json",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "nothing was stored");
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// A browser/password session is valid for the admin UI but is not a NuGet
 /// publishing credential. An unrelated Authorization scheme must not satisfy
 /// the route's wire-credential check while the cookie supplies the principal.

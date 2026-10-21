@@ -225,6 +225,17 @@ pub(crate) fn package_id(ctx: &RouteContext, raw: &str) -> Option<String> {
     ctx.format.validate_id(&lower).ok().map(|()| lower)
 }
 
+/// The normalized version of a request path, or `None` when it is not a
+/// version or is longer than any publishable one
+/// ([`crate::version::MAX_VERSION_LENGTH`]). Such a request answers 404
+/// before any backend sees it.
+pub(crate) fn package_version(ctx: &RouteContext, raw: &str) -> Option<String> {
+    if raw.trim().len() > crate::version::MAX_VERSION_LENGTH {
+        return None;
+    }
+    ctx.format.normalize_version(raw).ok()
+}
+
 /// Map a [`RepoError`] to an HTTP response.
 pub(crate) fn repo_error_response(err: RepoError) -> axum::response::Response {
     use axum::http::StatusCode;

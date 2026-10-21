@@ -46,9 +46,8 @@ pub async fn content(
     let Some(lower) = package_id(&ctx, &id) else {
         return (StatusCode::NOT_FOUND, "package not found").into_response();
     };
-    let norm_ver = match ctx.format.normalize_version(&version) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::NOT_FOUND, "invalid version").into_response(),
+    let Some(norm_ver) = super::package_version(&ctx, &version) else {
+        return (StatusCode::NOT_FOUND, "invalid version").into_response();
     };
 
     let lower_file = filename.to_ascii_lowercase();

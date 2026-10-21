@@ -485,6 +485,29 @@ async fn malformed_ids_are_404_before_the_backend() {
     }
 }
 
+/// A version longer than any publishable one answers 404 before the backend
+/// is asked, on every route that reads a version from the path.
+#[tokio::test]
+async fn overlong_versions_are_404_before_the_backend() {
+    let long = format!("1.0.0-{}", "a".repeat(59));
+    let mut ops = MockOps::default();
+    // A backend that would answer for the long version if asked.
+    ops.nuspecs
+        .insert(("sample.lib".into(), long.clone()), b"<package/>".to_vec());
+    let router = nuget_router(
+        RepoKind::Proxy,
+        ctx(RepoKind::Proxy, ops, MockBytes::default()),
+    );
+    for uri in [
+        format!("/flat/sample.lib/{long}/sample.lib.nuspec"),
+        format!("/registration/sample.lib/{long}.json"),
+        format!("/catalog/sample.lib/{long}.json"),
+    ] {
+        let (status, _h, _b) = get(&router, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
 #[tokio::test]
 async fn flat_version_normalized_on_path() {
     // Request version "1.0" should resolve the stored normalized "1.0.0".
