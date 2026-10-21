@@ -41,7 +41,7 @@ use forge_core::auth::chain::{provision_and_map, ChainOutcome};
 use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip};
 use forge_core::auth::login_throttle::{username_for_log, AttemptRefused, MAX_USERNAME_BYTES};
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
-use forge_core::auth::token::{generate_token_secret, hash_token};
+use forge_core::auth::token::{check_token, generate_token_secret, hash_token, TokenCheck};
 use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
@@ -813,6 +813,26 @@ async fn password_login(
                 .into_response();
         }
     };
+    // A token Forge issued is never a password, even one that cannot be used
+    // now. As on the wire Basic path it is not run through the chain (a
+    // credential-forwarding realm would send it upstream), and it does not
+    // sign in either: a session carries its owner's rights, not the token's
+    // scope.
+    match check_token(&state.pool, &body.password).await {
+        Ok(TokenCheck::Unknown) => {}
+        Ok(TokenCheck::Live(_) | TokenCheck::Unusable) => {
+            attempt.failed();
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Err(_) => {
+            attempt.released();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable",
+            )
+                .into_response();
+        }
+    }
     let cred = PasswordCredential {
         username: &username,
         password: &body.password,
