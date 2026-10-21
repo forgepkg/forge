@@ -64,6 +64,8 @@ const fetchMock = vi.fn()
 
 interface ApiHandlers {
   repositories?: RepoView[]
+  /** `GET /admin/formats`; unanswered (404) when absent. */
+  formats?: unknown[]
   members?: MemberView[]
   onCreate?: (body: unknown) => Response
   onUpdate?: (name: string, body: unknown) => Response
@@ -83,6 +85,9 @@ function mockApi(h: ApiHandlers) {
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
 
+      if (path.endsWith('/admin/formats') && h.formats) {
+        return Promise.resolve(json(h.formats))
+      }
       if (path.endsWith('/admin/repositories') && method === 'GET') {
         return Promise.resolve(json(h.repositories ?? []))
       }
@@ -200,6 +205,32 @@ describe('admin repositories', () => {
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toMatchObject({ name: 'brand-new', kind: 'hosted' })
     expect(posted).not.toHaveProperty('remote_url')
+  })
+
+  it('creates a repository of an installed format plugin', async () => {
+    let posted: unknown = null
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'helm', name: 'Helm charts', builtin: false, kinds: ['hosted', 'group'], mount: '/repository' },
+      ],
+      onCreate: (body) => {
+        posted = body
+        return json(repo({ name: (body as RepoView).name, format: 'helm' }), 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/new')
+
+    await user.type(await screen.findByLabelText('Name'), 'charts')
+    await screen.findByRole('option', { name: 'Helm charts (plugin helm)' })
+    await user.selectOptions(screen.getByLabelText('Format'), 'helm')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toMatchObject({ name: 'charts', kind: 'hosted', format: 'helm' })
   })
 
   it('create blocks an invalid repository name before requesting', async () => {
