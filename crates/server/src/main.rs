@@ -13,7 +13,6 @@ use forge_server::app::{
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers;
-use forge_storage::BlobStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,12 +76,11 @@ async fn main() -> anyhow::Result<()> {
     }
     drop(staging);
 
-    // Object store (ensure the bucket exists).
-    let blob_store = BlobStore::new(config.s3.to_storage());
-    blob_store
-        .ensure_bucket()
-        .await
-        .context("ensure S3 bucket")?;
+    // Object store, with the local blob cache in front when configured, and
+    // the bucket check. With the cache, an unreachable S3 does not stop the
+    // start: the instance serves its cache and retries in the background.
+    let blob_store = forge_server::object_store::open(&config)?;
+    forge_server::object_store::ensure_bucket(&blob_store).await?;
 
     // Cache: L2 Redis when configured, else L1-only. Redis is connected
     // lazily: an unreachable Redis delays startup by a few seconds (the first

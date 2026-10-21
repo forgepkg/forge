@@ -139,6 +139,21 @@ max_nuspec_compression_ratio = 200          # (default: 200)
 l1_max_capacity = 10000         # (default: 10000)
 default_ttl_seconds = 30        # (default: 30)
 
+[blob_cache]
+# Optional local disk cache for package blobs: hot downloads skip S3, and
+# cached packages keep resolving while S3 is unreachable (pushes and uncached
+# downloads then answer 503 with Retry-After, and /readyz reports the object
+# store "degraded" instead of failing). S3 stays the source of truth. Unset
+# path = no cache. Each instance needs a directory of its own.
+# path = "/var/cache/forge"
+# "auto": the size of the filesystem holding `path` minus min_free_bytes (and
+# server.max_staging_bytes when staging is on the same filesystem), re-read
+# every minute; or a fixed number of bytes. On a Kubernetes emptyDir, statvfs
+# sees the node's disk, not the volume's sizeLimit: set a number below it.
+# max_bytes = "auto"            # (default: "auto")
+# Free space the cache leaves on its filesystem, evicting instead of filling it.
+# min_free_bytes = 1073741824   # (default: 5 % of the filesystem)
+
 [outbox]
 batch_size = 100                # (default: 100)
 grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted

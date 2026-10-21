@@ -73,6 +73,14 @@ pub enum CasError {
     Db(#[from] sqlx::Error),
 }
 
+impl CasError {
+    /// Whether S3 could not be reached (see [`S3Error::Unavailable`]): the
+    /// caller should answer "try again later".
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, CasError::S3(e) if e.is_unavailable())
+    }
+}
+
 /// Locally staged bytes and their content hashes.
 ///
 /// Staging is intentionally mutation-free so a format parser and authorization
@@ -615,7 +623,11 @@ impl Cas {
                     tokio::time::sleep(DELETION_WAIT).await;
                 }
                 forge_db::blob_dao::BeginIngestOutcome::CompleteStaleDeletion(reservation) => {
-                    if let Err(error) = self.store.delete(&reservation.s3_key).await {
+                    if let Err(error) = self
+                        .store
+                        .delete_blob(&reservation.sha256, &reservation.s3_key)
+                        .await
+                    {
                         // A failed response can be ambiguous: the delete may
                         // still complete after this call returns. Keep the
                         // reservation fenced instead of making its key
@@ -643,6 +655,14 @@ impl Cas {
                 return Err(error.into());
             }
         };
+
+        // Write-through: S3 has the object now, so the staged copy may join
+        // the local blob cache instead of only being deleted.
+        if let Some(cache) = self.store.cache() {
+            cache
+                .insert_staged(&staged.sha256, staged.size, &staged.temp_path)
+                .await;
+        }
 
         Ok(StoredBlob {
             sha256: staged.sha256,

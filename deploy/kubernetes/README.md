@@ -14,6 +14,8 @@ deploy/kubernetes/
 │   ├── httproute/           Gateway API HTTPRoute instead of an Ingress
 │   ├── redis/               in-cluster Redis (shared cache), password-protected
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
+│   ├── local-cache/         local blob cache on an emptyDir (faster downloads, serves through an S3 outage)
+│   ├── local-cache-persistent/  the same on a PersistentVolume (one replica, survives restarts)
 │   ├── postgres/            in-cluster PostgreSQL 17 (evaluation / small installs)
 │   ├── s3-versitygw/        in-cluster S3 gateway on a PersistentVolume (evaluation / small installs)
 │   └── image-latest/        run :latest instead of the pinned release
@@ -124,6 +126,58 @@ Points that matter on Kubernetes:
   one hour; see the httproute component).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
+
+## Local blob cache
+
+Forge can keep a copy of the blobs it serves on a local disk: hot downloads
+skip S3, and cached packages keep resolving while S3 is unreachable (see
+[docs/deployment.md](../../docs/deployment.md#local-blob-cache)). The
+components mount a volume at `/var/cache/forge` and set
+`FORGE_BLOB_CACHE__PATH` (and `__MAX_BYTES` where needed). The existing
+`/readyz` readiness probe needs no change: with the cache, an S3 outage
+reports `degraded` but keeps the pod in the Service.
+
+- **`components/local-cache`**: an `emptyDir` (`sizeLimit: 10Gi`) with a
+  fixed 8 GiB cache. `statvfs` on an `emptyDir` sees the node's disk, not the
+  `sizeLimit`, so the cache must not size itself (`auto`) there: raise both
+  numbers together. Works with any number of replicas; the cache goes with
+  the pod, so it bridges an S3 outage only while the pod keeps running.
+- **`components/local-cache-persistent`**: a 20 GiB ReadWriteOnce
+  PersistentVolumeClaim, so the cache survives restarts, and an instance
+  restarted during an S3 outage serves what it had. One pod can mount the
+  volume, so it runs one replica with `strategy: Recreate` (a short gap on
+  every rollout); it cannot be combined with `components/high-availability`.
+  The cache sizes itself from the volume (`auto`).
+
+For a dedicated disk per pod (e.g. local NVMe) with any number of replicas,
+use `components/local-cache` and swap its volume for a generic ephemeral
+volume, where `auto` works because the cache sees the volume itself:
+
+```yaml
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: forge
+      spec:
+        template:
+          spec:
+            containers:
+              - name: forge
+                env:
+                  - name: FORGE_BLOB_CACHE__MAX_BYTES
+                    value: auto
+            volumes:
+              - name: blob-cache
+                emptyDir: null
+                ephemeral:
+                  volumeClaimTemplate:
+                    spec:
+                      accessModes: [ReadWriteOnce]
+                      storageClassName: local-nvme
+                      resources: { requests: { storage: 50Gi } }
+```
 
 ## Checking changes
 

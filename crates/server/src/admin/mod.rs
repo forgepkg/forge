@@ -19,6 +19,7 @@
 //! * [`crypto`] — §12.5 secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
 //! * [`settings`] — install-wide switches (`legacy_open_access`).
+//! * [`blob_cache`] — the local blob cache's statistics.
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -33,6 +34,7 @@
 //! the upstream directory's password. Administration takes a browser session
 //! (sign in through `/auth/login` or OIDC) or an admin-scoped token.
 
+pub mod blob_cache;
 pub mod content_selectors;
 pub mod crypto;
 pub mod effective;
@@ -242,6 +244,8 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/anonymous/effective", get(effective::for_anonymous))
         // --- §12.5: secret encryption at rest -------------------------------
         .route("/crypto/keys", get(crypto::list_keys))
+        // --- local blob cache ----------------------------------------------
+        .route("/blob-cache", get(blob_cache::stats))
         .route(
             "/crypto/rotate/{layer}",
             axum::routing::post(crypto::rotate),

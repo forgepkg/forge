@@ -69,6 +69,11 @@ async fn pg_endpoint() -> &'static str {
     PG_ENDPOINT.get().unwrap()
 }
 
+/// The shared versitygw's endpoint (booted on first use).
+pub(crate) async fn shared_s3_endpoint() -> &'static str {
+    s3_endpoint().await
+}
+
 async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
@@ -270,7 +275,20 @@ fn config_toml(
     public_base_url: &str,
     oidc_block: &str,
     auth_block: &str,
+    blob_cache: Option<&BlobCacheSetup>,
 ) -> String {
+    let blob_cache_block = match blob_cache {
+        // No free-space reserve: whether the cache may grow must not depend
+        // on how full the test host's disk is.
+        Some(cache) => format!(
+            "[blob_cache]\npath = {:?}\nmax_bytes = {}\nmin_free_bytes = 0\n",
+            cache.path.display().to_string(),
+            cache
+                .max_bytes
+                .map_or_else(|| "\"auto\"".to_string(), |b| b.to_string())
+        ),
+        None => String::new(),
+    };
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -319,6 +337,7 @@ poll_interval_seconds = 1
 default_run_interval_seconds = 3600
 lease_seconds = 30
 {oidc_block}
+{blob_cache_block}
 "#,
         bucket = S3_BUCKET,
         access = S3_ACCESS,
@@ -329,6 +348,14 @@ lease_seconds = 30
 }
 
 // ── Stack builder ───────────────────────────────────────────────────────────
+
+/// The `[blob_cache]` of a stack.
+#[derive(Debug, Clone)]
+struct BlobCacheSetup {
+    path: std::path::PathBuf,
+    /// `None`: `"auto"`.
+    max_bytes: Option<u64>,
+}
 
 /// Produces the `[oidc]` TOML block from the (post-bind) public base URL, so the
 /// `redirect_url` can embed the ephemeral address the server actually binds to.
@@ -348,6 +375,10 @@ pub struct StackBuilder {
     /// set, this is the `providers = [...]` line plus the `[auth.upstream_basic]`
     /// table injected into the `[auth]` config section.
     auth_block: Option<String>,
+    /// `None` ⇒ the shared versitygw.
+    s3_endpoint: Option<String>,
+    /// `None` ⇒ no local blob cache.
+    blob_cache: Option<BlobCacheSetup>,
 }
 
 impl Default for StackBuilder {
@@ -363,6 +394,8 @@ impl Default for StackBuilder {
             cache_ttl_seconds: 5,
             oidc_block_fn: None,
             auth_block: None,
+            s3_endpoint: None,
+            blob_cache: None,
         }
     }
 }
@@ -420,6 +453,39 @@ impl StackBuilder {
         self
     }
 
+    /// Talk to S3 at `endpoint` (e.g. an [`S3Gate`](crate::S3Gate) in front
+    /// of the shared versitygw) instead of the shared versitygw directly.
+    pub fn s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.s3_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Enable the local blob cache at `path`, `max_bytes` bytes large
+    /// (`None`: `"auto"`). The server then starts even while S3 is down.
+    pub fn blob_cache(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+        max_bytes: Option<u64>,
+    ) -> Self {
+        self.blob_cache = Some(BlobCacheSetup {
+            path: path.into(),
+            max_bytes,
+        });
+        self
+    }
+
+    /// Boot a server over an existing stack's database (e.g. an instance
+    /// restarted on its persistent blob cache), without creating the
+    /// bootstrap admin or minting tokens.
+    pub async fn start_on(self, db_url: &str) -> TestServer {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(db_url)
+            .await
+            .expect("connect existing db");
+        self.serve(db_url.to_string(), pool, false).await
+    }
+
     /// Boot a fresh stack: a new database + a server instance.
     pub async fn start(self) -> TestServer {
         let db_url = fresh_database().await;
@@ -450,8 +516,8 @@ impl StackBuilder {
     /// Build the config + server for `pool`, optionally creating the bootstrap
     /// admin and minting an admin token.
     async fn serve(self, db_url: String, pool: PgPool, mint_token: bool) -> TestServer {
-        let store = blob_store().await;
-        let s3 = s3_endpoint().await;
+        let shared_s3 = s3_endpoint().await;
+        let s3 = self.s3_endpoint.as_deref().unwrap_or(shared_s3);
         let redis = if self.use_redis {
             Some(redis_url().await.to_string())
         } else {
@@ -489,12 +555,26 @@ impl StackBuilder {
             &base_url,
             &oidc_block,
             self.auth_block.as_deref().unwrap_or_default(),
+            self.blob_cache.as_ref(),
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
             figment::Figment::new().merge(figment::providers::Toml::string(&toml)),
         )
         .expect("valid config");
+
+        // A stack with its own S3 endpoint or a blob cache builds its store
+        // the way `main` does (degraded start while S3 is down, with the
+        // cache); the others share the readiness-checked versitygw store.
+        let store = if self.s3_endpoint.is_some() || self.blob_cache.is_some() {
+            let store = forge_server::object_store::open(&config).expect("object store");
+            forge_server::object_store::ensure_bucket(&store)
+                .await
+                .expect("ensure bucket");
+            store
+        } else {
+            blob_store().await
+        };
 
         ensure_bootstrap_admin(&config, &pool)
             .await

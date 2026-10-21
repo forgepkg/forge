@@ -36,6 +36,7 @@ impl RepoReadOps for FixtureReads {
         _version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
         Ok(Some(NupkgLocation {
+            blob_sha256: "blob".to_string(),
             blob_s3_key: "blob".to_string(),
             size: 4,
             content_type: "application/octet-stream".to_string(),

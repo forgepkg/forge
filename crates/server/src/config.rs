@@ -76,6 +76,10 @@ pub struct Config {
     /// `/admin/crypto/*` endpoints are live.
     #[serde(default)]
     pub crypto: Option<CryptoConfig>,
+    /// Optional local disk cache for blobs. Absent (no `path`) ⇒ every
+    /// download reads S3.
+    #[serde(default)]
+    pub blob_cache: BlobCacheConfig,
 }
 
 /// `server.*`
@@ -668,6 +672,67 @@ impl RedisConfig {
                 .map(Duration::from_millis)
                 .unwrap_or(defaults.response),
         }
+    }
+}
+
+/// `blob_cache.*` (optional): a copy of downloaded blobs on a local disk, so
+/// hot downloads skip S3 and cached packages keep resolving while S3 is down.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BlobCacheConfig {
+    /// The cache directory (created if missing). Unset or blank ⇒ no cache.
+    /// Each instance needs a directory of its own.
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
+    /// `"auto"` (default): the size of the filesystem holding `path`, minus
+    /// `min_free_bytes` (and `server.max_staging_bytes` when staging is on
+    /// the same filesystem), re-read periodically; or a fixed byte count.
+    /// Either way capped so the filesystem keeps `min_free_bytes` free.
+    #[serde(default)]
+    pub max_bytes: BlobCacheMaxBytes,
+    /// Free space the cache leaves on its filesystem, evicting instead of
+    /// filling it. Default: 5 % of the filesystem.
+    #[serde(default)]
+    pub min_free_bytes: Option<u64>,
+}
+
+/// `blob_cache.max_bytes`: `"auto"` or a byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobCacheMaxBytes {
+    /// Sized from the disk.
+    #[default]
+    Auto,
+    /// A fixed limit in bytes.
+    Bytes(u64),
+}
+
+impl<'de> Deserialize<'de> for BlobCacheMaxBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = BlobCacheMaxBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"auto\" or a number of bytes")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(BlobCacheMaxBytes::Bytes(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u64::try_from(v)
+                    .map(BlobCacheMaxBytes::Bytes)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("auto") {
+                    Ok(BlobCacheMaxBytes::Auto)
+                } else {
+                    v.parse()
+                        .map(BlobCacheMaxBytes::Bytes)
+                        .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -1698,6 +1763,15 @@ impl Config {
         {
             self.redis.url = None;
         }
+        // `FORGE_BLOB_CACHE__PATH=` turns the blob cache off.
+        if self
+            .blob_cache
+            .path
+            .as_deref()
+            .is_some_and(|p| p.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            self.blob_cache.path = None;
+        }
     }
 
     /// Validate cross-cutting invariants that serde cannot express.
@@ -1752,6 +1826,15 @@ impl Config {
                 "server.max_upload_bytes must be greater than 0".into(),
             ));
         }
+        if self.blob_cache.path.is_some()
+            && self.blob_cache.max_bytes == BlobCacheMaxBytes::Bytes(0)
+        {
+            return Err(ConfigError::Invalid(
+                "blob_cache.max_bytes must be greater than 0 (or \"auto\"); unset \
+                 blob_cache.path to turn the cache off"
+                    .into(),
+            ));
+        }
         if let Some(budget) = self.staging_budget() {
             let needed = self.largest_staged_set();
             if budget < needed {
@@ -1786,6 +1869,23 @@ impl Config {
             .staging_dir
             .clone()
             .unwrap_or_else(forge_storage::Staging::default_dir)
+    }
+
+    /// The local blob cache's configuration, `None` when it is off
+    /// (`blob_cache.path` unset).
+    pub fn blob_cache(&self) -> Option<forge_storage::BlobCacheConfig> {
+        let path = self.blob_cache.path.clone()?;
+        Some(forge_storage::BlobCacheConfig {
+            path,
+            max_bytes: match self.blob_cache.max_bytes {
+                BlobCacheMaxBytes::Auto => forge_storage::CacheLimit::Auto,
+                BlobCacheMaxBytes::Bytes(bytes) => forge_storage::CacheLimit::Bytes(bytes),
+            },
+            min_free_bytes: self.blob_cache.min_free_bytes,
+            staging: self
+                .staging_budget()
+                .map(|budget| (self.staging_dir(), budget)),
+        })
     }
 
     /// The temp-space budget for staging, or `None` for no limit
@@ -2960,6 +3060,57 @@ mod tests {
                     .any(|w| w.contains("not https")),
                 "{base:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_blob_cache_is_off_unless_a_path_is_set() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(cfg.blob_cache().is_none());
+
+        let blank = format!("{MINIMAL}\n[blob_cache]\npath = \" \"\nmax_bytes = 0\n");
+        let cfg = Config::from_figment(fig_from_toml(&blank)).expect("blank path: off");
+        assert!(cfg.blob_cache().is_none());
+    }
+
+    #[test]
+    fn blob_cache_max_bytes_is_auto_or_a_byte_count() {
+        let auto = format!("{MINIMAL}\n[blob_cache]\npath = \"/var/cache/forge\"\n");
+        let cache = Config::from_figment(fig_from_toml(&auto))
+            .expect("valid")
+            .blob_cache()
+            .expect("on");
+        assert_eq!(cache.path, std::path::PathBuf::from("/var/cache/forge"));
+        assert_eq!(cache.max_bytes, forge_storage::CacheLimit::Auto);
+        assert_eq!(cache.min_free_bytes, None);
+        let (staging_dir, budget) = cache.staging.expect("staging budget");
+        assert_eq!(staging_dir, forge_storage::Staging::default_dir());
+        assert_eq!(budget, 4 * 1024 * 1024 * 1024);
+
+        for (value, expected) in [
+            ("\"AUTO\"", forge_storage::CacheLimit::Auto),
+            ("10737418240", forge_storage::CacheLimit::Bytes(10 << 30)),
+            ("\"1048576\"", forge_storage::CacheLimit::Bytes(1 << 20)),
+        ] {
+            let toml = format!(
+                "{MINIMAL}\n[blob_cache]\npath = \"/c\"\nmax_bytes = {value}\nmin_free_bytes = 1024\n"
+            );
+            let cache = Config::from_figment(fig_from_toml(&toml))
+                .expect(value)
+                .blob_cache()
+                .expect("on");
+            assert_eq!(cache.max_bytes, expected, "{value}");
+            assert_eq!(cache.min_free_bytes, Some(1024));
+        }
+
+        for (value, message) in [
+            ("0", "blob_cache.max_bytes"),
+            ("\"lots\"", "auto"),
+            ("-1", "auto"),
+        ] {
+            let toml = format!("{MINIMAL}\n[blob_cache]\npath = \"/c\"\nmax_bytes = {value}\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(message), "{value}: {err}");
         }
     }
 

@@ -110,19 +110,33 @@ impl RepoReadOps for MockOps {
 #[derive(Default, Clone)]
 struct MockBytes {
     map: std::collections::HashMap<String, Vec<u8>>,
+    /// Serve byte ranges (as the server does with the local blob cache).
+    ranges: bool,
 }
 
 #[async_trait]
 impl NupkgBytes for MockBytes {
-    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
-        let bytes = self
+    async fn open(
+        &self,
+        loc: &NupkgLocation,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
+        let s3_key = &loc.blob_s3_key;
+        let mut bytes = self
             .map
             .get(s3_key)
             .cloned()
             .ok_or_else(|| RepoError::RepoNotFound(s3_key.to_string()))?;
+        if let Some(range) = range {
+            bytes = bytes[range.start as usize..range.end as usize].to_vec();
+        }
         Ok(Box::pin(futures_util::stream::once(async move {
             Ok(bytes::Bytes::from(bytes))
         })))
+    }
+
+    fn serves_ranges(&self) -> bool {
+        self.ranges
     }
 }
 
@@ -356,6 +370,7 @@ async fn flat_nupkg_streams_bytes_with_content_type() {
     ops.nupkgs.insert(
         ("sample.lib".into(), "1.0.0".into()),
         NupkgLocation {
+            blob_sha256: "abc".into(),
             blob_s3_key: "blobs/abc".into(),
             size: 5,
             content_type: "application/octet-stream".into(),
@@ -375,6 +390,99 @@ async fn flat_nupkg_streams_bytes_with_content_type() {
         "application/octet-stream"
     );
     assert_eq!(body, b"PK\x03\x04!");
+}
+
+/// A router serving `sample.lib 1.0.0` as the ten bytes `0123456789`.
+fn ranged_router(ranges: bool) -> axum::Router {
+    let mut ops = MockOps::default();
+    ops.nupkgs.insert(
+        ("sample.lib".into(), "1.0.0".into()),
+        NupkgLocation {
+            blob_sha256: "abc".into(),
+            blob_s3_key: "blobs/abc".into(),
+            size: 10,
+            content_type: "application/octet-stream".into(),
+        },
+    );
+    let mut bytes = MockBytes {
+        ranges,
+        ..MockBytes::default()
+    };
+    bytes.map.insert("blobs/abc".into(), b"0123456789".to_vec());
+    nuget_router(RepoKind::Hosted, ctx(RepoKind::Hosted, ops, bytes))
+}
+
+async fn get_range(
+    router: &axum::Router,
+    range: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let req = Request::builder()
+        .uri("/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg")
+        .header("range", range)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let (status, headers) = (resp.status(), resp.headers().clone());
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
+/// With a blob source that serves ranges, a single range is answered 206
+/// and one past the end 416.
+#[tokio::test]
+async fn flat_nupkg_answers_range_requests_when_ranges_are_served() {
+    let router = ranged_router(true);
+    let (status, headers, body) = get_range(&router, "bytes=2-5").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers["content-range"], "bytes 2-5/10");
+    assert_eq!(headers["content-length"], "4");
+    assert_eq!(headers["accept-ranges"], "bytes");
+    assert_eq!(body, b"2345");
+
+    let (status, headers, body) = get_range(&router, "bytes=-3").await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers["content-range"], "bytes 7-9/10");
+    assert_eq!(body, b"789");
+
+    let (status, headers, body) = get_range(&router, "bytes=10-").await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(headers["content-range"], "bytes */10");
+    assert!(body.is_empty());
+
+    // Several ranges: the whole package.
+    let (status, headers, body) = get_range(&router, "bytes=0-1,4-5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-length"], "10");
+    assert_eq!(body, b"0123456789");
+
+    // A HEAD ignores the range and advertises support.
+    let (status, headers, _) = send(
+        &router,
+        "HEAD",
+        "/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["accept-ranges"], "bytes");
+    assert_eq!(headers["content-length"], "10");
+}
+
+/// Without range support (no local blob cache) downloads stay as they
+/// were: a `Range` is ignored and no `Accept-Ranges` is sent.
+#[tokio::test]
+async fn flat_nupkg_ignores_range_requests_without_range_support() {
+    let router = ranged_router(false);
+    let (status, headers, body) = get_range(&router, "bytes=2-5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!headers.contains_key("accept-ranges"));
+    assert!(!headers.contains_key("content-range"));
+    assert_eq!(body, b"0123456789");
 }
 
 #[tokio::test]
@@ -492,6 +600,7 @@ async fn flat_version_normalized_on_path() {
     ops.nupkgs.insert(
         ("sample.lib".into(), "1.0.0".into()),
         NupkgLocation {
+            blob_sha256: "abc".into(),
             blob_s3_key: "blobs/abc".into(),
             size: 1,
             content_type: "application/octet-stream".into(),

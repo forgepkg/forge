@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            - name: FORGE_BLOB_CACHE__PATH
+              value: /var/cache/forge
+          volumeMounts:
+            - name: blob-cache
+              mountPath: /var/cache/forge
+      volumes:
+        - name: blob-cache
+          persistentVolumeClaim:
+            claimName: forge-blob-cache
