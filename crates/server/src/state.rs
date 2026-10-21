@@ -598,7 +598,10 @@ mod tests {
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
-        assert_eq!(registry.kinds("helm"), Some(vec!["hosted", "group"]));
+        assert_eq!(
+            registry.kinds("helm"),
+            Some(vec!["hosted", "proxy", "group"])
+        );
         assert_eq!(registry.kinds("npm"), None);
         assert!(!registry.is_installed("npm"));
     }

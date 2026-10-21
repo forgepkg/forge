@@ -16,6 +16,10 @@
 //! Chart names are matched case-insensitively (the canonical id is the
 //! lowercased name); versions are SemVer, normalized (`v1.2` → `1.2.0`).
 //!
+//! A proxy repository mirrors another chart repository ([`upstream`]): its
+//! index lists the upstream's charts, each downloaded and cached on first
+//! use.
+//!
 //! Forge links this plugin in ([`Helm`], [`PLUGIN_TOML`]). With the
 //! `component` feature the same crate builds as a WebAssembly component of
 //! the `forge:format` world instead (`cargo xtask plugins`).
@@ -23,14 +27,16 @@
 mod chart;
 mod semver;
 mod tar;
+mod upstream;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use forge_plugin_api::{
-    Action, Answer, ChangeRequest, Dependency, DependencyGroup, FormatError, FormatPlugin, Loaded,
-    PackageInfo, PackageRef, PackageSource, ParsedPackage, PublishRequest, Query, Rendered,
-    Repository, Request, Response, SearchQuery, Upload,
+    Action, Answer, ChangeRequest, Dependency, DependencyGroup, FetchResult, FormatError,
+    FormatPlugin, Loaded, PackageInfo, PackageRef, PackageSource, ParsedPackage, PublishRequest,
+    Query, Remote, Rendered, Repository, RepositoryKind, Request, Response, SearchHit, SearchQuery,
+    Upload, UpstreamOp, UpstreamStep,
 };
 use serde_json::{json, Map, Value};
 
@@ -119,39 +125,19 @@ impl FormatPlugin for Helm {
 
     fn manifest_summary(&self, manifest: &[u8]) -> Option<String> {
         let chart = chart::parse_chart_yaml(manifest.to_vec()).ok()?;
-        let metadata: Map<String, Value> = chart
-            .metadata
-            .iter()
-            .filter(|(k, _)| METADATA_KEYS.contains(&k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let deps: Vec<Value> = dependencies(&chart.metadata)
-            .into_iter()
-            .map(|d| json!({ "id": d.id, "range": d.range }))
-            .collect();
-        // `description` and `dependency_groups` are what Forge's web UI shows.
-        let summary = json!({
-            "chart": metadata,
-            "description": chart.metadata.get("description").cloned().unwrap_or(Value::Null),
-            "dependency_groups": if deps.is_empty() {
-                json!([])
-            } else {
-                json!([{ "target_framework": null, "dependencies": deps }])
-            },
-        });
-        Some(summary.to_string())
+        Some(summary(&chart.metadata))
     }
 
-    fn handle(&self, _repo: &Repository, req: &Request) -> Action {
+    fn handle(&self, repo: &Repository, req: &Request) -> Action {
         let read = matches!(req.method.as_str(), "GET" | "HEAD");
         let segments: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
         match (req.method.as_str(), segments.as_slice()) {
-            (_, ["index.yaml"]) if read => Action::Load(vec![search_page(0)]),
+            (_, ["index.yaml"]) if read => Action::Load(vec![search_page(repo, 0)]),
             (_, ["charts", name, version, file]) if read => match package_ref(name, version) {
                 Some(target) if file.ends_with(".tgz") => Action::Download(target),
                 _ => Action::Respond(not_found()),
             },
-            (_, ["api", "charts"]) if read => Action::Load(vec![search_page(0)]),
+            (_, ["api", "charts"]) if read => Action::Load(vec![search_page(repo, 0)]),
             (_, ["api", "charts", name]) if read => match decode(name) {
                 Some(name) if chart::valid_name(&name) => {
                     Action::Load(vec![Query::Packages(name.to_ascii_lowercase())])
@@ -209,6 +195,40 @@ impl FormatPlugin for Helm {
             _ => Rendered::Respond(not_found()),
         }
     }
+
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        upstream::step(remote, op, fetched)
+    }
+}
+
+/// The manifest summary of a chart's metadata (its Chart.yaml, or an index
+/// entry): the chart metadata an index entry carries, and the description
+/// and dependency groups Forge's web UI shows.
+fn summary(metadata: &Map<String, Value>) -> String {
+    let chart: Map<String, Value> = metadata
+        .iter()
+        .filter(|(k, _)| METADATA_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let deps: Vec<Value> = dependencies(metadata)
+        .into_iter()
+        .map(|d| json!({ "id": d.id, "range": d.range }))
+        .collect();
+    json!({
+        "chart": chart,
+        "description": metadata.get("description").cloned().unwrap_or(Value::Null),
+        "dependency_groups": if deps.is_empty() {
+            json!([])
+        } else {
+            json!([{ "target_framework": null, "dependencies": deps }])
+        },
+    })
+    .to_string()
 }
 
 /// Chart.yaml `dependencies` as Forge dependencies.
@@ -263,14 +283,16 @@ fn package_ref(name: &str, version: &str) -> Option<PackageRef> {
     })
 }
 
-fn search_page(skip: u32) -> Query {
+/// A page of every chart of `repo`: a proxy's (and a group's proxies')
+/// upstream charts included, not only the ones it has cached.
+fn search_page(repo: &Repository, skip: u32) -> Query {
     Query::Search(SearchQuery {
         text: String::new(),
         skip,
         take: PAGE,
         prerelease: true,
         semver2: true,
-        upstream: false,
+        upstream: repo.kind != RepositoryKind::Hosted,
     })
 }
 
@@ -280,6 +302,7 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
     let mut total = 0u32;
     let mut pages = 0u32;
     let mut ids: Vec<String> = Vec::new();
+    let mut hits: Vec<&SearchHit> = Vec::new();
     let mut charts: Vec<Vec<&PackageInfo>> = Vec::new();
     for loaded in data {
         match (&loaded.query, &loaded.answer) {
@@ -292,6 +315,7 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
                         .iter()
                         .map(|h| h.original_id.to_ascii_lowercase()),
                 );
+                hits.extend(result.hits.iter());
             }
             // Unlisted versions stay downloadable but are not offered.
             (Query::Packages(_), Answer::Packages(versions)) => {
@@ -309,9 +333,22 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
     if !loaded_charts {
         if pages * PAGE < total && pages == 1 {
             let more = (1..total.div_ceil(PAGE))
-                .map(|p| search_page(p * PAGE))
+                .map(|p| search_page(repo, p * PAGE))
                 .collect();
             return Rendered::Load(more);
+        }
+        // A proxy's charts are its upstream's: the search lists each with
+        // its versions and the newest one's metadata, so the index comes
+        // from it rather than from reading the upstream once per chart.
+        if repo.kind == RepositoryKind::Proxy {
+            let mut entries = Map::new();
+            for hit in hits {
+                entries.insert(
+                    hit.original_id.clone(),
+                    Value::Array(hit_entries(repo, hit)),
+                );
+            }
+            return render_index(segments, entries, None);
         }
         if !ids.is_empty() {
             ids.sort();
@@ -342,6 +379,12 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
         let list: Vec<Value> = versions.into_iter().map(|p| entry(repo, p)).collect();
         entries.insert(name, Value::Array(list));
     }
+    render_index(segments, entries, latest)
+}
+
+/// The index (`/index.yaml`) or the ChartMuseum listing (`/api/charts`) of
+/// `entries`, generated as of `latest`.
+fn render_index(segments: &[&str], entries: Map<String, Value>, latest: Option<&str>) -> Rendered {
     if segments == ["api", "charts"] {
         return Rendered::Respond(json_response(200, &Value::Object(entries)));
     }
@@ -355,6 +398,57 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
     Rendered::Respond(
         Response::new(200, "application/x-yaml", Value::Object(index).to_string())
             .with_header("cache-control", "no-cache"),
+    )
+}
+
+/// The index entries of a chart a proxy's search found, newest first. The
+/// newest version carries the chart's metadata; the others, which the
+/// search does not describe, their name, version and URL.
+fn hit_entries(repo: &Repository, hit: &SearchHit) -> Vec<Value> {
+    let chart: Map<String, Value> = hit
+        .summary
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|s| match s.get("chart") {
+            Some(Value::Object(map)) => Some(map.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut versions: Vec<_> = hit.versions.iter().collect();
+    versions.sort_by(
+        |a, b| match (Version::parse(&a.version), Version::parse(&b.version)) {
+            (Ok(a), Ok(b)) => b.cmp(&a),
+            _ => b.version.cmp(&a.version),
+        },
+    );
+    versions
+        .into_iter()
+        .map(|v| {
+            let mut entry = if v.version == hit.latest_version {
+                chart.clone()
+            } else {
+                chart
+                    .get("apiVersion")
+                    .map(|api| Map::from_iter([("apiVersion".to_string(), api.clone())]))
+                    .unwrap_or_default()
+            };
+            entry.insert("name".into(), json!(hit.original_id));
+            entry.insert("version".into(), json!(v.version_original));
+            entry.insert(
+                "urls".into(),
+                json!([chart_url(repo, &hit.original_id, &v.version)]),
+            );
+            Value::Object(entry)
+        })
+        .collect()
+}
+
+/// Where a chart version is downloaded from this repository.
+fn chart_url(repo: &Repository, name: &str, version: &str) -> String {
+    format!(
+        "{}/charts/{}/{version}/{name}-{version}.tgz",
+        repo.base_url,
+        name.to_ascii_lowercase(),
     )
 }
 
@@ -381,16 +475,9 @@ fn entry(repo: &Repository, p: &PackageInfo) -> Value {
         .unwrap_or_default();
     chart.insert("name".into(), json!(p.original_id));
     chart.insert("version".into(), json!(p.version_original));
-    let file = format!("{}-{}.tgz", p.original_id, p.version);
     chart.insert(
         "urls".into(),
-        json!([format!(
-            "{}/charts/{}/{}/{}",
-            repo.base_url,
-            p.original_id.to_ascii_lowercase(),
-            p.version,
-            file
-        )]),
+        json!([chart_url(repo, &p.original_id, &p.version)]),
     );
     if let Some(published) = &p.published {
         chart.insert("created".into(), json!(published));

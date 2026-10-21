@@ -173,7 +173,7 @@ and the loaded WebAssembly plugins (with the `sha256` of their component),
 each with the repository kinds it supports and where its repositories are
 served. The web UI's *New repository* form offers them. Plugins serve
 **hosted** and **group** repositories, and **proxies** when they implement
-the upstream side (NuGet does). Docker has proxies of its own.
+the upstream side (NuGet and Helm do). Docker has proxies of its own.
 
 Helm is built in, so a Helm repository needs no setup beyond creating it:
 
@@ -197,6 +197,26 @@ helm install web forge/mychart --version 1.2.0
 curl -u ci:$TOKEN -X DELETE \
   https://forge.example.com/repository/charts/api/charts/mychart/1.2.0
 ```
+
+A Helm **proxy** mirrors another chart repository: its index lists the
+upstream's charts, and each chart is downloaded from the upstream on first
+use and served from Forge after.
+
+```bash
+curl -u admin:$ADMIN_TOKEN -H 'content-type: application/json' \
+  -d '{"name": "bitnami", "kind": "proxy", "format": "helm",
+       "remote_url": "https://charts.bitnami.com/bitnami"}' \
+  https://forge.example.com/admin/repositories
+helm repo add bitnami-via-forge https://forge.example.com/repository/bitnami \
+  --username me --password $TOKEN
+```
+
+Its index describes each chart's newest version fully and the older ones by
+name, version and URL: that is what one search of the upstream says, and
+reading the upstream's index once per chart would be slow for large
+repositories. A group with a Helm proxy among its members reads the
+upstream once per chart for its index; for a large upstream, add the proxy
+itself as a Helm repository.
 
 As with every format, the password is an **API token**. A password typed at
 the web login is not a publishing credential.
@@ -434,6 +454,10 @@ to lift them:
   for it.
 - **Listings are bounded.** A response may load at most 2,048 answers, so the
   Helm index covers at most about 2,000 charts.
+- **A Helm upstream is read whole.** Every upstream operation of a Helm
+  proxy reads the upstream's `index.yaml` (cached for the metadata TTL, and
+  at most `proxy.max_metadata_bytes`, 32 MiB by default); the contract has
+  no ranged or streamed reads of an upstream document.
 
 ### NuGet as a plugin
 

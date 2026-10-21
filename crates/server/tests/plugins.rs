@@ -403,15 +403,14 @@ async fn formats_keep_to_their_own_mounts_and_kinds() {
     assert_eq!(formats[1]["id"], "docker");
     assert_eq!(formats[2]["id"], "helm");
     assert_eq!(formats[2]["builtin"], true);
-    assert_eq!(formats[2]["kinds"], json!(["hosted", "group"]));
+    assert_eq!(formats[2]["kinds"], json!(["hosted", "proxy", "group"]));
     assert_eq!(formats[2]["mount"], "/repository");
     assert!(formats[2].get("sha256").is_none());
 
-    // Plugin formats have no proxies; unknown formats are refused.
+    // A proxy needs its upstream; unknown formats are refused.
     let resp = create_repo(
         &srv,
-        json!({ "name": format!("p{}", unique()), "kind": "proxy", "format": "helm",
-                "remote_url": "https://charts.example.com" }),
+        json!({ "name": format!("p{}", unique()), "kind": "proxy", "format": "helm" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -597,4 +596,145 @@ fn a_component_cannot_take_a_builtin_format_id() {
         .err()
         .expect("helm is taken");
     assert!(err.contains("built into this server"), "{err}");
+}
+
+/// A chart repository upstream of a Helm proxy, serving `index.yaml` and
+/// chart archives under `/stable`, and counting chart downloads.
+struct ChartUpstream {
+    base: String,
+    charts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+    downloads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ChartUpstream {
+    async fn start(index: String) -> Self {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::atomic::Ordering;
+
+        type Shared = (
+            String,
+            std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        );
+        let charts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/stable/index.yaml",
+                axum::routing::get(|State((index, _, _)): State<Shared>| async move { index }),
+            )
+            .route(
+                "/stable/charts/{file}",
+                axum::routing::get(
+                    |State((_, charts, downloads)): State<Shared>, Path(file): Path<String>| async move {
+                        match charts.lock().unwrap().get(&file).cloned() {
+                            Some(bytes) => {
+                                downloads.fetch_add(1, Ordering::SeqCst);
+                                bytes.into_response()
+                            }
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                ),
+            )
+            .with_state((index, charts.clone(), downloads.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/stable", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ChartUpstream {
+            base,
+            charts,
+            downloads,
+        }
+    }
+
+    fn publish(&self, file: &str, bytes: Vec<u8>) {
+        self.charts.lock().unwrap().insert(file.into(), bytes);
+    }
+
+    fn downloads(&self) -> usize {
+        self.downloads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A Helm proxy lists its upstream's charts in its index, serves each from
+/// the upstream once and from its cache after, and publishes nothing.
+#[tokio::test]
+async fn a_helm_proxy_serves_its_upstreams_charts() {
+    let index = "apiVersion: v1\nentries:\n  demo:\n    - apiVersion: v2\n      name: demo\n      version: 1.0.0\n      description: demo chart\n      urls: [charts/demo-1.0.0.tgz]\n  other:\n    - apiVersion: v2\n      name: other\n      version: 2.0.0\n      urls: [charts/other-2.0.0.tgz]\n".to_string();
+    let upstream = ChartUpstream::start(index).await;
+    let demo = chart("demo", "1.0.0");
+    upstream.publish("demo-1.0.0.tgz", demo.clone());
+
+    let srv = start_helm(ServerOpts::default()).await;
+    let creds = credentials(&srv).await;
+    let proxy = format!("proxy{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": proxy, "kind": "proxy", "format": "helm", "remote_url": upstream.base }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    // The index lists the upstream's charts, nothing downloaded yet.
+    let resp = get_index(&srv, &proxy, Some(&creds)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let index: Value = resp.json().await.unwrap();
+    assert_eq!(index["entries"]["other"][0]["version"], "2.0.0");
+    let url = index["entries"]["demo"][0]["urls"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        url.ends_with(&format!(
+            "/repository/{proxy}/charts/demo/1.0.0/demo-1.0.0.tgz"
+        )),
+        "{url}"
+    );
+    assert_eq!(index["entries"]["demo"][0]["description"], "demo chart");
+    assert_eq!(upstream.downloads(), 0);
+
+    // The chart comes from the upstream once, then from the cache.
+    let get = |url: String| {
+        srv.client()
+            .get(url.replace("http://test.local", &srv.base_url))
+            .basic_auth(&creds.0, Some(&creds.1))
+            .send()
+    };
+    for _ in 0..2 {
+        let resp = get(url.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), demo.as_slice());
+    }
+    assert_eq!(upstream.downloads(), 1);
+
+    // A version the upstream does not have is not found.
+    let resp = get(format!(
+        "{}/repository/{proxy}/charts/other/2.0.0/other-2.0.0.tgz",
+        srv.base_url
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The ChartMuseum view of one chart, from the upstream's index.
+    let resp = get(format!(
+        "{}/repository/{proxy}/api/charts/demo",
+        srv.base_url
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let versions: Value = resp.json().await.unwrap();
+    assert_eq!(versions[0]["version"], "1.0.0");
+
+    // A proxy publishes nothing.
+    let resp = push(&srv, &proxy, &creds, chart("demo", "1.0.1")).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
