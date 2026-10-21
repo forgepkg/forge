@@ -329,6 +329,7 @@ async fn browse_repos_folder_root() {
         .find(|r| r["name"] == json!(repo))
         .expect("created repo listed in /browse/repos");
     assert_eq!(entry["kind"], json!("hosted"));
+    assert_eq!(entry["online"], json!(true));
 
     // Sorted by name.
     let names: Vec<&str> = repos.iter().map(|r| r["name"].as_str().unwrap()).collect();
@@ -401,6 +402,117 @@ async fn browse_group_merges_members() {
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0]["version"], json!("2.0.0"));
     let _ = lower;
+}
+
+/// An offline hosted or group repository serves nothing through browse either,
+/// as on its feed (#73): its search and package detail answer 503 with
+/// `Retry-After`, a merged search leaves it out, and `/browse/repos` flags it.
+/// An offline proxy still browses what it cached.
+#[tokio::test]
+async fn browse_offline_hosted_and_group_answer_503() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let hosted = format!("boffh{s}");
+    let group = format!("boffg{s}");
+    let proxy = format!("boffp{s}");
+    let id = format!("Off.Browse{s}");
+
+    publish_one(&srv, &hosted, &id, "1.0.0", false).await;
+    for body in [
+        json!({"name": group, "kind": "group"}),
+        json!({"name": proxy, "kind": "proxy",
+               "remote_url": "https://api.nuget.org/v3/index.json"}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{body}");
+    }
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"member": hosted, "priority": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let get = |path: String| {
+        client
+            .get(format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+    };
+    let merged_has_id = |body: &Value| {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["original_id"] == json!(id))
+    };
+    let merged: Value = get(format!("/browse/packages?q={id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(merged_has_id(&merged), "online: {merged}");
+
+    for repo in [&hosted, &group, &proxy] {
+        let resp = client
+            .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"online": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    for repo in [&hosted, &group] {
+        for path in [
+            format!("/browse/packages?repo={repo}"),
+            format!("/browse/packages/{repo}/{id}"),
+        ] {
+            let resp = get(path.clone()).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            assert!(resp.headers().contains_key("retry-after"), "{path}");
+        }
+    }
+    let merged: Value = get(format!("/browse/packages?q={id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!merged_has_id(&merged), "offline repos left out: {merged}");
+    let resp = get(format!("/browse/packages?repo={proxy}")).await.unwrap();
+    assert_eq!(resp.status(), 200, "an offline proxy browses its cache");
+
+    let repos: Value = get("/browse/repos".into())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for repo in [&hosted, &group, &proxy] {
+        let entry = repos
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == json!(repo))
+            .expect("offline repositories are still listed");
+        assert_eq!(entry["online"], json!(false), "{repo}");
+    }
 }
 
 /// Mounting `/browse` and `/admin/me` must not shadow the admin-only `/admin/*`

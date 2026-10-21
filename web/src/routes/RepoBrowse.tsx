@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
-import type { BrowseItem } from '~/api/packages'
+import { isRepositoryOffline, type BrowseItem } from '~/api/packages'
 import { usePackageSearch } from '~/queries/usePackageSearch'
 import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
@@ -9,7 +9,7 @@ import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
 import { Label } from '~/components/catalyst/fieldset'
 import { SearchBox } from '~/components/SearchBox'
 import { Paginator } from '~/components/Paginator'
-import { ErrorState } from '~/components/ErrorState'
+import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { Breadcrumbs } from '~/components/Breadcrumbs'
 import { ChevronIcon, FolderIcon } from './Browse'
@@ -123,6 +123,7 @@ function RepoBrowse() {
       <RepoBrowseResults
         isLoading={search.isLoading}
         isError={search.isError}
+        offline={isRepositoryOffline(search.error)}
         errorMessage={search.error?.message}
         onRetry={() => void search.refetch()}
         total={search.data?.total ?? 0}
@@ -138,6 +139,7 @@ function RepoBrowse() {
 function RepoBrowseResults({
   isLoading,
   isError,
+  offline,
   errorMessage,
   onRetry,
   total,
@@ -148,6 +150,8 @@ function RepoBrowseResults({
 }: {
   isLoading: boolean
   isError: boolean
+  /** The search failed because the repository is offline (503). */
+  offline: boolean
   errorMessage?: string
   onRetry: () => void
   total: number
@@ -156,6 +160,10 @@ function RepoBrowseResults({
   skip: number
   onSkipChange: (next: number) => void
 }) {
+  if (isError && offline) {
+    return <RepositoryOfflineState onRetry={onRetry} />
+  }
+
   if (isError) {
     return (
       <ErrorState

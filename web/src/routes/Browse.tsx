@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
+import { Badge } from '~/components/catalyst/badge'
 import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
@@ -14,7 +15,8 @@ export const Route = createFileRoute('/_app/')({
 /**
  * Browse root: the repositories the signed-in user may read, rendered as the
  * top level of the folder view (repository → packages → versions). Search is
- * per repository and lives on the repository screen, not here.
+ * per repository and lives on the repository screen, not here. An offline
+ * repository carries an "offline" badge.
  */
 function Browse() {
   const repos = useBrowseRepos()
@@ -55,6 +57,18 @@ function Browse() {
                   {repo.name}
                 </span>
                 <RepoKindBadge kind={repo.kind} />
+                {repo.online === false && (
+                  <Badge
+                    color="zinc"
+                    title={
+                      repo.kind === 'proxy'
+                        ? 'Offline: shows only the packages Forge has cached'
+                        : 'Offline for maintenance'
+                    }
+                  >
+                    offline
+                  </Badge>
+                )}
                 <ChevronIcon />
               </Link>
             </li>

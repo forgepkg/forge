@@ -25,6 +25,11 @@
 //! * `GET /browse/packages/{repo}/{id}` — package detail: visible versions with
 //!   per-version metadata + dependency groups parsed from the stored `.nuspec`.
 //!
+//! An offline hosted or group repository serves nothing here either: its
+//! package search and detail answer 503 with `Retry-After`, as its feed does,
+//! and a merged search leaves it out. An offline proxy still shows what it
+//! cached.
+//!
 //! ## Download stats
 //! Slice 1 has **no** download counters in its schema (`component` has no
 //! `downloads` column and there is no counter table). The plan's
@@ -46,6 +51,7 @@ use forge_db::{component_dao, repository_dao};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
+use crate::dispatch::{offline_response, offline_serves_nothing};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -78,6 +84,10 @@ pub struct BrowseRepo {
     pub name: String,
     /// Repository kind (`hosted` | `proxy` | `group`).
     pub kind: String,
+    /// Whether the repository serves requests. An offline hosted or group
+    /// repository is listed, but its packages answer 503 like its feed; an
+    /// offline proxy still shows what it cached.
+    pub online: bool,
 }
 
 /// `GET /browse/repos` — the repositories the caller may read, sorted by name.
@@ -101,6 +111,7 @@ pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Reque
             out.push(BrowseRepo {
                 name: repo.name.clone(),
                 kind: repo.kind.clone(),
+                online: repo.online,
             });
         }
     }
@@ -203,6 +214,15 @@ pub async fn search_packages(
         }
     }
 
+    // An offline hosted or group repository serves nothing, here as on its
+    // feed: a search of that repository alone answers 503, and a merged
+    // search leaves it out. (Checked after authorization, so it reveals
+    // nothing to a caller who may not read it.)
+    if query.repo.is_some() && readable.iter().any(|r| offline_serves_nothing(r)) {
+        return offline_response();
+    }
+    readable.retain(|r| !offline_serves_nothing(r));
+
     // A single repository pages in its backend, whose order (by lowered id)
     // is the browse order. A merge asks each repository for the window it
     // must fill (`skip + take`, always ≥ 1 because `effective_take()` is ≥ 1),
@@ -291,7 +311,10 @@ pub struct DetailVersion {
     /// `.nupkg` byte size, if a stored asset is known (None for not-yet-cached
     /// proxy versions or group-resolved versions).
     pub size: Option<i64>,
-    /// Publish/first-seen time (`component.created_at`), if known.
+    /// When the version was stored here (`component.created_at`), if it is:
+    /// the push time on a hosted repository, and on a proxy the time Forge
+    /// first downloaded it from the upstream (`None` until then), which the
+    /// web UI labels "Cached" rather than "Published".
     pub published_at: Option<DateTime<Utc>>,
     /// Proxy package-delay status (`null` for hosted/group versions).
     pub delay_status: Option<DelayStatus>,
@@ -355,6 +378,10 @@ pub async fn package_detail(
     // denial is 403 (401 for anonymous callers was already returned above).
     if !state.authz.can_read(&principal, &repo).await {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    // An offline hosted or group repository serves nothing, as on its feed.
+    if offline_serves_nothing(&repo) {
+        return offline_response();
     }
 
     let format = state.formats.for_repository(&repo);

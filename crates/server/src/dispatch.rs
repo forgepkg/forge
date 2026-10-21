@@ -38,6 +38,25 @@ use crate::state::AppState;
 /// `Retry-After` (seconds) of an offline repository's 503.
 const OFFLINE_RETRY_AFTER_SECS: &str = "60";
 
+/// Whether `repo` is switched off for maintenance and so serves nothing: an
+/// offline hosted or group repository. An offline proxy still serves what it
+/// cached, without asking its upstream.
+pub(crate) fn offline_serves_nothing(repo: &Repository) -> bool {
+    !repo.online && repo.kind() != RepoKind::Proxy
+}
+
+/// The answer of a repository that [`offline_serves_nothing`]: 503 with
+/// `Retry-After`. Callers send it only after authorization, so it reveals
+/// nothing to a caller who may not use the repository.
+pub(crate) fn offline_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, OFFLINE_RETRY_AFTER_SECS)],
+        "repository is offline",
+    )
+        .into_response()
+}
+
 /// RBAC action corresponding to one NuGet protocol request.
 fn action_for_method(method: &Method) -> Action {
     match *method {
@@ -168,16 +187,9 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         return authz_denied(&principal);
     }
     // An offline hosted or group repository serves nothing (a maintenance
-    // window); an offline proxy still serves what it cached, without asking
-    // its upstream. Answered after authorization, so it reveals nothing to a
-    // caller who may not use the repository.
-    if !repo.online && repo.kind() != RepoKind::Proxy {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, OFFLINE_RETRY_AFTER_SECS)],
-            "repository is offline",
-        )
-            .into_response();
+    // window). Answered after authorization.
+    if offline_serves_nothing(&repo) {
+        return offline_response();
     }
     let package_filter = state
         .authz

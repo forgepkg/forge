@@ -1,4 +1,4 @@
-import { httpClient } from '~/lib/httpClient'
+import { ApiError, httpClient } from '~/lib/httpClient'
 
 /**
  * Read-side browse / package-detail API.
@@ -14,6 +14,8 @@ import { httpClient } from '~/lib/httpClient'
  *
  * Every `/browse/*` endpoint requires a signed-in user (401 otherwise); the
  * `_app` layout's login gate ensures these are only called with a session.
+ * An offline hosted or group repository answers its package detail and its
+ * per-repository search with 503 (see {@link isRepositoryOffline}).
  */
 
 /** One readable repository (`GET /browse/repos` item) — a folder-view root. */
@@ -22,6 +24,24 @@ export interface BrowseRepo {
   name: string
   /** Repository kind: `hosted` | `proxy` | `group`. */
   kind: string
+  /**
+   * `false` while the repository is offline: a proxy still browses what it
+   * cached, a hosted or group repository answers 503.
+   */
+  online: boolean
+}
+
+/**
+ * The 503 an offline hosted or group repository answers browse requests with
+ * during a maintenance window (`repository is offline`, with `Retry-After`).
+ * Other 503s, such as a busy database, are not this.
+ */
+export function isRepositoryOffline(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 503 &&
+    /offline/i.test(error.body)
+  )
 }
 
 /** One cross-repository search hit (`GET /browse/packages` item). */
@@ -61,7 +81,10 @@ export interface DetailVersion {
   listed: boolean
   /** `.nupkg` byte size, if a stored asset is known (null when not cached). */
   size: number | null
-  /** Publish / first-seen time (`component.created_at`), if known. */
+  /**
+   * When the version reached Forge (`component.created_at`), if known: the
+   * push time on a hosted repository, the first download on a proxy.
+   */
   published_at: string | null
   /** Proxy package-delay status (`null` for hosted / group versions). */
   delay_status: DelayStatus | null

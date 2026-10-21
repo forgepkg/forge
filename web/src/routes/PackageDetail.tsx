@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
+import { isRepositoryOffline } from '~/api/packages'
 import { usePackageDetail } from '~/queries/usePackageDetail'
 import { Heading, Subheading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
@@ -8,7 +9,7 @@ import { Divider } from '~/components/catalyst/divider'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { VersionTable } from '~/components/VersionTable'
 import { DependencyGroups } from '~/components/DependencyGroups'
-import { ErrorState } from '~/components/ErrorState'
+import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { Breadcrumbs } from '~/components/Breadcrumbs'
 
@@ -19,7 +20,8 @@ export const Route = createFileRoute('/_app/packages/$repo/$id')({
 /**
  * Package-detail view (plan §4, §Phase 3): versions with per-version metadata +
  * delay/retention badges, and dependency groups per version. Loading / empty /
- * not-found / error states are all handled. Reachable by any reader.
+ * not-found / repository-offline / error states are all handled. Reachable by
+ * any reader.
  */
 function PackageDetailPage() {
   const { repo, id } = Route.useParams()
@@ -41,6 +43,9 @@ function PackageDetailPage() {
           repository <span className="font-mono">{repo}</span>.
         </EmptyState>
       )
+    }
+    if (isRepositoryOffline(detail.error)) {
+      return <RepositoryOfflineState onRetry={() => void detail.refetch()} />
     }
     return (
       <ErrorState
@@ -81,7 +86,7 @@ function PackageDetailPage() {
           </div>
         ) : (
           <div className="mt-3">
-            <VersionTable versions={pkg.versions} />
+            <VersionTable versions={pkg.versions} repoKind={pkg.repo_kind} />
           </div>
         )}
       </div>

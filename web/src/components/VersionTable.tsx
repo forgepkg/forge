@@ -18,14 +18,32 @@ import { RetentionBadge } from './RetentionBadge'
  * time, size, listed/unlisted, and proxy delay + retention badges. Download
  * counts are intentionally absent — slice 1 has no counters (see
  * `src/api/packages.ts`).
+ *
+ * `published_at` is when the version reached Forge. On a proxy that is when
+ * Forge first downloaded it from the upstream, not when it was published
+ * there (and unknown for versions not downloaded yet), so the column is
+ * labelled "Cached" for a proxy repository.
  */
-export function VersionTable({ versions }: { versions: DetailVersion[] }) {
+export function VersionTable({
+  versions,
+  repoKind,
+}: {
+  versions: DetailVersion[]
+  /** The package's repository kind: `hosted` | `proxy` | `group`. */
+  repoKind: string
+}) {
   return (
     <Table striped>
       <TableHead>
         <TableRow>
           <TableHeader>Version</TableHeader>
-          <TableHeader>Published</TableHeader>
+          {repoKind === 'proxy' ? (
+            <TableHeader title="When Forge first downloaded this version from the upstream">
+              Cached
+            </TableHeader>
+          ) : (
+            <TableHeader>Published</TableHeader>
+          )}
           <TableHeader>Size</TableHeader>
           <TableHeader>Status</TableHeader>
         </TableRow>
