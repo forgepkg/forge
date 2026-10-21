@@ -340,7 +340,7 @@ fn handle_path(file: &std::fs::File, fallback: &Path) -> PathBuf {
 }
 
 /// Create `dir` (and, with `parents`, its missing parents) with mode `0700`.
-fn create_private_dir(dir: &Path, parents: bool) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path, parents: bool) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(parents);
     #[cfg(unix)]
@@ -358,6 +358,18 @@ fn create_private_dir(dir: &Path, parents: bool) -> std::io::Result<()> {
 /// package between its hashing and its upload, and through content-addressed
 /// dedup that would poison every repository holding the package.
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    ensure_owned_dir(dir, "staging directory", "server.staging_dir", true)
+}
+
+/// Refuse `dir` (the `what` that `setting` names) unless it is this
+/// process's user's and neither group nor others can write to it; with
+/// `sticky_ok`, a sticky directory others can write (like `/tmp`) passes.
+pub(crate) fn ensure_owned_dir(
+    dir: &Path,
+    what: &str,
+    setting: &str,
+    sticky_ok: bool,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -365,8 +377,7 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "staging directory {} {why}; use a directory only Forge's user can write \
-                     (server.staging_dir)",
+                    "{what} {} {why}; use a directory only Forge's user can write ({setting})",
                     dir.display()
                 ),
             ))
@@ -383,7 +394,7 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
             ));
         }
         let mode = meta.permissions().mode();
-        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        if mode & 0o022 != 0 && !(sticky_ok && mode & 0o1000 != 0) {
             return refuse(format!(
                 "is writable by group or others (mode {:o})",
                 mode & 0o7777
@@ -391,7 +402,7 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
         }
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    let _ = (dir, what, setting, sticky_ok);
     Ok(())
 }
 

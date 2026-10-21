@@ -53,6 +53,8 @@ use bytes::Bytes;
 use futures_util::{FutureExt, Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tempfile::TempPath;
+
+use crate::cas::create_private_dir;
 use tokio::sync::watch;
 
 /// A blob's bytes as a stream of chunks.
@@ -375,8 +377,13 @@ impl BlobCache {
     /// [`Self::open`] reading filesystem space through `fs`.
     pub fn open_with(config: BlobCacheConfig, fs: FsProbe) -> std::io::Result<Self> {
         let root = config.path;
+        // Entries are private package bytes, and a file in place of one is
+        // served as it: the directory must be Forge's alone (no sticky
+        // exception, since anyone may create a shard directory in one).
+        create_private_dir(&root, true)?;
+        crate::cas::ensure_owned_dir(&root, "blob cache directory", "blob_cache.path", false)?;
         let tmp = root.join(TMP_DIR);
-        std::fs::create_dir_all(&tmp)?;
+        create_private_dir(&tmp, true)?;
         let partial = clear_dir(&tmp)?;
         if partial > 0 {
             tracing::info!(removed = partial, dir = %tmp.display(), "removed partial blob cache fills");
@@ -711,8 +718,9 @@ impl BlobCache {
         let target = self.path_of(&key);
         let prepared = file
             .set_modified(SystemTime::now())
+            .and_then(|()| make_private(file))
             .and_then(|()| match target.parent() {
-                Some(parent) => std::fs::create_dir_all(parent),
+                Some(parent) => create_private_dir(parent, true),
                 None => Ok(()),
             });
         let mut index = self.lock();
@@ -785,7 +793,7 @@ impl BlobCache {
         let cache = self.clone();
         let sha256 = sha256.to_string();
         tokio::task::spawn_blocking(move || {
-            let result = File::create(&temp).and_then(|mut file| {
+            let result = create_private_file(&temp).and_then(|mut file| {
                 let copied = std::io::copy(&mut source, &mut file)?;
                 if copied != size {
                     return Err(std::io::Error::other(format!(
@@ -1042,6 +1050,28 @@ impl Drop for FillSlot {
 }
 
 /// Remove everything in `dir`; returns how many entries went.
+/// Make an entry readable by Forge's user alone, however it was made (a
+/// hard link keeps the staged file's mode).
+fn make_private(file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+/// Create the new file `path`, readable by Forge's user alone.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 fn clear_dir(dir: &Path) -> std::io::Result<usize> {
     let mut removed = 0;
     for entry in std::fs::read_dir(dir)? {

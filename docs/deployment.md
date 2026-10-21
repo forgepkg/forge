@@ -597,7 +597,7 @@ anything from an `emptyDir` to a dedicated or persistent volume.
 
 | Setting | Meaning |
 | --- | --- |
-| `FORGE_BLOB_CACHE__PATH` | The cache directory, e.g. `/var/cache/forge`. Unset (the default) = no cache. Each instance needs a directory of its own. |
+| `FORGE_BLOB_CACHE__PATH` | The cache directory, e.g. `/var/cache/forge/blobs`. Unset (the default) = no cache. Each instance needs a directory of its own. It must belong to Forge's user, and neither group nor others may write to it: startup refuses it otherwise, since a file placed there is served as the blob it is named after. Forge creates it (mode `0700`) when it is missing, so point it at a subdirectory of a mounted volume, whose root belongs to root. Entries are readable by Forge's user alone (`0600`). |
 | `FORGE_BLOB_CACHE__MAX_BYTES` | `auto` (default): the size of the filesystem holding the path, minus `min_free_bytes`, minus `server.max_staging_bytes` when staging is on the same filesystem; re-read every minute, so a resized volume is picked up without a restart. Or a fixed number of bytes. |
 | `FORGE_BLOB_CACHE__MIN_FREE_BYTES` | Free space the cache always leaves on its filesystem, evicting instead of filling it, even when something else uses the disk too. Default: 5 % of the filesystem. On a shared disk with less free space than that, nothing is cached (logged as a warning at startup). |
 
@@ -667,7 +667,7 @@ With the Helm chart, set `config.blob_cache` and mount the volume with
 ```yaml
 config:
   blob_cache:
-    path: /var/cache/forge
+    path: /var/cache/forge/blobs   # Forge creates it in the volume
     max_bytes: 8589934592   # below the emptyDir sizeLimit
 extraVolumes:
   - name: blob-cache

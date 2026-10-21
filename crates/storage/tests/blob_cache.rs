@@ -618,6 +618,67 @@ async fn uploads_are_written_through() {
     assert_eq!(cache.stats().reserved_bytes, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn the_cache_is_private_to_forges_user() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+    // A directory others can write is refused, sticky or not.
+    for shared in [0o777, 0o1777, 0o775] {
+        let dir = scratch("shared");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(shared)).unwrap();
+        let err = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{shared:o}"
+        );
+    }
+
+    // What the cache creates only Forge's user can read: directories 0700,
+    // entries 0600, whether filled from S3, hard-linked or copied.
+    let (endpoint, fake) = spawn_fake_s3().await;
+    let dir = scratch("private").join("cache");
+    let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+    assert_eq!(mode(&dir), 0o700);
+    let store = cached_store(&endpoint, cache.clone());
+    let filled = Blob::new(50, 4096);
+    fake.put(&filled.key, filled.bytes.clone());
+    assert_eq!(read(&store, &filled, None).await, filled.bytes);
+    until_cached(&cache, &filled).await;
+    let mut entries = vec![filled];
+
+    let linked = Blob::new(51, 4096);
+    let staged = scratch("private-staging").join("staged");
+    std::fs::write(&staged, &linked.bytes).unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+    cache
+        .insert_staged(&linked.sha256, linked.bytes.len() as u64, &staged)
+        .await;
+    until_cached(&cache, &linked).await;
+    entries.push(linked);
+
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir() {
+        let copied = Blob::new(52, 4096);
+        let staged = shm.join(format!("forge-private-{}", std::process::id()));
+        std::fs::write(&staged, &copied.bytes).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cache
+            .insert_staged(&copied.sha256, copied.bytes.len() as u64, &staged)
+            .await;
+        std::fs::remove_file(&staged).unwrap();
+        until_cached(&cache, &copied).await;
+        entries.push(copied);
+    }
+    for blob in &entries {
+        let file = blob.file(&dir);
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
+    }
+}
+
 #[tokio::test]
 async fn garbage_collection_evicts_the_cached_copy() {
     let (endpoint, fake) = spawn_fake_s3().await;

@@ -185,7 +185,9 @@ Forge can keep a copy of the blobs it serves on a local disk: hot downloads
 skip S3, and cached packages keep resolving while S3 is unreachable (see
 [docs/deployment.md](../../docs/deployment.md#local-blob-cache)). The
 components mount a volume at `/var/cache/forge` and set
-`FORGE_BLOB_CACHE__PATH` (and `__MAX_BYTES` where needed). The existing
+`FORGE_BLOB_CACHE__PATH` to `/var/cache/forge/blobs`, a directory Forge creates
+in it (the cache refuses one its user does not own), and `__MAX_BYTES` where
+needed. The existing
 `/readyz` readiness probe needs no change: with the cache, an S3 outage
 reports `degraded` but keeps the pod in the Service.
 
