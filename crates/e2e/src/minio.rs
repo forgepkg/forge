@@ -31,9 +31,10 @@ pub const ROOT_USER: &str = "forge-e2e-root";
 /// MinIO's root password (CI-only credentials).
 pub const ROOT_PASSWORD: &str = "forge-e2e-root-password";
 
-const IMAGE: &str = "minio/minio";
-/// The last community release published as an image.
-const TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
+/// MinIO took its community images off Docker Hub (`minio/minio` no longer
+/// exists); this is the community fork that still publishes releases there.
+const IMAGE: &str = "pgsty/minio";
+const TAG: &str = "RELEASE.2026-08-04T00-00-00Z";
 const PORT: u16 = 9000;
 
 /// A running MinIO (removed when dropped).
@@ -49,7 +50,8 @@ impl Minio {
         let config_url = format!("{}/.well-known/openid-configuration", issuer.issuer());
         let container = GenericImage::new(IMAGE, TAG)
             .with_exposed_port(PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("API: "))
+            // The fork prints its startup banner on stderr (upstream: stdout).
+            .with_wait_for(WaitFor::message_on_either_std("API: "))
             .with_host(HOST_ALIAS, host_for_containers())
             .with_env_var("MINIO_ROOT_USER", ROOT_USER)
             .with_env_var("MINIO_ROOT_PASSWORD", ROOT_PASSWORD)

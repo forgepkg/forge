@@ -6,7 +6,7 @@
 # settings; change both together. Images are pinned by digest (tag kept for
 # readability), as ci.yml pins its actions; nothing bumps them here, so do it
 # by hand. The images the test harnesses start themselves (postgres:17,
-# versity/versitygw:v1.4.1, redis, minio/minio) are named by tag in their
+# versity/versitygw:v1.4.1, redis, pgsty/minio) are named by tag in their
 # code, as on GitHub.
 #
 # The GitHub runners come with a Docker daemon; here the jobs that need one
@@ -275,7 +275,7 @@ e2e:
     - docker pull postgres:17
     - docker pull versity/versitygw:v1.4.1
     - docker pull redis:5.0
-    - docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
+    - docker pull pgsty/minio:RELEASE.2026-08-04T00-00-00Z
   script:
     - rustup target add wasm32-wasip2
     - cargo test --workspace --features forge-e2e
