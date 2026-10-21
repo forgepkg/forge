@@ -91,15 +91,35 @@ fmt:
     - rustup component add rustfmt
     - cargo fmt --all --check
 
-# ── Clippy ─────────────────────────────────────────────────────────────────
+# ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
+# Both are check builds; as on GitHub, the drift guard runs here rather than
+# in `test`, off the longest job's path. GitLab services have no health checks
+# like GitHub's, so the job waits for Postgres before using it.
 clippy:
   stage: clippy
   needs: ["fmt"]
+  services:
+    - name: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+      alias: postgres
+  variables:
+    POSTGRES_DB: forge
+    POSTGRES_USER: forge
+    POSTGRES_PASSWORD: forge
+    DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
   cache:
     <<: *cargo-cache
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq postgresql-client
+    - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
   script:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
+    # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
+    # the committed .sqlx/ cache matches the current queries + schema.
+    - cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - SQLX_OFFLINE= sqlx migrate run --source migrations
+    - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
 # ── Dependency advisories (RustSec) ────────────────────────────────────────
 # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
@@ -126,51 +146,39 @@ plugins:
     - rustup target add wasm32-wasip2
     - cargo xtask plugins-check
 
-# ── Unit tests ─────────────────────────────────────────────────────────────
+# ── Unit + integration tests ───────────────────────────────────────────────
 # As on GitHub, the db/core/server/storage/cache integration tests start their
 # own Postgres, versitygw and Redis with testcontainers, here on the dind
 # service, so every test binary gets fresh containers (FORGE_TEST_* pointed at
-# GitLab services would make all crates' suites share one database). The
-# Postgres service is for the sqlx drift guard. GitLab services have no health
-# checks like GitHub's, so the job waits for both before using them.
+# GitLab services would make all crates' suites share one database). The job
+# waits for the dind daemon before using it. No separate `cargo build
+# --workspace`: `cargo test` builds with the dev-dependencies' features, so it
+# would rebuild most of it.
 test:
   stage: test
   needs: ["fmt"]
   services:
-    - name: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
-      alias: postgres
     - *dind-service
   variables:
     <<: *dind-variables
-    POSTGRES_DB: forge
-    POSTGRES_USER: forge
-    POSTGRES_PASSWORD: forge
-    DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
-    FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge"
     FORGE_TEST_TIMINGS: "$CI_PROJECT_DIR/.test-timings"
   cache:
     <<: *cargo-cache
   before_script:
-    - apt-get update -qq && apt-get install -y -qq postgresql-client
-    - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
     - timeout 60 bash -c 'until curl -fs http://docker:2375/_ping >/dev/null; do sleep 1; done'
   script:
     # The format-plugin tests build plugins/ as WebAssembly components.
     - rustup target add wasm32-wasip2
-    - cargo build --workspace
     # forge-e2e feature is intentionally excluded here — unit tests only.
     # Each test binary runs through test-timings-runner.sh, which adds every
     # test's duration to its result line and records it for after_script.
     - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace
-    # sqlx cache drift guard (A1): apply migrations to the live DB, then verify
-    # the committed .sqlx/ cache matches the current queries + schema.
-    - cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres --locked
-    - export PATH="$CARGO_HOME/bin:$PATH"
-    - SQLX_OFFLINE= sqlx migrate run --source migrations
-    - SQLX_OFFLINE= cargo sqlx prepare --check --workspace -- --all-targets --all-features
   after_script:
     # The slowest test binaries and tests (GitHub puts them in the job summary).
     - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
+    # Keep the test binaries out of the cache (archived after after_script):
+    # every run relinks them, and they are most of target/ (~19 GB).
+    - find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete || true
 
 # ── Container image (build only; releases push from release.yml) ─────────
 # Builds the production Dockerfile on every change so a broken image is
@@ -289,6 +297,9 @@ e2e:
     - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace --features forge-e2e
   after_script:
     - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
+    # Keep the test binaries out of the cache (archived after after_script):
+    # every run relinks them, and they are most of target/ (~19 GB).
+    - find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete || true
 
 # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ──────
 # Boots Postgres + versitygw via docker compose on the dind daemon, builds the

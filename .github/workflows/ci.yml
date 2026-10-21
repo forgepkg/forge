@@ -34,6 +34,15 @@ permissions:
 # resolved from is in the trailing comment); Dependabot
 # (.github/dependabot.yml) proposes updates.
 
+# Build caches. A repository's Actions caches share a 10 GB quota, and an
+# entry past it evicts the least recently used. So:
+#   - the cargo caches (Swatinem/rust-cache) hold the registry and the
+#     dependencies' build output only, not the workspace crates or the test
+#     binaries, which every run rebuilds anyway (~19 GB of test binaries);
+#   - only pushes to the default branch save them (and the docker job's
+#     layer cache); pull requests and the merge queue restore those, and
+#     their own copies, which no other ref can read, would evict them.
+
 env:
   CARGO_TERM_COLOR: always
   # Keep target/ small enough for a hosted runner's disk: a full-debuginfo
@@ -43,7 +52,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # Used by sqlx for compile-time query verification from the cached .sqlx/ dir.
-  # The `prepare` job overrides this when it needs a live database.
+  # The clippy job's drift guard unsets it to check against a live database.
   SQLX_OFFLINE: "true"
 
 jobs:
@@ -60,29 +69,64 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
-  # ── Clippy ─────────────────────────────────────────────────────────────────
+  # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
+  # Both are check builds; the drift guard runs here rather than in `test`,
+  # whose build it shares nothing with (--all-features), to keep it off the
+  # longest job's path.
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     needs: [fmt]
+
+    services:
+      # For `cargo sqlx prepare --check`: the migrations run against it, then
+      # the check verifies that the committed .sqlx/ cache matches the
+      # queries and schema. Pinned by digest; Dependabot does not see
+      # workflow images, so bump it with deploy/kubernetes/components/postgres.
+      postgres:
+        image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        env:
+          POSTGRES_DB: forge
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://forge:forge@localhost:5432/forge
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml) (with clippy)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
         with:
           components: clippy
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-
+          save-if: ${{ github.event_name == 'push' }}
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # sqlx cache drift guard (A1). SQLX_OFFLINE is unset so the check talks
+      # to the database.
+      - name: Install sqlx-cli (prebuilt, no source compile)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: sqlx-cli@0.9.0
+      - name: Run migrations
+        env:
+          SQLX_OFFLINE: ""
+        run: sqlx migrate run --source migrations
+      - name: cargo sqlx prepare --check (catch .sqlx drift)
+        env:
+          SQLX_OFFLINE: ""
+        run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
   # ── Dependency advisories (RustSec) ────────────────────────────────────────
   # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
@@ -115,73 +159,46 @@ jobs:
         with:
           components: clippy
           targets: wasm32-wasip2
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-plugins-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-plugins-${{ hashFiles('rust-toolchain.toml') }}-
+          save-if: ${{ github.event_name == 'push' }}
       - name: cargo xtask plugins-check
         run: cargo xtask plugins-check
 
-  # ── Unit tests (no containers required) ────────────────────────────────────
+  # ── Unit + integration tests ───────────────────────────────────────────────
+  # The integration tests start their own Postgres, versitygw and Redis with
+  # testcontainers (the runner has a Docker daemon). There is no separate
+  # `cargo build --workspace`: `cargo test` builds with the dev-dependencies'
+  # features, so it would rebuild most of it (and clippy and the docker job
+  # already prove the workspace builds).
   test:
     name: test
     runs-on: ubuntu-latest
     needs: [fmt]
 
-    services:
-      # Postgres is provisioned here so we can run `cargo sqlx prepare --check`
-      # against a live DB to catch drift between migrations/ and the committed
-      # .sqlx/ cache. Unit tests themselves use SQLX_OFFLINE=true. Pinned by
-      # digest; Dependabot does not see workflow images, so bump it with
-      # deploy/kubernetes/components/postgres.
-      postgres:
-        image: postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
-        env:
-          POSTGRES_DB: forge
-          POSTGRES_USER: forge
-          POSTGRES_PASSWORD: forge
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U forge -d forge"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
     env:
-      DATABASE_URL: postgres://forge:forge@localhost:5432/forge
-      FORGE_DATABASE_URL: postgres://forge:forge@localhost:5432/forge
       SQLX_OFFLINE: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
         with:
           # The format-plugin tests build plugins/ as WebAssembly components.
           targets: wasm32-wasip2
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: cargo build --workspace
-        run: cargo build --workspace
+          save-if: ${{ github.event_name == 'push' }}
       - name: cargo test --workspace
         id: tests
         # forge-e2e feature is intentionally excluded here — unit tests only.
@@ -192,23 +209,6 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
           FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
         run: cargo test --workspace
-
-      # sqlx cache drift guard (A1). Runs migrations against the live Postgres
-      # service, then verifies the committed .sqlx/ dir matches the current
-      # queries + schema. SQLX_OFFLINE is unset here so the check talks to the DB.
-      - name: Install sqlx-cli (prebuilt, no source compile)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: sqlx-cli@0.9.0
-      - name: Run migrations
-        env:
-          SQLX_OFFLINE: ""
-        run: sqlx migrate run --source migrations
-      - name: cargo sqlx prepare --check (catch .sqlx drift)
-        env:
-          SQLX_OFFLINE: ""
-        run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
-      # Last, so that a failure here never skips a check; reporting only.
       - name: Test timings (job summary)
         if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         continue-on-error: true
@@ -235,7 +235,9 @@ jobs:
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Written by pushes to the default branch only (see the note on
+          # build caches at the top).
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
   # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
   # Checks that every image reference (Dockerfile, deploy/, the workflows) is
@@ -364,16 +366,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-oci-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-oci-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+          # oci-e2e and web-e2e build the same debug forge-server.
+          shared-key: forge-server
+          save-if: ${{ github.event_name == 'push' }}
       - name: Install crane and cosign
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
@@ -425,9 +423,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
@@ -438,16 +440,10 @@ jobs:
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "8.0.x"
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+          save-if: ${{ github.event_name == 'push' }}
 
       # Pre-pull the images the testcontainers harness uses (deterministic).
       # By tag, not digest: the harness names them by tag in its code
@@ -484,9 +480,13 @@ jobs:
       SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
@@ -501,16 +501,12 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+          # oci-e2e and web-e2e build the same debug forge-server.
+          shared-key: forge-server
+          save-if: ${{ github.event_name == 'push' }}
       # By tag, like the e2e job: web/e2e names them by tag.
       - name: Pre-pull container images
         run: |

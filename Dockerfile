@@ -94,10 +94,13 @@ ARG BUILDKIT_SBOM_SCAN_STAGE=true
 # sqlx is compile-time-checked against the committed .sqlx/ offline cache; no DB
 # is reachable in the image build, so the offline mode is mandatory.
 ENV SQLX_OFFLINE=true
-# Cook the dependency layer first (cached unless the recipe changes).
+# Cook the dependency layer first (cached unless the recipe changes). The
+# compiled dependencies stay in this layer's target/, not in a cache mount:
+# a layer cache (CI's `cache-to: type=gha`) exports layers but never cache
+# mounts, so with target/ in one every fresh builder found an empty target/
+# and compiled all dependencies again, cached cook layer or not.
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
     cargo chef cook --release --locked --recipe-path recipe.json -p forge-server
 # Now build the actual server binary. .sqlx/ and migrations/ come in with the
 # source copy (migrations/ is embedded into the binary via sqlx::migrate!).
@@ -106,11 +109,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # log (`docker build --build-arg FORGE_GIT_SHA=$(git rev-parse HEAD) .`).
 ARG FORGE_GIT_SHA=unknown
 ENV FORGE_GIT_SHA=${FORGE_GIT_SHA}
+# target/ is removed in the same step, so the layer holds the binary alone.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
     cargo auditable build --release --locked -p forge-server \
-    && cp target/release/forge-server /usr/local/bin/forge-server
+    && cp target/release/forge-server /usr/local/bin/forge-server \
+    && rm -rf target
 # Third-party notices for the crates compiled into forge-server
 # (docker/licenses/about.toml). cargo-about reads the metadata of every locked
 # crate, so fetch those of the other platforms too; then it needs no network
