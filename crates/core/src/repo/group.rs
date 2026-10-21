@@ -29,8 +29,10 @@
 //!   way. An attacker publishing a same-named, higher-versioned package on a
 //!   public feed therefore cannot shadow an internal package (dependency
 //!   confusion). The check is one batched existence query over the hosted
-//!   leaves; a failure of it fails the request (fail closed), and it reveals
-//!   no more than the resulting 404 does.
+//!   leaves; a failure of it fails the request (fail closed). The 404 does
+//!   tell such a caller that an id the upstream has also exists in a hosted
+//!   leaf it cannot read (a documented limitation: the guard cannot both
+//!   withhold the public package and look absent).
 //! * **Reserved prefixes** (group `config.reserved_prefixes`, e.g. `acme.`):
 //!   ids under a reserved prefix never come from a proxy member, whether or
 //!   not a hosted member has them yet — prefer-hosted alone cannot protect an

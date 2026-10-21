@@ -54,6 +54,15 @@ cluster:
 host: forge.example.com
 replicaCount: 2
 
+# Only the gateway may reach Forge: every address in trusted_proxy_cidrs
+# chooses the client IP Forge sees.
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gateway-system   # your gateway's namespace
+
 config:
   auth:
     trusted_proxy_cidrs: [10.0.0.0/8]   # the gateway's pod network

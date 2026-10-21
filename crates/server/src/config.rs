@@ -104,7 +104,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_staging_bytes: Option<u64>,
     /// Permit starting with **known-insecure placeholder credentials** (the
-    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys).
+    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys, an unedited
+    /// `<…>` value of an example env file).
     /// Default `false`: such a config refuses to start, so a copied dev config
     /// or the image's baked defaults never reach production unnoticed. Set
     /// `true` only for local development / compose stacks.
@@ -429,7 +430,12 @@ fn default_providers() -> Vec<String> {
 /// validated-credential cache HMAC and is **redacted** from `Debug` (and any
 /// config dump), mirroring the slice-1 `upstream_password` / OIDC `client_secret`
 /// treatment, and is forward-compatible with §12.5 encryption at rest.
+///
+/// Unknown keys are refused, like in a realm config set through the admin
+/// API: a misspelled `identity_path` or `required_groups` would otherwise
+/// seed the realm with that gate turned off.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamBasicAuthConfig {
     /// Master switch. When `false`, the provider is not built even if it appears
     /// in `auth.providers` (that combination is a startup error — see validate).
@@ -529,7 +535,9 @@ impl UpstreamBasicAuthConfig {
 }
 
 /// `auth.upstream_basic.cache.*` — the validated-credential cache tuning.
+/// Unknown keys are refused (see [`UpstreamBasicAuthConfig`]).
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredCacheConfig {
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
@@ -1107,7 +1115,12 @@ fn default_web_assets_dir() -> String {
 /// impl (and must be redacted from any admin API that echoes config), mirroring
 /// the slice-1 proxy `upstream_password` treatment. Encrypting it at rest is
 /// slice 12.5.
+///
+/// Unknown keys are refused, like in a realm config set through the admin
+/// API: a misspelled `required_claims` or `auto_provision` would otherwise
+/// seed the realm with that gate turned off.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// Master switch. When `false`, the section parses but the feature stays off
     /// (lets an operator keep the block while disabling login).
@@ -1568,6 +1581,23 @@ fn normalize_secret_env(value: &str) -> String {
         .to_string()
 }
 
+/// Whether a secret is still a `<…>` placeholder of an example env file
+/// (`<initial admin password>`, `<secret key>`), copied without filling it in.
+fn is_placeholder(value: &str) -> bool {
+    let value = value.trim();
+    value.len() > 2 && value.starts_with('<') && value.ends_with('>')
+}
+
+/// [`is_placeholder`] for the password of a connection URL, as the example
+/// env files write it (`postgres://forge:<password>@host/forge`).
+fn url_password_is_placeholder(url: &str) -> bool {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .and_then(|authority| authority.rsplit_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .is_some_and(|(_, password)| is_placeholder(password))
+}
+
 /// Configuration load / validation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1630,7 +1660,17 @@ impl Config {
     ///   is configured purely through env, and removing the password after
     ///   the first start is the documented flow);
     /// * a blank `redis.url` (e.g. `FORGE_REDIS__URL=`) means no Redis.
+    ///
+    /// It also trims `server.public_base_url` and lowercases its scheme:
+    /// session cookies are `Secure` and HSTS is sent when it starts with
+    /// `https://`, and `HTTPS://host` or ` https://host` (which validation
+    /// accepts) must not turn them off.
     fn normalize(&mut self) {
+        let base = self.server.public_base_url.trim();
+        self.server.public_base_url = match base.split_once("://") {
+            Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+            None => base.to_string(),
+        };
         if self
             .auth
             .bootstrap_admin
@@ -1857,18 +1897,64 @@ impl Config {
 
     /// Refuse known-insecure placeholder credentials unless
     /// `server.allow_insecure_defaults` opts in (dev/compose only): a
-    /// `changeme` bootstrap-admin password, or `minioadmin` S3 keys. (A blank
+    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys, or a secret
+    /// still holding a `<…>` placeholder of the example env files
+    /// (`<initial admin password>`, `postgres://forge:<password>@…`). (A blank
     /// bootstrap password is not a placeholder: it means "no bootstrap admin",
     /// see [`Self::normalize`].)
     fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
-        let mut found = Vec::new();
+        let mut found: Vec<String> = Vec::new();
         if let Some(ba) = &self.auth.bootstrap_admin {
             if ba.password.trim().eq_ignore_ascii_case("changeme") {
-                found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder");
+                found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder".into());
             }
         }
         if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
-            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults");
+            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults".into());
+        }
+        let unedited: Vec<&str> = [
+            (
+                "auth.bootstrap_admin.password",
+                self.auth
+                    .bootstrap_admin
+                    .as_ref()
+                    .is_some_and(|ba| is_placeholder(&ba.password)),
+            ),
+            ("s3.access_key", is_placeholder(&self.s3.access_key)),
+            ("s3.secret_key", is_placeholder(&self.s3.secret_key)),
+            (
+                "the database.url password",
+                url_password_is_placeholder(&self.database.url),
+            ),
+            (
+                "the redis.url password",
+                self.redis
+                    .url
+                    .as_deref()
+                    .is_some_and(url_password_is_placeholder),
+            ),
+            (
+                "auth.upstream_basic.cache.key_pepper",
+                self.auth
+                    .upstream_basic
+                    .as_ref()
+                    .is_some_and(|ub| is_placeholder(&ub.cache.key_pepper)),
+            ),
+            (
+                "oidc.client_secret",
+                self.oidc
+                    .as_ref()
+                    .is_some_and(|o| is_placeholder(&o.client_secret)),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, hit)| hit.then_some(key))
+        .collect();
+        if !unedited.is_empty() {
+            found.push(format!(
+                "{} still hold a \"<…>\" placeholder of an example file",
+                unedited.join(", ")
+            ));
         }
         if found.is_empty() {
             return Ok(());
@@ -2827,6 +2913,56 @@ mod tests {
         assert!(cfg.auth.upstream_basic.is_none());
     }
 
+    /// The `[auth.upstream_basic]` and `[oidc]` seeds refuse a misspelled key
+    /// instead of seeding the realm with that gate turned off, as a realm
+    /// config set through the admin API does.
+    #[test]
+    fn legacy_realm_seeds_refuse_misspelled_keys() {
+        let upstream = minimal_with_upstream("").replace(
+            "[auth.upstream_basic.cache]",
+            "identity_pth = \"login\"\n[auth.upstream_basic.cache]",
+        );
+        let err = Config::from_figment(fig_from_toml(&upstream)).unwrap_err();
+        assert!(err.to_string().contains("identity_pth"), "{err}");
+
+        let cache = minimal_with_upstream("negative_ttl = 5\n");
+        let err = Config::from_figment(fig_from_toml(&cache)).unwrap_err();
+        assert!(err.to_string().contains("negative_ttl"), "{err}");
+
+        let oidc = minimal_with_oidc("\nrequired_claim = { tid = [\"tenant\"] }");
+        let err = Config::from_figment(fig_from_toml(&oidc)).unwrap_err();
+        assert!(err.to_string().contains("required_claim"), "{err}");
+
+        // The correctly spelled keys still load.
+        let oidc = minimal_with_oidc("\nrequired_claims = { tid = [\"tenant\"] }");
+        let cfg = Config::from_figment(fig_from_toml(&oidc)).expect("valid");
+        assert_eq!(cfg.oidc.unwrap().required_claims["tid"], vec!["tenant"]);
+    }
+
+    /// `HTTPS://` and surrounding whitespace pass validation, so they must
+    /// count as https for the cookie and HSTS decision (`starts_with`).
+    #[test]
+    fn public_base_url_scheme_case_and_whitespace_still_count_as_https() {
+        for base in [
+            "HTTPS://forge.example.com/",
+            "  https://forge.example.com/ ",
+        ] {
+            let toml = MINIMAL.replace("https://forge.example.com/", base);
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+            assert_eq!(
+                cfg.public_base_url(),
+                "https://forge.example.com",
+                "{base:?}"
+            );
+            assert!(
+                !cfg.deployment_warnings()
+                    .iter()
+                    .any(|w| w.contains("not https")),
+                "{base:?}"
+            );
+        }
+    }
+
     #[test]
     fn staging_budget_defaults_to_four_of_the_largest_item_and_is_validated() {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
@@ -3021,6 +3157,18 @@ mod tests {
             ),
             ("access_key = \"test\"", "access_key = \"minioadmin\""),
             ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
+            // The `<…>` placeholders of the example env files, left unedited.
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\n\
+                 password = \"<initial admin password>\"",
+            ),
+            ("secret_key = \"test\"", "secret_key = \"<secret key>\""),
+            ("forge:forge@localhost", "forge:<password>@localhost"),
+            (
+                "[auth]",
+                "[redis]\nurl = \"redis://:<redis password>@forge-redis:6379\"\n\n[auth]",
+            ),
         ] {
             let toml = MINIMAL.replace(from, to);
             let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();

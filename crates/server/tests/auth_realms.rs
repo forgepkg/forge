@@ -524,7 +524,8 @@ async fn admin_realm_crud_with_write_only_secrets() {
 /// #71: an API token Forge issued is never tried as a password, even when it
 /// cannot be used (its owner is deactivated, it expired or was revoked): a
 /// credential-forwarding realm would send the live secret upstream on every
-/// request of a client that still stores it.
+/// request of a client that still stores it. The same holds for a token
+/// pasted into the web login form.
 #[tokio::test]
 async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -608,6 +609,17 @@ async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
                 .status()
         }
     };
+    // The web login form refuses a token as the password, live or not, and
+    // forwards none of them either.
+    for secret in [&live, &expired, &revoked] {
+        let resp = client
+            .post(format!("{}/auth/login", srv.base_url))
+            .json(&json!({ "username": username, "password": secret }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "a token is no password");
+    }
     assert_ne!(get(live.clone()).await, 401, "the live token signs in");
     assert_eq!(get(expired).await, 401);
     assert_eq!(get(revoked).await, 401);

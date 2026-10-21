@@ -120,8 +120,10 @@ lists the required settings.
   with interactively cannot be disabled or deleted.
 - The bootstrap admin is created once and stays deleted after removal. Boot
   logs a security warning while it still accepts the placeholder password.
-  Startup refuses placeholder credentials and warns about a non-https or
-  loopback `public_base_url` and about disabled secret encryption.
+  Startup refuses placeholder credentials, including a secret that still
+  holds a `<…>` placeholder of the example env files, and warns about a
+  non-https or loopback `public_base_url` and about disabled secret
+  encryption.
 
 **Tokens and the admin API**
 
@@ -133,10 +135,13 @@ lists the required settings.
   signs in through `/auth/login`: give administrators an OIDC realm, and
   NuGet clients tokens.
 - An expired or revoked API token, or one of a deactivated user, sent as the
-  Basic password is refused and never tried as a password.
+  Basic password is refused and never tried as a password. A token typed
+  into the web login's password field is refused the same way, live or not.
 - Admin request bodies refuse unknown fields (422 naming the field), and a
-  realm's `config` refuses unknown keys (400), so a typo never falls back to
-  an unsafe default. Token listings show each token's scope.
+  realm's `config` refuses unknown keys (400), as do the `[oidc]` and
+  `[auth.upstream_basic]` config sections that seed realms (at startup), so
+  a typo never falls back to an unsafe default. Token listings show each
+  token's scope.
 - Every package change (push, redeploy, unlist, relist) and every admin
   change is logged at INFO under the `forge::audit` target with the
   principal's ids.
@@ -262,7 +267,9 @@ lists the required settings.
   the upstream names, also to private or plain-http addresses (credentials
   go only to the upstream's own origin), and parses its metadata documents
   (up to `proxy.max_metadata_bytes`, 32 MiB) in memory. Point proxies only
-  at upstreams you trust.
+  at upstreams you trust. Behind an outbound proxy (`HTTP(S)_PROXY`) the
+  proxy resolves host names, so Forge refuses only literal cloud-metadata
+  addresses and the well-known metadata host names there.
 - Unless a group flags owner members, it trusts all its hosted members
   equally: anyone who can push to any hosted member can publish under the
   group's `reserved_prefixes`, and with `prefer_hosted` can claim any
@@ -270,6 +277,15 @@ lists the required settings.
   when a group mixes feeds with different writers. Owners claim only the
   ids they have: an id no owner has is still served by every member, so
   reserve the internal prefixes as well.
+- With `prefer_hosted`, a caller who cannot read a group's hosted members
+  still learns whether one of them has a package id the upstream also has:
+  they get 404 instead of the public package.
+- A role grant of the `admin` action on one repository has no effect: every
+  `/admin` operation needs a global administrator.
+- An OIDC realm that provisions accounts can take a username before a
+  credential-forwarding user of that name first signs in, where users choose
+  their own username claim at the IdP. That user is then refused until an
+  administrator removes the other account.
 - Under `anonymous_mode = "allowlist"`, anonymous feed responses carry no
   `Cache-Control: no-store`, and whether one is served depends on the
   client's address, which a cache does not key on. A shared cache in front
@@ -277,7 +293,21 @@ lists the required settings.
   does) can serve a package an allowlisted client fetched to a client
   outside the allowlist. Do not let such a cache store `/v3` responses.
 - While Redis is unreachable, an instance hears no invalidations from the
-  others and converges by TTL (60 s for authorization).
+  others and converges by TTL (60 s for authorization). Anything that can
+  publish to Redis can grow every instance's memory: the invalidation
+  bookkeeping is not bounded.
+- Every `.nupkg` download updates its version's download counters in
+  PostgreSQL, unthrottled. Hundreds of downloads of one version per second
+  queue on those rows and can hold every database connection.
+- Forge does not check the owner or permissions of `server.staging_dir`. On
+  a host shared with other users, use a directory only Forge's user can
+  write (the container image and the Kubernetes manifests are not affected).
+- The Helm chart rolls the pods on a change of `secretEnv` (and of the
+  in-cluster Redis `auth`) through an unsalted SHA-256 of the values in a pod
+  annotation: whoever can read the Deployment can test guesses of a weak
+  secret against it.
+- The release build pulls the Dockerfile frontend, BuildKit and the SBOM
+  scanner images by tag, not by digest.
 - Login lockouts and failure counts are per instance and lost on restart
   (the networks a username signed in from are kept in the database).
 - A first download through a proxy runs inside the request, so
