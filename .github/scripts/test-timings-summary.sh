@@ -50,12 +50,14 @@ awk -F'\t' '{ n += $3; ms += $1; b++ }
 
 echo "| Slowest test binaries | Wall time | Tests |"
 echo "|---|--:|--:|"
-LC_ALL=C sort -t$'\t' -k1,1nr "$binaries" | head -n "$rows" |
-  awk -F'\t' '{ printf "| `%s` | %.1f s | %d |\n", $2, $1 / 1000, $3 }'
+# awk reads all of sort's output (head would close the pipe early, and
+# pipefail fails the script on sort's SIGPIPE).
+LC_ALL=C sort -t$'\t' -k1,1nr "$binaries" |
+  awk -F'\t' -v rows="$rows" 'NR <= rows { printf "| `%s` | %.1f s | %d |\n", $2, $1 / 1000, $3 }'
 echo
 echo "| Slowest tests | Time | Binary |"
 echo "|---|--:|---|"
-LC_ALL=C sort -t$'\t' -k1,1nr "$tests" | head -n "$rows" |
-  awk -F'\t' '{ printf "| `%s`%s | %.1f s | `%s` |\n", $4, ($2 == "ok" ? "" : " (" $2 ")"), $1, $3 }'
+LC_ALL=C sort -t$'\t' -k1,1nr "$tests" |
+  awk -F'\t' -v rows="$rows" 'NR <= rows { printf "| `%s`%s | %.1f s | `%s` |\n", $4, ($2 == "ok" ? "" : " (" $2 ")"), $1, $3 }'
 echo
 echo "A test's time includes waiting on locks its binary's other tests hold; doctests are not timed."
