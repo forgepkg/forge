@@ -14,7 +14,12 @@ name: Release
 # Order of operations: the image is pushed BY DIGEST (untagged), the digest is
 # signed and the signature verified, and only then are the tags attached
 # (`docker buildx imagetools create`), so no tag ever points at an unsigned
-# image. The floating tags are decided right before they are attached, against
+# image. Every signature is checked, here and by the `cosign verify` commands
+# in the release notes, against this workflow at the release's tag AND the
+# tagged commit (and the push trigger): the identity alone names only the
+# tag, which a moved or re-created tag would share with another commit (so
+# protect refs/tags/v* with a ruleset; DEVELOPMENT.md, Releasing). The
+# floating tags are decided right before they are attached, against
 # the tags that exist by then, so an overlapping run for an older tag that
 # finishes last cannot move them back. Every third-party action is pinned to a
 # full commit SHA (the tag it was resolved from is in the trailing comment);
@@ -133,6 +138,11 @@ jobs:
       contents: write # create the GitHub release
       packages: write # push to ghcr.io
       id-token: write # keyless cosign signing + provenance
+    env:
+      # The signer of this release's signatures: this workflow at the tag.
+      # Every `cosign verify` also pins the commit (GITHUB_SHA, the commit the
+      # tag points to) and the push trigger.
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,13 +252,14 @@ jobs:
       - name: Sign the image digest (keyless) and verify the signature
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
         run: |
           cosign sign --yes "${IMAGE}@${DIGEST}"
           # The exact command published in the release notes must succeed.
           cosign verify "${IMAGE}@${DIGEST}" \
             --certificate-identity "${IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
+            --certificate-github-workflow-trigger push > /dev/null
 
       # Which floating tags this release may move: `latest` only for the
       # highest non-prerelease version and `<major>.<minor>` only for the
@@ -322,7 +333,6 @@ jobs:
           PACKAGE: ${{ steps.chart.outputs.package }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
         run: |
           printf '%s' "$REGISTRY_PASSWORD" | helm registry login ghcr.io --username "$REGISTRY_USER" --password-stdin
           helm push "$PACKAGE" "oci://${CHART_REPO}" 2>&1 | tee helm-push.log
@@ -334,7 +344,9 @@ jobs:
           cosign sign --yes "${CHART_REPO}/forge@${digest}"
           cosign verify "${CHART_REPO}/forge@${digest}" \
             --certificate-identity "${IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
+            --certificate-github-workflow-trigger push > /dev/null
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Create the GitHub release
@@ -344,17 +356,24 @@ jobs:
           CHART_DIGEST: ${{ steps.chart-push.outputs.digest }}
           PACKAGE: ${{ steps.chart.outputs.package }}
         run: |
+          verify() { # <reference>: the command that checks its signature
+            echo "cosign verify $1 \\"
+            echo "  --certificate-identity ${IDENTITY} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-github-workflow-sha ${GITHUB_SHA} \\"
+            echo "  --certificate-github-workflow-trigger push"
+          }
           {
             cat release-notes.md
             echo
             echo "### Image"
             echo
+            echo "Built from commit ${GITHUB_SHA}, which \`${GITHUB_REF_NAME}\` points to. The \`cosign verify\` commands below accept only a signature by this repository's release workflow for that tag and that commit."
+            echo
             echo '```'
             echo "docker pull ${IMAGE}:${{ steps.version.outputs.version }}"
             echo "# digest: ${DIGEST}"
-            echo "cosign verify ${IMAGE}@${DIGEST} \\"
-            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            verify "${IMAGE}@${DIGEST}"
             echo '```'
             echo
             echo "### Helm chart"
@@ -364,9 +383,7 @@ jobs:
             echo '```'
             echo "helm install forge oci://${CHART_REPO}/forge --version ${{ steps.version.outputs.version }}"
             echo "# digest: ${CHART_DIGEST}"
-            echo "cosign verify ${CHART_REPO}/forge@${CHART_DIGEST} \\"
-            echo "  --certificate-identity https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME} \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            verify "${CHART_REPO}/forge@${CHART_DIGEST}"
             echo '```'
           } > release-body.md
           prerelease=""

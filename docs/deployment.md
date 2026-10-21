@@ -32,14 +32,21 @@ docker pull ghcr.io/<owner>/<repo>:1.0.0
 
 Release images are signed with keyless cosign and carry an SBOM and a
 provenance attestation. The exact `cosign verify` command is in each GitHub
-release's notes; it pins the signer to this repository's release workflow at
-that release's tag:
+release's notes, next to the commit the release was built from. It pins the
+signer to this repository's release workflow at that release's tag, run by
+the push of the tag, on that commit:
 
 ```bash
 cosign verify ghcr.io/<owner>/<repo>@<digest> \
   --certificate-identity https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v1.0.0 \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha <commit> \
+  --certificate-github-workflow-trigger push
 ```
+
+The identity alone names only the tag; pinning the commit as well rejects a
+signature from a release run for a tag that was later moved or re-created on
+another commit.
 
 Each release also publishes the Helm chart of the same version,
 `oci://ghcr.io/<owner>/charts/forge`, which pulls the image by the digest the

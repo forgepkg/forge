@@ -36,5 +36,10 @@ The most important ones:
   else in those ranges reach Forge (on Kubernetes, a NetworkPolicy);
 - remove the bootstrap admin once real administrators exist, and its
   password from the environment;
-- verify release images before deploying them (`cosign verify` with the exact
-  workflow identity printed in each GitHub release's notes).
+- verify release images before deploying them, with the exact `cosign verify`
+  command printed in each GitHub release's notes: besides the release
+  workflow's identity at the release's tag, it pins the tagged commit
+  (`--certificate-github-workflow-sha`, the commit the notes name) and the
+  push trigger (`--certificate-github-workflow-trigger push`), so a signature
+  made for a tag that was moved or re-created on another commit does not
+  pass.

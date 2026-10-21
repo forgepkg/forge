@@ -610,6 +610,20 @@ got another number): fold its entries into `[Unreleased]` first. Run without
 `--no-tag` on a clean `main`, it also creates the annotated tag, for a
 repository whose `main` accepts direct pushes.
 
+**Protect the release tags.** A release's signatures name the release
+workflow at its tag and the commit the tag pointed to, and the published
+`cosign verify` commands check both. A tag that can be moved, or deleted and
+pushed again, would still start a release run of another commit under the
+same name, so protect `refs/tags/v*` with tag rulesets (repository
+**Settings → Rules → Rulesets**), which cannot be set from this repository's
+files:
+
+1. a ruleset targeting `refs/tags/v*` with **Restrict creations**, whose
+   bypass list holds only the maintainers who cut releases;
+2. a second ruleset targeting `refs/tags/v*` with **Restrict updates** and
+   **Restrict deletions** and an empty bypass list, so nobody moves or
+   deletes a release tag.
+
 **First release only.** GHCR creates a package of a user account as
 **private**, whatever the repository's visibility, and there is no REST API
 to change it. After the first release run, open each package's settings
