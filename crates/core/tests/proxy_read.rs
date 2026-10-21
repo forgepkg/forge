@@ -75,6 +75,9 @@ struct MockState {
     registrations: Mutex<HashMap<String, serde_json::Value>>,
     /// `"{lower_id}/{file}" -> registration page document`.
     registration_pages: Mutex<HashMap<String, serde_json::Value>>,
+    /// `file -> catalog entry document`.
+    catalog: Mutex<HashMap<String, serde_json::Value>>,
+    catalog_hits: AtomicUsize,
     /// `lower_id -> flat-container listing document` served instead of the
     /// corpus's.
     flat_index_override: Mutex<HashMap<String, serde_json::Value>>,
@@ -137,6 +140,17 @@ impl MockUpstream {
     }
     fn registration_page_hits(&self) -> usize {
         self.state.registration_page_hits.load(Ordering::SeqCst)
+    }
+    fn catalog_hits(&self) -> usize {
+        self.state.catalog_hits.load(Ordering::SeqCst)
+    }
+    /// Serve `doc` as the catalog entry at `{base}/catalog/{file}`.
+    fn set_catalog_entry(&self, file: &str, doc: serde_json::Value) {
+        self.state
+            .catalog
+            .lock()
+            .unwrap()
+            .insert(file.to_string(), doc);
     }
     /// Publish (or replace) a version upstream.
     fn publish(&self, lower_id: &str, version: &str, bytes: Vec<u8>) {
@@ -320,6 +334,17 @@ async fn serve_registration_page(
     }
 }
 
+async fn serve_catalog(
+    State(st): State<Arc<MockState>>,
+    Path(file): Path<String>,
+) -> impl IntoResponse {
+    st.catalog_hits.fetch_add(1, Ordering::SeqCst);
+    match st.catalog.lock().unwrap().get(&file) {
+        Some(doc) => (StatusCode::OK, axum::Json(doc.clone())).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Extract the `.nuspec` entry from a `.nupkg` (zip) archive.
 fn nuspec_of(nupkg: &[u8]) -> Vec<u8> {
     use std::io::Read;
@@ -365,6 +390,8 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         nuspec_override: Mutex::default(),
         registrations: Mutex::default(),
         registration_pages: Mutex::default(),
+        catalog: Mutex::default(),
+        catalog_hits: AtomicUsize::new(0),
         flat_index_override: Mutex::default(),
         index_override: Mutex::default(),
         hold_nupkg: Mutex::default(),
@@ -379,6 +406,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
             "/registration/{id}/page/{file}",
             get(serve_registration_page),
         )
+        .route("/catalog/{file}", get(serve_catalog))
         .with_state(state.clone());
 
     let task = tokio::spawn(async move {
@@ -2500,4 +2528,161 @@ async fn unicode_package_ids_resolve_like_nuget_clients() {
         .unwrap()
         .is_some());
     assert_eq!(mock.nupkg_hits(), 1, "both spellings hit one cached copy");
+}
+
+/// #111: an unlisted version counts from when its catalog entry says the
+/// upstream created it, not from its first sighting: nuget.org dates
+/// unlisted versions 1900 in the registration, which never counts, so a
+/// pinned version released years ago and unlisted since used to sit out the
+/// whole delay (restores failed with NU1102). A version created recently
+/// and unlisted at once still waits, and one without a catalog entry keeps
+/// its first sighting.
+#[tokio::test]
+async fn an_old_unlisted_version_is_dated_from_its_catalog_entry() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0", "2.0.0", "3.0.0"])).await;
+    let five_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let unlisted = |version: &str, catalog: Option<&str>| {
+        let mut entry = serde_json::json!({
+            "id": "Contoso.Lib", "version": version, "listed": false,
+            "published": "1900-01-01T00:00:00+00:00"
+        });
+        if let Some(file) = catalog {
+            entry["@id"] = serde_json::json!(format!("{}/catalog/{file}", mock.base));
+        }
+        serde_json::json!({ "catalogEntry": entry })
+    };
+    mock.set_registration(
+        "contoso.lib",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "3.0.0", "count": 3,
+            "items": [
+                unlisted("1.0.0", Some("old.json")),
+                unlisted("2.0.0", Some("recent.json")),
+                unlisted("3.0.0", None),
+            ]
+        } ] }),
+    );
+    mock.set_catalog_entry(
+        "old.json",
+        serde_json::json!({ "created": "2019-04-05T06:07:08+00:00",
+                            "published": "1900-01-01T00:00:00+00:00" }),
+    );
+    mock.set_catalog_entry(
+        "recent.json",
+        serde_json::json!({ "created": five_minutes_ago,
+                            "published": "1900-01-01T00:00:00+00:00" }),
+    );
+    // A one-hour delay.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "only the old unlisted version is out of quarantine"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    for version in ["2.0.0", "3.0.0"] {
+        assert!(
+            px.resolve_nupkg(&repo, "Contoso.Lib", version)
+                .await
+                .unwrap()
+                .is_none(),
+            "{version} is still inside the delay"
+        );
+    }
+    assert_eq!(mock.catalog_hits(), 2, "one read per catalog entry");
+}
+
+/// #111: dating the delay reads every registration page that covers a
+/// version still inside it, not only the newest ten (640 versions on
+/// nuget.org): an old version of a package with more versions than that is
+/// served at its first sighting too.
+#[tokio::test]
+async fn the_delay_of_old_versions_beyond_ten_pages_is_dated_too() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Big.Lib", &["1.0.0"])).await;
+    let pages = 12;
+    let versions: Vec<String> = (0..pages)
+        .flat_map(|page| (0..64).map(move |i| format!("1.{page}.{i}")))
+        .collect();
+    mock.state.flat_index_override.lock().unwrap().insert(
+        "big.lib".into(),
+        serde_json::json!({ "versions": versions }),
+    );
+    let items: Vec<serde_json::Value> = (0..pages)
+        .map(|page| {
+            let file = format!("{page}.json");
+            mock.set_registration_page(
+                "big.lib",
+                &file,
+                serde_json::json!({ "items": (0..64).map(|i| serde_json::json!({
+                    "catalogEntry": { "id": "Big.Lib", "version": format!("1.{page}.{i}"),
+                                      "listed": true,
+                                      "published": "2019-01-01T00:00:00+00:00" }
+                })).collect::<Vec<_>>() }),
+            );
+            serde_json::json!({
+                "@id": format!("{}/registration/big.lib/page/{file}", mock.base),
+                "lower": format!("1.{page}.0"), "upper": format!("1.{page}.63"), "count": 64
+            })
+        })
+        .collect();
+    mock.set_registration(
+        "big.lib",
+        serde_json::json!({ "count": pages, "items": items }),
+    );
+    // A one-hour delay.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    let listed = versions_of(&px.list_versions(&repo, "Big.Lib").await.unwrap());
+    assert_eq!(listed.len(), versions.len(), "every old version is listed");
+    assert!(px
+        .resolve_nupkg(&repo, "Big.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(mock.registration_page_hits(), pages);
+}
+
+/// #108: each upstream version keeps the casing it was pushed with
+/// (`jquery`, `jQuery`), and the casing recorded for search is the newest
+/// version's, on every read: taking any leaf of a map made it flip between
+/// reads and rewrote the rows each time.
+#[tokio::test]
+async fn the_recorded_id_casing_is_the_newest_versions() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("jQuery", &["1.0.0", "1.5.0", "2.0.0"])).await;
+    let leaf = |id: &str, version: &str| serde_json::json!({ "catalogEntry": { "id": id, "version": version, "listed": true } });
+    mock.set_registration(
+        "jquery",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "2.0.0", "count": 3,
+            "items": [ leaf("jquery", "1.0.0"), leaf("JQUERY", "1.5.0"), leaf("jQuery", "2.0.0") ]
+        } ] }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let repo_id = repo_id(&pool, &repo).await;
+    for read in 0..10 {
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+        px.registration(&repo, "jquery").await.unwrap();
+        let recorded: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT DISTINCT original_id FROM proxy_cached_version \
+             WHERE repository_id = $1 AND name = 'jquery' AND version <> '*'",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recorded, [Some("jQuery".to_string())], "read {read}");
+    }
 }
