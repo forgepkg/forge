@@ -65,9 +65,21 @@ const MAX_CONFIG_BYTES: i64 = 1024 * 1024;
 /// Largest upstream tag list or referrers document read.
 const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
 
-/// Cached upstream registry tokens: key → (token, expiry).
+/// Cached upstream registry tokens: key → (token, expiry). Bounded: the key
+/// names an image a client chose, and the token and its lifetime are the
+/// upstream's word.
 static TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> =
     LazyLock::new(Default::default);
+
+/// The most upstream tokens kept per process.
+const MAX_CACHED_TOKENS: usize = 4096;
+
+/// The largest upstream token kept; a longer one is used for its request
+/// only. Registry tokens are a few KiB at most.
+const MAX_CACHED_TOKEN_BYTES: usize = 8 * 1024;
+
+/// The longest an upstream token is kept, whatever its `expires_in`.
+const MAX_TOKEN_TTL: Duration = Duration::from_secs(600);
 
 /// In-flight first-time blob downloads, so concurrent pulls of one layer
 /// share a single upstream fetch per process.
@@ -94,12 +106,25 @@ fn cached_token(key: &str) -> Option<String> {
 }
 
 fn cache_token(key: String, token: String, ttl: Duration) {
-    let mut tokens = TOKENS.lock().unwrap_or_else(|p| p.into_inner());
-    if tokens.len() > 4096 {
-        let now = Instant::now();
-        tokens.retain(|_, (_, expiry)| *expiry > now);
+    if token.len() > MAX_CACHED_TOKEN_BYTES {
+        return;
     }
-    tokens.insert(key, (token, Instant::now() + ttl));
+    let now = Instant::now();
+    let mut tokens = TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    if tokens.len() >= MAX_CACHED_TOKENS && !tokens.contains_key(&key) {
+        tokens.retain(|_, (_, expiry)| *expiry > now);
+        if tokens.len() >= MAX_CACHED_TOKENS {
+            // Full of live tokens: drop the one that expires first.
+            let soonest = tokens
+                .iter()
+                .min_by_key(|(_, (_, expiry))| *expiry)
+                .map(|(key, _)| key.clone());
+            if let Some(soonest) = soonest {
+                tokens.remove(&soonest);
+            }
+        }
+    }
+    tokens.insert(key, (token, now + ttl.min(MAX_TOKEN_TTL)));
 }
 
 /// The upstream base URL of a proxy: `remote_url` without a trailing `/`
@@ -368,7 +393,12 @@ impl Upstream<'_> {
             .or(parsed.access_token)
             .filter(|t| !t.is_empty())
             .ok_or_else(|| OciError::unavailable("the upstream token service sent no token"))?;
-        let ttl = parsed.expires_in.unwrap_or(60).saturating_sub(10).max(10);
+        let ttl = parsed
+            .expires_in
+            .unwrap_or(60)
+            .min(MAX_TOKEN_TTL.as_secs())
+            .saturating_sub(10)
+            .max(10);
         Ok((token, Duration::from_secs(ttl)))
     }
 }
@@ -935,6 +965,23 @@ fn content_type(response: &reqwest::Response) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_upstream_token_cache_stays_bounded() {
+        let key = |i: usize| format!("bounded-test:{i}");
+        let forever = Duration::from_secs(u64::MAX / 2);
+        for i in 0..MAX_CACHED_TOKENS + 100 {
+            cache_token(key(i), "token".into(), forever);
+        }
+        let tokens = TOKENS.lock().unwrap();
+        assert!(tokens.len() <= MAX_CACHED_TOKENS);
+        let (_, expiry) = tokens.get(&key(MAX_CACHED_TOKENS + 99)).unwrap();
+        assert!(*expiry <= Instant::now() + MAX_TOKEN_TTL, "lifetime capped");
+        drop(tokens);
+        let huge = "x".repeat(MAX_CACHED_TOKEN_BYTES + 1);
+        cache_token(key(usize::MAX), huge, Duration::from_secs(60));
+        assert_eq!(cached_token(&key(usize::MAX)), None, "not kept");
+    }
 
     #[test]
     fn challenges() {

@@ -975,7 +975,8 @@ impl<'de> Deserialize<'de> for BlobCacheMaxBytes {
 /// `cache.*`
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    /// Max number of L1 entries.
+    /// Max number of L1 entries; an entry over 16 KiB counts once per
+    /// started 16 KiB, so this bounds the L1's memory too.
     #[serde(default = "default_l1_capacity")]
     pub l1_max_capacity: u64,
     /// Default TTL (seconds) for cached read responses.

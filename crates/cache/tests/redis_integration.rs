@@ -926,3 +926,50 @@ async fn a_silently_dead_subscription_is_detected_and_l1_flushed() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_backplane_messages_are_dropped() {
+    let url = redis_url().await;
+    let cache = connect(&url).await;
+    let ns = format!("oversized-{}", std::process::id());
+    let sentinel = format!("{ns}-sentinel");
+    let read = |ns: &str, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.to_string(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sentinel_calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&ns, &calls).await, 0);
+    assert_eq!(read(&sentinel, &sentinel_calls).await, 0);
+
+    // An invalidation of the entry's key padded past the size limit (in its
+    // namespace field, which tag messages ignore) is dropped whole.
+    let padded = format!("{ns}{}", "x".repeat(64 * 1024));
+    let client = redis::Client::open(url).unwrap();
+    let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    for message in [
+        format!("1|t|{padded}|1|@key:{ns}:verdict"),
+        format!("1|t|{sentinel}|1|@ns:{sentinel}"),
+    ] {
+        let _: () = publisher
+            .publish("forge:cache:invalidate", message)
+            .await
+            .unwrap();
+    }
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&sentinel, &sentinel_calls).await == 0 {
+        assert!(Instant::now() < deadline, "sentinel never delivered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(read(&ns, &calls).await, 0, "the entry was not invalidated");
+}
