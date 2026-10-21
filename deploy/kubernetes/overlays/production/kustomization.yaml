@@ -30,7 +30,10 @@ configMapGenerator:
     behavior: merge
     literals:
       - FORGE_SERVER__PUBLIC_BASE_URL=https://forge.example.com
-      # The ingress controller's pod network.
+      # The ingress controller's pod network. Every pod in it can choose the
+      # client IP Forge sees (login lockout, anonymous allowlist): narrow it
+      # to the ingress pods, or let only the ingress reach Forge (a
+      # NetworkPolicy; see docs/deployment.md).
       - FORGE_AUTH__TRUSTED_PROXY_CIDRS=[10.0.0.0/8]
       - FORGE_S3__ENDPOINT=https://s3.eu-central-1.amazonaws.com
       - FORGE_S3__REGION=eu-central-1

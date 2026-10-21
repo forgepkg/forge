@@ -75,10 +75,12 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin password (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` defaults to `admin`). Without it no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
-| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. |
+| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (the Helm chart's `networkPolicy`). |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
-password, `minioadmin` S3 keys). It logs a warning when `public_base_url` is
+password, `minioadmin` S3 keys, and a secret still holding a `<…>` placeholder
+of the example env files, such as `<initial admin password>`). It logs a
+warning when `public_base_url` is
 not https, points at localhost, or secret encryption is off. Treat those
 warnings as deployment errors.
 
@@ -332,7 +334,11 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   or NFSv3 with `lockd`; not a mount with `nolock` or `local_lock`):
   otherwise one instance's startup can remove another's files mid-request.
   Where locks do not work at all, a killed process's files are removed once
-  idle for an hour instead.
+  idle for an hour instead. On a host shared with other users, point
+  `server.staging_dir` at a directory only Forge's user can write: Forge does
+  not check the directory's owner or permissions, and another user can create
+  the default one under the system temp directory first. (The container image
+  and the Kubernetes manifests are not affected.)
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
   made them; keep those lines.
@@ -345,7 +351,9 @@ Redis**: authorization sets, credential-forwarding verdicts, OIDC discovery
 documents and signing keys, workload-identity token verdicts, and a proxy's
 upstream service index, manifests and registrations are cached in each
 instance's memory only. Redis carries only their invalidations, so the worst
-a Redis writer can do to them is evict them early. The only values still
+a Redis writer can do to them is evict them early, or grow every instance's
+memory by publishing invalidations for ever new names (that bookkeeping is not
+bounded yet). The only values still
 shared through Redis are two proxy markers ("listing refreshed", "version
 rejected"); forging them can hide a proxied package until its TTL expires,
 not change what is served.

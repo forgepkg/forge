@@ -29,6 +29,9 @@
 //!   upstream, not the admin, and such a target is never a package feed, but
 //!   it is where a malicious upstream would bounce Forge to read instance
 //!   credentials. Private and loopback upstreams stay allowed (12.7 §3.6).
+//!   Behind an outbound proxy (`HTTP(S)_PROXY`) the proxy resolves host
+//!   names, so only literal addresses and the well-known metadata names are
+//!   refused there.
 //! * **Encoded metadata** — a metadata body sent with `Content-Encoding: gzip`
 //!   (nuget.org's `registration5-gz-*` documents always are) is inflated with
 //!   the same size cap applied to the decoded bytes.

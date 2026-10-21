@@ -115,6 +115,11 @@ pub fn release(args: &[String]) -> Result<(), String> {
             "Tagged {tag_name}. Publish it (release.yml builds and signs the image and the chart):"
         );
         println!("  git push --atomic origin {branch} {tag_name}");
+        println!(
+            "A `{branch}` that requires status checks refuses that push: then delete the tag \
+             (`git tag -d {tag_name}`), merge this commit through a pull request and tag the \
+             merge commit (DEVELOPMENT.md)."
+        );
     } else {
         println!(
             "Prepared {tag_name} on `{branch}`. Open a pull request; once it is merged and CI \
