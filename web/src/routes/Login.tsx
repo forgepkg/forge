@@ -1,6 +1,11 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { createFileRoute, useRouter, useSearch } from '@tanstack/react-router'
+import {
+  createFileRoute,
+  Link,
+  useRouter,
+  useSearch,
+} from '@tanstack/react-router'
 
 import {
   fetchLoginOptions,
@@ -32,6 +37,31 @@ interface LoginSearch {
   expired?: boolean
   /** Set when sign-out could not be confirmed by the server. */
   logout_failed?: boolean
+  /** Set when the server's OIDC callback sent the browser back here. */
+  error?: LoginError
+}
+
+/**
+ * Why an OIDC sign-in ended back here (`/login?error=...`): `oidc_failed`
+ * when the callback did not validate (or the IdP returned an error),
+ * `not_permitted` when the account may not sign in. Any other value is
+ * `other`; the raw parameter is never shown.
+ */
+type LoginError = 'oidc_failed' | 'not_permitted' | 'other'
+
+/** Generic on purpose: IdP details stay in the server log. */
+const loginErrorMessages: Record<LoginError, string> = {
+  oidc_failed:
+    'Sign-in with your identity provider did not complete. Try again; if it keeps failing, ask your administrator.',
+  not_permitted:
+    'Your account is not permitted to sign in to Forge. Ask your administrator for access.',
+  other:
+    'Sign-in did not complete. Try again; if it keeps failing, ask your administrator.',
+}
+
+function parseLoginError(raw: unknown): LoginError | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined
+  return raw === 'oidc_failed' || raw === 'not_permitted' ? raw : 'other'
 }
 
 const passwordFallbackOptions: LoginOptions = {
@@ -47,6 +77,7 @@ export const Route = createFileRoute('/login')({
     expired: search.expired === true || search.expired === 'true',
     logout_failed:
       search.logout_failed === true || search.logout_failed === 'true',
+    error: parseLoginError(search.error),
   }),
 })
 
@@ -63,12 +94,16 @@ export const Route = createFileRoute('/login')({
  *
  * A successful password login sets the `forge_session` cookie; we persist the
  * returned CSRF token (session mode) and navigate to the `redirect` target.
+ * A failed OIDC callback lands here with `?error=<code>`: a short, generic
+ * message is shown above the form with a "Try again" link that clears it.
  * Signing in with a registry token is intentionally not offered: the UI always
  * authenticates with username+password or via a realm. Tokens are minted on
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired, logout_failed } = useSearch({ from: '/login' })
+  const { redirect, expired, logout_failed, error } = useSearch({
+    from: '/login',
+  })
   const options = useQuery<LoginOptions, ApiError>({
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
@@ -92,6 +127,22 @@ function Login() {
           <Heading className="!text-2xl">envisia&nbsp;forge</Heading>
           <Text>Sign in to the package registry</Text>
         </div>
+
+        {error && (
+          <div
+            role="alert"
+            className="space-y-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
+          >
+            <p>{loginErrorMessages[error]}</p>
+            <Link
+              to="/login"
+              search={{ redirect }}
+              className="font-medium underline hover:no-underline"
+            >
+              Try again
+            </Link>
+          </div>
+        )}
 
         {expired && (
           <p

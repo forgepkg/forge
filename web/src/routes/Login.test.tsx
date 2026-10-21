@@ -27,6 +27,8 @@ vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
  *    `redirect` target through as `redirect_to`;
  *  - combined mode renders username+password plus one button per OIDC entry;
  *  - a 401 from /auth/login shows the uniform inline error;
+ *  - a failed OIDC callback (`?error=<code>`) shows a generic message per
+ *    code, never the raw parameter, with a "Try again" link that clears it;
  *  - there is **no** registry-token sign-in: the UI always authenticates with
  *    username+password or via a realm.
  */
@@ -463,6 +465,69 @@ describe('Login', () => {
       await waitFor(() => expect(router.state.location.pathname).toBe('/'))
       expect(getCsrfToken()).toBe('csrf-fallback')
       expect(screen.queryByLabelText('Registry token')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('OIDC callback errors', () => {
+    it('says the identity provider sign-in did not complete (oidc_failed)', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?error=oidc_failed')
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Sign-in with your identity provider did not complete. Try again; if it keeps failing, ask your administrator.',
+      )
+      // The sign-in form is still offered below the message.
+      expect(
+        await screen.findByRole('button', { name: 'Login with Corp SSO' }),
+      ).toBeInTheDocument()
+    })
+
+    it('says the account is not permitted (not_permitted)', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?error=not_permitted')
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Your account is not permitted to sign in to Forge. Ask your administrator for access.',
+      )
+    })
+
+    it('shows no message without an error parameter', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin()
+
+      await screen.findByLabelText('Username')
+      expect(screen.queryByRole('alert')).toBeNull()
+      expect(screen.queryByRole('link', { name: 'Try again' })).toBeNull()
+    })
+
+    it('never echoes an unknown code', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?error=Upstream%20IdP%20said%20no')
+
+      const alert = await screen.findByRole('alert')
+      expect(alert).toHaveTextContent('Sign-in did not complete.')
+      expect(alert).not.toHaveTextContent(/Upstream|IdP said no/)
+      expect(screen.queryByText(/IdP said no/)).toBeNull()
+    })
+
+    it('"Try again" clears the error and keeps the return-to', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({ options: combined })
+
+      const router = await renderLogin(
+        '/login?error=oidc_failed&redirect=%2Ftokens',
+      )
+
+      await user.click(await screen.findByRole('link', { name: 'Try again' }))
+
+      await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+      expect(router.state.location.pathname).toBe('/login')
+      expect(router.state.location.search).not.toHaveProperty('error')
+      expect(router.state.location.search).toMatchObject({ redirect: '/tokens' })
     })
   })
 })
