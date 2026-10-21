@@ -75,6 +75,9 @@ fn main() -> ExitCode {
         "prepare" => prepare(),
         "prepare-check" => prepare_check(),
         "clean" => clean(),
+        // Format plugins (WebAssembly components in plugins/)
+        "plugins" => plugins(),
+        "plugins-check" => plugins_check(),
         // Docker image (Dockerfile lands in phase 2; thin wrappers now)
         "docker-build" => docker_build(),
         "docker-run" => docker_run(),
@@ -141,6 +144,12 @@ Rust build & quality:
   prepare       Migrate, then regenerate the sqlx offline cache (needs `up` + sqlx-cli).
   prepare-check Migrate, then verify the committed .sqlx/ cache is in sync (CI's drift guard).
   clean         Remove build artifacts (cargo clean).
+
+Format plugins (plugins/<id>/, WebAssembly components; needs the wasm32-wasip2
+target: `rustup target add wasm32-wasip2`):
+  plugins       Build every plugin and install it under target/plugins/installed/<id>/,
+                printing the [plugins] configuration that loads them (with digests).
+  plugins-check fmt --check, clippy -D warnings and unit tests of every plugin.
 
 Docker image (single container: web SPA + Rust server):
   docker-build  Build the application image from ./Dockerfile (multi-stage:
@@ -696,6 +705,152 @@ fn sqlx_prepare(extra: &[&str]) -> Result<(), String> {
 
 fn clean() -> Result<(), String> {
     Cmd::new("cargo").arg("clean").run()
+}
+
+// ── Format plugins ───────────────────────────────────────────────────────────
+
+/// Format plugins: one crate per directory, each its own workspace.
+const PLUGINS: &str = "plugins";
+
+/// Where `plugins` builds and installs them.
+const PLUGINS_TARGET: &str = "target/plugins";
+
+/// The plugin directories (`plugins/<id>/` with a `plugin.toml`), sorted.
+fn plugin_dirs() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut dirs: Vec<_> = std::fs::read_dir(PLUGINS)
+        .map_err(|e| format!("read {PLUGINS}/: {e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("plugin.toml").is_file())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// The `component = "…"` of a plugin.toml (a plain line scan: xtask has no
+/// TOML parser, and the key is a single string).
+fn plugin_component(dir: &std::path::Path) -> Result<String, String> {
+    let manifest = dir.join("plugin.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("read {}: {e}", manifest.display()))?;
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("component"))
+        .filter_map(|rest| rest.trim().strip_prefix('='))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .next()
+        .ok_or_else(|| format!("{} has no component", manifest.display()))
+}
+
+/// The SHA-256 of `file` (`sha256sum`, or `shasum -a 256` on macOS).
+fn sha256_of(file: &std::path::Path) -> Option<String> {
+    let tools: [(&str, &[&str]); 2] = [("sha256sum", &[]), ("shasum", &["-a", "256"])];
+    tools.iter().find_map(|(tool, args)| {
+        let out = std::process::Command::new(tool)
+            .args(*args)
+            .arg(file)
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        out.status
+            .success()
+            .then(|| text.split_whitespace().next().map(str::to_string))?
+    })
+}
+
+/// Build every plugin and install it as an operator would (plugin.toml plus
+/// component under `target/plugins/installed/<id>/`).
+fn plugins() -> Result<(), String> {
+    let mut pins = Vec::new();
+    for dir in plugin_dirs()? {
+        let id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("plugin directory name is not UTF-8")?
+            .to_string();
+        let component = plugin_component(&dir)?;
+        Cmd::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "--target",
+                "wasm32-wasip2",
+            ])
+            .arg("--manifest-path")
+            .arg(dir.join("Cargo.toml"))
+            .args(["--target-dir", PLUGINS_TARGET])
+            .run()?;
+        let installed = std::path::Path::new(PLUGINS_TARGET)
+            .join("installed")
+            .join(&id);
+        std::fs::create_dir_all(&installed)
+            .map_err(|e| format!("create {}: {e}", installed.display()))?;
+        std::fs::copy(dir.join("plugin.toml"), installed.join("plugin.toml"))
+            .map_err(|e| format!("copy plugin.toml: {e}"))?;
+        let built = std::path::Path::new(PLUGINS_TARGET)
+            .join("wasm32-wasip2/release")
+            .join(&component);
+        std::fs::copy(&built, installed.join(&component))
+            .map_err(|e| format!("copy {}: {e}", built.display()))?;
+        let pin = sha256_of(&installed.join(&component)).map_or_else(
+            || "<sha256 of the component>".to_string(),
+            |sha| format!("sha256:{sha}"),
+        );
+        pins.push((id, pin));
+    }
+    let dir = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(PLUGINS_TARGET)
+        .join("installed");
+    println!(
+        "\nInstalled into {}. To load them, add to forge.toml:\n",
+        dir.display()
+    );
+    println!(
+        "[plugins]\ndir = {:?}\n\n[plugins.formats]",
+        dir.display().to_string()
+    );
+    for (id, pin) in pins {
+        println!("{id} = \"{pin}\"");
+    }
+    Ok(())
+}
+
+/// What CI checks of every plugin: formatting, lints (for the wasm target and
+/// for its native unit tests), and the unit tests.
+fn plugins_check() -> Result<(), String> {
+    for dir in plugin_dirs()? {
+        let manifest = dir.join("Cargo.toml");
+        let target_dir = ["--target-dir", PLUGINS_TARGET];
+        Cmd::new("cargo")
+            .args(["fmt", "--check", "--manifest-path"])
+            .arg(&manifest)
+            .run()?;
+        Cmd::new("cargo")
+            .args([
+                "clippy",
+                "--locked",
+                "--target",
+                "wasm32-wasip2",
+                "--manifest-path",
+            ])
+            .arg(&manifest)
+            .args(target_dir)
+            .args(["--", "-D", "warnings"])
+            .run()?;
+        Cmd::new("cargo")
+            .args(["clippy", "--locked", "--tests", "--manifest-path"])
+            .arg(&manifest)
+            .args(target_dir)
+            .args(["--", "-D", "warnings"])
+            .run()?;
+        Cmd::new("cargo")
+            .args(["test", "--locked", "--lib", "--manifest-path"])
+            .arg(&manifest)
+            .args(target_dir)
+            .run()?;
+    }
+    Ok(())
 }
 
 // ── Docker image (single-container web SPA + Rust server) ────────────────────

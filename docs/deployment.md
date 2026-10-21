@@ -409,6 +409,10 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   of its addresses is such a target. A name that resolves differently for
   the proxy than for Forge, or that only the proxy can resolve, still gets
   through: block those addresses on the proxy too.
+- **Format plugins.** Every instance must load the same plugins (the same
+  `[plugins]` section and component files): a repository whose format is
+  missing on an instance answers 503 there. See
+  [format-plugins.md](./format-plugins.md#operating-plugins).
 
 ### Redis is a trust boundary
 
