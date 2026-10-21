@@ -586,6 +586,30 @@ got another number): fold its entries into `[Unreleased]` first. Run without
 `--no-tag` on a clean `main`, it also creates the annotated tag, for a
 repository whose `main` accepts direct pushes.
 
+**First release only.** GHCR creates a package of a user account as
+**private**, whatever the repository's visibility, and there is no REST API
+to change it. After the first release run, open each package's settings
+(profile → **Packages** → the package → **Package settings**) for
+`ghcr.io/schmitch/forge` (the image) and `ghcr.io/schmitch/charts/forge` (the
+chart):
+
+1. Under **Danger Zone → Change visibility**, make both **Public**.
+2. On the chart, under **Manage Actions access**, give the `schmitch/forge`
+   repository the **Write** role if it is not listed. Without it the next
+   release's `helm push` fails after the image tags have already moved.
+
+Both packages name the repository in `org.opencontainers.image.source`: the
+image through `docker/metadata-action`, the chart because `helm push` copies
+the first `sources` entry of `Chart.yaml` into that annotation.
+
+**After every release**, check that both can be pulled without credentials
+(Helm keeps its own registry login, so log out of both):
+
+```bash
+docker logout ghcr.io; helm registry logout ghcr.io
+docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
+```
+
 ### Upgrade boundary for migration 0011
 
 Migration `0011_blob_deletion_reservations.sql` changes the CAS coordination
