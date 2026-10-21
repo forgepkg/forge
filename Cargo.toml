@@ -190,3 +190,16 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+# Tests build unoptimized, yet the mock IdPs generate RSA keys and every test
+# server hashes its bootstrap admin password: ~30x (RSA-2048 keygen, ~3 s) and
+# ~15x (Argon2 default, ~0.3 s) slower than optimized. Optimize just those
+# dependencies; the workspace crates stay fast to build and debug.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
