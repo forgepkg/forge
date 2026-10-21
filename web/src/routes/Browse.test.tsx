@@ -14,9 +14,10 @@ import type { BrowseRepo, BrowseResult } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Folder-view browse: the root lists the readable repositories; a repository
- * screen searches + paginates that repo's packages. Drives the real route tree
- * + `useBrowseRepos` / `usePackageSearch`, so URL-search-param wiring is
+ * Folder-view browse: the root lists the readable repositories (an offline
+ * one badged); a repository screen searches + paginates that repo's packages
+ * and says when the repository is offline. Drives the real route tree +
+ * `useBrowseRepos` / `usePackageSearch`, so URL-search-param wiring is
  * exercised too.
  */
 
@@ -27,8 +28,9 @@ const readerMe: Me = {
 }
 
 const repos: BrowseRepo[] = [
-  { name: 'nuget', kind: 'proxy' },
-  { name: 'internal', kind: 'hosted' },
+  { name: 'nuget', kind: 'proxy', online: true },
+  { name: 'internal', kind: 'hosted', online: true },
+  { name: 'releases', kind: 'hosted', online: false },
 ]
 
 function page(total: number, ids: string[]): BrowseResult {
@@ -123,6 +125,21 @@ describe('Browse root (repository folders)', () => {
     const nugetLink = await screen.findByRole('link', { name: /nuget/ })
     expect(nugetLink).toHaveAttribute('href', '/repos/nuget')
     expect(screen.getByRole('link', { name: /internal/ })).toBeInTheDocument()
+  })
+
+  it('badges an offline repository', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/')
+
+    const releases = await screen.findByRole('link', { name: /releases/ })
+    expect(within(releases).getByText('offline')).toHaveAttribute(
+      'title',
+      'Offline for maintenance',
+    )
+    expect(
+      within(screen.getByRole('link', { name: /internal/ })).queryByText('offline'),
+    ).toBeNull()
   })
 
   it('navigates into a repository when its folder is clicked', async () => {
@@ -229,6 +246,26 @@ describe('RepoBrowse (per-repo search)', () => {
     const alert = await screen.findByRole('alert')
     expect(within(alert).getByText('Could not load packages')).toBeInTheDocument()
     expect(within(alert).getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  it('says the repository is offline on its 503', async () => {
+    mockApi(
+      () =>
+        new Response('repository is offline', {
+          status: 503,
+          headers: { 'retry-after': '60' },
+        }),
+    )
+
+    await renderBrowse('/repos/releases')
+
+    const alert = await screen.findByRole('alert')
+    expect(within(alert).getByText('Repository offline')).toBeInTheDocument()
+    expect(alert).toHaveTextContent(
+      'This repository is offline for maintenance. Try again later.',
+    )
+    expect(within(alert).queryByText('Could not load packages')).toBeNull()
+    expect(screen.queryByText('No packages found')).toBeNull()
   })
 
   it('debounces a typed query into the URL search param', async () => {

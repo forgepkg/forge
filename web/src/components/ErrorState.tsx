@@ -33,3 +33,17 @@ export function ErrorState({
     </div>
   )
 }
+
+/**
+ * An offline hosted or group repository (`isRepositoryOffline`): says so
+ * instead of showing the server's status line.
+ */
+export function RepositoryOfflineState({ onRetry }: { onRetry?: () => void }) {
+  return (
+    <ErrorState
+      title="Repository offline"
+      message="This repository is offline for maintenance. Try again later."
+      onRetry={onRetry}
+    />
+  )
+}

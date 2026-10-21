@@ -8,6 +8,7 @@ import {
 } from '@tanstack/react-router'
 
 import { clearSession } from '~/lib/auth'
+import { makeQueryClient } from '~/lib/queryClient'
 import type { Me } from '~/api/me'
 import type { PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
@@ -16,8 +17,9 @@ import { routeTree } from '~/routeTree.gen'
  * Package-detail screen (plan §Phase 3 testing): renders versions + dependency
  * groups; a delayed proxy version shows the delay badge; a proxy labels the
  * time column "Cached" (when Forge downloaded it), a hosted repository
- * "Published"; a 404 renders the not-found empty state. Drives the real
- * route tree + `usePackageDetail`.
+ * "Published"; a 404 renders the not-found empty state; an offline
+ * repository's 503 says so (without retrying). Drives the real route tree +
+ * `usePackageDetail`.
  */
 
 const anonMe: Me = {
@@ -97,8 +99,7 @@ function testQueryClient() {
   })
 }
 
-async function renderDetail(path: string) {
-  const queryClient = testQueryClient()
+async function renderDetail(path: string, queryClient = testQueryClient()) {
   const router = createRouter({
     routeTree,
     context: { queryClient },
@@ -199,6 +200,40 @@ describe('PackageDetail', () => {
     await renderDetail('/packages/nuget/missing')
 
     expect(await screen.findByText('Package not found')).toBeInTheDocument()
+  })
+
+  it('says the repository is offline on its 503, without retrying', async () => {
+    mockApi(
+      () =>
+        new Response('repository is offline', {
+          status: 503,
+          headers: { 'retry-after': '60' },
+        }),
+    )
+
+    // The app's query client, so its retry policy applies.
+    await renderDetail('/packages/internal/acme.core', makeQueryClient())
+
+    const alert = await screen.findByRole('alert')
+    expect(within(alert).getByText('Repository offline')).toBeInTheDocument()
+    expect(alert).toHaveTextContent(
+      'This repository is offline for maintenance. Try again later.',
+    )
+    expect(alert).not.toHaveTextContent('503')
+    const detailCalls = fetchMock.mock.calls.filter(([input]) =>
+      String(input).includes('/browse/packages/'),
+    )
+    expect(detailCalls).toHaveLength(1)
+  })
+
+  it('keeps the generic error for another 503', async () => {
+    mockApi(() => new Response('temporarily unavailable', { status: 503 }))
+
+    await renderDetail('/packages/internal/acme.core')
+
+    const alert = await screen.findByRole('alert')
+    expect(within(alert).getByText('Could not load package')).toBeInTheDocument()
+    expect(alert).not.toHaveTextContent('offline')
   })
 
   it('renders an error state on a server error', async () => {
