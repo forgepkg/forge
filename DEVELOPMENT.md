@@ -577,22 +577,39 @@ there would be missing from the release notes).
 `main` only accepts commits whose required checks passed, so the release
 commit goes through a pull request and the tag goes on the merge commit; a
 direct `git push origin main v1.0.1` of the release commit is refused.
-`cargo xtask release <version> --no-tag` prepares the commit:
+`cargo xtask release <version>` does all of it through the GitHub CLI (`gh`,
+logged in with `gh auth login`):
+
+```bash
+git switch main && git pull --ff-only   # HEAD must be origin/main, the tree clean
+cargo xtask release 1.0.1
+```
+
+It commits `release: v1.0.1` on a new `release-1.0.1` branch, pushes it, opens
+a pull request, waits for the pull request's CI run and merges the pull
+request once that run passed. Then it waits for the merge commit's CI run on
+`main`, **including `e2e` and `web-e2e`**: they run only on `main`, after the
+merge, never on the pull request. Every push to `main` gets its own CI run,
+which a later push never cancels. Once that run passed, it tags the merge
+commit `v1.0.1` and pushes the tag, which starts the release workflow. The
+release workflow checks CI as well: before it builds anything, it waits (up
+to an hour) for the tagged commit's CI run on `main` and fails unless every
+job of it passed.
+
+When a step fails (the pull request's CI run, the merge, the CI run on
+`main`), nothing is tagged, and the xtask says what is left. Once the release
+pull request is merged (after a fix, or by hand), run it again on an
+up-to-date `main`: `main` already carries the version, so it commits nothing,
+waits for the CI run of `main`'s head and tags that commit.
+
+Without `gh`, `cargo xtask release <version> --no-tag` only prepares the
+commit, on the current branch; the rest is manual:
 
 ```bash
 git switch -c release-1.0.1 origin/main   # clean and up to date
 cargo xtask release 1.0.1 --no-tag        # commits `release: v1.0.1`
 git push -u origin release-1.0.1          # open a pull request, merge it
-```
-
-Then wait until CI on the merge commit is green, **including `e2e` and
-`web-e2e`**: they run only on `main`, after the merge, never on the pull
-request. Every push to `main` gets its own CI run, which a later push never
-cancels. The release workflow checks this as well: before it builds anything,
-it waits (up to an hour) for the tagged commit's CI run on `main` and fails
-unless every job of it passed. Tag that commit and push the tag:
-
-```bash
+# once the merge commit's CI run on main passed:
 git fetch origin
 git tag -a v1.0.1 -m v1.0.1 <merge commit>
 git push origin v1.0.1
@@ -602,13 +619,11 @@ The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
 --workspace`), `web/package.json`, the Kubernetes base and the Helm chart,
 renames `## [Unreleased]` in `CHANGELOG.md` to `## [1.0.1]` under a new, empty
 `[Unreleased]`, updates the links at its bottom, and commits
-`release: v1.0.1`. It pushes nothing. A `## [1.0.1]` section drafted ahead of
-time is kept as it is, but only while `[Unreleased]` is empty; with entries
-in both, the release is refused. It also refuses a changelog with a version
-section whose tag does not exist (a section drafted for a release that then
-got another number): fold its entries into `[Unreleased]` first. Run without
-`--no-tag` on a clean `main`, it also creates the annotated tag, for a
-repository whose `main` accepts direct pushes.
+`release: v1.0.1`. A `## [1.0.1]` section drafted ahead of time is kept as it
+is, but only while `[Unreleased]` is empty; with entries in both, the release
+is refused. It also refuses a changelog with a version section whose tag does
+not exist (a section drafted for a release that then got another number):
+fold its entries into `[Unreleased]` first.
 
 **First release only.** GHCR creates a package of a user account as
 **private**, whatever the repository's visibility, and there is no REST API

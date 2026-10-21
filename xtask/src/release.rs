@@ -3,10 +3,20 @@
 //! Sets the version everywhere the release workflow checks it (the workspace
 //! `Cargo.toml` and `Cargo.lock`, `web/package.json`, the image tag of the
 //! Kubernetes base, and the Helm chart's `version` and `appVersion`), turns
-//! the changelog's `[Unreleased]` section into the version's section,
-//! commits, and creates the annotated `v<version>` tag.
-//! Pushing is left to the caller. Every edit is computed before the first
-//! file is written, so a failed precondition leaves the tree untouched.
+//! the changelog's `[Unreleased]` section into the version's section, and
+//! commits on a `release-<version>` branch off the default branch. Then,
+//! through the GitHub CLI (`gh`), it opens a pull request, waits for its CI
+//! run, merges it, waits for the merge commit's CI run on the default branch
+//! (e2e and web-e2e run only there), and creates and pushes the annotated
+//! `v<version>` tag on the merge commit, which starts release.yml.
+//! `--no-tag` only commits, on the current branch, and pushes nothing.
+//! Every edit is computed before the first file is written, so a failed
+//! precondition leaves the tree untouched.
+//!
+//! When the default branch already carries the version (a release pull
+//! request merged by hand, or a run that stopped after the merge), nothing is
+//! committed: the run waits for the CI run of the default branch's head and
+//! tags that commit.
 //!
 //! Two changelog guards keep the release notes (the version's section alone)
 //! whole. A release is refused while the changelog has a version section
@@ -16,6 +26,8 @@
 
 use crate::proc::Cmd;
 use std::fs;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const CARGO_TOML: &str = "Cargo.toml";
 const PACKAGE_JSON: &str = "web/package.json";
@@ -23,12 +35,26 @@ const KUSTOMIZATION: &str = "deploy/kubernetes/base/kustomization.yaml";
 const CHART: &str = "deploy/helm/forge/Chart.yaml";
 const CHANGELOG: &str = "CHANGELOG.md";
 
+/// The workflow whose runs gate the merge and the tag (release.yml requires
+/// the tagged commit's run of it).
+const CI_WORKFLOW: &str = "ci.yml";
+/// How long a pushed commit's CI run may take to show up; release.yml waits
+/// as long.
+const RUN_APPEARS_WITHIN: Duration = Duration::from_secs(10 * 60);
+/// How long a merged pull request may take to land (a merge queue runs CI
+/// first).
+const MERGE_LANDS_WITHIN: Duration = Duration::from_secs(90 * 60);
+const POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A file's content with the version set.
+type Edit = fn(&str, &str) -> Result<String, String>;
+
 pub fn release(args: &[String]) -> Result<(), String> {
     let mut version = None;
-    let mut tag = true;
+    let mut publish = true;
     for arg in args {
         match arg.as_str() {
-            "--no-tag" => tag = false,
+            "--no-tag" => publish = false,
             v if version.is_none() && !v.starts_with('-') => {
                 version = Some(v.strip_prefix('v').unwrap_or(v).to_string())
             }
@@ -46,6 +72,36 @@ pub fn release(args: &[String]) -> Result<(), String> {
     if !git(&["status", "--porcelain"])?.is_empty() {
         return Err("release: the working tree has uncommitted changes".into());
     }
+    // The default branch, fetched with every tag: the release starts from
+    // its head, and the tag checks below see the tags pushed from elsewhere.
+    let base = if publish {
+        let base = gh(&[
+            "repo",
+            "view",
+            "--json",
+            "defaultBranchRef",
+            "--jq",
+            ".defaultBranchRef.name",
+        ])
+        .map_err(|e| {
+            format!(
+                "release: {e}. Opening and merging the release pull request takes the \
+                 GitHub CLI, logged in (`gh auth login`); --no-tag only commits"
+            )
+        })?;
+        Cmd::new("git")
+            .args(["fetch", "--tags", "origin", &base])
+            .run()?;
+        if git(&["rev-parse", "HEAD"])? != git(&["rev-parse", &format!("origin/{base}")])? {
+            return Err(format!(
+                "release: HEAD is not origin/{base}, where the release starts: \
+                 `git switch {base} && git pull --ff-only` first"
+            ));
+        }
+        Some(base)
+    } else {
+        None
+    };
     if git(&[
         "rev-parse",
         "--quiet",
@@ -60,36 +116,85 @@ pub fn release(args: &[String]) -> Result<(), String> {
     let tags = git(&["tag", "--list", "v*"])?;
     check_sections_are_tagged(&changelog, &tags.lines().collect::<Vec<_>>(), &version)
         .map_err(|e| format!("release: {CHANGELOG}: {e}"))?;
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if tag && branch != "main" && branch != "master" {
-        // release.yml only publishes tags on the default branch.
-        return Err(format!(
-            "release: on `{branch}`, not the default branch; use --no-tag to prepare the \
-             release in a pull request and tag the merge commit"
-        ));
+
+    let edits: [(&str, Edit); 5] = [
+        (CARGO_TOML, set_workspace_version),
+        (PACKAGE_JSON, set_package_version),
+        (KUSTOMIZATION, set_image_tag),
+        (CHART, set_chart_version),
+        (CHANGELOG, release_changelog),
+    ];
+    // Only the files the release changes.
+    let mut contents = Vec::new();
+    for (path, edit) in edits {
+        let old = read(path)?;
+        let new = edit(&old, &version).map_err(|e| format!("release: {path}: {e}"))?;
+        if new != old {
+            contents.push((path, new));
+        }
     }
 
-    let edits = [
-        (
-            CARGO_TOML,
-            set_workspace_version(&read(CARGO_TOML)?, &version),
-        ),
-        (
-            PACKAGE_JSON,
-            set_package_version(&read(PACKAGE_JSON)?, &version),
-        ),
-        (
-            KUSTOMIZATION,
-            set_image_tag(&read(KUSTOMIZATION)?, &version),
-        ),
-        (CHART, set_chart_version(&read(CHART)?, &version)),
-        (CHANGELOG, release_changelog(&changelog, &version)),
-    ];
-    let mut contents = Vec::new();
-    for (path, edited) in edits {
-        contents.push((path, edited.map_err(|e| format!("release: {path}: {e}"))?));
-    }
-    for (path, content) in &contents {
+    let Some(base) = base else {
+        commit(&contents, &tag_name)?;
+        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        println!();
+        println!(
+            "Prepared {tag_name} on `{branch}`. Open a pull request; once it is merged and CI \
+             on the merge commit (e2e and web-e2e included) is green, tag that commit:"
+        );
+        println!("  git tag -a {tag_name} -m {tag_name} <commit> && git push origin {tag_name}");
+        return Ok(());
+    };
+    let target = if contents.is_empty() {
+        println!("origin/{base} already carries {version}: tagging it once its CI run passed.");
+        git(&["rev-parse", "HEAD"])?
+    } else {
+        let branch = format!("release-{version}");
+        let ref_name = format!("refs/heads/{branch}");
+        if git(&["rev-parse", "--quiet", "--verify", &ref_name]).is_ok()
+            || !git(&["ls-remote", "--heads", "origin", &ref_name])?.is_empty()
+        {
+            return Err(format!(
+                "release: branch `{branch}` already exists (here or on origin): delete it, \
+                 or merge its pull request and run this again on an up-to-date `{base}`"
+            ));
+        }
+        Cmd::new("git").args(["switch", "-c", &branch]).run()?;
+        commit(&contents, &tag_name)?;
+        let resume = format!(
+            "once the pull request is merged, run `cargo xtask release {version}` again on an \
+             up-to-date `{base}` to tag the merge commit"
+        );
+        merge_pull_request(&branch, &base, &tag_name)
+            .map_err(|e| format!("{e}; nothing is tagged: {resume}"))?
+    };
+
+    println!("Waiting for the CI run of {} on `{base}`.", short(&target));
+    wait_for_ci(&target, &base, "push").map_err(|e| {
+        format!(
+            "{e}; nothing is tagged: once a fix is merged, run `cargo xtask release {version}` \
+             again on an up-to-date `{base}`"
+        )
+    })?;
+    // The merge commit exists only on origin so far.
+    Cmd::new("git").args(["fetch", "origin", &base]).run()?;
+    Cmd::new("git")
+        .args(["tag", "-a", &tag_name, "-m", &tag_name, &target])
+        .run()?;
+    Cmd::new("git").args(["push", "origin", &tag_name]).run()?;
+    println!();
+    println!(
+        "Pushed {tag_name} on {}: release.yml builds and signs the image and the chart and \
+         creates the GitHub release.",
+        short(&target)
+    );
+    Ok(())
+}
+
+/// Writes `contents`, updates Cargo.lock and commits `release: <tag_name>`;
+/// nothing to commit when the tree already carries the version.
+fn commit(contents: &[(&str, String)], tag_name: &str) -> Result<(), String> {
+    for (path, content) in contents {
         fs::write(path, content).map_err(|e| format!("release: write {path}: {e}"))?;
     }
     // Cargo.lock records every workspace crate's version; nothing else moves.
@@ -100,34 +205,140 @@ pub fn release(args: &[String]) -> Result<(), String> {
         .args(contents.iter().map(|(path, _)| *path))
         .arg("Cargo.lock")
         .run()?;
-    // Nothing to commit when the tree already carries this version.
     if git(&["diff", "--cached", "--quiet"]).is_err() {
         Cmd::new("git")
             .args(["commit", "-m", &format!("release: {tag_name}")])
             .run()?;
     }
-    println!();
-    if tag {
-        Cmd::new("git")
-            .args(["tag", "-a", &tag_name, "-m", &tag_name])
-            .run()?;
-        println!(
-            "Tagged {tag_name}. Publish it (release.yml builds and signs the image and the chart):"
-        );
-        println!("  git push --atomic origin {branch} {tag_name}");
-        println!(
-            "A `{branch}` that requires status checks refuses that push: then delete the tag \
-             (`git tag -d {tag_name}`), merge this commit through a pull request and tag the \
-             merge commit (DEVELOPMENT.md)."
-        );
-    } else {
-        println!(
-            "Prepared {tag_name} on `{branch}`. Open a pull request; once it is merged and CI \
-             on the merge commit (e2e and web-e2e included) is green, tag that commit:"
-        );
-        println!("  git tag -a {tag_name} -m {tag_name} <commit> && git push origin {tag_name}");
-    }
     Ok(())
+}
+
+/// Pushes `branch`, opens its pull request into `base`, waits for the pull
+/// request's CI run and merges it; the merge commit once it is on `base`.
+fn merge_pull_request(branch: &str, base: &str, tag_name: &str) -> Result<String, String> {
+    Cmd::new("git")
+        .args(["push", "-u", "origin", branch])
+        .run()?;
+    let head = git(&["rev-parse", "HEAD"])?;
+    let created = gh(&[
+        "pr",
+        "create",
+        "--base",
+        base,
+        "--head",
+        branch,
+        "--title",
+        &format!("release: {tag_name}"),
+        "--body",
+        &format!(
+            "Release {tag_name}, prepared by `cargo xtask release`. It merges this pull request \
+             once its CI run passed, and tags the merge commit {tag_name} once the merge \
+             commit's CI run on `{base}` passed."
+        ),
+    ])?;
+    // gh prints the pull request's URL last.
+    let url = created.lines().last().unwrap_or_default().to_string();
+    println!("Opened {url}. Waiting for its CI run.");
+    wait_for_ci(&head, branch, "pull_request")
+        .map_err(|e| format!("{e}. Push a fix to `{branch}` ({url})"))?;
+    // Merges nothing but the commit whose CI run passed.
+    Cmd::new("gh")
+        .args(["pr", "merge", &url, "--merge", "--match-head-commit", &head])
+        .run()
+        .map_err(|e| format!("release: {e}"))?;
+    poll(
+        &format!("merge commit for {url}"),
+        MERGE_LANDS_WITHIN,
+        || {
+            let view = gh(&[
+                "pr",
+                "view",
+                &url,
+                "--json",
+                "state,mergeCommit",
+                "--jq",
+                r#"[.state, .mergeCommit.oid // ""] | join(" ")"#,
+            ])?;
+            merge_commit(&view).map_err(|e| format!("release: {url}: {e}"))
+        },
+    )
+}
+
+/// The merge commit from `<state> <merge commit>`; `None` while the pull
+/// request is still open (in a merge queue).
+fn merge_commit(view: &str) -> Result<Option<String>, String> {
+    let view = view.trim();
+    let (state, oid) = view.split_once(' ').unwrap_or((view, ""));
+    match state {
+        "MERGED" if !oid.is_empty() => Ok(Some(oid.to_string())),
+        "MERGED" | "OPEN" => Ok(None),
+        other => Err(format!("the pull request is {other}, not merged")),
+    }
+}
+
+/// Waits for the newest CI run of `sha` on `branch`, triggered by `event`,
+/// to finish; `Err` unless it succeeded.
+fn wait_for_ci(sha: &str, branch: &str, event: &str) -> Result<(), String> {
+    let run = poll(
+        &format!("{CI_WORKFLOW} run of {} on `{branch}`", short(sha)),
+        RUN_APPEARS_WITHIN,
+        || {
+            let ids = gh(&[
+                "run",
+                "list",
+                "--workflow",
+                CI_WORKFLOW,
+                "--commit",
+                sha,
+                "--branch",
+                branch,
+                "--event",
+                event,
+                "--limit",
+                "1",
+                "--json",
+                "databaseId",
+                "--jq",
+                ".[].databaseId",
+            ])?;
+            Ok(ids.lines().next().map(str::to_string))
+        },
+    )?;
+    Cmd::new("gh")
+        .args(["run", "watch", &run, "--exit-status", "--interval", "30"])
+        .run()
+        .map_err(|e| format!("release: the CI run of {} did not pass: {e}", short(sha)))
+}
+
+/// `check()` every [`POLL_INTERVAL`] until it finds something; `Err` once
+/// `within` has passed without.
+fn poll<T>(
+    what: &str,
+    within: Duration,
+    mut check: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<T, String> {
+    let start = Instant::now();
+    loop {
+        if let Some(found) = check()? {
+            return Ok(found);
+        }
+        if start.elapsed() >= within {
+            return Err(format!(
+                "release: no {what} after {} minutes",
+                within.as_secs() / 60
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// `gh <args>` stdout (trimmed); `Err` on a non-zero exit.
+fn gh(args: &[&str]) -> Result<String, String> {
+    Cmd::new("gh").args(args).output_string()
 }
 
 /// `git <args>` stdout (trimmed); `Err` on a non-zero exit.
@@ -347,6 +558,19 @@ mod tests {
         ] {
             assert!(!is_release_version(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn merge_commit_once_the_pull_request_is_merged() {
+        assert_eq!(
+            merge_commit("MERGED abc123\n").unwrap(),
+            Some("abc123".into())
+        );
+        // Still in a merge queue, or merged but its commit not reported yet.
+        assert_eq!(merge_commit("OPEN ").unwrap(), None);
+        assert_eq!(merge_commit("MERGED ").unwrap(), None);
+        let err = merge_commit("CLOSED ").unwrap_err();
+        assert!(err.contains("CLOSED"), "{err}");
     }
 
     #[test]
