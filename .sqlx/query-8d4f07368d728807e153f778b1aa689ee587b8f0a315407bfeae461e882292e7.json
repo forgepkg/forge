@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO forge_setting (key, value)\n        VALUES ($1, $2)\n        ON CONFLICT (key) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8d4f07368d728807e153f778b1aa689ee587b8f0a315407bfeae461e882292e7"
+}

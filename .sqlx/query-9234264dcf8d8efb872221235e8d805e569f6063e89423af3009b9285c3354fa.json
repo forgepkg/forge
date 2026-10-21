@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT l.repository_id, l.image, l.digest\n        FROM oci_blob_link l\n        WHERE l.last_used_at < $1\n          AND NOT EXISTS (\n              SELECT 1\n              FROM oci_manifest m\n              JOIN oci_manifest_ref r ON r.manifest_id = m.id\n              WHERE m.repository_id = l.repository_id AND m.image = l.image\n                AND r.kind = 'blob' AND r.digest = l.digest\n          )\n        ORDER BY l.last_used_at\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_blob_link",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "image",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_blob_link",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_blob_link",
+            "name": "digest"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9234264dcf8d8efb872221235e8d805e569f6063e89423af3009b9285c3354fa"
+}

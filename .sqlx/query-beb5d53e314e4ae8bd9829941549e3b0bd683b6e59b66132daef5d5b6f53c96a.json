@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT tag FROM oci_tag\n        WHERE repository_id = $1 AND image = $2\n          AND ($3::text IS NULL OR tag COLLATE \"C\" > $3::text COLLATE \"C\")\n        ORDER BY tag COLLATE \"C\"\n        LIMIT $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tag",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "tag"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "beb5d53e314e4ae8bd9829941549e3b0bd683b6e59b66132daef5d5b6f53c96a"
+}

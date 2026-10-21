@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT t.image, t.tag, t.manifest_id, m.digest, t.updated_at, m.last_pulled_at\n        FROM oci_tag t\n        JOIN oci_manifest m ON m.id = t.manifest_id\n        WHERE t.repository_id = $1\n        ORDER BY t.image, t.tag\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tag",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "tag"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "manifest_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "manifest_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "digest"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "last_pulled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "last_pulled_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "63dfb9ce3241767681a854506711a49c9f71fc22726bc64f509b1410dda59763"
+}
