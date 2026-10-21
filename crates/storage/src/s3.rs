@@ -25,7 +25,7 @@ use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{
     BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -599,6 +599,8 @@ impl BlobStore {
             Err(e) => {
                 if is_not_found(&e) {
                     Ok(())
+                } else if e.code() == Some("AccessDenied") {
+                    Err(delete_denied(key))
                 } else {
                     Err(self.error(e))
                 }
@@ -615,6 +617,17 @@ impl BlobStore {
         }
         Ok(())
     }
+}
+
+/// The error for a delete S3 refused with `AccessDenied`: says what the
+/// credentials lack, since the consequence (a blob whose bytes can never be
+/// stored again) shows up far from the cause.
+fn delete_denied(key: &str) -> S3Error {
+    S3Error::S3(format!(
+        "S3 refused to delete {key} (AccessDenied): Forge's credentials need s3:DeleteObject \
+         on the bucket's objects; until then the blob stays reserved for deletion and \
+         storing the same bytes again fails (see the deployment guide's S3 permissions)"
+    ))
 }
 
 /// Aborts an in-progress multipart upload unless [disarmed](Self::disarm).
@@ -824,6 +837,13 @@ mod tests {
                 Some(region)
             );
         }
+    }
+
+    #[test]
+    fn a_denied_delete_says_which_permission_is_missing() {
+        let err = delete_denied("blobs/sha256/aa/bb/x").to_string();
+        assert!(err.contains("blobs/sha256/aa/bb/x"), "{err}");
+        assert!(err.contains("s3:DeleteObject"), "{err}");
     }
 
     #[test]
