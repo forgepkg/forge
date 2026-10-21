@@ -143,19 +143,25 @@ pub async fn set_token_scope(
     Ok(res.rows_affected() > 0)
 }
 
-/// Update a token's `last_used_at` to `now()`.
-pub async fn touch_last_used(pool: &PgPool, id: i64) -> sqlx::Result<()> {
-    sqlx::query!(
+/// Update a token's `last_used_at` to `now()`, unless it was updated less
+/// than `min_age_secs` ago. Throttled like a session's `last_seen_at`: a
+/// restore sends hundreds of parallel requests with one token, and an
+/// unconditional write would serialize them on the token's row. Returns
+/// whether the row was written.
+pub async fn touch_last_used(pool: &PgPool, id: i64, min_age_secs: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query!(
         r#"
         UPDATE token
         SET last_used_at = now()
         WHERE id = $1
+          AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => $2))
         "#,
         id,
+        min_age_secs as f64,
     )
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 /// Revoke every live token of `user_id` that was minted from a session

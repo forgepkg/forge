@@ -34,6 +34,10 @@ use super::login_throttle::{username_for_log, AttemptRefused, LoginThrottle, MAX
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
 
+/// A token's `last_used_at` is written at most this often (seconds), so the
+/// parallel requests of one restore do not all write the token's row.
+const TOKEN_TOUCH_INTERVAL_SECS: i64 = 60;
+
 /// Hash a token secret into the lowercase-hex SHA-256 form stored in the DB.
 pub fn hash_token(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
@@ -55,9 +59,10 @@ pub fn generate_token_secret() -> String {
 /// expired nor revoked, and belongs to an active user; `Ok(None)` when the
 /// secret is not such a token. `Err` only on a database failure: the secret may
 /// still be a live token, so the caller must fail closed and must not treat it
-/// as anything else (e.g. a password). Best-effort updates `last_used_at`
-/// (failure there does not fail authentication). [`check_token`] also tells an
-/// unusable token from a secret that is no token at all.
+/// as anything else (e.g. a password). Best-effort updates `last_used_at`, at
+/// most once a minute (failure there does not fail authentication).
+/// [`check_token`] also tells an unusable token from a secret that is no token
+/// at all.
 pub async fn verify_token(pool: &PgPool, secret: &str) -> sqlx::Result<Option<UserPrincipal>> {
     Ok(match check_token(pool, secret).await? {
         TokenCheck::Live(up) => Some(up),
@@ -125,8 +130,10 @@ pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck
         return Ok(TokenCheck::Unusable);
     }
 
-    // Best-effort touch; ignore errors.
-    if let Err(e) = forge_db::token_dao::touch_last_used(pool, token.id).await {
+    // Best-effort touch, at most once a minute per token; ignore errors.
+    if let Err(e) =
+        forge_db::token_dao::touch_last_used(pool, token.id, TOKEN_TOUCH_INTERVAL_SECS).await
+    {
         tracing::debug!(error = %e, token_id = token.id, "touch_last_used failed");
     }
 

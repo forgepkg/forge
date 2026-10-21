@@ -1188,14 +1188,27 @@ async fn user_and_token_round_trip() {
     assert_eq!(by_hash.id, token.id);
     assert_eq!(by_hash.user_id, user.id);
 
-    token_dao::touch_last_used(pool, token.id)
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
         .await
-        .expect("touch");
+        .expect("touch"));
     let touched = token_dao::find_token_by_hash(pool, &hash)
         .await
         .expect("by hash")
         .expect("present");
     assert!(touched.last_used_at.is_some());
+    // Throttled: a second use within the interval writes nothing...
+    assert!(!token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
+    // ...and one after it does.
+    sqlx::query("UPDATE token SET last_used_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(token.id)
+        .execute(pool)
+        .await
+        .expect("backdate");
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
 }
 
 #[tokio::test]
