@@ -107,7 +107,8 @@ adjust:
   controller or gateway, so Forge sees the real client IP;
 - the namespace in the NetworkPolicy patch: that of your ingress controller
   (or your gateway's data plane), the only pods that may reach Forge;
-- the S3 endpoint, region and bucket, and `forge.env`.
+- the S3 endpoint, region and bucket (on AWS, create the bucket beforehand;
+  docs/deployment.md lists the S3 permissions Forge needs), and `forge.env`.
 
 Points that matter on Kubernetes:
 

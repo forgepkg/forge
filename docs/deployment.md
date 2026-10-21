@@ -9,8 +9,8 @@ CI publishing without stored API keys see
 
 | Dependency | Notes |
 | --- | --- |
-| PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. |
-| S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … The bucket is created if missing. |
+| PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. From PostgreSQL 15 on, `public` no longer grants CREATE to every role, so the role in `FORGE_DATABASE__URL` must own the database (`CREATE DATABASE forge OWNER forge`) or hold CREATE on its schema. |
+| S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … A missing bucket is created in the configured region; see [S3 permissions](#s3-permissions). |
 | TLS termination | A reverse proxy or load balancer in front of Forge (nginx, Traefik, an ingress, an ALB). Forge itself speaks plain HTTP. |
 | Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. |
 
@@ -23,6 +23,48 @@ On Kubernetes, install the Helm chart
 kustomize manifests in [`deploy/kubernetes`](../deploy/kubernetes/README.md).
 Both set the probes, the shutdown timing and the security context described
 below, and pin the image to the release they belong to.
+
+### S3 permissions
+
+Forge's S3 credentials need these actions on its bucket (an AWS IAM policy
+for the bucket `forge`; MinIO and Ceph RGW use the same action names):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::forge"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::forge/*"
+    }
+  ]
+}
+```
+
+- `s3:ListBucket` is what the bucket check (HeadBucket, at startup and in
+  `/readyz`) needs, and without it S3 answers a lookup of a missing key with
+  403 instead of 404.
+- `s3:PutObject` covers multipart uploads too (large pushes and proxied
+  downloads); `s3:AbortMultipartUpload` discards an interrupted one.
+- `s3:DeleteObject` is not optional. When a package is deleted or retention
+  evicts a version, garbage collection deletes the blob through the outbox.
+  With append-only credentials that delete fails, the blob's reservation
+  stays fenced, and every later ingest of the same bytes retries the delete
+  itself and fails: a package deleted and pushed again with identical bytes,
+  or a proxied version evicted by retention, can then never be stored again.
+- `s3:CreateBucket` (on the bucket, next to `s3:ListBucket`) only if Forge
+  should create the bucket. Forge creates a
+  missing bucket in `FORGE_S3__REGION` (outside `us-east-1` it sends the
+  region as the location constraint), and refuses to start when the name
+  belongs to another account (`BucketAlreadyExists`). On AWS, create the
+  bucket beforehand (with the [lifecycle rule](#s3-bucket-lifecycle) below);
+  then Forge needs no `s3:CreateBucket`.
 
 ## Image
 
