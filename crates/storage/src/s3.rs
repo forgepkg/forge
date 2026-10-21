@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{
-    BehaviorVersion, Credentials, Region, RequestChecksumCalculation, ResponseChecksumValidation,
+    BehaviorVersion, IdentityCache, Region, RequestChecksumCalculation, ResponseChecksumValidation,
 };
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::create_bucket::CreateBucketError;
@@ -35,6 +35,7 @@ use aws_sdk_s3::Client;
 
 use crate::blob_cache::BlobCache;
 use crate::breaker::CircuitBreaker;
+use crate::credentials::{self, S3Credentials};
 
 /// Errors raised by the blob store.
 #[derive(Debug, thiserror::Error)]
@@ -83,34 +84,20 @@ pub enum ConditionalWrites {
 
 /// Connection + behavior configuration for [`BlobStore`]. `Debug` omits the
 /// secret key.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
-    pub access_key: String,
-    pub secret_key: String,
+    /// Where the credentials come from: static keys, the AWS default chain,
+    /// or STS web identity.
+    pub credentials: S3Credentials,
     /// Path-style addressing (true for versitygw/MinIO, false for real AWS S3).
     pub force_path_style: bool,
     /// Bodies at or above this many bytes are uploaded via multipart.
     pub multipart_threshold: u64,
     /// `If-None-Match: *` dedup PUTs: auto-detect / force on / force off.
     pub conditional_writes: ConditionalWrites,
-}
-
-impl std::fmt::Debug for S3Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3Config")
-            .field("endpoint", &self.endpoint)
-            .field("region", &self.region)
-            .field("bucket", &self.bucket)
-            .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
-            .field("force_path_style", &self.force_path_style)
-            .field("multipart_threshold", &self.multipart_threshold)
-            .field("conditional_writes", &self.conditional_writes)
-            .finish()
-    }
 }
 
 /// S3 connect deadline.
@@ -143,14 +130,19 @@ const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
 
 impl BlobStore {
     /// Build a store from [`S3Config`], wiring up the versitygw-friendly client.
+    /// Nothing is fetched yet: temporary credentials are fetched by the first
+    /// request that needs them.
     pub fn new(cfg: S3Config) -> Self {
-        let creds = Credentials::new(cfg.access_key, cfg.secret_key, None, None, "forge-static");
-
         let s3_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .endpoint_url(cfg.endpoint)
-            .credentials_provider(creds)
+            .credentials_provider(cfg.credentials.provider(&cfg.region))
+            .identity_cache(
+                IdentityCache::lazy()
+                    .buffer_time(credentials::REFRESH_BEFORE_EXPIRY)
+                    .build(),
+            )
             .force_path_style(cfg.force_path_style)
             // versitygw chokes on the aws-sdk default flexible checksums; only
             // emit/verify them when the operation actually demands it.
@@ -226,8 +218,16 @@ impl BlobStore {
     }
 
     /// Convert an SDK error: [`S3Error::Unavailable`] when S3 could not be
-    /// reached and the breaker is installed.
+    /// reached and the breaker is installed. A call that failed for want of
+    /// credentials says so, naming the credential source.
     fn error<E: std::fmt::Debug>(&self, e: SdkError<E, HttpResponse>) -> S3Error {
+        if let Some(failure) = credentials::failure(&e) {
+            return if self.breaker.is_some() && failure.is_unreachable() {
+                S3Error::Unavailable(failure.to_string())
+            } else {
+                S3Error::S3(failure.to_string())
+            };
+        }
         if self.breaker.is_some() && is_unreachable(&e) {
             S3Error::Unavailable(format!("{e:?}"))
         } else {
@@ -269,8 +269,11 @@ impl BlobStore {
         // Fast path: bucket already there.
         let head = self.client.head_bucket().bucket(&self.bucket).send().await;
         self.observe(&head);
-        if head.is_ok() {
-            return Ok(());
+        match head {
+            Ok(_) => return Ok(()),
+            // Without credentials a create cannot succeed either.
+            Err(e) if credentials::failure(&e).is_some() => return Err(self.error(e)),
+            Err(_) => {}
         }
         let mut create = self.client.create_bucket().bucket(&self.bucket);
         if let Some(config) = create_bucket_configuration(&self.region) {
@@ -425,6 +428,7 @@ impl BlobStore {
         self.observe(&result);
         match result {
             Ok(_) => Ok(ConditionalPut::Uploaded),
+            Err(e) if credentials::failure(&e).is_some() => Err(self.error(e)),
             Err(e) => {
                 let msg = format!("{e:?}");
                 match classify_conditional_put_error(&msg) {
@@ -764,8 +768,13 @@ async fn body_from_path(path: &Path) -> Result<ByteStream, S3Error> {
 
 /// Whether an SDK error means S3 could not be reached: no connection, a
 /// timeout, an unreadable response, or a `5xx` other than `501` (a backend
-/// refusing a feature answered, so it is up).
+/// refusing a feature answered, so it is up). Credentials that could not be
+/// fetched count when their endpoint (e.g. STS) could not be reached, not
+/// when it refused them.
 fn is_unreachable<E>(e: &SdkError<E, HttpResponse>) -> bool {
+    if let Some(failure) = credentials::failure(e) {
+        return failure.is_unreachable();
+    }
     match e {
         SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) | SdkError::ResponseError(_) => {
             true
@@ -778,11 +787,14 @@ fn is_unreachable<E>(e: &SdkError<E, HttpResponse>) -> bool {
 }
 
 /// Whether an SDK error represents a 404 / NoSuchKey / NotFound.
-fn is_not_found<E, R>(e: &SdkError<E, R>) -> bool
+fn is_not_found<E>(e: &SdkError<E, HttpResponse>) -> bool
 where
     E: std::fmt::Debug,
-    R: std::fmt::Debug,
 {
+    // Never a missing credentials file (an `io::ErrorKind::NotFound`).
+    if credentials::failure(e).is_some() {
+        return false;
+    }
     if let SdkError::ServiceError(se) = e {
         // HEAD has no typed error body, so fall back to the HTTP status.
         let msg = format!("{:?}", se.err());
@@ -860,8 +872,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             region: "us-east-1".into(),
             bucket: "test".into(),
-            access_key: "ak".into(),
-            secret_key: "sk".into(),
+            credentials: S3Credentials::from_keys("ak", "sk"),
             force_path_style: true,
             multipart_threshold: 8 * 1024 * 1024,
             conditional_writes: mode,
@@ -876,8 +887,7 @@ mod tests {
                 endpoint: "http://127.0.0.1:1".into(),
                 region: "us-east-1".into(),
                 bucket: "test".into(),
-                access_key: "ak".into(),
-                secret_key: "sk".into(),
+                credentials: S3Credentials::from_keys("ak", "sk"),
                 force_path_style: true,
                 multipart_threshold: 1,
                 conditional_writes: ConditionalWrites::Off,

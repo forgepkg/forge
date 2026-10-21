@@ -7,15 +7,14 @@ use std::io::Cursor;
 use std::time::{Duration, SystemTime};
 
 use forge_storage::cas::{Cas, CasError, Staging};
-use forge_storage::{BlobStore, ConditionalWrites, S3Config};
+use forge_storage::{BlobStore, ConditionalWrites, S3Config, S3Credentials};
 
 fn cas(staging: Staging) -> Cas {
     let store = BlobStore::new(S3Config {
         endpoint: "http://127.0.0.1:9".into(),
         region: "us-east-1".into(),
         bucket: "unused".into(),
-        access_key: "unused".into(),
-        secret_key: "unused".into(),
+        credentials: S3Credentials::from_keys("unused", "unused"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: ConditionalWrites::default(),

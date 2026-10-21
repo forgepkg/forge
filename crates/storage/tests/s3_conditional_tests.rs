@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use forge_storage::{BlobStore, ConditionalWrites, S3Config};
+use forge_storage::{BlobStore, ConditionalWrites, S3Config, S3Credentials};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -156,8 +156,7 @@ fn store(endpoint: &str, mode: ConditionalWrites) -> BlobStore {
         endpoint: endpoint.to_string(),
         region: "us-east-1".into(),
         bucket: "forge-test".into(),
-        access_key: "test".into(),
-        secret_key: "test".into(),
+        credentials: S3Credentials::from_keys("test", "test"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: mode,

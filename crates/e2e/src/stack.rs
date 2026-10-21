@@ -10,7 +10,7 @@ use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers::{self, WorkerHandles};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -210,8 +210,7 @@ async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -274,7 +273,12 @@ fn config_toml(
     oidc_block: &str,
     auth_block: &str,
     blob_cache: Option<&BlobCacheSetup>,
+    s3_credentials: Option<&str>,
 ) -> String {
+    let s3_credentials = s3_credentials.map_or_else(
+        || format!("access_key = \"{S3_ACCESS}\"\nsecret_key = \"{S3_SECRET}\""),
+        str::to_string,
+    );
     let blob_cache_block = match blob_cache {
         // No free-space reserve: whether the cache may grow must not depend
         // on how full the test host's disk is.
@@ -311,9 +315,8 @@ url = "{db_url}"
 [s3]
 endpoint = "{s3_endpoint}"
 bucket = "{bucket}"
-access_key = "{access}"
-secret_key = "{secret}"
 force_path_style = true
+{s3_credentials}
 
 [auth]
 anonymous_mode = "{anon_mode}"
@@ -338,8 +341,6 @@ lease_seconds = 30
 {blob_cache_block}
 "#,
         bucket = S3_BUCKET,
-        access = S3_ACCESS,
-        secret = S3_SECRET,
         anon_mode = anon.mode(),
         allowlist = anon.allowlist_toml(),
     )
@@ -377,6 +378,8 @@ pub struct StackBuilder {
     s3_endpoint: Option<String>,
     /// `None` ⇒ no local blob cache.
     blob_cache: Option<BlobCacheSetup>,
+    /// `None` ⇒ the static test keys.
+    s3_credentials: Option<String>,
 }
 
 impl Default for StackBuilder {
@@ -394,6 +397,7 @@ impl Default for StackBuilder {
             auth_block: None,
             s3_endpoint: None,
             blob_cache: None,
+            s3_credentials: None,
         }
     }
 }
@@ -455,6 +459,14 @@ impl StackBuilder {
     /// of the shared versitygw) instead of the shared versitygw directly.
     pub fn s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.s3_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Replace the static test keys with `toml` at the end of the `[s3]`
+    /// section: further `s3.*` keys, then e.g. `credentials = "web_identity"`
+    /// and its `[s3.web_identity]` table. Combine with [`Self::s3_endpoint`].
+    pub fn s3_credentials(mut self, toml: impl Into<String>) -> Self {
+        self.s3_credentials = Some(toml.into());
         self
     }
 
@@ -554,6 +566,7 @@ impl StackBuilder {
             &oidc_block,
             self.auth_block.as_deref().unwrap_or_default(),
             self.blob_cache.as_ref(),
+            self.s3_credentials.as_deref(),
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
@@ -564,7 +577,10 @@ impl StackBuilder {
         // A stack with its own S3 endpoint or a blob cache builds its store
         // the way `main` does (degraded start while S3 is down, with the
         // cache); the others share the readiness-checked versitygw store.
-        let store = if self.s3_endpoint.is_some() || self.blob_cache.is_some() {
+        let store = if self.s3_endpoint.is_some()
+            || self.blob_cache.is_some()
+            || self.s3_credentials.is_some()
+        {
             let store = forge_server::object_store::open(&config).expect("object store");
             forge_server::object_store::ensure_bucket(&store)
                 .await

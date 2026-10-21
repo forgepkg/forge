@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use forge_e2e::{make_nupkg, StackBuilder, S3_ACCESS, S3_BUCKET, S3_SECRET};
-use forge_storage::{BlobStore, Cas, S3Config};
+use forge_storage::{BlobStore, Cas, S3Config, S3Credentials};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 identity of `bytes` (the blob-table key; S3 adds an incarnation).
@@ -144,8 +144,7 @@ async fn orphan_reconciler_reclaims_pending_blob() {
         endpoint: srv.state.config.s3.endpoint.clone(),
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),

@@ -236,15 +236,32 @@ fn default_db_acquire_timeout() -> u64 {
 pub struct S3Config {
     /// S3 endpoint URL (e.g. `http://localhost:8422` for versitygw).
     pub endpoint: String,
-    /// AWS region (any value for versitygw; `us-east-1` is fine).
+    /// AWS region (any value for versitygw; `us-east-1` is fine). Also the
+    /// region STS and the AWS default credentials chain are asked in.
     #[serde(default = "default_region")]
     pub region: String,
     /// Bucket name holding all blobs.
     pub bucket: String,
-    /// Access key id.
-    pub access_key: String,
-    /// Secret access key.
-    pub secret_key: String,
+    /// Where the credentials come from: `static` (default) uses
+    /// [`Self::access_key`] / [`Self::secret_key`]; `default_chain` the AWS
+    /// SDK default credentials chain (env vars with `AWS_SESSION_TOKEN`,
+    /// profile, IRSA web identity, EKS Pod Identity, ECS task role, EC2
+    /// instance metadata); `web_identity` exchanges a token file for
+    /// temporary keys via STS `AssumeRoleWithWebIdentity` ([`Self::web_identity`]).
+    #[serde(default)]
+    pub credentials: S3CredentialsMode,
+    /// Access key id. Required with `credentials = "static"`, refused with
+    /// the other modes.
+    #[serde(default)]
+    pub access_key: Option<String>,
+    /// Secret access key. Required with `credentials = "static"`, refused
+    /// with the other modes.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// `s3.web_identity.*`: required with `credentials = "web_identity"`,
+    /// refused with the other modes.
+    #[serde(default)]
+    pub web_identity: Option<S3WebIdentityConfig>,
     /// Use path-style addressing (required for versitygw/MinIO).
     #[serde(default = "default_true")]
     pub force_path_style: bool,
@@ -266,11 +283,85 @@ impl std::fmt::Debug for S3Config {
             .field("endpoint", &redacted_url(&self.endpoint))
             .field("region", &self.region)
             .field("bucket", &self.bucket)
+            .field("credentials", &self.credentials)
             .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("web_identity", &self.web_identity)
             .field("force_path_style", &self.force_path_style)
             .field("multipart_threshold", &self.multipart_threshold)
             .field("conditional_writes", &self.conditional_writes)
+            .finish()
+    }
+}
+
+/// `s3.credentials` values (snake_case in TOML/env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3CredentialsMode {
+    /// `s3.access_key` / `s3.secret_key`.
+    #[default]
+    Static,
+    /// The AWS SDK default credentials chain.
+    DefaultChain,
+    /// STS `AssumeRoleWithWebIdentity` with `[s3.web_identity]`.
+    WebIdentity,
+}
+
+impl S3CredentialsMode {
+    /// The value as `s3.credentials` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::DefaultChain => "default_chain",
+            Self::WebIdentity => "web_identity",
+        }
+    }
+}
+
+/// `s3.web_identity.*`: a token file exchanged for temporary S3 keys via
+/// STS `AssumeRoleWithWebIdentity`. `Debug` shows the token's path, never a
+/// token (none is held here).
+#[derive(Clone, Deserialize)]
+pub struct S3WebIdentityConfig {
+    /// The role to assume. AWS requires it; MinIO takes none for its
+    /// claim-based policies (its `RoleArn` for a role policy otherwise).
+    #[serde(default)]
+    pub role_arn: Option<String>,
+    /// The file holding the web identity token (e.g. a projected
+    /// service-account token). Read again on every refresh, so a token the
+    /// kubelet rotated is picked up.
+    pub token_file: std::path::PathBuf,
+    /// STS endpoint URL. Unset: AWS STS in `s3.region`. Set it for MinIO or
+    /// Ceph RGW (usually the S3 endpoint).
+    #[serde(default)]
+    pub sts_endpoint: Option<String>,
+    /// `RoleSessionName` (AWS CloudTrail records it). Default `forge`.
+    #[serde(default = "default_s3_session_name")]
+    pub session_name: String,
+    /// Lifetime of the temporary credentials asked of STS, 900..=43200
+    /// seconds. Unset: the STS default (one hour on AWS).
+    #[serde(default)]
+    pub duration_seconds: Option<u32>,
+}
+
+fn default_s3_session_name() -> String {
+    "forge".into()
+}
+
+impl std::fmt::Debug for S3WebIdentityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3WebIdentityConfig")
+            .field("role_arn", &self.role_arn)
+            .field("token_file", &self.token_file)
+            .field(
+                "sts_endpoint",
+                &self.sts_endpoint.as_deref().map(redacted_url),
+            )
+            .field("session_name", &self.session_name)
+            .field("duration_seconds", &self.duration_seconds)
             .finish()
     }
 }
@@ -290,14 +381,14 @@ pub enum ConditionalWritesMode {
 }
 
 impl S3Config {
-    /// Convert into the storage crate's S3 config.
+    /// Convert into the storage crate's S3 config. Call on a validated
+    /// config: `static` then has both keys.
     pub fn to_storage(&self) -> forge_storage::S3Config {
         forge_storage::S3Config {
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),
             bucket: self.bucket.clone(),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
+            credentials: self.storage_credentials(),
             force_path_style: self.force_path_style,
             multipart_threshold: self.multipart_threshold,
             conditional_writes: match self.conditional_writes {
@@ -306,6 +397,127 @@ impl S3Config {
                 ConditionalWritesMode::Off => forge_storage::ConditionalWrites::Off,
             },
         }
+    }
+
+    fn storage_credentials(&self) -> forge_storage::S3Credentials {
+        match (self.credentials, &self.web_identity) {
+            (S3CredentialsMode::DefaultChain, _) => forge_storage::S3Credentials::DefaultChain,
+            (S3CredentialsMode::WebIdentity, Some(wi)) => {
+                forge_storage::S3Credentials::WebIdentity(forge_storage::WebIdentity {
+                    role_arn: wi.role_arn.clone(),
+                    token_file: wi.token_file.clone(),
+                    sts_endpoint: wi.sts_endpoint.clone(),
+                    session_name: wi.session_name.clone(),
+                    duration_seconds: wi.duration_seconds,
+                })
+            }
+            // `static`, or an unvalidated `web_identity` without its block
+            // (whose keys are then empty and S3 refuses them).
+            _ => forge_storage::S3Credentials::from_keys(
+                self.access_key.clone().unwrap_or_default(),
+                self.secret_key.clone().unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Blank optional values mean unset (`FORGE_S3__ACCESS_KEY=` in an env
+    /// file or a chart that renders every variable).
+    fn normalize(&mut self) {
+        fn blank_is_none(value: &mut Option<String>) {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *value = None;
+            }
+        }
+        blank_is_none(&mut self.access_key);
+        blank_is_none(&mut self.secret_key);
+        if let Some(wi) = self.web_identity.as_mut() {
+            blank_is_none(&mut wi.role_arn);
+            blank_is_none(&mut wi.sts_endpoint);
+        }
+    }
+
+    /// The credential source has exactly the settings it uses: both keys for
+    /// `static`, `[s3.web_identity]` for `web_identity`, neither for
+    /// `default_chain`. A setting the chosen source would ignore is refused
+    /// rather than silently left unused (a long-lived key kept in a Secret
+    /// after the switch to short-lived credentials, or the wrong mode).
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mode = self.credentials.as_str();
+        let keys_set = self.access_key.is_some() || self.secret_key.is_some();
+        match self.credentials {
+            S3CredentialsMode::Static => {
+                if self.access_key.is_none() || self.secret_key.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "s3.access_key and s3.secret_key are required with s3.credentials = \
+                         \"static\" (the default): set FORGE_S3__ACCESS_KEY and \
+                         FORGE_S3__SECRET_KEY, or set s3.credentials to \"default_chain\" or \
+                         \"web_identity\" for short-lived credentials"
+                            .into(),
+                    ));
+                }
+            }
+            S3CredentialsMode::DefaultChain | S3CredentialsMode::WebIdentity => {
+                if keys_set {
+                    return Err(ConfigError::Invalid(format!(
+                        "s3.access_key / s3.secret_key are set, but s3.credentials = \
+                         \"{mode}\" does not use them: remove them (FORGE_S3__ACCESS_KEY / \
+                         FORGE_S3__SECRET_KEY) or set s3.credentials = \"static\""
+                    )));
+                }
+            }
+        }
+        match (self.credentials, &self.web_identity) {
+            (S3CredentialsMode::WebIdentity, None) => Err(ConfigError::Invalid(
+                "s3.credentials = \"web_identity\" needs [s3.web_identity] with at least \
+                 token_file (FORGE_S3__WEB_IDENTITY__TOKEN_FILE)"
+                    .into(),
+            )),
+            (S3CredentialsMode::WebIdentity, Some(wi)) => wi.validate(),
+            (_, Some(_)) => Err(ConfigError::Invalid(format!(
+                "[s3.web_identity] is set, but s3.credentials = \"{mode}\" does not use it: \
+                 set s3.credentials = \"web_identity\" (FORGE_S3__CREDENTIALS) or remove it"
+            ))),
+            (_, None) => Ok(()),
+        }
+    }
+}
+
+impl S3WebIdentityConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |msg: String| Err(ConfigError::Invalid(format!("s3.web_identity.{msg}")));
+        if self.token_file.as_os_str().is_empty() {
+            return invalid("token_file must not be empty".into());
+        }
+        if let Some(endpoint) = &self.sts_endpoint {
+            let ok = url::Url::parse(endpoint)
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some());
+            if !ok {
+                return invalid(format!(
+                    "sts_endpoint must be an http(s) URL, got {:?}",
+                    redacted_url(endpoint)
+                ));
+            }
+        }
+        // AWS's limits; MinIO and Ceph RGW apply the same ones.
+        let name = &self.session_name;
+        let name_ok = (2..=64).contains(&name.len())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c));
+        if !name_ok {
+            return invalid(format!(
+                "session_name must be 2 to 64 characters of letters, digits and _+=,.@- \
+                 (got {name:?})"
+            ));
+        }
+        if let Some(seconds) = self.duration_seconds {
+            if !(900..=43_200).contains(&seconds) {
+                return invalid(format!(
+                    "duration_seconds must be between 900 and 43200, got {seconds}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1949,6 +2161,7 @@ impl Config {
     /// `https://`, and `HTTPS://host` or ` https://host` (which validation
     /// accepts) must not turn them off.
     fn normalize(&mut self) {
+        self.s3.normalize();
         let base = self.server.public_base_url.trim();
         self.server.public_base_url = match base.split_once("://") {
             Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
@@ -2034,6 +2247,7 @@ impl Config {
                 )))
             }
         }
+        self.s3.validate()?;
         self.validate_crypto()?;
         self.proxy.validate()?;
         self.nuget.validate()?;
@@ -2256,7 +2470,14 @@ impl Config {
                 found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder".into());
             }
         }
-        if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
+        // Only static keys can be placeholders (the other modes have none).
+        let static_keys = self.s3.credentials == S3CredentialsMode::Static;
+        let s3_key = |key: &Option<String>, check: fn(&str) -> bool| {
+            static_keys && key.as_deref().is_some_and(check)
+        };
+        if s3_key(&self.s3.access_key, |k| k == "minioadmin")
+            || s3_key(&self.s3.secret_key, |k| k == "minioadmin")
+        {
             found.push("s3.access_key/secret_key are the \"minioadmin\" defaults".into());
         }
         let unedited: Vec<&str> = [
@@ -2267,8 +2488,8 @@ impl Config {
                     .as_ref()
                     .is_some_and(|ba| is_placeholder(&ba.password)),
             ),
-            ("s3.access_key", is_placeholder(&self.s3.access_key)),
-            ("s3.secret_key", is_placeholder(&self.s3.secret_key)),
+            ("s3.access_key", s3_key(&self.s3.access_key, is_placeholder)),
+            ("s3.secret_key", s3_key(&self.s3.secret_key, is_placeholder)),
             (
                 "the database.url password",
                 url_password_is_placeholder(&self.database.url),
@@ -2863,8 +3084,8 @@ mod tests {
             assert_eq!(cfg.public_base_url(), "https://forge.test");
             assert_eq!(cfg.database.url, "postgres://u:p@db/forge");
             assert_eq!(cfg.s3.endpoint, "http://s3.test:7070");
-            assert_eq!(cfg.s3.access_key, "ak");
-            assert_eq!(cfg.s3.secret_key, "sk");
+            assert_eq!(cfg.s3.access_key.as_deref(), Some("ak"));
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("sk"));
             assert!(!cfg.s3.force_path_style);
             assert_eq!(cfg.s3.multipart_threshold, 1_048_576);
             assert_eq!(cfg.auth.anonymous_mode, "allowlist");
@@ -3004,6 +3225,264 @@ mod tests {
             assert_eq!(cfg.s3.conditional_writes, mode, "{value}");
             assert_eq!(cfg.s3.to_storage().conditional_writes, storage, "{value}");
         }
+    }
+
+    /// `MINIMAL` with its static keys replaced by `credentials` settings.
+    fn without_s3_keys(credentials: &str) -> String {
+        MINIMAL.replace(
+            "access_key = \"test\"\n        secret_key = \"test\"",
+            credentials,
+        )
+    }
+
+    #[test]
+    fn s3_credentials_default_to_static_keys() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::Static);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::from_keys("test", "test")
+        );
+        // Spelled out, the same.
+        let toml = MINIMAL.replace(
+            "secret_key = \"test\"",
+            "secret_key = \"test\"\ncredentials = \"static\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::Static);
+    }
+
+    #[test]
+    fn s3_static_credentials_need_both_keys() {
+        for keys in ["", "access_key = \"ak\"", "secret_key = \"sk\""] {
+            let err = Config::from_figment(fig_from_toml(&without_s3_keys(keys))).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("s3.access_key and s3.secret_key"), "{msg}");
+            assert!(msg.contains("FORGE_S3__ACCESS_KEY"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn s3_default_chain_needs_no_keys() {
+        let cfg = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"default_chain\"",
+        )))
+        .expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::DefaultChain);
+        assert_eq!(cfg.s3.access_key, None);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::DefaultChain
+        );
+    }
+
+    #[test]
+    fn s3_web_identity_from_toml() {
+        let toml = without_s3_keys(
+            r#"credentials = "web_identity"
+        [s3.web_identity]
+        role_arn = "arn:aws:iam::123456789012:role/forge"
+        token_file = "/var/run/secrets/forge/s3/token"
+        sts_endpoint = "https://minio.example.com:9000"
+        session_name = "forge-eu"
+        duration_seconds = 3600"#,
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::WebIdentity(forge_storage::WebIdentity {
+                role_arn: Some("arn:aws:iam::123456789012:role/forge".into()),
+                token_file: "/var/run/secrets/forge/s3/token".into(),
+                sts_endpoint: Some("https://minio.example.com:9000".into()),
+                session_name: "forge-eu".into(),
+                duration_seconds: Some(3600),
+            })
+        );
+
+        // Only the token file is required: no role (MinIO claim-based
+        // policies), AWS STS, the default session name and lifetime.
+        let toml = without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let wi = cfg.s3.web_identity.as_ref().expect("web_identity");
+        assert_eq!(wi.role_arn, None);
+        assert_eq!(wi.sts_endpoint, None);
+        assert_eq!(wi.session_name, "forge");
+        assert_eq!(wi.duration_seconds, None);
+    }
+
+    #[test]
+    fn s3_web_identity_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", &without_s3_keys(""))?;
+            jail.set_env("FORGE_S3__CREDENTIALS", "web_identity");
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__ROLE_ARN",
+                "arn:aws:iam::123456789012:role/forge",
+            );
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+                "/var/run/secrets/forge/s3/token",
+            );
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__STS_ENDPOINT",
+                "http://minio.forge.svc:9000",
+            );
+            jail.set_env("FORGE_S3__WEB_IDENTITY__SESSION_NAME", "forge-1");
+            jail.set_env("FORGE_S3__WEB_IDENTITY__DURATION_SECONDS", "900");
+            // A chart that renders every variable leaves the keys blank.
+            jail.set_env("FORGE_S3__ACCESS_KEY", "");
+            jail.set_env("FORGE_S3__SECRET_KEY", " ");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+            assert_eq!(cfg.s3.access_key, None);
+            assert_eq!(cfg.s3.secret_key, None);
+            let wi = cfg.s3.web_identity.as_ref().expect("web_identity");
+            assert_eq!(
+                wi.role_arn.as_deref(),
+                Some("arn:aws:iam::123456789012:role/forge")
+            );
+            assert_eq!(
+                wi.token_file,
+                std::path::Path::new("/var/run/secrets/forge/s3/token")
+            );
+            assert_eq!(
+                wi.sts_endpoint.as_deref(),
+                Some("http://minio.forge.svc:9000")
+            );
+            assert_eq!(wi.session_name, "forge-1");
+            assert_eq!(wi.duration_seconds, Some(900));
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", &without_s3_keys(""))?;
+            jail.set_env("FORGE_S3__CREDENTIALS", "default_chain");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::DefaultChain);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn s3_credential_modes_refuse_settings_they_do_not_use() {
+        let web_identity = "[s3.web_identity]\ntoken_file = \"/token\"";
+        for (toml, expected) in [
+            // Long-lived keys left over next to short-lived credentials.
+            (
+                MINIMAL.replace(
+                    "secret_key = \"test\"",
+                    "secret_key = \"test\"\ncredentials = \"default_chain\"",
+                ),
+                "does not use them",
+            ),
+            (
+                format!(
+                    "{}\n{web_identity}",
+                    MINIMAL.replace(
+                        "secret_key = \"test\"",
+                        "secret_key = \"test\"\ncredentials = \"web_identity\"",
+                    )
+                ),
+                "does not use them",
+            ),
+            // A web identity block the mode ignores.
+            (format!("{MINIMAL}\n{web_identity}"), "does not use it"),
+            (
+                format!(
+                    "{}\n{web_identity}",
+                    without_s3_keys("credentials = \"default_chain\"")
+                ),
+                "does not use it",
+            ),
+            // web_identity without its block.
+            (
+                without_s3_keys("credentials = \"web_identity\""),
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+            ),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
+    }
+
+    #[test]
+    fn s3_web_identity_settings_are_validated() {
+        let web_identity = |extra: &str| {
+            without_s3_keys(&format!(
+                "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"\n{extra}"
+            ))
+        };
+        for (extra, expected) in [
+            ("sts_endpoint = \"minio:9000\"", "sts_endpoint"),
+            ("sts_endpoint = \"ftp://minio:9000\"", "sts_endpoint"),
+            ("session_name = \"x\"", "session_name"),
+            ("session_name = \"forge server\"", "session_name"),
+            ("duration_seconds = 899", "duration_seconds"),
+            ("duration_seconds = 43201", "duration_seconds"),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&web_identity(extra))).unwrap_err();
+            assert!(err.to_string().contains(expected), "{extra}: {err}");
+        }
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("token_file"), "{err}");
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\nrole_arn = \"arn:x\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("token_file"), "{err}");
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"instance_profile\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("instance_profile"), "{err}");
+    }
+
+    #[test]
+    fn s3_debug_shows_the_credential_source_but_no_secret() {
+        let toml = without_s3_keys(
+            r#"credentials = "web_identity"
+        [s3.web_identity]
+        role_arn = "arn:aws:iam::123456789012:role/forge"
+        token_file = "/var/run/secrets/forge/s3/token"
+        sts_endpoint = "https://sts-user:sts-pw@minio.example.com:9000/""#,
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let shown = format!("{:?}", cfg.s3);
+        for part in [
+            "WebIdentity",
+            "arn:aws:iam::123456789012:role/forge",
+            "/var/run/secrets/forge/s3/token",
+            "minio.example.com:9000",
+        ] {
+            assert!(shown.contains(part), "{part} missing: {shown}");
+        }
+        assert!(!shown.contains("sts-pw"), "{shown}");
+        let storage = format!("{:?}", cfg.s3.to_storage());
+        assert!(
+            storage.contains("/var/run/secrets/forge/s3/token"),
+            "{storage}"
+        );
+    }
+
+    #[test]
+    fn insecure_s3_key_checks_apply_only_to_static_keys() {
+        // The same check that refuses `minioadmin` static keys has nothing to
+        // look at with short-lived credentials.
+        let cfg = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"default_chain\"",
+        )))
+        .expect("valid");
+        assert!(cfg.validate_insecure_defaults().is_ok());
+        let err = Config::from_figment(fig_from_toml(
+            &MINIMAL.replace("access_key = \"test\"", "access_key = \"minioadmin\""),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("minioadmin"), "{err}");
     }
 
     #[test]
@@ -3704,6 +4183,31 @@ mod tests {
         });
     }
 
+    /// The image's baked config names no S3 keys: they come from the
+    /// environment, or short-lived credentials replace them, configured
+    /// through the environment alone.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn docker_image_config_takes_s3_keys_or_short_lived_credentials_from_env() {
+        let baked = include_str!("../../../docker/forge.docker.toml");
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", baked)?;
+            jail.set_env("FORGE_DATABASE__URL", "postgres://forge:pw@db/forge");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(err.to_string().contains("FORGE_S3__ACCESS_KEY"), "{err}");
+
+            jail.set_env("FORGE_S3__CREDENTIALS", "web_identity");
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+                "/var/run/secrets/forge/s3/token",
+            );
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+            assert_eq!(cfg.s3.access_key, None);
+            Ok(())
+        });
+    }
+
     /// Review L9: secret env values are taken verbatim as strings — figment
     /// would otherwise type-sniff them (`12345` → integer, `true` → bool,
     /// `[x]` → array) and refuse them as "invalid type", echoing the value.
@@ -3728,8 +4232,8 @@ mod tests {
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
             let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
             assert_eq!(ba.password, "1234567890");
-            assert_eq!(cfg.s3.access_key, "true");
-            assert_eq!(cfg.s3.secret_key, "[not-a-list]");
+            assert_eq!(cfg.s3.access_key.as_deref(), Some("true"));
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("[not-a-list]"));
             assert_eq!(cfg.database.url, "postgres://u:{p}@db/forge");
             assert_eq!(cfg.oidc.as_ref().expect("oidc").client_secret, "0x1F");
             assert_eq!(cfg.cache.l1_max_capacity, 42);
@@ -3765,7 +4269,7 @@ mod tests {
                 "\"pw with \"inner\" quotes\"",
             );
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
-            assert_eq!(cfg.s3.secret_key, "s3-secret");
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("s3-secret"));
             let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
             assert_eq!(ba.password, "pw with \"inner\" quotes");
             Ok(())
