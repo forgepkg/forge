@@ -10,6 +10,140 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+Fixes for the findings of the 1.0.0 release review. The 1.0.0 known
+limitations still apply, except where an entry below says otherwise.
+
+### Upgrade notes
+
+- Startup refuses a `server.staging_dir` that does not belong to Forge's
+  user, or that group or others can write unless it is sticky like `/tmp`.
+  The container image and the Kubernetes manifests are not affected.
+  ([#127](https://github.com/schmitch/forge/issues/127))
+- Durations above 100 years (`outbox.grace_seconds`,
+  `retention.default_run_interval_seconds`, `retention.lease_seconds`,
+  `crypto.cache.unwrapped_key_ttl_secs`,
+  `crypto.rotation.dek_max_age_days`, `crypto.rotation.kek_max_age_days`)
+  fail validation instead of panicking later.
+  ([#128](https://github.com/schmitch/forge/issues/128))
+- Migration 0032 deletes grants of the `admin` action on a single
+  repository, which never had an effect, and the grants API refuses them
+  with 400. Administration stays global.
+  ([#124](https://github.com/schmitch/forge/issues/124))
+- While a credential-forwarding realm is enabled, an account that an OIDC
+  realm provisions is named `<claim>@<realm>`. Existing accounts keep their
+  names. ([#123](https://github.com/schmitch/forge/issues/123))
+- Proxy search now calls the upstream's search service, which may live on
+  another host than the feed (on nuget.org, `azuresearch-*.nuget.org`).
+  Where outbound traffic is restricted, allow that host, or proxy search
+  keeps answering from the cache only.
+  ([#112](https://github.com/schmitch/forge/issues/112))
+- The production kustomize overlay adds a NetworkPolicy that admits only
+  the ingress controller's namespace (set it in the overlay), and the Helm
+  chart renders one as soon as `networkPolicy.from` lists a peer.
+  ([#129](https://github.com/schmitch/forge/issues/129))
+- Helm: the first upgrade rolls the Forge pods (when `secretEnv` is set)
+  and restarts the in-cluster Redis once, because the checksum annotations
+  are now salted. ([#133](https://github.com/schmitch/forge/issues/133))
+- The published `cosign verify` commands also pin the tagged commit and the
+  push trigger; use the commands of the release you verify.
+  ([#130](https://github.com/schmitch/forge/issues/130))
+
+### Fixed
+
+- Proxy and group search find packages nobody has restored through Forge
+  yet: a proxy forwards the search to its upstream's search service,
+  applies the caller's package filter, not-found markers and the package
+  delay, and answers from its cache when the upstream search fails. The
+  browse UI keeps listing what Forge holds.
+  ([#112](https://github.com/schmitch/forge/issues/112))
+- A proxy pointed back to its previous upstream within the metadata TTL
+  served empty version listings.
+  ([#105](https://github.com/schmitch/forge/issues/105))
+- A proxied package id's casing could flip between reads; it is the
+  newest version's, as on nuget.org.
+  ([#108](https://github.com/schmitch/forge/issues/108))
+- The package delay held back old unlisted upstream versions, such as ones
+  a lockfile pins, for the whole delay. They now count from when the
+  upstream created them, and old versions of large packages are dated at
+  their first sighting too.
+  ([#111](https://github.com/schmitch/forge/issues/111))
+- A push with a version longer than 64 characters answered 500; it is
+  refused with 400. ([#134](https://github.com/schmitch/forge/issues/134))
+- An offline nested group was still served through its outer group; it now
+  fails like an offline hosted member.
+  ([#106](https://github.com/schmitch/forge/issues/106))
+- When a group was reachable along two paths, a guard on one path hid
+  packages the other path admits.
+  ([#107](https://github.com/schmitch/forge/issues/107))
+- Downloads are counted in memory and written in batches every few
+  seconds. A burst of downloads of one version no longer queues on its row
+  and holds every database connection.
+  ([#119](https://github.com/schmitch/forge/issues/119))
+- Creating a missing S3 bucket failed on AWS outside us-east-1, and a
+  bucket name owned by another account counted as created.
+  ([#113](https://github.com/schmitch/forge/issues/113))
+- Unknown paths under `/admin`, `/auth`, `/browse` and `/v3` answered 200
+  with the web UI's page; they answer 404.
+  ([#121](https://github.com/schmitch/forge/issues/121))
+- `PUT /admin/realms/order` answered 500 when it raced another realm
+  change; it answers 409. ([#117](https://github.com/schmitch/forge/issues/117))
+- The browse API served offline hosted and group repositories; it answers
+  503 like the feed, and the web UI says the repository is offline.
+  ([#120](https://github.com/schmitch/forge/issues/120))
+- A failed OIDC sign-in ended on a plain-text page; it returns to the
+  login page with a message and a way to try again.
+  ([#109](https://github.com/schmitch/forge/issues/109))
+- Web UI: a proxy's version times are labelled "Cached", not "Published"
+  ([#110](https://github.com/schmitch/forge/issues/110)); disabling a
+  sign-in realm asks first
+  ([#104](https://github.com/schmitch/forge/issues/104)); unflagging a
+  group's last owner and removing a member ask first
+  ([#122](https://github.com/schmitch/forge/issues/122)); the user list
+  shows how each user signs in
+  ([#123](https://github.com/schmitch/forge/issues/123)).
+
+### Security
+
+- Behind an outbound `HTTP(S)_PROXY`, a proxy refuses an upstream host
+  name that resolves to a link-local or cloud-metadata address, and checks
+  every redirect hop the same way.
+  ([#125](https://github.com/schmitch/forge/issues/125))
+- Forged Redis invalidations can no longer grow every instance's memory:
+  the invalidation bookkeeping is bounded.
+  ([#126](https://github.com/schmitch/forge/issues/126))
+- The staging directory is private to Forge's user, and a staged package
+  is parsed and uploaded from the file that was hashed, not reopened by
+  name. ([#127](https://github.com/schmitch/forge/issues/127))
+- An OIDC-provisioned account can no longer take a credential-forwarding
+  user's username. ([#123](https://github.com/schmitch/forge/issues/123))
+- Only the ingress proxies can reach Forge when it trusts
+  `X-Forwarded-For` from a pod network (NetworkPolicy, see above).
+  ([#129](https://github.com/schmitch/forge/issues/129))
+- Release: every `cosign verify` pins the tagged commit
+  ([#130](https://github.com/schmitch/forge/issues/130)); re-running a
+  release reuses what it already pushed instead of moving the tags to a
+  new build ([#131](https://github.com/schmitch/forge/issues/131)); the
+  build helpers and the dependency images are pinned by digest
+  ([#132](https://github.com/schmitch/forge/issues/132)); the Helm
+  checksum annotations are salted
+  ([#133](https://github.com/schmitch/forge/issues/133)).
+
+### Documentation
+
+- The deployment guide lists the S3 permissions and the PostgreSQL role
+  Forge needs, and an S3 delete that is denied names the missing
+  `s3:DeleteObject`. ([#114](https://github.com/schmitch/forge/issues/114))
+
+### Known limitations
+
+- With a package delay, proxy search shows a version only once the proxy
+  has recorded it and the delay has passed, because a search answer names
+  no publish times. Totals of a proxy search are the upstream's, less the
+  ids dropped from the returned page.
+- Behind an outbound proxy, a host name that resolves differently for the
+  proxy than for Forge, or that only the proxy can resolve, still gets
+  past the metadata guard; block those addresses on the proxy as well.
+
 ## [1.0.0]
 
 First production release. envisia-forge is dual-licensed under the GNU AGPL
