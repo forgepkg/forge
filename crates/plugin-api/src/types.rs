@@ -114,6 +114,64 @@ impl Request {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// The path's segments, percent-decoded (`/flat/a%2Fb/x` → `["flat",
+    /// "a/b", "x"]`); a trailing slash adds an empty segment. `None` when an
+    /// escape is malformed or a segment is not UTF-8.
+    pub fn segments(&self) -> Option<Vec<String>> {
+        self.path
+            .strip_prefix('/')
+            .unwrap_or(&self.path)
+            .split('/')
+            .map(|segment| percent_decode(segment, false))
+            .collect()
+    }
+
+    /// The query string's `name=value` pairs, decoded as an HTML form does
+    /// (`+` is a space). A pair that does not decode is skipped.
+    pub fn query_pairs(&self) -> Vec<(String, String)> {
+        self.query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter_map(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                Some((percent_decode(name, true)?, percent_decode(value, true)?))
+            })
+            .collect()
+    }
+
+    /// The first value of query parameter `name`.
+    pub fn query_param(&self, name: &str) -> Option<String> {
+        self.query_pairs()
+            .into_iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    }
+}
+
+/// `%XX`-decode `s` (and `+` as a space when `plus_is_space`).
+fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = s.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// An HTTP response. The host keeps only the headers it allows (content
@@ -127,6 +185,11 @@ pub struct Response {
 }
 
 impl Response {
+    /// A plain-text response (`text/plain; charset=utf-8`).
+    pub fn text(status: u16, body: &str) -> Self {
+        Response::new(status, "text/plain; charset=utf-8", body)
+    }
+
     /// A response with a body of `content_type`.
     pub fn new(status: u16, content_type: &str, body: impl Into<Vec<u8>>) -> Self {
         Response {
@@ -150,14 +213,29 @@ pub struct PackageRef {
     pub version: String,
 }
 
+/// Some versions of one package (canonical id, normalized versions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageVersions {
+    pub id: String,
+    pub versions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
-    /// Free text; empty matches every package.
+    /// Free text; empty matches every package. `packageid:x` and `id:x`
+    /// match an id exactly; several terms must all match.
     pub text: String,
     pub skip: u32,
-    /// Clamped by the host to 1000.
+    /// The page size: 0 means the default (20), more than 1000 is 1000.
     pub take: u32,
+    /// Include prerelease versions.
     pub prerelease: bool,
+    /// Include SemVer 2.0.0 versions (dotted prerelease labels, build
+    /// metadata).
+    pub semver2: bool,
+    /// Let a proxy repository forward the search to its upstream, so packages
+    /// it has not cached yet are found too.
+    pub upstream: bool,
 }
 
 /// Data a plugin can ask for. Package ids are canonical, versions
@@ -171,6 +249,9 @@ pub enum Query {
     Packages(String),
     /// One version with its metadata.
     Package(PackageRef),
+    /// Some versions of a package with their metadata, ascending; versions
+    /// it does not have are left out.
+    PackagesOf(PackageVersions),
     /// The manifest stored with one version.
     Manifest(PackageRef),
     /// The packages matching a search.
@@ -192,7 +273,8 @@ pub struct PackageInfo {
     pub version: String,
     pub version_original: String,
     pub listed: bool,
-    /// When the version was published into the repository (RFC 3339).
+    /// When the version was published into the repository: RFC 3339 in UTC
+    /// with milliseconds (`2026-10-21T12:00:00.000+00:00`).
     pub published: Option<String>,
     /// The package's SHA-256, lowercase hex.
     pub sha256: Option<String>,
@@ -214,6 +296,9 @@ pub struct SearchHit {
     pub versions: Vec<VersionInfo>,
     /// The summary of the latest version.
     pub summary: Option<String>,
+    /// Downloads of the package, all versions, when the repository counts
+    /// them.
+    pub total_downloads: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +311,7 @@ pub struct SearchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     Versions(Vec<VersionInfo>),
+    /// The answer to [`Query::Packages`] and to [`Query::PackagesOf`].
     Packages(Vec<PackageInfo>),
     Package(Option<PackageInfo>),
     Manifest(Option<Vec<u8>>),
@@ -244,8 +330,11 @@ pub struct Loaded {
 pub enum Upload {
     /// The request body is the package.
     Body,
-    /// The package is the `multipart/form-data` file part of this name.
+    /// The package is the `multipart/form-data` part of this name.
     MultipartField(String),
+    /// The package is the first part of a `multipart/form-data` body,
+    /// whatever its name.
+    FirstPart,
 }
 
 /// A publish, and the response when it succeeds. When it fails the host

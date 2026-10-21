@@ -105,8 +105,9 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
 /// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
-/// * `/repository/{repo}/...` — repositories of plugin formats
-///   ([`crate::plugins`]).
+/// * `{mount}/{repo}/...` — repositories of plugin formats, under each
+///   format's mount (`/repository` unless its plugin names another;
+///   [`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).
 ///
@@ -121,6 +122,14 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
+    let mounts: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        state
+            .formats
+            .mounts()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
     let mut app = Router::new()
         // Liveness / readiness probes (unauthenticated, dependency-light).
         .merge(crate::health::health_router())
@@ -139,16 +148,23 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // /DELETE; the dispatcher enforces authz per method.
         .route("/v3/{repo}", any(dispatch))
         .route("/v3/{repo}/{*rest}", any(dispatch))
-        // Repositories of plugin formats, each served by its format's plugin
-        // (`crate::plugins`); like `/v3`, authorization is per method.
-        .route("/repository/{repo}", any(crate::plugins::dispatch))
-        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch))
         // The Docker / OCI registry: clients always talk to `/v2/` at the
         // host root; the registry resolves repositories from the name (or
         // the host) itself.
         .route("/v2", any(crate::registry::registry))
         .route("/v2/", any(crate::registry::registry))
         .route("/v2/{*rest}", any(crate::registry::registry));
+    // Repositories of plugin formats, each served by its format's plugin
+    // under the format's mount (`crate::plugins`); like `/v3`,
+    // authorization is per method.
+    for mount in mounts.iter() {
+        app = app
+            .route(&format!("{mount}/{{repo}}"), any(crate::plugins::dispatch))
+            .route(
+                &format!("{mount}/{{repo}}/{{*rest}}"),
+                any(crate::plugins::dispatch),
+            );
+    }
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
@@ -172,7 +188,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, public_base_url.clone(), req, next)
+            response_policy(hsts, mounts.clone(), public_base_url.clone(), req, next)
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).
@@ -228,7 +244,7 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
-/// * feed responses (`/v3/...`, and `/repository/...` of plugin formats)
+/// * feed responses (`/v3/...`, and the mounts of plugin formats, `feeds`)
 ///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
@@ -243,6 +259,7 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 /// The SPA keeps its own cache headers (hashed assets are immutable).
 async fn response_policy(
     hsts: bool,
+    feeds: std::sync::Arc<Vec<String>>,
     public_base_url: String,
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -250,7 +267,7 @@ async fn response_policy(
     let path = req.uri().path();
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse");
-    let feed = under("/v3") || under(crate::plugins::MOUNT);
+    let feed = under("/v3") || feeds.iter().any(|mount| under(mount));
     let registry = under("/v2");
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)

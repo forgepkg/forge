@@ -175,6 +175,19 @@ impl FormatRegistry {
         id == DOCKER_FORMAT || self.formats.contains_key(id)
     }
 
+    /// The mounts plugin formats are served under, sorted and distinct
+    /// (`/repository`, and any other a plugin names).
+    pub fn mounts(&self) -> Vec<&str> {
+        let mut mounts: Vec<&str> = self
+            .plugins
+            .values()
+            .map(|p| p.manifest().mount.as_str())
+            .collect();
+        mounts.sort_unstable();
+        mounts.dedup();
+        mounts
+    }
+
     /// The installed format ids, sorted.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         let mut ids: Vec<&str> = self.formats.keys().map(String::as_str).collect();
@@ -185,15 +198,24 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed. NuGet and Docker have proxies (each speaks its own upstream
-    /// protocol); format plugins serve hosted and group repositories only.
-    pub fn kinds(&self, id: &str) -> Option<&'static [&'static str]> {
-        const ALL: &[&str] = &["hosted", "proxy", "group"];
-        const NO_PROXY: &[&str] = &["hosted", "group"];
+    /// protocol); a format plugin serves the kinds its `plugin.toml` names.
+    pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         if id == DOCKER_FORMAT || id == self.nuget.id() {
-            Some(ALL)
-        } else {
-            self.formats.contains_key(id).then_some(NO_PROXY)
+            return Some(vec!["hosted", "proxy", "group"]);
         }
+        let plugin = self.plugins.get(id)?;
+        Some(
+            plugin
+                .manifest()
+                .kinds
+                .iter()
+                .map(|kind| match kind {
+                    forge_plugin::api::RepositoryKind::Hosted => "hosted",
+                    forge_plugin::api::RepositoryKind::Proxy => "proxy",
+                    forge_plugin::api::RepositoryKind::Group => "group",
+                })
+                .collect(),
+        )
     }
 
     /// Resolve the format for a repository by its `format` column. A format
@@ -585,13 +607,13 @@ mod tests {
         );
         assert_eq!(
             registry.kinds(DOCKER_FORMAT),
-            Some(&["hosted", "proxy", "group"][..])
+            Some(vec!["hosted", "proxy", "group"])
         );
         assert_eq!(
             registry.kinds("nuget"),
-            Some(&["hosted", "proxy", "group"][..])
+            Some(vec!["hosted", "proxy", "group"])
         );
-        assert_eq!(registry.kinds("helm"), Some(&["hosted", "group"][..]));
+        assert_eq!(registry.kinds("helm"), Some(vec!["hosted", "group"]));
         assert_eq!(registry.kinds("npm"), None);
         assert!(!registry.is_installed("npm"));
     }

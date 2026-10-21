@@ -3,7 +3,7 @@
 id = "helm"
 name = "Helm charts"
 version = "0.1.0"
-api = "0.1.0"
+api = "0.2.0"
 component = "forge_format_helm.wasm"
 description = "Helm chart repositories: `helm repo add` / `helm pull`, ChartMuseum-compatible push and delete."
 

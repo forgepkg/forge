@@ -230,6 +230,7 @@ fn renders_the_index_from_what_it_loads() {
                 latest_version: "2.1.0".into(),
                 versions: vec![version("1.0.0"), version("2.1.0")],
                 summary: None,
+                total_downloads: None,
             }],
         }),
     }];

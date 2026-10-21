@@ -17,9 +17,10 @@ use sha2::Digest;
 /// plugin holds `helm`).
 const WASM_HELM: &str = "helm-wasm";
 
-/// The `[plugins]` block loading the Helm plugin built as a component.
+/// The `[plugins]` block loading the Helm plugin built as a component,
+/// served under a mount of its own (`/charts`).
 fn wasm_helm_plugins_block() -> String {
-    let dir = forge_plugin::testing::example_plugin_as("helm", WASM_HELM);
+    let dir = forge_plugin::testing::example_plugin_with("helm", WASM_HELM, "mount = \"/charts\"");
     let sha = forge_plugin::testing::component_sha256(&dir);
     let parent = dir.parent().expect("plugin directory parent");
     format!("[plugins]\ndir = {parent:?}\n\n[plugins.formats]\n{WASM_HELM} = \"sha256:{sha}\"\n")
@@ -109,8 +110,19 @@ async fn push(
     creds: &(String, String),
     body: Vec<u8>,
 ) -> reqwest::Response {
+    push_at(srv, "/repository", repo, creds, body).await
+}
+
+/// [`push`] to a repository served under `mount`.
+async fn push_at(
+    srv: &TestServer,
+    mount: &str,
+    repo: &str,
+    creds: &(String, String),
+    body: Vec<u8>,
+) -> reqwest::Response {
     srv.client()
-        .post(format!("{}/repository/{repo}/api/charts", srv.base_url))
+        .post(format!("{}{mount}/{repo}/api/charts", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .body(body)
         .send()
@@ -123,9 +135,19 @@ async fn get_index(
     repo: &str,
     creds: Option<&(String, String)>,
 ) -> reqwest::Response {
+    get_index_at(srv, "/repository", repo, creds).await
+}
+
+/// [`get_index`] of a repository served under `mount`.
+async fn get_index_at(
+    srv: &TestServer,
+    mount: &str,
+    repo: &str,
+    creds: Option<&(String, String)>,
+) -> reqwest::Response {
     let req = srv
         .client()
-        .get(format!("{}/repository/{repo}/index.yaml", srv.base_url));
+        .get(format!("{}{mount}/{repo}/index.yaml", srv.base_url));
     let req = match creds {
         Some((u, p)) => req.basic_auth(u, Some(p)),
         None => req,
@@ -526,16 +548,21 @@ async fn a_webassembly_plugin_serves_like_a_builtin_one() {
     assert_eq!(wasm["builtin"], false);
     assert_eq!(wasm["sha256"].as_str().map(str::len), Some(64));
 
+    assert_eq!(wasm["mount"], "/charts");
+
     let repo = hosted_repo(&srv, WASM_HELM, false).await;
     let package = chart("Demo", "v1.0");
-    let resp = push(&srv, &repo, &creds, package.clone()).await;
+    let resp = push_at(&srv, "/charts", &repo, &creds, package.clone()).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let resp = push(&srv, &repo, &creds, package.clone()).await;
+    let resp = push_at(&srv, "/charts", &repo, &creds, package.clone()).await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let resp = push(&srv, &repo, &creds, b"not a chart".to_vec()).await;
+    let resp = push_at(&srv, "/charts", &repo, &creds, b"not a chart".to_vec()).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Served under its own mount only.
+    let resp = get_index(&srv, &repo, Some(&creds)).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    let index: Value = get_index(&srv, &repo, Some(&creds))
+    let index: Value = get_index_at(&srv, "/charts", &repo, Some(&creds))
         .await
         .json()
         .await
@@ -544,6 +571,7 @@ async fn a_webassembly_plugin_serves_like_a_builtin_one() {
     assert_eq!(entry["version"], "v1.0");
     assert_eq!(entry["digest"], hex::encode(sha2::Sha256::digest(&package)));
     let url = entry["urls"][0].as_str().unwrap();
+    assert!(url.contains(&format!("/charts/{repo}/charts/")), "{url}");
     let resp = srv
         .client()
         .get(url.replace("http://test.local", &srv.base_url))

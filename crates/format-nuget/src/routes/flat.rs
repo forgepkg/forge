@@ -140,7 +140,7 @@ fn header_value(value: String) -> HeaderValue {
 
 /// What a request's `Range` header asks of a body of some size.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ByteRange {
+pub enum ByteRange {
     /// No (usable) range: the whole body, `200`.
     Full,
     /// One satisfiable range, `206`.
@@ -151,7 +151,7 @@ pub(crate) enum ByteRange {
 
 /// The [`ByteRange`] a request asks of a `size`-byte body. Only one
 /// `bytes` range is honored; anything else is answered in full.
-pub(crate) fn byte_range(request: &HeaderMap, size: u64) -> ByteRange {
+pub fn byte_range(request: &HeaderMap, size: u64) -> ByteRange {
     // `If-Range` needs a validator to compare with, and none is served.
     if request.contains_key(header::IF_RANGE) {
         return ByteRange::Full;

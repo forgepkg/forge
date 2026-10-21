@@ -456,8 +456,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             body.format
         ));
     };
-    // Proxies speak NuGet V3 or the distribution spec upstream; format
-    // plugins serve hosted and group repositories only.
+    // NuGet and Docker serve every kind (each speaks its own upstream
+    // protocol); a plugin format serves the kinds its plugin names.
     if !kinds.contains(&kind.as_str()) {
         return bad_request(format!(
             "{kind} repositories are not available for format {:?}",

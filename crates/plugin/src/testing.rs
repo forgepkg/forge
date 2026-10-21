@@ -24,9 +24,18 @@ pub fn example_plugin(name: &str) -> PathBuf {
 /// rewritten): a component of a plugin that is also built in, under an id of
 /// its own.
 pub fn example_plugin_as(name: &str, id: &str) -> PathBuf {
-    static BUILT: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+    example_plugin_with(name, id, "")
+}
+
+/// [`example_plugin_as`], with `plugin_keys` (TOML lines such as
+/// `mount = "/charts"`) added to its `[plugin]` table.
+pub fn example_plugin_with(name: &str, id: &str, plugin_keys: &str) -> PathBuf {
+    static BUILT: Mutex<Vec<(String, String, PathBuf)>> = Mutex::new(Vec::new());
     let mut built = BUILT.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((_, dir)) = built.iter().find(|(i, _)| i == id) {
+    if let Some((_, _, dir)) = built
+        .iter()
+        .find(|(i, keys, _)| i == id && keys == plugin_keys)
+    {
         return dir.clone();
     }
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -69,6 +78,8 @@ pub fn example_plugin_as(name: &str, id: &str) -> PathBuf {
             let key = line.split('=').next().unwrap_or("").trim();
             if key == "id" {
                 format!("id = {id:?}\n")
+            } else if line.trim() == "[plugin]" {
+                format!("{line}\n{plugin_keys}\n")
             } else {
                 format!("{line}\n")
             }
@@ -83,7 +94,7 @@ pub fn example_plugin_as(name: &str, id: &str) -> PathBuf {
     std::fs::write(dir.join("plugin.toml"), text).expect("write plugin.toml");
     let wasm = target.join("wasm32-wasip2/plugin").join(&component);
     std::fs::copy(&wasm, dir.join(&component)).expect("copy the component");
-    built.push((id.to_string(), dir.clone()));
+    built.push((id.to_string(), plugin_keys.to_string(), dir.clone()));
     dir
 }
 

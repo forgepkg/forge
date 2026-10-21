@@ -293,9 +293,11 @@ pub struct ServerOpts {
     pub public_base_url: Option<String>,
     /// Extra raw TOML lines for the `[server]` section (e.g. timeouts).
     pub server_extra: Option<String>,
-    /// When set, this raw TOML is appended as the `[plugins]` section, and the
-    /// format plugins it lists are loaded.
+    /// When set, this raw TOML is appended last (the `[plugins]` section, or
+    /// any other), and the format plugins it lists are loaded.
     pub plugins_block: Option<String>,
+    /// Format plugins installed next to the built-in ones, as if built in.
+    pub extra_plugins: Vec<std::sync::Arc<forge_plugin::Plugin>>,
 }
 
 impl Default for ServerOpts {
@@ -310,6 +312,7 @@ impl Default for ServerOpts {
             public_base_url: None,
             server_extra: None,
             plugins_block: None,
+            extra_plugins: Vec::new(),
         }
     }
 }
@@ -333,6 +336,13 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         figment::Figment::new().merge(figment::providers::Toml::string(&toml)),
     )
     .expect("valid config");
+    // As in `main`: the local blob cache in front of S3 when configured.
+    let store = match config.blob_cache() {
+        Some(cache) => {
+            store.with_cache(forge_storage::BlobCache::open(cache).expect("open the blob cache"))
+        }
+        None => store,
+    };
 
     ensure_bootstrap_admin(&config, &pool)
         .await
@@ -356,7 +366,8 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
     let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
+    let mut plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
+    plugins.extend(opts.extra_plugins.iter().cloned());
     let registry_keys =
         forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
             .await
