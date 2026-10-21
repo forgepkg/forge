@@ -311,7 +311,10 @@ pub struct DetailVersion {
     /// `.nupkg` byte size, if a stored asset is known (None for not-yet-cached
     /// proxy versions or group-resolved versions).
     pub size: Option<i64>,
-    /// Publish/first-seen time (`component.created_at`), if known.
+    /// When the version was stored here (`component.created_at`), if it is:
+    /// the push time on a hosted repository, and on a proxy the time Forge
+    /// first downloaded it from the upstream (`None` until then), which the
+    /// web UI labels "Cached" rather than "Published".
     pub published_at: Option<DateTime<Utc>>,
     /// Proxy package-delay status (`null` for hosted/group versions).
     pub delay_status: Option<DelayStatus>,
