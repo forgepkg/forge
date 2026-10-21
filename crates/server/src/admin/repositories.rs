@@ -769,11 +769,11 @@ async fn delete_repository_locked(
     kind: RepoKind,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
-    // A proxy delete locks the repository row before its cached versions,
-    // while a concurrent cache fill or retention eviction holds a cached
-    // version and then needs the repository row: Postgres resolves that
-    // deadlock by aborting one side. The whole transaction rolled back, so
-    // retrying the delete is safe.
+    // A proxy delete locks its cached versions before the repository row,
+    // the order a cache fill or retention eviction takes them in (see
+    // `proxy_dao::lock_cached_versions`). A version a fill creates between
+    // the two locks can still deadlock; Postgres then aborts one side. The
+    // whole transaction rolled back, so retrying the delete is safe.
     let mut attempt = 0;
     loop {
         match delete_repository_once(state, repo_id, kind, grace).await {
@@ -795,6 +795,11 @@ async fn delete_repository_once(
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
     let mut tx = state.pool.begin().await?;
+    if kind != RepoKind::Hosted {
+        // Before the repository row: an in-flight first download holds its
+        // cached version and then needs the repository row.
+        forge_db::proxy_dao::lock_cached_versions(&mut *tx, repo_id).await?;
+    }
     if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
         return Ok(RepoDelete::NotFound);
     }

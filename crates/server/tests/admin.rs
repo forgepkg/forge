@@ -3115,3 +3115,86 @@ async fn hosted_repo_delete_refuses_inflight_publish() {
     );
     assert_eq!(ref_count(&srv.pool, &sha).await, 1);
 }
+
+/// Deleting a proxy repository while a first download is being finalized:
+/// the download holds its cached-version row and then takes the foreign-key
+/// lock on the repository row (inserting the component). The delete used to
+/// lock the repository row first and then wait for the cached version, a
+/// lock cycle Postgres broke by aborting one side (a 500 for the download).
+/// It now waits for the cached versions first, so the download's
+/// foreign-key lock is granted at once.
+#[tokio::test]
+async fn deleting_a_proxy_waits_for_an_in_flight_download_instead_of_deadlocking() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("px{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://api.nuget.org/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repository WHERE name = $1")
+        .bind(&name)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO proxy_cached_version (repository_id, name, version) \
+         VALUES ($1, 'contoso.lib', '1.0.0')",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    // The download: holds its cached version...
+    let mut download = srv.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM proxy_cached_version WHERE repository_id = $1 FOR UPDATE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    // ...while the delete starts.
+    let delete = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{}/admin/repositories/{name}", srv.base_url);
+        async move {
+            client
+                .delete(url)
+                .basic_auth(&au, Some(&ap))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    // The delete waits: for the cached version (or, in the old lock order,
+    // holding the repository row, in the cascade to it).
+    common::wait_for_lock_wait(
+        &srv.pool,
+        &[
+            "%FROM proxy_cached_version%FOR UPDATE%",
+            "%DELETE FROM repository%",
+        ],
+    )
+    .await;
+    // The component insert's foreign-key lock, well before Postgres' 1 s
+    // deadlock check would break a cycle.
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM repository WHERE id = $1 FOR KEY SHARE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .expect("the download's foreign-key lock waited on the delete");
+    download.commit().await.unwrap();
+
+    assert_eq!(delete.await.unwrap(), 204);
+}

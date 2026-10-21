@@ -216,6 +216,30 @@ pub async fn prune_unconfirmed(
     Ok(result.rows_affected())
 }
 
+/// Lock every cached-version row of a repository (`FOR UPDATE`, in id order),
+/// waiting for an in-flight first download or cache eviction that holds one.
+/// A repository delete takes these **before** the repository row: those
+/// writers hold a cached version and then need the repository row (the
+/// foreign-key lock of the component they insert), so taking the repository
+/// row first deadlocks with them.
+pub async fn lock_cached_versions<'e, E>(executor: E, repository_id: i64) -> sqlx::Result<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query!(
+        r#"
+        SELECT id FROM proxy_cached_version
+        WHERE repository_id = $1
+        ORDER BY id
+        FOR UPDATE
+        "#,
+        repository_id,
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(())
+}
+
 /// Forget what a proxy learned from its previous upstream, inside the
 /// transaction that changes its `remote_url`. Versions that were never
 /// downloaded (listing rows and the not-found markers, including the
