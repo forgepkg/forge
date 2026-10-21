@@ -126,9 +126,12 @@ docker run --rm -p 8421:8421 \
   envisia-forge:latest
 ```
 
-The image refuses to start with placeholder credentials (`minioadmin` S3 keys,
-a `changeme` bootstrap password). It bakes no bootstrap admin:
-`FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start, and
+The image refuses to start without S3 credentials and with placeholder
+credentials (`minioadmin` S3 keys, a `changeme` bootstrap password). Instead
+of S3 keys it can use short-lived credentials from the platform's workload
+identity (IRSA, EKS Pod Identity, STS web identity; see
+[docs/deployment.md](docs/deployment.md#short-lived-s3-credentials)). It
+bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start, and
 once it is removed the image simply starts without one. It defaults to
 `anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads)
 and `allow_password_basic = false` (clients use API tokens; see

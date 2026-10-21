@@ -16,7 +16,7 @@ use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers::{self, WorkerHandles};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -155,8 +155,7 @@ async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -186,6 +185,10 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
     let oidc_block = opts.oidc_block.as_deref();
     let crypto_block = opts.crypto_block.as_deref();
     let plugins_block = opts.plugins_block.as_deref();
+    let s3_credentials = opts
+        .s3_credentials
+        .clone()
+        .unwrap_or_else(|| format!("access_key = \"{S3_ACCESS}\"\nsecret_key = \"{S3_SECRET}\""));
     let public_base_url = opts
         .public_base_url
         .as_deref()
@@ -215,9 +218,8 @@ url = "{db_url}"
 [s3]
 endpoint = "{s3_endpoint}"
 bucket = "{bucket}"
-access_key = "{access}"
-secret_key = "{secret}"
 force_path_style = true
+{s3_credentials}
 
 [auth]
 anonymous_mode = "{anon}"
@@ -239,8 +241,6 @@ poll_interval_seconds = 1
 {plugins}
 "#,
         bucket = S3_BUCKET,
-        access = S3_ACCESS,
-        secret = S3_SECRET,
         oidc = oidc_block.unwrap_or(""),
         crypto = crypto_block.unwrap_or(""),
         plugins = plugins_block.unwrap_or(""),
@@ -296,6 +296,11 @@ pub struct ServerOpts {
     pub plugins_block: Option<String>,
     /// Format plugins installed next to the built-in ones, as if built in.
     pub extra_plugins: Vec<std::sync::Arc<forge_plugin::Plugin>>,
+    /// When set, this raw TOML replaces the static keys at the end of the
+    /// `[s3]` section (e.g. `credentials = "web_identity"` and its
+    /// `[s3.web_identity]` table), and the object store is built from the
+    /// config as `main` does, without the startup bucket check.
+    pub s3_credentials: Option<String>,
 }
 
 impl Default for ServerOpts {
@@ -311,6 +316,7 @@ impl Default for ServerOpts {
             server_extra: None,
             plugins_block: None,
             extra_plugins: Vec::new(),
+            s3_credentials: None,
         }
     }
 }
@@ -325,7 +331,6 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
             format!("postgres://forge:forge@{endpoint}/forge")
         }
     };
-    let store = blob_store().await;
     let s3 = s3_endpoint().await;
 
     let toml = config_toml(&db_url, s3, &opts);
@@ -334,12 +339,19 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         figment::Figment::new().merge(figment::providers::Toml::string(&toml)),
     )
     .expect("valid config");
-    // As in `main`: the local blob cache in front of S3 when configured.
-    let store = match config.blob_cache() {
-        Some(cache) => {
-            store.with_cache(forge_storage::BlobCache::open(cache).expect("open the blob cache"))
+    let store = match opts.s3_credentials {
+        // Built from the config as `main` does (blob cache included).
+        Some(_) => forge_server::object_store::open(&config).expect("open the object store"),
+        None => {
+            let store = blob_store().await;
+            // As in `main`: the local blob cache in front of S3 when configured.
+            match config.blob_cache() {
+                Some(cache) => store.with_cache(
+                    forge_storage::BlobCache::open(cache).expect("open the blob cache"),
+                ),
+                None => store,
+            }
         }
-        None => store,
     };
 
     ensure_bootstrap_admin(&config, &pool)

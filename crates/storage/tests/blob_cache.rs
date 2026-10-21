@@ -17,7 +17,7 @@ use forge_storage::blob_cache::{FsProbe, FsSpace};
 use forge_storage::breaker::CircuitBreaker;
 use forge_storage::{
     BlobCache, BlobCacheConfig, BlobRef, BlobStore, CacheLimit, ConditionalWrites, S3Config,
-    S3Error,
+    S3Credentials, S3Error,
 };
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
@@ -176,8 +176,7 @@ fn store(endpoint: &str) -> BlobStore {
         endpoint: endpoint.to_string(),
         region: "us-east-1".into(),
         bucket: BUCKET.into(),
-        access_key: "test".into(),
-        secret_key: "test".into(),
+        credentials: S3Credentials::from_keys("test", "test"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: ConditionalWrites::Off,

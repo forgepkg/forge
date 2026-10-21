@@ -1,0 +1,16 @@
+# CI: S3 credentials from the AWS SDK default chain with IRSA: the service
+# account carries the role, the EKS webhook injects the token.
+config:
+  server:
+    public_base_url: https://forge.example.com
+  s3:
+    endpoint: https://s3.eu-central-1.amazonaws.com
+    region: eu-central-1
+    bucket: forge
+    force_path_style: false
+s3:
+  credentials: default_chain
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/forge
+existingSecret: forge-credentials

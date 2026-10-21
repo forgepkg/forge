@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            - name: FORGE_S3__CREDENTIALS
+              value: web_identity
+            - name: FORGE_S3__WEB_IDENTITY__TOKEN_FILE
+              value: /var/run/secrets/forge/s3/token
+          volumeMounts:
+            - name: s3-token
+              mountPath: /var/run/secrets/forge/s3
+              readOnly: true
+      volumes:
+        - name: s3-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  # AWS STS; the STS's client id for MinIO / Ceph RGW.
+                  audience: sts.amazonaws.com
+                  # The kubelet replaces the token at 80 % of this.
+                  expirationSeconds: 3600
+                  path: token

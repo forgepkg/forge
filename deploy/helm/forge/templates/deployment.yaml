@@ -161,6 +161,11 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if include "forge.s3ProjectedToken" . }}
+            - name: s3-token
+              mountPath: {{ include "forge.s3TokenDir" . }}
+              readOnly: true
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -186,6 +191,17 @@ spec:
           emptyDir:
             {{- toYaml (default dict .Values.tmpVolume.emptyDir) | nindent 12 }}
           {{- end }}
+        {{- if include "forge.s3ProjectedToken" . }}
+        # The token Forge exchanges for S3 credentials (s3.webIdentity): for
+        # the STS audience only, not a Kubernetes API token.
+        - name: s3-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.s3.webIdentity.projectedToken.audience | quote }}
+                  expirationSeconds: {{ int .Values.s3.webIdentity.projectedToken.expirationSeconds }}
+                  path: token
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- tpl (toYaml .) $ | nindent 8 }}
         {{- end }}

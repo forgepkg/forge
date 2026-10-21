@@ -129,12 +129,33 @@ impl MockOidc {
         Self::start_with_discovery(client_id, true).await
     }
 
+    /// Start a workload-only issuer that a container can reach: it listens on
+    /// every interface and its issuer is `http://{host}:<port>`, with `host`
+    /// the name the container knows the test host by (e.g.
+    /// `host.docker.internal`, mapped to the Docker host gateway).
+    pub async fn start_workload_only_on_host(client_id: &str, host: &str) -> Self {
+        Self::start_on(client_id, true, "0.0.0.0:0", Some(host)).await
+    }
+
     async fn start_with_discovery(client_id: &str, workload_only_discovery: bool) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        Self::start_on(client_id, workload_only_discovery, "127.0.0.1:0", None).await
+    }
+
+    /// Bind `bind`; the issuer is `http://<host or bound address>:<port>`.
+    async fn start_on(
+        client_id: &str,
+        workload_only_discovery: bool,
+        bind: &str,
+        host: Option<&str>,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind(bind)
             .await
             .expect("bind mock idp");
         let addr = listener.local_addr().expect("idp addr");
-        let issuer = format!("http://{addr}");
+        let issuer = match host {
+            Some(host) => format!("http://{host}:{}", addr.port()),
+            None => format!("http://{addr}"),
+        };
         let signer = Signer::new("k1");
 
         let inner = Arc::new(Mutex::new(Inner {

@@ -8,7 +8,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 
 /// What the fake answers a `CreateBucket` with.
 #[derive(Clone, Copy)]
@@ -71,8 +71,7 @@ async fn start(create: Create, region: &str) -> (Arc<FakeS3>, BlobStore) {
         endpoint: format!("http://{addr}"),
         region: region.into(),
         bucket: "forge-blobs".into(),
-        access_key: "ak".into(),
-        secret_key: "sk".into(),
+        credentials: S3Credentials::from_keys("ak", "sk"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),

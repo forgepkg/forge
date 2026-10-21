@@ -10,7 +10,7 @@ CI publishing without stored API keys see
 | Dependency | Notes |
 | --- | --- |
 | PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. From PostgreSQL 15 on, `public` no longer grants CREATE to every role, so the role in `FORGE_DATABASE__URL` must own the database (`CREATE DATABASE forge OWNER forge`) or hold CREATE on its schema. |
-| S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … A missing bucket is created in the configured region; see [S3 permissions](#s3-permissions). |
+| S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … A missing bucket is created in the configured region; see [S3 permissions](#s3-permissions). Static keys or [short-lived credentials](#short-lived-s3-credentials) (IRSA, EKS Pod Identity, STS web identity). |
 | TLS termination | A reverse proxy or load balancer in front of Forge (nginx, Traefik, an ingress, an ALB). Forge itself speaks plain HTTP. |
 | Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. |
 
@@ -66,6 +66,140 @@ for the bucket `forge`; MinIO and Ceph RGW use the same action names):
   bucket beforehand (with the [lifecycle rule](#s3-bucket-lifecycle) below);
   then Forge needs no `s3:CreateBucket`.
 
+These are the S3 calls behind the policy: `HeadBucket`, `CreateBucket` (only
+when the bucket is missing), `HeadObject`, `GetObject`, `PutObject`,
+`DeleteObject`, `CreateMultipartUpload`, `UploadPart`,
+`CompleteMultipartUpload` and `AbortMultipartUpload`. The policy is the same
+for static keys and for the role behind short-lived credentials.
+
+### Short-lived S3 credentials
+
+Instead of a long-lived access key in a Secret, Forge can get temporary S3
+credentials from the platform's workload identity and refresh them itself.
+Then there is no S3 secret to store, rotate or leak. `s3.credentials`
+(`FORGE_S3__CREDENTIALS`) chooses the source:
+
+| `s3.credentials` | Credentials from |
+| --- | --- |
+| `static` (default) | `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY`. |
+| `default_chain` | The AWS SDK default credentials chain, in this order: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, the shared profile (`AWS_PROFILE`), web identity (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`, which IRSA injects), the container credentials endpoint (EKS Pod Identity, ECS task roles), and EC2 instance metadata (instance profiles). |
+| `web_identity` | A token file exchanged for temporary keys with STS `AssumeRoleWithWebIdentity`, against AWS STS or the STS of MinIO or Ceph RGW (`[s3.web_identity]`, below). |
+
+With `default_chain` and `web_identity`, leave `FORGE_S3__ACCESS_KEY` and
+`FORGE_S3__SECRET_KEY` unset. Forge refuses to start with keys it would not
+use, so a long-lived key does not stay behind in a Secret after the switch.
+The insecure-default check (`minioadmin`) applies only to `static`. Endpoint,
+region, path-style and checksum settings work the same with every source.
+
+| Variable | `[s3.web_identity]` key | Value |
+| --- | --- | --- |
+| `FORGE_S3__WEB_IDENTITY__TOKEN_FILE` | `token_file` | Required. The token, e.g. a projected service-account token. |
+| `FORGE_S3__WEB_IDENTITY__ROLE_ARN` | `role_arn` | The role to assume. AWS and MinIO's role policies need one; MinIO's claim-based policies take none. |
+| `FORGE_S3__WEB_IDENTITY__STS_ENDPOINT` | `sts_endpoint` | Unset: AWS STS in `s3.region`. For MinIO and Ceph RGW, their URL (usually the S3 endpoint). |
+| `FORGE_S3__WEB_IDENTITY__SESSION_NAME` | `session_name` | `RoleSessionName`, recorded by CloudTrail. Default `forge`. |
+| `FORGE_S3__WEB_IDENTITY__DURATION_SECONDS` | `duration_seconds` | 900 to 43200. Unset leaves it to STS (one hour on AWS). |
+
+How Forge handles them:
+
+- **Refresh.** The S3 client caches the credentials and fetches new ones 30
+  to 60 seconds before they expire, so no request is signed with expired
+  keys. Each fetch reads `token_file` again, which picks up a token the
+  kubelet rotated. Every request is signed with the credentials current when
+  it is sent, so a multipart upload that outlives one set of credentials
+  completes.
+- **Failures.** A failed fetch fails the S3 call that needed it with an error
+  that names the source, the role, the token file and the STS endpoint, and
+  the STS error code (`InvalidIdentityToken`, `AccessDenied`, …). It is also
+  logged as a warning. Neither ever contains the token or the derived keys,
+  and neither does the configuration's debug output. Like an S3 failure, it
+  makes the startup bucket check abort and `/readyz` answer 503. With the
+  [local blob cache](#local-blob-cache), an STS that cannot be reached counts
+  as S3 being down (start degraded, serve the cache), while a refused token
+  still fails startup.
+- **Network.** Forge must reach the STS (`sts.<region>.amazonaws.com`, or
+  the store's endpoint), and for EKS Pod Identity the node's agent at
+  `169.254.170.23:80`. Allow them in a restrictive egress policy.
+
+**IRSA (EKS).** Create an IAM role with the [policy above](#s3-permissions)
+and a trust policy for the cluster's OIDC provider and Forge's service
+account (`system:serviceaccount:<namespace>:<service account>`). Annotate the
+service account with `eks.amazonaws.com/role-arn: <role ARN>` and set
+`FORGE_S3__CREDENTIALS=default_chain`. The EKS webhook injects
+`AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE` and the token volume.
+
+**EKS Pod Identity.** Create a Pod Identity association between the role
+(with the policy above, trusted by `pods.eks.amazonaws.com`) and Forge's
+service account, and set `FORGE_S3__CREDENTIALS=default_chain`. The webhook
+injects `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`.
+
+Both work with `automountServiceAccountToken: false`, which the Helm chart
+and the kustomize base set. The webhook (amazon-eks-pod-identity-webhook)
+selects pods by the service account's role annotation or the Pod Identity
+association. It does not read `automountServiceAccountToken`, and it adds
+its own projected token volume, separate from the Kubernetes API token that
+setting controls.
+
+**ECS, EC2.** `default_chain` picks up the task role or the instance profile.
+
+**MinIO.** Its STS accepts tokens from an OpenID Connect issuer. To trust
+the Kubernetes service-account issuer, set
+`MINIO_IDENTITY_OPENID_CONFIG_URL` to the cluster's discovery document
+(`<issuer>/.well-known/openid-configuration`), and
+`MINIO_IDENTITY_OPENID_CLIENT_ID` to the audience Forge's token carries
+(e.g. `forge-s3`). A projected service-account token cannot carry a policy
+claim, so give the issuer a role policy (`MINIO_IDENTITY_OPENID_ROLE_POLICY=forge`)
+and set `role_arn` to the role ARN MinIO logs at startup
+(`IAM Roles: arn:minio:iam:::role/…`). Any pod in the
+cluster can request a token for that audience, so restrict the policy to
+Forge's service account with a `jwt:sub` condition (namespace `forge`,
+service account `forge`, bucket `forge`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::forge"],
+      "Condition": { "StringEquals": { "jwt:sub": "system:serviceaccount:forge:forge" } }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      "Resource": ["arn:aws:s3:::forge/*"],
+      "Condition": { "StringEquals": { "jwt:sub": "system:serviceaccount:forge:forge" } }
+    }
+  ]
+}
+```
+
+With an issuer whose tokens name the policy in a claim
+(`MINIO_IDENTITY_OPENID_CLAIM_NAME`, MinIO's claim-based policies), leave
+`role_arn` unset.
+
+Point Forge at it:
+
+```bash
+FORGE_S3__CREDENTIALS=web_identity
+FORGE_S3__WEB_IDENTITY__TOKEN_FILE=/var/run/secrets/forge/s3/token
+FORGE_S3__WEB_IDENTITY__STS_ENDPOINT=https://minio.example.com:9000
+FORGE_S3__WEB_IDENTITY__ROLE_ARN=arn:minio:iam:::role/<id from the MinIO log>
+```
+
+Forge then needs no `s3:CreateBucket`: create the bucket with MinIO's root
+user (`mc mb`).
+
+On Kubernetes, the token is a projected service-account token with that
+audience. The Helm chart mounts it with `s3.credentials: web_identity`, and
+the kustomize component `s3-workload-identity` does the same. Ceph RGW works
+the same way with its OpenID Connect provider and `role_arn`.
+
+**Not covered.** GCS's S3 interoperability API accepts only HMAC keys, and
+Azure Blob Storage has no S3 API, so neither works with short-lived
+credentials here.
+
 ## Image
 
 ```bash
@@ -120,7 +254,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__ENDPOINT` | e.g. `https://s3.eu-central-1.amazonaws.com` or `http://minio:9000` |
 | `FORGE_S3__REGION` | e.g. `eu-central-1` |
 | `FORGE_S3__BUCKET` | e.g. `forge` |
-| `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` | Object-store credentials. |
+| `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` | Object-store credentials, or instead `FORGE_S3__CREDENTIALS` for [short-lived credentials](#short-lived-s3-credentials). |
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin password (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` defaults to `admin`). Without it no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |

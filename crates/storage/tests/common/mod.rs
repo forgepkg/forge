@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -144,8 +144,7 @@ pub async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".to_string(),
         bucket: S3_BUCKET.to_string(),
-        access_key: S3_ACCESS.to_string(),
-        secret_key: S3_SECRET.to_string(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -174,8 +173,7 @@ pub async fn blob_store_with_threshold(threshold: u64) -> BlobStore {
         endpoint,
         region: "us-east-1".to_string(),
         bucket: S3_BUCKET.to_string(),
-        access_key: S3_ACCESS.to_string(),
-        secret_key: S3_SECRET.to_string(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: threshold,
         conditional_writes: Default::default(),

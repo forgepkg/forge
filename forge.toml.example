@@ -52,8 +52,20 @@ acquire_timeout_seconds = 10    # (default: 10) wait for a free connection befor
 endpoint = "http://localhost:8422"
 region = "us-east-1"            # (default: "us-east-1")
 bucket = "forge"
-access_key = "minioadmin"
-secret_key = "minioadmin"
+# Where the S3 credentials come from (default: "static"):
+#   static        access_key / secret_key below.
+#   default_chain the AWS SDK default credentials chain: AWS_* env vars (with
+#                 AWS_SESSION_TOKEN), the shared profile, web identity (IRSA:
+#                 AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE), EKS Pod
+#                 Identity / ECS task role, EC2 instance profile.
+#   web_identity  exchange token_file for temporary keys with STS
+#                 AssumeRoleWithWebIdentity ([s3.web_identity] below), against
+#                 AWS STS or MinIO / Ceph RGW.
+# Temporary credentials are refreshed before they expire. The short-lived
+# modes refuse access_key / secret_key (remove them).
+credentials = "static"
+access_key = "minioadmin"       # static only
+secret_key = "minioadmin"       # static only
 force_path_style = true         # (default: true) required for versitygw/MinIO
 multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above this many bytes
 # Dedup PUTs with `If-None-Match: *` instead of HEAD-then-PUT: auto | on | off.
@@ -61,6 +73,18 @@ multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above thi
 # process lifetime if the backend rejects it (versitygw); "on" forces it (AWS
 # S3/MinIO); "off" disables it. Pure optimization — behavior is identical.
 conditional_writes = "auto"     # (default: "auto")
+
+# credentials = "web_identity" only.
+# [s3.web_identity]
+# The role to assume (AWS requires one; none for MinIO's claim-based policies).
+# role_arn = "arn:aws:iam::123456789012:role/forge"
+# The token (a projected service-account token, any OIDC token), read again on
+# every refresh so a rotated token is picked up.
+# token_file = "/var/run/secrets/forge/s3/token"
+# Unset: AWS STS in s3.region. MinIO / Ceph RGW: their URL (usually endpoint).
+# sts_endpoint = "https://minio.example.com:9000"
+# session_name = "forge"          # (default: "forge") RoleSessionName
+# duration_seconds = 3600         # 900..43200 (default: the STS default)
 
 [auth]
 anonymous_mode = "off"          # (default: "off") off | allowlist | all

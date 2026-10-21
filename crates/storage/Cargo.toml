@@ -12,6 +12,8 @@ forge-db = { path = "../db" }
 tokio = { workspace = true, features = ["sync", "time"] }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
+aws-sdk-sts = { workspace = true }
+aws-credential-types = { workspace = true }
 sqlx = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }

@@ -63,6 +63,16 @@ aws-sdk-s3 = { version = "1.85", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-config = { version = "1.8" }
+# Short-lived S3 credentials (`s3.credentials = "web_identity"`): STS
+# AssumeRoleWithWebIdentity against AWS or an S3-compatible STS endpoint.
+# `default-features = false` for the same reason as `aws-sdk-s3` above (the
+# SDK's `rustls` feature is the legacy connector); the call is unsigned, so
+# no `sigv4a` either.
+aws-sdk-sts = { version = "1.114", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-credential-types = { version = "1.2" }
 
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form", "system-proxy"] }

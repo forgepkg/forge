@@ -16,6 +16,8 @@
 //! * [`make_nupkg`] — build a minimal valid `.nupkg` fixture.
 //! * [`S3Gate`] — a proxy in front of the shared S3 that counts requests and
 //!   can simulate an outage (local blob cache scenarios).
+//! * [`minio::Minio`] — a MinIO whose STS trusts a [`MockOidc`] issuer
+//!   (short-lived S3 credentials via web identity).
 //!
 //! Containers are shared per test-binary process (booted once, leaked so their
 //! async `Drop` never runs on a torn-down runtime) but every [`start_stack`]
@@ -24,6 +26,7 @@
 
 #![cfg(feature = "forge-e2e")]
 
+pub mod minio;
 mod mock_basic_upstream;
 mod mock_oidc;
 mod mock_upstream;

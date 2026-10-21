@@ -599,9 +599,9 @@ http://localhost:8421.
 (`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
 anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
 `allow_password_basic=false`, no bootstrap admin — that comes only from
-`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env). The placeholder credentials
-(`minioadmin` S3 keys, a `changeme` password) are **refused at startup** unless
-overridden; only the dev compose stack sets
+`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env), and no S3 keys. Placeholder
+credentials (`minioadmin` S3 keys, a `changeme` password) are **refused at
+startup**; only the dev compose stack sets
 `FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin/changeme and
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
 env vars (double-underscore nesting). Required at runtime (no safe default):
@@ -611,7 +611,7 @@ env vars (double-underscore nesting). Required at runtime (no safe default):
 | `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
 | `FORGE_S3__ENDPOINT` | `http://s3:8422` |
 | `FORGE_S3__BUCKET` | `forge` |
-| `FORGE_S3__ACCESS_KEY` | `…` |
+| `FORGE_S3__ACCESS_KEY` | `…` (or short-lived credentials: `FORGE_S3__CREDENTIALS`, see docs/deployment.md) |
 | `FORGE_S3__SECRET_KEY` | `…` |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
 
