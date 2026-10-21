@@ -52,6 +52,10 @@ struct MockState {
     packages: Mutex<HashMap<String, HashMap<String, Vec<u8>>>>,
     /// `lower_id -> id as published`.
     ids: Mutex<HashMap<String, String>>,
+    /// `(lower_id, version) -> publish time` the registration reports: when
+    /// the version was added to the mock (a fresh release), unless a test
+    /// set another one.
+    published: Mutex<HashMap<(String, String), String>>,
     index_hits: AtomicUsize,
     flat_index_hits: AtomicUsize,
     nupkg_hits: AtomicUsize,
@@ -98,9 +102,15 @@ impl MockUpstream {
     pub async fn start(packages: Vec<UpstreamPackage>) -> MockUpstream {
         let mut corpus: HashMap<String, HashMap<String, Vec<u8>>> = HashMap::new();
         let mut ids = HashMap::new();
+        let mut published = HashMap::new();
+        let now = chrono::Utc::now().to_rfc3339();
         for p in packages {
-            ids.insert(p.id.to_lowercase(), p.id.clone());
-            corpus.insert(p.id.to_lowercase(), p.versions);
+            let lower = p.id.to_lowercase();
+            for version in p.versions.keys() {
+                published.insert((lower.clone(), version.clone()), now.clone());
+            }
+            ids.insert(lower.clone(), p.id.clone());
+            corpus.insert(lower, p.versions);
         }
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -113,6 +123,7 @@ impl MockUpstream {
             base: base.clone(),
             packages: Mutex::new(corpus),
             ids: Mutex::new(ids),
+            published: Mutex::new(published),
             index_hits: AtomicUsize::new(0),
             flat_index_hits: AtomicUsize::new(0),
             nupkg_hits: AtomicUsize::new(0),
@@ -188,9 +199,22 @@ impl MockUpstream {
             .packages
             .lock()
             .unwrap()
-            .entry(lower)
+            .entry(lower.clone())
             .or_default()
             .insert(version.to_string(), bytes);
+        self.state.published.lock().unwrap().insert(
+            (lower, version.to_string()),
+            chrono::Utc::now().to_rfc3339(),
+        );
+    }
+
+    /// Report `version` of `id` as published at `at` (RFC 3339) from now on.
+    pub fn set_published(&self, id: &str, version: &str, at: &str) {
+        self.state
+            .published
+            .lock()
+            .unwrap()
+            .insert((id.to_lowercase(), version.to_string()), at.to_string());
     }
 }
 
@@ -298,17 +322,19 @@ async fn serve_registration(
         .cloned()
         .unwrap_or_else(|| id.clone());
     let packages = st.packages.lock().unwrap().get(&lower).cloned();
+    let published = st.published.lock().unwrap().clone();
     match packages {
         Some(vers) => {
             let items: Vec<_> = vers
                 .iter()
                 .map(|(v, bytes)| {
+                    let at = published.get(&(lower.clone(), v.clone()));
                     serde_json::json!({
                         "catalogEntry": {
                             "id": original,
                             "version": v,
                             "listed": true,
-                            "published": "2026-01-01T00:00:00+00:00",
+                            "published": at,
                             "dependencyGroups": dependency_groups_json(bytes),
                         },
                         "packageContent":
