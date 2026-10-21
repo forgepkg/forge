@@ -50,16 +50,18 @@ limitations still apply, except where an entry below says otherwise.
 
 ### Features
 
-- **Format plugins** (preview): further package formats as sandboxed
-  WebAssembly components (the `forge:format@0.1.0` WIT contract, run by
-  Wasmtime), served under `/repository/{repo}/` with the same storage,
-  RBAC and package selectors, hosted and group repositories, retention and
-  audit log as NuGet. Plugins are loaded from `[plugins]` only when pinned
-  by SHA-256; each call runs with fuel, memory and time limits and no WASI
-  capabilities. The first one, **Helm chart repositories** (`plugins/helm`),
-  serves `index.yaml`, chart downloads and ChartMuseum-compatible push,
-  delete and listing. `GET /admin/formats` lists the installed formats; the
-  web UI offers them when creating a repository. See
+- **Format plugins** (preview): further package formats, served under
+  `/repository/{repo}/` with the same storage, RBAC and package selectors,
+  hosted and group repositories, retention and audit log as NuGet. A plugin
+  is a crate implementing one contract (`forge-plugin-api`'s
+  `FormatPlugin`, mirrored by the `forge:format@0.1.0` WIT package) and
+  runs either built into the server or as a WebAssembly component run by
+  Wasmtime. Components are loaded from `[plugins]` only when pinned by
+  SHA-256, and each call runs with fuel, memory and time limits and no WASI
+  capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
+  `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
+  listing. `GET /admin/formats` lists the installed formats; the web UI
+  offers them when creating a repository. See
   [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
 
 ### Fixed

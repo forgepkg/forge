@@ -1,5 +1,6 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the built-in NuGet format and every loaded format plugin.
+//! repositories of: NuGet, the built-in format plugins, and every loaded
+//! WebAssembly plugin.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
@@ -14,7 +15,8 @@ pub struct FormatView {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Whether the format is built in (NuGet) rather than a plugin.
+    /// Whether the format is built into the server (NuGet and the built-in
+    /// plugins) rather than loaded as a WebAssembly plugin.
     pub builtin: bool,
     /// The repository kinds it supports.
     pub kinds: Vec<&'static str>,
@@ -26,7 +28,7 @@ pub struct FormatView {
     /// Plugin description (plugins only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// SHA-256 of the plugin's component (plugins only).
+    /// SHA-256 of the plugin's component (WebAssembly plugins only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -48,12 +50,12 @@ pub async fn list(State(state): State<AppState>) -> Response {
         FormatView {
             id: plugin.id().to_string(),
             name: manifest.name.clone(),
-            builtin: false,
+            builtin: plugin.is_builtin(),
             kinds: vec!["hosted", "group"],
             mount: crate::plugins::MOUNT,
             version: Some(manifest.version.clone()),
             description: manifest.description.clone(),
-            sha256: Some(plugin.sha256().to_string()),
+            sha256: plugin.sha256().map(str::to_string),
         }
     }));
     Json(formats).into_response()

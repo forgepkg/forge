@@ -54,8 +54,8 @@ pub struct AppState {
     /// Authorization decision service (§12.4 seam): every read/write/admin gate
     /// routes through this.
     pub authz: Authz,
-    /// Package-format registry, keyed by `Format::id()`: the built-in NuGet
-    /// format plus any loaded format plugins.
+    /// Package-format registry, keyed by `Format::id()`: the NuGet format,
+    /// the built-in format plugins, and any loaded WebAssembly plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -87,25 +87,33 @@ pub struct AppState {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`]. NuGet is built in; every other format comes from a format
-/// plugin loaded at startup ([`FormatRegistry::with_format`]).
+/// [`Format`]. NuGet and the built-in format plugins ([`crate::plugins::builtin`])
+/// are always there; WebAssembly plugins are added at startup
+/// ([`FormatRegistry::with_plugin`]).
 pub struct FormatRegistry {
     nuget: Arc<dyn Format>,
     formats: BTreeMap<String, Arc<dyn Format>>,
-    /// The protocol side of each plugin format, by format id.
+    /// Every plugin format (built in or WebAssembly), by format id: its
+    /// client protocol.
     plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
 }
 
 impl FormatRegistry {
-    /// A registry holding the built-in NuGet format only.
+    /// A registry holding NuGet and the built-in format plugins.
     pub fn new(nuget: Arc<dyn Format>) -> Self {
         let mut formats = BTreeMap::new();
         formats.insert(nuget.id().to_string(), nuget.clone());
-        FormatRegistry {
+        let mut registry = FormatRegistry {
             nuget,
             formats,
             plugins: BTreeMap::new(),
+        };
+        for plugin in crate::plugins::builtin() {
+            registry = registry
+                .with_plugin(plugin)
+                .expect("built-in format ids are distinct");
         }
+        registry
     }
 
     /// Add `format` under its [`Format::id`]. An id that is already taken
@@ -113,15 +121,22 @@ impl FormatRegistry {
     pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
         let id = format.id().to_string();
         if self.formats.contains_key(&id) {
-            return Err(format!("format {id:?} is already registered"));
+            let built_in =
+                id == self.nuget.id() || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
+            return Err(if built_in {
+                format!("format {id:?} is built into this server")
+            } else {
+                format!("format {id:?} is already registered")
+            });
         }
         self.formats.insert(id, format);
         Ok(self)
     }
 
-    /// Add a format plugin: its [`Format`] and its client protocol.
+    /// Add a format plugin: its [`Format`] and its client protocol. Its id
+    /// must be free: a WebAssembly plugin never replaces a built-in format.
     pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
-        let format = Arc::new(forge_plugin::PluginFormat::new(plugin.clone()));
+        let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
         self = self.with_format(format)?;
         self.plugins.insert(plugin.id().to_string(), plugin);
         Ok(self)
@@ -137,7 +152,7 @@ impl FormatRegistry {
         self.plugins.get(id).cloned()
     }
 
-    /// The loaded format plugins, by format id.
+    /// The plugin formats (built in and WebAssembly), by format id.
     pub fn plugins(&self) -> impl Iterator<Item = &Arc<forge_plugin::Plugin>> {
         self.plugins.values()
     }
@@ -261,9 +276,9 @@ impl AppState {
         self
     }
 
-    /// Install the loaded format plugins (see [`crate::plugins::load`]). A
-    /// plugin whose format id is taken (NuGet, or another plugin) is an
-    /// error.
+    /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
+    /// next to the built-in formats. A plugin whose format id is taken
+    /// (NuGet, a built-in plugin, or another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
         let mut registry = FormatRegistry::new(self.formats.nuget());
         for plugin in plugins {

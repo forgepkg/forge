@@ -1,5 +1,10 @@
-// The contract between Forge and a format plugin: a WebAssembly component
-// that teaches Forge one more package format.
+// The contract between Forge and a format plugin: what teaches Forge one more
+// package format.
+//
+// A plugin is a Rust crate implementing `forge_plugin_api::FormatPlugin`, the
+// same contract in Rust (crates/plugin-api/src/lib.rs). Forge links its
+// built-in plugins natively; any plugin can also be built as a WebAssembly
+// component of the `format-plugin` world below and loaded at startup.
 //
 // The division of labor is fixed: the host owns everything a repository is —
 // storage (the content-addressed store), metadata (Postgres), authentication,
@@ -43,6 +48,9 @@ interface types {
         malformed-manifest(string),
         invalid-version(string),
         invalid-id(string),
+        /// The plugin itself failed (a bug, an exhausted resource): the
+        /// client gets a server error, not this text.
+        internal(string),
     }
 }
 

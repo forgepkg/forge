@@ -1,14 +1,17 @@
-//! `plugin.toml`: what a plugin directory declares about its component.
+//! `plugin.toml`: what a plugin declares about itself, next to its crate's
+//! `Cargo.toml` (`plugins/<id>/plugin.toml`) and in an installed plugin
+//! directory.
 //!
 //! ```toml
 //! [plugin]
 //! id = "helm"               # the format id repositories are created with
 //! name = "Helm charts"
 //! version = "0.1.0"         # the plugin's own version (informational)
-//! api = "0.1.0"             # the forge:format WIT package it is built against
-//! component = "helm.wasm"   # the component, relative to the directory
+//! api = "0.1.0"             # the forge:format contract it is built against
+//! component = "helm.wasm"   # built as a component: its file, relative to
+//!                           # the directory (unused when built in)
 //!
-//! [limits]                  # optional; each capped by the host's maximum
+//! [limits]                  # as a component; each capped by the host's maximum
 //! memory_mib = 64
 //! fuel = 2000000000
 //! timeout_ms = 2000
@@ -20,8 +23,8 @@ use serde::Deserialize;
 
 use crate::PluginError;
 
-/// The `forge:format` WIT package versions this host implements.
-pub const SUPPORTED_APIS: &[&str] = &["0.1.0"];
+/// The `forge:format` contract versions this host implements.
+pub const SUPPORTED_APIS: &[&str] = &[forge_plugin_api::API];
 
 /// Format ids a plugin can never take: the built-in format, and names the
 /// server routes or reserves.
@@ -36,13 +39,14 @@ pub struct Manifest {
     pub name: String,
     /// The plugin's own version.
     pub version: String,
-    /// The `forge:format` package version it is built against.
+    /// The `forge:format` contract version it is built against.
     pub api: String,
     /// Optional one-line description.
     pub description: Option<String>,
-    /// Path of the component, relative to the plugin directory.
-    pub component: PathBuf,
-    /// Requested limits (`None` → the host default).
+    /// Path of the component, relative to the plugin directory (WebAssembly
+    /// plugins).
+    pub component: Option<PathBuf>,
+    /// Requested limits as a component (`None` → the host default).
     pub limits: RequestedLimits,
 }
 
@@ -73,7 +77,7 @@ struct RawPlugin {
     name: String,
     version: String,
     api: String,
-    component: String,
+    component: Option<String>,
     description: Option<String>,
 }
 
@@ -90,19 +94,18 @@ impl Manifest {
                 p.api
             )));
         }
-        let component = PathBuf::from(&p.component);
         // The component is a file inside the plugin directory: a plain
         // relative path, never `..`, absolute, or a drive/root prefix.
-        if p.component.is_empty()
-            || !component
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
-        {
-            return Err(PluginError::Manifest(format!(
-                "component {:?} must be a relative path inside the plugin directory",
-                p.component
-            )));
-        }
+        let component = p.component.map(|raw| {
+            let path = PathBuf::from(&raw);
+            if raw.is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_))) {
+                return Err(PluginError::Manifest(format!(
+                    "component {raw:?} must be a relative path inside the plugin directory"
+                )));
+            }
+            Ok(path)
+        });
+        let component = component.transpose()?;
         if p.name.trim().is_empty() {
             return Err(PluginError::Manifest("name must not be empty".into()));
         }
@@ -165,7 +168,7 @@ mod tests {
     fn parses_a_manifest() {
         let m = Manifest::parse(GOOD).unwrap();
         assert_eq!(m.id, "helm");
-        assert_eq!(m.component, PathBuf::from("helm.wasm"));
+        assert_eq!(m.component, Some(PathBuf::from("helm.wasm")));
         assert_eq!(m.limits.memory_mib, Some(32));
         assert_eq!(m.limits.fuel, None);
     }
@@ -197,6 +200,9 @@ mod tests {
         }
         let text = GOOD.replace("\"helm.wasm\"", "\"lib/helm.wasm\"");
         assert!(Manifest::parse(&text).is_ok());
+        // A built-in plugin needs none.
+        let text = GOOD.replace("component = \"helm.wasm\"", "");
+        assert_eq!(Manifest::parse(&text).unwrap().component, None);
     }
 
     #[test]

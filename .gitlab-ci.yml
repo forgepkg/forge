@@ -111,24 +111,18 @@ audit:
   script:
     - cargo install cargo-audit --version 0.22.2 --locked
     - cargo audit
-    - for lock in plugins/*/Cargo.lock; do cargo audit --file "$lock"; done
 
-# ── Format plugins (plugins/<id>/, WebAssembly components) ────────────────
-# Each plugin is its own workspace built for wasm32-wasip2: formatting,
-# clippy (wasm and native test builds) and its unit tests. The host-side tests
-# that load them run in `test`.
+# ── Format plugins as WebAssembly components (plugins/<id>/) ──────────────
+# The plugins are workspace crates (fmt, clippy and their tests run with the
+# workspace); this checks that each one also lints clean and builds as a
+# component for wasm32-wasip2. The tests that load a component run in `test`.
 plugins:
   stage: test
   needs: ["fmt"]
   cache:
     <<: *cargo-cache
-    key:
-      files:
-        - plugins/helm/Cargo.lock
-        - rust-toolchain.toml
-      prefix: "$CI_JOB_NAME"
   script:
-    - rustup component add rustfmt clippy
+    - rustup component add clippy
     - rustup target add wasm32-wasip2
     - cargo xtask plugins-check
 
@@ -160,7 +154,7 @@ test:
     - timeout 60 bash -c 'until pg_isready -h postgres -p 5432 -U forge; do sleep 1; done'
     - timeout 60 bash -c 'until curl -fs http://docker:2375/_ping >/dev/null; do sleep 1; done'
   script:
-    # The format-plugin tests build the example plugins (plugins/).
+    # The format-plugin tests build plugins/ as WebAssembly components.
     - rustup target add wasm32-wasip2
     - cargo build --workspace
     # forge-e2e feature is intentionally excluded here — unit tests only.

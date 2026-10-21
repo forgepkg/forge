@@ -7,18 +7,16 @@ members = [
     "crates/core",
     "crates/crypto",
     "crates/format-nuget",
+    "crates/plugin-api",
     "crates/plugin",
     "crates/server",
     "crates/e2e",
+    "plugins/helm",
     "xtask",
 ]
 
 # One version for the whole product: every crate inherits it, so a release
 # bumps it here once (and `web/package.json` to match).
-# Format plugins are WebAssembly components with workspaces of their own
-# (built for `wasm32-wasip2`, see plugins/README.md).
-exclude = ["plugins"]
-
 [workspace.package]
 version = "1.0.0"
 edition = "2021"
@@ -172,3 +170,12 @@ wasmtime = { version = "48.0.7", default-features = false, features = [
 # WASI 0.2 for plugin components (a Rust guest's std imports it); the host
 # grants no filesystem, network or environment.
 wasmtime-wasi = { version = "48.0.7", default-features = false, features = ["p2"] }
+
+# Format plugins built as WebAssembly components (`cargo xtask plugins`):
+# small, self-contained `.wasm` files.
+[profile.plugin]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

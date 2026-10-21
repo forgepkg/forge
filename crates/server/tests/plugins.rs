@@ -1,22 +1,28 @@
-//! Format plugins end to end: the example Helm plugin (`plugins/helm`) loaded
-//! into a server, its repositories created through the admin API and used
-//! through `/repository/{repo}` the way Helm clients use a chart repository.
+//! Format plugins end to end: the built-in Helm plugin (`plugins/helm`), its
+//! repositories created through the admin API and used through
+//! `/repository/{repo}` the way Helm clients use a chart repository — and the
+//! same crate built as a WebAssembly component, loaded at startup.
 
 mod common;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use common::{start_with, unique, ServerOpts, TestServer};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::Digest;
 
-/// The `[plugins]` block loading the example Helm plugin.
-fn helm_plugins_block() -> String {
-    let dir = forge_plugin::testing::example_plugin("helm");
+/// The format id the Helm component is installed under (the built-in Helm
+/// plugin holds `helm`).
+const WASM_HELM: &str = "helm-wasm";
+
+/// The `[plugins]` block loading the Helm plugin built as a component.
+fn wasm_helm_plugins_block() -> String {
+    let dir = forge_plugin::testing::example_plugin_as("helm", WASM_HELM);
     let sha = forge_plugin::testing::component_sha256(&dir);
     let parent = dir.parent().expect("plugin directory parent");
-    format!("[plugins]\ndir = {parent:?}\n\n[plugins.formats]\nhelm = \"sha256:{sha}\"\n")
+    format!("[plugins]\ndir = {parent:?}\n\n[plugins.formats]\n{WASM_HELM} = \"sha256:{sha}\"\n")
 }
 
 async fn start_helm(opts: ServerOpts) -> TestServer {
@@ -24,7 +30,6 @@ async fn start_helm(opts: ServerOpts) -> TestServer {
         common::pool().await,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
-            plugins_block: Some(helm_plugins_block()),
             ..opts
         },
     )
@@ -72,10 +77,15 @@ async fn create_repo(srv: &TestServer, body: Value) -> reqwest::Response {
 
 /// Create a hosted Helm repository and return its name.
 async fn helm_repo(srv: &TestServer, anonymous_read: bool) -> String {
+    hosted_repo(srv, "helm", anonymous_read).await
+}
+
+/// Create a hosted repository of `format` and return its name.
+async fn hosted_repo(srv: &TestServer, format: &str, anonymous_read: bool) -> String {
     let name = format!("charts{}", unique());
     let resp = create_repo(
         srv,
-        json!({ "name": name, "kind": "hosted", "format": "helm", "anonymous_read": anonymous_read }),
+        json!({ "name": name, "kind": "hosted", "format": format, "anonymous_read": anonymous_read }),
     )
     .await;
     assert_eq!(
@@ -370,8 +380,10 @@ async fn formats_keep_to_their_own_mounts_and_kinds() {
         .unwrap();
     assert_eq!(formats[0]["id"], "nuget");
     assert_eq!(formats[1]["id"], "helm");
+    assert_eq!(formats[1]["builtin"], true);
     assert_eq!(formats[1]["kinds"], json!(["hosted", "group"]));
     assert_eq!(formats[1]["mount"], "/repository");
+    assert!(formats[1].get("sha256").is_none());
 
     // Plugin formats have no proxies; unknown formats are refused.
     let resp = create_repo(
@@ -463,7 +475,7 @@ async fn a_repository_whose_plugin_is_missing_is_unavailable() {
     let srv = common::start().await;
     let name = format!("orphan{}", unique());
     let mut row = forge_db::repository_dao::NewRepository::hosted(name.clone());
-    row.format = "helm".into();
+    row.format = WASM_HELM.into();
     forge_db::repository_dao::insert_repository(&srv.pool, row)
         .await
         .expect("insert repository");
@@ -481,4 +493,81 @@ async fn a_repository_whose_plugin_is_missing_is_unavailable() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The Helm crate built as a WebAssembly component serves its repositories
+/// exactly as the built-in one does: one contract, two ways to run it.
+#[tokio::test]
+async fn a_webassembly_plugin_serves_like_a_builtin_one() {
+    let srv = start_helm(ServerOpts {
+        plugins_block: Some(wasm_helm_plugins_block()),
+        ..Default::default()
+    })
+    .await;
+    let creds = credentials(&srv).await;
+    let (u, p) = srv.admin_basic();
+    let formats: Value = srv
+        .client()
+        .get(format!("{}/admin/formats", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let wasm = formats
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == WASM_HELM)
+        .expect("the component is listed");
+    assert_eq!(wasm["builtin"], false);
+    assert_eq!(wasm["sha256"].as_str().map(str::len), Some(64));
+
+    let repo = hosted_repo(&srv, WASM_HELM, false).await;
+    let package = chart("Demo", "v1.0");
+    let resp = push(&srv, &repo, &creds, package.clone()).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = push(&srv, &repo, &creds, package.clone()).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp = push(&srv, &repo, &creds, b"not a chart".to_vec()).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let index: Value = get_index(&srv, &repo, Some(&creds))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let entry = &index["entries"]["Demo"][0];
+    assert_eq!(entry["version"], "v1.0");
+    assert_eq!(entry["digest"], hex::encode(sha2::Sha256::digest(&package)));
+    let url = entry["urls"][0].as_str().unwrap();
+    let resp = srv
+        .client()
+        .get(url.replace("http://test.local", &srv.base_url))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), package.as_slice());
+}
+
+/// A WebAssembly plugin never replaces a built-in format.
+#[test]
+fn a_component_cannot_take_a_builtin_format_id() {
+    let dir = forge_plugin::testing::example_plugin("helm");
+    let plugin = forge_plugin::Plugin::load(
+        &dir,
+        &forge_plugin::testing::component_sha256(&dir),
+        &forge_plugin::HostLimits::default(),
+    )
+    .unwrap();
+    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(forge_nuget::NugetFormat::default());
+    let err = forge_server::state::FormatRegistry::new(nuget)
+        .with_plugin(plugin)
+        .err()
+        .expect("helm is taken");
+    assert!(err.contains("built into this server"), "{err}");
 }

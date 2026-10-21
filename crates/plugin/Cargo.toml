@@ -7,11 +7,13 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# `testing::example_plugin`: builds a plugin of `plugins/` for tests.
+# `testing::example_plugin`: builds a plugin of `plugins/` as a component for
+# tests.
 testing = []
 
 [dependencies]
 forge-core = { path = "../core" }
+forge-plugin-api = { path = "../plugin-api" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,8 +22,6 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 toml = "0.9"
-# The async plugin call awaits a oneshot answer from the plugin threads.
-tokio = { workspace = true, features = ["sync"] }
 # Spools a package handed over as a reader into a file the plugin can be lent.
 tempfile = { workspace = true }
 
@@ -30,5 +30,6 @@ wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
 forge-plugin = { path = ".", features = ["testing"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# The built-in Helm plugin, to compare with its component.
+forge-format-helm = { path = "../../plugins/helm" }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }

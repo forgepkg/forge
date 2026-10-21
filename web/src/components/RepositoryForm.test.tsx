@@ -24,7 +24,7 @@ import {
 const helm: FormatView = {
   id: 'helm',
   name: 'Helm charts',
-  builtin: false,
+  builtin: true,
   kinds: ['hosted', 'group'],
   mount: '/repository',
   version: '0.1.0',

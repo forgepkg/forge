@@ -207,13 +207,14 @@ describe('admin repositories', () => {
     expect(posted).not.toHaveProperty('remote_url')
   })
 
-  it('creates a repository of an installed format plugin', async () => {
+  it('creates a repository of a built-in format plugin', async () => {
     let posted: unknown = null
     mockApi({
       repositories: [],
       formats: [
         { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
-        { id: 'helm', name: 'Helm charts', builtin: false, kinds: ['hosted', 'group'], mount: '/repository' },
+        { id: 'helm', name: 'Helm charts', builtin: true, kinds: ['hosted', 'group'], mount: '/repository' },
+        { id: 'acme', name: 'Acme packages', builtin: false, kinds: ['hosted', 'group'], mount: '/repository' },
       ],
       onCreate: (body) => {
         posted = body
@@ -225,7 +226,9 @@ describe('admin repositories', () => {
     await renderAt('/manage/repositories/new')
 
     await user.type(await screen.findByLabelText('Name'), 'charts')
-    await screen.findByRole('option', { name: 'Helm charts (plugin helm)' })
+    await screen.findByRole('option', { name: 'Helm charts' })
+    // A WebAssembly plugin is named with its id.
+    expect(screen.getByRole('option', { name: 'Acme packages (plugin acme)' })).toBeInTheDocument()
     await user.selectOptions(screen.getByLabelText('Format'), 'helm')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
 

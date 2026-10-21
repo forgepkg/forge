@@ -1,12 +1,13 @@
-//! Format plugins: loading them at startup, and serving the repositories of
-//! their formats under `/repository/{repo}/...` (see `docs/format-plugins.md`).
+//! Format plugins: the built-in ones, loading the WebAssembly ones at
+//! startup, and serving the repositories of their formats under
+//! `/repository/{repo}/...` (see `docs/format-plugins.md`).
 //!
 //! The dispatcher does what [`crate::dispatch`] does for the NuGet feed —
 //! resolve the repository, authorize the request's action (GET/HEAD read,
 //! PUT/POST write, DELETE delete), refuse an offline repository — and then
 //! lets the format's plugin decide what the request is
-//! ([`forge_plugin::Plugin::handle`]). Everything that touches data stays
-//! here:
+//! ([`FormatPlugin::handle`]), whether it is built in or a component.
+//! Everything that touches data stays here:
 //!
 //! * **Queries** the plugin asks for run through the same read ops as every
 //!   other read ([`AppState::read_ops_for`]): package selectors, group
@@ -43,9 +44,9 @@ use forge_core::repo::{
 use forge_db::model::Repository;
 use forge_db::repository_dao;
 use forge_nuget::routes::NupkgBytes;
-use forge_plugin::protocol::{
-    self, Action, Answer, ChangeRequest, Loaded, PackageInfo, PackageRef, PublishRequest, Query,
-    Rendered, Upload,
+use forge_plugin::api::{
+    self as protocol, Action, Answer, ChangeRequest, FormatPlugin, Loaded, PackageInfo, PackageRef,
+    PublishRequest, Query, Rendered, Upload,
 };
 use forge_plugin::{HostLimits, Plugin};
 use futures_util::{StreamExt, TryStreamExt};
@@ -93,9 +94,24 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "location",
 ];
 
-/// Load the plugins `config` lists, each from `<dir>/<id>`, checked against
-/// its pinned digest. Any failure fails startup: a configured format that is
-/// silently missing would leave its repositories unavailable.
+/// The format plugins built into this server: crates under `plugins/<id>/`,
+/// linked in. Always installed, like NuGet.
+pub fn builtin() -> Vec<Arc<Plugin>> {
+    static BUILTIN: std::sync::OnceLock<Vec<Arc<Plugin>>> = std::sync::OnceLock::new();
+    BUILTIN
+        .get_or_init(|| {
+            vec![
+                Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm)
+                    .expect("plugins/helm/plugin.toml is valid"),
+            ]
+        })
+        .clone()
+}
+
+/// Load the WebAssembly plugins `config` lists, each from `<dir>/<id>`,
+/// checked against its pinned digest. Any failure fails startup: a
+/// configured format that is silently missing would leave its repositories
+/// unavailable.
 pub fn load(config: &PluginsConfig) -> anyhow::Result<Vec<Arc<Plugin>>> {
     let Some(dir) = &config.dir else {
         return Ok(Vec::new());
@@ -117,7 +133,7 @@ pub fn load(config: &PluginsConfig) -> anyhow::Result<Vec<Arc<Plugin>>> {
             tracing::info!(
                 format = id,
                 version = %plugin.manifest().version,
-                sha256 = plugin.sha256(),
+                sha256 = plugin.sha256().unwrap_or_default(),
                 "format plugin loaded"
             );
             Ok(plugin)
@@ -239,15 +255,20 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         principal,
         permission,
         head: method == Method::HEAD,
-        plugin,
+        plugin: plugin.implementation().clone(),
         format,
         ops,
         package_filter,
         target,
     };
-    let response = match ctx.plugin.handle(ctx.target.clone(), request.clone()).await {
+    let handled = {
+        let (target, request) = (ctx.target.clone(), request.clone());
+        ctx.call(move |plugin| plugin.handle(&target, &request))
+            .await
+    };
+    let response = match handled {
         Ok(action) => ctx.perform(action, request, req).await,
-        Err(e) => plugin_failed(&repo, e),
+        Err(response) => response,
     };
     if permission != Permission::Read {
         // The same audit trail as the NuGet feed's package mutations.
@@ -272,7 +293,7 @@ struct Ctx<'a> {
     /// What the request's method was authorized for.
     permission: Permission,
     head: bool,
-    plugin: Arc<Plugin>,
+    plugin: Arc<dyn FormatPlugin>,
     format: Arc<dyn Format>,
     ops: Arc<dyn RepoReadOps>,
     /// The caller's package selector for [`Self::permission`].
@@ -281,6 +302,19 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// Run a protocol call of the plugin off the async workers: rendering a
+    /// large index takes a while, and a component's call may run for as long
+    /// as its time limit. A plugin that panics answers 500.
+    async fn call<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&dyn FormatPlugin) -> R + Send + 'static,
+    ) -> Result<R, Response> {
+        let plugin = Arc::clone(&self.plugin);
+        tokio::task::spawn_blocking(move || f(plugin.as_ref()))
+            .await
+            .map_err(|e| plugin_failed(self.repo, &e))
+    }
+
     async fn perform(
         &self,
         action: Action,
@@ -338,14 +372,20 @@ impl Ctx<'_> {
                     .zip(answers)
                     .map(|(query, answer)| Loaded { query, answer }),
             );
-            match self
-                .plugin
-                .render(self.target.clone(), request.clone(), data.clone())
-                .await
-            {
-                Ok(Rendered::Respond(response)) => return self.respond(response),
-                Ok(Rendered::Load(more)) => queries = more,
-                Err(e) => return plugin_failed(self.repo, e),
+            let (target, req) = (self.target.clone(), request.clone());
+            let rendered = self
+                .call(move |plugin| {
+                    let rendered = plugin.render(&target, &req, &data);
+                    (rendered, data)
+                })
+                .await;
+            match rendered {
+                Ok((Rendered::Respond(response), _)) => return self.respond(response),
+                Ok((Rendered::Load(more), loaded)) => {
+                    data = loaded;
+                    queries = more;
+                }
+                Err(response) => return response,
             }
         }
         tracing::warn!(
@@ -755,7 +795,7 @@ fn refused(what: &str) -> Response {
         .into_response()
 }
 
-fn plugin_failed(repo: &Repository, e: forge_plugin::PluginError) -> Response {
+fn plugin_failed(repo: &Repository, e: &dyn std::fmt::Display) -> Response {
     tracing::error!(repo = %repo.name, format = %repo.format, error = %e, "format plugin failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response()
 }

@@ -1,29 +1,22 @@
 [package]
 name = "forge-format-helm"
+# The plugin's own version: keep it equal to `version` in plugin.toml.
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.95"
-license = "AGPL-3.0-only OR LicenseRef-envisia"
-publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "Helm chart repositories for Forge, as a format plugin"
 
-# A WebAssembly component built on its own (`cargo xtask plugins`), not a
-# member of the server workspace.
-[workspace]
-
-[lib]
-crate-type = ["cdylib"]
+# Built into the server; `--features component` builds it as a WebAssembly
+# component instead (`cargo xtask plugins`).
+[features]
+component = ["forge-plugin-api/component"]
 
 [dependencies]
-wit-bindgen = { version = "0.61", default-features = false, features = ["macros", "realloc", "std"] }
-# .tgz charts: gzip with the pure-Rust backend (no C in a wasm build).
+forge-plugin-api = { path = "../../crates/plugin-api" }
+# .tgz charts: gzip with a pure-Rust backend (no C in a wasm build).
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # Chart.yaml, and the index.yaml it serves.
 yaml-rust2 = { version = "0.13", default-features = false }
-serde_json = "1"
-
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
-strip = true
+serde_json = { workspace = true }

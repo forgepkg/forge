@@ -88,7 +88,7 @@ function originOf(url: string | null | undefined): string | null {
   }
 }
 
-/** The built-in format, all a server without format plugins offers. */
+/** The NuGet format: what the form offers when the format list is unavailable. */
 export const NUGET_FORMAT: FormatView = {
   id: 'nuget',
   name: 'NuGet',
@@ -99,7 +99,7 @@ export const NUGET_FORMAT: FormatView = {
 
 /** Where a repository of `format` named `name` is served. */
 export function feedPath(format: FormatView, name: string): string {
-  return format.builtin
+  return format.id === NUGET_FORMAT.id
     ? `${format.mount}/${name}/index.json`
     : `${format.mount}/${name}/`
 }
@@ -301,7 +301,7 @@ export function RepositoryForm({
           {mode === 'edit'
             ? 'The format cannot be changed after creation.'
             : format.description ??
-              (format.builtin
+              (format.id === NUGET_FORMAT.id
                 ? 'NuGet packages, served as a NuGet V3 feed.'
                 : 'A format plugin; its repositories are hosted or groups.')}
         </Description>

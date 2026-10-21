@@ -22,6 +22,8 @@ forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-nuget = { path = "../format-nuget" }
 forge-plugin = { path = "../plugin" }
+# Built-in format plugins (plugins/<id>/), linked in.
+forge-format-helm = { path = "../../plugins/helm" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }

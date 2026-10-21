@@ -15,29 +15,29 @@
 //!
 //! Chart names are matched case-insensitively (the canonical id is the
 //! lowercased name); versions are SemVer, normalized (`v1.2` → `1.2.0`).
+//!
+//! Forge links this plugin in ([`Helm`], [`PLUGIN_TOML`]). With the
+//! `component` feature the same crate builds as a WebAssembly component of
+//! the `forge:format` world instead (`cargo xtask plugins`).
 
 mod chart;
 mod semver;
 mod tar;
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::io::{self, Read};
 
+use forge_plugin_api::{
+    Action, Answer, ChangeRequest, Dependency, DependencyGroup, FormatError, FormatPlugin, Loaded,
+    PackageInfo, PackageRef, PackageSource, ParsedPackage, PublishRequest, Query, Rendered,
+    Repository, Request, Response, SearchQuery, Upload,
+};
 use serde_json::{json, Map, Value};
 
-wit_bindgen::generate!({
-    world: "format-plugin",
-    path: "../../crates/plugin/wit",
-});
-
-use exports::forge::format::format::{Guest as FormatGuest, ParsedPackage};
-use exports::forge::format::protocol::{
-    Action, Answer, ChangeRequest, Guest as ProtocolGuest, Loaded, PackageInfo, PackageRef,
-    PublishRequest, Query, Rendered, Repository, Request, Response, SearchQuery, Upload,
-};
-use forge::format::package_source::PackageReader;
-use forge::format::types::{Dependency, DependencyGroup, FormatError};
 use semver::Version;
+
+/// This plugin's `plugin.toml`: its format id, name and version.
+pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
 
 /// Searches page through the repository this many charts at a time.
 const PAGE: u32 = 1000;
@@ -63,62 +63,41 @@ const METADATA_KEYS: &[&str] = &[
     "tags",
 ];
 
-struct Helm;
+/// The Helm chart format.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Helm;
 
-export!(Helm);
+#[cfg(feature = "component")]
+forge_plugin_api::export_component!(Helm);
 
-/// A package reader as [`Read`].
-struct Source<'a> {
-    reader: &'a PackageReader,
-    offset: u64,
-}
-
-impl Read for Source<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        let chunk = self
-            .reader
-            .read_at(self.offset, len)
-            .map_err(io::Error::other)?;
-        buf[..chunk.len()].copy_from_slice(&chunk);
-        self.offset += chunk.len() as u64;
-        Ok(chunk.len())
-    }
-}
-
-impl FormatGuest for Helm {
-    fn canonical_id(id: String) -> String {
+impl FormatPlugin for Helm {
+    fn canonical_id(&self, id: &str) -> String {
         id.to_ascii_lowercase()
     }
 
-    fn validate_id(id: String) -> Result<(), FormatError> {
-        if chart::valid_name(&id) {
+    fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        if chart::valid_name(id) {
             Ok(())
         } else {
             Err(FormatError::InvalidId(format!("invalid chart name {id:?}")))
         }
     }
 
-    fn normalize_version(version: String) -> Result<String, FormatError> {
-        Version::parse(&version)
+    fn normalize_version(&self, version: &str) -> Result<String, FormatError> {
+        Version::parse(version)
             .map(|v| v.to_string())
             .map_err(FormatError::InvalidVersion)
     }
 
-    fn compare_versions(a: String, b: String) -> i8 {
-        let order = match (Version::parse(&a), Version::parse(&b)) {
+    fn compare_versions(&self, a: &str, b: &str) -> Ordering {
+        match (Version::parse(a), Version::parse(b)) {
             (Ok(a), Ok(b)) => a.cmp(&b),
-            _ => a.cmp(&b),
-        };
-        order as i8
+            _ => a.cmp(b),
+        }
     }
 
-    fn parse_package(source: &PackageReader) -> Result<ParsedPackage, FormatError> {
-        let chart = chart::read(Source {
-            reader: source,
-            offset: 0,
-        })
-        .map_err(FormatError::InvalidPackage)?;
+    fn parse_package(&self, package: &mut dyn PackageSource) -> Result<ParsedPackage, FormatError> {
+        let chart = chart::read(package).map_err(FormatError::InvalidPackage)?;
         let dependencies = dependencies(&chart.metadata);
         Ok(ParsedPackage {
             id: chart.name.to_ascii_lowercase(),
@@ -138,8 +117,8 @@ impl FormatGuest for Helm {
         })
     }
 
-    fn manifest_summary(manifest: Vec<u8>) -> Option<String> {
-        let chart = chart::parse_chart_yaml(manifest).ok()?;
+    fn manifest_summary(&self, manifest: &[u8]) -> Option<String> {
+        let chart = chart::parse_chart_yaml(manifest.to_vec()).ok()?;
         let metadata: Map<String, Value> = chart
             .metadata
             .iter()
@@ -162,6 +141,74 @@ impl FormatGuest for Helm {
         });
         Some(summary.to_string())
     }
+
+    fn handle(&self, _repo: &Repository, req: &Request) -> Action {
+        let read = matches!(req.method.as_str(), "GET" | "HEAD");
+        let segments: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
+        match (req.method.as_str(), segments.as_slice()) {
+            (_, ["index.yaml"]) if read => Action::Load(vec![search_page(0)]),
+            (_, ["charts", name, version, file]) if read => match package_ref(name, version) {
+                Some(target) if file.ends_with(".tgz") => Action::Download(target),
+                _ => Action::Respond(not_found()),
+            },
+            (_, ["api", "charts"]) if read => Action::Load(vec![search_page(0)]),
+            (_, ["api", "charts", name]) if read => match decode(name) {
+                Some(name) if chart::valid_name(&name) => {
+                    Action::Load(vec![Query::Packages(name.to_ascii_lowercase())])
+                }
+                _ => Action::Respond(not_found()),
+            },
+            (_, ["api", "charts", name, version]) if read => match package_ref(name, version) {
+                Some(target) => Action::Load(vec![Query::Package(target)]),
+                None => Action::Respond(not_found()),
+            },
+            ("POST", ["api", "charts"]) => {
+                let multipart = req
+                    .header("content-type")
+                    .is_some_and(|v| v.to_ascii_lowercase().starts_with("multipart/form-data"));
+                Action::Publish(PublishRequest {
+                    upload: if multipart {
+                        Upload::MultipartField("chart".into())
+                    } else {
+                        Upload::Body
+                    },
+                    done: json_response(201, &json!({ "saved": true })),
+                })
+            }
+            ("DELETE", ["api", "charts", name, version]) => match package_ref(name, version) {
+                Some(target) => Action::Delete(ChangeRequest {
+                    target,
+                    done: json_response(200, &json!({ "deleted": true })),
+                }),
+                None => Action::Respond(not_found()),
+            },
+            _ => Action::Respond(not_found()),
+        }
+    }
+
+    fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Rendered {
+        let segments: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
+        match segments.as_slice() {
+            ["index.yaml"] | ["api", "charts"] => render_listing(repo, &segments, data),
+            ["api", "charts", _] => match data.first().map(|l| &l.answer) {
+                Some(Answer::Packages(versions)) if !versions.is_empty() => {
+                    let mut versions: Vec<&PackageInfo> = versions.iter().collect();
+                    newest_first(&mut versions);
+                    let entries: Vec<Value> =
+                        versions.into_iter().map(|p| entry(repo, p)).collect();
+                    Rendered::Respond(json_response(200, &Value::Array(entries)))
+                }
+                _ => Rendered::Respond(not_found()),
+            },
+            ["api", "charts", _, _] => match data.first().map(|l| &l.answer) {
+                Some(Answer::Package(Some(p))) => {
+                    Rendered::Respond(json_response(200, &entry(repo, p)))
+                }
+                _ => Rendered::Respond(not_found()),
+            },
+            _ => Rendered::Respond(not_found()),
+        }
+    }
 }
 
 /// Chart.yaml `dependencies` as Forge dependencies.
@@ -180,16 +227,8 @@ fn dependencies(metadata: &Map<String, Value>) -> Vec<Dependency> {
         .collect()
 }
 
-fn respond(status: u16, content_type: &str, body: Vec<u8>) -> Response {
-    Response {
-        status,
-        headers: vec![("content-type".into(), content_type.into())],
-        body,
-    }
-}
-
 fn json_response(status: u16, value: &Value) -> Response {
-    respond(status, "application/json", value.to_string().into_bytes())
+    Response::new(status, "application/json", value.to_string())
 }
 
 fn not_found() -> Response {
@@ -231,76 +270,6 @@ fn search_page(skip: u32) -> Query {
         take: PAGE,
         prerelease: true,
     })
-}
-
-impl ProtocolGuest for Helm {
-    fn handle(_repo: Repository, req: Request) -> Action {
-        let read = matches!(req.method.as_str(), "GET" | "HEAD");
-        let segments: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
-        match (req.method.as_str(), segments.as_slice()) {
-            (_, ["index.yaml"]) if read => Action::Load(vec![search_page(0)]),
-            (_, ["charts", name, version, file]) if read => match package_ref(name, version) {
-                Some(target) if file.ends_with(".tgz") => Action::Download(target),
-                _ => Action::Respond(not_found()),
-            },
-            (_, ["api", "charts"]) if read => Action::Load(vec![search_page(0)]),
-            (_, ["api", "charts", name]) if read => match decode(name) {
-                Some(name) if chart::valid_name(&name) => {
-                    Action::Load(vec![Query::Packages(name.to_ascii_lowercase())])
-                }
-                _ => Action::Respond(not_found()),
-            },
-            (_, ["api", "charts", name, version]) if read => match package_ref(name, version) {
-                Some(target) => Action::Load(vec![Query::Package(target)]),
-                None => Action::Respond(not_found()),
-            },
-            ("POST", ["api", "charts"]) => {
-                let multipart = req.headers.iter().any(|(k, v)| {
-                    k == "content-type" && v.to_ascii_lowercase().starts_with("multipart/form-data")
-                });
-                Action::Publish(PublishRequest {
-                    upload: if multipart {
-                        Upload::MultipartField("chart".into())
-                    } else {
-                        Upload::Body
-                    },
-                    done: json_response(201, &json!({ "saved": true })),
-                })
-            }
-            ("DELETE", ["api", "charts", name, version]) => match package_ref(name, version) {
-                Some(target) => Action::Delete(ChangeRequest {
-                    target,
-                    done: json_response(200, &json!({ "deleted": true })),
-                }),
-                None => Action::Respond(not_found()),
-            },
-            _ => Action::Respond(not_found()),
-        }
-    }
-
-    fn render(repo: Repository, req: Request, data: Vec<Loaded>) -> Rendered {
-        let segments: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
-        match segments.as_slice() {
-            ["index.yaml"] | ["api", "charts"] => render_listing(&repo, &segments, &data),
-            ["api", "charts", _] => match data.first().map(|l| &l.answer) {
-                Some(Answer::Packages(versions)) if !versions.is_empty() => {
-                    let mut versions: Vec<&PackageInfo> = versions.iter().collect();
-                    newest_first(&mut versions);
-                    let entries: Vec<Value> =
-                        versions.into_iter().map(|p| entry(&repo, p)).collect();
-                    Rendered::Respond(json_response(200, &Value::Array(entries)))
-                }
-                _ => Rendered::Respond(not_found()),
-            },
-            ["api", "charts", _, _] => match data.first().map(|l| &l.answer) {
-                Some(Answer::Package(Some(p))) => {
-                    Rendered::Respond(json_response(200, &entry(&repo, p)))
-                }
-                _ => Rendered::Respond(not_found()),
-            },
-            _ => Rendered::Respond(not_found()),
-        }
-    }
 }
 
 /// The index (`/index.yaml`) or the ChartMuseum listing (`/api/charts`):
@@ -381,14 +350,10 @@ fn render_listing(repo: &Repository, segments: &[&str], data: &[Loaded]) -> Rend
         index.insert("generated".into(), json!(latest));
     }
     // JSON is YAML; Helm reads either.
-    Rendered::Respond(Response {
-        status: 200,
-        headers: vec![
-            ("content-type".into(), "application/x-yaml".into()),
-            ("cache-control".into(), "no-cache".into()),
-        ],
-        body: Value::Object(index).to_string().into_bytes(),
-    })
+    Rendered::Respond(
+        Response::new(200, "application/x-yaml", Value::Object(index).to_string())
+            .with_header("cache-control", "no-cache"),
+    )
 }
 
 fn newest_first(versions: &mut [&PackageInfo]) {
@@ -432,4 +397,27 @@ fn entry(repo: &Repository, p: &PackageInfo) -> Value {
         chart.insert("digest".into(), json!(sha256));
     }
     Value::Object(chart)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_toml_names_this_crate() {
+        let value = |key: &str| {
+            PLUGIN_TOML
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .find(|(k, _)| k.trim() == key)
+                .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        };
+        assert_eq!(value("id").as_deref(), Some("helm"));
+        assert_eq!(value("version").as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(value("api").as_deref(), Some(forge_plugin_api::API));
+        assert_eq!(
+            value("component"),
+            Some(format!("{}.wasm", env!("CARGO_CRATE_NAME")))
+        );
+    }
 }

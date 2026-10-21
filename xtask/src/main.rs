@@ -145,11 +145,12 @@ Rust build & quality:
   prepare-check Migrate, then verify the committed .sqlx/ cache is in sync (CI's drift guard).
   clean         Remove build artifacts (cargo clean).
 
-Format plugins (plugins/<id>/, WebAssembly components; needs the wasm32-wasip2
-target: `rustup target add wasm32-wasip2`):
-  plugins       Build every plugin and install it under target/plugins/installed/<id>/,
-                printing the [plugins] configuration that loads them (with digests).
-  plugins-check fmt --check, clippy -D warnings and unit tests of every plugin.
+Format plugins as WebAssembly components (plugins/<id>/; the workspace builds
+them natively, these need the wasm32-wasip2 target: `rustup target add wasm32-wasip2`):
+  plugins       Build every plugin as a component and install it under
+                target/plugins/installed/<id>/, printing the [plugins]
+                configuration that loads them (with digests).
+  plugins-check clippy -D warnings of every plugin's component build, and the build.
 
 Docker image (single container: web SPA + Rust server):
   docker-build  Build the application image from ./Dockerfile (multi-stage:
@@ -709,10 +710,11 @@ fn clean() -> Result<(), String> {
 
 // ── Format plugins ───────────────────────────────────────────────────────────
 
-/// Format plugins: one crate per directory, each its own workspace.
+/// Format plugins: one workspace crate per directory (`plugins/<id>/`).
 const PLUGINS: &str = "plugins";
 
-/// Where `plugins` builds and installs them.
+/// Where the components are built and installed (apart from `target/`, so a
+/// wasm build never invalidates the host's).
 const PLUGINS_TARGET: &str = "target/plugins";
 
 /// The plugin directories (`plugins/<id>/` with a `plugin.toml`), sorted.
@@ -741,6 +743,14 @@ fn plugin_component(dir: &std::path::Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} has no component", manifest.display()))
 }
 
+/// Whether the server links the plugin in `dir` (a path dependency of
+/// forge-server): its id is then taken by the built-in plugin.
+fn plugin_is_builtin(dir: &std::path::Path) -> bool {
+    let server = std::fs::read_to_string("crates/server/Cargo.toml").unwrap_or_default();
+    let path = format!("\"../../{}\"", dir.display()).replace('\\', "/");
+    server.contains(&path)
+}
+
 /// The SHA-256 of `file` (`sha256sum`, or `shasum -a 256` on macOS).
 fn sha256_of(file: &std::path::Path) -> Option<String> {
     let tools: [(&str, &[&str]); 2] = [("sha256sum", &[]), ("shasum", &["-a", "256"])];
@@ -757,8 +767,29 @@ fn sha256_of(file: &std::path::Path) -> Option<String> {
     })
 }
 
-/// Build every plugin and install it as an operator would (plugin.toml plus
-/// component under `target/plugins/installed/<id>/`).
+/// `cargo <sub>` of the plugin crate in `dir` for wasm32-wasip2 with its
+/// `component` feature, into [`PLUGINS_TARGET`].
+fn plugin_cargo(sub: &str, dir: &std::path::Path) -> Cmd {
+    Cmd::new("cargo")
+        .args([sub, "--locked", "--target", "wasm32-wasip2"])
+        .args(["--features", "component", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"))
+        .args(["--target-dir", PLUGINS_TARGET])
+}
+
+/// Build the component of the plugin in `dir` (the crate as a `cdylib`, with
+/// the `plugin` profile); returns its path.
+fn build_component(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    plugin_cargo("rustc", dir)
+        .args(["--lib", "--crate-type", "cdylib", "--profile", "plugin"])
+        .run()?;
+    Ok(std::path::Path::new(PLUGINS_TARGET)
+        .join("wasm32-wasip2/plugin")
+        .join(plugin_component(dir)?))
+}
+
+/// Build every plugin as a component and install it as an operator would
+/// (plugin.toml plus component under `target/plugins/installed/<id>/`).
 fn plugins() -> Result<(), String> {
     let mut pins = Vec::new();
     for dir in plugin_dirs()? {
@@ -768,18 +799,7 @@ fn plugins() -> Result<(), String> {
             .ok_or("plugin directory name is not UTF-8")?
             .to_string();
         let component = plugin_component(&dir)?;
-        Cmd::new("cargo")
-            .args([
-                "build",
-                "--release",
-                "--locked",
-                "--target",
-                "wasm32-wasip2",
-            ])
-            .arg("--manifest-path")
-            .arg(dir.join("Cargo.toml"))
-            .args(["--target-dir", PLUGINS_TARGET])
-            .run()?;
+        let built = build_component(&dir)?;
         let installed = std::path::Path::new(PLUGINS_TARGET)
             .join("installed")
             .join(&id);
@@ -787,16 +807,13 @@ fn plugins() -> Result<(), String> {
             .map_err(|e| format!("create {}: {e}", installed.display()))?;
         std::fs::copy(dir.join("plugin.toml"), installed.join("plugin.toml"))
             .map_err(|e| format!("copy plugin.toml: {e}"))?;
-        let built = std::path::Path::new(PLUGINS_TARGET)
-            .join("wasm32-wasip2/release")
-            .join(&component);
         std::fs::copy(&built, installed.join(&component))
             .map_err(|e| format!("copy {}: {e}", built.display()))?;
         let pin = sha256_of(&installed.join(&component)).map_or_else(
             || "<sha256 of the component>".to_string(),
             |sha| format!("sha256:{sha}"),
         );
-        pins.push((id, pin));
+        pins.push((id, pin, plugin_is_builtin(&dir)));
     }
     let dir = std::env::current_dir()
         .map_err(|e| e.to_string())?
@@ -810,45 +827,28 @@ fn plugins() -> Result<(), String> {
         "[plugins]\ndir = {:?}\n\n[plugins.formats]",
         dir.display().to_string()
     );
-    for (id, pin) in pins {
-        println!("{id} = \"{pin}\"");
+    for (id, pin, builtin) in pins {
+        if builtin {
+            println!(
+                "# {id} is built into the server: its component loads only under another id\n\
+                 # (rename its directory, `id` in its plugin.toml and the key here).\n\
+                 # {id} = \"{pin}\""
+            );
+        } else {
+            println!("{id} = \"{pin}\"");
+        }
     }
     Ok(())
 }
 
-/// What CI checks of every plugin: formatting, lints (for the wasm target and
-/// for its native unit tests), and the unit tests.
+/// What CI checks of every plugin beyond the workspace's own fmt, clippy and
+/// tests: that it lints clean and builds as a WebAssembly component.
 fn plugins_check() -> Result<(), String> {
     for dir in plugin_dirs()? {
-        let manifest = dir.join("Cargo.toml");
-        let target_dir = ["--target-dir", PLUGINS_TARGET];
-        Cmd::new("cargo")
-            .args(["fmt", "--check", "--manifest-path"])
-            .arg(&manifest)
-            .run()?;
-        Cmd::new("cargo")
-            .args([
-                "clippy",
-                "--locked",
-                "--target",
-                "wasm32-wasip2",
-                "--manifest-path",
-            ])
-            .arg(&manifest)
-            .args(target_dir)
+        plugin_cargo("clippy", &dir)
             .args(["--", "-D", "warnings"])
             .run()?;
-        Cmd::new("cargo")
-            .args(["clippy", "--locked", "--tests", "--manifest-path"])
-            .arg(&manifest)
-            .args(target_dir)
-            .args(["--", "-D", "warnings"])
-            .run()?;
-        Cmd::new("cargo")
-            .args(["test", "--locked", "--lib", "--manifest-path"])
-            .arg(&manifest)
-            .args(target_dir)
-            .run()?;
+        build_component(&dir)?;
     }
     Ok(())
 }

@@ -7,7 +7,7 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::StoreLimits;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
-use crate::bindings::forge::format::{package_source, types};
+use super::bindings::forge::format::{package_source, types};
 
 /// The most `read-at` returns in one call.
 const MAX_READ: u32 = 1024 * 1024;

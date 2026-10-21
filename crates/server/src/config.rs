@@ -61,8 +61,9 @@ pub struct Config {
     /// proxied packages.
     #[serde(default)]
     pub nuget: NugetConfig,
-    /// Format plugins: further package formats as WebAssembly components
-    /// (see `docs/format-plugins.md`). None are loaded by default.
+    /// WebAssembly format plugins: further package formats loaded at startup
+    /// (see `docs/format-plugins.md`). None are loaded by default; the
+    /// built-in plugins (Helm) need no configuration.
     #[serde(default)]
     pub plugins: PluginsConfig,
     /// Static web UI (SPA) serving.
@@ -1142,11 +1143,13 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
     forge_nuget::model::NupkgLimits::default().max_nuspec_compression_ratio
 }
 
-/// `plugins.*` — format plugins.
+/// `plugins.*` — WebAssembly format plugins.
 ///
-/// Every plugin is listed explicitly with the SHA-256 of its component: a
-/// directory under `dir` that is not listed is never loaded, and a listed one
-/// whose component does not match its pin fails startup. Every instance must
+/// The format plugins built into the server (Helm) are always installed.
+/// Further ones are WebAssembly components, each listed explicitly with the
+/// SHA-256 of its component: a directory under `dir` that is not listed is
+/// never loaded, and a listed one whose component does not match its pin, or
+/// whose id is taken by a built-in format, fails startup. Every instance must
 /// therefore load the same plugins (the same configuration and files), since
 /// a repository of a format an instance lacks is unavailable there.
 ///
@@ -1155,11 +1158,11 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
 /// dir = "/etc/forge/plugins"     # holds <id>/plugin.toml + its component
 ///
 /// [plugins.formats]
-/// helm = "sha256:3f1c…"          # format id → pinned component digest
+/// example = "sha256:3f1c…"       # format id → pinned component digest
 /// ```
 ///
 /// As environment variables: `FORGE_PLUGINS__DIR`,
-/// `FORGE_PLUGINS__FORMATS__HELM`.
+/// `FORGE_PLUGINS__FORMATS__EXAMPLE`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginsConfig {

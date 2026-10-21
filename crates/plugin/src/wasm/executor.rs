@@ -1,10 +1,10 @@
-//! The threads plugin code runs on.
+//! The threads guest code runs on.
 //!
 //! Guest code never runs on a tokio worker: the WASI bindings answer a
 //! guest's stdout/stderr writes (a panic message, say) by blocking on a tokio
 //! runtime, which panics inside an asynchronous context. Every call into a
-//! plugin is therefore handed to a dedicated thread; an async caller awaits
-//! the result, a synchronous one blocks until it is there.
+//! component is therefore handed to a dedicated thread, and the caller
+//! blocks until the result is there.
 //!
 //! There are two pools, so that the calls a request makes synchronously — the
 //! [`forge_core::Format`] rules, microseconds each, waited for on a tokio
@@ -90,22 +90,5 @@ where
         }))
         .map_err(|_| PluginError::Trap("the plugin threads are gone".into()))?;
     rx.recv()
-        .map_err(|_| PluginError::Trap("the plugin call panicked".into()))
-}
-
-/// Run `f` on a thread of `pool` and await its result.
-pub(crate) async fn run<R, F>(pool: Pool, f: F) -> Result<R, PluginError>
-where
-    R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    executor(pool)
-        .jobs
-        .send(Box::new(move || {
-            let _ = tx.send(f());
-        }))
-        .map_err(|_| PluginError::Trap("the plugin threads are gone".into()))?;
-    rx.await
         .map_err(|_| PluginError::Trap("the plugin call panicked".into()))
 }

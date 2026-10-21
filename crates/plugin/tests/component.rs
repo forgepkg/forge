@@ -1,5 +1,7 @@
-//! The example Helm plugin (`plugins/helm`) loaded into the host: its format
-//! rules, its package parser, its protocol, and the sandbox around it.
+//! The Helm plugin (`plugins/helm`) built as a WebAssembly component and
+//! loaded into the host: its format rules, its package parser, its protocol,
+//! the sandbox around it — and that it answers exactly like the same crate
+//! built in.
 
 use std::cmp::Ordering;
 use std::io::Write;
@@ -7,18 +9,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use forge_core::Format;
-use forge_plugin::protocol::{
-    Action, Answer, Loaded, PackageInfo, Query, Rendered, Repository, RepositoryKind, Request,
-    SearchHit, SearchResult, Upload, VersionInfo,
+use forge_plugin::api::{
+    Action, Answer, FormatPlugin, Loaded, PackageInfo, Query, Rendered, Repository, RepositoryKind,
+    Request, SearchHit, SearchResult, Upload, VersionInfo,
 };
 use forge_plugin::testing::{component_sha256, example_plugin};
-use forge_plugin::{HostLimits, Manifest, Plugin, PluginError, PluginFormat};
+use forge_plugin::{HostLimits, Manifest, Origin, Plugin, PluginError, PluginFormat};
 
 fn helm() -> (PathBuf, Arc<Plugin>) {
     let dir = example_plugin("helm");
     let plugin = Plugin::load(&dir, &component_sha256(&dir), &HostLimits::default())
         .expect("load the helm plugin");
     (dir, plugin)
+}
+
+fn builtin() -> Arc<Plugin> {
+    Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm).unwrap()
 }
 
 /// A gzipped ustar archive of `(path, contents)` entries.
@@ -72,7 +78,13 @@ fn request(method: &str, path: &str) -> Request {
 fn loads_only_the_pinned_component() {
     let (dir, plugin) = helm();
     assert_eq!(plugin.id(), "helm");
-    assert_eq!(plugin.sha256(), component_sha256(&dir));
+    assert!(!plugin.is_builtin());
+    assert_eq!(
+        plugin.origin(),
+        &Origin::Wasm {
+            sha256: component_sha256(&dir)
+        }
+    );
     let err = Plugin::load(&dir, &"0".repeat(64), &HostLimits::default()).unwrap_err();
     assert!(matches!(err, PluginError::Digest { .. }), "{err}");
     // The pin may carry its algorithm.
@@ -83,7 +95,7 @@ fn loads_only_the_pinned_component() {
 #[test]
 fn the_format_rules_come_from_the_plugin() {
     let (_, plugin) = helm();
-    let format = PluginFormat::new(plugin);
+    let format = PluginFormat::new(&plugin);
     assert_eq!(format.id(), "helm");
     assert_eq!(format.lower_id("Ingress-NGINX"), "ingress-nginx");
     assert!(format.validate_id("ingress-nginx").is_ok());
@@ -109,7 +121,7 @@ fn the_format_rules_come_from_the_plugin() {
 #[test]
 fn parses_a_chart_through_the_lent_reader() {
     let (_, plugin) = helm();
-    let format = PluginFormat::new(plugin);
+    let format = PluginFormat::new(&plugin);
     let mut staged = tempfile::NamedTempFile::new().unwrap();
     staged.write_all(&chart("NGINX", "v2.1")).unwrap();
 
@@ -141,14 +153,15 @@ fn parses_a_chart_through_the_lent_reader() {
     assert!(err.to_string().contains("not a chart archive"), "{err}");
 }
 
-#[tokio::test]
-async fn routes_requests_to_host_actions() {
+#[test]
+fn routes_requests_to_host_actions() {
     let (_, plugin) = helm();
+    let plugin = plugin.implementation();
 
-    let action = plugin
-        .handle(repo(), request("GET", "/charts/nginx/v2.1/nginx-2.1.0.tgz"))
-        .await
-        .unwrap();
+    let action = plugin.handle(
+        &repo(),
+        &request("GET", "/charts/nginx/v2.1/nginx-2.1.0.tgz"),
+    );
     let Action::Download(target) = action else {
         panic!("expected a download, got {action:?}");
     };
@@ -157,10 +170,7 @@ async fn routes_requests_to_host_actions() {
         ("nginx", "2.1.0")
     );
 
-    let action = plugin
-        .handle(repo(), request("POST", "/api/charts"))
-        .await
-        .unwrap();
+    let action = plugin.handle(&repo(), &request("POST", "/api/charts"));
     assert!(
         matches!(&action, Action::Publish(p) if matches!(p.upload, Upload::Body)),
         "{action:?}"
@@ -170,16 +180,13 @@ async fn routes_requests_to_host_actions() {
         "content-type".into(),
         "multipart/form-data; boundary=x".into(),
     )];
-    let action = plugin.handle(repo(), multipart).await.unwrap();
+    let action = plugin.handle(&repo(), &multipart);
     assert!(
         matches!(&action, Action::Publish(p) if matches!(&p.upload, Upload::MultipartField(f) if f == "chart")),
         "{action:?}"
     );
 
-    let action = plugin
-        .handle(repo(), request("DELETE", "/api/charts/NGINX/2.1.0"))
-        .await
-        .unwrap();
+    let action = plugin.handle(&repo(), &request("DELETE", "/api/charts/NGINX/2.1.0"));
     assert!(
         matches!(&action, Action::Delete(c) if c.target.id == "nginx"),
         "{action:?}"
@@ -190,7 +197,7 @@ async fn routes_requests_to_host_actions() {
         ("PUT", "/index.yaml"),
         ("GET", "/charts/..%2Fx/1.0.0/x.tgz"),
     ] {
-        let action = plugin.handle(repo(), request(method, path)).await.unwrap();
+        let action = plugin.handle(&repo(), &request(method, path));
         assert!(
             matches!(&action, Action::Respond(r) if r.status == 404),
             "{method} {path}: {action:?}"
@@ -198,11 +205,12 @@ async fn routes_requests_to_host_actions() {
     }
 }
 
-#[tokio::test]
-async fn renders_the_index_from_what_it_loads() {
+#[test]
+fn renders_the_index_from_what_it_loads() {
     let (_, plugin) = helm();
+    let plugin = plugin.implementation();
     let req = request("GET", "/index.yaml");
-    let Action::Load(first) = plugin.handle(repo(), req.clone()).await.unwrap() else {
+    let Action::Load(first) = plugin.handle(&repo(), &req) else {
         panic!("the index loads data");
     };
     assert!(matches!(&first[..], [Query::Search(s)] if s.skip == 0 && s.prerelease));
@@ -225,11 +233,7 @@ async fn renders_the_index_from_what_it_loads() {
             }],
         }),
     }];
-    let Rendered::Load(second) = plugin
-        .render(repo(), req.clone(), data.clone())
-        .await
-        .unwrap()
-    else {
+    let Rendered::Load(second) = plugin.render(&repo(), &req, &data) else {
         panic!("the index loads each chart's versions");
     };
     assert!(
@@ -256,7 +260,7 @@ async fn renders_the_index_from_what_it_loads() {
             package("2.1.0", true),
         ]),
     });
-    let Rendered::Respond(response) = plugin.render(repo(), req, data).await.unwrap() else {
+    let Rendered::Respond(response) = plugin.render(&repo(), &req, &data) else {
         panic!("the index renders once everything is loaded");
     };
     assert_eq!(response.status, 200);
@@ -327,7 +331,7 @@ fn runs_inside_its_limits() {
         &HostLimits::default(),
     )
     .unwrap();
-    let format = PluginFormat::new(plugin);
+    let format = PluginFormat::new(&plugin);
     let bomb = {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         // A tar entry claiming 32 MiB of zeros before any Chart.yaml.
@@ -350,4 +354,102 @@ fn runs_inside_its_limits() {
         "{err}"
     );
     assert_eq!(format.normalize_version("1.0").unwrap(), "1.0.0");
+}
+
+#[test]
+fn a_builtin_plugin_has_no_component() {
+    let plugin = builtin();
+    assert_eq!(plugin.id(), "helm");
+    assert!(plugin.is_builtin());
+    assert_eq!(plugin.sha256(), None);
+    assert_eq!(plugin.manifest().name, "Helm charts");
+    let format = PluginFormat::new(&plugin);
+    assert_eq!(format.lower_id("NGINX"), "nginx");
+}
+
+/// One contract, two ways to run it: the component and the built-in crate
+/// answer every call the same.
+#[test]
+fn the_component_answers_like_the_builtin_plugin() {
+    let (_, component) = helm();
+    let builtin = builtin();
+    let (wasm, native): (&dyn FormatPlugin, &dyn FormatPlugin) = (
+        component.implementation().as_ref(),
+        builtin.implementation().as_ref(),
+    );
+
+    for id in ["Ingress-NGINX", "nginx", "../etc", ""] {
+        assert_eq!(wasm.canonical_id(id), native.canonical_id(id), "{id:?}");
+        assert_eq!(wasm.validate_id(id), native.validate_id(id), "{id:?}");
+    }
+    for version in ["v1.2", "1.0.0-rc.1+build.5", "one", ""] {
+        assert_eq!(
+            wasm.normalize_version(version),
+            native.normalize_version(version),
+            "{version:?}"
+        );
+    }
+    for (a, b) in [
+        ("1.10.0", "1.9.0"),
+        ("1.0.0-rc.1", "1.0.0"),
+        ("2.0.0", "2.0.0"),
+    ] {
+        assert_eq!(wasm.compare_versions(a, b), native.compare_versions(a, b));
+    }
+
+    let package = std::io::Cursor::new(chart("NGINX", "v2.1"));
+    let parsed = wasm.parse_package(&mut package.clone()).unwrap();
+    assert_eq!(parsed, native.parse_package(&mut package.clone()).unwrap());
+    assert_eq!(
+        wasm.manifest_summary(&parsed.manifest),
+        native.manifest_summary(&parsed.manifest)
+    );
+    let mut garbage = std::io::Cursor::new(b"not a chart".to_vec());
+    let mut garbage_too = garbage.clone();
+    assert_eq!(
+        wasm.parse_package(&mut garbage),
+        native.parse_package(&mut garbage_too)
+    );
+
+    let mut multipart = request("POST", "/api/charts");
+    multipart.headers = vec![(
+        "content-type".into(),
+        "multipart/form-data; boundary=x".into(),
+    )];
+    for req in [
+        request("GET", "/index.yaml"),
+        request("GET", "/charts/nginx/2.1.0/nginx-2.1.0.tgz"),
+        request("HEAD", "/api/charts/nginx"),
+        request("GET", "/api/charts/nginx/2.1.0"),
+        request("POST", "/api/charts"),
+        multipart,
+        request("DELETE", "/api/charts/nginx/2.1.0"),
+        request("GET", "/nope"),
+    ] {
+        assert_eq!(
+            wasm.handle(&repo(), &req),
+            native.handle(&repo(), &req),
+            "{req:?}"
+        );
+    }
+
+    let req = request("GET", "/api/charts/nginx");
+    let data = [Loaded {
+        query: Query::Packages("nginx".into()),
+        answer: Answer::Packages(vec![PackageInfo {
+            original_id: "NGINX".into(),
+            version: "2.1.0".into(),
+            version_original: "v2.1".into(),
+            listed: true,
+            published: Some("2026-10-01T12:00:00Z".into()),
+            sha256: Some("ab".repeat(32)),
+            sha512: None,
+            size: Some(1234),
+            summary: native.manifest_summary(&parsed.manifest),
+        }]),
+    }];
+    assert_eq!(
+        wasm.render(&repo(), &req, &data),
+        native.render(&repo(), &req, &data)
+    );
 }
