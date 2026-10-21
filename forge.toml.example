@@ -147,6 +147,17 @@ max_nuspec_compression_ratio = 200          # (default: 200)
 # [plugins.formats]
 # example = "sha256:<64 hex digits>"
 
+[docker]
+# The Docker / OCI registry under /v2 (see docs/docker.md).
+max_blob_bytes                = 1073741824  # (default: 1 GiB) largest layer pushed or proxied; staged on disk
+token_ttl_seconds             = 300         # (default: 300) registry token lifetime, 60-3600
+# Signs registry tokens (at least 32 characters). Unset: a key generated once
+# and kept in the database, sealed when [crypto] is enabled.
+# token_secret = "…"
+upload_ttl_seconds            = 86400       # (default: 24 h) abandoned upload sessions expire
+unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) unused blobs no manifest references
+sweep_interval_seconds        = 300         # (default: 300)
+
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
 default_ttl_seconds = 30        # (default: 30)

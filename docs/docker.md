@@ -1,0 +1,260 @@
+# Docker / OCI registry
+
+Forge serves container images and other OCI artifacts (Helm charts, cosign
+signatures, SBOMs) under `/v2/`, the way Nexus' docker-hosted, docker-proxy
+and docker-group repositories do. It speaks the
+[OCI Distribution Spec](https://github.com/opencontainers/distribution-spec)
+v1.1 that Docker, Podman, containerd, crane, skopeo, oras, Helm and cosign
+use. CI runs the spec's conformance suite against Forge on every change.
+
+Images live in repositories of `format: "docker"`, which come in the same
+three kinds as NuGet repositories:
+
+- **hosted**: push and pull your own images;
+- **proxy**: a pull-through cache of an upstream registry: Docker Hub, GHCR,
+  Quay, MCR, or any registry that speaks the distribution spec;
+- **group**: one name over several members, resolved by priority.
+
+Layers, configs and manifests are blobs in the content-addressed store. A
+layer shared by many images, or by images in several repositories, is
+stored once.
+
+## Names
+
+Docker clients always talk to `https://<host>/v2/`. Forge finds the
+repository in the image name:
+
+- **By path** (always available): the first component of the name is the
+  Forge repository, the rest the image.
+  `forge.example.com/docker-hosted/team/app:1.2` is the image `team/app` in
+  the repository `docker-hosted`.
+- **By host** (optional): a repository with a `host`
+  (`"host": "docker.example.com"`) also answers at the root of that host, so
+  its images keep short names: `docker.example.com/team/app:1.2`. Point the
+  host name at Forge, include it in the TLS certificate, keep `Host` intact
+  in the reverse proxy, and add it to `server.allowed_hosts` if you use
+  `anonymous_mode = "allowlist"`.
+
+A docker repository's name is part of every image name, so it follows the
+spec's name grammar: lowercase letters and digits, separated by `.`, `_`,
+`__` or `-` (for example `docker-hosted`). Image names follow the same
+grammar, with `/` between components.
+
+Nexus-style per-repository connector ports are not supported: they are
+awkward behind an Ingress.
+
+## Logging in
+
+Forge implements Docker's Bearer token service (Nexus' "Docker Bearer Token
+Realm"): `GET /v2/` answers `401` with a challenge naming the token endpoint
+`/v2/token`, the client sends its credentials there once and receives a
+short-lived token (`docker.token_ttl_seconds`, 5 minutes by default) for the
+repositories and actions it asked for.
+
+```bash
+docker login forge.example.com -u <username>   # password: an API token
+docker pull forge.example.com/docker-hosted/team/app:1.2
+docker push forge.example.com/docker-hosted/team/app:1.3
+```
+
+- **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
+  the password to use. A token's repository scope applies.
+- **Passwords** work where Basic passwords are allowed at all:
+  `auth.allow_password_basic`, or an enabled credential-forwarding realm (so
+  users of an existing Nexus or LDAP sign in with their upstream password).
+  The password goes to the token endpoint only; the registry itself sees the
+  short-lived token.
+- **CI workloads** with a workload-identity realm pass their OIDC token as
+  the password ([trusted publishing](trusted-publishing.md)); their pushes
+  are recorded in the trusted-publishing ledger.
+- **Anonymous pulls** work for repositories that allow anonymous read (with
+  `auth.anonymous_mode`): clients get an anonymous token without logging in.
+- A browser session never pushes, even an administrator's.
+
+A registry token grants only what the caller may do when it is issued:
+`pull` needs `read` on the repository, `push` needs `write`, and `delete`
+needs `delete`; content selectors match image names (`team/*`). Every
+request is authorized again against the current permissions, and the user
+and API token behind a registry token must still be active. Registry tokens
+are accepted under `/v2` only.
+
+Registry tokens are signed with `docker.token_secret` when set, otherwise
+with a key Forge generates once and keeps in the database (sealed with the
+`[crypto]` envelope key when secret encryption is enabled), so every
+instance accepts every instance's tokens.
+
+## Hosted repositories
+
+```bash
+curl -u admin:<admin-token> -H 'content-type: application/json' \
+  https://forge.example.com/admin/repositories \
+  -d '{"name":"docker-hosted","kind":"hosted","format":"docker"}'
+```
+
+All of the spec's push paths work: monolithic and chunked (resumable)
+uploads, cross-repository mounts (`?mount=&from=`, needs read on the source
+image), pushes by tag or digest, `?tag=` parameters on a push by digest, and
+deletes of tags, manifests and blobs. Manifests may be Docker v2 schema 2
+manifests and manifest lists, OCI image manifests and indexes, or artifacts
+with any `artifactType`; Docker schema 1 is refused.
+
+- **Immutable tags**: `"immutable_tags": true` refuses to move an existing
+  tag to another manifest (re-pushing the same manifest is fine). With
+  `"latest_mutable": true`, `latest` may still move.
+- A manifest must name blobs the image has (`MANIFEST_BLOB_UNKNOWN`
+  otherwise), except non-distributable layers and the OCI empty config
+  (`{}`), which Forge stores itself when it is missing.
+- A blob a manifest of the image references cannot be deleted (`409`):
+  delete the manifest first.
+- Uploads are limited to `docker.max_blob_bytes` per blob (1 GiB by default)
+  and staged on disk like package pushes (see `server.max_staging_bytes`).
+  Upload sessions are shared by all instances; an abandoned one expires
+  after `docker.upload_ttl_seconds`.
+
+### Signatures, SBOMs and attestations
+
+The referrers API (`GET /v2/<name>/referrers/<digest>`, with the
+`artifactType` filter) lists every manifest whose `subject` is the digest,
+with its annotations. cosign 3 stores signatures and attestations there by
+default; older cosign versions use tags (`sha256-<digest>.sig`), which work
+as well.
+
+## Proxy repositories
+
+```bash
+curl -u admin:<admin-token> -H 'content-type: application/json' \
+  https://forge.example.com/admin/repositories -d '{
+    "name": "docker-hub", "kind": "proxy", "format": "docker",
+    "remote_url": "https://registry-1.docker.io",
+    "upstream_username": "envisia", "upstream_password": "<docker hub token>"
+  }'
+docker pull forge.example.com/docker-hub/nginx:1.27
+```
+
+- `remote_url` is the registry's base URL: `https://registry-1.docker.io`
+  (not `docker.io`), `https://ghcr.io`, `https://quay.io`,
+  `https://mcr.microsoft.com`.
+- Docker Hub's one-component names live in `library/`: `nginx` and
+  `library/nginx` are the same image, cached once.
+- Upstream credentials are optional; give Docker Hub ones to raise its pull
+  rate limit. They are sent to the upstream and to the token service its
+  `401` challenge names (Docker Hub's `auth.docker.io`), over https when the
+  upstream is https. With secret encryption they are sealed at rest.
+- Blobs and manifests pulled by digest are verified against their digest and
+  cached for good. A tag is served from the cache for `metadata_ttl_seconds`
+  (default 600) and then re-validated with a `HEAD`, which Docker Hub does not
+  count against the rate limit. While the upstream is unreachable or rate
+  limits, the cached tag is served; an upstream "not found" is remembered for
+  `not_found_ttl_seconds` (default 60).
+- Multi-arch indexes are cached as they are; each platform's manifest and
+  layers are fetched when a client asks for them. Tag lists and referrers
+  come from the upstream, or from the cache while it is unreachable.
+- An offline proxy (`"online": false`) serves only what it cached. Pointing a
+  proxy at another `remote_url` empties its cache.
+- A proxy is read-only (`405` on pushes).
+
+## Group repositories
+
+```bash
+curl … /admin/repositories -d '{"name":"docker","kind":"group","format":"docker",
+                                 "writable_member":"docker-hosted",
+                                 "reserved_prefixes":["envisia/"]}'
+curl … /admin/repositories/docker/members -d '{"member":"docker-hosted","priority":10}'
+curl … /admin/repositories/docker/members -d '{"member":"docker-hub","priority":5}'
+docker pull forge.example.com/docker/nginx:1.27
+```
+
+- A pull is served by the highest-priority member that has the image and the
+  caller may read; a failing member (an unreachable upstream) is skipped
+  while another answers. Tag lists and referrers are merged.
+- Members must be docker repositories.
+- **Pushes** to a group go to its `writable_member`, a hosted member (Nexus
+  Pro's group deployment). Without one, pushes are refused. The caller needs
+  read on the group and write on that member.
+- **Dependency-confusion guard**: an image under one of the group's
+  `reserved_prefixes` (namespaces such as `envisia/`) is never served by a
+  proxy member, and with `prefer_hosted` (on by default) neither is an image
+  a hosted member already has. Flag trusted members as `owner` when hosted
+  members have different writers, as for NuGet groups.
+
+## Browsing
+
+The web UI lists a docker repository's images, and per image its tags and
+manifests with digests, sizes, platforms, referrers, push and pull times, and
+ready-to-paste `docker login` / `docker pull` commands. The same data is in
+the browse API: `GET /browse/images?repo=<name>` and
+`GET /browse/images/<repo>/<image>`.
+
+The catalog API (`/v2/_catalog`) is not supported.
+
+## Retention and garbage collection
+
+A manifest keeps its config and layers alive through the image's blob links.
+Deleting a tag only untags its manifest; deleting a manifest releases the
+manifest, and the registry sweeper (every `docker.sweep_interval_seconds`)
+releases the blobs no manifest of the image references any more once they
+have been unused for `docker.unreferenced_blob_ttl_seconds` (24 h by
+default: the time a client has between pushing layers and pushing their
+manifest). The blob outbox deletes a blob after its grace period once no
+image of any repository links it, so deleting an image never removes a layer
+another image uses.
+
+A docker repository's retention policy (`PUT
+/admin/repositories/<name>/retention`) has image rules:
+
+```json
+{"policy": {
+  "version": 1,
+  "rules": [
+    {"id": "keep-10", "image_prefix": "team/", "keep_last_n_tags": 10,
+     "protected_tags": ["latest", "stable"]},
+    {"id": "stale-tags", "tag_older_than_days": 90, "tag_not_pulled_for_days": 30},
+    {"id": "untagged", "delete_untagged_after_days": 7}
+  ]
+}}
+```
+
+- **Tag rules** delete tags. Per image (only those under `image_prefix`, when
+  set), the `keep_last_n_tags` most recently pushed tags and the
+  `protected_tags` stay; any other tag goes when every trigger the rule sets
+  holds (`tag_older_than_days` since its push, `tag_not_pulled_for_days`). A
+  rule with only `keep_last_n_tags` keeps N tags per image.
+- **Untagged rules** (`delete_untagged_after_days`) delete manifests without a
+  tag for that long, except what something kept refers to: the platforms of
+  a kept index, and the signatures, SBOMs and attestations (referrers) of a
+  kept manifest.
+- `dry_run_only`, `enabled`, `min_run_interval_seconds`, preview, run and
+  audit work as for NuGet repositories; audit rows carry the image as
+  `package_name` and the tag or digest as `version`. Group repositories have
+  no policy of their own.
+
+## Configuration
+
+```toml
+[docker]
+max_blob_bytes = 1073741824           # (default: 1 GiB) largest layer pushed or proxied
+token_ttl_seconds = 300               # (default: 300) registry token lifetime, 60-3600
+# token_secret = "…"                  # (default: a generated key kept in the database)
+upload_ttl_seconds = 86400            # (default: 24 h) abandoned upload sessions expire
+unreferenced_blob_ttl_seconds = 86400 # (default: 24 h, at least 1 h)
+sweep_interval_seconds = 300          # (default: 300)
+```
+
+Raising `max_blob_bytes` raises the default `server.max_staging_bytes`
+(four times the largest item) as well; size the staging volume for it. The
+reverse proxy must allow request bodies of `max_blob_bytes` on `/v2` (docker
+sends a whole layer in one request) and stream them without buffering; see
+[deployment](deployment.md#reverse-proxy).
+
+## Known limitations
+
+- A proxy downloads a blob completely (and verifies it) before it answers the
+  client, so a client waits for a large layer's first fetch. Concurrent pulls
+  of one layer share a download per instance.
+- An upload of several chunks is assembled into a new blob when it finishes
+  (the chunks are read back from the object store); one-chunk uploads, what
+  docker, podman and containerd send, are stored once.
+- Mounting a blob without `from` succeeds only when the image already has it.
+- The registry is served over plain http only behind a TLS-terminating proxy
+  or for `localhost`; Docker refuses other plain-http registries unless they
+  are listed as insecure registries in the daemon.

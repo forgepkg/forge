@@ -1,8 +1,10 @@
 # envisia-forge
 
-A self-hosted **NuGet package registry** written in Rust. It speaks the NuGet
-**V3** protocol and supports the three repository types you expect from an
-enterprise registry (more formats come as **format plugins**, see below):
+A self-hosted **NuGet package registry and Docker / OCI registry** written in
+Rust. It speaks the NuGet **V3** protocol and the **OCI Distribution Spec**
+v1.1 (Docker, Podman, containerd, crane, Helm, cosign), and supports the
+three repository types you expect from an enterprise registry (more package
+formats come as **format plugins**, see below):
 
 - **hosted** — push and restore your own `.nupkg` packages.
 - **proxy** — cache packages on demand from an upstream NuGet V3 feed —
@@ -12,6 +14,10 @@ enterprise registry (more formats come as **format plugins**, see below):
 - **group** — fan a single feed URL out across several member repos by
   priority; tolerates a failing member and, by default, keeps public feeds
   from shadowing internal package ids (dependency-confusion guard).
+
+The same three types exist for container images: hosted image repositories,
+pull-through proxies of Docker Hub, GHCR, Quay or any OCI registry, and
+groups — see **[docs/docker.md](./docs/docker.md)**.
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
@@ -41,15 +47,17 @@ A Cargo workspace of small crates plus the web SPA:
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `format-nuget` | `forge-nuget` | NuGet V3 protocol + `.nupkg`/`.nuspec` parsing. |
+| `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait, its WIT twin and the component glue. |
 | `plugin` | `forge-plugin` | The host side of format plugins: built-in and WebAssembly plugins (Wasmtime) behind one trait. |
-| `server` | `forge-server` | Axum HTTP server: NuGet feed, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `server` | `forge-server` | Axum HTTP server: NuGet feed, Docker registry, format-plugin repositories, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `helm`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
 **Single-origin serving.** `forge-server` mounts the NuGet feed (`/v3`), the
+Docker / OCI registry (`/v2`), the
 admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
 the same origin with relative URLs; no routing proxy is required (production
@@ -139,6 +147,18 @@ For a non-anonymous repo, pass `--username admin --password <TOKEN>
 --store-password-in-clear-text` to the source (the password is a **token**, not
 the user password).
 
+### Push and pull container images
+
+Create a docker repository (`"format": "docker"`) under **Admin →
+Repositories**, then log in with an API token as the password:
+
+```bash
+docker login localhost:8421 -u admin              # password: an API token
+docker tag alpine:3.20 localhost:8421/docker-hosted/team/alpine:3.20
+docker push localhost:8421/docker-hosted/team/alpine:3.20
+docker pull localhost:8421/docker-hosted/team/alpine:3.20
+```
+
 ## Documentation
 
 - **[Production deployment](./docs/deployment.md)** — required settings, TLS
@@ -153,6 +173,9 @@ the user password).
 - **[DEVELOPMENT.md](./DEVELOPMENT.md)** — full local-dev guide: every
   `cargo xtask` command, configuration knobs, OIDC/Entra setup, the web UI dev
   server, tests, and Docker packaging details.
+- **[Docker / OCI registry](./docs/docker.md)** — image repositories (hosted,
+  proxy, group), naming and host-based routing, `docker login`, retention and
+  garbage collection.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers.
 - **[Format plugins](./docs/format-plugins.md)** — further package formats

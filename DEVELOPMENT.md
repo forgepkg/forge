@@ -236,6 +236,14 @@ password supplied to NuGet should be a **token**.
   list the group **and** every member it should be served from, e.g.
   `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
 
+The same three types exist for container images with `"format":"docker"`
+(`{"name":"docker-hosted","kind":"hosted","format":"docker"}`, a proxy with
+`"remote_url":"https://registry-1.docker.io"`, a group with an optional
+`"writable_member"`), served under `/v2/`. Log in with an API token as the
+password: `docker login localhost:8421 -u admin`, then
+`docker push localhost:8421/docker-hosted/team/app:1`. See
+[docs/docker.md](docs/docker.md).
+
 ### Repositories of other formats (format plugins)
 
 Formats other than NuGet come from format plugins, crates in
@@ -491,6 +499,17 @@ need the `wasm32-wasip2` target.
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
+
+The registry's end-to-end check with real clients (the OCI conformance suite,
+docker buildx, crane, a `registry:2` upstream behind a proxy, cosign) is a
+script that CI's `oci-e2e` job runs. It needs docker with buildx, go, crane,
+cosign, curl and jq, a Postgres and an S3 endpoint (see the variables at the
+top of the script):
+
+```bash
+cargo build -p forge-server
+.github/scripts/oci-e2e.sh target/debug/forge-server target/oci-e2e
+```
 
 **Without Docker**, point the db / storage / core / server suites at running
 services instead (use a fresh database per crate run — suites share it):

@@ -127,9 +127,10 @@ Points that matter on Kubernetes:
 - **Two or more replicas** need Redis (`components/redis` or your own
   `FORGE_REDIS__URL`), and replicas × `database.max_connections` (20) must fit
   PostgreSQL's `max_connections`.
-- **Reverse proxy.** Allow 512 MiB request bodies without buffering, and keep
-  the proxy's upstream idle timeout below 150 s (Envoy and Istio default to
-  one hour; see the httproute component).
+- **Reverse proxy.** Allow 1 GiB request bodies without buffering (image
+  layers up to `docker.max_blob_bytes`; NuGet pushes are up to 512 MiB), and
+  keep the proxy's upstream idle timeout below 150 s (Envoy and Istio default
+  to one hour; see the httproute component).
 - **Who reaches Forge.** Forge believes the `X-Forwarded-For` of every peer
   in `FORGE_AUTH__TRUSTED_PROXY_CIDRS`, usually the whole pod network, so any
   other pod could call the Service with a forged client address and get past

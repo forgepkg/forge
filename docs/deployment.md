@@ -256,9 +256,16 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   pod network: admit only the ingress controller or gateway with a
   NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
   `network-policy` component; the CNI must enforce it).
-- Allow large request bodies for `PUT /v3/{repo}/package` (package pushes).
-  In nginx that is `client_max_body_size`. Match it to
-  `FORGE_SERVER__MAX_UPLOAD_BYTES` if you raised that limit.
+- Allow large request bodies for `PUT /v3/{repo}/package` (package pushes)
+  and for image pushes under `/v2`, where docker sends a whole layer in one
+  request. In nginx that is `client_max_body_size`. Match it to the larger of
+  `FORGE_SERVER__MAX_UPLOAD_BYTES` and `FORGE_DOCKER__MAX_BLOB_BYTES` (1 GiB
+  by default).
+- Serve `/v2` at the root of the host: Docker clients always talk to
+  `https://<host>/v2/`, whatever path `public_base_url` has. A docker
+  repository with a `host` ([docs/docker.md](docker.md#names)) needs that
+  name routed to Forge with `Host` preserved, and covered by the
+  certificate.
 - Disable response buffering or give it enough room. Package downloads are
   streamed.
 - Do not rewrite the `Origin` or `Sec-Fetch-Site` headers. Forge refuses
@@ -266,9 +273,10 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   or fakes these headers breaks that protection.
 - With an `https://` `public_base_url` Forge sends
   `Strict-Transport-Security: max-age=31536000`; serve it over https only.
-  API responses and every feed response to a request with credentials are
-  `Cache-Control: private, no-store`, and feed responses carry
-  `Vary: Authorization, Cookie, X-NuGet-ApiKey`: keep a caching proxy from
+  API responses and every feed and registry response to a request with
+  credentials are `Cache-Control: private, no-store`; feed responses carry
+  `Vary: Authorization, Cookie, X-NuGet-ApiKey` and registry responses
+  `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
 - With `anonymous_mode = "allowlist"`, do not let a shared cache store `/v3`
   responses at all. Anonymous feed responses carry no `Cache-Control`, and
@@ -296,7 +304,7 @@ server {
     server_name nuget.example.com;
     # ssl_certificate …; ssl_certificate_key …;
 
-    client_max_body_size 512m;
+    client_max_body_size 1g;   # docker.max_blob_bytes (and server.max_upload_bytes)
     proxy_request_buffering off;
     proxy_buffering off;
 
