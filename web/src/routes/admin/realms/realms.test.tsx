@@ -23,7 +23,9 @@ import { routeTree } from '~/routeTree.gen'
  *  - the enabled toggle PATCHes the realm; disabling `local` asks first and
  *    a server refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
- *    invalid) and POSTs the parsed config when valid.
+ *    invalid) and POSTs the parsed config when valid;
+ *  - the edit form sends list values containing commas back unchanged, and
+ *    requires a new client secret once the issuer or client ID changes.
  */
 
 const adminMe: Me = {
@@ -364,7 +366,8 @@ describe('admin realms list', () => {
   })
 })
 
-describe('admin realms create', () => {
+// Typing-heavy form tests can outlast the 5 s default on a loaded machine.
+describe('admin realms create', { timeout: 20_000 }, () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
@@ -415,7 +418,10 @@ describe('admin realms create', () => {
     await u.type(screen.getByLabelText('Issuer URL'), 'https://idp.example.com')
     await u.type(screen.getByLabelText('Client ID'), 'forge')
     await u.type(screen.getByLabelText('Client secret'), 's3cret')
-    await u.type(screen.getByLabelText('Login domains'), 'example.com, corp.example.com')
+    await u.type(
+      screen.getByLabelText('Login domains'),
+      'example.com{Enter}corp.example.com',
+    )
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
@@ -620,6 +626,145 @@ describe('admin realms create', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'invalid config: key_pepper is required',
+    )
+  })
+})
+
+describe('admin realms edit', { timeout: 20_000 }, () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    setSession('admin-csrf')
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  const adminsDn = 'CN=Forge Admins,OU=Groups,DC=corp'
+  const usersDn = 'CN=Forge Users,OU=Groups,DC=corp'
+  const corpSso = realm({
+    id: 5,
+    kind: 'oidc',
+    name: 'corp-sso',
+    priority: 1,
+    config: {
+      issuer: 'https://idp.example.com',
+      client_id: 'forge',
+      client_secret_set: true,
+      auto_provision: true,
+      link_existing_by_username: false,
+      allow_http_issuer: false,
+      admin_groups: [adminsDn, 'forge-ops'],
+      required_claims: { groups: [usersDn] },
+    },
+  })
+
+  it('saves list values containing commas unchanged', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(corpSso)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    expect(await screen.findByLabelText('Admin groups')).toHaveValue(
+      `${adminsDn}\nforge-ops`,
+    )
+    expect(screen.getByLabelText('Required claims')).toHaveValue(
+      `groups = ${usersDn}`,
+    )
+
+    // Edit an unrelated field, then save.
+    await u.type(screen.getByLabelText('Button label'), 'Corp SSO')
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toEqual({
+      name: 'corp-sso',
+      enabled: true,
+      config: {
+        issuer: 'https://idp.example.com',
+        client_id: 'forge',
+        auto_provision: true,
+        link_existing_by_username: false,
+        allow_http_issuer: false,
+        admin_groups: [adminsDn, 'forge-ops'],
+        required_claims: { groups: [usersDn] },
+        button_label: 'Corp SSO',
+      },
+    })
+  })
+
+  it('requires a new client secret after the issuer changes', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(corpSso)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    const secret = await screen.findByLabelText('Client secret')
+    expect(secret).toHaveAttribute('placeholder', '•••••••• (set to replace)')
+    expect(screen.queryByRole('status')).toBeNull()
+
+    // A trailing slash is not a different issuer.
+    await u.type(screen.getByLabelText('Issuer URL'), '/')
+    expect(screen.queryByRole('status')).toBeNull()
+
+    const issuer = screen.getByLabelText('Issuer URL')
+    await u.clear(issuer)
+    await u.type(issuer, 'https://login.example.org')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'The stored client secret will be dropped when you save',
+    )
+    expect(secret).toHaveAttribute('placeholder', 'Required')
+    expect(screen.queryByText(/Leave blank to keep it/)).toBeNull()
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    expect(
+      await screen.findByText(
+        'Enter the client secret for the new issuer or client ID.',
+      ),
+    ).toBeInTheDocument()
+    expect(patched).toBeNull()
+
+    await u.type(secret, 'new-s3cret')
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toMatchObject({
+      config: {
+        issuer: 'https://login.example.org',
+        client_id: 'forge',
+        client_secret: 'new-s3cret',
+      },
+    })
+  })
+
+  it('requires a new client secret after the client ID changes', async () => {
+    mockApi({ realms: [corpSso] })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    await u.type(await screen.findByLabelText('Client ID'), '-v2')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'The issuer or client ID differs from the stored one.',
+    )
+    expect(screen.getByLabelText('Client secret')).toHaveAttribute(
+      'placeholder',
+      'Required',
     )
   })
 })
