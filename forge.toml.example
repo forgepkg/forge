@@ -17,15 +17,19 @@ public_base_url = "http://localhost:8421"
 # admin/changeme) are refused at startup unless this is true. Keep it for a
 # local dev copy only; in production replace the placeholders and drop it.
 allow_insecure_defaults = true  # (default: false)
-# Largest accepted push (`dotnet nuget push`, a Helm chart, …). Uploads stream
-# to a temp file (never buffered in memory); larger pushes get HTTP 413. One
-# format can have its own limit under [plugins.max_upload_bytes].
-max_upload_bytes = 536870912    # (default: 512 MiB)
+# Upload limits are set per hosted repository in the web UI (Repositories →
+# Edit → "Maximum upload size") or the admin API (max_upload_bytes); without
+# one a repository accepts pushes of 512 MiB (docker: blobs of 1 GiB). Uploads
+# stream to a temp file (never buffered in memory); larger pushes get HTTP 413.
+# Deprecated: max_upload_bytes here is still honoured as the default of package
+# repositories without a limit of their own (startup warns); docker ignores it.
+# max_upload_bytes = 536870912
 # Pushes and first-time proxy downloads are staged here; files a killed process
 # left behind are removed at startup. All staged files of this instance share
 # max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
 # staging_dir = "/var/tmp/forge"  # (default: <system temp dir>/forge-staging)
-# max_staging_bytes = 4294967296  # (default: 4 x the largest of max_upload_bytes, plugins.max_upload_bytes, proxy.max_package_bytes, docker.max_blob_bytes; 0 = no limit)
+# max_staging_bytes = 4294967296  # (default: 4 x the largest of the default upload limits, proxy.max_package_bytes, docker.max_blob_bytes; 0 = no limit)
+# It also caps the upload limit a repository may be given.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
 # anonymous_mode = "allowlist": a request naming any other host is not served
@@ -35,7 +39,7 @@ allowed_hosts = []              # (default: [])
 # request headers, or whose request body stalls longer, is cut off; a handler
 # that has not answered within request_timeout_seconds gets 408 (an already
 # streaming download is not cut off). Keep request_timeout_seconds above the
-# slowest push of max_upload_bytes you expect. header_read_timeout_seconds also
+# slowest push of the largest repository upload limit you expect. header_read_timeout_seconds also
 # closes an idle keep-alive connection: keep it above your reverse proxy's
 # upstream keep-alive idle timeout, or the proxy may reuse a connection Forge is
 # closing and answer 502. 0 disables a limit.
@@ -171,16 +175,10 @@ max_nuspec_compression_ratio = 200          # (default: 200)
 #
 # [plugins.formats]
 # example = "sha256:<64 hex digits>"
-#
-# The largest accepted push per format (built-in ones included), in place of
-# server.max_upload_bytes; it counts towards server.max_staging_bytes. An id no
-# installed format has fails startup. Docker has docker.max_blob_bytes.
-# [plugins.max_upload_bytes]
-# helm = 104857600
 
 [docker]
 # The Docker / OCI registry under /v2 (see docs/docker.md).
-max_blob_bytes                = 1073741824  # (default: 1 GiB) largest layer pushed or proxied; staged on disk
+max_blob_bytes                = 1073741824  # (default: 1 GiB) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
 token_ttl_seconds             = 300         # (default: 300) registry token lifetime, 60-3600
 # Signs registry tokens (at least 32 characters). Unset: a key generated once
 # and kept in the database, sealed when [crypto] is enabled.

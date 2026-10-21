@@ -392,9 +392,9 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `network-policy` component; the CNI must enforce it).
 - Allow large request bodies for `PUT /v3/{repo}/package` (package pushes)
   and for image pushes under `/v2`, where docker sends a whole layer in one
-  request. In nginx that is `client_max_body_size`. Match it to the larger of
-  `FORGE_SERVER__MAX_UPLOAD_BYTES` and `FORGE_DOCKER__MAX_BLOB_BYTES` (1 GiB
-  by default).
+  request. In nginx that is `client_max_body_size`. Match it to the largest
+  upload limit a repository has (set per repository in the web UI; 512 MiB
+  for package repositories and 1 GiB per blob for docker by default).
 - Serve `/v2` at the root of the host: Docker clients always talk to
   `https://<host>/v2/`, whatever path `public_base_url` has. A docker
   repository with a `host` ([docs/docker.md](docker.md#names)) needs that
@@ -438,7 +438,7 @@ server {
     server_name nuget.example.com;
     # ssl_certificate …; ssl_certificate_key …;
 
-    client_max_body_size 1g;   # docker.max_blob_bytes (and server.max_upload_bytes)
+    client_max_body_size 1g;   # the largest repository upload limit (docker: 1 GiB by default)
     proxy_request_buffering off;
     proxy_buffering off;
 
@@ -522,11 +522,12 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
 - **Temp space.** Pushes and first-time proxy downloads are staged in
   `server.staging_dir` (default `forge-staging` in the system temp
   directory). All staged files of an instance share `server.max_staging_bytes`
-  (default four times the largest item: `server.max_upload_bytes`, a
-  format's own `plugins.max_upload_bytes`, `proxy.max_package_bytes` or
-  `docker.max_blob_bytes`, so 4 GiB; `0` removes the limit); past it,
-  pushes and downloads are answered `503` with `Retry-After` until space
-  frees up. Size the volume above that budget. Each process stages in a
+  (default four times the largest item: a push under the default upload
+  limits, `proxy.max_package_bytes` or `docker.max_blob_bytes`, so 4 GiB;
+  `0` removes the limit); past it, pushes and downloads are answered `503`
+  with `Retry-After` until space frees up. A repository's upload limit may
+  not exceed the budget (less `nuget.max_nuspec_bytes`), so raise the
+  budget before giving a repository a larger limit. Size the volume above that budget. Each process stages in a
   locked subdirectory of its own, and the files a killed process left are
   removed at the next start however recent they are, so they do not add to
   the space a restarted instance needs. Give each instance a volume of its

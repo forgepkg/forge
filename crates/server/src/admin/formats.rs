@@ -33,12 +33,19 @@ pub struct FormatView {
     /// SHA-256 of the plugin's component (WebAssembly plugins only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// The upload limit of its hosted repositories without one of their own
+    /// (for docker, per blob).
+    pub default_max_upload_bytes: u64,
+    /// The largest upload limit a repository may be given (what a push can
+    /// stage); `None` when it is unbounded.
+    pub max_upload_bytes_limit: Option<u64>,
 }
 
 /// `GET /admin/formats`: NuGet first, then Docker, then the other formats
 /// by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
+    let ceiling = state.config.max_repository_upload_bytes();
     let view = |plugin: &forge_plugin::Plugin| {
         let manifest = plugin.manifest();
         FormatView {
@@ -50,6 +57,8 @@ pub async fn list(State(state): State<AppState>) -> Response {
             version: Some(manifest.version.clone()),
             description: manifest.description.clone(),
             sha256: plugin.sha256().map(str::to_string),
+            default_max_upload_bytes: state.config.default_upload_limit(plugin.id()),
+            max_upload_bytes_limit: ceiling,
         }
     };
     let mut plugins: Vec<_> = state.formats.plugins().collect();
@@ -65,6 +74,8 @@ pub async fn list(State(state): State<AppState>) -> Response {
         version: None,
         description: None,
         sha256: None,
+        default_max_upload_bytes: state.config.default_upload_limit(DOCKER_FORMAT),
+        max_upload_bytes_limit: ceiling,
     });
     formats.extend(others.into_iter().map(|p| view(p)));
     Json(formats).into_response()

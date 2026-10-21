@@ -226,19 +226,14 @@ The web UI's *Browse* screen filters repositories by format
 client commands: `dotnet nuget` for NuGet, `helm repo add` and the push for
 Helm, the repository's URL for other plugin formats.
 
-**Upload limits.** A push to a plugin format's repository may be as large as
-`server.max_upload_bytes`, unless the format has a limit of its own, built-in
-plugins included:
-
-```toml
-[plugins.max_upload_bytes]
-helm = 104857600               # format id → largest accepted push, in bytes
-```
-
-or `FORGE_PLUGINS__MAX_UPLOAD_BYTES__HELM=104857600`. Every push is staged on
-disk, so the largest limit also sizes the default `server.max_staging_bytes`.
-An id that no installed plugin format has fails startup (Docker's limit is
-`docker.max_blob_bytes`).
+**Upload limits.** Each hosted repository has its own upload limit, the
+largest push it accepts (413 above it), whatever its format: set it under
+*Maximum upload size* when creating or editing the repository in the web UI,
+or as `max_upload_bytes` in the admin API (`null` on an update clears it).
+Without one a repository accepts 512 MiB. Every push is staged on disk, so
+a limit may be at most what a push can stage, `server.max_staging_bytes` less
+`nuget.max_nuspec_bytes` (`GET /admin/formats` reports it as
+`max_upload_bytes_limit`, with each format's `default_max_upload_bytes`).
 
 ## Loading WebAssembly plugins
 

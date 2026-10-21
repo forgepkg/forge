@@ -54,6 +54,7 @@ function repo(over: Partial<RepoView>): RepoView {
     immutable_tags: false,
     latest_mutable: false,
     writable_member: null,
+    max_upload_bytes: null,
     ...over,
   }
 }

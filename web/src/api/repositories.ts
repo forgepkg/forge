@@ -78,6 +78,11 @@ export interface RepoView {
   latest_mutable: boolean
   /** Docker group: the hosted member a push to the group goes to. */
   writable_member: string | null
+  /**
+   * Hosted: the largest push it accepts in bytes (docker: the largest blob);
+   * `null` for its format's default (`FormatView.default_max_upload_bytes`).
+   */
+  max_upload_bytes: number | null
 }
 
 /** `POST /admin/repositories` request body (`CreateRepo`). */
@@ -109,6 +114,8 @@ export interface CreateRepo {
   latest_mutable?: boolean
   /** Docker group only: name of a hosted docker repository pushes go to. */
   writable_member?: string
+  /** Hosted only: the largest push it accepts, in bytes. Absent: the default. */
+  max_upload_bytes?: number
 }
 
 /**
@@ -144,6 +151,8 @@ export interface UpdateRepo {
   latest_mutable?: boolean
   /** Docker group only; `null` clears it (pushes to the group are refused). */
   writable_member?: string | null
+  /** Hosted only; `null` clears it (the format's default applies). */
+  max_upload_bytes?: number | null
 }
 
 /**
@@ -167,6 +176,10 @@ export interface FormatView {
   description?: string
   /** SHA-256 of a WebAssembly plugin's component. */
   sha256?: string
+  /** The upload limit of its hosted repositories without one of their own. */
+  default_max_upload_bytes?: number
+  /** The largest upload limit a repository may be given; `null`: unbounded. */
+  max_upload_bytes_limit?: number | null
 }
 
 /** A group member view (`MemberView`). */

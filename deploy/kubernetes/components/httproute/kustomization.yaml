@@ -4,10 +4,11 @@
 #
 # Request size limits and timeouts are implementation-specific (Envoy Gateway
 # BackendTrafficPolicy / ClientTrafficPolicy, Istio, Cilium, …). Allow pushes
-# of server.max_upload_bytes (512 MiB) and image layers of
-# docker.max_blob_bytes (1 GiB), and keep the upstream idle timeout below
-# server.header_read_timeout_seconds (150 s): Envoy and Istio default to
-# 1 hour, which makes the proxy reuse connections Forge is closing (502).
+# of the largest repository upload limit (set per repository in the web UI;
+# by default 512 MiB, and 1 GiB per image layer), and keep the upstream idle
+# timeout below server.header_read_timeout_seconds (150 s): Envoy and Istio
+# default to 1 hour, which makes the proxy reuse connections Forge is closing
+# (502).
 #
 # List the gateway's pod network in FORGE_AUTH__TRUSTED_PROXY_CIDRS, and add
 # ../network-policy, patched to the namespace of the gateway's data plane, so

@@ -151,22 +151,6 @@ impl FormatRegistry {
         Ok(self)
     }
 
-    /// Refuse an upload limit (`plugins.max_upload_bytes`) for a format that
-    /// has no plugin here: a misspelled id would otherwise leave that
-    /// format at `server.max_upload_bytes` unnoticed.
-    pub fn check_upload_limits(&self, limits: &BTreeMap<String, u64>) -> Result<(), String> {
-        match limits.keys().find(|id| !self.plugins.contains_key(*id)) {
-            Some(id) => {
-                let installed: Vec<&str> = self.plugins.keys().map(String::as_str).collect();
-                Err(format!(
-                    "plugins.max_upload_bytes.{id}: no format {id:?} is installed \
-                     (plugin formats: {installed:?})"
-                ))
-            }
-            None => Ok(()),
-        }
-    }
-
     /// The format with id `id`, if installed.
     pub fn get(&self, id: &str) -> Option<Arc<dyn Format>> {
         self.formats.get(id).cloned()
@@ -341,6 +325,7 @@ impl AppState {
             config: forge_oci::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
                 max_blob_bytes: self.config.docker.max_blob_bytes,
+                default_max_upload_bytes: self.config.default_upload_limit(DOCKER_FORMAT),
                 token_ttl_seconds: self.config.docker.token_ttl_seconds,
                 delete_grace: self.config.outbox.grace(),
                 max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
@@ -369,16 +354,22 @@ impl AppState {
 
     /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
     /// next to the built-in formats. A plugin whose format id is taken
-    /// (a built-in plugin, or another plugin) is an error, and so is an upload
-    /// limit (`plugins.max_upload_bytes`) for a format that is not installed.
+    /// (a built-in plugin, or another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
         let mut registry = FormatRegistry::new(self.config.nuget.limits());
         for plugin in plugins {
             registry = registry.with_plugin(plugin)?;
         }
-        registry.check_upload_limits(&self.config.plugins.max_upload_bytes)?;
         self.formats = Arc::new(registry);
         Ok(self)
+    }
+
+    /// The largest push `repo` accepts (for docker, the largest blob): its
+    /// own limit, else the default of its format
+    /// ([`Config::default_upload_limit`]).
+    pub fn upload_limit(&self, repo: &Repository) -> u64 {
+        repo.max_upload_bytes()
+            .unwrap_or_else(|| self.config.default_upload_limit(&repo.format))
     }
 
     /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`PackageBytes`).
@@ -622,20 +613,6 @@ mod tests {
         );
         assert_eq!(registry.kinds("npm"), None);
         assert!(!registry.is_installed("npm"));
-    }
-
-    #[test]
-    fn upload_limits_name_installed_plugin_formats() {
-        let registry = FormatRegistry::new(Default::default());
-        let limits = |id: &str| BTreeMap::from([(id.to_string(), 4096u64)]);
-        assert!(registry.check_upload_limits(&BTreeMap::new()).is_ok());
-        assert!(registry.check_upload_limits(&limits("helm")).is_ok());
-        assert!(registry.check_upload_limits(&limits("nuget")).is_ok());
-        let err = registry
-            .check_upload_limits(&limits("npm"))
-            .expect_err("not installed");
-        assert!(err.contains("plugins.max_upload_bytes.npm"), "{err}");
-        assert!(err.contains("helm"), "{err}");
     }
 
     #[test]

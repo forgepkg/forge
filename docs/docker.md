@@ -108,8 +108,10 @@ with any `artifactType`; Docker schema 1 is refused.
   (`{}`), which Forge stores itself when it is missing.
 - A blob a manifest of the image references cannot be deleted (`409`):
   delete the manifest first.
-- Uploads are limited to `docker.max_blob_bytes` per blob (1 GiB by default)
-  and staged on disk like package pushes (see `server.max_staging_bytes`).
+- Uploads are limited per blob by the repository's upload limit (*Maximum
+  upload size* in the web UI, `max_upload_bytes` in the admin API; 1 GiB
+  when unset) and staged on disk like package pushes (see
+  `server.max_staging_bytes`, which also caps the limit).
   Upload sessions are shared by all instances; an abandoned one expires
   after `docker.upload_ttl_seconds`.
 
@@ -236,7 +238,7 @@ A docker repository's retention policy (`PUT
 
 ```toml
 [docker]
-max_blob_bytes = 1073741824           # (default: 1 GiB) largest layer pushed or proxied
+max_blob_bytes = 1073741824           # (default: 1 GiB) largest layer a proxy downloads
 token_ttl_seconds = 300               # (default: 300) registry token lifetime, 60-3600
 # token_secret = "…"                  # (default: a generated key kept in the database)
 upload_ttl_seconds = 86400            # (default: 24 h) abandoned upload sessions expire
@@ -244,10 +246,12 @@ unreferenced_blob_ttl_seconds = 86400 # (default: 24 h, at least 1 h)
 sweep_interval_seconds = 300          # (default: 300)
 ```
 
+Pushes follow the repository's upload limit, not `max_blob_bytes`.
 Raising `max_blob_bytes` raises the default `server.max_staging_bytes`
 (four times the largest item) as well; size the staging volume for it. The
-reverse proxy must allow request bodies of `max_blob_bytes` on `/v2` (docker
-sends a whole layer in one request) and stream them without buffering; see
+reverse proxy must allow request bodies of the largest repository upload
+limit on `/v2` (docker sends a whole layer in one request, 1 GiB by default)
+and stream them without buffering; see
 [deployment](deployment.md#reverse-proxy).
 
 ## Known limitations

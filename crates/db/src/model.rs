@@ -217,6 +217,9 @@ pub const LATEST_MUTABLE_KEY: &str = "latest_mutable";
 /// `repository.config` key of [`Repository::writable_member`].
 pub const WRITABLE_MEMBER_KEY: &str = "writable_member";
 
+/// `repository.config` key of [`Repository::max_upload_bytes`].
+pub const MAX_UPLOAD_BYTES_KEY: &str = "max_upload_bytes";
+
 impl Repository {
     /// Whether this is a Docker / OCI registry repository.
     pub fn is_docker(&self) -> bool {
@@ -250,6 +253,19 @@ impl Repository {
             .get(LATEST_MUTABLE_KEY)
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
+    }
+
+    /// Hosted option (`config.max_upload_bytes`): the largest package push
+    /// (for docker, the largest blob) this repository accepts. `None`: the
+    /// server's default for the repository's format.
+    pub fn max_upload_bytes(&self) -> Option<u64> {
+        if self.kind() != RepoKind::Hosted {
+            return None;
+        }
+        self.config
+            .get(MAX_UPLOAD_BYTES_KEY)
+            .and_then(|v| v.as_u64())
+            .filter(|&bytes| bytes > 0)
     }
 
     /// Docker group option (`config.writable_member`): the name of the hosted
