@@ -232,11 +232,10 @@ async fn anonymous_uses_anonymous_role_grants() {
 
 #[tokio::test]
 async fn anonymous_never_admin_even_with_admin_grant() {
-    // Defense in depth: even a (mis)granted admin on the anonymous role must not
-    // make an anonymous caller admin via the short-circuit (the loader forces
-    // is_admin=false for anonymous), but a literal admin *grant* on the repo
-    // would still satisfy can_admin. Assert the short-circuit is not triggered:
-    // an anonymous caller is not allow-all across unrelated repos.
+    // Defense in depth: an admin grant on the anonymous role can never make an
+    // anonymous caller admin. One on a single repository is refused outright
+    // (administration is global, #124), and the short-circuit is not
+    // triggered: an anonymous caller is not allow-all.
     let pool = pool().await;
     let cache = Cache::l1_only(64);
     let az = Authz::new(pool.clone(), cache.clone());
@@ -249,16 +248,13 @@ async fn anonymous_never_admin_even_with_admin_grant() {
         .expect("seeded");
     add_grant(&pool, anon_role, Some(repo.id), "admin", None)
         .await
-        .expect("grant");
+        .expect_err("an admin grant on one repository is refused");
     core_authz::invalidate_anonymous(&cache).await;
 
     let p = anon();
-    // The grant is repo-scoped admin on `repo` only — NOT an allow-all
-    // short-circuit, so an unrelated repo stays denied.
-    assert!(
-        !az.can_read(&p, &other).await,
-        "anon admin grant on one repo is not allow-all"
-    );
+    assert!(!az.can_admin(&p, &repo).await, "anon is not admin");
+    assert!(!az.can_read(&p, &repo).await, "anon is not allow-all");
+    assert!(!az.can_read(&p, &other).await, "anon is not allow-all");
 }
 
 #[tokio::test]

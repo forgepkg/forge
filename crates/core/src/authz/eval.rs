@@ -53,7 +53,8 @@ pub enum Action {
     Write,
     /// Unlist / delete.
     Delete,
-    /// Repository config + privilege management.
+    /// Repository config + privilege management. Administration is global:
+    /// the grants API and the table refuse an `admin` grant on one repository.
     Admin,
 }
 
