@@ -43,6 +43,7 @@ fn parse_params(raw: &HashMap<String, String>) -> SearchParams {
         take,
         prerelease,
         include_semver2: wants_semver2(raw),
+        include_upstream: true,
     }
 }
 

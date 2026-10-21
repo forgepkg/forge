@@ -70,6 +70,10 @@ impl Format for NugetFormat {
             .and_then(|summary| serde_json::to_value(summary).ok())
     }
 
+    fn search_hit_summary(&self, hit: &serde_json::Value) -> Option<serde_json::Value> {
+        serde_json::to_value(nuspec::summary_from_search_hit(hit)).ok()
+    }
+
     fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
         nuspec::manifest_identity(manifest, &self.limits)
     }

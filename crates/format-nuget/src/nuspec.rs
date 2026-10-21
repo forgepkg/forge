@@ -201,6 +201,66 @@ pub fn manifest_summary(bytes: &[u8]) -> Result<ManifestSummary, FormatError> {
     })
 }
 
+/// The display metadata of one V3 search result entry
+/// (`SearchQueryService`), as a [`ManifestSummary`] without dependency
+/// groups. `authors`, `owners` and `tags` may be arrays or strings; text is
+/// trimmed and empty values are dropped, as for a `.nuspec`.
+pub fn summary_from_search_hit(hit: &serde_json::Value) -> ManifestSummary {
+    use serde_json::Value;
+
+    let text = |key: &str| {
+        hit.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let list = |key: &str, split: fn(char) -> bool| -> Vec<String> {
+        let items: Vec<&str> = match hit.get(key) {
+            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
+            Some(Value::String(joined)) => joined.split(split).collect(),
+            _ => Vec::new(),
+        };
+        items
+            .into_iter()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let names =
+        |key: &str| Some(list(key, |c| c == ',').join(", ")).filter(|joined| !joined.is_empty());
+    let package_types = hit
+        .get("packageTypes")
+        .and_then(Value::as_array)
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(|t| t.get("name")?.as_str())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    ManifestSummary {
+        metadata: NuspecMetadata {
+            title: text("title"),
+            description: text("description"),
+            summary: text("summary"),
+            authors: names("authors"),
+            owners: names("owners"),
+            tags: list("tags", |c| c.is_whitespace() || c == ',' || c == ';'),
+            project_url: text("projectUrl"),
+            license_url: text("licenseUrl"),
+            icon_url: text("iconUrl"),
+            package_types,
+            ..NuspecMetadata::default()
+        },
+        dependency_groups: Vec::new(),
+    }
+}
+
 /// The [`ManifestSummary`] of a version: the stored one when present (and
 /// readable), else parsed from the manifest bytes; empty when neither works.
 pub fn summary_of(stored: Option<&serde_json::Value>, manifest: Option<&[u8]>) -> ManifestSummary {
@@ -1118,6 +1178,44 @@ mod tests {
                   </group></dependencies></metadata></package>";
         let parsed = parse_nuspec(ok.as_bytes()).unwrap();
         assert_eq!(parsed.deps[0].dependencies[0].id, "b");
+    }
+
+    #[test]
+    fn search_hits_map_to_manifest_summaries() {
+        let hit = serde_json::json!({
+            "id": "Serilog",
+            "version": "4.0.0",
+            "title": " Serilog ",
+            "description": "Simple .NET logging",
+            "summary": "",
+            "authors": ["Serilog Contributors", " "],
+            "owners": "serilog, nblumhardt",
+            "tags": ["logging", "semantic"],
+            "projectUrl": "https://serilog.net/",
+            "licenseUrl": "https://licenses.nuget.org/Apache-2.0",
+            "iconUrl": "https://api.nuget.org/v3-flatcontainer/serilog/4.0.0/icon",
+            "packageTypes": [{ "name": "Dependency" }],
+            "totalDownloads": 1
+        });
+        let summary = summary_from_search_hit(&hit);
+        let meta = &summary.metadata;
+        assert_eq!(meta.title.as_deref(), Some("Serilog"));
+        assert_eq!(meta.description.as_deref(), Some("Simple .NET logging"));
+        assert_eq!(meta.summary, None);
+        assert_eq!(meta.authors.as_deref(), Some("Serilog Contributors"));
+        assert_eq!(meta.owners.as_deref(), Some("serilog, nblumhardt"));
+        assert_eq!(meta.tags, ["logging", "semantic"]);
+        assert_eq!(meta.project_url.as_deref(), Some("https://serilog.net/"));
+        assert_eq!(meta.package_types, ["Dependency"]);
+        assert!(summary.dependency_groups.is_empty());
+
+        // Tags as one string, and a hit without metadata.
+        let meta = summary_from_search_hit(&serde_json::json!({ "tags": "a b,c" })).metadata;
+        assert_eq!(meta.tags, ["a", "b", "c"]);
+        assert_eq!(
+            summary_from_search_hit(&serde_json::json!({})),
+            ManifestSummary::default()
+        );
     }
 
     #[test]

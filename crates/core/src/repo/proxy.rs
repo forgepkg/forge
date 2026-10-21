@@ -79,10 +79,15 @@
 //!   came from: once it changes, nothing more is requested from the previous
 //!   upstream, and a failing new one is an error, never a fallback to the
 //!   previous upstream's index. Packages already downloaded stay cached.
+//! * **Search** — forwarded to the upstream's `SearchQueryService` (cached
+//!   for the metadata TTL), so packages nobody has restored yet are found.
+//!   The caller's package filter, live not-found markers and the package
+//!   delay apply to the upstream's hits; when the upstream has no search
+//!   service or its search fails, the locally cached packages are searched.
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -129,6 +134,9 @@ pub const NS_UPSTREAM_REGISTRATION: &str = "proxy_registration";
 /// Cache namespace for one non-inlined upstream registration page, keyed by
 /// `"{scope}/{page url}"`.
 pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
+/// Cache namespace for one page of upstream search results, keyed by
+/// `"{scope}/{search url}"`.
+pub const NS_UPSTREAM_SEARCH: &str = "proxy_search";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
@@ -1866,17 +1874,21 @@ impl ProxyRepo {
     /// with bounded concurrency, and a failed read leaves that hit without one.
     async fn enrich_hits(&self, repo_id: i64, hits: &mut [SearchHit]) {
         use futures_util::StreamExt;
-        let wanted: Vec<(String, String)> = hits
+        // A hit from the upstream's search carries its metadata already.
+        let wanted: Vec<Option<(String, String)>> = hits
             .iter()
             .map(|hit| {
-                (
-                    self.format.lower_id(&hit.original_id),
-                    hit.latest_version.clone(),
-                )
+                hit.manifest_summary.is_none().then(|| {
+                    (
+                        self.format.lower_id(&hit.original_id),
+                        hit.latest_version.clone(),
+                    )
+                })
             })
             .collect();
         let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
-            .map(|(id, version)| async move {
+            .map(|wanted| async move {
+                let (id, version) = wanted?;
                 self.local_nuspec(repo_id, &id, &version)
                     .await
                     .unwrap_or_else(|e| {
@@ -2320,7 +2332,7 @@ impl RepoReadOps for ProxyRepo {
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, &PackageFilter::AllowAll, true)
+        self.search_through_upstream(repo, params, &PackageFilter::AllowAll, true)
             .await
     }
 
@@ -2330,7 +2342,8 @@ impl RepoReadOps for ProxyRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, filter, true).await
+        self.search_through_upstream(repo, params, filter, true)
+            .await
     }
 
     async fn search_unenriched(
@@ -2339,7 +2352,8 @@ impl RepoReadOps for ProxyRepo {
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
-        self.search_filtered(repo, params, filter, false).await
+        self.search_through_upstream(repo, params, filter, false)
+            .await
     }
 
     async fn enrich_search_hits(
@@ -2353,6 +2367,267 @@ impl RepoReadOps for ProxyRepo {
         let repo_row = self.proxy_repo(repo).await?;
         self.enrich_hits(repo_row.id, hits).await;
         Ok(())
+    }
+}
+
+/// One page of an upstream's search results, reduced to what a search hit
+/// renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamSearchPage {
+    /// The upstream's total hit count.
+    total_hits: usize,
+    hits: Vec<UpstreamSearchHit>,
+}
+
+/// One package of an [`UpstreamSearchPage`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamSearchHit {
+    /// Package id as the upstream spells it.
+    id: String,
+    /// The versions the upstream lists, normalized, ascending.
+    versions: Vec<String>,
+    /// Display metadata ([`Format::search_hit_summary`]).
+    summary: Option<JsonValue>,
+    total_downloads: Option<i64>,
+}
+
+impl ProxyRepo {
+    /// Search `repo` through the upstream's `SearchQueryService` when the
+    /// caller allows it ([`SearchParams::include_upstream`]), the proxy is
+    /// online and the upstream advertises one; otherwise, and when the
+    /// upstream search fails, search the cached packages
+    /// ([`Self::search_filtered`]).
+    async fn search_through_upstream(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+        enrich: bool,
+    ) -> Result<SearchResult, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        if params.include_upstream && repo_row.online && !matches!(filter, PackageFilter::DenyAll) {
+            match self.upstream_search(&repo_row, params).await {
+                Ok(Some(page)) => {
+                    return self
+                        .upstream_search_result(&repo_row, params, filter, page)
+                        .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(repo = %repo_row.name, error = %e, "upstream search failed; searching the cached packages");
+                }
+            }
+        }
+        self.search_filtered(repo, params, filter, enrich).await
+    }
+
+    /// One page of the upstream's search results for `params`, cached for
+    /// the metadata TTL. `None` when the upstream advertises no search
+    /// service.
+    async fn upstream_search(
+        &self,
+        repo: &Repository,
+        params: &SearchParams,
+    ) -> Result<Option<UpstreamSearchPage>, RepoError> {
+        let resources = self.resolve_upstream_index(repo).await?;
+        let Some(service) = resources.search_query_service else {
+            return Ok(None);
+        };
+        let mut url = url::Url::parse(&service)
+            .map_err(|e| RepoError::Storage(format!("upstream search service {service}: {e}")))?;
+        // As much of `q` as a local search honors.
+        let mut q_end = params.q.len().min(SearchQuery::MAX_QUERY_BYTES);
+        while !params.q.is_char_boundary(q_end) {
+            q_end -= 1;
+        }
+        let take = params.effective_take();
+        url.query_pairs_mut()
+            .append_pair("q", &params.q[..q_end])
+            .append_pair("skip", &params.skip.to_string())
+            .append_pair("take", &take.to_string())
+            .append_pair("prerelease", &params.prerelease.to_string())
+            .append_pair(
+                "semVerLevel",
+                if params.include_semver2 {
+                    "2.0.0"
+                } else {
+                    "1.0.0"
+                },
+            );
+        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
+        let key = format!("{}/{url}", Self::upstream_scope(repo));
+        self.cache
+            // Local-only: which packages exist upstream (see NS_UPSTREAM_NUSPEC).
+            .get_or_try_insert_local(NS_UPSTREAM_SEARCH, &key, ttl, || async {
+                let doc = self
+                    .fetch_json(repo, url.as_str())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("upstream search {url} returned 404"))?;
+                Ok(self.upstream_search_page(&doc, params.skip, take))
+            })
+            .await
+            .map(Some)
+            .map_err(RepoError::Storage)
+    }
+
+    /// Read an upstream search response: at most `take` hits. An entry
+    /// without a well-formed id (ids end up in Forge's URLs) is dropped, and
+    /// the upstream's total reduced by it.
+    fn upstream_search_page(
+        &self,
+        doc: &JsonValue,
+        skip: usize,
+        take: usize,
+    ) -> UpstreamSearchPage {
+        let entries: Vec<&JsonValue> = doc
+            .get("data")
+            .and_then(JsonValue::as_array)
+            .map(|data| data.iter().take(take).collect())
+            .unwrap_or_default();
+        let returned = entries.len();
+        let hits: Vec<UpstreamSearchHit> = entries
+            .into_iter()
+            .filter_map(|entry| self.upstream_search_hit(entry))
+            .collect();
+        let total_hits = doc
+            .get("totalHits")
+            .and_then(JsonValue::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
+            .saturating_sub(returned - hits.len())
+            .max(skip.saturating_add(hits.len()));
+        UpstreamSearchPage { total_hits, hits }
+    }
+
+    /// One upstream search result entry with its parseable versions; `None`
+    /// when its id is not well-formed.
+    fn upstream_search_hit(&self, entry: &JsonValue) -> Option<UpstreamSearchHit> {
+        let id = entry.get("id")?.as_str()?.trim();
+        self.format.validate_id(id).ok()?;
+        let normalize = |raw: &str| self.format.normalize_version(raw).ok();
+        let mut versions: Vec<String> = entry
+            .get("versions")
+            .and_then(JsonValue::as_array)
+            .map(|versions| {
+                versions
+                    .iter()
+                    .filter_map(|v| normalize(v.get("version")?.as_str()?))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if versions.is_empty() {
+            versions.extend(
+                entry
+                    .get("version")
+                    .and_then(JsonValue::as_str)
+                    .and_then(normalize),
+            );
+        }
+        versions.sort_by(|a, b| self.format.compare_versions(a, b));
+        versions.dedup();
+        Some(UpstreamSearchHit {
+            id: id.to_string(),
+            versions,
+            summary: self.format.search_hit_summary(entry),
+            total_downloads: entry.get("totalDownloads").and_then(JsonValue::as_i64),
+        })
+    }
+
+    /// The search result for an upstream `page`, with the caller's package
+    /// filter, the prerelease and SemVer 2.0.0 filters, and the proxy's own
+    /// state of each version applied:
+    ///
+    /// * a version, or an id, under a live not-found marker is hidden;
+    /// * with a package delay, a version is shown only once the proxy has
+    ///   recorded it and it has cleared the delay. An upstream search names
+    ///   no publish times, so a version the proxy has not seen yet counts as
+    ///   inside the window.
+    ///
+    /// An id left without versions is dropped, and the upstream's total is
+    /// reduced by the ids dropped from this page.
+    async fn upstream_search_result(
+        &self,
+        repo: &Repository,
+        params: &SearchParams,
+        filter: &PackageFilter,
+        page: UpstreamSearchPage,
+    ) -> Result<SearchResult, RepoError> {
+        let returned = page.hits.len();
+        let hits: Vec<UpstreamSearchHit> = page
+            .hits
+            .into_iter()
+            .filter(|hit| filter.allows(&hit.id))
+            .collect();
+        let names: Vec<String> = hits
+            .iter()
+            .map(|hit| self.format.lower_id(&hit.id))
+            .collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT name, version, confirmed, first_seen_at, not_found, not_found_at
+            FROM proxy_cached_version
+            WHERE repository_id = $1 AND name = ANY($2::text[])
+            "#,
+            repo.id,
+            &names,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let now = self.db_now().await?;
+        let not_found_ttl = Self::not_found_ttl(repo);
+        // `(name, version)` under a live marker; version `*` marks the id.
+        let mut marked: HashSet<(String, String)> = HashSet::new();
+        // `(name, version)` recorded and past the package delay.
+        let mut cleared: HashSet<(String, String)> = HashSet::new();
+        for row in rows {
+            if row.not_found && row.not_found_at.is_some_and(|at| now - at < not_found_ttl) {
+                marked.insert((row.name.clone(), row.version.clone()));
+            }
+            if row.confirmed && Self::delay_cleared(repo, row.first_seen_at, now) {
+                cleared.insert((row.name, row.version));
+            }
+        }
+        let delayed = repo.package_delay_seconds > 0;
+
+        let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
+        for (hit, name) in hits.into_iter().zip(names) {
+            if marked.contains(&(name.clone(), "*".to_string())) {
+                continue;
+            }
+            let versions: Vec<VersionEntry> = hit
+                .versions
+                .into_iter()
+                .filter(|v| params.prerelease || !v.contains('-'))
+                .filter(|v| params.include_semver2 || !crate::repo::is_semver2(v))
+                .filter(|v| {
+                    let key = (name.clone(), v.clone());
+                    !marked.contains(&key) && (!delayed || cleared.contains(&key))
+                })
+                .map(|version| VersionEntry {
+                    original_id: hit.id.clone(),
+                    version_original: version.clone(),
+                    version,
+                    listed: true,
+                })
+                .collect();
+            let Some(latest) = versions.last() else {
+                continue;
+            };
+            out.push(SearchHit {
+                original_id: hit.id.clone(),
+                latest_version: latest.version.clone(),
+                versions,
+                nuspec_bytes: None,
+                manifest_summary: hit.summary,
+                total_downloads: hit.total_downloads,
+            });
+        }
+        let total_hits = page.total_hits.saturating_sub(returned - out.len());
+        Ok(SearchResult {
+            total_hits,
+            hits: out,
+        })
     }
 }
 

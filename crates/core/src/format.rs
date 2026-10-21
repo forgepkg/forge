@@ -66,6 +66,16 @@ pub trait Format: Send + Sync {
         None
     }
 
+    /// The summary (as [`Self::manifest_summary`] returns it) of the display
+    /// metadata an upstream search service reports for a package (`hit` is
+    /// one entry of its results). A proxy uses it for search hits whose
+    /// manifest it has not cached. `None` (the default) when the format reads
+    /// none.
+    fn search_hit_summary(&self, hit: &serde_json::Value) -> Option<serde_json::Value> {
+        let _ = hit;
+        None
+    }
+
     /// Whether `id` is a well-formed package id of this format. Read routes
     /// answer 404 for anything else, and a proxy never puts such an id into
     /// an upstream URL: an id is pasted into URL paths, so `/`, `..`, `?`,
