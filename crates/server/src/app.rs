@@ -228,10 +228,7 @@ async fn response_policy(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    let under = |prefix: &str| {
-        path.strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    };
+    let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse");
     let feed = under("/v3");
     let headers = req.headers();
