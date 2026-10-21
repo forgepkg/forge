@@ -368,6 +368,77 @@ async fn exchange_ok_any(srv: &TestServer, token: &str) -> String {
 }
 
 #[tokio::test]
+async fn a_registry_token_dies_with_its_workload_key() {
+    let idp = MockOidc::start_workload_only("unused-wif-client").await;
+    let srv = start_stack().await;
+    let realm_id = setup(&srv, &idp, json!({})).await;
+    let created = srv
+        .create_repo(json!({"name": "ci-images", "kind": "hosted", "format": "docker"}))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let role: i64 = sqlx::query_scalar("SELECT id FROM role WHERE name = 'ci-pub'")
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.add_grant(role, Some("ci-images"), "read", None)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // `docker login -u oidc -p <key>`, then a pull of an image not pushed
+    // yet: 404 while the token stands, 401 once it does not.
+    let key = exchange_ok(&srv, &idp.sign_token(job_claims(&idp)).await).await;
+    let response = srv
+        .client()
+        .get(format!(
+            "{}/v2/token?scope=repository:ci-images/app:pull",
+            srv.base_url
+        ))
+        .basic_auth("oidc", Some(&key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let token = response.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pull = || async {
+        srv.client()
+            .get(format!("{}/v2/ci-images/app/tags/list", srv.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(pull().await, StatusCode::NOT_FOUND);
+
+    let (u, p) = srv.admin_basic();
+    let set_enabled = |enabled: bool| {
+        srv.client()
+            .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({ "enabled": enabled }))
+            .send()
+    };
+    // What a registry token rests on is re-checked every 10 seconds.
+    let recheck = std::time::Duration::from_secs(11);
+    assert_eq!(set_enabled(false).await.unwrap().status(), StatusCode::OK);
+    tokio::time::sleep(recheck).await;
+    assert_eq!(pull().await, StatusCode::UNAUTHORIZED, "realm disabled");
+    assert_eq!(set_enabled(true).await.unwrap().status(), StatusCode::OK);
+    tokio::time::sleep(recheck).await;
+    assert_eq!(
+        pull().await,
+        StatusCode::UNAUTHORIZED,
+        "the key it was minted from stays revoked"
+    );
+}
+
+#[tokio::test]
 async fn a_key_dies_with_its_expiry_and_any_realm_change() {
     let idp = MockOidc::start_workload_only("unused-wif-client").await;
     let srv = start_stack().await;
@@ -422,9 +493,35 @@ async fn a_key_dies_with_its_expiry_and_any_realm_change() {
         .unwrap();
     assert_eq!(patched.status(), StatusCode::OK);
     assert_eq!(
-        read_index(&srv, "ci-hosted", with_key(edited)).await,
+        read_index(&srv, "ci-hosted", with_key(edited.clone())).await,
         StatusCode::UNAUTHORIZED,
         "a key issued under the old policy is revoked"
+    );
+    // Putting the old policy back does not bring the key back.
+    let reverted = srv
+        .client()
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"config": {
+            "issuer": idp.issuer(),
+            "allow_http_issuer": true,
+            "allowed_audiences": [AUD],
+            "rules": [{
+                "role": "ci-pub",
+                "conditions": [
+                    {"claim": "job_project_id", "any_of": ["1001"]},
+                    {"claim": "ref_protected", "any_of": ["true"]}
+                ],
+            }],
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reverted.status(), StatusCode::OK);
+    assert_eq!(
+        read_index(&srv, "ci-hosted", with_key(edited)).await,
+        StatusCode::UNAUTHORIZED,
+        "a revoked key stays revoked"
     );
     assert_eq!(
         push_with_api_key(
@@ -452,6 +549,26 @@ async fn a_key_dies_with_its_expiry_and_any_realm_change() {
     assert_eq!(
         read_index(&srv, "ci-hosted", with_key(disabled.clone())).await,
         StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        push_with_api_key(&srv, &disabled, "Acme.Disabled", "1.0.0").await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Enabling it again does not bring them back.
+    let patched = srv
+        .client()
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    assert_eq!(
+        read_index(&srv, "ci-hosted", with_key(disabled.clone())).await,
+        StatusCode::UNAUTHORIZED,
+        "a key of a re-enabled realm stays revoked"
     );
     assert_eq!(
         push_with_api_key(&srv, &disabled, "Acme.Disabled", "1.0.0").await,

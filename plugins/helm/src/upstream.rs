@@ -14,7 +14,6 @@ use forge_plugin_api::{
     UpstreamStep, VersionMetadata,
 };
 use serde_json::{json, Map, Value};
-use yaml_rust2::YamlLoader;
 
 use crate::chart::{self, to_json};
 use crate::semver::Version;
@@ -115,7 +114,7 @@ fn failed(reason: impl Into<String>) -> UpstreamStep {
 /// a valid chart version (name, version) are left out.
 fn parse_index(body: &[u8]) -> Result<Index, String> {
     let text = std::str::from_utf8(body).map_err(|_| "not UTF-8".to_string())?;
-    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("not YAML: {e}"))?;
+    let docs = crate::yaml::load(text).map_err(|e| format!("not YAML: {e}"))?;
     let doc = docs.first().map(to_json).unwrap_or(Value::Null);
     let Some(entries) = doc.get("entries").and_then(Value::as_object) else {
         // An empty repository may write `entries: {}` or leave it out, but

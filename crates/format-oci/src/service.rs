@@ -47,6 +47,16 @@ pub trait PublishRecorder: Send + Sync {
     fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy>;
 }
 
+/// Whether the workload principal of a registry token still stands. The
+/// server answers it from its realms: like a workload key, a token stands
+/// only while its realm is enabled with the configuration it was verified
+/// under, and while the workload key its CI token was exchanged for (if it
+/// was) has not ended.
+#[async_trait::async_trait]
+pub trait WorkloadCheck: Send + Sync {
+    async fn still_valid(&self, principal: &Principal) -> Result<bool, String>;
+}
+
 /// The Docker / OCI registry: everything under `/v2`.
 #[derive(Clone)]
 pub struct Registry {
@@ -64,6 +74,7 @@ pub(crate) struct Inner {
     pub config: RegistryConfig,
     pub keys: TokenKeys,
     pub recorder: Option<Arc<dyn PublishRecorder>>,
+    pub workloads: Option<Arc<dyn WorkloadCheck>>,
 }
 
 /// Parts the registry is built from.
@@ -78,6 +89,7 @@ pub struct RegistryParts {
     pub config: RegistryConfig,
     pub keys: TokenKeys,
     pub recorder: Option<Arc<dyn PublishRecorder>>,
+    pub workloads: Option<Arc<dyn WorkloadCheck>>,
 }
 
 impl Registry {
@@ -94,6 +106,7 @@ impl Registry {
                 config: parts.config,
                 keys: parts.keys,
                 recorder: parts.recorder,
+                workloads: parts.workloads,
             }),
         }
     }
@@ -321,10 +334,42 @@ impl Registry {
         })
     }
 
-    /// Re-read what a token's user principal rests on: the account must still
+    /// Re-read what a token's principal rests on: a user's account must still
     /// be active (and the API token it was minted from live), and the admin
-    /// flag is the current one. Cached briefly per process.
+    /// flag is the current one; a workload's realm and key must still stand
+    /// ([`WorkloadCheck`]). Cached briefly per process.
     async fn refresh_principal(&self, principal: Principal) -> OciResult<Option<Principal>> {
+        if let Principal::Workload {
+            realm_id,
+            config_sha256,
+            jti_sha256,
+            ..
+        } = principal
+        {
+            let Some(check) = self.inner.workloads.clone() else {
+                return Ok(Some(principal));
+            };
+            let key = format!(
+                "{realm_id}:{}:{}",
+                hex::encode(config_sha256),
+                jti_sha256.map(hex::encode).unwrap_or_default()
+            );
+            let live: Result<bool, String> = self
+                .inner
+                .cache
+                .get_or_try_insert_local(
+                    "oci:workload",
+                    &key,
+                    std::time::Duration::from_secs(10),
+                    || async move { check.still_valid(&principal).await },
+                )
+                .await;
+            return match live {
+                Ok(true) => Ok(Some(principal)),
+                Ok(false) => Ok(None),
+                Err(e) => Err(OciError::internal("workload lookup", e)),
+            };
+        }
         let Principal::User {
             user_id,
             token_id,

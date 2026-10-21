@@ -5,7 +5,7 @@
 //! index makes [`insert`] the one-time redemption of a CI token.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
 /// A key to store for a freshly verified, exchanged CI token.
 #[derive(Debug, Clone)]
@@ -41,9 +41,12 @@ pub struct WorkloadApiKey {
 /// Store a key, redeeming its CI token. Returns the key's expiry, or `None`
 /// when that token (`issuer_sha256`, `jti_sha256`) was already exchanged.
 /// The expiry is computed from the database clock, like every other expiry
-/// the server checks against `now()`.
+/// the server checks against `now()`. The caller holds the realm row
+/// (`trusted_publish_audit_dao::lock_identity_snapshot`), so a realm change
+/// either waits for this key and then revokes it ([`revoke_realm`]) or lands
+/// first and the key is never issued.
 pub async fn insert(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     new: NewWorkloadApiKey<'_>,
 ) -> sqlx::Result<Option<DateTime<Utc>>> {
     // Runtime query rather than a macro keeps the new migration independently
@@ -71,9 +74,31 @@ pub async fn insert(
     .bind(new.token_issued_at)
     .bind(new.token_expires_at)
     .bind(new.ttl_seconds as f64)
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?;
     row.map(|row| row.try_get("expires_at")).transpose()
+}
+
+/// End every live key of `realm_id` now, in the transaction that edits,
+/// disables or deletes the realm (after its row is written, so a concurrent
+/// exchange holding the row is waited for and its key is ended too). The
+/// rows stay: until its CI token expires, each is the record that the token
+/// was redeemed. Ended keys never come back, whatever the realm becomes.
+pub async fn revoke_realm(conn: &mut PgConnection, realm_id: i64) -> sqlx::Result<u64> {
+    // `clock_timestamp()`, not the transaction's `now()`: a key committed
+    // after this transaction began has a later `created_at`, and the CHECK
+    // wants the expiry after it.
+    let res = sqlx::query(
+        r#"
+        UPDATE workload_api_key
+        SET expires_at = greatest(clock_timestamp(), created_at + interval '1 microsecond')
+        WHERE realm_id = $1 AND expires_at > now()
+        "#,
+    )
+    .bind(realm_id)
+    .execute(conn)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// The unexpired key whose SHA-256 is `key_sha256`, if any.
@@ -109,15 +134,41 @@ pub async fn find_live(
     .transpose()
 }
 
+/// Whether the CI token `(issuer_sha256, jti_sha256)` was exchanged for a
+/// key that has since ended (expired or revoked). `false` when it was never
+/// exchanged, or its key is live.
+pub async fn redemption_ended(
+    pool: &PgPool,
+    issuer_sha256: &[u8; 32],
+    jti_sha256: &[u8; 32],
+) -> sqlx::Result<bool> {
+    let ended: Option<bool> = sqlx::query_scalar(
+        r#"
+        SELECT expires_at <= now()
+        FROM workload_api_key
+        WHERE issuer_sha256 = $1 AND jti_sha256 = $2
+        "#,
+    )
+    .bind(issuer_sha256.as_slice())
+    .bind(jti_sha256.as_slice())
+    .fetch_optional(pool)
+    .await?;
+    Ok(ended.unwrap_or(false))
+}
+
 /// Delete the rows whose key **and** CI token have both expired: until the
 /// token's own expiry the row is the record that it was already redeemed.
-pub async fn reap_expired(pool: &PgPool) -> sqlx::Result<u64> {
+/// `leeway_seconds` is the most clock skew the token's `exp` is accepted
+/// with: until then the token still verifies, so its row must stay.
+pub async fn reap_expired(pool: &PgPool, leeway_seconds: u64) -> sqlx::Result<u64> {
     let res = sqlx::query(
         r#"
         DELETE FROM workload_api_key
-        WHERE expires_at <= now() AND token_expires_at <= now()
+        WHERE expires_at <= now()
+          AND token_expires_at + make_interval(secs => $1) <= now()
         "#,
     )
+    .bind(leeway_seconds as f64)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())

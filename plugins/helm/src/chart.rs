@@ -3,7 +3,7 @@
 use std::io::Read;
 
 use serde_json::{Map, Value};
-use yaml_rust2::{Yaml, YamlLoader};
+use yaml_rust2::Yaml;
 
 use crate::semver::Version;
 use crate::tar;
@@ -66,7 +66,7 @@ pub fn read(tgz: impl Read) -> Result<Chart, String> {
 /// Parse a Chart.yaml.
 pub fn parse_chart_yaml(chart_yaml: Vec<u8>) -> Result<Chart, String> {
     let text = std::str::from_utf8(&chart_yaml).map_err(|_| "Chart.yaml is not UTF-8")?;
-    let docs = YamlLoader::load_from_str(text).map_err(|e| format!("Chart.yaml: {e}"))?;
+    let docs = crate::yaml::load(text).map_err(|e| format!("Chart.yaml: {e}"))?;
     let Some(Value::Object(metadata)) = docs.first().map(to_json) else {
         return Err("Chart.yaml is not a mapping".into());
     };

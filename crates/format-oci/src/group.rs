@@ -6,7 +6,9 @@
 //! names: an image under one of the group's `reserved_prefixes` (e.g.
 //! `envisia/`), or — with `prefer_hosted`, the default — an image an owning
 //! member already has, is never served by a proxy member. Owners are the
-//! members flagged `owner`, or every hosted member when none is.
+//! members flagged `owner`, or every hosted member when none is, decided
+//! over the whole group whatever the caller may read: a caller without read
+//! on the owner gets nothing, never a proxy's image of the same name.
 //!
 //! A failing member (an unreachable proxy upstream) does not fail the pull
 //! while another member answers it.
@@ -26,6 +28,15 @@ use crate::service::{Caller, Registry};
 /// A leaf member serving a group pull, in priority order.
 struct Leaf {
     repo: Repository,
+}
+
+/// What a member reached during a group walk is for.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// Its hosted members own images (the group's guard).
+    owning: bool,
+    /// The caller may read it, through every group above: it may serve.
+    serving: bool,
 }
 
 impl Registry {
@@ -49,7 +60,10 @@ impl Registry {
             &mut path,
             &mut leaves,
             &mut owners,
-            true,
+            Walk {
+                owning: true,
+                serving: true,
+            },
         )
         .await?;
 
@@ -73,6 +87,11 @@ impl Registry {
             .collect())
     }
 
+    /// Collect the leaves that may serve the caller and the owning hosted
+    /// members, over the whole membership graph. Owners are decided without
+    /// the caller's grants (as in NuGet groups): a caller who cannot read the
+    /// hosted copy of an image must get nothing rather than a proxy's image
+    /// of the same name. Grants and offline members only decide what serves.
     #[allow(clippy::too_many_arguments)]
     fn walk<'a>(
         &'a self,
@@ -83,7 +102,7 @@ impl Registry {
         path: &'a mut HashSet<i64>,
         leaves: &'a mut Vec<Leaf>,
         owners: &'a mut HashSet<i64>,
-        owning: bool,
+        walk: Walk,
     ) -> futures_util::future::BoxFuture<'a, OciResult<()>> {
         Box::pin(async move {
             if depth >= self.inner.config.max_group_depth.max(1) {
@@ -99,18 +118,16 @@ impl Registry {
                 if !member.is_docker() || path.contains(&member.id) {
                     continue;
                 }
-                if !self
-                    .rbac_allows(&caller.principal, &member, image, Action::Read)
-                    .await
-                {
-                    continue;
-                }
+                let serving = walk.serving
+                    && self
+                        .rbac_allows(&caller.principal, &member, image, Action::Read)
+                        .await;
                 // Without flags every hosted member owns; with flags only
                 // the flagged ones (and what flagged groups own).
-                let member_owns = owning && (flagged.is_empty() || flagged.contains(&member.id));
+                let owning = walk.owning && (flagged.is_empty() || flagged.contains(&member.id));
                 match member.kind() {
                     RepoKind::Group => {
-                        if !member.online {
+                        if !serving && !owning {
                             continue;
                         }
                         path.insert(member.id);
@@ -122,20 +139,28 @@ impl Registry {
                             path,
                             leaves,
                             owners,
-                            member_owns,
+                            Walk {
+                                owning,
+                                // An offline nested group serves nothing.
+                                serving: serving && member.online,
+                            },
                         )
                         .await?;
                         path.remove(&member.id);
                     }
                     RepoKind::Hosted => {
-                        if member_owns {
+                        if owning {
                             owners.insert(member.id);
                         }
-                        if member.online {
+                        if serving && member.online {
                             leaves.push(Leaf { repo: member });
                         }
                     }
-                    RepoKind::Proxy => leaves.push(Leaf { repo: member }),
+                    RepoKind::Proxy => {
+                        if serving {
+                            leaves.push(Leaf { repo: member });
+                        }
+                    }
                 }
             }
             Ok(())
@@ -235,6 +260,7 @@ impl Registry {
         depth: u32,
     ) -> OciResult<Vec<ReferrerDescriptor>> {
         let mut out: Vec<ReferrerDescriptor> = Vec::new();
+        let mut seen = HashSet::new();
         for member in self.serving_members(caller, group, image, depth).await? {
             match self
                 .referrers_from(caller, &member, image, subject, depth + 1)
@@ -242,7 +268,7 @@ impl Registry {
             {
                 Ok(found) => {
                     for r in found {
-                        if !out.iter().any(|seen| seen.digest == r.digest) {
+                        if seen.insert(r.digest.clone()) {
                             out.push(r);
                         }
                     }

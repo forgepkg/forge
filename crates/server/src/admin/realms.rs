@@ -21,6 +21,7 @@ use forge_crypto::CryptoError;
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm, ReorderOutcome};
 use forge_db::model::AuthRealm;
 use forge_db::secret_dao::{self, SecretDbError};
+use forge_db::workload_api_key_dao;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -537,6 +538,11 @@ async fn write_realm_update(
         }
     };
     if row.is_some() {
+        // Any edit ends the realm's workload keys for good, re-enabling or
+        // reverting it included.
+        if existing.kind == KIND_WORKLOAD_IDENTITY {
+            workload_api_key_dao::revoke_realm(&mut tx, existing.id).await?;
+        }
         tx.commit().await?;
     }
     Ok(row)
@@ -550,6 +556,9 @@ async fn delete_realm_guarded(
     let mut tx = state.pool.begin().await?;
     guard_last_interactive_realm(&mut tx, realm).await?;
     let deleted = auth_realm_dao::delete_realm(&mut *tx, realm.id).await?;
+    if deleted && realm.kind == KIND_WORKLOAD_IDENTITY {
+        workload_api_key_dao::revoke_realm(&mut tx, realm.id).await?;
+    }
     tx.commit().await?;
     Ok(deleted)
 }

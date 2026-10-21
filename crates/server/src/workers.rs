@@ -375,9 +375,15 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
                 Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
                 Err(e) => tracing::error!(error = %e, "session reap failed"),
             }
-            // Exchanged workload keys whose CI token has expired as well
-            // (until then the row records the token's redemption).
-            match forge_db::workload_api_key_dao::reap_expired(&pool).await {
+            // Exchanged workload keys whose CI token has expired as well,
+            // past any clock skew a realm accepts (until then the row
+            // records the token's redemption).
+            match forge_db::workload_api_key_dao::reap_expired(
+                &pool,
+                crate::auth::MAX_CLOCK_SKEW_SECONDS,
+            )
+            .await
+            {
                 Ok(0) => {}
                 Ok(n) => {
                     tracing::debug!(reaped = n, "auth reaper deleted expired workload API keys")

@@ -68,7 +68,8 @@ fn default_positive_cache() -> u64 {
     60
 }
 
-const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
+/// The most leeway a realm may give a token's `exp`, `nbf` and `iat`.
+pub(crate) const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_POSITIVE_CACHE_SECONDS: u64 = 5 * 60;
 /// Lifetime of an exchanged workload API key when the realm sets none: an
@@ -341,6 +342,15 @@ fn normalize_nonempty_values(mut values: Vec<String>, field: &str) -> Result<Vec
     values.sort();
     values.dedup();
     Ok(values)
+}
+
+/// Whether `snap` has realm `realm_id` enabled with the configuration
+/// `config_sha256` names: what a workload key, and a registry token minted
+/// for a workload, rest on. Any edit, disable or delete of the realm ends it.
+pub(crate) fn realm_current(snap: &RealmSnapshot, realm_id: i64, config_sha256: &[u8; 32]) -> bool {
+    snap.workload
+        .iter()
+        .any(|realm| realm.realm_id == realm_id && realm.config_sha256 == *config_sha256)
 }
 
 /// A built WIF realm in a [`super::RealmSnapshot`]: the realm identity, the
@@ -682,11 +692,7 @@ impl WorkloadIdentitySource {
         if row.key_sha256.ct_eq(&digest).unwrap_u8() != 1 {
             return SourceOutcome::Reject;
         }
-        let current = snap
-            .workload
-            .iter()
-            .find(|realm| realm.realm_id == row.realm_id);
-        if current.is_none_or(|realm| realm.config_sha256 != row.config_sha256) {
+        if !realm_current(snap, row.realm_id, &row.config_sha256) {
             tracing::warn!(
                 realm_id = row.realm_id,
                 key_id = row.id,

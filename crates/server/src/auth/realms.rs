@@ -1118,6 +1118,9 @@ async fn apply_seed(
             .is_some()
                 && authz_dao::replace_setting(&mut *tx, &key, &marker, &fingerprint).await?;
             if applied {
+                if kind == KIND_WORKLOAD_IDENTITY {
+                    forge_db::workload_api_key_dao::revoke_realm(&mut tx, existing.id).await?;
+                }
                 tx.commit().await?;
                 tracing::info!(realm = %name, %kind, "re-applied changed legacy config (row unmodified since seed)");
             } else {

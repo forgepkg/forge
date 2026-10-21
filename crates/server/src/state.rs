@@ -332,6 +332,10 @@ impl AppState {
             },
             keys: self.registry_keys.clone(),
             recorder: Some(Arc::new(crate::registry::LedgerRecorder)),
+            workloads: Some(Arc::new(crate::registry::WorkloadLiveness {
+                realms: self.realms.clone(),
+                pool: self.pool.clone(),
+            })),
         })
     }
 
