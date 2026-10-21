@@ -311,3 +311,74 @@ fn an_idle_subdirectory_without_a_lock_file_is_removed() {
     drop(staging);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// #127: a staging directory another local user could tamper with is
+/// refused: one writable by group or others (unless sticky, like `/tmp`), or
+/// one that belongs to another user. Whoever can rename the process's
+/// subdirectory could swap a package between its hashing and its upload.
+#[cfg(unix)]
+#[test]
+fn a_staging_directory_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("open");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = Staging::new(&dir, None)
+        .expect_err("world-writable")
+        .to_string();
+    assert!(err.contains("writable by group or others"), "{err}");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(Staging::new(&dir, None).is_err(), "group-writable");
+    // Sticky, like /tmp: others cannot rename what is not theirs.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    Staging::new(&dir, None).expect("sticky");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Staging::new(&dir, None).expect("only the owner writes");
+
+    // Another user's directory (needs root to give one away).
+    if rustix::process::geteuid().is_root() {
+        let theirs = scratch_dir("theirs");
+        std::os::unix::fs::chown(&theirs, Some(4242), None).unwrap();
+        let err = Staging::new(&theirs, None)
+            .expect_err("not ours")
+            .to_string();
+        assert!(err.contains("uid 4242"), "{err}");
+    }
+}
+
+/// #127: Forge creates a missing staging directory, and each process's
+/// subdirectory, with mode 0700.
+#[cfg(unix)]
+#[tokio::test]
+async fn staging_directories_are_created_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private").join("nested").join("staging");
+    let cas = cas(Staging::new(&dir, None).unwrap());
+    let staged = cas.stage(Cursor::new(b"x".to_vec()), 1024).await.unwrap();
+    let own = staged.temp_path.parent().unwrap();
+    for created in [dir.as_path(), own] {
+        let mode = std::fs::metadata(created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", created.display());
+    }
+}
+
+/// #127: a staged file is read back through the handle it was written and
+/// hashed through, so replacing the file at its path in between (what the
+/// owner of a shared staging directory could do) does not change what is
+/// parsed or uploaded.
+#[tokio::test]
+async fn a_staged_file_is_read_through_its_own_handle() {
+    let dir = scratch_dir("handle");
+    let cas = cas(Staging::new(&dir, None).unwrap());
+    let staged = cas
+        .stage(Cursor::new(b"the hashed bytes".to_vec()), 1024)
+        .await
+        .unwrap();
+    std::fs::remove_file(&staged.temp_path).unwrap();
+    std::fs::write(&staged.temp_path, b"attacker bytes").unwrap();
+    let read = std::fs::read(staged.read_path()).unwrap();
+    if cfg!(target_os = "linux") {
+        assert_eq!(read, b"the hashed bytes");
+    }
+}

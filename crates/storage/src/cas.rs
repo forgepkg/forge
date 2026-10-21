@@ -22,6 +22,14 @@
 //! the process lives, so [`Staging::sweep_stale`] removes what a killed
 //! process left there at startup, however recent, instead of letting it take
 //! up space beside the new process's budget.
+//!
+//! The staging directory must belong to the process's user and must not be
+//! writable by others (unless sticky, like `/tmp`), and Forge creates it and
+//! its process subdirectories with mode `0700`: whoever owns the directory can
+//! swap the files in it. A staged file is read back (to parse it, to upload
+//! it) through the handle staging wrote it with ([`StagedBlob::read_path`]),
+//! never by its name, so what is parsed and uploaded is the file that was
+//! hashed.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -91,6 +99,8 @@ pub struct StagedBlob {
     pub sha512_base64: String,
     pub size: u64,
     pub temp_path: TempPath,
+    /// The handle the bytes were written and hashed through.
+    file: std::fs::File,
     /// The temp-space reservation, released with the temp file.
     reservation: Option<Reservation>,
     /// Keeps the process's staging subdirectory (and its lock) alive while
@@ -111,6 +121,8 @@ pub struct StoredBlob {
     /// The temp file holding the content. Kept alive so callers can re-read it
     /// (e.g. parse the package) before it is dropped/unlinked.
     pub temp_path: TempPath,
+    /// The handle the bytes were written and hashed through.
+    file: std::fs::File,
     /// The S3 key the object was stored under.
     pub s3_key: String,
     /// Whether this ingest performed a fresh S3 upload (`false` = dedup hit).
@@ -251,7 +263,7 @@ impl OwnDir {
         );
         let pending = dir.join(format!(".{name}"));
         let path = dir.join(name);
-        std::fs::create_dir(&pending)?;
+        create_private_dir(&pending, false)?;
         let locked = (|| {
             let lock = std::fs::File::create(pending.join(Staging::LOCK_FILE))?;
             let lock = match lock.try_lock() {
@@ -294,6 +306,95 @@ impl Drop for OwnDir {
     }
 }
 
+impl StagedBlob {
+    /// A path that opens the staged bytes' own file: on Linux
+    /// `/proc/self/fd/<n>` of the handle they were written and hashed
+    /// through, so whatever replaces the file or its directory in between
+    /// cannot change what is parsed or uploaded; elsewhere (or without
+    /// `/proc`) the temp file's path in the private staging directory.
+    pub fn read_path(&self) -> PathBuf {
+        handle_path(&self.file, &self.temp_path)
+    }
+}
+
+impl StoredBlob {
+    /// Like [`StagedBlob::read_path`].
+    pub fn read_path(&self) -> PathBuf {
+        handle_path(&self.file, &self.temp_path)
+    }
+}
+
+/// [`StagedBlob::read_path`] of `file`, whose name is `fallback`.
+fn handle_path(file: &std::fs::File, fallback: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if path.exists() {
+            return path;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    fallback.to_path_buf()
+}
+
+/// Create `dir` (and, with `parents`, its missing parents) with mode `0700`.
+fn create_private_dir(dir: &Path, parents: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(parents);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Refuse a staging directory another local user could tamper with: one that
+/// is not this process's user's, or that group or others can write to
+/// without the sticky bit (which keeps them from renaming what is not
+/// theirs). Whoever can rename the process's subdirectory can swap a staged
+/// package between its hashing and its upload, and through content-addressed
+/// dedup that would poison every repository holding the package.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refuse = |why: String| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "staging directory {} {why}; use a directory only Forge's user can write \
+                     (server.staging_dir)",
+                    dir.display()
+                ),
+            ))
+        };
+        let meta = std::fs::metadata(dir)?;
+        if !meta.is_dir() {
+            return refuse("is not a directory".into());
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        if meta.uid() != euid {
+            return refuse(format!(
+                "belongs to uid {}, not to this process's user (uid {euid})",
+                meta.uid()
+            ));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return refuse(format!(
+                "is writable by group or others (mode {:o})",
+                mode & 0o7777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 impl Staging {
     /// File-name prefix of staged files.
     const PREFIX: &'static str = "forge-staging-";
@@ -313,9 +414,16 @@ impl Staging {
     /// Stage under `dir` (created if missing), in a new subdirectory of this
     /// process's own, with at most `max_bytes` in use at once (`None`: no
     /// budget).
+    ///
+    /// The directory must belong to this process's user and must not be
+    /// writable by group or others unless it is sticky
+    /// ([`ensure_private_dir`]); it is created with mode `0700` and resolved
+    /// once, so a symbolic link to it cannot be repointed later.
     pub fn new(dir: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)?;
+        create_private_dir(&dir, true)?;
+        let dir = std::fs::canonicalize(&dir)?;
+        ensure_private_dir(&dir)?;
         let own = Some(Arc::new(Mutex::new(OwnDir::create(&dir)?)));
         let limit = max_bytes.unwrap_or(0);
         let budget = max_bytes.map(|bytes| {
@@ -551,7 +659,9 @@ impl Cas {
             exhausted: false,
         };
         let (sha256, sha512_base64, size) = {
-            let file = tokio::fs::File::create(temp.path()).await?;
+            // Through the file `tempfile` created (`O_EXCL`), never reopened
+            // by its name.
+            let file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
             let mut writer = HashingWriter::new(file);
             match copy(&mut reader, &mut writer).await {
                 Ok(_) => {}
@@ -576,12 +686,13 @@ impl Cas {
             writer.finalize().await?
         };
 
-        let temp_path = temp.into_temp_path();
+        let (file, temp_path) = temp.into_parts();
         Ok(StagedBlob {
             sha256,
             sha512_base64,
             size,
             temp_path,
+            file,
             reservation: reader.reservation,
             own_dir,
         })
@@ -648,7 +759,7 @@ impl Cas {
 
         // Content addressing guarantees an existing object is byte-identical.
         // The live ingest lease prevents a deleter from racing this check/put.
-        let uploaded = match self.store.put_if_absent(&s3_key, &staged.temp_path).await {
+        let uploaded = match self.store.put_if_absent(&s3_key, &staged.read_path()).await {
             Ok(uploaded) => uploaded,
             Err(error) => {
                 let _ = forge_db::blob_dao::abort_ingest(&self.pool, ingest_token).await;
@@ -669,6 +780,7 @@ impl Cas {
             sha512_base64: staged.sha512_base64,
             size: staged.size,
             temp_path: staged.temp_path,
+            file: staged.file,
             s3_key,
             uploaded,
             ingest_token,
