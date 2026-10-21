@@ -24,9 +24,11 @@ use crate::authz::PackageFilter;
 /// it without depending on `forge-db` directly.
 pub use forge_db::model::RepoKind;
 
-/// Canonical asset path of the stored `.nupkg` blob within a component.
+/// Canonical asset path of the stored `.nupkg` blob within a component
+/// (NuGet's [`crate::format::Format::package_asset_path`]).
 pub const NUPKG_ASSET_PATH: &str = "package.nupkg";
-/// Canonical asset path of the derived `.nuspec` blob within a component.
+/// Canonical asset path of the derived `.nuspec` blob within a component
+/// (NuGet's [`crate::format::Format::manifest_asset_path`]).
 pub const NUSPEC_ASSET_PATH: &str = "package.nuspec";
 
 /// Content type stored/served for the `.nupkg` asset.
@@ -63,6 +65,11 @@ pub enum RepoError {
     /// the client should retry later → 503.
     #[error("temporarily unavailable: {0}")]
     Busy(String),
+    /// The repository's format is not installed on this server (a format
+    /// plugin missing from the configuration) → 503: nothing of it is served
+    /// until the format is back, and it is never read as another format.
+    #[error("format {0:?} is not installed")]
+    FormatUnavailable(String),
 }
 
 /// Errors surfaced by the hosted **write** path (publish / delete / relist).
@@ -204,10 +211,18 @@ pub struct RegistrationEntry {
     pub original_id: String,
     /// Normalized version.
     pub version: String,
+    /// Version exactly as published (the normalized one when unknown, e.g.
+    /// a proxied version not cached yet).
+    pub version_original: String,
     /// Whether listed.
     pub listed: bool,
     /// SHA-512 of the `.nupkg`, base64-encoded (from `asset.sha512_base64`).
     pub package_hash_sha512_base64: Option<String>,
+    /// SHA-256 of the package, lowercase hex (the CAS key of its blob), when
+    /// the package is stored locally.
+    pub package_sha256: Option<String>,
+    /// Byte size of the package, when it is stored locally.
+    pub package_size: Option<i64>,
     /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored and
     /// no [`Self::manifest_summary`] is (older versions).
     pub nuspec_bytes: Option<Vec<u8>>,

@@ -1,6 +1,6 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
-import { useCreateRepository } from '~/queries/useRepositories'
+import { useCreateRepository, useFormats } from '~/queries/useRepositories'
 import { Heading } from '~/components/catalyst/heading'
 import {
   RepositoryForm,
@@ -21,6 +21,8 @@ export const Route = createFileRoute('/_app/manage/repositories/new')({
 function CreateRepository() {
   const navigate = useNavigate()
   const create = useCreateRepository()
+  // Without the list (loading, or an older server) the form offers NuGet.
+  const formats = useFormats()
 
   function handleSubmit(values: RepoFormValues) {
     create.mutate(toCreateBody(values), {
@@ -38,6 +40,7 @@ function CreateRepository() {
       <Heading>New repository</Heading>
       <RepositoryForm
         mode="create"
+        formats={formats.data}
         submitting={create.isPending}
         serverError={
           create.isError ? create.error.body || create.error.message : null

@@ -2,7 +2,7 @@
 
 A self-hosted **NuGet package registry** written in Rust. It speaks the NuGet
 **V3** protocol and supports the three repository types you expect from an
-enterprise registry:
+enterprise registry (more formats come as **format plugins**, see below):
 
 - **hosted** — push and restore your own `.nupkg` packages.
 - **proxy** — cache packages on demand from an upstream NuGet V3 feed —
@@ -23,8 +23,12 @@ without stored API keys through Forge's **direct-token OIDC trusted-publishing**
 flow for GitHub Actions, GitLab CI, and compatible workload issuers; its bearer
 token, cache, and audit limitations are documented below.
 A **retention** engine reaps cold versions and garbage-collects dereferenced
-blobs. The admin + browse UI is a **TanStack Router SPA** served by the same Rust
-process on a single origin — there is no Node server in production.
+blobs. **Format plugins** (preview) add further package formats that reuse all
+of the above, either built into the server or loaded as sandboxed WebAssembly
+components; **Helm chart repositories** are built in
+([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
+a **TanStack Router SPA** served by the same Rust process on a single origin —
+there is no Node server in production.
 
 ## Architecture
 
@@ -37,9 +41,12 @@ A Cargo workspace of small crates plus the web SPA:
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `format-nuget` | `forge-nuget` | NuGet V3 protocol + `.nupkg`/`.nuspec` parsing. |
+| `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait, its WIT twin and the component glue. |
+| `plugin` | `forge-plugin` | The host side of format plugins: built-in and WebAssembly plugins (Wasmtime) behind one trait. |
 | `server` | `forge-server` | Axum HTTP server: NuGet feed, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
+| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `helm`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
 **Single-origin serving.** `forge-server` mounts the NuGet feed (`/v3`), the
@@ -148,6 +155,9 @@ the user password).
   server, tests, and Docker packaging details.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers.
+- **[Format plugins](./docs/format-plugins.md)** — further package formats
+  (Helm charts), built in or as sandboxed WebAssembly components: design,
+  operation, and writing one.
 
 Run `cargo xtask help` for the complete command list.
 

@@ -109,6 +109,29 @@ export interface UpdateRepo {
   reserved_prefixes?: string[]
 }
 
+/**
+ * An installed package format (`FormatView` of `GET /admin/formats`): NuGet,
+ * the built-in format plugins, and every loaded WebAssembly plugin.
+ */
+export interface FormatView {
+  /** The format id (`RepoView.format`). */
+  id: string
+  /** Display name. */
+  name: string
+  /** Built into the server (NuGet, the built-in plugins) rather than a WebAssembly plugin. */
+  builtin: boolean
+  /** The repository kinds it supports (plugins: hosted and group). */
+  kinds: RepoKind[]
+  /** Where its repositories are served: `{mount}/{repository}`. */
+  mount: string
+  /** Plugin version. */
+  version?: string
+  /** Plugin description. */
+  description?: string
+  /** SHA-256 of a WebAssembly plugin's component. */
+  sha256?: string
+}
+
 /** A group member view (`MemberView`). */
 export interface MemberView {
   name: string
@@ -144,6 +167,16 @@ export const repoKeys = {
   list: () => ['repositories', 'list'] as const,
   detail: (name: string) => ['repositories', 'detail', name] as const,
   members: (name: string) => ['repositories', 'members', name] as const,
+}
+
+/** Query key of the installed formats. */
+export const formatKeys = {
+  list: () => ['formats'] as const,
+}
+
+/** `GET /admin/formats` — the formats repositories can be created with. */
+export function fetchFormats(signal?: AbortSignal): Promise<FormatView[]> {
+  return httpClient.get<FormatView[]>('/admin/formats', { signal })
 }
 
 /** `GET /admin/repositories` — bare array of all repositories. */

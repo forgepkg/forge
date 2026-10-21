@@ -8,7 +8,9 @@ for S3).
 ## Prerequisites
 
 - **Docker** (for Postgres + versitygw, and for the test suites).
-- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`).
+- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`), with
+  the `wasm32-wasip2` target for the format plugins' component builds and the
+  tests that load them (`rustup target add wasm32-wasip2`).
 - **Node 22 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
   pinned `pnpm@11.5.0` from `web/package.json`).
 - *Optional:* the **.NET SDK** (`dotnet`) to drive the feed with a real client.
@@ -233,6 +235,23 @@ password supplied to NuGet should be a **token**.
   lists repositories: scoped to the group alone it sees an empty feed, so
   list the group **and** every member it should be served from, e.g.
   `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
+
+### Repositories of other formats (format plugins)
+
+Formats other than NuGet come from format plugins, crates in
+[`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)).
+Helm is built in: create a repository with `"format": "helm"` (hosted or group;
+plugin formats have no proxies). It is served under `/repository/<name>/`, e.g.
+`helm repo add local http://localhost:8421/repository/charts`.
+
+To run a plugin as a WebAssembly component instead:
+
+```bash
+cargo xtask plugins     # builds plugins/* as components, prints the [plugins] section for forge.toml
+```
+
+A built-in plugin's component loads only under another id (rename its
+installed directory and the `id` in its `plugin.toml`).
 
 ## Configuration
 
@@ -463,7 +482,12 @@ Postgres/versitygw/Redis automatically, so you only need Docker running (you do
 cargo xtask test    # unit + integration (cargo test --workspace)
 cargo xtask e2e     # end-to-end suite (cargo test -p forge-e2e --features forge-e2e)
 cargo xtask check   # cargo fmt --check + clippy -D warnings
+cargo xtask plugins-check   # the format plugins' component builds: clippy and build
 ```
+
+The format-plugin tests (`crates/plugin/tests`, `crates/server/tests/plugins.rs`)
+build the Helm plugin as a component themselves into `target/plugins/`; they
+need the `wasm32-wasip2` target.
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
@@ -495,6 +519,9 @@ cargo test -p forge-server
 `up` · `down` · `dev` · `run` · `seed` · `test` · `e2e` · `check` · `fmt` ·
 `clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
 `ps` · `clean`.
+
+Format plugins as components: `plugins` (build + install, prints the config) ·
+`plugins-check` (clippy and build).
 
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).

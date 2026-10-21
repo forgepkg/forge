@@ -1,0 +1,315 @@
+// The contract between Forge and a format plugin: what teaches Forge one more
+// package format.
+//
+// A plugin is a Rust crate implementing `forge_plugin_api::FormatPlugin`, the
+// same contract in Rust (crates/plugin-api/src/lib.rs). Forge links its
+// built-in plugins natively; any plugin can also be built as a WebAssembly
+// component of the `format-plugin` world below and loaded at startup.
+//
+// The division of labor is fixed: the host owns everything a repository is —
+// storage (the content-addressed store), metadata (Postgres), authentication,
+// authorization and package selectors, hosted/group semantics, retention,
+// streaming of package bytes in both directions. The plugin owns what is
+// specific to its format: the identity rules (ids, versions), reading a
+// package's manifest, and the client protocol (which URL answers what, and how
+// a response looks).
+//
+// A plugin never sees credentials, never touches storage, and never holds a
+// whole package in memory: the host stages uploads on its disk and lends the
+// plugin a reader, and the host streams downloads itself.
+//
+// Versioning: a plugin is built against one version of this package and
+// declares it in its plugin.toml (`api`). A host supports a fixed set of
+// versions; changing anything in this file means a new package version.
+package forge:format@0.1.0;
+
+/// Types shared by the interfaces below.
+interface types {
+    /// A dependency on another package of the same format.
+    record dependency {
+        /// The package id, as written.
+        id: string,
+        /// The version range in the format's syntax; none for any version.
+        range: option<string>,
+    }
+
+    /// The dependencies that apply to one target (a framework, a platform);
+    /// a format without targets uses a single group without one.
+    record dependency-group {
+        target: option<string>,
+        dependencies: list<dependency>,
+    }
+
+    /// Why a package, an id or a version was refused. The text is shown to
+    /// the client that sent it.
+    variant format-error {
+        invalid-package(string),
+        missing-manifest(string),
+        malformed-manifest(string),
+        invalid-version(string),
+        invalid-id(string),
+        /// The plugin itself failed (a bug, an exhausted resource): the
+        /// client gets a server error, not this text.
+        internal(string),
+    }
+}
+
+/// Read access to a package the host staged on its local disk.
+interface package-source {
+    resource package-reader {
+        /// The package's size in bytes.
+        size: func() -> u64;
+        /// Up to `len` bytes starting at `offset`: fewer only at the end of
+        /// the package, none at or past it. `len` is clamped to 1 MiB.
+        read-at: func(offset: u64, len: u32) -> result<list<u8>, string>;
+    }
+}
+
+/// The format's identity rules and package parsing. Every function is pure:
+/// the host may call them in any order, on any instance, any number of times.
+interface format {
+    use types.{dependency-group, format-error};
+    use package-source.{package-reader};
+
+    /// What a package declares about itself.
+    record parsed-package {
+        /// The canonical id: what `canonical-id` returns for `original-id`.
+        id: string,
+        /// The id exactly as the package writes it.
+        original-id: string,
+        /// The normalized version (what `normalize-version` returns).
+        version: string,
+        /// The version exactly as the package writes it.
+        version-original: string,
+        /// Whether the version shows up in searches and as "latest".
+        listed: bool,
+        /// The manifest (e.g. Chart.yaml, package.json), stored next to the
+        /// package and handed back through the `manifest` query. Keep it
+        /// small: it is held in memory.
+        manifest: list<u8>,
+        dependencies: list<dependency-group>,
+    }
+
+    /// The canonical form of a package id, used for lookups and uniqueness
+    /// (e.g. lowercased).
+    canonical-id: func(id: string) -> string;
+
+    /// Whether `id` (canonical) is a well-formed id. The host treats a query
+    /// or an action naming any other id like one naming an unknown package
+    /// (an empty answer, a 404).
+    validate-id: func(id: string) -> result<_, format-error>;
+
+    /// The normalized form of a version, used for lookups and uniqueness.
+    /// Prerelease versions must contain a `-` (the host filters on it).
+    normalize-version: func(version: string) -> result<string, format-error>;
+
+    /// The order of two normalized versions: negative when `a` sorts before
+    /// `b`, zero when equal, positive when after.
+    compare-versions: func(a: string, b: string) -> s8;
+
+    /// Read a package's identity, manifest and dependencies.
+    parse-package: func(source: borrow<package-reader>) -> result<parsed-package, format-error>;
+
+    /// A JSON object summarizing `manifest`, stored with the version so that
+    /// rendering never re-reads the manifest (the `summary` of package-info).
+    /// None when there is nothing worth keeping.
+    manifest-summary: func(manifest: list<u8>) -> option<string>;
+}
+
+/// The client protocol of the format.
+///
+/// The host has authenticated the caller and checked that it may perform the
+/// request's action on the repository (GET/HEAD read, PUT/POST write, DELETE
+/// delete) before `handle` is called. `handle` decides what the request is:
+/// a response it can give right away, data it needs first (then `render` is
+/// called with that data), or an action only the host can perform (serve a
+/// package, publish one, unlist, relist or delete a version).
+interface protocol {
+    /// How the repository stores its packages.
+    enum repository-kind {
+        hosted,
+        proxy,
+        group,
+    }
+
+    /// The repository a request is for.
+    record repository {
+        name: string,
+        kind: repository-kind,
+        /// The absolute URL the repository is served at, without a trailing
+        /// slash (e.g. https://forge.example.com/repository/charts).
+        base-url: string,
+    }
+
+    /// An HTTP request from a package client.
+    record request {
+        /// The method, upper case.
+        method: string,
+        /// The path below `base-url`, starting with "/", still
+        /// percent-encoded as the client sent it.
+        path: string,
+        /// The query string without its "?", empty when there is none.
+        query: string,
+        /// The request headers the host passes on (lowercase names): accept,
+        /// accept-language, content-type, if-match, if-modified-since,
+        /// if-none-match, user-agent. Never credentials or cookies.
+        headers: list<tuple<string, string>>,
+    }
+
+    /// An HTTP response. The host keeps only the headers it allows (content
+    /// type, caching and validators, content-disposition, location) and adds
+    /// its own security headers.
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// One version of one package (canonical id, normalized version).
+    record package-ref {
+        id: string,
+        version: string,
+    }
+
+    record search-query {
+        /// Free text; empty matches every package.
+        text: string,
+        skip: u32,
+        /// Clamped by the host to 1000.
+        take: u32,
+        prerelease: bool,
+    }
+
+    /// Data the plugin can ask for. Package ids are canonical, versions
+    /// normalized. Everything the caller may not read (package selectors,
+    /// group members it cannot see) is left out, exactly as for an unknown
+    /// package.
+    variant query {
+        /// Every version of a package, ascending.
+        versions(string),
+        /// Every version of a package with its metadata, ascending.
+        packages(string),
+        /// One version with its metadata.
+        %package(package-ref),
+        /// The manifest stored with one version.
+        manifest(package-ref),
+        /// The packages matching a search.
+        search(search-query),
+    }
+
+    record version-info {
+        /// The id as the package writes it.
+        original-id: string,
+        version: string,
+        version-original: string,
+        listed: bool,
+    }
+
+    record package-info {
+        original-id: string,
+        version: string,
+        version-original: string,
+        listed: bool,
+        /// When the version was published into the repository (RFC 3339).
+        published: option<string>,
+        /// The package's SHA-256, lowercase hex.
+        sha256: option<string>,
+        /// The package's SHA-512, base64.
+        sha512: option<string>,
+        /// The package's size in bytes.
+        size: option<u64>,
+        /// What `manifest-summary` returned at publish.
+        summary: option<string>,
+    }
+
+    record search-hit {
+        original-id: string,
+        latest-version: string,
+        /// Ascending.
+        versions: list<version-info>,
+        /// The summary of the latest version.
+        summary: option<string>,
+    }
+
+    record search-result {
+        /// Matching packages before paging.
+        total: u32,
+        hits: list<search-hit>,
+    }
+
+    variant answer {
+        versions(list<version-info>),
+        packages(list<package-info>),
+        %package(option<package-info>),
+        manifest(option<list<u8>>),
+        search(search-result),
+    }
+
+    /// A query with its answer.
+    record loaded {
+        query: query,
+        answer: answer,
+    }
+
+    /// Where a publish request carries the package.
+    variant upload {
+        /// The request body is the package.
+        body,
+        /// The package is the multipart/form-data file part of this name.
+        multipart-field(string),
+    }
+
+    /// A publish, unlist, relist or delete, and the response when it succeeds.
+    /// When it fails the host answers with its own status (400 invalid
+    /// package, 403 not allowed, 404 unknown version, 409 version exists,
+    /// 413 too large).
+    record publish-request {
+        upload: upload,
+        done: response,
+    }
+
+    record change-request {
+        target: package-ref,
+        done: response,
+    }
+
+    variant action {
+        /// Answer with this response.
+        respond(response),
+        /// Load this data, then call `render` with it.
+        load(list<query>),
+        /// Serve the stored package of this version, or 404 when the caller
+        /// cannot read it. The host streams it and counts the download.
+        download(package-ref),
+        /// Publish the package the request carries (hosted repositories,
+        /// write permission). The host parses it with `parse-package`.
+        publish(publish-request),
+        /// Hide a version from searches and "latest" (delete permission).
+        unlist(change-request),
+        /// Show an unlisted version again (write permission).
+        relist(change-request),
+        /// Remove a version and its bytes (delete permission).
+        delete(change-request),
+    }
+
+    variant rendered {
+        /// Answer with this response.
+        respond(response),
+        /// Load more data, then call `render` again with everything loaded
+        /// so far (the host bounds the rounds and the number of queries).
+        load(list<query>),
+    }
+
+    handle: func(repo: repository, req: request) -> action;
+
+    render: func(repo: repository, req: request, data: list<loaded>) -> rendered;
+}
+
+/// What a format plugin is: it exports the format and its protocol and
+/// imports nothing but the package reader (and WASI, which the host provides
+/// without any file system, network, environment or arguments).
+world format-plugin {
+    import package-source;
+    export format;
+    export protocol;
+}

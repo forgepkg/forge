@@ -105,6 +105,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
 /// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
+/// * `/repository/{repo}/...` — repositories of plugin formats
+///   ([`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).
 ///
@@ -136,7 +138,11 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
         // /DELETE; the dispatcher enforces authz per method.
         .route("/v3/{repo}", any(dispatch))
-        .route("/v3/{repo}/{*rest}", any(dispatch));
+        .route("/v3/{repo}/{*rest}", any(dispatch))
+        // Repositories of plugin formats, each served by its format's plugin
+        // (`crate::plugins`); like `/v3`, authorization is per method.
+        .route("/repository/{repo}", any(crate::plugins::dispatch))
+        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch));
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
@@ -212,7 +218,8 @@ const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
-/// * feed responses (`/v3/...`) carry [`FEED_VARY`], and are `private,
+/// * feed responses (`/v3/...`, and `/repository/...` of plugin formats)
+///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
 ///   someone else. Anonymous responses carry no `Cache-Control`; under
@@ -230,7 +237,7 @@ async fn response_policy(
     let path = req.uri().path();
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse");
-    let feed = under("/v3");
+    let feed = under("/v3") || under(crate::plugins::MOUNT);
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")

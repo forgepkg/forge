@@ -1099,8 +1099,11 @@ impl RepoReadOps for FakeProxy {
             .map(|v| forge_core::repo::RegistrationEntry {
                 original_id: "Sample".into(),
                 version: (*v).into(),
+                version_original: (*v).into(),
                 listed: true,
                 package_hash_sha512_base64: None,
+                package_sha256: None,
+                package_size: None,
                 nuspec_bytes: None,
                 manifest_summary: None,
                 published: None,

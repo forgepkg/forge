@@ -25,4 +25,4 @@ pub use model::{
     validate_policy, Action, Criteria, PolicyError, ReleaseType, RetentionPolicy, RetentionRule,
     Scope, POLICY_VERSION,
 };
-pub use worker::{RetentionConfig, RetentionWorker, WorkerError};
+pub use worker::{FormatResolver, RetentionConfig, RetentionWorker, WorkerError};

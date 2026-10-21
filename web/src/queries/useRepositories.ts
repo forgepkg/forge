@@ -9,15 +9,18 @@ import {
   addMember,
   createRepository,
   deleteRepository,
+  fetchFormats,
   fetchMembers,
   fetchRepositories,
   fetchRepository,
+  formatKeys,
   removeMember,
   repoKeys,
   updateMember,
   updateRepository,
   type AddMember,
   type CreateRepo,
+  type FormatView,
   type MemberView,
   type RepoView,
   type UpdateRepo,
@@ -36,6 +39,16 @@ export function useRepositories() {
   return useQuery<RepoView[], ApiError>({
     queryKey: repoKeys.list(),
     queryFn: ({ signal }) => fetchRepositories(signal),
+  })
+}
+
+/** The installed package formats (`GET /admin/formats`). */
+export function useFormats() {
+  return useQuery<FormatView[], ApiError>({
+    queryKey: formatKeys.list(),
+    queryFn: ({ signal }) => fetchFormats(signal),
+    // Formats change only when the server restarts with other plugins.
+    staleTime: 5 * 60 * 1000,
   })
 }
 

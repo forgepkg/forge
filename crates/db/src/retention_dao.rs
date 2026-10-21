@@ -360,15 +360,17 @@ where
 }
 
 /// Load the hosted retention candidates for a repository: every component whose
-/// primary `.nupkg` asset exists, with that asset's `blob_sha256`. Components
-/// without a `.nupkg` asset (nothing to GC) are excluded.
+/// primary package asset exists, with that asset's `blob_sha256`. Components
+/// without one (nothing to GC) are excluded.
 ///
-/// The primary `.nupkg` is the lexicographically-first asset whose `path` ends
-/// in `.nupkg` (NuGet stores exactly one per version; the ordering makes the
-/// pick deterministic if that ever changes).
+/// The primary package asset is the one at `package_path` (the format's
+/// package asset path) or, for NuGet, any asset whose `path` ends in `.nupkg`;
+/// the lexicographically-first match wins (NuGet stores exactly one per
+/// version; the ordering makes the pick deterministic if that ever changes).
 pub async fn load_candidate_components<'e, E>(
     executor: E,
     repository_id: i64,
+    package_path: &str,
 ) -> sqlx::Result<Vec<(CandidateRow, String)>>
 where
     E: PgExecutor<'e>,
@@ -385,7 +387,7 @@ where
             (
                 SELECT a.blob_sha256
                 FROM asset a
-                WHERE a.component_id = c.id AND a.path LIKE '%.nupkg'
+                WHERE a.component_id = c.id AND (a.path = $2 OR a.path LIKE '%.nupkg')
                 ORDER BY a.path
                 LIMIT 1
             ) AS "blob_sha256?: String"
@@ -394,6 +396,7 @@ where
         ORDER BY c.name, c.id
         "#,
         repository_id,
+        package_path,
     )
     .fetch_all(executor)
     .await?;
@@ -665,6 +668,7 @@ pub async fn lock_package_candidates(
     conn: &mut sqlx::PgConnection,
     repository_id: i64,
     name: &str,
+    package_path: &str,
 ) -> sqlx::Result<Vec<CandidateRow>> {
     let rows = sqlx::query!(
         r#"
@@ -677,7 +681,7 @@ pub async fn lock_package_candidates(
             c.last_downloaded_at AS last_downloaded_at,
             EXISTS (
                 SELECT 1 FROM asset a
-                WHERE a.component_id = c.id AND a.path LIKE '%.nupkg'
+                WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')
             ) AS "has_nupkg!"
         FROM component c
         WHERE c.repository_id = $1 AND c.name = $2
@@ -686,6 +690,7 @@ pub async fn lock_package_candidates(
         "#,
         repository_id,
         name,
+        package_path,
     )
     .fetch_all(conn)
     .await?;

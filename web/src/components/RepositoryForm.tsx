@@ -2,6 +2,7 @@ import { useState } from 'react'
 
 import type {
   CreateRepo,
+  FormatView,
   RepoKind,
   RepoView,
   UpdateRepo,
@@ -36,8 +37,9 @@ import { Select } from '~/components/catalyst/select'
  *  - **group**  → `prefer_hosted`; members are managed on a separate screen
  *                 (`GroupMembers`)
  *
- * On **create** `kind` is selectable; on **edit** it is fixed (identity column,
- * not updatable server-side) and shown read-only. The form emits its values;
+ * On **create** `format` and `kind` are selectable (the kinds the format
+ * supports: format plugins have no proxies); on **edit** both are fixed
+ * (identity columns, not updatable server-side) and shown read-only. The form emits its values;
  * `toCreateBody` / `toUpdateBody` turn them into the request bodies. An update
  * carries only the fields the admin changed (absent = keep); the nullable
  * proxy fields are sent as `null` only when explicitly cleared (an emptied TTL
@@ -86,9 +88,27 @@ function originOf(url: string | null | undefined): string | null {
   }
 }
 
+/** The NuGet format: what the form offers when the format list is unavailable. */
+export const NUGET_FORMAT: FormatView = {
+  id: 'nuget',
+  name: 'NuGet',
+  builtin: true,
+  kinds: ['hosted', 'proxy', 'group'],
+  mount: '/v3',
+}
+
+/** Where a repository of `format` named `name` is served. */
+export function feedPath(format: FormatView, name: string): string {
+  return format.id === NUGET_FORMAT.id
+    ? `${format.mount}/${name}/index.json`
+    : `${format.mount}/${name}/`
+}
+
 /** A draft mirrors the form fields; numbers are kept as strings while editing. */
 export interface RepoFormValues {
   name: string
+  /** The format id (`nuget` or a format plugin's). */
+  format: string
   kind: RepoKind
   anonymous_read: boolean
   online: boolean
@@ -112,6 +132,11 @@ export interface RepositoryFormProps {
   mode: 'create' | 'edit'
   /** Existing repo (edit mode) used to seed defaults; absent in create mode. */
   existing?: RepoView
+  /**
+   * The installed formats (`GET /admin/formats`); NuGet alone when absent
+   * (e.g. while they load, or when the request failed).
+   */
+  formats?: FormatView[]
   /** Disabled while a mutation is in flight. */
   submitting: boolean
   /** Server-side error to surface above the submit button. */
@@ -125,6 +150,7 @@ export interface RepositoryFormProps {
 function seed(existing?: RepoView): RepoFormValues {
   return {
     name: existing?.name ?? '',
+    format: existing?.format ?? 'nuget',
     kind: (existing?.kind as RepoKind) ?? 'hosted',
     anonymous_read: existing?.anonymous_read ?? false,
     online: existing?.online ?? true,
@@ -151,6 +177,7 @@ function seed(existing?: RepoView): RepoFormValues {
 export function RepositoryForm({
   mode,
   existing,
+  formats,
   submitting,
   serverError,
   onSubmit,
@@ -193,6 +220,26 @@ export function RepositoryForm({
     onSubmit(values)
   }
 
+  const available = formats && formats.length > 0 ? formats : [NUGET_FORMAT]
+  // An edited repository's format may not be installed (any more): describe
+  // it as a plugin format, which is what it must have been.
+  const format: FormatView = available.find((f) => f.id === values.format) ?? {
+    id: values.format,
+    name: values.format,
+    builtin: false,
+    kinds: ['hosted', 'group'],
+    mount: '/repository',
+  }
+
+  function setFormat(id: string) {
+    const next = available.find((f) => f.id === id) ?? NUGET_FORMAT
+    setValues((v) => ({
+      ...v,
+      format: next.id,
+      kind: next.kinds.includes(v.kind) ? v.kind : 'hosted',
+    }))
+  }
+
   const isProxy = values.kind === 'proxy'
   const isHosted = values.kind === 'hosted'
   const isGroup = values.kind === 'group'
@@ -222,10 +269,42 @@ export function RepositoryForm({
           invalid={!!errors.name}
         />
         <Description>
-          Part of the feed URL (<span className="font-mono">/v3/&lt;name&gt;/index.json</span>):
+          Part of the feed URL (
+          <span className="font-mono">{feedPath(format, '<name>')}</span>):
           letters, digits, ".", "_" and "-", up to 64 characters.
         </Description>
         {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
+      </Field>
+
+      <Field>
+        <Label>Format</Label>
+        {mode === 'create' ? (
+          <Select
+            value={values.format}
+            onChange={(e) => setFormat(e.target.value)}
+          >
+            {available.map((f) => (
+              <option key={f.id} value={f.id}>
+                {f.builtin ? f.name : `${f.name} (plugin ${f.id})`}
+              </option>
+            ))}
+          </Select>
+        ) : (
+          <Input
+            type="text"
+            value={format.builtin ? format.name : format.id}
+            readOnly
+            aria-readonly="true"
+          />
+        )}
+        <Description>
+          {mode === 'edit'
+            ? 'The format cannot be changed after creation.'
+            : format.description ??
+              (format.id === NUGET_FORMAT.id
+                ? 'NuGet packages, served as a NuGet V3 feed.'
+                : 'A format plugin; its repositories are hosted or groups.')}
+        </Description>
       </Field>
 
       <Field>
@@ -235,9 +314,13 @@ export function RepositoryForm({
             value={values.kind}
             onChange={(e) => set('kind', e.target.value as RepoKind)}
           >
-            <option value="hosted">hosted</option>
-            <option value="proxy">proxy</option>
-            <option value="group">group</option>
+            {(['hosted', 'proxy', 'group'] as const)
+              .filter((kind) => format.kinds.includes(kind))
+              .map((kind) => (
+                <option key={kind} value={kind}>
+                  {kind}
+                </option>
+              ))}
           </Select>
         ) : (
           <Input
@@ -516,6 +599,8 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     anonymous_read: values.anonymous_read,
     online: values.online,
   }
+  // Absent means NuGet, the server's default.
+  if (values.format !== 'nuget') body.format = values.format
   if (values.kind === 'hosted') {
     body.allow_redeploy = values.allow_redeploy
   }

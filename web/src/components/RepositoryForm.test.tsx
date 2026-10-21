@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import type { RepoView } from '~/api/repositories'
+import type { FormatView, RepoView } from '~/api/repositories'
 import {
+  NUGET_FORMAT,
   RepositoryForm,
   toCreateBody,
   toUpdateBody,
@@ -19,6 +20,16 @@ import {
  *    existing repo's GET, and only sent when typed;
  *  - validation blocks an empty name and a proxy without a remote URL.
  */
+
+const helm: FormatView = {
+  id: 'helm',
+  name: 'Helm charts',
+  builtin: true,
+  kinds: ['hosted', 'group'],
+  mount: '/repository',
+  version: '0.1.0',
+  description: 'Helm chart repositories.',
+}
 
 function lastValues(onSubmit: ReturnType<typeof vi.fn>): RepoFormValues {
   return onSubmit.mock.calls.at(-1)![0] as RepoFormValues
@@ -53,6 +64,49 @@ describe('RepositoryForm', () => {
     })
     expect(body).not.toHaveProperty('remote_url')
     expect(body).not.toHaveProperty('upstream_password')
+    // NuGet is the server's default format: not sent.
+    expect(body).not.toHaveProperty('format')
+  })
+
+  it('creates a repository of a plugin format, offering only its kinds', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, helm]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+
+    // NuGet first: proxies are offered, the feed is a V3 index.
+    expect(screen.getByRole('option', { name: 'proxy' })).toBeInTheDocument()
+    expect(screen.getByText('/v3/<name>/index.json')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    await user.selectOptions(screen.getByLabelText('Format'), 'helm')
+    // A plugin format has no proxies; the kind falls back to hosted.
+    expect(screen.queryByRole('option', { name: 'proxy' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Kind')).toHaveValue('hosted')
+    expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
+    expect(screen.getByText(helm.description!)).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Name'), 'charts')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      name: 'charts',
+      kind: 'hosted',
+      format: 'helm',
+    })
+  })
+
+  it('shows a stored format read-only on edit', () => {
+    renderEdit({ ...storedProxy, kind: 'hosted', format: 'helm' })
+    expect(screen.getByLabelText('Format')).toHaveValue('helm')
+    expect(screen.getByLabelText('Format')).toHaveAttribute('readonly')
+    expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
   })
 
   it('sends prefer_hosted for groups (on by default)', async () => {

@@ -100,6 +100,34 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # ── Format plugins as WebAssembly components (plugins/<id>/) ──────────────
+  # The plugins are workspace crates (fmt, clippy and their tests run with the
+  # workspace); this checks that each one also lints clean and builds as a
+  # component for wasm32-wasip2. The tests that load a component run in `test`.
+  plugins:
+    name: plugins
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy, wasm32-wasip2)
+        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          components: clippy
+          targets: wasm32-wasip2
+      - name: Cache cargo registry + build artefacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-plugins-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-plugins-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: cargo xtask plugins-check
+        run: cargo xtask plugins-check
+
   # ── Unit tests (no containers required) ────────────────────────────────────
   test:
     name: test
@@ -139,6 +167,9 @@ jobs:
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          # The format-plugin tests build plugins/ as WebAssembly components.
+          targets: wasm32-wasip2
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -310,6 +341,9 @@ jobs:
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          # The format-plugin tests build plugins/ as WebAssembly components.
+          targets: wasm32-wasip2
       - name: Install .NET SDK (for the optional dotnet smoke test)
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:

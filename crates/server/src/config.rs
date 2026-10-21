@@ -61,6 +61,11 @@ pub struct Config {
     /// proxied packages.
     #[serde(default)]
     pub nuget: NugetConfig,
+    /// WebAssembly format plugins: further package formats loaded at startup
+    /// (see `docs/format-plugins.md`). None are loaded by default; the
+    /// built-in plugins (Helm) need no configuration.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -1138,6 +1143,63 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
     forge_nuget::model::NupkgLimits::default().max_nuspec_compression_ratio
 }
 
+/// `plugins.*` — WebAssembly format plugins.
+///
+/// The format plugins built into the server (Helm) are always installed.
+/// Further ones are WebAssembly components, each listed explicitly with the
+/// SHA-256 of its component: a directory under `dir` that is not listed is
+/// never loaded, and a listed one whose component does not match its pin, or
+/// whose id is taken by a built-in format, fails startup. Every instance must
+/// therefore load the same plugins (the same configuration and files), since
+/// a repository of a format an instance lacks is unavailable there.
+///
+/// ```toml
+/// [plugins]
+/// dir = "/etc/forge/plugins"     # holds <id>/plugin.toml + its component
+///
+/// [plugins.formats]
+/// example = "sha256:3f1c…"       # format id → pinned component digest
+/// ```
+///
+/// As environment variables: `FORGE_PLUGINS__DIR`,
+/// `FORGE_PLUGINS__FORMATS__EXAMPLE`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Directory with one subdirectory per plugin, named by its format id.
+    #[serde(default)]
+    pub dir: Option<std::path::PathBuf>,
+    /// The plugins to load: format id → SHA-256 of its component (lowercase
+    /// hex, optionally prefixed `sha256:`).
+    #[serde(default)]
+    pub formats: std::collections::BTreeMap<String, String>,
+}
+
+impl PluginsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.formats.is_empty() {
+            return Ok(());
+        }
+        if self.dir.is_none() {
+            return Err(ConfigError::Invalid(
+                "plugins.formats lists plugins but plugins.dir is not set".into(),
+            ));
+        }
+        for (id, sha256) in &self.formats {
+            forge_plugin::manifest::validate_id(id)
+                .map_err(|e| ConfigError::Invalid(format!("plugins.formats.{id}: {e}")))?;
+            let hex = sha256.trim();
+            let hex = hex.strip_prefix("sha256:").unwrap_or(hex);
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.formats.{id} must be the component's SHA-256 (64 hex digits)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -1835,6 +1897,7 @@ impl Config {
         self.validate_crypto()?;
         self.proxy.validate()?;
         self.nuget.validate()?;
+        self.plugins.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
         if self.server.max_upload_bytes == 0 {

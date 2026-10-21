@@ -135,7 +135,12 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     let nuget: Arc<dyn forge_core::format::Format> =
         Arc::new(NugetFormat::with_limits(config.nuget.limits()));
-    let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
+    let plugins = forge_server::plugins::load(&config.plugins).context("load format plugins")?;
+    let state = AppState::new(pool, blob_store, cache, nuget, config)
+        .with_envelope(envelope)
+        .with_plugins(plugins)
+        .map_err(anyhow::Error::msg)
+        .context("install format plugins")?;
     let layer = principal_layer(&state)?;
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 

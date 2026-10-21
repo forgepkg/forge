@@ -48,6 +48,22 @@ limitations still apply, except where an entry below says otherwise.
   push trigger; use the commands of the release you verify.
   ([#130](https://github.com/schmitch/forge/issues/130))
 
+### Features
+
+- **Format plugins** (preview): further package formats, served under
+  `/repository/{repo}/` with the same storage, RBAC and package selectors,
+  hosted and group repositories, retention and audit log as NuGet. A plugin
+  is a crate implementing one contract (`forge-plugin-api`'s
+  `FormatPlugin`, mirrored by the `forge:format@0.1.0` WIT package) and
+  runs either built into the server or as a WebAssembly component run by
+  Wasmtime. Components are loaded from `[plugins]` only when pinned by
+  SHA-256, and each call runs with fuel, memory and time limits and no WASI
+  capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
+  `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
+  listing. `GET /admin/formats` lists the installed formats; the web UI
+  offers them when creating a repository. See
+  [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
+
 ### Fixed
 
 - Proxy and group search find packages nobody has restored through Forge
@@ -143,6 +159,11 @@ limitations still apply, except where an entry below says otherwise.
 - Behind an outbound proxy, a host name that resolves differently for the
   proxy than for Forge, or that only the proxy can resolve, still gets
   past the metadata guard; block those addresses on the proxy as well.
+- Format plugins have no proxy repositories, receive no request bodies
+  other than the published package (which must be the whole body or one
+  multipart part), accept only Basic credentials, serve whole package
+  downloads (no `Range` requests), and treat a version with a `-` as a
+  prerelease; a response of a plugin may load at most 2,048 query answers.
 
 ## [1.0.0]
 

@@ -69,21 +69,34 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Resolves a repository's [`Format`] from its `repository.format` id.
+pub trait FormatResolver: Send + Sync {
+    /// The format named `id`, or `None` when it is not installed.
+    fn resolve(&self, id: &str) -> Option<Arc<dyn Format>>;
+}
+
+/// One format for every repository, whatever its `format` column says.
+impl FormatResolver for Arc<dyn Format> {
+    fn resolve(&self, _id: &str) -> Option<Arc<dyn Format>> {
+        Some(Arc::clone(self))
+    }
+}
+
 /// The retention worker. Cheap to clone (everything inside is `Arc`/clone-cheap).
 #[derive(Clone)]
 pub struct RetentionWorker {
     pool: PgPool,
-    format: Arc<dyn Format>,
+    formats: Arc<dyn FormatResolver>,
     cache: Arc<dyn CacheInvalidator>,
     config: RetentionConfig,
 }
 
 impl RetentionWorker {
-    /// Build a worker over a pool, a version-ordering [`Format`], a cache
-    /// invalidator, and tuning.
+    /// Build a worker over a pool, the version-ordering [`Format`]s (resolved
+    /// per repository), a cache invalidator, and tuning.
     pub fn new(
         pool: PgPool,
-        format: Arc<dyn Format>,
+        formats: impl FormatResolver + 'static,
         cache: Arc<dyn CacheInvalidator>,
         mut config: RetentionConfig,
     ) -> Self {
@@ -97,7 +110,7 @@ impl RetentionWorker {
             .max(Duration::seconds(MIN_RUN_INTERVAL_SECONDS));
         RetentionWorker {
             pool,
-            format,
+            formats: Arc::new(formats),
             cache,
             config,
         }
@@ -220,6 +233,12 @@ impl RetentionWorker {
             .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
         validate_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
+        // A repository of a format that is not installed (a plugin removed
+        // from the configuration) cannot order its versions: fail the run
+        // without mutating anything until the format is back.
+        let format = self.formats.resolve(&repo.format).ok_or_else(|| {
+            WorkerError::Policy(format!("format {:?} is not installed", repo.format))
+        })?;
 
         // The database's clock: `next_run_at` is compared with it, and the
         // ages evaluated below are of timestamps it wrote.
@@ -246,18 +265,22 @@ impl RetentionWorker {
         let hosted: Vec<CandidateComponent> = if kind == RepoKind::Proxy {
             Vec::new()
         } else {
-            retention_dao::load_candidate_components(&self.pool, repo.repository_id)
-                .await?
-                .into_iter()
-                .map(|(r, _sha)| CandidateComponent {
-                    component_id: r.component_id,
-                    package_name: r.name,
-                    version: r.version,
-                    listed: r.listed,
-                    created_at: r.created_at,
-                    last_downloaded_at: r.last_downloaded_at,
-                })
-                .collect()
+            retention_dao::load_candidate_components(
+                &self.pool,
+                repo.repository_id,
+                format.package_asset_path(),
+            )
+            .await?
+            .into_iter()
+            .map(|(r, _sha)| CandidateComponent {
+                component_id: r.component_id,
+                package_name: r.name,
+                version: r.version,
+                listed: r.listed,
+                created_at: r.created_at,
+                last_downloaded_at: r.last_downloaded_at,
+            })
+            .collect()
         };
 
         let proxy: Vec<ProxyCandidate> = if kind == RepoKind::Proxy {
@@ -279,7 +302,7 @@ impl RetentionWorker {
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
         // with the repository, so it must not stall a runtime worker thread. ──
         let evaluation = {
-            let format = Arc::clone(&self.format);
+            let format = Arc::clone(&format);
             let policy = policy.clone();
             tokio::task::spawn_blocking(move || {
                 (
@@ -318,7 +341,7 @@ impl RetentionWorker {
             fence: Some(RunFence {
                 stored_policy: &repo.policy,
                 policy: &policy,
-                format: self.format.as_ref(),
+                format: format.as_ref(),
             }),
         };
         let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;

@@ -349,15 +349,24 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // Only NuGet is implemented; any other value would silently behave as
-    // NuGet (the format registry has a single module).
-    if body.format != "nuget" {
+    // The format must be installed: the built-in NuGet or a loaded format
+    // plugin. It is fixed for the repository's lifetime.
+    if state.formats.get(&body.format).is_none() {
+        let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
-            "unsupported format {:?}: only \"nuget\" is available",
+            "unsupported format {:?}: available formats are {available:?}",
             body.format
         ));
     }
     let parsed_kind = RepoKind::from(kind.as_str());
+    // Proxies speak the NuGet V3 upstream protocol; format plugins serve
+    // hosted and group repositories only.
+    if parsed_kind == RepoKind::Proxy && body.format != state.formats.nuget().id() {
+        return bad_request(format!(
+            "proxy repositories are not available for format {:?}",
+            body.format
+        ));
+    }
 
     // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
     if parsed_kind == RepoKind::Proxy {
@@ -850,7 +859,10 @@ pub async fn hard_delete_package(
             .into_response();
     }
 
-    let format = state.formats.for_repository(&repo);
+    let format = match state.formats.for_repository(&repo) {
+        Ok(format) => format,
+        Err(e) => return super::format_unavailable(e),
+    };
     let lower = format.lower_id(&id);
     let norm_ver = match format.normalize_version(&version) {
         Ok(v) => v,

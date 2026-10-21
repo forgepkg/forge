@@ -47,6 +47,15 @@ pub trait Format: Send + Sync {
     /// Parse an uploaded package into format-neutral [`ParsedUpload`] data.
     fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError>;
 
+    /// [`Self::parse_upload`] for a package staged on disk at `path` (what
+    /// the hosted publish path parses). The default opens the file and reads
+    /// it through `parse_upload`; a format that needs the file itself (a
+    /// format plugin lends it to its sandbox) overrides it.
+    fn parse_upload_file(&self, path: &std::path::Path) -> Result<ParsedUpload, FormatError> {
+        let mut file = std::fs::File::open(path)?;
+        self.parse_upload(&mut file)
+    }
+
     /// Normalize a raw version string into the canonical form used for storage
     /// and lookups (e.g. SemVer normalization for NuGet).
     fn normalize_version(&self, raw: &str) -> Result<String, FormatError>;
@@ -56,6 +65,29 @@ pub trait Format: Send + Sync {
 
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
+
+    /// The asset path a version's package archive is stored under (the
+    /// `asset.path` of its component). Internal to the repository: clients
+    /// never see it. NuGet keeps `package.nupkg`.
+    fn package_asset_path(&self) -> &str {
+        "package"
+    }
+
+    /// The content type stored and served for the package archive.
+    fn package_content_type(&self) -> &str {
+        "application/octet-stream"
+    }
+
+    /// The asset path of the manifest the parser extracted
+    /// ([`ParsedUpload::nuspec_bytes`]). NuGet keeps `package.nuspec`.
+    fn manifest_asset_path(&self) -> &str {
+        "manifest"
+    }
+
+    /// The content type stored for the manifest asset.
+    fn manifest_content_type(&self) -> &str {
+        "application/octet-stream"
+    }
 
     /// A summary of `manifest` to store with the version at publish, so that
     /// metadata endpoints render it without fetching and re-parsing the

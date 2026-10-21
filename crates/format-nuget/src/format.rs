@@ -60,6 +60,22 @@ impl Format for NugetFormat {
         nuspec::lower_id(id)
     }
 
+    fn package_asset_path(&self) -> &str {
+        forge_core::repo::NUPKG_ASSET_PATH
+    }
+
+    fn package_content_type(&self) -> &str {
+        forge_core::repo::NUPKG_CONTENT_TYPE
+    }
+
+    fn manifest_asset_path(&self) -> &str {
+        forge_core::repo::NUSPEC_ASSET_PATH
+    }
+
+    fn manifest_content_type(&self) -> &str {
+        forge_core::repo::NUSPEC_CONTENT_TYPE
+    }
+
     fn validate_id(&self, id: &str) -> Result<(), FormatError> {
         nuspec::validate_package_id(id)
     }

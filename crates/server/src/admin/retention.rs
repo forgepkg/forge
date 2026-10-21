@@ -33,7 +33,7 @@ use forge_db::{repository_dao, retention_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use super::db_error;
+use super::{db_error, format_unavailable};
 use crate::state::AppState;
 
 /// Default + cap for the audit page size.
@@ -233,13 +233,23 @@ pub async fn preview(
 
     let now = body.and_then(|b| b.0.at).unwrap_or_else(Utc::now);
     let kind = repo.kind();
+    let format = match state.formats.for_repository(&repo) {
+        Ok(format) => format,
+        Err(e) => return format_unavailable(e),
+    };
 
     // Snapshot hosted candidates (never on a proxy: its components are cache
     // entries evicted only through `proxy_cached_version`, as in the worker).
     let hosted: Vec<CandidateComponent> = if kind == RepoKind::Proxy {
         Vec::new()
     } else {
-        match retention_dao::load_candidate_components(&state.pool, repo.id).await {
+        match retention_dao::load_candidate_components(
+            &state.pool,
+            repo.id,
+            format.package_asset_path(),
+        )
+        .await
+        {
             Ok(rows) => rows
                 .into_iter()
                 .map(|(r, _sha)| CandidateComponent {
@@ -275,7 +285,6 @@ pub async fn preview(
     };
 
     let evaluated = hosted.len() + proxy.len();
-    let format = state.formats.for_repository(&repo);
     // The evaluator is CPU-bound and grows with the repository: run it on the
     // blocking pool so a large preview does not stall a runtime worker thread.
     let evaluation = tokio::task::spawn_blocking(move || {

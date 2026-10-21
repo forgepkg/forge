@@ -135,6 +135,18 @@ max_total_uncompressed_bytes = 17179869184  # (default: 16 GiB) total declared s
 max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upstream .nuspec a proxy verifies
 max_nuspec_compression_ratio = 200          # (default: 200)
 
+# Optional: WebAssembly format plugins — further package formats loaded at
+# startup (docs/format-plugins.md). The built-in ones (Helm) need nothing here.
+# Only the plugins listed under [plugins.formats] are loaded, each from
+# <dir>/<id>/ and pinned to its component's SHA-256; a mismatch, or an id a
+# built-in format holds, fails startup. `cargo xtask plugins` builds the
+# plugins of plugins/ as components and prints this section with their digests.
+# [plugins]
+# dir = "/etc/forge/plugins"
+#
+# [plugins.formats]
+# example = "sha256:<64 hex digits>"
+
 [cache]
 l1_max_capacity = 10000         # (default: 10000)
 default_ttl_seconds = 30        # (default: 30)
