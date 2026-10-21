@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -21,8 +21,9 @@ import { routeTree } from '~/routeTree.gen'
  *  - the list renders repositories;
  *  - create-hosted POSTs the right body to `/admin/repositories`;
  *  - the group members editor prevents a duplicate priority before any request,
- *    toggles a member's owner flag, explains a refused owner removal, and
- *    offers other groups as (nested) members.
+ *    toggles a member's owner flag, asks before removing a member or
+ *    unflagging the last owner, explains a refused owner removal, and offers
+ *    other groups as (nested) members.
  */
 
 const adminMe: Me = {
@@ -420,12 +421,89 @@ describe('admin repositories', () => {
     await renderAt('/manage/repositories/grp/members')
 
     await user.click(await screen.findByRole('button', { name: 'Remove' }))
+    await user.click(screen.getByRole('button', { name: 'Confirm' }))
 
     await waitFor(() => expect(removed).toBe('releases'))
     expect(await screen.findByRole('alert')).toHaveTextContent(
       "this member owns the group's package ids; unflag it as owner before removing it Clear the owner box of releases first, then remove it.",
     )
     expect(screen.getByText('releases')).toBeInTheDocument()
+  })
+
+  it('asks before unflagging the last owner; sends nothing until confirmed', async () => {
+    const patches: Array<{ member: string; body: unknown }> = []
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+        { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+      ],
+      onPatchMember: (member, body) => {
+        patches.push({ member, body })
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'releases owner' })
+    await user.click(toggle)
+
+    const row = toggle.closest('li')!
+    expect(within(row).getByText(/is the last owner/)).toHaveTextContent(
+      'the group trusts every hosted member equally',
+    )
+    expect(toggle).toBeChecked()
+
+    await user.click(within(row).getByRole('button', { name: 'Cancel' }))
+    expect(within(row).queryByText(/is the last owner/)).toBeNull()
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+
+    await user.click(toggle)
+    expect(patches).toEqual([])
+    await user.click(within(row).getByRole('button', { name: 'Unflag' }))
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ member: 'releases', body: { owner: false } }]),
+    )
+  })
+
+  it('asks before removing a member; cancelling sends nothing', async () => {
+    const removed: string[] = []
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+        { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+      ],
+      onRemoveMember: (member) => {
+        removed.push(member)
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const row = (await screen.findByText('nuget-org')).closest('li')!
+    await user.click(within(row).getByRole('button', { name: 'Remove' }))
+    expect(removed).toEqual([])
+
+    await user.click(within(row).getByRole('button', { name: 'Cancel' }))
+    expect(within(row).getByRole('button', { name: 'Remove' })).toBeInTheDocument()
+    expect(removed).toEqual([])
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE',
+      ),
+    ).toBe(false)
+
+    await user.click(within(row).getByRole('button', { name: 'Remove' }))
+    await user.click(within(row).getByRole('button', { name: 'Confirm' }))
+
+    await waitFor(() => expect(removed).toEqual(['nuget-org']))
   })
 
   it('offers other groups as members and shows a refused nesting', async () => {
