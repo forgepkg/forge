@@ -15,7 +15,7 @@ members = [
 # One version for the whole product: every crate inherits it, so a release
 # bumps it here once (and `web/package.json` to match).
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.95"
 # AGPL v3 or the envisia license, at the user's choice (see README → License).

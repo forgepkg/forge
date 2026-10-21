@@ -7,8 +7,8 @@ apiVersion: v2
 name: forge
 description: Self-hosted NuGet V3 registry (hosted, proxy and group feeds)
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 1.0.0
+appVersion: "1.0.0"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/schmitch/forge
 sources:
