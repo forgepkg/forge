@@ -1,23 +1,27 @@
 name: CI
 
 # One run per change: pull requests are checked via `pull_request` (which tests
-# the merge result), and only the default branch runs on `push` (post-merge +
-# the main-only e2e jobs). Pushing to a PR branch no longer triggers a second,
-# identical `push` run. Branches without a PR can be checked on demand via
-# `workflow_dispatch`.
+# the merge result), a merge queue's merge groups via `merge_group` (the commit
+# that lands; without this trigger a queue waits forever for its required
+# checks), and only the default branch runs on `push` (post-merge). Pushing to
+# a PR branch no longer triggers a second, identical `push` run. Branches
+# without a PR can be checked on demand via `workflow_dispatch`.
 on:
   push:
     branches: [main, master]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 # Pull requests: a newer commit on the same PR supersedes (cancels) the running
-# check. Every other run (a push to the default branch, a manual run) has a
-# group of its own commit: a concurrency group holds at most one pending run
-# and cancels it when a newer one queues, even with cancel-in-progress: false,
-# so one group for the default branch would drop the run of a commit merged
-# while another was in progress, main-only e2e jobs included. Per commit, every
-# merge gets its own full run, and the release workflow can require it.
+# check. Every other run (a merge group, a push to the default branch, a manual
+# run) has a group of its own commit: a concurrency group holds at most one
+# pending run and cancels it when a newer one queues, even with
+# cancel-in-progress: false, so one group for the default branch would drop
+# the run of a commit merged while another was in progress, e2e jobs included,
+# and one for the merge queue would leave a queued group without its checks.
+# Per commit, every merge gets its own full run, and the release workflow can
+# require it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -280,9 +284,11 @@ jobs:
   e2e:
     name: e2e
     runs-on: ubuntu-latest
-    # Only run on pushes to main/master; skipping on every PR keeps CI fast.
-    # release.yml refuses a tag unless this and web-e2e passed on its commit.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    # Skipped on pull requests to keep them fast (a skipped job passes a
+    # required check); runs in the merge queue, so a change that breaks it
+    # never lands, and on main/master. release.yml refuses a tag unless this
+    # and web-e2e passed on its commit.
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
 
     env:
       SQLX_OFFLINE: "true"
@@ -322,11 +328,12 @@ jobs:
 
   # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ────
   # Boots Postgres + versitygw via docker compose, builds the SPA + server, and
-  # runs the browser specs. Default-branch only (slow; needs Docker + browsers).
+  # runs the browser specs. Like e2e, only in the merge queue and on the default
+  # branch (slow; needs Docker + browsers).
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'merge_group' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     env:
       SQLX_OFFLINE: "true"
     steps:
