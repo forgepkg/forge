@@ -536,6 +536,30 @@ cargo xtask docker-run         # run the image against the compose db + s3 on :8
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
 http://localhost:8421.
 
+**Runtime configuration.** The baked `forge.toml` carries non-secret defaults
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
+anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
+`allow_password_basic=false`, no bootstrap admin — that comes only from
+`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env). The placeholder credentials
+(`minioadmin` S3 keys, a `changeme` password) are **refused at startup** unless
+overridden; only the dev compose stack sets
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin/changeme and
+`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
+env vars (double-underscore nesting). Required at runtime (no safe default):
+
+| Env var | Example |
+| --- | --- |
+| `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
+| `FORGE_S3__ENDPOINT` | `http://s3:8422` |
+| `FORGE_S3__BUCKET` | `forge` |
+| `FORGE_S3__ACCESS_KEY` | `…` |
+| `FORGE_S3__SECRET_KEY` | `…` |
+| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
+
+Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
+URLs). For a production deployment (TLS, secret encryption, trusted proxies,
+backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
+
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
@@ -609,57 +633,3 @@ the first `sources` entry of `Chart.yaml` into that annotation.
 docker logout ghcr.io; helm registry logout ghcr.io
 docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
 ```
-
-### Upgrade boundary for migration 0011
-
-Migration `0011_blob_deletion_reservations.sql` changes the CAS coordination
-protocol as well as the database schema: new instances acquire `blob_ingest`
-leases and create incarnation-qualified S3 keys. Instances built before this
-migration do neither. **Do not perform a rolling upgrade across this boundary.**
-
-For the first deployment containing migration 0011:
-
-1. disable old upload traffic **and** old blob-outbox/reconciler workers;
-2. stop every pre-0011 Forge instance, wait for active uploads, and ensure every
-   S3 DELETE issued by the old workers has reached an unambiguous terminal
-   state before continuing;
-3. take a coordinated PostgreSQL and object-store backup;
-4. start only the new version and let one instance apply migrations; and
-5. verify package upload and download before restoring normal replica count.
-
-Stopping the old process is not by itself proof that an S3 DELETE did not reach
-the backend: a timed-out or disconnected request can complete later. Use the
-object store's documented operation bound/active-request observability for the
-quiescence check. If the backend cannot provide that guarantee, copy/restore
-the coordinated backup into a clean object namespace before starting the new
-version. A delayed pre-0011 DELETE must never overlap a post-0011 revival of the
-same legacy object key.
-
-Do not roll back to a pre-0011 binary after new instances have accepted writes.
-A rollback requires restoring the coordinated PostgreSQL/object-store backup.
-Later versions that use the same lease and key protocol may again be deployed
-with the operator's normal rolling strategy.
-
-**Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
-anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
-`allow_password_basic=false`, no bootstrap admin — that comes only from
-`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env). The placeholder credentials
-(`minioadmin` S3 keys, a `changeme` password) are **refused at startup** unless
-overridden; only the dev compose stack sets
-`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin/changeme and
-`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
-env vars (double-underscore nesting). Required at runtime (no safe default):
-
-| Env var | Example |
-| --- | --- |
-| `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
-| `FORGE_S3__ENDPOINT` | `http://s3:8422` |
-| `FORGE_S3__BUCKET` | `forge` |
-| `FORGE_S3__ACCESS_KEY` | `…` |
-| `FORGE_S3__SECRET_KEY` | `…` |
-| `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
-
-Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
-URLs). For a production deployment (TLS, secret encryption, trusted proxies,
-backups, upgrades) follow [docs/deployment.md](docs/deployment.md).

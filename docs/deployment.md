@@ -158,11 +158,6 @@ be entered again through the API. For a realm, that is an edit
 (`PATCH /admin/realms/{id}` or the realm form) that includes the secret:
 until then the realm is skipped at login, and an edit without the secret
 answers 400 naming it.
-Secrets sealed by pre-release builds were bound to their row only. They
-do not decrypt unless `crypto.accept_row_bound_secrets = true`; start every
-instance once with it so startup re-seals them for their destination, then
-remove it (while it is on, an old blob copied into a repointed row would be
-accepted).
 `GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
 plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
