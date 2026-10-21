@@ -83,6 +83,64 @@
       "type": "string",
       "description": "An existing Secret with FORGE_* secrets; any name but <fullname>-secret-env, the chart's own"
     },
+    "s3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "credentials": {
+          "type": "string",
+          "enum": [
+            "static",
+            "default_chain",
+            "web_identity"
+          ]
+        },
+        "webIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "roleArn": {
+              "type": "string"
+            },
+            "stsEndpoint": {
+              "type": "string"
+            },
+            "sessionName": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_+=,.@-]{2,64}$"
+            },
+            "durationSeconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 900,
+              "maximum": 43200
+            },
+            "projectedToken": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "audience": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "expirationSeconds": {
+                  "type": "integer",
+                  "minimum": 600
+                }
+              }
+            },
+            "tokenFile": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
     "env": {
       "type": "array"
     },

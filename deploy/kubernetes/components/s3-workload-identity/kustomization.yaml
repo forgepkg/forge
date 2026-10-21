@@ -1,0 +1,41 @@
+# Short-lived S3 credentials from a projected service-account token, exchanged
+# with STS AssumeRoleWithWebIdentity (FORGE_S3__CREDENTIALS=web_identity):
+# no FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY in the forge-env Secret. Take
+# both out of it; Forge refuses to start with keys it would not use.
+#
+# The token is a separate projected volume for the STS audience, not a
+# Kubernetes API token: automountServiceAccountToken stays false. The kubelet
+# replaces it before it expires, and Forge reads it again on every refresh.
+#
+# Set in your overlay's forge-config (configMapGenerator, behavior: merge):
+#   FORGE_S3__WEB_IDENTITY__ROLE_ARN      the role to assume (AWS, or the
+#                                         ARN MinIO logs for its role policy)
+#   FORGE_S3__WEB_IDENTITY__STS_ENDPOINT  MinIO / Ceph RGW: their URL; unset
+#                                         for AWS STS in FORGE_S3__REGION
+# and, for anything but AWS, the token's audience (the STS's client id, e.g.
+# MINIO_IDENTITY_OPENID_CLIENT_ID) with a patch that restates the source:
+#   - patch: |-
+#       apiVersion: apps/v1
+#       kind: Deployment
+#       metadata:
+#         name: forge
+#       spec:
+#         template:
+#           spec:
+#             volumes:
+#               - name: s3-token
+#                 projected:
+#                   sources:
+#                     - serviceAccountToken:
+#                         audience: forge-s3
+#                         expirationSeconds: 3600
+#                         path: token
+#
+# On EKS, IRSA and EKS Pod Identity need no token of Forge's own: annotate
+# the ServiceAccount (or create a Pod Identity association) and set
+# FORGE_S3__CREDENTIALS=default_chain instead (../../README.md).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - path: deployment-patch.yaml

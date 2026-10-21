@@ -156,7 +156,62 @@ public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
       "bucket" .Values.versitygw.bucket
       "force_path_style" true) }}
 {{- end }}
+{{- $credentials := include "forge.s3Credentials" . | fromYaml }}
+{{- if $credentials }}
+{{- $_ := set $derived "s3" (mergeOverwrite (default dict $derived.s3) $credentials) }}
+{{- end }}
 {{- include "forge.toml" (mergeOverwrite $derived (deepCopy .Values.config)) }}
+{{- end }}
+
+{{/* The s3.credentials settings of .Values.s3 (YAML; empty for the default
+`static`), after checking them. */}}
+{{- define "forge.s3Credentials" -}}
+{{- $s3 := .Values.s3 }}
+{{- $mode := $s3.credentials }}
+{{- if not (has $mode (list "static" "default_chain" "web_identity")) }}
+{{- fail (printf "s3.credentials must be static, default_chain or web_identity, not %q" $mode) }}
+{{- end }}
+{{- if ne $mode "static" }}
+{{- if .Values.versitygw.enabled }}
+{{- fail (printf "s3.credentials %s: the in-cluster versitygw (versitygw.enabled) has only static root credentials" $mode) }}
+{{- end }}
+{{- range $key := list "FORGE_S3__ACCESS_KEY" "FORGE_S3__SECRET_KEY" }}
+{{- if hasKey $.Values.secretEnv $key }}
+{{- fail (printf "s3.credentials %s does not use %s: remove it from secretEnv" $mode $key) }}
+{{- end }}
+{{- end }}
+{{- $settings := dict "credentials" $mode }}
+{{- if eq $mode "web_identity" }}
+{{- $wi := $s3.webIdentity }}
+{{- $tokenFile := $wi.tokenFile }}
+{{- if $wi.projectedToken.enabled }}
+{{- $tokenFile = include "forge.s3TokenPath" . }}
+{{- end }}
+{{- if not $tokenFile }}
+{{- fail "s3.credentials web_identity needs s3.webIdentity.projectedToken.enabled or s3.webIdentity.tokenFile" }}
+{{- end }}
+{{- $table := dict "token_file" $tokenFile "session_name" $wi.sessionName }}
+{{- with $wi.roleArn }}{{ $_ := set $table "role_arn" . }}{{ end }}
+{{- with $wi.stsEndpoint }}{{ $_ := set $table "sts_endpoint" . }}{{ end }}
+{{- if not (kindIs "invalid" $wi.durationSeconds) }}{{ $_ := set $table "duration_seconds" $wi.durationSeconds }}{{ end }}
+{{- $_ := set $settings "web_identity" $table }}
+{{- end }}
+{{- toYaml $settings }}
+{{- end }}
+{{- end }}
+
+{{/* Whether the chart mounts a projected token for s3.credentials
+web_identity. */}}
+{{- define "forge.s3ProjectedToken" -}}
+{{- if and (eq .Values.s3.credentials "web_identity") .Values.s3.webIdentity.projectedToken.enabled }}true{{ end }}
+{{- end }}
+
+{{- define "forge.s3TokenDir" -}}
+/var/run/secrets/forge/s3
+{{- end }}
+
+{{- define "forge.s3TokenPath" -}}
+{{ include "forge.s3TokenDir" . }}/token
 {{- end }}
 
 {{/* A map as a TOML document. Helm's toToml would print the YAML integers of

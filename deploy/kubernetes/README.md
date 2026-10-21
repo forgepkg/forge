@@ -19,6 +19,7 @@ deploy/kubernetes/
 │   ├── local-cache-persistent/  the same on a PersistentVolume (one replica, survives restarts)
 │   ├── postgres/            in-cluster PostgreSQL 17 (evaluation / small installs)
 │   ├── s3-versitygw/        in-cluster S3 gateway on a PersistentVolume (evaluation / small installs)
+│   ├── s3-workload-identity/  short-lived S3 credentials from a projected service-account token (no S3 keys)
 │   └── image-latest/        run :latest instead of the pinned release
 └── overlays/
     ├── production/          external PostgreSQL + S3, Redis, two replicas, Ingress, NetworkPolicy
@@ -139,6 +140,43 @@ Points that matter on Kubernetes:
   trusted proxies (the CNI must enforce NetworkPolicy).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
+
+## Short-lived S3 credentials
+
+Instead of `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` in `forge-env`,
+Forge can get temporary S3 credentials from the pod's identity and refresh
+them itself (`FORGE_S3__CREDENTIALS`; the IAM policy and the store-side setup
+are in [docs/deployment.md](../../docs/deployment.md#short-lived-s3-credentials)).
+Take the keys out of `forge-env` then: Forge refuses to start with keys it
+would not use.
+
+- **IRSA / EKS Pod Identity** (EKS): set `FORGE_S3__CREDENTIALS=default_chain`
+  in `forge-config`. For IRSA, annotate the ServiceAccount; for Pod Identity,
+  create an association for the `forge` ServiceAccount instead. The EKS
+  webhook injects its own token volume and `AWS_*` variables. It does not
+  read `automountServiceAccountToken`, which stays `false`.
+
+  ```yaml
+  patches:
+    - patch: |-
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: forge
+          annotations:
+            eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/forge
+  ```
+
+- **MinIO, Ceph RGW, AWS without EKS**: `components/s3-workload-identity`
+  mounts a projected service-account token for the STS audience and sets
+  `FORGE_S3__CREDENTIALS=web_identity`. Add
+  `FORGE_S3__WEB_IDENTITY__STS_ENDPOINT` (MinIO / Ceph RGW) and
+  `FORGE_S3__WEB_IDENTITY__ROLE_ARN` to `forge-config`, and patch the
+  token's audience for anything but AWS (the component shows how).
+
+With `components/network-policy` and your own egress rules, allow the STS
+(for EKS Pod Identity, the node's agent at `169.254.170.23:80`). The
+s3-versitygw component keeps its static root credentials.
 
 ## Local blob cache
 

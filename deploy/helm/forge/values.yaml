@@ -92,6 +92,45 @@ secretEnvChecksumSalt: ""
 # but <fullname>-secret-env, the chart's own, e.g. forge-credentials.
 existingSecret: ""
 
+# Where Forge's S3 credentials come from (s3.credentials, see
+# docs/deployment.md → Short-lived S3 credentials). The chart writes the
+# choice into the configuration file.
+s3:
+  # static: FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY in secretEnv or
+  #   existingSecret (or versitygw's root credentials with versitygw.enabled).
+  # default_chain: the AWS SDK default credentials chain. For IRSA annotate
+  #   the service account (serviceAccount.annotations:
+  #   eks.amazonaws.com/role-arn: <role ARN>); for EKS Pod Identity create a
+  #   Pod Identity association for it. Nothing else to set here.
+  # web_identity: STS AssumeRoleWithWebIdentity with the token below, against
+  #   AWS STS or the STS of MinIO / Ceph RGW (webIdentity.stsEndpoint).
+  # Both short-lived modes refuse S3 keys in secretEnv / existingSecret.
+  credentials: static
+  # s3.web_identity, with credentials: web_identity.
+  webIdentity:
+    # The role to assume: on AWS, or the ARN MinIO logs for its role policy.
+    # Empty sends none (MinIO's claim-based policies).
+    roleArn: ""
+    # Empty: AWS STS in config.s3.region. MinIO / Ceph RGW: their URL,
+    # usually the S3 endpoint.
+    stsEndpoint: ""
+    sessionName: forge
+    # 900 to 43200; null leaves the lifetime to STS (one hour on AWS).
+    durationSeconds: null
+    # A projected service-account token for the STS, mounted at
+    # /var/run/secrets/forge/s3/token and used as the token file. It is not a
+    # Kubernetes API token: automountServiceAccountToken stays false.
+    projectedToken:
+      enabled: true
+      # What the STS expects in the token's `aud`: sts.amazonaws.com for AWS,
+      # MINIO_IDENTITY_OPENID_CLIENT_ID for MinIO.
+      audience: sts.amazonaws.com
+      # The kubelet replaces the token at 80 % of this (at least 600).
+      expirationSeconds: 3600
+    # Without projectedToken: the path of a token mounted otherwise
+    # (extraVolumes / extraVolumeMounts).
+    tokenFile: ""
+
 # Extra environment variables (Kubernetes EnvVar objects), after the chart's
 # own; `valueFrom` reads single keys, e.g. a CloudNativePG app Secret:
 #   - name: FORGE_DATABASE__URL
@@ -122,12 +161,16 @@ serviceAccount:
   create: true
   # Defaults to the fullname when created, to "default" otherwise.
   name: ""
+  # e.g. eks.amazonaws.com/role-arn for IRSA (s3.credentials: default_chain).
   annotations: {}
   labels: {}
   # Forge never talks to the Kubernetes API.
   automountServiceAccountToken: false
 
-# Mount a service account token into the pod (Forge does not need one).
+# Mount a service account token into the pod (Forge does not need one). The
+# S3 credential tokens are separate projected volumes: the chart's own
+# (s3.webIdentity.projectedToken) and those the EKS IRSA / Pod Identity
+# webhook injects, which it adds whatever this says.
 automountServiceAccountToken: false
 # A Service named like the release would otherwise inject FORGE_PORT=tcp://...
 # and friends into Forge's own FORGE_* configuration namespace.
@@ -365,7 +408,9 @@ networkPolicy:
   # Further ingress rules.
   extraIngress: []
   # Egress rules. Empty leaves egress unrestricted; once set, allow DNS,
-  # PostgreSQL, S3, Redis and every proxy upstream / OIDC issuer.
+  # PostgreSQL, S3, Redis and every proxy upstream / OIDC issuer, and for
+  # short-lived S3 credentials the STS (EKS Pod Identity: the node's agent at
+  # 169.254.170.23, TCP 80).
   egress: []
 
 # Further objects to render with the release, as YAML or as strings; both are

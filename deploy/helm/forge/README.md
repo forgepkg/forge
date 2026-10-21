@@ -112,6 +112,55 @@ before you configure proxy repositories or auth realms, and keep the root key
 with your backups. Every other value is documented in
 [values.yaml](values.yaml).
 
+## Short-lived S3 credentials
+
+Instead of `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` in a Secret, Forge
+can get temporary S3 credentials from the pod's identity and refresh them
+itself (`s3.credentials`; the IAM policy and the store-side setup are in
+[docs/deployment.md](../../../docs/deployment.md#short-lived-s3-credentials)).
+Leave the S3 keys out of `secretEnv` and `existingSecret` then: Forge refuses
+to start with keys it would not use, and the chart refuses them in
+`secretEnv`.
+
+IRSA on EKS: annotate the service account with the role and use the AWS SDK
+default credentials chain, which reads what the EKS webhook injects:
+
+```yaml
+s3:
+  credentials: default_chain
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/forge
+```
+
+EKS Pod Identity: `s3.credentials: default_chain` and a Pod Identity
+association for the release's service account (`<fullname>`, or
+`serviceAccount.name`); nothing else in the values.
+
+MinIO, Ceph RGW, or AWS without EKS: `web_identity` exchanges a projected
+service-account token at the store's STS. The chart mounts the token
+(audience `s3.webIdentity.projectedToken.audience`) at
+`/var/run/secrets/forge/s3/token`:
+
+```yaml
+s3:
+  credentials: web_identity
+  webIdentity:
+    stsEndpoint: http://minio.storage.svc:9000   # empty: AWS STS
+    roleArn: arn:minio:iam:::role/<id>           # the role ARN MinIO logs at startup
+    projectedToken:
+      audience: forge-s3                         # MINIO_IDENTITY_OPENID_CLIENT_ID
+```
+
+`automountServiceAccountToken` stays `false` in every mode. The chart's
+token is a separate projected volume for the STS audience, not a Kubernetes
+API token. The EKS IRSA and Pod Identity webhook also adds its own projected
+token volume and environment variables. It chooses pods by the service
+account's role annotation or a Pod Identity association, and does not read
+`automountServiceAccountToken` (amazon-eks-pod-identity-webhook,
+`pkg/handler/handler.go`). With a restricted `networkPolicy.egress`, allow
+the STS, or for EKS Pod Identity the node's agent at `169.254.170.23:80`.
+
 Forge believes the `X-Forwarded-For` header of every peer in
 `trusted_proxy_cidrs`, which on Kubernetes is usually the whole pod network.
 Without a NetworkPolicy any pod in the cluster can call the Service with a
@@ -193,7 +242,7 @@ and wired into Forge when enabled:
 | --- | --- | --- |
 | PostgreSQL 17 (StatefulSet) | `postgresql.enabled` | `FORGE_DATABASE__URL` |
 | Redis, cache only (Deployment) | `redis.enabled` | `FORGE_REDIS__URL` |
-| versitygw S3 gateway (StatefulSet) | `versitygw.enabled` | `s3.endpoint`, `s3.bucket`, `FORGE_S3__ACCESS_KEY` / `_SECRET_KEY` |
+| versitygw S3 gateway (StatefulSet) | `versitygw.enabled` | `s3.endpoint`, `s3.bucket`, `FORGE_S3__ACCESS_KEY` / `_SECRET_KEY` (static root credentials only: not with short-lived `s3.credentials`) |
 
 None has backups, replication or failover. For production use a managed
 PostgreSQL (or an operator such as CloudNativePG; point
