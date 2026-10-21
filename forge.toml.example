@@ -17,14 +17,15 @@ public_base_url = "http://localhost:8421"
 # admin/changeme) are refused at startup unless this is true. Keep it for a
 # local dev copy only; in production replace the placeholders and drop it.
 allow_insecure_defaults = true  # (default: false)
-# Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
-# (never buffered in memory); larger pushes get HTTP 413.
+# Largest accepted push (`dotnet nuget push`, a Helm chart, …). Uploads stream
+# to a temp file (never buffered in memory); larger pushes get HTTP 413. One
+# format can have its own limit under [plugins.max_upload_bytes].
 max_upload_bytes = 536870912    # (default: 512 MiB)
 # Pushes and first-time proxy downloads are staged here; files a killed process
 # left behind are removed at startup. All staged files of this instance share
 # max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
 # staging_dir = "/var/tmp/forge"  # (default: <system temp dir>/forge-staging)
-# max_staging_bytes = 4294967296  # (default: 4 x max(max_upload_bytes, proxy.max_package_bytes); 0 = no limit)
+# max_staging_bytes = 4294967296  # (default: 4 x the largest of max_upload_bytes, plugins.max_upload_bytes, proxy.max_package_bytes, docker.max_blob_bytes; 0 = no limit)
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
 # anonymous_mode = "allowlist": a request naming any other host is not served
@@ -146,6 +147,12 @@ max_nuspec_compression_ratio = 200          # (default: 200)
 #
 # [plugins.formats]
 # example = "sha256:<64 hex digits>"
+#
+# The largest accepted push per format (built-in ones included), in place of
+# server.max_upload_bytes; it counts towards server.max_staging_bytes. An id no
+# installed format has fails startup. Docker has docker.max_blob_bytes.
+# [plugins.max_upload_bytes]
+# helm = 104857600
 
 [docker]
 # The Docker / OCI registry under /v2 (see docs/docker.md).

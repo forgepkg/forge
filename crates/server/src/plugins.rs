@@ -664,7 +664,7 @@ impl Ctx<'_> {
             self.package_filter.clone(),
             replace_filter,
         );
-        let limit = self.state.config.server.max_upload_bytes;
+        let limit = self.state.config.max_upload_bytes(&self.repo.format);
         let flags = UploadFlags::default();
         let reader = match &publish.upload {
             Upload::Body => body_reader(req.into_body()),

@@ -99,9 +99,11 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
-    /// Largest accepted package upload (`dotnet nuget push`) in bytes. Uploads
-    /// are streamed to a temp file, never buffered in memory; exceeding the
-    /// limit yields HTTP 413. Default 512 MiB.
+    /// Largest accepted package upload (`dotnet nuget push`, a Helm chart
+    /// push, …) in bytes, unless `plugins.max_upload_bytes` names another for
+    /// the repository's format. Uploads are streamed to a temp file, never
+    /// buffered in memory; exceeding the limit yields HTTP 413. Default 512
+    /// MiB.
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
     /// Directory pushes and first-time proxy downloads are staged in. Files a
@@ -111,8 +113,9 @@ pub struct ServerConfig {
     pub staging_dir: Option<std::path::PathBuf>,
     /// Temp space all staged pushes and proxy downloads of this instance may
     /// use at once, in bytes; a stage that would exceed it is answered `503`
-    /// with `Retry-After`. Default: four times the larger of
-    /// `max_upload_bytes` and `proxy.max_package_bytes` (4 GiB with the
+    /// with `Retry-After`. Default: four times the largest item staged:
+    /// `max_upload_bytes`, `plugins.max_upload_bytes`,
+    /// `proxy.max_package_bytes` or `docker.max_blob_bytes` (4 GiB with the
     /// defaults). `0` removes the limit. Size the staging volume above it.
     #[serde(default)]
     pub max_staging_bytes: Option<u64>,
@@ -1268,6 +1271,15 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
 ///
 /// As environment variables: `FORGE_PLUGINS__DIR`,
 /// `FORGE_PLUGINS__FORMATS__EXAMPLE`.
+///
+/// `max_upload_bytes` overrides `server.max_upload_bytes` for the
+/// repositories of one format, built-in plugins included (Docker has
+/// `docker.max_blob_bytes`):
+///
+/// ```toml
+/// [plugins.max_upload_bytes]
+/// helm = 104857600               # format id → largest accepted push
+/// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginsConfig {
@@ -1278,10 +1290,32 @@ pub struct PluginsConfig {
     /// hex, optionally prefixed `sha256:`).
     #[serde(default)]
     pub formats: std::collections::BTreeMap<String, String>,
+    /// Largest accepted push per format: format id → bytes, in place of
+    /// `server.max_upload_bytes` for that format's repositories. Staged on
+    /// disk like every push, so it counts towards `server.max_staging_bytes`.
+    /// An id no installed format has fails startup.
+    #[serde(default)]
+    pub max_upload_bytes: std::collections::BTreeMap<String, u64>,
 }
 
 impl PluginsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        for (id, bytes) in &self.max_upload_bytes {
+            if id == forge_db::model::DOCKER_FORMAT {
+                return Err(ConfigError::Invalid(
+                    "plugins.max_upload_bytes.docker: docker is not a plugin format; \
+                     set docker.max_blob_bytes"
+                        .into(),
+                ));
+            }
+            forge_plugin::manifest::validate_id(id)
+                .map_err(|e| ConfigError::Invalid(format!("plugins.max_upload_bytes.{id}: {e}")))?;
+            if *bytes == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.max_upload_bytes.{id} must be greater than 0"
+                )));
+            }
+        }
         if self.formats.is_empty() {
             return Ok(());
         }
@@ -2026,9 +2060,9 @@ impl Config {
             if budget < needed {
                 return Err(ConfigError::Invalid(format!(
                     "server.max_staging_bytes ({budget}) must be at least the largest of \
-                     server.max_upload_bytes, proxy.max_package_bytes and \
-                     docker.max_blob_bytes plus nuget.max_nuspec_bytes ({needed}), or 0 \
-                     for no limit"
+                     server.max_upload_bytes, plugins.max_upload_bytes, \
+                     proxy.max_package_bytes and docker.max_blob_bytes plus \
+                     nuget.max_nuspec_bytes ({needed}), or 0 for no limit"
                 )));
             }
         }
@@ -2036,12 +2070,26 @@ impl Config {
     }
 
     /// The largest single item staged in the temp directory: a package push
-    /// or download, or an image blob.
+    /// (of any format) or download, or an image blob.
     fn largest_staged_item(&self) -> u64 {
-        self.server
+        self.plugins
             .max_upload_bytes
+            .values()
+            .fold(self.server.max_upload_bytes, |largest, &bytes| {
+                largest.max(bytes)
+            })
             .max(self.proxy.max_package_bytes)
             .max(self.docker.max_blob_bytes)
+    }
+
+    /// The largest accepted push to a repository of format `format`:
+    /// `plugins.max_upload_bytes.<format>`, else `server.max_upload_bytes`.
+    pub fn max_upload_bytes(&self, format: &str) -> u64 {
+        self.plugins
+            .max_upload_bytes
+            .get(format)
+            .copied()
+            .unwrap_or(self.server.max_upload_bytes)
     }
 
     /// What one push or download stages at once at most: the package, and
@@ -3364,6 +3412,41 @@ mod tests {
             &format!("[server]\nmax_staging_bytes = {largest}"),
         );
         assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
+    }
+
+    #[test]
+    fn upload_limits_per_format_override_the_server_limit_and_size_staging() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        let default = cfg.server.max_upload_bytes;
+        assert_eq!(cfg.max_upload_bytes("helm"), default);
+
+        let big = 8 * 1024 * 1024 * 1024u64;
+        let toml = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nhelm = {big}\nnuget = 4096\n");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.max_upload_bytes("helm"), big);
+        assert_eq!(cfg.max_upload_bytes("nuget"), 4096);
+        assert_eq!(cfg.max_upload_bytes("other"), default);
+        // A push of the largest format limit fits the default budget.
+        assert_eq!(cfg.staging_budget(), Some(4 * big));
+        let too_small = toml.replace(
+            "[server]",
+            &format!("[server]\nmax_staging_bytes = {}", 2 * default),
+        );
+        let err = Config::from_figment(fig_from_toml(&too_small)).unwrap_err();
+        assert!(
+            err.to_string().contains("plugins.max_upload_bytes"),
+            "{err}"
+        );
+
+        for (entry, message) in [
+            ("helm = 0", "greater than 0"),
+            ("docker = 4096", "docker.max_blob_bytes"),
+            ("\"Not An Id\" = 4096", "plugins.max_upload_bytes.Not An Id"),
+        ] {
+            let toml = format!("{MINIMAL}\n[plugins.max_upload_bytes]\n{entry}\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(message), "{entry}: {err}");
+        }
     }
 
     #[test]
