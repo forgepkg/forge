@@ -137,6 +137,9 @@ pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
 /// Cache namespace for one page of upstream search results, keyed by
 /// `"{scope}/{search url}"`.
 pub const NS_UPSTREAM_SEARCH: &str = "proxy_search";
+/// Cache namespace marking a proxy whose upstream search failed, keyed by
+/// `"{scope}"`; see [`UPSTREAM_SEARCH_BACKOFF`].
+pub const NS_UPSTREAM_SEARCH_FAILED: &str = "proxy_search_failed";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
@@ -148,6 +151,10 @@ fn min_trusted_publish_time() -> DateTime<Utc> {
     DateTime::from_timestamp(1_262_304_000, 0).expect("valid timestamp")
 }
 
+/// After an upstream search fails, the proxy searches only its cache for this
+/// long, so an upstream that times out does not hold every search for the
+/// whole metadata timeout.
+const UPSTREAM_SEARCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
@@ -2395,8 +2402,8 @@ impl ProxyRepo {
     /// Search `repo` through the upstream's `SearchQueryService` when the
     /// caller allows it ([`SearchParams::include_upstream`]), the proxy is
     /// online and the upstream advertises one; otherwise, and when the
-    /// upstream search fails, search the cached packages
-    /// ([`Self::search_filtered`]).
+    /// upstream search fails (and for [`UPSTREAM_SEARCH_BACKOFF`] after),
+    /// search the cached packages ([`Self::search_filtered`]).
     async fn search_through_upstream(
         &self,
         repo: &str,
@@ -2405,7 +2412,11 @@ impl ProxyRepo {
         enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
-        if params.include_upstream && repo_row.online && !matches!(filter, PackageFilter::DenyAll) {
+        if params.include_upstream
+            && repo_row.online
+            && !matches!(filter, PackageFilter::DenyAll)
+            && !self.upstream_search_failed(&repo_row).await
+        {
             match self.upstream_search(&repo_row, params).await {
                 Ok(Some(page)) => {
                     return self
@@ -2414,11 +2425,36 @@ impl ProxyRepo {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(repo = %repo_row.name, error = %e, "upstream search failed; searching the cached packages");
+                    tracing::warn!(repo = %repo_row.name, error = %e, "upstream search failed; searching the cached packages for a minute");
+                    let _ = self
+                        .cache
+                        .get_or_try_insert_local(
+                            NS_UPSTREAM_SEARCH_FAILED,
+                            &Self::upstream_scope(&repo_row),
+                            UPSTREAM_SEARCH_BACKOFF,
+                            || async { Ok::<_, ()>(true) },
+                        )
+                        .await;
                 }
             }
         }
         self.search_filtered(repo, params, filter, enrich).await
+    }
+
+    /// Whether `repo`'s upstream search failed within the last
+    /// [`UPSTREAM_SEARCH_BACKOFF`].
+    async fn upstream_search_failed(&self, repo: &Repository) -> bool {
+        // Lookup only: the factory never yields a value, so a miss caches
+        // nothing.
+        self.cache
+            .get_or_try_insert_local(
+                NS_UPSTREAM_SEARCH_FAILED,
+                &Self::upstream_scope(repo),
+                UPSTREAM_SEARCH_BACKOFF,
+                || async { Err::<bool, ()>(()) },
+            )
+            .await
+            .is_ok()
     }
 
     /// One page of the upstream's search results for `params`, cached for

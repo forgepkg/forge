@@ -2642,7 +2642,8 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
         q: "sample".into(),
         ..Default::default()
     };
-    // The search service answers 404, then 500.
+    // The search service answers 404 (then 500): the cache answers, and for
+    // a minute after a failure the upstream search is not tried again.
     for status in [None, Some(StatusCode::INTERNAL_SERVER_ERROR)] {
         if let Some(status) = status {
             mock.set_search(status, vec![search_entry("Other.Lib", &["1.0.0"])], 1);
@@ -2651,7 +2652,11 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
         assert_eq!(result.total_hits, 1);
         assert_eq!(result.hits[0].original_id.to_lowercase(), "sample.lib");
     }
-    assert_eq!(mock.search_queries().len(), 2, "a failure is not cached");
+    assert_eq!(
+        mock.search_queries().len(),
+        1,
+        "backed off after the failure"
+    );
 
     // An offline proxy never asks.
     let offline = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, false).await;
@@ -2662,7 +2667,7 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
     );
     let result = px.search(&offline, &params).await.unwrap();
     assert!(result.hits.is_empty());
-    assert_eq!(mock.search_queries().len(), 2);
+    assert_eq!(mock.search_queries().len(), 1);
 }
 
 /// #112: upstream hits honor the caller's package filter, live not-found
