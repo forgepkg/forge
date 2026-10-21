@@ -31,5 +31,6 @@ pub mod trusted_publish_audit_dao;
 pub mod user_dao;
 pub mod username;
 pub mod validated_credential_dao;
+pub mod workload_api_key_dao;
 
 pub use pool::{connect, connect_with, db_now, migrate};

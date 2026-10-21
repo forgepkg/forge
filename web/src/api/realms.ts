@@ -103,6 +103,8 @@ export interface WorkloadIdentityConfig {
   max_token_age_seconds?: number
   allowed_authorized_parties?: string[]
   positive_cache_seconds?: number
+  /** Lifetime of a key the token exchange (`POST /api/v2/token`) issues. */
+  api_key_ttl_seconds?: number
   rules: WorkloadIdentityRule[]
   /** Extra stable workload-identity claims of a custom issuer. */
   identity_claims?: string[]

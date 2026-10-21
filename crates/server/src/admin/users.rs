@@ -89,8 +89,9 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// `POST /admin/users`
 pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>) -> Response {
     // Stored canonical (trimmed, NFC, lowercased), like every login looks it up,
-    // and without a `:`, which no password login accepts.
-    let username = match forge_core::auth::canonical_password_username(&body.username) {
+    // without a `:`, which no password login accepts, and never a reserved
+    // protocol name such as the workload-identity username `oidc`.
+    let username = match forge_core::auth::canonical_account_username(&body.username, true) {
         Ok(u) => u,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("invalid username: {e}")).into_response()

@@ -65,7 +65,7 @@ pub const UI_ADMIN_PREFIX: &str = "/manage";
 
 /// The API and feed prefixes. No SPA route lives under them, so a path there
 /// that no API route matched answers 404 instead of `index.html`.
-pub const API_PREFIXES: [&str; 4] = ["/admin", "/auth", "/browse", "/v3"];
+pub const API_PREFIXES: [&str; 5] = ["/admin", "/api", "/auth", "/browse", "/v3"];
 
 /// Whether `path` is `prefix` itself or lies under it (`/admin`, `/admin/x`;
 /// not `/administrator`).

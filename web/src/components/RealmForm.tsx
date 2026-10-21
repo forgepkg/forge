@@ -117,6 +117,8 @@ export interface RealmFormValues {
   max_token_age_seconds: string
   /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
   positive_cache_seconds: string
+  /** Lifetime of an API key the token exchange issues (blank ⇒ 3600). */
+  api_key_ttl_seconds: string
   /** Ordered claim→role rules; anyOf holds one value per line per condition. */
   wifRules: Array<{
     role: string
@@ -256,6 +258,8 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
       wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
     positive_cache_seconds:
       wif.positive_cache_seconds != null ? String(wif.positive_cache_seconds) : '',
+    api_key_ttl_seconds:
+      wif.api_key_ttl_seconds != null ? String(wif.api_key_ttl_seconds) : '',
     wifRules: (wif.rules ?? []).map((rule) => ({
       role: rule.role ?? '',
       conditions: (rule.conditions ?? []).map((c) => ({
@@ -365,6 +369,9 @@ export function RealmForm({
       }
       if (!isBlankNumberInRange(values.positive_cache_seconds, 0, 300)) {
         next.positive_cache_seconds = 'Positive cache TTL must be between 0 and 300 seconds.'
+      }
+      if (!isBlankNumberInRange(values.api_key_ttl_seconds, 60, 86400)) {
+        next.api_key_ttl_seconds = 'API key lifetime must be between 60 and 86400 seconds.'
       }
       if (values.wifRules.length === 0) {
         next.wifRules = 'At least one rule is required.'
@@ -1078,6 +1085,29 @@ export function RealmForm({
               )}
             </Field>
 
+            <Field>
+              <Label>Exchanged API key lifetime (seconds)</Label>
+              <Input
+                type="number"
+                min={60}
+                max={86400}
+                value={values.api_key_ttl_seconds}
+                onChange={(e) => set('api_key_ttl_seconds', e.target.value)}
+                placeholder="3600"
+                invalid={!!errors.api_key_ttl_seconds}
+              />
+              <Description>
+                How long a key from the token exchange (<code>POST /api/v2/token</code>)
+                stays valid, whatever the CI token&apos;s own lifetime. Editing this
+                realm revokes all of its outstanding keys.
+              </Description>
+              {errors.api_key_ttl_seconds && (
+                <ErrorMessage role="alert">
+                  {errors.api_key_ttl_seconds}
+                </ErrorMessage>
+              )}
+            </Field>
+
             <CheckboxField>
               <Checkbox
                 checked={values.allow_http_issuer}
@@ -1529,6 +1559,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     }
     const positiveCache = parseNumber(values.positive_cache_seconds)
     if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
+    const apiKeyTtl = parseNumber(values.api_key_ttl_seconds)
+    if (apiKeyTtl !== undefined) config.api_key_ttl_seconds = apiKeyTtl
     const identityClaims = parseLines(values.identity_claims)
     if (identityClaims.length > 0) config.identity_claims = identityClaims
     return config

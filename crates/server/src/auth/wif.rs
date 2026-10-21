@@ -32,18 +32,21 @@ use base64::Engine;
 use forge_cache::Cache;
 use forge_core::auth::token::{PrincipalSource, SourceOutcome};
 use forge_core::auth::Principal;
+use forge_core::auth::{is_workload_key, WORKLOAD_USERNAME};
 use forge_core::net::ssrf;
 use forge_core::oidc::{IdTokenClaims, OidcError, OidcMetadataClient, Verified};
 use forge_db::authz_dao;
 use forge_db::model::AuthRealm;
+use forge_db::workload_api_key_dao;
 use http::header::AUTHORIZATION;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 
-use super::realms::RealmAuth;
+use super::realms::{RealmAuth, RealmSnapshot};
 
 /// Default leeway (seconds) on `exp`/`nbf`/`iat` for a WIF token.
 fn default_clock_skew() -> u64 {
@@ -68,6 +71,11 @@ fn default_positive_cache() -> u64 {
 const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_POSITIVE_CACHE_SECONDS: u64 = 5 * 60;
+/// Lifetime of an exchanged workload API key when the realm sets none: an
+/// hour, like nuget.org's trusted-publishing keys.
+pub const DEFAULT_API_KEY_TTL_SECONDS: u64 = 60 * 60;
+const MIN_API_KEY_TTL_SECONDS: u64 = 60;
+const MAX_API_KEY_TTL_SECONDS: u64 = 24 * 60 * 60;
 /// Cache namespace for positive workload-token verdicts. In-process only
 /// ([`forge_cache::Cache::get_or_try_insert_local`]): a verdict stored in Redis
 /// could be planted by anyone with access to it.
@@ -116,6 +124,21 @@ pub struct WorkloadIdentityRealmConfig {
     /// claim; a custom CI system declares its own (e.g. `pipeline_id`) here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identity_claims: Vec<String>,
+    /// Lifetime of the API key the token exchange (`POST /api/v2/token`)
+    /// issues for a token of this realm, independent of the token's own
+    /// lifetime. Unset means [`DEFAULT_API_KEY_TTL_SECONDS`]. Left out of the
+    /// normalized config while unset, so realms that predate it keep their
+    /// policy digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ttl_seconds: Option<u64>,
+}
+
+impl WorkloadIdentityRealmConfig {
+    /// The exchanged-key lifetime this realm grants.
+    pub fn api_key_ttl_seconds(&self) -> u64 {
+        self.api_key_ttl_seconds
+            .unwrap_or(DEFAULT_API_KEY_TTL_SECONDS)
+    }
 }
 
 /// Claims that identify a workload (a repository/project, its owner, or a
@@ -218,6 +241,13 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
         return Err(format!(
             "positive_cache_seconds must not exceed {MAX_POSITIVE_CACHE_SECONDS}"
         ));
+    }
+    if let Some(ttl) = cfg.api_key_ttl_seconds {
+        if !(MIN_API_KEY_TTL_SECONDS..=MAX_API_KEY_TTL_SECONDS).contains(&ttl) {
+            return Err(format!(
+                "api_key_ttl_seconds must be between {MIN_API_KEY_TTL_SECONDS} and {MAX_API_KEY_TTL_SECONDS}"
+            ));
+        }
     }
     if cfg.rules.is_empty() {
         return Err(
@@ -454,10 +484,83 @@ fn positive_cache_key(
 
 /// The [`PrincipalSource`] that authenticates WIF workloads. Reads the enabled
 /// `workload_identity` realms from the (snapshot-cached) realm table, routes a
-/// presented JWT to the realm whose issuer it names, and validates it.
+/// presented JWT to the realm whose issuer it names, and validates it. It also
+/// owns the two other workload credentials: an exchanged workload API key
+/// ([`forge_core::auth::workload_key`]) in any transport, and the reserved
+/// Basic username `oidc` ([`WORKLOAD_USERNAME`]), whose secret must be one of
+/// the two.
 pub struct WorkloadIdentitySource {
     realms: Arc<RealmAuth>,
     pool: PgPool,
+}
+
+/// A workload proven by a verified OIDC token: the principal it authorizes as,
+/// plus what the token exchange records about the token.
+pub(crate) struct VerifiedWorkload {
+    /// Always a [`Principal::Workload`].
+    pub principal: Principal,
+    /// The token's `exp` (Unix seconds).
+    pub expires_at: i64,
+    /// The token's `jti`, when it has one.
+    pub jti: Option<String>,
+    /// The exchanged-key lifetime the token's realm grants.
+    pub api_key_ttl_seconds: u64,
+}
+
+/// Why the token exchange refused a presented token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExchangeRefusal {
+    /// Not a JWT for an enabled workload-identity realm.
+    NotWorkloadToken,
+    /// A workload token that failed verification or matched no rule.
+    Rejected,
+    /// The realm table or the role lookup failed: retry later.
+    Unavailable,
+}
+
+/// Where a presented secret routes among the enabled WIF realms.
+enum JwtRoute<'a> {
+    /// Not a JWT.
+    NotJwt,
+    /// A JWT, but no enabled realm names its issuer.
+    Unclaimed,
+    /// A JWT for this realm.
+    Realm(&'a WorkloadIdentityRealm),
+    /// A JWT whose issuer an invalid or several enabled realms name: refused
+    /// terminally, never handed to another source.
+    Refused,
+}
+
+/// Route `secret` by its (unverified) `iss` claim.
+fn route_jwt<'a>(snap: &'a RealmSnapshot, secret: &str) -> JwtRoute<'a> {
+    let Some(issuer) = jwt_issuer(secret) else {
+        return JwtRoute::NotJwt;
+    };
+    let issuer = normalize_issuer(&issuer);
+    if snap
+        .workload_ambiguous_issuers
+        .iter()
+        .any(|configured| configured == issuer)
+    {
+        tracing::error!(issuer = %issuer, "JWT issuer is configured by multiple enabled WIF realms; rejecting ambiguous route");
+        return JwtRoute::Refused;
+    }
+    if let Some(realm) = snap.workload.iter().find(|r| r.issuer_matches(issuer)) {
+        return JwtRoute::Realm(realm);
+    }
+    if snap
+        .workload_configured_issuers
+        .iter()
+        .any(|configured| configured == issuer)
+    {
+        // The enabled row names this issuer but failed runtime config
+        // construction. It still owns the JWT routing decision: never let a
+        // matching token fall through and become a forwarded Basic password
+        // merely because the realm is malformed.
+        tracing::error!(issuer = %issuer, "JWT matched an invalid WIF realm; rejecting terminally");
+        return JwtRoute::Refused;
+    }
+    JwtRoute::Unclaimed
 }
 
 impl WorkloadIdentitySource {
@@ -471,15 +574,20 @@ impl WorkloadIdentitySource {
     ///
     /// **Terminal**: this is only called once a presented secret has been
     /// positively identified as a JWT for `realm` (its `iss` matched), so every
-    /// failure returns [`SourceOutcome::Reject`] — the chain stops and the token
-    /// is *never* handed to a downstream source (so it cannot be reinterpreted as
-    /// an opaque API token or forwarded upstream as a password — design §8).
-    async fn authenticate(&self, realm: &WorkloadIdentityRealm, token: &str) -> SourceOutcome {
+    /// failure is [`SourceOutcome::Reject`] (or [`SourceOutcome::Unavailable`])
+    /// — the chain stops and the token is *never* handed to a downstream
+    /// source (so it cannot be reinterpreted as an opaque API token or
+    /// forwarded upstream as a password — design §8).
+    async fn verify(
+        &self,
+        realm: &WorkloadIdentityRealm,
+        token: &str,
+    ) -> Result<VerifiedWorkload, SourceOutcome> {
         let verified = match realm.verify_token(token).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(realm = %realm.realm_name, error = %e, "WIF token validation failed");
-                return SourceOutcome::Reject;
+                return Err(SourceOutcome::Reject);
             }
         };
 
@@ -493,7 +601,7 @@ impl WorkloadIdentitySource {
                 subject = %verified.subject,
                 "WIF token matched no claim rule (default deny)"
             );
-            return SourceOutcome::Reject;
+            return Err(SourceOutcome::Reject);
         };
 
         // Defense in depth for malformed/legacy rows that bypassed config
@@ -503,7 +611,7 @@ impl WorkloadIdentitySource {
                 realm = %realm.realm_name,
                 "WIF rule attempted to grant the global admin role; denying"
             );
-            return SourceOutcome::Reject;
+            return Err(SourceOutcome::Reject);
         }
 
         match authz_dao::role_id_by_name(&self.pool, role_name).await {
@@ -514,14 +622,19 @@ impl WorkloadIdentitySource {
                     role = %role_name,
                     "WIF workload authenticated"
                 );
-                SourceOutcome::Authenticated(Principal::Workload {
-                    realm_id: realm.realm_id,
-                    role_id,
-                    issuer_sha256: sha256_bytes(verified.issuer.trim_end_matches('/')),
-                    config_sha256: realm.config_sha256,
-                    subject_sha256: workload_subject_hash(&verified.issuer, &verified.subject),
-                    jti_sha256: verified.claims.jti.as_deref().map(sha256_bytes),
-                    issued_at: verified.claims.iat.expect("workload verifier requires iat"),
+                Ok(VerifiedWorkload {
+                    principal: Principal::Workload {
+                        realm_id: realm.realm_id,
+                        role_id,
+                        issuer_sha256: sha256_bytes(verified.issuer.trim_end_matches('/')),
+                        config_sha256: realm.config_sha256,
+                        subject_sha256: workload_subject_hash(&verified.issuer, &verified.subject),
+                        jti_sha256: verified.claims.jti.as_deref().map(sha256_bytes),
+                        issued_at: verified.claims.iat.expect("workload verifier requires iat"),
+                    },
+                    expires_at: verified.claims.exp.expect("workload verifier requires exp"),
+                    jti: verified.claims.jti.clone(),
+                    api_key_ttl_seconds: realm.config.api_key_ttl_seconds(),
                 })
             }
             Ok(None) => {
@@ -530,14 +643,96 @@ impl WorkloadIdentitySource {
                     role = %role_name,
                     "WIF rule maps to a non-existent role (deny)"
                 );
-                SourceOutcome::Reject
+                Err(SourceOutcome::Reject)
             }
             // Not a verdict on the token: 503, so the CI job retries.
             Err(e) => {
                 tracing::error!(error = %e, "WIF role lookup failed");
-                SourceOutcome::Unavailable
+                Err(SourceOutcome::Unavailable)
             }
         }
+    }
+
+    async fn authenticate(&self, realm: &WorkloadIdentityRealm, token: &str) -> SourceOutcome {
+        match self.verify(realm, token).await {
+            Ok(workload) => SourceOutcome::Authenticated(workload.principal),
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Resolve a workload API key to the principal captured when it was
+    /// issued. **Terminal** like a WIF token: a key that is unknown, expired,
+    /// or whose realm is no longer enabled with the very configuration it was
+    /// issued under (any realm edit revokes its keys) is rejected and never
+    /// handed to another source.
+    async fn authenticate_key(&self, snap: &RealmSnapshot, key: &str) -> SourceOutcome {
+        let digest = forge_core::auth::workload_key_sha256(key);
+        let row = match workload_api_key_dao::find_live(&self.pool, &digest).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::warn!("unknown or expired workload API key");
+                return SourceOutcome::Reject;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "workload API key lookup failed");
+                return SourceOutcome::Unavailable;
+            }
+        };
+        // Defense in depth against a non-constant-time index comparison.
+        if row.key_sha256.ct_eq(&digest).unwrap_u8() != 1 {
+            return SourceOutcome::Reject;
+        }
+        let current = snap
+            .workload
+            .iter()
+            .find(|realm| realm.realm_id == row.realm_id);
+        if current.is_none_or(|realm| realm.config_sha256 != row.config_sha256) {
+            tracing::warn!(
+                realm_id = row.realm_id,
+                key_id = row.id,
+                "workload API key revoked: its realm was disabled, deleted or reconfigured"
+            );
+            return SourceOutcome::Reject;
+        }
+        tracing::debug!(
+            realm_id = row.realm_id,
+            key_id = row.id,
+            "workload API key authenticated"
+        );
+        SourceOutcome::Authenticated(Principal::Workload {
+            realm_id: row.realm_id,
+            role_id: row.role_id,
+            issuer_sha256: row.issuer_sha256,
+            config_sha256: row.config_sha256,
+            subject_sha256: row.subject_sha256,
+            jti_sha256: Some(row.jti_sha256),
+            issued_at: row.token_issued_at.timestamp(),
+        })
+    }
+
+    /// Verify `token`, a CI job's OIDC token, for the token exchange. Routes
+    /// and verifies exactly like [`PrincipalSource::resolve`] does.
+    pub(crate) async fn verify_for_exchange(
+        &self,
+        token: &str,
+    ) -> Result<VerifiedWorkload, ExchangeRefusal> {
+        let snap = self.realms.snapshot().await.map_err(|e| {
+            tracing::error!(error = %e, "WIF realm snapshot failed");
+            ExchangeRefusal::Unavailable
+        })?;
+        let realm = match route_jwt(&snap, token) {
+            JwtRoute::Realm(realm) => realm,
+            JwtRoute::NotJwt | JwtRoute::Unclaimed => {
+                return Err(ExchangeRefusal::NotWorkloadToken)
+            }
+            JwtRoute::Refused => return Err(ExchangeRefusal::Rejected),
+        };
+        self.verify(realm, token)
+            .await
+            .map_err(|outcome| match outcome {
+                SourceOutcome::Unavailable => ExchangeRefusal::Unavailable,
+                _ => ExchangeRefusal::Rejected,
+            })
     }
 }
 
@@ -556,69 +751,60 @@ fn sha256_bytes(value: &str) -> [u8; 32] {
 #[async_trait]
 impl PrincipalSource for WorkloadIdentitySource {
     async fn resolve(&self, headers: &HeaderMap, _peer_ip: std::net::IpAddr) -> SourceOutcome {
+        // Basic `oidc:<secret>` names a workload whatever the secret is: it is
+        // decided here and never reaches the token or password sources.
+        let workload_basic = basic_username(headers).is_some_and(|username| {
+            forge_db::username::canonical_username(&username)
+                .is_ok_and(|name| name == WORKLOAD_USERNAME)
+        });
         let candidates = candidate_secrets(headers);
-        if candidates.is_empty() {
+        let claims_any = workload_basic
+            || candidates
+                .iter()
+                .any(|s| is_workload_key(s) || jwt_issuer(s).is_some());
+        if !claims_any {
+            // Nothing workload-shaped: the token/Basic sources handle it.
             return SourceOutcome::NoCredentials;
         }
 
-        // Resolve the realm snapshot. On a snapshot error we cannot route. If any
-        // presented secret structurally parses as a JWT we stop as temporarily
-        // unavailable (terminal, 503) rather than let it fall through to the
-        // password/token sources — a JWT must never be reinterpreted as a
-        // password, even while the realm table is unreadable. A request
-        // carrying no JWT-shaped secret declines, so the (separately
-        // fail-closed) token/Basic sources handle it as before.
+        // Resolve the realm snapshot. On a snapshot error we cannot route, and
+        // a workload-shaped credential (a JWT, a workload key, the `oidc`
+        // username) must never be reinterpreted as a password, even while the
+        // realm table is unreadable: temporarily unavailable (terminal, 503).
         let snap = match self.realms.snapshot().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "WIF realm snapshot failed");
-                if candidates.iter().any(|s| jwt_issuer(s).is_some()) {
-                    return SourceOutcome::Unavailable;
-                }
-                return SourceOutcome::NoCredentials;
+                return SourceOutcome::Unavailable;
             }
         };
-        if snap.workload.is_empty() && snap.workload_configured_issuers.is_empty() {
-            return SourceOutcome::NoCredentials;
-        }
 
         for secret in &candidates {
-            let Some(issuer) = jwt_issuer(secret) else {
-                continue; // not a JWT — let other sources handle this secret
-            };
-            if snap
-                .workload_ambiguous_issuers
-                .iter()
-                .any(|configured| configured == normalize_issuer(&issuer))
-            {
-                tracing::error!(issuer = %issuer, "JWT issuer is configured by multiple enabled WIF realms; rejecting ambiguous route");
-                return SourceOutcome::Reject;
+            if is_workload_key(secret) {
+                // A workload key, live or not: terminal from here.
+                return self.authenticate_key(&snap, secret).await;
             }
-            if let Some(realm) = snap.workload.iter().find(|r| r.issuer_matches(&issuer)) {
+            match route_jwt(&snap, secret) {
                 // This secret IS a WIF token for `realm`: terminal from here.
-                return self.authenticate(realm, secret).await;
+                JwtRoute::Realm(realm) => return self.authenticate(realm, secret).await,
+                JwtRoute::Refused => return SourceOutcome::Reject,
+                // Not a WIF token: let other sources handle this secret.
+                JwtRoute::NotJwt | JwtRoute::Unclaimed => {}
             }
-            if snap
-                .workload_configured_issuers
-                .iter()
-                .any(|configured| configured == normalize_issuer(&issuer))
-            {
-                // The enabled row names this issuer but failed runtime config
-                // construction. It still owns the JWT routing decision: never
-                // let a matching token fall through and become a forwarded
-                // Basic password merely because the realm is malformed.
-                tracing::error!(issuer = %issuer, "JWT matched an invalid WIF realm; rejecting terminally");
-                return SourceOutcome::Reject;
-            }
-            // A JWT, but not for any configured WIF issuer.
+        }
+        if workload_basic {
+            tracing::warn!(
+                "Basic username {WORKLOAD_USERNAME:?} without a workload token or key; rejected"
+            );
+            return SourceOutcome::Reject;
         }
         SourceOutcome::NoCredentials
     }
 }
 
-/// Collect candidate secrets a workload could present its `id_token` in, in
-/// priority order: `Authorization: Bearer`, then the Basic password, then
-/// `X-NuGet-ApiKey`.
+/// Collect candidate secrets a workload could present its `id_token` (or an
+/// exchanged workload key) in, in priority order: `Authorization: Bearer`,
+/// then the Basic password, then `X-NuGet-ApiKey`.
 fn candidate_secrets(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(auth) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
@@ -628,7 +814,7 @@ fn candidate_secrets(headers: &HeaderMap) -> Vec<String> {
                 out.push(t.to_string());
             }
         } else if let Some(basic) = strip_prefix_ci(auth, "Basic ") {
-            if let Some(pw) = basic_password(basic.trim()) {
+            if let Some((_, pw)) = basic_credentials(basic.trim()) {
                 if !pw.is_empty() {
                     out.push(pw);
                 }
@@ -644,6 +830,13 @@ fn candidate_secrets(headers: &HeaderMap) -> Vec<String> {
     out
 }
 
+/// The username of an HTTP Basic `Authorization` header, if one is present.
+fn basic_username(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let basic = strip_prefix_ci(auth, "Basic ")?;
+    basic_credentials(basic.trim()).map(|(username, _)| username)
+}
+
 /// Case-insensitive prefix strip (HTTP auth schemes are case-insensitive).
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
@@ -653,11 +846,12 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Decode the password half of a Base64 `user:password` HTTP Basic credential.
-fn basic_password(b64: &str) -> Option<String> {
+/// Decode a Base64 `user:password` HTTP Basic credential into its halves.
+fn basic_credentials(b64: &str) -> Option<(String, String)> {
     let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let s = String::from_utf8(decoded).ok()?;
-    s.split_once(':').map(|(_, pw)| pw.to_string())
+    s.split_once(':')
+        .map(|(user, pw)| (user.to_string(), pw.to_string()))
 }
 
 /// If `secret` structurally parses as a JWT (three segments; header decodes with
@@ -1222,11 +1416,58 @@ mod tests {
     }
 
     #[test]
-    fn basic_password_decodes_the_password_half() {
-        let cred = base64::engine::general_purpose::STANDARD.encode("user:s3cr3t");
-        assert_eq!(basic_password(&cred).as_deref(), Some("s3cr3t"));
+    fn basic_credentials_split_at_the_first_colon() {
+        let cred = base64::engine::general_purpose::STANDARD.encode("user:s3:cr3t");
+        assert_eq!(
+            basic_credentials(&cred),
+            Some(("user".to_string(), "s3:cr3t".to_string()))
+        );
         // token-as-password with no colon-prefixed user still needs a colon.
-        assert_eq!(basic_password("@@@notbase64"), None);
+        assert_eq!(basic_credentials("@@@notbase64"), None);
+    }
+
+    fn basic_header(credential: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credential);
+        headers.insert(AUTHORIZATION, format!("Basic {encoded}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn basic_username_is_read_from_the_basic_header_only() {
+        assert_eq!(
+            basic_username(&basic_header("OIDC:secret")).as_deref(),
+            Some("OIDC")
+        );
+        let mut bearer = HeaderMap::new();
+        bearer.insert(AUTHORIZATION, "Bearer abc".parse().unwrap());
+        assert_eq!(basic_username(&bearer), None);
+        assert_eq!(basic_username(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn api_key_ttl_defaults_to_an_hour_and_is_bounded() {
+        let base = json!({
+            "issuer": "https://gitlab.example",
+            "allowed_audiences": ["https://forge.example"],
+            "rules": [{"role": "ci", "conditions": [{"claim": "project_id", "any_of": ["1"]}]}],
+        });
+        let normalized = validate_workload_identity_config(&base).unwrap();
+        // Unset stays out of the normalized document (stable policy digest).
+        assert!(normalized.get("api_key_ttl_seconds").is_none());
+        let cfg: WorkloadIdentityRealmConfig = serde_json::from_value(normalized).unwrap();
+        assert_eq!(cfg.api_key_ttl_seconds(), DEFAULT_API_KEY_TTL_SECONDS);
+
+        let mut with_ttl = base.clone();
+        with_ttl["api_key_ttl_seconds"] = json!(900);
+        let cfg: WorkloadIdentityRealmConfig =
+            serde_json::from_value(validate_workload_identity_config(&with_ttl).unwrap()).unwrap();
+        assert_eq!(cfg.api_key_ttl_seconds(), 900);
+        for bad in [0, 59, 24 * 60 * 60 + 1] {
+            let mut cfg = base.clone();
+            cfg["api_key_ttl_seconds"] = json!(bad);
+            assert!(validate_workload_identity_config(&cfg).is_err(), "{bad}");
+        }
     }
 
     #[test]

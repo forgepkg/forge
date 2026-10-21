@@ -59,6 +59,7 @@ use crate::state::AppState;
 
 mod realms;
 mod redirect;
+mod token_exchange;
 mod wif;
 
 pub(crate) use realms::normalize_endpoint_hosts;
@@ -68,6 +69,7 @@ pub use realms::{
     KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
+pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
 pub(crate) use wif::workload_identity_config_sha256;
 pub use wif::WorkloadIdentitySource;
 
@@ -866,7 +868,11 @@ async fn password_login(
     // now. As on the wire Basic path it is not run through the chain (a
     // credential-forwarding realm would send it upstream), and it does not
     // sign in either: a session carries its owner's rights, not the token's
-    // scope.
+    // scope. The same holds for a workload API key.
+    if forge_core::auth::is_workload_key(&body.password) {
+        attempt.failed();
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
     match check_token(&state.pool, &body.password).await {
         Ok(TokenCheck::Unknown) => {}
         Ok(TokenCheck::Live(_) | TokenCheck::Unusable) => {
