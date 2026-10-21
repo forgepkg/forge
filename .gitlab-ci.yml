@@ -6,7 +6,7 @@
 # settings; change both together. Images are pinned by digest (tag kept for
 # readability), as ci.yml pins its actions; nothing bumps them here, so do it
 # by hand. The images the test harnesses start themselves (postgres:17,
-# versity/versitygw:v1.4.1, redis, minio/minio) are named by tag in their
+# versity/versitygw:v1.4.1 and v1.9.0, redis) are named by tag in their
 # code, as on GitHub.
 #
 # The GitHub runners come with a Docker daemon; here the jobs that need one
@@ -247,10 +247,11 @@ web:
     expire_in: 1 day
 
 # ── E2E / integration tests (forge-e2e crate, testcontainers) ────────────────
-# The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis, MinIO)
-# containers via testcontainers on the dind service, so no other `services:`
-# are needed. MinIO reaches the test process's mock OIDC issuer at the job's
-# address on the route to the dind service.
+# The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis, and a
+# versitygw with its IAM/STS service) containers via testcontainers on the
+# dind service, so no other `services:` are needed. The STS reaches the test
+# process's mock OIDC issuer at the job's address on the route to the dind
+# service.
 # Gated behind the `forge-e2e` feature; left out of MR pipelines to keep them
 # fast, but runs in merge trains (so a change that breaks it never lands) and
 # on the default branch. The optional dotnet smoke test is skipped here (no SDK
@@ -274,8 +275,8 @@ e2e:
     # Pre-pull the images the harness uses (faster, deterministic).
     - docker pull postgres:17
     - docker pull versity/versitygw:v1.4.1
+    - docker pull versity/versitygw:v1.9.0
     - docker pull redis:5.0
-    - docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
   script:
     - rustup target add wasm32-wasip2
     - cargo test --workspace --features forge-e2e

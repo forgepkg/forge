@@ -1918,6 +1918,8 @@ name = "forge-e2e"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "aws-credential-types",
+ "aws-sigv4",
  "axum",
  "base64 0.23.1",
  "chrono",
