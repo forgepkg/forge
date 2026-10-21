@@ -128,6 +128,13 @@ pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
 
+/// The earliest upstream publish time the package delay trusts
+/// (2010-01-01, before any NuGet feed): nuget.org reports unlisted versions as
+/// published in 1900.
+fn min_trusted_publish_time() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_262_304_000, 0).expect("valid timestamp")
+}
+
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
@@ -788,6 +795,9 @@ impl ProxyRepo {
                         Self::metadata_ttl(repo).num_seconds(),
                     )
                     .await?;
+                }
+                if repo.package_delay_seconds > 0 {
+                    self.date_delay_from_upstream(repo, lower_id).await;
                 }
                 Ok(true)
             }
@@ -1812,6 +1822,12 @@ impl ProxyRepo {
             });
         }
 
+        // The id as the package spells it (rows hold the lowercased one).
+        let original_ids: HashMap<String, String> =
+            proxy_dao::original_ids(&self.pool, repo_row.id, &page)
+                .await?
+                .into_iter()
+                .collect();
         let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
         for name in &page {
             let Some(mut versions) = by_id.remove(name) else {
@@ -1819,6 +1835,13 @@ impl ProxyRepo {
                 continue;
             };
             versions.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+            let original_id = original_ids
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone());
+            for v in &mut versions {
+                v.original_id.clone_from(&original_id);
+            }
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -1840,7 +1863,12 @@ impl ProxyRepo {
         use futures_util::StreamExt;
         let wanted: Vec<(String, String)> = hits
             .iter()
-            .map(|hit| (hit.original_id.clone(), hit.latest_version.clone()))
+            .map(|hit| {
+                (
+                    self.format.lower_id(&hit.original_id),
+                    hit.latest_version.clone(),
+                )
+            })
             .collect();
         let manifests: Vec<Option<Vec<u8>>> = futures_util::stream::iter(wanted)
             .map(|(id, version)| async move {
@@ -1856,6 +1884,223 @@ impl ProxyRepo {
             .await;
         for (hit, manifest) in hits.iter_mut().zip(manifests) {
             hit.nuspec_bytes = manifest;
+        }
+    }
+    /// The registration entries of `id`: every listable version, or only
+    /// those in `only` (normalized). The upstream registration is consulted
+    /// for the versions returned only, so a registration page or leaf fetches
+    /// just the upstream pages covering its own versions (an index of more
+    /// versions than [`MAX_REGISTRATION_PAGES`] upstream pages hold is paged,
+    /// never rendered whole).
+    async fn registration_of(
+        &self,
+        repo: &str,
+        id: &str,
+        only: Option<&[String]>,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(Vec::new());
+        };
+
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(Vec::new());
+        }
+
+        let rows = self.discover_versions(&repo_row, &lower).await?;
+        let now = self.db_now().await?;
+        let mut visible: Vec<forge_db::model::ProxyCachedVersion> = rows
+            .into_iter()
+            .filter(|r| Self::listable(&repo_row, r, now))
+            .filter(|r| {
+                only.is_none_or(|only| only.iter().any(|v| v.eq_ignore_ascii_case(&r.version)))
+            })
+            .collect();
+        visible.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+
+        let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
+        let upstream = self.upstream_leaves(&repo_row, &lower, &wanted).await;
+
+        // Persist the upstream listing state so the flat index and search
+        // report it too (best effort).
+        let (changed, listed): (Vec<String>, Vec<bool>) = visible
+            .iter()
+            .filter_map(|r| {
+                let leaf = upstream.get(&r.version)?;
+                (leaf.listed != r.listed).then(|| (r.version.clone(), leaf.listed))
+            })
+            .unzip();
+        if let Err(e) =
+            proxy_dao::set_listed(&self.pool, repo_row.id, &lower, &changed, &listed).await
+        {
+            tracing::warn!(repo = %repo_row.name, id = %lower, error = %e, "persisting upstream listing state failed");
+        }
+
+        // packageHash + the stored manifest are known only for downloaded
+        // versions: one query for all of them, with the manifest summary
+        // stored at download. A version cached before summaries were stored
+        // has its manifest read once (bounded concurrency) and backfilled.
+        let rows = match only {
+            None => {
+                component_dao::list_registration_rows(
+                    &self.pool,
+                    repo_row.id,
+                    &lower,
+                    NUPKG_ASSET_PATH,
+                )
+                .await?
+            }
+            Some(_) => {
+                component_dao::list_registration_rows_for_versions(
+                    &self.pool,
+                    repo_row.id,
+                    &lower,
+                    &wanted,
+                    NUPKG_ASSET_PATH,
+                )
+                .await?
+            }
+        };
+        let mut cached: HashMap<String, component_dao::RegistrationRow> = rows
+            .into_iter()
+            .map(|row| (row.version.clone(), row))
+            .collect();
+        let unsummarized: Vec<(i64, String)> = visible
+            .iter()
+            .filter(|r| r.downloaded)
+            .filter_map(|r| cached.get(&r.version))
+            .filter(|row| row.manifest_summary.is_none())
+            .map(|row| (row.id, row.version.clone()))
+            .collect();
+        let mut manifests: HashMap<String, (Option<JsonValue>, Option<Vec<u8>>)> = {
+            use futures_util::StreamExt;
+            let (repo_id, name) = (repo_row.id, lower.as_str());
+            futures_util::stream::iter(unsummarized)
+                .map(|(component_id, version)| async move {
+                    let manifest = self
+                        .summarize_cached(repo_id, name, component_id, &version)
+                        .await;
+                    (version, manifest)
+                })
+                .buffered(8)
+                .collect::<HashMap<_, _>>()
+                .await
+        };
+
+        let mut out = Vec::with_capacity(visible.len());
+        for r in visible {
+            let leaf = upstream.get(&r.version);
+            let (hash, summary, local) = match cached.remove(&r.version) {
+                Some(row) if r.downloaded => {
+                    let (summary, local) = match row.manifest_summary {
+                        Some(summary) => (Some(summary), None),
+                        None => manifests.remove(&r.version).unwrap_or_default(),
+                    };
+                    (row.package_hash_sha512_base64, summary, local)
+                }
+                _ => (None, None, None),
+            };
+            let original_id = leaf
+                .and_then(|l| l.id.clone())
+                .unwrap_or_else(|| r.name.clone());
+            // Not downloaded: the dependency groups are known only from the
+            // upstream registration.
+            let nuspec_bytes = if summary.is_some() {
+                None
+            } else {
+                local.or_else(|| {
+                    leaf.and_then(|l| {
+                        self.format.synthesize_manifest(
+                            &original_id,
+                            &r.version,
+                            &l.dependency_groups(),
+                        )
+                    })
+                })
+            };
+            out.push(RegistrationEntry {
+                original_id,
+                version: r.version.clone(),
+                listed: leaf.map_or(r.listed, |l| l.listed),
+                package_hash_sha512_base64: hash,
+                nuspec_bytes,
+                manifest_summary: summary,
+                // Only the upstream registration knows the publish time (the
+                // cache time would be misleading).
+                published: leaf.and_then(|l| l.published),
+            });
+        }
+        Ok(out)
+    }
+
+    /// [`Self::upstream_registration`] for `wanted`, without leaves that name
+    /// another package (they are not this package's metadata). Records the
+    /// package id's upstream casing for search (best effort).
+    async fn upstream_leaves(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        wanted: &[String],
+    ) -> HashMap<String, UpstreamLeaf> {
+        let mut upstream = self.upstream_registration(repo, lower_id, wanted).await;
+        upstream.retain(|_, leaf| {
+            leaf.id
+                .as_deref()
+                .is_none_or(|id| self.format.lower_id(id) == lower_id)
+        });
+        if let Some(original_id) = upstream.values().find_map(|leaf| leaf.id.as_deref()) {
+            if let Err(e) =
+                proxy_dao::record_original_id(&self.pool, repo.id, lower_id, original_id).await
+            {
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "recording the upstream id casing failed");
+            }
+        }
+        upstream
+    }
+
+    /// Date the package delay of `lower_id`'s versions still inside it from
+    /// when the upstream published them, instead of from their first
+    /// sighting here. The delay quarantines *new releases*: without this, a
+    /// version published years ago but first seen now (every version of a
+    /// package this proxy has not served before, all of them on a fresh
+    /// install) was hidden for the whole delay.
+    ///
+    /// Only a listed version's upstream publish time counts, and only a
+    /// plausible one: nuget.org reports unlisted versions as published in
+    /// 1900, which would let a release unlisted right after publishing skip
+    /// the quarantine, and a time in the future is ignored. Best effort: when
+    /// the upstream registration is unavailable, the first sighting stands.
+    async fn date_delay_from_upstream(&self, repo: &Repository, lower_id: &str) {
+        let result: Result<(), RepoError> = async {
+            let now = self.db_now().await?;
+            let pending: Vec<forge_db::model::ProxyCachedVersion> = self
+                .cached_rows(repo.id, lower_id)
+                .await?
+                .into_iter()
+                .filter(|r| !Self::delay_cleared(repo, r.first_seen_at, now))
+                .collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let wanted: Vec<String> = pending.iter().map(|r| r.version.clone()).collect();
+            let leaves = self.upstream_leaves(repo, lower_id, &wanted).await;
+            let (versions, published): (Vec<String>, Vec<DateTime<Utc>>) = pending
+                .iter()
+                .filter_map(|r| {
+                    let leaf = leaves.get(&r.version).filter(|leaf| leaf.listed)?;
+                    let at = leaf
+                        .published
+                        .filter(|at| *at >= min_trusted_publish_time() && *at <= now)?;
+                    (at < r.first_seen_at).then(|| (r.version.clone(), at))
+                })
+                .unzip();
+            proxy_dao::backdate_first_seen(&self.pool, repo.id, lower_id, &versions, &published)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "dating the package delay from the upstream failed");
         }
     }
 }
@@ -2023,128 +2268,50 @@ impl RepoReadOps for ProxyRepo {
         repo: &str,
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration_of(repo, id, None).await
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        // The listing alone: an index that does not inline its leaves needs
+        // no upstream registration.
         let repo_row = self.proxy_repo(repo).await?;
         let Some(lower) = self.upstream_id(id) else {
             return Ok(Vec::new());
         };
-
         if self.negative_cached(&repo_row, &lower, "*").await? {
             return Ok(Vec::new());
         }
-
         let rows = self.discover_versions(&repo_row, &lower).await?;
         let now = self.db_now().await?;
-        let mut visible: Vec<forge_db::model::ProxyCachedVersion> = rows
+        let mut versions: Vec<String> = rows
             .into_iter()
             .filter(|r| Self::listable(&repo_row, r, now))
+            .map(|r| r.version)
             .collect();
-        visible.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+        versions.sort_by(|a, b| self.format.compare_versions(a, b));
+        Ok(versions)
+    }
 
-        let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
-        let mut upstream = self.upstream_registration(&repo_row, &lower, &wanted).await;
-        // Leaves naming another package are not this package's metadata.
-        upstream.retain(|_, leaf| {
-            leaf.id
-                .as_deref()
-                .is_none_or(|id| self.format.lower_id(id) == lower)
-        });
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration_of(repo, id, Some(versions)).await
+    }
 
-        // Persist the upstream listing state so the flat index and search
-        // report it too (best effort).
-        let (changed, listed): (Vec<String>, Vec<bool>) = visible
-            .iter()
-            .filter_map(|r| {
-                let leaf = upstream.get(&r.version)?;
-                (leaf.listed != r.listed).then(|| (r.version.clone(), leaf.listed))
-            })
-            .unzip();
-        if let Err(e) =
-            proxy_dao::set_listed(&self.pool, repo_row.id, &lower, &changed, &listed).await
-        {
-            tracing::warn!(repo = %repo_row.name, id = %lower, error = %e, "persisting upstream listing state failed");
-        }
-
-        // packageHash + the stored manifest are known only for downloaded
-        // versions: one query for all of them, with the manifest summary
-        // stored at download. A version cached before summaries were stored
-        // has its manifest read once (bounded concurrency) and backfilled.
-        let mut cached: HashMap<String, component_dao::RegistrationRow> =
-            component_dao::list_registration_rows(
-                &self.pool,
-                repo_row.id,
-                &lower,
-                NUPKG_ASSET_PATH,
-            )
+    async fn registration_entry(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration_of(repo, id, Some(&[version.to_string()]))
             .await?
             .into_iter()
-            .map(|row| (row.version.clone(), row))
-            .collect();
-        let unsummarized: Vec<(i64, String)> = visible
-            .iter()
-            .filter(|r| r.downloaded)
-            .filter_map(|r| cached.get(&r.version))
-            .filter(|row| row.manifest_summary.is_none())
-            .map(|row| (row.id, row.version.clone()))
-            .collect();
-        let mut manifests: HashMap<String, (Option<JsonValue>, Option<Vec<u8>>)> = {
-            use futures_util::StreamExt;
-            let (repo_id, name) = (repo_row.id, lower.as_str());
-            futures_util::stream::iter(unsummarized)
-                .map(|(component_id, version)| async move {
-                    let manifest = self
-                        .summarize_cached(repo_id, name, component_id, &version)
-                        .await;
-                    (version, manifest)
-                })
-                .buffered(8)
-                .collect::<HashMap<_, _>>()
-                .await
-        };
-
-        let mut out = Vec::with_capacity(visible.len());
-        for r in visible {
-            let leaf = upstream.get(&r.version);
-            let (hash, summary, local) = match cached.remove(&r.version) {
-                Some(row) if r.downloaded => {
-                    let (summary, local) = match row.manifest_summary {
-                        Some(summary) => (Some(summary), None),
-                        None => manifests.remove(&r.version).unwrap_or_default(),
-                    };
-                    (row.package_hash_sha512_base64, summary, local)
-                }
-                _ => (None, None, None),
-            };
-            let original_id = leaf
-                .and_then(|l| l.id.clone())
-                .unwrap_or_else(|| r.name.clone());
-            // Not downloaded: the dependency groups are known only from the
-            // upstream registration.
-            let nuspec_bytes = if summary.is_some() {
-                None
-            } else {
-                local.or_else(|| {
-                    leaf.and_then(|l| {
-                        self.format.synthesize_manifest(
-                            &original_id,
-                            &r.version,
-                            &l.dependency_groups(),
-                        )
-                    })
-                })
-            };
-            out.push(RegistrationEntry {
-                original_id,
-                version: r.version.clone(),
-                listed: leaf.map_or(r.listed, |l| l.listed),
-                package_hash_sha512_base64: hash,
-                nuspec_bytes,
-                manifest_summary: summary,
-                // Only the upstream registration knows the publish time (the
-                // cache time would be misleading).
-                published: leaf.and_then(|l| l.published),
-            });
-        }
-        Ok(out)
+            .next())
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {

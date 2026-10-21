@@ -2271,6 +2271,157 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
     px.registration(&repo, "Contoso.Lib").await.unwrap();
     assert_eq!(mock.registration_page_hits(), 10, "pages are cached");
     assert_eq!(mock.registration_hits(), 1);
+
+    // A registration page or leaf asks for its own versions only, so the
+    // old versions get their pages too: no package is too long for its
+    // oldest versions' dependencies, listing state and publish date.
+    let old = px
+        .registration_entries(&repo, "Contoso.Lib", &["1.0.0".into(), "2.0.0".into()])
+        .await
+        .unwrap();
+    assert_eq!(old.len(), 2);
+    assert!(old.iter().all(|e| e.nuspec_bytes.is_some()), "{old:?}");
+    assert_eq!(mock.registration_page_hits(), 12);
+    let leaf = px
+        .registration_entry(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .expect("leaf");
+    assert!(leaf.nuspec_bytes.is_some());
+    // The versions alone (an index that does not inline its leaves) need no
+    // upstream registration at all.
+    assert_eq!(
+        px.registration_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap(),
+        versions
+    );
+    assert_eq!(mock.registration_page_hits(), 12);
+    assert_eq!(mock.registration_hits(), 1);
+}
+
+/// Proxy search answers with the package id as the package spells it, not
+/// the lowercased one the cache rows hold: from a downloaded version's
+/// manifest, else from the upstream registration.
+#[tokio::test]
+async fn proxy_search_shows_the_ids_original_casing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = corpus_of("Contoso.Downloaded", &["1.0.0"]);
+    corpus.extend(corpus_of("Contoso.Registered", &["1.0.0"]));
+    corpus.extend(corpus_of("Contoso.Listed", &["1.0.0"]));
+    let mock = start_mock(corpus).await;
+    mock.set_registration(
+        "contoso.registered",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "1.0.0", "count": 1,
+            "items": [ { "catalogEntry": {
+                "id": "Contoso.Registered", "version": "1.0.0", "listed": true
+            } } ]
+        } ] }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert!(px
+        .resolve_nupkg(&repo, "contoso.downloaded", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    px.registration(&repo, "contoso.registered").await.unwrap();
+    px.list_versions(&repo, "contoso.listed").await.unwrap();
+
+    let params = forge_core::repo::SearchParams {
+        q: "contoso".into(),
+        skip: 0,
+        take: 20,
+        prerelease: true,
+        include_semver2: true,
+    };
+    let ids: Vec<String> = px
+        .search(&repo, &params)
+        .await
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|h| h.original_id)
+        .collect();
+    // Known neither way: the lowercased id, as before.
+    assert_eq!(
+        ids,
+        ["Contoso.Downloaded", "contoso.listed", "Contoso.Registered"]
+    );
+}
+
+/// The package delay quarantines new releases: a version the upstream
+/// published long ago is served at its first sighting (every version of a
+/// package the proxy has not served before, all of them on a fresh install),
+/// while a recent release waits out the delay. Only a listed version's
+/// plausible publish time counts: nuget.org dates unlisted versions 1900.
+#[tokio::test]
+async fn the_package_delay_counts_from_the_upstream_publish_time() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of(
+        "Contoso.Lib",
+        &["1.0.0", "2.0.0", "3.0.0", "4.0.0"],
+    ))
+    .await;
+    let five_minutes_ago = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    mock.set_registration(
+        "contoso.lib",
+        serde_json::json!({ "count": 1, "items": [ {
+            "lower": "1.0.0", "upper": "4.0.0", "count": 4,
+            "items": [
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "1.0.0", "listed": true,
+                                    "published": "2020-02-03T04:05:06+00:00" } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "2.0.0", "listed": true,
+                                    "published": five_minutes_ago } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "3.0.0", "listed": false,
+                                    "published": "1900-01-01T00:00:00+00:00" } },
+                { "catalogEntry": { "id": "Contoso.Lib", "version": "4.0.0", "listed": true,
+                                    "published": tomorrow } }
+            ]
+        } ] }),
+    );
+    // A one-hour delay.
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"],
+        "only the old release is out of quarantine"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Contoso.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    for version in ["2.0.0", "3.0.0", "4.0.0"] {
+        assert!(
+            px.resolve_nupkg(&repo, "Contoso.Lib", version)
+                .await
+                .unwrap()
+                .is_none(),
+            "{version} is still inside the delay"
+        );
+    }
+
+    // The recent release clears the delay an hour after it was published,
+    // the others an hour after their first sighting.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = first_seen_at - interval '56 minutes' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1)",
+    )
+    .bind(&repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0", "2.0.0"]
+    );
 }
 
 /// M11: without an upstream registration the flat-container view is served

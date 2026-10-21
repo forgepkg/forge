@@ -241,6 +241,97 @@ pub async fn prune_unconfirmed(
     Ok(result.rows_affected())
 }
 
+/// Record the upstream casing of package id `name` (`original_id`, as its
+/// registration names it) on its version rows. Writes only rows that hold
+/// another value. Returns how many rows changed.
+pub async fn record_original_id(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    original_id: &str,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET original_id = $3
+        WHERE repository_id = $1 AND name = $2 AND version <> '*'
+          AND original_id IS DISTINCT FROM $3
+        "#,
+        repository_id,
+        name,
+        original_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Move the package-delay clock of confirmed `versions` of `name` back to
+/// when the upstream published them (`published`, pairwise):
+/// `first_seen_at` becomes the earlier of the two. Returns how many rows
+/// changed.
+pub async fn backdate_first_seen(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+    published: &[chrono::DateTime<chrono::Utc>],
+) -> sqlx::Result<u64> {
+    if versions.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version p
+        SET first_seen_at = u.published
+        FROM unnest($3::text[], $4::timestamptz[]) AS u(version, published)
+        WHERE p.repository_id = $1 AND p.name = $2 AND p.version = u.version
+          AND p.confirmed AND u.published < p.first_seen_at
+        "#,
+        repository_id,
+        name,
+        versions,
+        published,
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// The id casing proxy search shows for each of `names` (lowercased ids):
+/// a downloaded version's manifest id (`component.original_id`, the newest
+/// one), else the casing recorded from the upstream registration. Names
+/// without either are left out.
+pub async fn original_ids(
+    pool: &PgPool,
+    repository_id: i64,
+    names: &[String],
+) -> sqlx::Result<Vec<(String, String)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT n.name AS "name!",
+               coalesce(
+                   (SELECT c.original_id FROM component c
+                    WHERE c.repository_id = $1 AND c.name = n.name
+                    ORDER BY c.created_at DESC, c.id DESC LIMIT 1),
+                   (SELECT p.original_id FROM proxy_cached_version p
+                    WHERE p.repository_id = $1 AND p.name = n.name
+                      AND p.original_id IS NOT NULL
+                    LIMIT 1)
+               ) AS "original_id?"
+        FROM unnest($2::text[]) AS n(name)
+        "#,
+        repository_id,
+        names,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| Some((r.name, r.original_id?)))
+        .collect())
+}
+
 /// Lock every cached-version row of a repository (`FOR UPDATE`, in id order),
 /// waiting for an in-flight first download or cache eviction that holds one.
 /// A repository delete takes these **before** the repository row: those
