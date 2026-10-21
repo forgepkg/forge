@@ -66,9 +66,10 @@ docker push forge.example.com/docker-hosted/team/app:1.3
   users of an existing Nexus or LDAP sign in with their upstream password).
   The password goes to the token endpoint only; the registry itself sees the
   short-lived token.
-- **CI workloads** with a workload-identity realm pass their OIDC token as
-  the password ([trusted publishing](trusted-publishing.md)); their pushes
-  are recorded in the trusted-publishing ledger.
+- **CI workloads** with a workload-identity realm pass their OIDC token, or
+  the workload key it was exchanged for, as the password with the username
+  `oidc` ([trusted publishing](trusted-publishing.md)); their pushes and
+  deletes are recorded in the trusted-publishing ledger.
 - **Anonymous pulls** work for repositories that allow anonymous read (with
   `auth.anonymous_mode`): clients get an anonymous token without logging in.
 - A browser session never pushes, even an administrator's.
@@ -77,7 +78,10 @@ A registry token grants only what the caller may do when it is issued:
 `pull` needs `read` on the repository, `push` needs `write`, and `delete`
 needs `delete`; content selectors match image names (`team/*`). Every
 request is authorized again against the current permissions, and the user
-and API token behind a registry token must still be active. Registry tokens
+and API token behind a registry token must still be active; a workload's
+realm must still be enabled with the configuration it was verified under,
+and the workload key it came from must not have ended (checked at least
+every 10 seconds). Registry tokens
 are accepted under `/v2` only.
 
 Registry tokens are signed with `docker.token_secret` when set, otherwise

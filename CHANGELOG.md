@@ -159,7 +159,8 @@ limitations still apply, except where an entry below says otherwise.
   (`forge_wif.…`). Each token is redeemed once (its `jti` is required), the
   key lives for the realm's new `api_key_ttl_seconds` (default an hour)
   whatever the token's lifetime, it authorizes and is audited as the
-  token's workload, and any edit or disabling of the realm revokes its keys.
+  token's workload, and any edit, disabling or deletion of the realm
+  revokes its keys for good.
   `dotnet nuget push --source <feed>/v3/<repo>/package --no-service-endpoint
   --api-key <key>` publishes with the key alone; restore takes it as the
   Basic password of the username `oidc`.
@@ -302,7 +303,9 @@ limitations still apply, except where an entry below says otherwise.
 - Format plugins receive no request bodies other than the published
   package (which must be the whole body or one multipart part), accept only
   Basic credentials, and treat a version with a `-` as a prerelease; a
-  response of a plugin may load at most 2,048 query answers. Their proxies
+  response of a plugin may load at most 2,048 query answers. Helm refuses a
+  `Chart.yaml` or `index.yaml` whose YAML aliases would add more than
+  100,000 nodes, or that nests deeper than 64 levels. Their proxies
   read the upstream with plain GETs of whole documents (Basic credentials
   only, no token exchange).
 - A docker proxy downloads a blob completely and verifies it before it

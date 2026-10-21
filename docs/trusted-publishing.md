@@ -116,11 +116,14 @@ Content-Type: application/json
   digests and its `iat` in `trusted_publish_audit`.
 - **Revocation:** a key is honoured only while its realm is enabled with the
   very configuration it was issued under. Editing anything in the realm
-  (rules, audiences, lifetimes) or disabling or deleting it revokes all of its
-  outstanding keys on the next request; deleting the role leaves the key
-  without rights. Forge stores only SHA-256 digests of the key, subject and
-  `jti` (table `workload_api_key`), and the auth reaper deletes a row once
-  both the key and the token have expired.
+  (rules, audiences, lifetimes, its name) or disabling or deleting it revokes
+  all of its outstanding keys on the next request, for good: enabling the
+  realm again or reverting the edit does not bring them back. Deleting the
+  role leaves the key without rights. A registry token `docker login -u oidc`
+  got with a key stops working within 10 seconds of the same changes. Forge
+  stores only SHA-256 digests of the key, subject and `jti` (table
+  `workload_api_key`), and the auth reaper deletes a row once both the key and
+  the token have expired.
 - A key starts with `forge_wif.`, which no user API token can (user tokens
   are URL-safe base64, without a dot). Secret scanners can match
   `forge_wif\.[A-Za-z0-9_-]{43}`.
@@ -427,4 +430,4 @@ metadata according to the configured anonymous policy.
   publishing; a key outlives the job only up to `api_key_ttl_seconds`, so
   lower it when your jobs are short.
 - To revoke every outstanding workload key of a realm at once, edit or disable
-  the realm.
+  the realm; the keys stay revoked when you enable it again.
