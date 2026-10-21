@@ -27,7 +27,7 @@ pub mod bindings {
 
 crate::__wit_conversions!(crate::component::bindings);
 
-use bindings::exports::forge::format::{format, protocol};
+use bindings::exports::forge::format::{format, protocol, upstream};
 use bindings::forge::format::package_source::PackageReader;
 use bindings::forge::format::types;
 
@@ -141,5 +141,19 @@ impl<T: Exported> protocol::Guest for T {
     ) -> protocol::Rendered {
         let data: Vec<crate::Loaded> = data.into_iter().map(Into::into).collect();
         T::plugin().render(&repo.into(), &req.into(), &data).into()
+    }
+}
+
+impl<T: Exported> upstream::Guest for T {
+    fn upstream(
+        remote: upstream::Remote,
+        op: upstream::UpstreamOp,
+        fetched: Vec<upstream::FetchResult>,
+    ) -> Result<upstream::UpstreamStep, types::FormatError> {
+        let fetched: Vec<crate::FetchResult> = fetched.into_iter().map(Into::into).collect();
+        T::plugin()
+            .upstream(&remote.into(), &op.into(), &fetched)
+            .map(Into::into)
+            .map_err(Into::into)
     }
 }

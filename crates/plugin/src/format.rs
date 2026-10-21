@@ -8,51 +8,26 @@ use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload}
 use forge_core::format::{Format, ReadSeek};
 use forge_plugin_api::{self as api, FormatPlugin};
 
-use crate::manifest::{Assets, Upstream};
-use crate::upstream::{NugetV3, UpstreamManifests};
+use crate::manifest::Assets;
 use crate::Plugin;
 
 /// A format plugin, built in or WebAssembly, as a [`Format`]: what the
-/// hosted write path, the read ops and retention work with.
+/// hosted write path, the read ops, the proxy read path and retention work
+/// with.
 pub struct PluginFormat {
     id: &'static str,
     plugin: Arc<dyn FormatPlugin>,
     assets: Assets,
-    /// What a proxy of the format needs of its manifests
-    /// ([`crate::upstream`]).
-    upstream: Option<Arc<dyn UpstreamManifests>>,
 }
 
 impl PluginFormat {
-    /// Adapt `plugin`, with the upstream protocol its `plugin.toml` names.
+    /// Adapt `plugin`.
     pub fn new(plugin: &Plugin) -> Self {
-        let upstream: Option<Arc<dyn UpstreamManifests>> = match plugin.manifest().proxy {
-            Some(Upstream::NugetV3) => Some(Arc::new(NugetV3::default())),
-            None => None,
-        };
         PluginFormat {
             id: plugin.id(),
             plugin: plugin.implementation().clone(),
             assets: plugin.manifest().assets.clone(),
-            upstream,
         }
-    }
-
-    /// NuGet, the built-in plugin of `plugins/nuget`, reading archives and
-    /// upstream manifests under `limits`.
-    pub fn nuget(limits: forge_format_nuget::NupkgLimits) -> Self {
-        let plugin = Plugin::builtin(
-            forge_format_nuget::PLUGIN_TOML,
-            forge_format_nuget::Nuget::with_limits(limits),
-        )
-        .expect("plugins/nuget/plugin.toml is valid");
-        PluginFormat::new(&plugin).with_upstream(Arc::new(NugetV3::new(limits)))
-    }
-
-    /// Read upstream manifests with `upstream` instead.
-    pub fn with_upstream(mut self, upstream: Arc<dyn UpstreamManifests>) -> Self {
-        self.upstream = Some(upstream);
-        self
     }
 }
 
@@ -148,29 +123,15 @@ impl Format for PluginFormat {
         self.plugin.validate_id(id).map_err(format_error)
     }
 
-    fn search_hit_summary(&self, hit: &serde_json::Value) -> Option<serde_json::Value> {
-        self.upstream.as_ref()?.search_hit_summary(hit)
-    }
-
-    fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
-        match &self.upstream {
-            Some(upstream) => upstream.manifest_identity(manifest),
-            None => Err(FormatError::MalformedManifest(format!(
-                "{} manifests cannot be verified",
-                self.id
-            ))),
-        }
-    }
-
-    fn synthesize_manifest(
+    fn upstream(
         &self,
-        id: &str,
-        version: &str,
-        deps: &[DependencyGroup],
-    ) -> Option<Vec<u8>> {
-        self.upstream
-            .as_ref()?
-            .synthesize_manifest(id, version, deps)
+        remote: &api::Remote,
+        op: &api::UpstreamOp,
+        fetched: &[api::FetchResult],
+    ) -> Result<api::UpstreamStep, FormatError> {
+        self.plugin
+            .upstream(remote, op, fetched)
+            .map_err(format_error)
     }
 
     fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {

@@ -453,4 +453,27 @@ fn the_component_answers_like_the_builtin_plugin() {
         wasm.render(&repo(), &req, &data),
         native.render(&repo(), &req, &data)
     );
+
+    // The upstream side, through the component's `upstream` export.
+    let remote = forge_plugin::api::Remote {
+        url: "https://charts.example".into(),
+        index: None,
+    };
+    let fetched = [forge_plugin::api::FetchResult {
+        fetch: forge_plugin::api::Fetch {
+            url: "https://charts.example/index.yaml".into(),
+            freshness: forge_plugin::api::Freshness::Metadata,
+        },
+        outcome: forge_plugin::api::Fetched::Found(b"apiVersion: v1".to_vec()),
+    }];
+    for op in [
+        forge_plugin::api::UpstreamOp::Index,
+        forge_plugin::api::UpstreamOp::Versions("nginx".into()),
+    ] {
+        assert_eq!(
+            wasm.upstream(&remote, &op, &fetched),
+            native.upstream(&remote, &op, &fetched),
+            "{op:?}"
+        );
+    }
 }

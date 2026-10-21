@@ -106,18 +106,15 @@ pub struct FormatRegistry {
     /// Every format's plugin (built in or WebAssembly), by format id: its
     /// client protocol.
     plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
-    /// How `.nupkg` archives and upstream `.nuspec`s are read (`[nuget]`).
-    nuget_limits: forge_format_nuget::NupkgLimits,
 }
 
 impl FormatRegistry {
     /// A registry holding the built-in format plugins, NuGet reading
-    /// archives under `nuget_limits`.
+    /// archives and upstream manifests under `nuget_limits`.
     pub fn new(nuget_limits: forge_format_nuget::NupkgLimits) -> Self {
         let mut registry = FormatRegistry {
             formats: BTreeMap::new(),
             plugins: BTreeMap::new(),
-            nuget_limits,
         };
         for plugin in crate::plugins::builtin(nuget_limits) {
             registry = registry
@@ -148,13 +145,7 @@ impl FormatRegistry {
     /// Add a format plugin: its [`Format`] and its client protocol. Its id
     /// must be free: a WebAssembly plugin never replaces a built-in format.
     pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
-        let mut format = forge_plugin::PluginFormat::new(&plugin);
-        if plugin.manifest().proxy == Some(forge_plugin::manifest::Upstream::NugetV3) {
-            format = format.with_upstream(Arc::new(forge_plugin::upstream::NugetV3::new(
-                self.nuget_limits,
-            )));
-        }
-        let format = Arc::new(format);
+        let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
         self = self.with_format(format)?;
         self.plugins.insert(plugin.id().to_string(), plugin);
         Ok(self)

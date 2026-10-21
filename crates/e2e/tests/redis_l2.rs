@@ -133,7 +133,7 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
 /// id/version check and then stay cached for good).
 #[tokio::test]
 async fn proxy_upstream_index_is_not_read_from_redis() {
-    use forge_core::repo::proxy::{UpstreamResources, NS_UPSTREAM_INDEX};
+    use forge_core::repo::proxy::NS_UPSTREAM_INDEX;
     use forge_e2e::{make_nupkg_with_desc, MockUpstream, UpstreamPackage};
 
     let genuine_bytes = make_nupkg_with_desc("Contoso.Lib", "1.0.0", "genuine");
@@ -171,16 +171,17 @@ async fn proxy_upstream_index_is_not_read_from_redis() {
     let key = format!("{}/{}/{}", repo.name, repo.id, genuine.index_url());
     a.state
         .cache
-        .get_or_try_insert_with::<UpstreamResources, _, _, std::convert::Infallible>(
+        .get_or_try_insert_with::<String, _, _, std::convert::Infallible>(
             NS_UPSTREAM_INDEX,
             &key,
             Duration::from_secs(600),
             || async {
-                Ok(UpstreamResources {
-                    package_base_address: Some(format!("{}/flat/", forger.base())),
-                    registrations_base_url: None,
-                    search_query_service: None,
+                Ok(serde_json::json!({
+                    "package_base_address": format!("{}/flat/", forger.base()),
+                    "registrations_base_url": null,
+                    "search_query_service": null,
                 })
+                .to_string())
             },
         )
         .await

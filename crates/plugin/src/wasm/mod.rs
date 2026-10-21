@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use forge_plugin_api::{
-    Action, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Rendered, Repository,
-    Request, Response,
+    Action, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Remote,
+    Rendered, Repository, Request, Response, UpstreamOp, UpstreamStep,
 };
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker};
@@ -499,6 +499,26 @@ impl FormatPlugin for WasmPlugin {
             Err(_) => Rendered::Respond(failed()),
         }
     }
+
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        let remote = remote.clone().into();
+        let op = op.clone().into();
+        let fetched: Vec<bindings::exports::forge::format::upstream::FetchResult> =
+            fetched.iter().cloned().map(Into::into).collect();
+        self.call(Pool::Slow, "upstream", move |store, plugin| {
+            plugin
+                .forge_format_upstream()
+                .call_upstream(store, &remote, &op, &fetched)
+        })
+        .map_err(internal)?
+        .map(Into::into)
+        .map_err(Into::into)
+    }
 }
 
 /// A readable reason for a failed call.
@@ -551,7 +571,7 @@ mod tests {
             id = "demo"
             name = "Demo"
             version = "0.1.0"
-            api = "0.2.0"
+            api = "0.3.0"
             component = "demo.wasm"
             "#,
         )

@@ -27,7 +27,12 @@ use tokio::sync::Mutex;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    forge_plugin::PluginFormat::nuget(Default::default())
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
 }
 
 const MAX_UPLOAD: u64 = 64 * 1024 * 1024;

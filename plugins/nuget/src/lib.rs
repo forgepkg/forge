@@ -11,6 +11,9 @@
 //! * `PUT /package` — push; `DELETE /package/{id}/{version}` — unlist;
 //!   `POST /package/{id}/{version}` — relist (hosted repositories).
 //!
+//! Proxy repositories mirror another V3 feed ([`upstream`]): its service
+//! index, flat container, registration and search, read through the host.
+//!
 //! Ids are matched case-insensitively (`ToLowerInvariant`); versions are
 //! NuGet versions, normalized (`1.0` → `1.0.0`).
 //!
@@ -21,13 +24,14 @@
 pub mod model;
 pub mod nuspec;
 mod protocol;
+pub mod upstream;
 pub mod version;
 
 use std::cmp::Ordering;
 
 use forge_plugin_api::{
-    Action, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Rendered, Repository,
-    Request,
+    Action, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Remote,
+    Rendered, Repository, Request, UpstreamOp, UpstreamStep,
 };
 
 pub use model::NupkgLimits;
@@ -82,6 +86,15 @@ impl FormatPlugin for Nuget {
 
     fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Rendered {
         protocol::render(repo, req, data)
+    }
+
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        upstream::step(remote, op, fetched, &self.limits)
     }
 }
 

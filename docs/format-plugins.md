@@ -2,11 +2,11 @@
 
 Forge serves the Docker / OCI registry natively ([docker.md](docker.md)).
 Every package format comes from a **format plugin**: a Rust crate that
-teaches Forge the format's rules and its client protocol by implementing one
-trait,
+teaches Forge the format's rules, its client protocol and, for proxies, how
+to read an upstream, by implementing one trait,
 [`FormatPlugin`](../crates/plugin-api/src/lib.rs). The repository machinery
 stays Forge's own. That covers storage, metadata, authentication, RBAC and
-package selectors, hosted and group repositories, retention, and the
+package selectors, hosted, proxy and group repositories, retention, and the
 streaming of package bytes.
 
 A plugin runs one of two ways, and the server cannot tell them apart:
@@ -20,7 +20,7 @@ A plugin runs one of two ways, and the server cannot tell them apart:
   run in a sandbox. This is how formats that are not part of Forge are added
   without rebuilding it.
 
-> **Status: preview.** The plugin contract is `forge:format@0.2.0`. It may
+> **Status: preview.** The plugin contract is `forge:format@0.3.0`. It may
 > change before 1.x of the contract; a plugin declares the contract version it
 > was built for, and the server refuses one it does not implement.
 
@@ -28,6 +28,7 @@ A plugin runs one of two ways, and the server cannot tell them apart:
 
 - [One contract, two ways to run it](#one-contract-two-ways-to-run-it)
 - [How it fits together](#how-it-fits-together)
+- [Proxy repositories](#proxy-repositories)
 - [Using a plugin](#using-a-plugin)
 - [Loading WebAssembly plugins](#loading-webassembly-plugins)
 - [Security model](#security-model)
@@ -47,9 +48,10 @@ plugins/helm/
 
 plugins/nuget/
 ├── Cargo.toml
-├── plugin.toml    # mount "/v3", kinds hosted/proxy/group, [proxy] upstream
+├── plugin.toml    # mount "/v3", kinds hosted/proxy/group
 ├── src/lib.rs     # impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
+├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
 └── tests/         # the protocol against canned answers (forge-plugin-api `testing`)
 ```
 
@@ -78,6 +80,7 @@ runs Helm both ways and checks that every answer matches.
 | Reads | Runs the queries the plugin asks for through the repository read path (hosted, proxy or group). Package selectors, group membership, prefer-hosted and reserved prefixes all apply | `handle` decides what a request is; `render` turns the loaded data into the response body |
 | Downloads | Streams the blob from S3, counts the download, answers `HEAD` without touching S3, and a single `Range` when the local blob cache is on | Names the version (`download`) |
 | Unlist, relist, delete | Hosted write path, with the repository's permissions and selectors; a package outside the caller's selector answers 404, like an unknown one | Names the version and the success response |
+| Proxies | Sends every upstream request (credentials only to the upstream's origin, bounded, cached), downloads and verifies packages, keeps the package delay, the not-found markers and the offline mode | `upstream`: which documents an operation needs, and what they say ([Proxy repositories](#proxy-repositories)) |
 | Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of plugin repositories just works |
 | Retention | Evaluates policies, ordering versions with the plugin's `compare_versions` | Nothing more |
 
@@ -135,6 +138,33 @@ host asks `manifest_summary` of its stored manifest). The web UI's package detai
 if present: `description`, and `dependency_groups` (the same shape as
 NuGet's).
 
+## Proxy repositories
+
+A plugin that lists `proxy` among its kinds implements the upstream side of
+the contract, `upstream`. The host keeps everything a proxy is, whatever the
+format: the `proxy_cached_version` rows, the package delay, the not-found
+markers and their TTL, the download singleflight, the content-addressed
+store, credentials (decrypted per request, sent only to the origin of the
+repository's `remote_url`), the SSRF and cloud-metadata guards, the size and
+time bounds of every request, and the offline mode. What the plugin knows is
+which documents an operation needs and what they say:
+
+| Operation | The plugin answers |
+| --- | --- |
+| `index` | A JSON object of its own making, from `remote_url` (NuGet: the service index's resources). The host persists it, refreshes it once per metadata TTL, falls back to the last good one when a refresh fails, and hands it to every other operation |
+| `versions(id)` | The versions the upstream lists, or none when it does not know the package |
+| `package(id, version)` | The package's URL. The host downloads it, checks it with `parse_package` against the version asked for, and stores it |
+| `manifest(id, version)` | The manifest, verified to be that version's, without downloading the package |
+| `metadata(versions)`, `dating(versions)` | Per version: listing state, publish time, a manifest summary for a version not downloaded yet, and (`dating`) when it was created upstream, which the package delay counts from |
+| `search(query)` | A page of the upstream's search results |
+
+Each operation is a conversation: `upstream` either answers or asks for
+GETs (`fetch`), and is called again with every fetch so far and how it went
+(a body, a 404, or a failure), so a plugin keeps no state between calls. A
+fetch says how long its document may be reused: for the repository's
+metadata TTL, or for a day when it never changes once published. One
+conversation gets at most 4 rounds and 256 fetches, 4 at a time.
+
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
@@ -142,9 +172,8 @@ of: the built-in plugins (`builtin: true`; NuGet first, then Helm), Docker,
 and the loaded WebAssembly plugins (with the `sha256` of their component),
 each with the repository kinds it supports and where its repositories are
 served. The web UI's *New repository* form offers them. Plugins serve
-**hosted** and **group** repositories; a plugin also serves **proxies** when
-its `plugin.toml` names an upstream protocol the host implements, which
-today is NuGet's (`nuget-v3`). Docker has proxies of its own.
+**hosted** and **group** repositories, and **proxies** when they implement
+the upstream side (NuGet does). Docker has proxies of its own.
 
 Helm is built in, so a Helm repository needs no setup beyond creating it:
 
@@ -300,6 +329,7 @@ impl FormatPlugin for MyFormat {
     // identity: canonical_id, validate_id, normalize_version, compare_versions
     // packages: parse_package, manifest_summary
     // protocol: handle, render
+    // proxies (optional): upstream
 }
 ```
 
@@ -315,13 +345,11 @@ component = ["forge-plugin-api/component"]
 id = "example"                 # the format id repositories are created with
 name = "Example packages"
 version = "0.1.0"
-api = "0.2.0"                  # the forge:format contract
+api = "0.3.0"                  # the forge:format contract
 component = "forge_format_example.wasm"   # the component build's file
 mount = "/repository"          # optional: served at {mount}/{repo}/…
 kinds = ["hosted", "group"]    # optional: the repository kinds it serves
-
-[proxy]                        # optional: serve proxies through a host-side
-upstream = "nuget-v3"          # upstream protocol (adds "proxy" to `kinds`)
+                               # ("proxy" too when it implements `upstream`)
 
 [assets]                       # optional: how a version's files are stored
 package = "package"
@@ -335,8 +363,8 @@ timeout_ms = 2000
 
 A mount is `/` and one lowercase word; the server's own paths (`/admin`,
 `/auth`, `/browse`, `/v2`, the web UI's pages, …) are reserved, and plugins
-may share a mount. `proxy` is among a plugin's kinds only with a `[proxy]`
-upstream.
+may share a mount. List `proxy` among the kinds only when the plugin
+implements `upstream`.
 
 Then either:
 
@@ -363,7 +391,8 @@ A few rules hold either way:
 - **Test the protocol without a server.** `forge-plugin-api`'s `testing`
   feature runs `handle` and `render` against canned answers to the queries
   (`testing::serve`), as [`plugins/nuget/tests/protocol.rs`](../plugins/nuget/tests/protocol.rs)
-  does.
+  does; `testing::converse` runs `upstream` against canned upstream
+  documents ([`plugins/nuget/tests/upstream.rs`](../plugins/nuget/tests/upstream.rs)).
 - **Test both ways.** The crate's unit tests run with the workspace.
   [`crates/plugin/tests/component.rs`](../crates/plugin/tests/component.rs)
   loads the component and compares it with the built-in crate, and
@@ -381,12 +410,11 @@ with no capabilities.
 These are the current limits of the preview, roughly in the order we expect
 to lift them:
 
-- **Proxies only through a host-side upstream protocol.** The host
-  implements NuGet V3's upstream side (`nuget-v3`); a plugin cannot yet bring
-  its own. That needs format hooks for the upstream side (URLs for a version
-  listing and an artifact, parsing the listing, verifying the fetched
-  artifact). The host keeps the generic parts: delay, negative cache,
-  singleflight, credential scoping and the SSRF guard.
+- **Proxies fetch whole documents with GET.** An upstream request carries
+  no headers but the repository's Basic credentials, and its body is read
+  whole up to `proxy.max_metadata_bytes` before the plugin sees it. An
+  upstream that needs a token exchange (Docker Hub's) or streams a listing
+  too large to hold needs more from the contract.
 - **Requests carry no body into the plugin.** A publish streams its body
   straight into the store, and other requests' bodies are not passed on.
   npm's login and audit endpoints, for example, need a small body.
@@ -416,15 +444,16 @@ needed from the contract are general ones: a mount, its own asset names,
 ranged downloads, paged registrations (`packages-of`), the search options of
 the V3 search service, and publishing the first file of a multipart body.
 
-Two parts stay on the host side for now:
+Its proxies read another V3 feed through the plugin's upstream side
+([`src/upstream.rs`](../plugins/nuget/src/upstream.rs)): the service
+index's resources, the flat container, the registration (bounded to the
+newest pages a request needs), catalog entries for the package delay of
+unlisted versions, and the search service.
 
-- **The upstream protocol.** A NuGet proxy fetches, caches and verifies
-  through the host's `nuget-v3` upstream, which `plugin.toml` names with
-  `[proxy] upstream`. Moving it into the plugin is the next step of the
-  roadmap above.
-- **No component build.** The crate reads packages with `zip`, whose
-  `typed-path` dependency needs a nightly compiler for `wasm32-wasip2`, so
-  NuGet runs built in only (its `plugin.toml` names no `component`).
+One part is missing: **a component build.** The crate reads packages with
+`zip`, whose `typed-path` dependency needs a nightly compiler for
+`wasm32-wasip2`, so NuGet runs built in only (its `plugin.toml` names no
+`component`).
 
 ### Why Docker is not a plugin
 
@@ -462,7 +491,7 @@ contract:
 | Native formats | Handlers in the backend crate; the WASM contract is a separate, narrower interface | Built-in plugins are crates implementing the same contract a component exports; any of them also builds as a component |
 | Package bytes into the plugin | Whole artifact as `list<u8>` (uploads are read into memory) | A lent reader over the staged file; the plugin reads what it needs |
 | Data for a request | Every artifact row of the repository, on every request | Targeted queries, bounded per request |
-| Repository kinds | Hosted in practice (remote and virtual repositories see only their own rows) | Hosted, group, and proxy through the host's upstream protocol (NuGet's, for now) |
+| Repository kinds | Hosted in practice (remote and virtual repositories see only their own rows) | Hosted, group, and proxy: the plugin reads the upstream through the host |
 | Authorization of data | Repository visibility | Repository grants plus package selectors, group visibility and the dependency-confusion guards |
 | Uploads | A separate generic upload endpoint; the plugin validates and parses | The plugin routes the publish; the host streams it through the hosted write path |
 | Response headers | Passed through as the plugin sets them | Allowlist plus the feed's hardening headers |

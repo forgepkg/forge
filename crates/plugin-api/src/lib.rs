@@ -35,7 +35,7 @@ pub use types::*;
 
 /// The `forge:format` WIT package version this crate implements: what a
 /// plugin built against it declares as `api` in its `plugin.toml`.
-pub const API: &str = "0.2.0";
+pub const API: &str = "0.3.0";
 
 /// The `plugin.toml` of the crate this is expanded in: how a built-in plugin
 /// hands the server its id and name (`pub const PLUGIN_TOML: &str =
@@ -104,6 +104,28 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// The response to a request, from the data [`Self::handle`] (and earlier
     /// rounds of `render`) asked for — or more data to load.
     fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Rendered;
+
+    /// The upstream side of the format's proxy repositories: what to fetch
+    /// from `remote` for `op`, and what came of it. `fetched` holds every
+    /// fetch of earlier rounds with its result, so a plugin stays stateless.
+    ///
+    /// The host does the rest of what a proxy is: it sends every request
+    /// (credentials only to the upstream's own origin, bounded in size and
+    /// time, cached as [`Fetch::freshness`] says), downloads and verifies
+    /// packages, and keeps the package delay, the not-found markers and the
+    /// offline mode. Only a plugin whose `plugin.toml` lists the `proxy`
+    /// kind is asked; the default says so.
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        let _ = (remote, op, fetched);
+        Err(FormatError::Internal(
+            "this format has no proxy repositories".into(),
+        ))
+    }
 }
 
 /// Conversions between the types of this crate and the bindings of
@@ -122,6 +144,7 @@ macro_rules! __wit_conversions {
             use $($root)*::forge::format::types as t;
             use $($root)*::exports::forge::format::format as f;
             use $($root)*::exports::forge::format::protocol as p;
+            use $($root)*::exports::forge::format::upstream as u;
 
             $crate::__record!(t, Dependency { id: into, range: into });
             $crate::__record!(t, DependencyGroup { target: into, dependencies: vec });
@@ -210,6 +233,45 @@ macro_rules! __wit_conversions {
                 Delete: into,
             });
             $crate::__variant!(p, Rendered {} { Respond: into, Load: vec });
+            $crate::__record!(u, Remote { url: into, index: into });
+            $crate::__variant!(u, UpstreamOp { Index } {
+                Versions: into,
+                Package: into,
+                Manifest: into,
+                Metadata: into,
+                Dating: into,
+                Search: into,
+            });
+            $crate::__variant!(u, Freshness { Metadata, Immutable } {});
+            $crate::__record!(u, Fetch { url: into, freshness: into });
+            $crate::__variant!(u, Fetched { NotFound } { Found: into, Failed: into });
+            $crate::__record!(u, FetchResult { fetch: into, outcome: into });
+            $crate::__record!(u, VersionMetadata {
+                version: into,
+                original_id: into,
+                listed: into,
+                published: into,
+                created: into,
+                summary: into,
+            });
+            $crate::__record!(u, PackageMetadata { original_id: into, versions: vec });
+            $crate::__record!(u, UpstreamHit {
+                id: into,
+                versions: into,
+                summary: into,
+                total_downloads: into,
+            });
+            $crate::__record!(u, UpstreamSearch { total: into, hits: vec });
+            $crate::__variant!(u, UpstreamAnswer {} {
+                Index: into,
+                Versions: into,
+                Package: into,
+                Manifest: into,
+                Metadata: into,
+                Search: opt,
+                Failed: into,
+            });
+            $crate::__variant!(u, UpstreamStep {} { Fetch: vec, Done: into });
         };
     };
 }

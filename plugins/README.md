@@ -17,9 +17,9 @@ A plugin directory holds:
   (`component = ["forge-plugin-api/component"]`) unless it is built in only;
 - `plugin.toml`: the format id (also the directory's name), display name,
   version, the `forge:format` contract version it targets (`api`),
-  optionally its mount, repository kinds, `[proxy]` upstream and `[assets]`
-  names, and, for the component build, the component's file name and
-  optional `[limits]`;
+  optionally its mount, repository kinds (`proxy` when it implements
+  `upstream`) and `[assets]` names, and, for the component build, the
+  component's file name and optional `[limits]`;
 - `src/`: `impl FormatPlugin`, `pub const PLUGIN_TOML: &str =
   forge_plugin_api::plugin_toml!();`, and
   `#[cfg(feature = "component")] forge_plugin_api::export_component!(…);`.
