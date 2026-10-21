@@ -485,7 +485,10 @@ outbound upstream/issuer URLs are only restricted to http/https.)
 
 The integration/e2e suites use **testcontainers** — they start their own
 Postgres/versitygw/Redis automatically, so you only need Docker running (you do
-**not** need `cargo xtask up`).
+**not** need `cargo xtask up`). They pull these Docker Hub images through
+Google's mirror, `mirror.gcr.io` (as do the compose files and CI), which serves
+the same images without Docker Hub's pull rate limit; name a new one the same
+way (`mirror.gcr.io/library/<name>` for an official image).
 
 ```bash
 cargo xtask test    # unit + integration (cargo test --workspace)

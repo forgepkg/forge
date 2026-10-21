@@ -38,7 +38,7 @@ pub const ROOT_ACCESS: &str = "forge-e2e-root";
 /// versitygw's root secret key (CI-only credentials).
 pub const ROOT_SECRET: &str = "forge-e2e-root-secret";
 
-const IMAGE: &str = "versity/versitygw";
+const IMAGE: &str = "mirror.gcr.io/versity/versitygw";
 /// The standalone IAM service, and with it STS, first shipped in v1.8.0.
 const TAG: &str = "v1.9.0";
 const S3_PORT: u16 = 7070;

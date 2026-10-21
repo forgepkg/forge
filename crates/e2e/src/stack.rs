@@ -53,6 +53,7 @@ async fn pg_endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -80,7 +81,7 @@ async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
     }
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
@@ -110,6 +111,7 @@ async fn redis_url() -> &'static str {
         return u;
     }
     let container = Redis::default()
+        .with_name("mirror.gcr.io/library/redis")
         .start()
         .await
         .expect("start redis testcontainer (is Docker running?)");
