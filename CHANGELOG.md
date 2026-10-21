@@ -314,8 +314,10 @@ choice.
 - HTTP hardening: API responses (`/admin`, `/auth`, `/browse`) and feed
   responses to a request with credentials are `Cache-Control: private,
   no-store`, and feed responses carry `Vary: Authorization, Cookie,
-  X-NuGet-ApiKey`, so a shared cache can neither store a private package nor
-  serve one caller's answer to another; an https deployment sends HSTS. The
+  X-NuGet-ApiKey`, so a shared cache can neither store a package fetched
+  with credentials nor serve one caller's answer to another (for
+  `anonymous_mode = "allowlist"` see Known limitations); an https
+  deployment sends HSTS. The
   server now enforces a header-read timeout (`server.header_read_timeout_seconds`,
   default 150 s, counted from accept — `axum::serve` never armed hyper's, so a
   client trickling headers, or sending nothing at all, held a connection
@@ -857,6 +859,12 @@ choice.
   when a group mixes feeds with different writers. Owners claim only the
   ids they have: an id no owner has is still served by every member, so
   reserve the internal prefixes as well.
+- Under `anonymous_mode = "allowlist"`, anonymous feed responses carry no
+  `Cache-Control: no-store`, and whether one is served depends on the
+  client's address, which a cache does not key on. A shared cache in front
+  of Forge that stores responses without caching headers (Varnish's default
+  does) can serve a package an allowlisted client fetched to a client
+  outside the allowlist. Do not let such a cache store `/v3` responses.
 - While Redis is unreachable, an instance hears no invalidations from the
   others and converges by TTL (60 s for authorization).
 - Login lockouts and failure counts are per instance and lost on restart

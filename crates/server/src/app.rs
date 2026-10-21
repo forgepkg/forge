@@ -213,8 +213,12 @@ const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
 /// * feed responses (`/v3/...`) carry [`FEED_VARY`], and are `private,
-///   no-store` whenever the request presented credentials, so a private
-///   package is never stored by a shared cache or served to someone else;
+///   no-store` whenever the request presented credentials, so a package
+///   fetched with credentials is never stored by a shared cache or served to
+///   someone else. Anonymous responses carry no `Cache-Control`; under
+///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
+///   keep shared caches off `/v3`, since the allowlist decision is keyed on
+///   the client address, which no cache varies on;
 /// * with an `https` public URL every response carries HSTS.
 ///
 /// The SPA keeps its own cache headers (hashed assets are immutable).
