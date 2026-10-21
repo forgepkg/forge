@@ -2,7 +2,8 @@
 #
 # Isolated from the dev `docker-compose.yml` by a distinct project name
 # (`forge-web-e2e`, set via -p in harness.ts) and distinct host ports
-# (Postgres 55432, versitygw 57070) so running e2e never disturbs a dev stack.
+# (Postgres 25432, versitygw 27070; below the ephemeral port range, see
+# harness.ts) so running e2e never disturbs a dev stack.
 #
 # Mirrors the slice-1 testcontainers harness (crates/e2e/src/stack.rs): the same
 # Postgres 17 and versity/versitygw:v1.4.1 images, the same credentials shape.
@@ -14,7 +15,7 @@ services:
       POSTGRES_USER: forge
       POSTGRES_PASSWORD: forge
     ports:
-      - "55432:5432"
+      - "25432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forge -d forge"]
       interval: 2s
@@ -29,4 +30,4 @@ services:
     command:
       ["--port", ":7070", "--access", "test", "--secret", "test", "posix", "/tmp"]
     ports:
-      - "57070:7070"
+      - "27070:7070"

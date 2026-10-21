@@ -26,11 +26,15 @@ const webDir = path.resolve(here, '..')
 const COMPOSE_PROJECT = 'forge-web-e2e'
 const COMPOSE_FILE = path.join(here, 'docker-compose.e2e.yml')
 
-// Distinct host ports from the dev stack (5433 / 7070) so e2e never collides.
-const PG_PORT = 55432
-const S3_PORT = 57070
+// Distinct host ports from the dev stack (5433 / 8422) so e2e never collides.
+// All three stay below 32768, outside Linux's ephemeral port range
+// (32768-60999): a port in it can already be the local end of an outgoing
+// connection (the CI runner's own, a registry pull), and binding it then fails
+// with "address already in use".
+const PG_PORT = 25432
+const S3_PORT = 27070
 // The server under test listens here (distinct from dev :8421).
-const SERVER_PORT = 33000
+const SERVER_PORT = 28421
 
 // Host where the compose-published container ports are reachable. Defaults to
 // loopback (local + GitHub runners). On GitLab dind, published ports live on the
