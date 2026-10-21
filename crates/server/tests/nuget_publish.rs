@@ -183,7 +183,7 @@ async fn push_of_an_existing_version_is_409() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     assert_eq!(
         resp.text().await.unwrap(),
-        format!("package {} 1.0.0 already exists", id.to_lowercase())
+        format!("package {id} 1.0.0 already exists")
     );
 }
 
