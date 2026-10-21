@@ -1,9 +1,9 @@
 import { Badge } from '~/components/catalyst/badge'
 
 /**
- * Badge for a repository format (`nuget` | `docker`), with the format's
- * display name. Unknown formats fall back to their raw value in a neutral
- * style, like `RepoKindBadge`.
+ * Badge for a repository format (`nuget` | `docker` | `helm`), with the
+ * format's display name. Other formats (WebAssembly plugins) fall back to
+ * their raw id in a neutral style, like `RepoKindBadge`.
  */
 const FORMATS: Record<
   string,
@@ -11,9 +11,10 @@ const FORMATS: Record<
 > = {
   nuget: { label: 'NuGet', color: 'indigo' },
   docker: { label: 'Docker', color: 'cyan' },
+  helm: { label: 'Helm', color: 'sky' },
 }
 
-/** Display name of a repository format (`NuGet`, `Docker`). */
+/** Display name of a repository format (`NuGet`, `Docker`, `Helm`). */
 export function formatLabel(format: string): string {
   return FORMATS[format]?.label ?? format
 }

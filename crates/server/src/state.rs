@@ -160,6 +160,22 @@ impl FormatRegistry {
         Ok(self)
     }
 
+    /// Refuse an upload limit (`plugins.max_upload_bytes`) for a format that
+    /// has no plugin here: a misspelled id would otherwise leave that
+    /// format at `server.max_upload_bytes` unnoticed.
+    pub fn check_upload_limits(&self, limits: &BTreeMap<String, u64>) -> Result<(), String> {
+        match limits.keys().find(|id| !self.plugins.contains_key(*id)) {
+            Some(id) => {
+                let installed: Vec<&str> = self.plugins.keys().map(String::as_str).collect();
+                Err(format!(
+                    "plugins.max_upload_bytes.{id}: no format {id:?} is installed \
+                     (plugin formats: {installed:?})"
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
     /// The format with id `id`, if installed.
     pub fn get(&self, id: &str) -> Option<Arc<dyn Format>> {
         self.formats.get(id).cloned()
@@ -362,12 +378,14 @@ impl AppState {
 
     /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
     /// next to the built-in formats. A plugin whose format id is taken
-    /// (a built-in plugin, or another plugin) is an error.
+    /// (a built-in plugin, or another plugin) is an error, and so is an upload
+    /// limit (`plugins.max_upload_bytes`) for a format that is not installed.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
         let mut registry = FormatRegistry::new(self.config.nuget.limits());
         for plugin in plugins {
             registry = registry.with_plugin(plugin)?;
         }
+        registry.check_upload_limits(&self.config.plugins.max_upload_bytes)?;
         self.formats = Arc::new(registry);
         Ok(self)
     }
@@ -610,6 +628,20 @@ mod tests {
         assert_eq!(registry.kinds("helm"), Some(vec!["hosted", "group"]));
         assert_eq!(registry.kinds("npm"), None);
         assert!(!registry.is_installed("npm"));
+    }
+
+    #[test]
+    fn upload_limits_name_installed_plugin_formats() {
+        let registry = FormatRegistry::new(Default::default());
+        let limits = |id: &str| BTreeMap::from([(id.to_string(), 4096u64)]);
+        assert!(registry.check_upload_limits(&BTreeMap::new()).is_ok());
+        assert!(registry.check_upload_limits(&limits("helm")).is_ok());
+        assert!(registry.check_upload_limits(&limits("nuget")).is_ok());
+        let err = registry
+            .check_upload_limits(&limits("npm"))
+            .expect_err("not installed");
+        assert!(err.contains("plugins.max_upload_bytes.npm"), "{err}");
+        assert!(err.contains("helm"), "{err}");
     }
 
     #[test]

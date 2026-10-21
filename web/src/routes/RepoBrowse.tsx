@@ -23,6 +23,7 @@ import { Breadcrumbs } from '~/components/Breadcrumbs'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { RepoFormatBadge } from '~/components/RepoFormatBadge'
 import { DockerConnect } from '~/components/DockerConnect'
+import { PackageConnect } from '~/components/PackageConnect'
 import { ChevronIcon, FolderIcon } from './Browse'
 
 /**
@@ -71,8 +72,9 @@ export const Route = createFileRoute('/_app/repos/$repo')({
 
 /**
  * One repository's contents: the second level of the folder view, with the
- * per-repo search box — packages for a NuGet repository, images (plus the
- * `docker login` / `pull` snippets) for a docker one. The query is debounced
+ * per-repo search box — packages (plus the client snippets of the format:
+ * `dotnet nuget`, `helm repo add`, or the URL) for a package repository,
+ * images (plus the `docker login` / `pull` snippets) for a docker one. The query is debounced
  * into the URL search params (so it is shareable and survives reload) and fed
  * to `usePackageSearch` / `useImageSearch` scoped to this repository, which
  * keep the previous page visible while the next loads.
@@ -197,6 +199,14 @@ function RepoBrowse() {
             skip={skip}
             onSkipChange={setSkip}
           />
+          {info?.url && (
+            <PackageConnect
+              format={info.format}
+              repo={repo}
+              url={info.url}
+              canPush={info.kind === 'hosted'}
+            />
+          )}
         </>
       )}
     </section>

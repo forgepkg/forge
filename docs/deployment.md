@@ -388,8 +388,9 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
 - **Temp space.** Pushes and first-time proxy downloads are staged in
   `server.staging_dir` (default `forge-staging` in the system temp
   directory). All staged files of an instance share `server.max_staging_bytes`
-  (default four times the larger of `server.max_upload_bytes` and
-  `proxy.max_package_bytes`, so 4 GiB; `0` removes the limit); past it,
+  (default four times the largest item: `server.max_upload_bytes`, a
+  format's own `plugins.max_upload_bytes`, `proxy.max_package_bytes` or
+  `docker.max_blob_bytes`, so 4 GiB; `0` removes the limit); past it,
   pushes and downloads are answered `503` with `Retry-After` until space
   frees up. Size the volume above that budget. Each process stages in a
   locked subdirectory of its own, and the files a killed process left are

@@ -238,11 +238,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             RepoKind::Proxy => protocol::RepositoryKind::Proxy,
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
-        base_url: format!(
-            "{}{mount}/{}",
-            state.config.public_base_url().trim_end_matches('/'),
-            repo.name
-        ),
+        base_url: repository_url(&state, mount, &repo.name),
     };
     let request = protocol::Request {
         method: method.as_str().to_string(),
@@ -664,7 +660,7 @@ impl Ctx<'_> {
             self.package_filter.clone(),
             replace_filter,
         );
-        let limit = self.state.config.server.max_upload_bytes;
+        let limit = self.state.config.max_upload_bytes(&self.repo.format);
         let flags = UploadFlags::default();
         let reader = match &publish.upload {
             Upload::Body => body_reader(req.into_body()),
@@ -864,6 +860,16 @@ fn multipart_reader(
     let stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = std::io::Result<Bytes>> + Send>> =
         Box::pin(stream);
     Ok(Box::new(StreamReader::new(stream)))
+}
+
+/// The absolute URL of repository `name` served under `mount`:
+/// `{public_base_url}{mount}/{name}`, the base its plugin builds URLs on and
+/// the address its clients are given.
+pub fn repository_url(state: &AppState, mount: &str, name: &str) -> String {
+    format!(
+        "{}{mount}/{name}",
+        state.config.public_base_url().trim_end_matches('/')
+    )
 }
 
 /// See [`Ctx::within_repository`].

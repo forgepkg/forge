@@ -151,6 +151,30 @@ async fn push_over_the_upload_limit_is_413() {
     );
 }
 
+/// `plugins.max_upload_bytes.nuget` bounds NuGet pushes in place of
+/// `server.max_upload_bytes`.
+#[tokio::test]
+async fn nuget_pushes_follow_their_format_limit() {
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            plugins_block: Some("[plugins.max_upload_bytes]\nnuget = 4096\n".into()),
+            ..ServerOpts::default()
+        },
+    )
+    .await;
+    let repo = hosted_repo(&srv).await;
+    let id = format!("Format.Limit{}", unique());
+    let nupkg = common::make_nupkg_with_payload(&id, "1.0.0", 64 * 1024);
+
+    let resp = push(&srv, &repo, multipart_body(b"", &nupkg).into()).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "upload exceeds limit of 4096 bytes"
+    );
+}
+
 /// NuGet pushes are `multipart/form-data`; a bare body is refused.
 #[tokio::test]
 async fn push_that_is_not_multipart_is_400() {

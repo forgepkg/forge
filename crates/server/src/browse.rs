@@ -17,7 +17,8 @@
 //!
 //! ## Endpoints
 //! * `GET /browse/repos` — the repositories the caller may read (the SPA's
-//!   folder-view root).
+//!   folder-view root), with their format and client URL; `format` keeps
+//!   one format's.
 //! * `GET /browse/packages` — package search, paginated
 //!   (`q`, `repo`, `prerelease`, `skip`, `take`) → `{ total, items }`. The SPA
 //!   always passes `repo` (search is per repository); the merged cross-repo
@@ -91,13 +92,32 @@ pub struct BrowseRepo {
     /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
     /// browsed through `/browse/images`.
     pub format: String,
+    /// The address clients use for the repository (`{public_base_url}{mount}/{name}`),
+    /// for the UI's client snippets. Absent for docker repositories, whose
+    /// registry `/browse/images` names, and for a format not installed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
-/// `GET /browse/repos` — the repositories the caller may read, sorted by name.
+/// Query parameters for `GET /browse/repos`.
+#[derive(Debug, Deserialize)]
+pub struct ReposQuery {
+    /// Only repositories of this format (`nuget`, `docker`, a plugin
+    /// format's id).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// `GET /browse/repos` — the repositories the caller may read, sorted by name,
+/// optionally only those of one `format`.
 ///
 /// This is the root of the SPA's folder view: repositories are the top-level
 /// folders, their packages the entries inside.
-pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+pub async fn list_repos(
+    State(state): State<AppState>,
+    Query(query): Query<ReposQuery>,
+    req: axum::extract::Request,
+) -> Response {
     let principal = principal_of(&req);
     if let Some(denied) = require_user(&principal) {
         return denied;
@@ -110,12 +130,18 @@ pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Reque
 
     let mut out = Vec::new();
     for repo in &repos {
+        if query.format.as_ref().is_some_and(|f| *f != repo.format) {
+            continue;
+        }
         if state.authz.can_read(&principal, repo).await {
             out.push(BrowseRepo {
                 name: repo.name.clone(),
                 kind: repo.kind.clone(),
                 online: repo.online,
                 format: repo.format.clone(),
+                url: state.formats.plugin(&repo.format).map(|plugin| {
+                    crate::plugins::repository_url(&state, &plugin.manifest().mount, &repo.name)
+                }),
             });
         }
     }

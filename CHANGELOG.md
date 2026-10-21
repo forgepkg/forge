@@ -98,6 +98,16 @@ limitations still apply, except where an entry below says otherwise.
   platforms and referrers. New `[docker]` settings; see
   [docs/docker.md](https://github.com/schmitch/forge/blob/main/docs/docker.md).
   ([#40](https://github.com/schmitch/forge/issues/40))
+- **Per-format upload limits**: `[plugins.max_upload_bytes]` gives a format
+  (NuGet, Helm or a WebAssembly plugin) a push limit of its own in place of
+  `server.max_upload_bytes`, counted in the default staging budget. An id no
+  installed format has fails startup.
+  ([#38](https://github.com/schmitch/forge/issues/38))
+- **Browse by format**: `GET /browse/repos` takes `format` and names each
+  repository's client URL; the web UI's *Browse* screen filters by format,
+  and NuGet and Helm repositories show their `dotnet nuget` and `helm`
+  commands (other plugin formats, their URL) like docker ones show theirs.
+  ([#38](https://github.com/schmitch/forge/issues/38))
 
 ### Fixed
 

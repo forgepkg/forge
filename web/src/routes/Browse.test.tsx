@@ -31,10 +31,35 @@ const readerMe: Me = {
 }
 
 const repos: BrowseRepo[] = [
-  { name: 'nuget', kind: 'proxy', online: true, format: 'nuget' },
-  { name: 'internal', kind: 'hosted', online: true, format: 'nuget' },
-  { name: 'releases', kind: 'hosted', online: false, format: 'nuget' },
+  {
+    name: 'nuget',
+    kind: 'proxy',
+    online: true,
+    format: 'nuget',
+    url: 'https://forge.example.com/v3/nuget',
+  },
+  {
+    name: 'internal',
+    kind: 'hosted',
+    online: true,
+    format: 'nuget',
+    url: 'https://forge.example.com/v3/internal',
+  },
+  {
+    name: 'releases',
+    kind: 'hosted',
+    online: false,
+    format: 'nuget',
+    url: 'https://forge.example.com/v3/releases',
+  },
   { name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
+  {
+    name: 'charts',
+    kind: 'hosted',
+    online: true,
+    format: 'helm',
+    url: 'https://forge.example.com/repository/charts',
+  },
 ]
 
 function page(total: number, ids: string[]): BrowseResult {
@@ -185,6 +210,41 @@ describe('Browse root (repository folders)', () => {
     const nuget = screen.getByRole('link', { name: /^nuget/ })
     expect(within(nuget).getByText('NuGet')).toBeInTheDocument()
     expect(within(nuget).getByText('proxy')).toBeInTheDocument()
+  })
+
+  it('filters the repositories by format, in the URL', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    const user = userEvent.setup()
+    const router = await renderBrowse('/')
+
+    const select = await screen.findByLabelText('Format')
+    expect(
+      within(select).getAllByRole('option').map((o) => o.textContent),
+    ).toEqual(['All formats', 'Docker', 'Helm', 'NuGet'])
+
+    await user.selectOptions(select, 'helm')
+
+    await waitFor(() =>
+      expect(router.state.location.search).toEqual({ format: 'helm' }),
+    )
+    expect(await screen.findByRole('link', { name: /charts/ })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /internal/ })).toBeNull()
+    expect(screen.queryByRole('link', { name: /docker-hosted/ })).toBeNull()
+
+    await user.selectOptions(select, '')
+
+    await waitFor(() => expect(router.state.location.search).toEqual({}))
+    expect(await screen.findByRole('link', { name: /internal/ })).toBeInTheDocument()
+  })
+
+  it('says when no readable repository has the filtered format', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/?format=npm')
+
+    expect(await screen.findByText('No npm repositories')).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /internal/ })).toBeNull()
   })
 
   it('navigates into a repository when its folder is clicked', async () => {
@@ -361,6 +421,74 @@ describe('RepoBrowse (per-repo search)', () => {
     await new Promise((r) => setTimeout(r, 500))
     expect(router.state.location.search).toMatchObject({ q: 'alpha' })
     expect(box).toHaveValue('alpha')
+  })
+})
+
+describe('RepoBrowse connect snippets of package repositories', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    clearSession()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  it('shows the dotnet commands of a hosted NuGet repository', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/repos/internal')
+
+    const connect = await screen.findByRole('region', { name: 'Connect' })
+    expect(
+      within(connect).getByText(
+        'dotnet nuget add source https://forge.example.com/v3/internal/index.json --name internal --username <username> --password <token> --store-password-in-clear-text',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      within(connect).getByText(
+        'dotnet nuget push <package>.nupkg --source internal --api-key <token>',
+      ),
+    ).toBeInTheDocument()
+    expect(within(connect).getByRole('link', { name: 'Tokens' })).toHaveAttribute(
+      'href',
+      '/tokens',
+    )
+  })
+
+  it('offers no push command for a proxy', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/repos/nuget')
+
+    const connect = await screen.findByRole('region', { name: 'Connect' })
+    expect(
+      within(connect).getByRole('button', { name: 'Copy add-source command' }),
+    ).toBeInTheDocument()
+    expect(within(connect).queryByText(/dotnet nuget push/)).toBeNull()
+  })
+
+  it('shows the helm commands of a Helm repository', async () => {
+    mockApi(() => jsonResponse(page(0, [])))
+
+    await renderBrowse('/repos/charts')
+
+    const connect = await screen.findByRole('region', { name: 'Connect' })
+    expect(
+      within(connect).getByText(
+        'helm repo add charts https://forge.example.com/repository/charts --username <username> --password <token>',
+      ),
+    ).toBeInTheDocument()
+    expect(
+      within(connect).getByText('helm install <release> charts/<chart>'),
+    ).toBeInTheDocument()
+    expect(
+      within(connect).getByText(
+        'curl -u <username>:<token> --data-binary @<chart>-<version>.tgz https://forge.example.com/repository/charts/api/charts',
+      ),
+    ).toBeInTheDocument()
   })
 })
 

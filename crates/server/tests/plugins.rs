@@ -38,8 +38,13 @@ async fn start_helm(opts: ServerOpts) -> TestServer {
 
 /// A gzipped chart archive declaring `name` at `version`.
 fn chart(name: &str, version: &str) -> Vec<u8> {
+    chart_with_values(name, version, "replicas: 1\n")
+}
+
+/// [`chart`] with `values` as its `values.yaml`.
+fn chart_with_values(name: &str, version: &str, values: &str) -> Vec<u8> {
     let entries: [(String, String); 2] = [
-        (format!("{name}/values.yaml"), "replicas: 1\n".into()),
+        (format!("{name}/values.yaml"), values.into()),
         (
             format!("{name}/Chart.yaml"),
             format!(
@@ -489,6 +494,43 @@ async fn uploads_are_bounded_by_the_server_limit() {
     let creds = credentials(&srv).await;
     let resp = push(&srv, &repo, &creds, vec![0u8; 64 * 1024]).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_format_has_an_upload_limit_of_its_own() {
+    // Helm's limit admits a chart the server-wide limit refuses.
+    let srv = start_helm(ServerOpts {
+        server_extra: Some("max_upload_bytes = 1024".into()),
+        plugins_block: Some("[plugins.max_upload_bytes]\nhelm = 1048576\n".into()),
+        ..Default::default()
+    })
+    .await;
+    let repo = helm_repo(&srv, false).await;
+    let creds = credentials(&srv).await;
+    // Digests compress poorly: the archive stays well above 1 KiB.
+    let noise: String = (0u32..64)
+        .map(|i| {
+            format!(
+                "k{i}: {}\n",
+                hex::encode(sha2::Sha256::digest(i.to_le_bytes()))
+            )
+        })
+        .collect();
+    let package = chart_with_values("big", "1.0.0", &noise);
+    assert!(package.len() > 2048, "{}", package.len());
+    let resp = push(&srv, &repo, &creds, package).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let resp = push(&srv, &repo, &creds, vec![0u8; 2 * 1024 * 1024]).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "upload exceeds limit of 1048576 bytes"
+    );
 }
 
 #[tokio::test]

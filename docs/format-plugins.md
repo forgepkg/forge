@@ -74,7 +74,7 @@ runs Helm both ways and checks that every answer matches.
 | | Forge (the host) | The plugin |
 | --- | --- | --- |
 | Identity | Calls the format for every id and version it sees | `canonical_id`, `validate_id`, `normalize_version`, `compare_versions` |
-| Publishing | Streams the upload to a staging file, enforces `max_upload_bytes`, authorizes against the package selector, stores the blob content-addressed, writes the version in one transaction, records trusted-publishing provenance | `parse_package`: reads the staged file (a component through a lent reader), returns id, version, manifest, dependencies |
+| Publishing | Streams the upload to a staging file, enforces the format's upload limit, authorizes against the package selector, stores the blob content-addressed, writes the version in one transaction, records trusted-publishing provenance | `parse_package`: reads the staged file (a component through a lent reader), returns id, version, manifest, dependencies |
 | Reads | Runs the queries the plugin asks for through the repository read path (hosted, proxy or group). Package selectors, group membership, prefer-hosted and reserved prefixes all apply | `handle` decides what a request is; `render` turns the loaded data into the response body |
 | Downloads | Streams the blob from S3, counts the download, answers `HEAD` without touching S3, and a single `Range` when the local blob cache is on | Names the version (`download`) |
 | Unlist, relist, delete | Hosted write path, with the repository's permissions and selectors; a package outside the caller's selector answers 404, like an unknown one | Names the version and the success response |
@@ -171,6 +171,25 @@ curl -u ci:$TOKEN -X DELETE \
 
 As with every format, the password is an **API token**. A password typed at
 the web login is not a publishing credential.
+
+The web UI's *Browse* screen filters repositories by format
+(`GET /browse/repos?format=helm`), and a repository's screen shows its
+client commands: `dotnet nuget` for NuGet, `helm repo add` and the push for
+Helm, the repository's URL for other plugin formats.
+
+**Upload limits.** A push to a plugin format's repository may be as large as
+`server.max_upload_bytes`, unless the format has a limit of its own, built-in
+plugins included:
+
+```toml
+[plugins.max_upload_bytes]
+helm = 104857600               # format id → largest accepted push, in bytes
+```
+
+or `FORGE_PLUGINS__MAX_UPLOAD_BYTES__HELM=104857600`. Every push is staged on
+disk, so the largest limit also sizes the default `server.max_staging_bytes`.
+An id that no installed plugin format has fails startup (Docker's limit is
+`docker.max_blob_bytes`).
 
 ## Loading WebAssembly plugins
 
