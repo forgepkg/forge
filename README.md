@@ -89,8 +89,11 @@ cargo xtask dev --db none    # assume the DB is already up; don't start one
 
 ### Run via the Docker image
 
-The root `Dockerfile` packages the SPA **and** the Rust server into one image
-(no Node in prod):
+Every release publishes the signed image to GitHub Packages as
+[`ghcr.io/schmitch/forge`](https://github.com/schmitch/forge/pkgs/container/forge)
+(see [docs/deployment.md](docs/deployment.md#image)). To build it from a
+checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
+server into one image (no Node in prod):
 
 ```bash
 cargo xtask docker-build     # docker build -t envisia-forge:latest .
@@ -134,7 +137,8 @@ the user password).
 - **[Production deployment](./docs/deployment.md)** — required settings, TLS
   and reverse proxy, secret encryption, health probes, backup/restore and
   upgrades. Kubernetes: a Helm chart published with every release
-  (**[deploy/helm/forge](./deploy/helm/forge/README.md)**), or kustomize
+  (**[deploy/helm/forge](./deploy/helm/forge/README.md)**, on GitHub Packages
+  as [`oci://ghcr.io/schmitch/charts/forge`](https://github.com/schmitch/forge/pkgs/container/charts%2Fforge)), or kustomize
   manifests (**[deploy/kubernetes](./deploy/kubernetes/README.md)**).
 - **[CHANGELOG.md](./CHANGELOG.md)** — release notes, upgrade notes and known
   limitations; **[SECURITY.md](./SECURITY.md)** — how to report a
