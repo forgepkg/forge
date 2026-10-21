@@ -349,6 +349,7 @@ function ImageBrowse({
       <ImageBrowseResults
         isLoading={search.isLoading}
         isError={search.isError}
+        offline={isRepositoryOffline(search.error)}
         errorMessage={search.error?.message}
         onRetry={() => void search.refetch()}
         result={search.data}
@@ -371,6 +372,7 @@ function ImageBrowse({
 function ImageBrowseResults({
   isLoading,
   isError,
+  offline,
   errorMessage,
   onRetry,
   result,
@@ -381,6 +383,8 @@ function ImageBrowseResults({
 }: {
   isLoading: boolean
   isError: boolean
+  /** The listing failed because the repository is offline (503). */
+  offline: boolean
   errorMessage?: string
   onRetry: () => void
   result: ImagesResult | undefined
@@ -389,6 +393,10 @@ function ImageBrowseResults({
   skip: number
   onSkipChange: (next: number) => void
 }) {
+  if (isError && offline) {
+    return <RepositoryOfflineState onRetry={onRetry} />
+  }
+
   if (isError) {
     return (
       <ErrorState

@@ -16,6 +16,7 @@ use forge_core::authz::Action;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::RepoKind;
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
+use forge_storage::BlobRef;
 use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
@@ -774,7 +775,11 @@ impl Registry {
             .await
             .ok()??;
         let bytes = self
-            .read_manifest_bytes(&link.s3_key, link.size)
+            .read_manifest_bytes(BlobRef {
+                sha256: &link.blob_sha256,
+                s3_key: &link.s3_key,
+                size: link.size.max(0) as u64,
+            })
             .await
             .ok()?;
         config_platform(&bytes)

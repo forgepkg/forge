@@ -379,11 +379,12 @@ async fn formats_keep_to_their_own_mounts_and_kinds() {
         .await
         .unwrap();
     assert_eq!(formats[0]["id"], "nuget");
-    assert_eq!(formats[1]["id"], "helm");
-    assert_eq!(formats[1]["builtin"], true);
-    assert_eq!(formats[1]["kinds"], json!(["hosted", "group"]));
-    assert_eq!(formats[1]["mount"], "/repository");
-    assert!(formats[1].get("sha256").is_none());
+    assert_eq!(formats[1]["id"], "docker");
+    assert_eq!(formats[2]["id"], "helm");
+    assert_eq!(formats[2]["builtin"], true);
+    assert_eq!(formats[2]["kinds"], json!(["hosted", "group"]));
+    assert_eq!(formats[2]["mount"], "/repository");
+    assert!(formats[2].get("sha256").is_none());
 
     // Plugin formats have no proxies; unknown formats are refused.
     let resp = create_repo(

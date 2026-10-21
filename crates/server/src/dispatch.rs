@@ -160,15 +160,14 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     };
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        // A docker repository is served under `/v2`, not as a NuGet feed.
-        Ok(Some(r)) if r.format == forge_db::model::NUGET_FORMAT => r,
+        Ok(Some(r)) => r,
         // Answer an unknown name exactly like a repository the caller may
         // not read, so repository names cannot be enumerated; only a global
         // admin (who can list them anyway) learns that it does not exist.
-        Ok(_) if state.authz.is_global_admin(&principal).await => {
+        Ok(None) if state.authz.is_global_admin(&principal).await => {
             return (StatusCode::NOT_FOUND, "repository not found").into_response();
         }
-        Ok(_) => return authz_denied(&principal),
+        Ok(None) => return authz_denied(&principal),
         Err(e) => {
             tracing::error!(error = %e, repo = %repo_name, "repo lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -193,8 +192,8 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         return offline_response();
     }
     // `/v3` is the NuGet feed. A repository of another format is served by
-    // that format's own protocol (`/repository/{repo}`), never read or
-    // written as NuGet.
+    // that format's own protocol (`/v2` for docker, `/repository/{repo}` for
+    // a format plugin), never read or written as NuGet.
     if repo.format != state.formats.nuget().id() {
         return (StatusCode::NOT_FOUND, "not a NuGet repository").into_response();
     }

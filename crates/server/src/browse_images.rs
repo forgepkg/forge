@@ -2,9 +2,10 @@
 //! image's tags and manifests (digests, sizes, platforms), for the SPA.
 //!
 //! The same rules as the package browse apply: a signed-in user, per-repo
-//! read authorization, and the caller's content selectors on image names. A
-//! group lists what its members the caller may read hold, the highest
-//! priority member first.
+//! read authorization, the caller's content selectors on image names, and a
+//! 503 for an offline hosted or group repository. A group lists what its
+//! online members the caller may read hold, the highest priority member
+//! first, like a pull through it.
 //!
 //! ## Endpoints
 //! * `GET /browse/images?repo=<name>&q=&skip=&take=` → `{ total, items,
@@ -24,6 +25,7 @@ use forge_db::{oci_dao, repository_dao};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
+use crate::dispatch::{offline_response, offline_serves_nothing};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -146,6 +148,11 @@ async fn readable_docker_repo(
     if !state.authz.can_read(principal, &repo).await {
         return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
     }
+    // An offline hosted or group repository serves nothing, as in the
+    // registry.
+    if offline_serves_nothing(&repo) {
+        return Err(offline_response());
+    }
     Ok(repo)
 }
 
@@ -171,7 +178,9 @@ async fn sources(
         // Depth-first in priority order: push the lowest priority first.
         let mut nested = Vec::new();
         for (member, _) in members {
-            if !member.is_docker() || !seen.insert(member.id) {
+            // An offline hosted or group member serves nothing through the
+            // group; an offline proxy still serves its cache.
+            if !member.is_docker() || offline_serves_nothing(&member) || !seen.insert(member.id) {
                 continue;
             }
             if !state.authz.can_read(principal, &member).await {

@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 
 import type { FormatView, RepoView } from '~/api/repositories'
 import {
+  DOCKER_FORMAT,
   NUGET_FORMAT,
   RepositoryForm,
   toCreateBody,
@@ -501,6 +502,7 @@ function renderCreate() {
   render(
     <RepositoryForm
       mode="create"
+      formats={[NUGET_FORMAT, DOCKER_FORMAT]}
       submitting={false}
       onSubmit={onSubmit}
       onCancel={() => {}}
@@ -514,7 +516,7 @@ async function create(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe('docker repositories: create', () => {
-  it('a NuGet body sends format nuget and no docker fields', async () => {
+  it('a NuGet body sends no format and no docker fields', async () => {
     const user = userEvent.setup()
     const onSubmit = renderCreate()
 
@@ -527,7 +529,9 @@ describe('docker repositories: create', () => {
     await create(user)
 
     const body = toCreateBody(lastValues(onSubmit))
-    expect(body).toMatchObject({ name: 'feed', kind: 'hosted', format: 'nuget' })
+    expect(body).toMatchObject({ name: 'feed', kind: 'hosted' })
+    // NuGet is the server's default format: not sent.
+    expect(body).not.toHaveProperty('format')
     for (const field of DOCKER_FIELDS) expect(body).not.toHaveProperty(field)
   })
 
@@ -697,7 +701,7 @@ describe('docker repositories: update body', () => {
 
     const format = screen.getByLabelText('Format') as HTMLInputElement
     expect(format.readOnly).toBe(true)
-    expect(format).toHaveValue('Docker')
+    expect(format).toHaveValue('Docker / OCI')
     expect(screen.getByLabelText('Host')).toHaveValue('docker.example.com')
     await save(user)
 

@@ -446,25 +446,26 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // The format must be installed: the built-in NuGet or Docker, or a
-    // loaded format plugin. It is fixed for the repository's lifetime.
-    let docker = body.format == DOCKER_FORMAT;
-    if !docker && state.formats.get(&body.format).is_none() {
+    // The format must be installed: NuGet, Docker or a loaded format plugin
+    // (`GET /admin/formats`), and support the kind. It is fixed for the
+    // repository's lifetime.
+    let Some(kinds) = state.formats.kinds(&body.format) else {
         let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
             "unsupported format {:?}: available formats are {available:?}",
             body.format
         ));
-    }
-    let parsed_kind = RepoKind::from(kind.as_str());
-    // Proxies speak the NuGet V3 or the registry upstream protocol; format
+    };
+    // Proxies speak NuGet V3 or the distribution spec upstream; format
     // plugins serve hosted and group repositories only.
-    if parsed_kind == RepoKind::Proxy && !docker && body.format != state.formats.nuget().id() {
+    if !kinds.contains(&kind.as_str()) {
         return bad_request(format!(
-            "proxy repositories are not available for format {:?}",
+            "{kind} repositories are not available for format {:?}",
             body.format
         ));
     }
+    let docker = body.format == DOCKER_FORMAT;
+    let parsed_kind = RepoKind::from(kind.as_str());
     let docker_config = match docker_options(
         &state,
         docker,

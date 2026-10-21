@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, ManifestRow};
+use forge_storage::BlobRef;
 use futures_util::future::BoxFuture;
 
 use crate::digest::{Digest, DigestError};
@@ -26,6 +27,7 @@ pub(crate) struct ManifestHit {
     pub digest: String,
     pub media_type: String,
     pub size: i64,
+    pub blob_sha256: String,
     pub s3_key: String,
     /// The bytes, when they are already in memory (a proxy just fetched
     /// them).
@@ -33,12 +35,22 @@ pub(crate) struct ManifestHit {
 }
 
 impl ManifestHit {
+    /// The stored manifest as a blob of the store.
+    pub fn blob(&self) -> BlobRef<'_> {
+        BlobRef {
+            sha256: &self.blob_sha256,
+            s3_key: &self.s3_key,
+            size: self.size.max(0) as u64,
+        }
+    }
+
     pub fn from_row(row: ManifestRow) -> Self {
         ManifestHit {
             manifest_id: row.id,
             digest: row.digest,
             media_type: row.media_type,
             size: row.size,
+            blob_sha256: row.blob_sha256,
             s3_key: row.s3_key,
             bytes: None,
         }
@@ -52,10 +64,22 @@ pub(crate) struct BlobHit {
     pub image: String,
     pub digest: String,
     pub size: i64,
+    pub blob_sha256: String,
     pub s3_key: String,
     /// Whether it is an `oci_blob_link` (touched on use) rather than a
     /// manifest read as a blob.
     pub linked: bool,
+}
+
+impl BlobHit {
+    /// The blob of the store.
+    pub fn blob(&self) -> BlobRef<'_> {
+        BlobRef {
+            sha256: &self.blob_sha256,
+            s3_key: &self.s3_key,
+            size: self.size.max(0) as u64,
+        }
+    }
 }
 
 /// A referrer descriptor.
@@ -227,6 +251,7 @@ impl Registry {
                 image: image.to_string(),
                 digest: link.digest,
                 size: link.size,
+                blob_sha256: link.blob_sha256,
                 s3_key: link.s3_key,
                 linked: true,
             }));
@@ -241,6 +266,7 @@ impl Registry {
                     image: image.to_string(),
                     digest: m.digest,
                     size: m.size,
+                    blob_sha256: m.blob_sha256,
                     s3_key: m.s3_key,
                     linked: false,
                 }),
@@ -274,29 +300,36 @@ impl Registry {
         Ok(rows.iter().map(ReferrerDescriptor::from_row).collect())
     }
 
-    /// Read a stored manifest's bytes.
-    pub(crate) async fn read_manifest_bytes(&self, s3_key: &str, size: i64) -> OciResult<Bytes> {
-        let stream = self
+    /// Read a stored manifest's (or image config's) bytes, through the
+    /// local blob cache.
+    pub(crate) async fn read_manifest_bytes(&self, blob: BlobRef<'_>) -> OciResult<Bytes> {
+        let too_large = || {
+            OciError::internal(
+                "manifest read",
+                format!("stored manifest {} is too large", blob.s3_key),
+            )
+        };
+        if usize::try_from(blob.size).map_or(true, |size| size > MAX_MANIFEST_BYTES) {
+            return Err(too_large());
+        }
+        let bytes = self
             .inner
             .store
-            .get(s3_key)
+            .read_all(blob)
             .await
             .map_err(|e| OciError::internal("manifest read", e))?;
-        let bytes = stream
-            .collect()
-            .await
-            .map_err(|e| OciError::internal("manifest read", e))?
-            .into_bytes();
-        if bytes.len() as i64 != size || bytes.len() > MAX_MANIFEST_BYTES {
+        if bytes.len() as u64 != blob.size {
             return Err(OciError::internal(
                 "manifest read",
                 format!(
-                    "stored manifest {s3_key} has {} bytes, expected {size}",
-                    bytes.len()
+                    "stored manifest {} has {} bytes, expected {}",
+                    blob.s3_key,
+                    bytes.len(),
+                    blob.size
                 ),
             ));
         }
-        Ok(bytes)
+        Ok(Bytes::from(bytes))
     }
 
     // ── Handlers ────────────────────────────────────────────────────────────
@@ -326,7 +359,7 @@ impl Registry {
         } else {
             let bytes = match hit.bytes.clone() {
                 Some(bytes) => bytes,
-                None => self.read_manifest_bytes(&hit.s3_key, hit.size).await?,
+                None => self.read_manifest_bytes(hit.blob()).await?,
             };
             if let Err(e) = oci_dao::touch_manifest(&self.inner.pool, hit.manifest_id).await {
                 tracing::warn!(error = %e, "registry: recording a manifest pull failed");
@@ -381,27 +414,22 @@ impl Registry {
                 (StatusCode::PARTIAL_CONTENT, end - start + 1, Body::empty())
             }
             (true, None) => (StatusCode::OK, size, Body::empty()),
-            (false, None) => {
+            (false, range) => {
+                // Through the local blob cache, like package downloads.
                 let stream = self
                     .inner
                     .store
-                    .get(&hit.s3_key)
+                    .open(hit.blob(), range.map(|(start, end)| start..end + 1))
                     .await
                     .map_err(|e| OciError::internal("blob read", e))?;
-                (StatusCode::OK, size, byte_stream_body(stream))
-            }
-            (false, Some((start, end))) => {
-                let stream = self
-                    .inner
-                    .store
-                    .get_range(&hit.s3_key, start, Some(end))
-                    .await
-                    .map_err(|e| OciError::internal("blob read", e))?;
-                (
-                    StatusCode::PARTIAL_CONTENT,
-                    end - start + 1,
-                    byte_stream_body(stream),
-                )
+                match range {
+                    Some((start, end)) => (
+                        StatusCode::PARTIAL_CONTENT,
+                        end - start + 1,
+                        Body::from_stream(stream),
+                    ),
+                    None => (StatusCode::OK, size, Body::from_stream(stream)),
+                }
             }
         };
         let mut response = (status, body).into_response();
@@ -517,11 +545,6 @@ impl Registry {
 /// A header value from text Forge produced or validated.
 pub(crate) fn header_value(s: &str) -> HeaderValue {
     HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static("invalid"))
-}
-
-/// A streaming response body over an S3 object.
-pub(crate) fn byte_stream_body(stream: forge_storage::ByteStream) -> Body {
-    Body::from_stream(tokio_util::io::ReaderStream::new(stream.into_async_read()))
 }
 
 /// One `bytes=` range of a `size`-byte object, as inclusive offsets. `None`

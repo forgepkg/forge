@@ -468,12 +468,11 @@ fn spawn_proxy_refresh(state: AppState, interval: Duration) -> JoinHandle<()> {
 async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
     let repos = repository_dao::list_repositories(&state.pool).await?;
     for repo in repos {
-        // Docker proxies keep no upstream index; they revalidate per tag.
-        if repo.kind() != RepoKind::Proxy || !repo.online || repo.is_docker() {
+        if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        // Proxies speak the NuGet V3 upstream protocol; no other format has
-        // proxy repositories (the admin API refuses them).
+        // Only NuGet proxies keep an upstream index: docker proxies
+        // revalidate per tag, and format plugins have no proxies.
         let format = match state.formats.for_repository(&repo) {
             Ok(format) if format.id() == "nuget" => format,
             _ => continue,

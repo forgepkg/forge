@@ -422,7 +422,7 @@ impl UpstreamHttp {
     /// (registries redirect blobs to a CDN or an object store).
     pub async fn send(
         &self,
-        method: reqwest::Method,
+        mut method: reqwest::Method,
         url: &str,
         class: RequestClass,
         mut headers: reqwest::header::HeaderMap,
@@ -434,7 +434,6 @@ impl UpstreamHttp {
         };
         let deadline = tokio::time::Instant::now() + timeout;
         let origin = Origin::of(url);
-        let mut method = method;
         let mut hop = url.to_string();
         let mut hops = 0;
         loop {
@@ -853,6 +852,53 @@ mod tests {
         ));
     }
 
+    /// A registry's Bearer token stays on its origin: a redirect to another
+    /// host (a CDN serving the blob) gets the request without it, with the
+    /// method kept.
+    #[tokio::test]
+    async fn send_drops_authorization_on_a_cross_origin_redirect() {
+        use axum_like_server::serve_recording;
+
+        let http = UpstreamHttp::new(UpstreamHttpConfig::default()).unwrap();
+        let (target, heads) = serve_recording(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let (hop, hop_heads) = serve_recording(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}blob\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            "Bearer registry-token".parse().unwrap(),
+        );
+        let resp = http
+            .send(
+                reqwest::Method::HEAD,
+                &hop,
+                RequestClass::Metadata,
+                headers,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let sent = hop_heads.lock().unwrap().clone();
+        assert!(
+            sent[0].contains("authorization: bearer registry-token"),
+            "{sent:?}"
+        );
+        let followed = heads.lock().unwrap().clone();
+        assert_eq!(followed.len(), 1);
+        assert!(followed[0].starts_with("head /blob "), "{followed:?}");
+        assert!(!followed[0].contains("authorization"), "{followed:?}");
+    }
+
     /// A lookup table standing in for DNS: `imds.attacker.test` has a
     /// metadata address among its answers, `feed.example.test` is ordinary,
     /// and any other name does not resolve here.
@@ -995,6 +1041,34 @@ mod tests {
         /// the server's URL.
         pub async fn serve_raw(response: Vec<u8>) -> String {
             serve_counting(response).await.0
+        }
+
+        /// [`serve_raw`], also returning the head (request line and headers)
+        /// of every request it received, lowercased.
+        pub async fn serve_recording(
+            response: Vec<u8>,
+        ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = heads.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let response = response.clone();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                        seen.lock().unwrap().push(head);
+                        let _ = sock.write_all(&response).await;
+                    });
+                }
+            });
+            (format!("http://{addr}/"), heads)
         }
 
         /// [`serve_raw`], also returning how many connections it accepted.

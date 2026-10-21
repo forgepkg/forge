@@ -1,7 +1,7 @@
 # Format plugins
 
-Forge serves NuGet natively. Every other package format comes from a **format
-plugin**: a Rust crate that teaches Forge the format's rules and its client
+Forge serves NuGet and the Docker / OCI registry ([docker.md](docker.md))
+natively. Every other package format comes from a **format plugin**: a Rust crate that teaches Forge the format's rules and its client
 protocol by implementing one trait,
 [`FormatPlugin`](../crates/plugin-api/src/lib.rs). The repository machinery
 stays Forge's own. That covers storage, metadata, authentication, RBAC and
@@ -122,8 +122,9 @@ NuGet's).
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
-of: NuGet, the built-in plugins (`builtin: true`), and the loaded WebAssembly
-plugins (with the `sha256` of their component). The web UI's *New
+of: NuGet and Docker, the built-in plugins (`builtin: true`), and the loaded
+WebAssembly plugins (with the `sha256` of their component), each with the
+repository kinds it supports and where its repositories are served. The web UI's *New
 repository* form offers them. Plugin formats support **hosted** and
 **group** repositories; proxies are NuGet-only for now.
 
@@ -188,8 +189,8 @@ FORGE_PLUGINS__FORMATS__EXAMPLE=sha256:c2053ffc…
   this server does not implement, or a component that does not instantiate
   all fail startup. A directory under `dir` that is not listed is never
   read.
-- **Built-in formats come first.** A component cannot take the id of NuGet or
-  of a built-in plugin; configuring one fails startup.
+- **Built-in formats come first.** A component cannot take the id of NuGet,
+  Docker or a built-in plugin; configuring one fails startup.
 - **Every instance loads the same plugins.** A repository whose format is
   not loaded on an instance answers 503 there; it is never read as another
   format. The admin API refuses to create a repository of a format that is
@@ -369,6 +370,24 @@ The path we recommend is the reverse: grow the contract (the roadmap above)
 until it could express NuGet, and keep NuGet native as the reference the
 contract is measured against. Moving NuGet into `plugins/nuget` as a built-in
 plugin then becomes a packaging decision instead of a rewrite.
+
+### Why Docker is not a plugin
+
+The contract models a repository as package versions, each one file with an
+id, a version and a manifest. A container registry is a different model:
+content-addressed blobs and manifests linked per image, tags that move,
+indexes that refer to other manifests, referrers, and uploads in sessions of
+several requests with bodies the plugin would have to see. Its clients log in
+with Bearer tokens, read layers with `Range` requests, and expect proxies of
+Docker Hub and other registries. Every one of those is on the roadmap above
+or outside the contract altogether.
+
+So Docker is a native format like NuGet (`crates/format-oci`, served under
+`/v2`), registered next to it: `GET /admin/formats` lists it with all three
+repository kinds, the admin API and the web UI create its repositories the
+same way, a group holds members of its format only, and repositories, RBAC,
+package selectors (on image names), retention and the blob store are the
+same as for every other format.
 
 ## Design notes: compared with artifact-keeper
 

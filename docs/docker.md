@@ -7,8 +7,10 @@ and docker-group repositories do. It speaks the
 v1.1 that Docker, Podman, containerd, crane, skopeo, oras, Helm and cosign
 use. CI runs the spec's conformance suite against Forge on every change.
 
-Images live in repositories of `format: "docker"`, which come in the same
-three kinds as NuGet repositories:
+Images live in repositories of `format: "docker"`, a format built into
+Forge like NuGet (`GET /admin/formats` lists it; see
+[format plugins](format-plugins.md#why-docker-is-not-a-plugin) for why it is
+not a plugin). They come in the same three kinds as NuGet repositories:
 
 - **hosted**: push and pull your own images;
 - **proxy**: a pull-through cache of an upstream registry: Docker Hub, GHCR,
@@ -167,7 +169,8 @@ docker pull forge.example.com/docker/nginx:1.27
 - A pull is served by the highest-priority member that has the image and the
   caller may read; a failing member (an unreachable upstream) is skipped
   while another answers. Tag lists and referrers are merged.
-- Members must be docker repositories.
+- Members must be docker repositories. An offline hosted or nested group
+  member is skipped; an offline proxy member still serves its cache.
 - **Pushes** to a group go to its `writable_member`, a hosted member (Nexus
   Pro's group deployment). Without one, pushes are refused. The caller needs
   read on the group and write on that member.
@@ -183,7 +186,8 @@ The web UI lists a docker repository's images, and per image its tags and
 manifests with digests, sizes, platforms, referrers, push and pull times, and
 ready-to-paste `docker login` / `docker pull` commands. The same data is in
 the browse API: `GET /browse/images?repo=<name>` and
-`GET /browse/images/<repo>/<image>`.
+`GET /browse/images/<repo>/<image>`. An offline hosted or group repository
+answers 503 there, as it does to pulls and pushes.
 
 The catalog API (`/v2/_catalog`) is not supported.
 

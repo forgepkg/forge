@@ -24,7 +24,6 @@ import {
 } from '~/components/catalyst/fieldset'
 import { Input } from '~/components/catalyst/input'
 import { Select } from '~/components/catalyst/select'
-import { formatLabel } from '~/components/RepoFormatBadge'
 
 /**
  * Shared repository create/edit form (plan §Phase 4). Kind-conditional fields:
@@ -95,7 +94,7 @@ export function validateRepoName(
       ? 'A repository name can be at most 64 characters long.'
       : 'Use only letters, digits, ".", "_" and "-", starting with a letter or digit (no spaces).'
   }
-  if (format === DOCKER_FORMAT_ID && !DOCKER_REPO_NAME_PATTERN.test(name)) {
+  if (format === DOCKER_FORMAT.id && !DOCKER_REPO_NAME_PATTERN.test(name)) {
     return name !== name.toLowerCase()
       ? 'A docker repository name must be lowercase (it starts every image name).'
       : 'A docker repository name must start and end with a letter or digit, with single ".", "_", "__" or "-" separators between them.'
@@ -139,10 +138,16 @@ export const NUGET_FORMAT: FormatView = {
 }
 
 /**
- * The Docker / OCI registry format, whose repositories carry their own
- * options (`host`, immutable tags, a group's writable member).
+ * The Docker / OCI registry format, built in like NuGet. Its repositories
+ * carry their own options (`host`, immutable tags, a group's writable member).
  */
-export const DOCKER_FORMAT_ID = 'docker'
+export const DOCKER_FORMAT: FormatView = {
+  id: 'docker',
+  name: 'Docker / OCI',
+  builtin: true,
+  kinds: ['hosted', 'proxy', 'group'],
+  mount: '/v2',
+}
 
 /** Where a repository of `format` named `name` is served. */
 export function feedPath(format: FormatView, name: string): string {
@@ -279,7 +284,7 @@ export function RepositoryForm({
         next.package_delay_seconds = 'Delay must be a non-negative number.'
       }
     }
-    if (values.format === DOCKER_FORMAT_ID) {
+    if (values.format === DOCKER_FORMAT.id) {
       const hostError = validateDockerHost(values.host)
       if (hostError) next.host = hostError
     }
@@ -294,9 +299,11 @@ export function RepositoryForm({
   }
 
   const available = formats && formats.length > 0 ? formats : [NUGET_FORMAT]
-  // An edited repository's format may not be installed (any more): describe
-  // it as a plugin format, which is what it must have been.
-  const format: FormatView = available.find((f) => f.id === values.format) ?? {
+  // An edited repository's format may not be listed (the list failed to
+  // load, or a plugin is not installed any more): the built-in formats are
+  // known; any other one must have been a plugin format.
+  const format: FormatView = available.find((f) => f.id === values.format) ??
+    [NUGET_FORMAT, DOCKER_FORMAT].find((f) => f.id === values.format) ?? {
     id: values.format,
     name: values.format,
     builtin: false,
@@ -316,7 +323,7 @@ export function RepositoryForm({
   const isProxy = values.kind === 'proxy'
   const isHosted = values.kind === 'hosted'
   const isGroup = values.kind === 'group'
-  const isDocker = values.format === DOCKER_FORMAT_ID
+  const isDocker = values.format === DOCKER_FORMAT.id
 
   // Edit only: what is stored server-side for the upstream credentials.
   const hasStoredCredentials =
@@ -385,7 +392,7 @@ export function RepositoryForm({
             : format.description ??
               (format.id === NUGET_FORMAT.id
                 ? 'NuGet packages, served as a NuGet V3 feed.'
-                : format.id === DOCKER_FORMAT_ID
+                : format.id === DOCKER_FORMAT.id
                   ? 'Container images and other OCI artifacts, served by the registry under /v2.'
                   : 'A format plugin; its repositories are hosted or groups.')}
         </Description>
@@ -786,11 +793,10 @@ export function RepositoryForm({
  * consistently.
  */
 export function toCreateBody(values: RepoFormValues): CreateRepo {
-  const docker = values.format === DOCKER_FORMAT_ID
+  const docker = values.format === DOCKER_FORMAT.id
   const body: CreateRepo = {
     name: values.name.trim(),
     kind: values.kind,
-    format: values.format,
     anonymous_read: values.anonymous_read,
     online: values.online,
   }
@@ -862,7 +868,7 @@ export function toUpdateBody(
   existing: RepoView,
 ): UpdateRepo {
   const before = seed(existing)
-  const docker = before.format === DOCKER_FORMAT_ID
+  const docker = before.format === DOCKER_FORMAT.id
   const body: UpdateRepo = {}
   const name = values.name.trim()
   if (name !== existing.name) body.name = name

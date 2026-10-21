@@ -1,6 +1,7 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { ImageDetail } from '~/api/images'
+import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
 import { useImageDetail } from '~/queries/useImageDetail'
 import { Heading, Subheading } from '~/components/catalyst/heading'
@@ -11,7 +12,7 @@ import { Select } from '~/components/catalyst/select'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { CommandSnippet } from '~/components/CopyButton'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
-import { ErrorState } from '~/components/ErrorState'
+import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { Breadcrumbs } from '~/components/Breadcrumbs'
 
@@ -63,6 +64,9 @@ function ImageDetailPage() {
     // it as a not-found empty state rather than a scary error panel.
     if (detail.error instanceof ApiError && detail.error.status === 404) {
       return notFound
+    }
+    if (isRepositoryOffline(detail.error)) {
+      return <RepositoryOfflineState onRetry={() => void detail.refetch()} />
     }
     return (
       <ErrorState

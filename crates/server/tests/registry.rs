@@ -1479,13 +1479,46 @@ async fn admin_validates_docker_repositories() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    // Nor a format-plugin repository: docker has its own mount.
+    let resp = srv
+        .client()
+        .get(format!("{}/repository/a{n}/index.yaml", srv.base_url))
+        .basic_auth(
+            srv.admin_user.clone().unwrap(),
+            Some(srv.admin_scoped_token.clone().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // The admin API lists docker as a built-in format with all three kinds.
+    let (u, p) = srv.admin_basic();
+    let formats: Value = srv
+        .client()
+        .get(format!("{}/admin/formats", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let docker = formats
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "docker")
+        .expect("docker is listed");
+    assert_eq!(docker["builtin"], true);
+    assert_eq!(docker["kinds"], json!(["hosted", "proxy", "group"]));
+    assert_eq!(docker["mount"], "/v2");
 
     // A hosted repository with images is not deleted; a proxy is purged.
     let repo = format!("a{n}");
     let oci = admin_oci(&srv).await;
     oci.push_image(&format!("{repo}/app"), "1", "amd64", b"kept")
         .await;
-    let (u, p) = srv.admin_basic();
     let resp = srv
         .client()
         .delete(format!("{}/admin/repositories/{repo}", srv.base_url))
@@ -1703,7 +1736,7 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(resp.status(), 202);
     let worker = forge_core::retention::RetentionWorker::new(
         srv.pool.clone(),
-        Arc::new(forge_nuget::NugetFormat::default()),
+        Arc::new(forge_nuget::NugetFormat::default()) as Arc<dyn forge_core::format::Format>,
         Arc::new(forge_core::repo::NoopCacheInvalidator),
         forge_core::retention::RetentionConfig::default(),
     );

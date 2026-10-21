@@ -583,29 +583,6 @@ impl BlobStore {
         Ok(out.body)
     }
 
-    /// Fetch bytes `start..=end` of the object at `key` (to its end when `end`
-    /// is `None`), for HTTP range requests.
-    pub async fn get_range(
-        &self,
-        key: &str,
-        start: u64,
-        end: Option<u64>,
-    ) -> Result<ByteStream, S3Error> {
-        let range = match end {
-            Some(end) => format!("bytes={start}-{end}"),
-            None => format!("bytes={start}-"),
-        };
-        let out = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .range(range)
-            .send()
-            .await?;
-        Ok(out.body)
-    }
-
     /// Delete the object at `key`. Idempotent: a missing object is `Ok(())`.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
         self.admit()?;

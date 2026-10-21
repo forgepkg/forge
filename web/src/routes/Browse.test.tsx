@@ -405,6 +405,23 @@ describe('RepoBrowse of a docker repository (images)', () => {
     }
   })
 
+  it('says a docker repository is offline on its 503', async () => {
+    mockApi(
+      () => jsonResponse(page(0, [])),
+      () =>
+        new Response('repository is offline', {
+          status: 503,
+          headers: { 'retry-after': '60' },
+        }),
+    )
+
+    await renderBrowse('/repos/docker-hosted')
+
+    const alert = await screen.findByRole('alert')
+    expect(within(alert).getByText('Repository offline')).toBeInTheDocument()
+    expect(within(alert).queryByText('Could not load images')).toBeNull()
+  })
+
   it('shows the connect snippets with the registry and pull prefix', async () => {
     mockApi(
       () => jsonResponse(page(0, [])),

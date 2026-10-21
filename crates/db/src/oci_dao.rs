@@ -1,4 +1,4 @@
-//! Data access for the Docker/OCI registry tables (migration 0032).
+//! Data access for the Docker/OCI registry tables (migration 0033).
 //!
 //! Reference counting follows the rest of the CAS: every `oci_blob_link`,
 //! `oci_manifest` and `oci_upload_part` row holds one `blob.ref_count`

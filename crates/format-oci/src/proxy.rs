@@ -29,6 +29,7 @@ use forge_core::net::upstream::{Origin, RequestClass};
 use forge_core::repo::proxy::{upstream_credentials, Credentials};
 use forge_db::model::Repository;
 use forge_db::oci_dao::{self, LinkOutcome};
+use forge_storage::BlobRef;
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::Method;
@@ -663,7 +664,7 @@ impl Registry {
                                     &local,
                                     digest,
                                     hit.size,
-                                    Some(&hit.s3_key),
+                                    Some(hit.blob()),
                                     None,
                                 )
                                 .await;
@@ -741,7 +742,7 @@ impl Registry {
         image: &str,
         digest: &Digest,
         size: i64,
-        s3_key: Option<&str>,
+        stored: Option<BlobRef<'_>>,
         bytes: Option<Vec<u8>>,
     ) {
         if size > MAX_CONFIG_BYTES {
@@ -756,9 +757,9 @@ impl Registry {
                 return;
             }
         }
-        let bytes = match (bytes, s3_key) {
+        let bytes = match (bytes, stored) {
             (Some(bytes), _) => bytes,
-            (None, Some(key)) => match self.read_manifest_bytes(key, size).await {
+            (None, Some(blob)) => match self.read_manifest_bytes(blob).await {
                 Ok(bytes) => bytes.to_vec(),
                 Err(_) => return,
             },
