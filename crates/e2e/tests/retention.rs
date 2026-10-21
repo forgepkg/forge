@@ -893,6 +893,25 @@ async fn proxy_evicts_cold_cached_versions_only() {
     .await
     .unwrap();
 
+    // Downloads are counted in batches (#119): let both pulls be written
+    // first, so a late write cannot warm the version backdated below.
+    let mut stamped = 0_i64;
+    for _ in 0..200 {
+        stamped = sqlx::query_scalar(
+            "SELECT count(*) FROM proxy_cached_version \
+             WHERE repository_id = $1 AND last_downloaded_at IS NOT NULL",
+        )
+        .bind(rid)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+        if stamped == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(stamped, 2, "both pulls were counted");
+
     // Make 1.0.0 cold: not pulled for 90 days.
     sqlx::query(
         "UPDATE proxy_cached_version SET last_downloaded_at = now() - interval '90 days' \

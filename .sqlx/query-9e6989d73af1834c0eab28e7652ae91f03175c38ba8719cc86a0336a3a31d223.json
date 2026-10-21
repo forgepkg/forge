@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE component SET last_downloaded_at = now() WHERE id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9e6989d73af1834c0eab28e7652ae91f03175c38ba8719cc86a0336a3a31d223"
+}

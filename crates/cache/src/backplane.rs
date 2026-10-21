@@ -275,6 +275,25 @@ async fn subscriber_loop(
     }
 }
 
+/// The most publishers an instance remembers as tag-capable. A cluster has a
+/// handful; anything that can publish to Redis can name endless origins.
+const MAX_TAG_CAPABLE_ORIGINS: usize = 1024;
+
+/// Remember that `origin` publishes tag messages. At the cap the set starts
+/// over: a real peer announces itself again with its next tag message, and
+/// until then its companion messages are only promoted to tag bumps once
+/// more (a spare Redis round-trip, never a lost invalidation).
+fn note_tag_capable(origins: &mut HashSet<u64>, origin: u64) {
+    if origins.len() >= MAX_TAG_CAPABLE_ORIGINS && !origins.contains(&origin) {
+        tracing::warn!(
+            max = MAX_TAG_CAPABLE_ORIGINS,
+            "backplane: too many publishing origins; forgetting them"
+        );
+        origins.clear();
+    }
+    origins.insert(origin);
+}
+
 async fn apply_message(
     l2: &RedisL2,
     publisher: &redis::aio::ConnectionManager,
@@ -310,7 +329,7 @@ async fn apply_message(
                 tracing::warn!(generation, tag, "backplane: malformed tag generation");
                 return;
             };
-            tag_capable_origins.insert(origin);
+            note_tag_capable(tag_capable_origins, origin);
             // No namespace fence here (see module docs): barriers are
             // monotonic and every read/fill path re-validates against them.
             // Every tag message is an invalidation, also one whose
@@ -376,5 +395,22 @@ async fn apply_message(
             tag_versions.observe_one(&tag, generation);
         }
         other => tracing::warn!(kind = other, "backplane: unknown message kind"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tag_capable_origins_stay_bounded() {
+        let mut origins = HashSet::new();
+        for origin in 0..1_000_000 {
+            note_tag_capable(&mut origins, origin);
+            assert!(origins.len() <= MAX_TAG_CAPABLE_ORIGINS);
+        }
+        // A real peer announcing itself is remembered.
+        note_tag_capable(&mut origins, u64::MAX);
+        assert!(origins.contains(&u64::MAX));
     }
 }

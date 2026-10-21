@@ -418,9 +418,11 @@ Redis**: authorization sets, credential-forwarding verdicts, OIDC discovery
 documents and signing keys, workload-identity token verdicts, and a proxy's
 upstream service index, manifests and registrations are cached in each
 instance's memory only. Redis carries only their invalidations, so the worst
-a Redis writer can do to them is evict them early, or grow every instance's
-memory by publishing invalidations for ever new names (that bookkeeping is not
-bounded yet). The only values still
+a Redis writer can do to them is evict them early. Publishing invalidations
+for ever new names cannot grow an instance's memory without bound either: the
+per-name bookkeeping is capped (100,000 names), and an instance that reaches
+the cap clears it together with its in-memory cache, which costs a round of
+cache misses, not correctness. The only values still
 shared through Redis are two proxy markers ("listing refreshed", "version
 rejected"); forging them can hide a proxied package until its TTL expires,
 not change what is served.

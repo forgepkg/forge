@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE asset a\n        SET download_count = a.download_count + d.n,\n            last_downloaded_at = now()\n        FROM UNNEST($1::bigint[], $2::bigint[]) AS d(id, n)\n        WHERE a.id = d.id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3eae5b6a99f57e967eace2405a6b0c9f90d5fa9f52380ea8a39c9f0ffe08eef"
+}
