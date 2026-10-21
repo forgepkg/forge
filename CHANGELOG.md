@@ -22,7 +22,9 @@ limitations still apply, except where an entry below says otherwise.
 - Durations above 100 years (`outbox.grace_seconds`,
   `retention.default_run_interval_seconds`, `retention.lease_seconds`,
   `crypto.cache.unwrapped_key_ttl_secs`,
-  `crypto.rotation.dek_max_age_days`, `crypto.rotation.kek_max_age_days`)
+  `crypto.rotation.dek_max_age_days`, `crypto.rotation.kek_max_age_days`,
+  and the new `docker.upload_ttl_seconds`,
+  `docker.unreferenced_blob_ttl_seconds` and `docker.sweep_interval_seconds`)
   fail validation instead of panicking later.
   ([#128](https://github.com/schmitch/forge/issues/128))
 - Migration 0032 deletes grants of the `admin` action on a single
@@ -143,7 +145,9 @@ limitations still apply, except where an entry below says otherwise.
   `session_name`, `duration_seconds`). Credentials are refreshed before they
   expire and the token file is read again on each refresh. A failed fetch
   names the credential source and the STS error code, never the token. The
-  short-lived modes refuse S3 keys. The Helm chart has `s3.credentials` and
+  short-lived modes refuse S3 keys, and startup warns about a plain-http
+  `sts_endpoint` (the token and the temporary keys would cross the network
+  in clear text). The Helm chart has `s3.credentials` and
   `s3.webIdentity` (with an optional projected service-account token), and
   the kustomize component `s3-workload-identity` mounts one. See
   [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#short-lived-s3-credentials).
@@ -276,7 +280,8 @@ limitations still apply, except where an entry below says otherwise.
 - With a package delay, proxy search shows a version only once the proxy
   has recorded it and the delay has passed, because a search answer names
   no publish times. Totals of a proxy search are the upstream's, less the
-  ids dropped from the returned page.
+  ids dropped from the returned page; for a caller whose content selectors
+  hide packages, they count what it sees, plus one while more may follow.
 - Behind an outbound proxy, a host name that resolves differently for the
   proxy than for Forge, or that only the proxy can resolve, still gets
   past the metadata guard; block those addresses on the proxy as well.

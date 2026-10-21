@@ -1433,6 +1433,16 @@ impl DockerConfig {
                     .into(),
             ));
         }
+        for (key, seconds) in [
+            ("docker.upload_ttl_seconds", self.upload_ttl_seconds),
+            (
+                "docker.unreferenced_blob_ttl_seconds",
+                self.unreferenced_blob_ttl_seconds,
+            ),
+            ("docker.sweep_interval_seconds", self.sweep_interval_seconds),
+        ] {
+            at_most_100_years(key, i128::from(seconds))?;
+        }
         Ok(())
     }
 }
@@ -2452,6 +2462,22 @@ impl Config {
                     .to_string(),
             );
         }
+        let plain_sts = self.s3.credentials == S3CredentialsMode::WebIdentity
+            && self
+                .s3
+                .web_identity
+                .as_ref()
+                .and_then(|wi| wi.sts_endpoint.as_deref())
+                .is_some_and(|endpoint| {
+                    endpoint.trim().to_ascii_lowercase().starts_with("http://")
+                });
+        if plain_sts {
+            warnings.push(
+                "s3.web_identity.sts_endpoint is plain http: the service-account token and the \
+                 temporary S3 keys STS returns cross the network in clear text; use https"
+                    .to_string(),
+            );
+        }
         warnings
     }
 
@@ -3273,6 +3299,35 @@ mod tests {
             cfg.s3.to_storage().credentials,
             forge_storage::S3Credentials::DefaultChain
         );
+    }
+
+    #[test]
+    fn a_plain_http_sts_endpoint_is_warned_about() {
+        let sts = |endpoint: &str| {
+            let toml = without_s3_keys(&format!(
+                "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"\n\
+                 sts_endpoint = \"{endpoint}\""
+            ));
+            Config::from_figment(fig_from_toml(&toml))
+                .expect("valid")
+                .deployment_warnings()
+        };
+        let warned = |w: &[String]| w.iter().any(|w| w.contains("sts_endpoint is plain http"));
+        assert!(warned(&sts("http://minio:9000")));
+        assert!(!warned(&sts("https://minio:9000")));
+    }
+
+    #[test]
+    fn docker_durations_are_at_most_100_years() {
+        for key in [
+            "upload_ttl_seconds",
+            "unreferenced_blob_ttl_seconds",
+            "sweep_interval_seconds",
+        ] {
+            let toml = format!("{MINIMAL}\n[docker]\n{key} = {}\n", i64::MAX);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(&format!("docker.{key}")), "{err}");
+        }
     }
 
     #[test]

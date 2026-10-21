@@ -2792,6 +2792,35 @@ async fn upstream_search_hits_honour_markers_the_delay_and_the_package_filter() 
     );
     assert_eq!(result.total_hits, 3);
 
+    // The upstream's total counts what the filter hides too: a filtered
+    // caller is told only what it sees, plus one while more may follow.
+    mock.set_search(
+        StatusCode::OK,
+        vec![
+            search_entry("Seen.Lib", &["1.0.0"]),
+            search_entry("Hidden.Lib", &["1.0.0"]),
+        ],
+        1000,
+    );
+    let page = forge_core::repo::SearchParams {
+        take: 2,
+        ..forge_core::repo::SearchParams::default()
+    };
+    let result = px
+        .search_with_package_filter(&repo, &page, &filter)
+        .await
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.total_hits, 2);
+    let result = px
+        .search_with_package_filter(&repo, &page, &forge_core::authz::PackageFilter::AllowAll)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.total_hits, 1000,
+        "an unfiltered caller gets the upstream's"
+    );
+
     // With a delay of an hour, only what the proxy saw over an hour ago.
     let delayed = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
     record_version(&pool, &delayed, "seen.lib", "1.0.0", 7200, false).await;
