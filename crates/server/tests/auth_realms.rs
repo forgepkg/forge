@@ -698,3 +698,193 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
         "the dummy verification was not attempted: {outcome:?}"
     );
 }
+
+/// The last enabled realm people sign in with interactively (local or OIDC)
+/// cannot be disabled or deleted: without one, every password and OIDC
+/// login fails, and the admin UI is reachable again only with an
+/// admin-scoped token or SQL. Its own database, since it disables `local`.
+#[tokio::test]
+async fn the_last_interactive_realm_cannot_be_disabled_or_deleted() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let realms_url = format!("{}/admin/realms", srv.base_url);
+    let patch = |id: i64, body: Value| {
+        client
+            .patch(format!("{realms_url}/{id}"))
+            .basic_auth(&admin, Some(&password))
+            .json(&body)
+            .send()
+    };
+    let realms: Vec<Value> = client
+        .get(&realms_url)
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let local_id = realms.iter().find(|r| r["kind"] == "local").unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // Only `local`: refused, and it stays enabled.
+    let resp = patch(local_id, json!({"enabled": false})).await.unwrap();
+    assert_eq!(resp.status(), 409);
+    assert_eq!(
+        resp.text().await.unwrap(),
+        "no enabled realm to sign in with would remain (local or OIDC); enable another one first"
+    );
+    let local: Value = client
+        .get(format!("{realms_url}/{local_id}"))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(local["enabled"], true);
+
+    // A non-interactive realm does not count.
+    let resp = client
+        .post(&realms_url)
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"kind": "credential_forwarding", "name": "nexus",
+                      "config": {"url": "https://nexus.invalid/status", "key_pepper": "p"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = patch(local_id, json!({"enabled": false})).await.unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // With an enabled OIDC realm, `local` can be disabled...
+    let resp = client
+        .post(&realms_url)
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"kind": "oidc", "name": "entra", "config": {
+            "issuer": "https://login.microsoftonline.com/tid/v2.0",
+            "client_id": "cid",
+            "client_secret": "shh",
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let oidc_id = client
+        .get(&realms_url)
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json::<Vec<Value>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r["kind"] == "oidc")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = patch(local_id, json!({"enabled": false})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    // ...and then the OIDC realm is the last one: neither disabled nor deleted.
+    let resp = patch(oidc_id, json!({"enabled": false})).await.unwrap();
+    assert_eq!(resp.status(), 409);
+    let resp = client
+        .delete(format!("{realms_url}/{oidc_id}"))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    // Other edits of it still work.
+    let resp = patch(oidc_id, json!({"name": "entra-id"})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // With `local` back on, the OIDC realm can go.
+    let resp = patch(local_id, json!({"enabled": true})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .delete(format!("{realms_url}/{oidc_id}"))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+/// A PATCH merges its body over the realm it read and writes the whole row
+/// back. A change committed in between (another admin's config edit, a
+/// reorder) used to be overwritten silently; the write is now a
+/// compare-and-set and the PATCH answers 409.
+#[tokio::test]
+async fn a_realm_patch_never_undoes_a_concurrent_change() {
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("nexus{}", common::unique());
+    // Disabled: it must not join the shared database's login chain.
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(
+            &json!({"kind": "credential_forwarding", "name": name, "enabled": false,
+                      "config": {"url": "https://nexus.invalid/status", "key_pepper": "p"}}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+
+    // Hold the row so the PATCH, having read it, waits at its write...
+    let mut other = srv.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM auth_realm WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    let rename = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{}/admin/realms/{id}", srv.base_url);
+        let (admin, password) = (admin.clone(), password.clone());
+        let renamed = format!("{name}-renamed");
+        async move {
+            let resp = client
+                .patch(url)
+                .basic_auth(&admin, Some(&password))
+                .json(&json!({"name": renamed}))
+                .send()
+                .await
+                .unwrap();
+            (resp.status(), resp.text().await.unwrap())
+        }
+    });
+    common::wait_for_lock_wait(&srv.pool, &["%UPDATE auth_realm SET%"]).await;
+    // ...while another change of the realm commits.
+    sqlx::query(
+        "UPDATE auth_realm SET config = config || '{\"required_groups\": [\"forge\"]}', \
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *other)
+    .await
+    .unwrap();
+    other.commit().await.unwrap();
+
+    let (status, body) = rename.await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    let realm: Value = client
+        .get(format!("{}/admin/realms/{id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(realm["config"]["required_groups"], json!(["forge"]));
+    assert_eq!(realm["name"], json!(name));
+}
