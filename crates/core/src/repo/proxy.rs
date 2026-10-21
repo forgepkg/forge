@@ -117,8 +117,9 @@ use crate::repo::{
 pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// Cache namespace marking a package's upstream version listing as fresh,
 /// keyed by `"{scope}/{lower_id}"`. In this and the namespaces below, `scope`
-/// is `"{repo}/{repo_id}/{remote_url digest}"`, so nothing cached from a
-/// previous upstream is used once a proxy is repointed.
+/// is `"{repo}/{repo_id}/{remote_url digest}/{updated_at}"`, so nothing
+/// cached from a previous upstream, or before a repoint, is used once a proxy
+/// is repointed.
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
 /// Cache namespace for upstream `.nuspec` documents of not-yet-downloaded
 /// versions, keyed by `"{scope}/{lower_id}/{version}"`.
@@ -132,6 +133,9 @@ pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
+/// Cache namespace for the creation time an upstream catalog entry names,
+/// keyed by `"{scope}/{catalog entry url}"`.
+pub const NS_UPSTREAM_CATALOG: &str = "proxy_catalog";
 
 /// The earliest upstream publish time the package delay trusts
 /// (2010-01-01, before any NuGet feed): nuget.org reports unlisted versions as
@@ -152,6 +156,15 @@ const NUSPEC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 
 /// so this covers the newest ~640; older versions of a larger package fall
 /// back to the flat-container view.
 const MAX_REGISTRATION_PAGES: usize = 10;
+/// Dating the package delay of versions still inside it reads every upstream
+/// registration page that covers one, up to this many (8192 versions on
+/// nuget.org). It runs when a listing is refreshed, and a version leaves the
+/// delay once dated, so a package's older pages are read about once.
+const MAX_BACKDATE_REGISTRATION_PAGES: usize = 128;
+/// At most this many upstream catalog entries are read per listing refresh to
+/// date unlisted versions ([`ProxyRepo::date_delay_from_upstream`]); the rest
+/// are dated at the next refresh.
+const MAX_CATALOG_FETCHES: usize = 32;
 /// Concurrent upstream registration page fetches per request.
 const REGISTRATION_PAGE_CONCURRENCY: usize = 4;
 
@@ -255,6 +268,10 @@ struct UpstreamLeaf {
     published: Option<DateTime<Utc>>,
     /// The dependency groups.
     groups: Vec<UpstreamGroup>,
+    /// The `@id` of the version's catalog entry, which names when the
+    /// version was created even when it is unlisted.
+    #[serde(default)]
+    catalog_url: Option<String>,
 }
 
 impl UpstreamLeaf {
@@ -499,12 +516,24 @@ impl ProxyRepo {
 
     /// The key prefix of everything cached from `repo`'s upstream: the
     /// repository (its id too, so a deleted-and-recreated repository starts
-    /// afresh) and a digest of its `remote_url`, so a repointed proxy never
-    /// serves what the previous upstream answered. A digest rather than the
-    /// URL itself keeps keys that append another URL unambiguous.
+    /// afresh), a digest of its `remote_url`, so a repointed proxy never
+    /// serves what the previous upstream answered, and the row's
+    /// `updated_at`, so every repoint starts afresh too. Repointing resets
+    /// what the proxy learned (`reset_for_new_upstream` deletes the listed
+    /// versions not downloaded yet); without the timestamp, pointing back to
+    /// an upstream within the metadata TTL found that upstream's "listing
+    /// refreshed" marker still valid and served the emptied listing until
+    /// it expired. A digest rather than the URL itself keeps keys that
+    /// append another URL unambiguous.
     fn upstream_scope(repo: &Repository) -> String {
         let digest = Sha256::digest(repo.remote_url.as_deref().unwrap_or_default());
-        format!("{}/{}/{}", repo.name, repo.id, hex::encode(&digest[..8]))
+        format!(
+            "{}/{}/{}/{}",
+            repo.name,
+            repo.id,
+            hex::encode(&digest[..8]),
+            repo.updated_at.timestamp_micros()
+        )
     }
 
     /// Cache key of the "listing refreshed" marker of `lower_id`.
@@ -1509,26 +1538,34 @@ impl ProxyRepo {
     /// failure yield what could be gathered (possibly nothing), and the caller
     /// falls back to the flat-container view. Inlined leaves cost no extra
     /// request; of the non-inlined pages covering a wanted version, at most
-    /// [`MAX_REGISTRATION_PAGES`] (newest first) are fetched. The index and
-    /// each page are cached for the metadata TTL.
+    /// `max_pages` (newest first) are fetched. The index and each page are
+    /// cached for the metadata TTL.
+    ///
+    /// Also returns the newest version the index names (the highest page
+    /// `upper`), whether or not its leaf was read.
     async fn upstream_registration(
         &self,
         repo: &Repository,
         lower_id: &str,
         wanted: &[String],
-    ) -> HashMap<String, UpstreamLeaf> {
+        max_pages: usize,
+    ) -> (HashMap<String, UpstreamLeaf>, Option<String>) {
         let mut out = HashMap::new();
         if !repo.online || wanted.is_empty() {
-            return out;
+            return (out, None);
         }
         let pages = match Box::pin(self.upstream_registration_index(repo, lower_id)).await {
             Ok(Some(pages)) => pages,
-            Ok(None) => return out,
+            Ok(None) => return (out, None),
             Err(e) => {
                 tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream registration unavailable; serving flat-container metadata");
-                return out;
+                return (out, None);
             }
         };
+        let newest = pages
+            .iter()
+            .filter_map(|page| page.upper.clone())
+            .max_by(|a, b| self.format.compare_versions(a, b));
 
         let mut to_fetch: Vec<(Option<String>, String)> = Vec::new();
         for page in pages {
@@ -1555,7 +1592,7 @@ impl ProxyRepo {
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         });
-        to_fetch.truncate(MAX_REGISTRATION_PAGES);
+        to_fetch.truncate(max_pages);
 
         use futures_util::StreamExt;
         let fetched: Vec<_> = futures_util::stream::iter(to_fetch)
@@ -1574,7 +1611,7 @@ impl ProxyRepo {
                 }
             }
         }
-        out
+        (out, newest)
     }
 
     /// The upstream registration index of `lower_id` (`None`: the upstream has
@@ -1732,6 +1769,10 @@ impl ProxyRepo {
                     listed,
                     published,
                     groups,
+                    catalog_url: entry
+                        .get("@id")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string),
                 },
             );
         }
@@ -1930,7 +1971,9 @@ impl ProxyRepo {
         visible.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
 
         let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
-        let upstream = self.upstream_leaves(&repo_row, &lower, &wanted).await;
+        let upstream = self
+            .upstream_leaves(&repo_row, &lower, &wanted, MAX_REGISTRATION_PAGES)
+            .await;
 
         // Persist the upstream listing state so the flat index and search
         // report it too (best effort).
@@ -2047,19 +2090,37 @@ impl ProxyRepo {
     /// [`Self::upstream_registration`] for `wanted`, without leaves that name
     /// another package (they are not this package's metadata). Records the
     /// package id's upstream casing for search (best effort).
+    ///
+    /// Each version keeps the casing it was pushed with (`jQuery` /
+    /// `jquery`), so the casing recorded is the newest version's, the one
+    /// nuget.org shows for the package, and only when its leaf was read:
+    /// taking any leaf made the recorded casing, and search, flip between
+    /// reads.
     async fn upstream_leaves(
         &self,
         repo: &Repository,
         lower_id: &str,
         wanted: &[String],
+        max_pages: usize,
     ) -> HashMap<String, UpstreamLeaf> {
-        let mut upstream = self.upstream_registration(repo, lower_id, wanted).await;
+        let (mut upstream, newest) = self
+            .upstream_registration(repo, lower_id, wanted, max_pages)
+            .await;
         upstream.retain(|_, leaf| {
             leaf.id
                 .as_deref()
                 .is_none_or(|id| self.format.lower_id(id) == lower_id)
         });
-        if let Some(original_id) = upstream.values().find_map(|leaf| leaf.id.as_deref()) {
+        let newest_leaf = upstream
+            .iter()
+            .filter_map(|(version, leaf)| leaf.id.as_deref().map(|id| (version, id)))
+            .max_by(|(a, _), (b, _)| self.format.compare_versions(a, b))
+            .filter(|(version, _)| {
+                newest.as_deref().is_none_or(|newest| {
+                    self.format.compare_versions(version, newest) != std::cmp::Ordering::Less
+                })
+            });
+        if let Some((_, original_id)) = newest_leaf {
             if let Err(e) =
                 proxy_dao::record_original_id(&self.pool, repo.id, lower_id, original_id).await
             {
@@ -2076,11 +2137,18 @@ impl ProxyRepo {
     /// package this proxy has not served before, all of them on a fresh
     /// install) was hidden for the whole delay.
     ///
-    /// Only a listed version's upstream publish time counts, and only a
-    /// plausible one: nuget.org reports unlisted versions as published in
-    /// 1900, which would let a release unlisted right after publishing skip
-    /// the quarantine, and a time in the future is ignored. Best effort: when
-    /// the upstream registration is unavailable, the first sighting stands.
+    /// A listed version counts from its registration `published` time. An
+    /// unlisted one counts from when its catalog entry says it was `created`:
+    /// nuget.org reports unlisted versions as published in 1900, which would
+    /// let a release unlisted right after publishing skip the quarantine, so
+    /// that time is never used, but an old unlisted version that a lockfile
+    /// pins is still restorable at once (up to [`MAX_CATALOG_FETCHES`]
+    /// catalog reads per refresh; the rest at the next one). Only a plausible
+    /// time counts (not before 2010, not in the future), and it only ever
+    /// moves the clock back. Every registration page covering a pending
+    /// version is read, up to [`MAX_BACKDATE_REGISTRATION_PAGES`]. Best
+    /// effort: when the upstream registration is unavailable, the first
+    /// sighting stands.
     async fn date_delay_from_upstream(&self, repo: &Repository, lower_id: &str) {
         let result: Result<(), RepoError> = async {
             let now = self.db_now().await?;
@@ -2094,14 +2162,21 @@ impl ProxyRepo {
                 return Ok(());
             }
             let wanted: Vec<String> = pending.iter().map(|r| r.version.clone()).collect();
-            let leaves = self.upstream_leaves(repo, lower_id, &wanted).await;
+            let leaves = self
+                .upstream_leaves(repo, lower_id, &wanted, MAX_BACKDATE_REGISTRATION_PAGES)
+                .await;
+            let created = self.unlisted_created(repo, &pending, &leaves).await;
+            let plausible = |at: &DateTime<Utc>| *at >= min_trusted_publish_time() && *at <= now;
             let (versions, published): (Vec<String>, Vec<DateTime<Utc>>) = pending
                 .iter()
                 .filter_map(|r| {
-                    let leaf = leaves.get(&r.version).filter(|leaf| leaf.listed)?;
-                    let at = leaf
-                        .published
-                        .filter(|at| *at >= min_trusted_publish_time() && *at <= now)?;
+                    let leaf = leaves.get(&r.version)?;
+                    let at = if leaf.listed {
+                        leaf.published
+                    } else {
+                        created.get(&r.version).copied()
+                    }
+                    .filter(plausible)?;
                     (at < r.first_seen_at).then(|| (r.version.clone(), at))
                 })
                 .unzip();
@@ -2113,6 +2188,67 @@ impl ProxyRepo {
         if let Err(e) = result {
             tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "dating the package delay from the upstream failed");
         }
+    }
+
+    /// When the upstream created each of `pending`'s unlisted versions, read
+    /// from the catalog entries their registration leaves name (at most
+    /// [`MAX_CATALOG_FETCHES`]). An entry that cannot be read or names no
+    /// creation time is left out.
+    async fn unlisted_created(
+        &self,
+        repo: &Repository,
+        pending: &[forge_db::model::ProxyCachedVersion],
+        leaves: &HashMap<String, UpstreamLeaf>,
+    ) -> HashMap<String, DateTime<Utc>> {
+        use futures_util::StreamExt;
+        let to_read: Vec<(String, String)> = pending
+            .iter()
+            .filter_map(|r| {
+                let leaf = leaves.get(&r.version).filter(|leaf| !leaf.listed)?;
+                Some((r.version.clone(), leaf.catalog_url.clone()?))
+            })
+            .take(MAX_CATALOG_FETCHES)
+            .collect();
+        futures_util::stream::iter(to_read)
+            .map(|(version, url)| async move {
+                match self.upstream_catalog_created(repo, &url).await {
+                    Ok(created) => created.map(|at| (version, at)),
+                    Err(e) => {
+                        tracing::warn!(repo = %repo.name, %url, error = %e, "upstream catalog entry unavailable");
+                        None
+                    }
+                }
+            })
+            .buffered(REGISTRATION_PAGE_CONCURRENCY)
+            .filter_map(|dated| async move { dated })
+            .collect()
+            .await
+    }
+
+    /// The `created` time of one upstream catalog entry (`None` when it names
+    /// none). A catalog entry never changes, so it is cached like a manifest.
+    async fn upstream_catalog_created(
+        &self,
+        repo: &Repository,
+        url: &str,
+    ) -> Result<Option<DateTime<Utc>>, RepoError> {
+        let key = format!("{}/{url}", Self::upstream_scope(repo));
+        self.cache
+            // Local-only, like the registration it comes from.
+            .get_or_try_insert_local(NS_UPSTREAM_CATALOG, &key, NUSPEC_CACHE_TTL, || async {
+                let doc = self
+                    .fetch_json(repo, url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(doc
+                    .as_ref()
+                    .and_then(|doc| doc.get("created"))
+                    .and_then(JsonValue::as_str)
+                    .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                    .map(|at| at.with_timezone(&Utc)))
+            })
+            .await
+            .map_err(RepoError::Storage)
     }
 }
 
@@ -2432,6 +2568,7 @@ mod tests {
                 Some("net8.0".into()),
                 vec![("B".into(), Some("[1.0.0, )".into())), ("C".into(), None)],
             )],
+            catalog_url: None,
         };
         let groups = leaf.dependency_groups();
         assert_eq!(groups.len(), 1);
