@@ -329,16 +329,43 @@ impl OidcMetadataClient {
             .await
     }
 
-    /// Force a cache-bypassing JWKS refetch: drop the cached entry (which also
-    /// broadcasts an invalidation to peer instances via the cache backplane,
-    /// when Redis is configured), then repopulate it.
+    /// Refetch the JWKS after a `kid` miss (an early IdP key rotation),
+    /// bypassing the cache; `cached` is the set that missed.
     ///
-    /// Per-instance coalescing means a rotation storm refetches at most once per
-    /// instance; we deliberately use **no** advisory lock — an occasional
-    /// duplicate JWKS fetch is harmless.
-    async fn refetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, OidcError> {
+    /// The fetch comes first. When it fails, `cached` stays in place and keeps
+    /// verifying tokens signed with its keys: the token that triggered the
+    /// refresh needs no valid signature, so dropping the keys first would let
+    /// anyone empty every instance's cache during an IdP outage. Only a set
+    /// that differs from `cached` replaces it, through an invalidation that
+    /// also reaches the peer instances (via the cache backplane, when Redis is
+    /// configured) so they pick up the rotated keys; a refresh that finds the
+    /// same keys changes nothing anywhere.
+    ///
+    /// We deliberately use **no** advisory lock: an occasional duplicate JWKS
+    /// fetch is harmless.
+    async fn refetch_jwks(&self, jwks_uri: &str, cached: JwkSet) -> JwkSet {
+        let fresh = match fetch_json::<JwkSet>(&self.http, jwks_uri, "jwks").await {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(
+                    issuer = %self.issuer,
+                    error = %e,
+                    "jwks refresh after an unknown kid failed; keeping the cached keys"
+                );
+                return cached;
+            }
+        };
+        if fresh == cached {
+            return cached;
+        }
         self.cache.invalidate(NS_JWKS, &self.issuer).await;
-        self.fetch_jwks_cached(jwks_uri).await
+        let stored = fresh.clone();
+        self.cache
+            .get_or_try_insert_local(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
+                Ok::<JwkSet, Infallible>(stored)
+            })
+            .await
+            .unwrap_or_else(|never| match never {})
     }
 
     /// Claim the issuer's single unknown-`kid` refresh slot for the cooldown
@@ -482,7 +509,7 @@ impl OidcMetadataClient {
         let mut jwks = self.fetch_jwks_cached(&jwks_uri).await?;
         let mut jwk = find_key(&jwks, kid.as_deref());
         if jwk.is_none() && self.acquire_unknown_kid_refresh().await {
-            jwks = self.refetch_jwks(&jwks_uri).await?;
+            jwks = self.refetch_jwks(&jwks_uri, jwks.clone()).await;
             jwk = find_key(&jwks, kid.as_deref());
         }
         let jwk = jwk.ok_or_else(|| OidcError::UnknownKid(kid.clone()))?;
@@ -1506,6 +1533,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_kid_miss_refresh_keeps_the_cached_keys() {
+        // A token with a made-up kid (no valid signature needed) while the
+        // IdP's JWKS endpoint is down must not cost the cached keys: tokens
+        // signed with them keep verifying until the endpoint recovers.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let present = TestSigner::new("present-kid");
+        let made_up = TestSigner::new("made-up-kid");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_json(&issuer, &issuer)),
+            )
+            .mount(&server)
+            .await;
+        let jwks_hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(FirstThenDown {
+                body: json!({ "keys": [present.jwk] }),
+                hits: jwks_hits.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let client = client_for(&issuer, &server);
+        let params = VerifyParams {
+            audience: "client-abc".into(),
+            nonce: Some("n".into()),
+            leeway_seconds: 60,
+        };
+        let good = present.sign(&good_claims(&issuer, "client-abc", "n"));
+        client
+            .verify_id_token(&good, &params)
+            .await
+            .expect("cold load");
+
+        let bogus = made_up.sign(&good_claims(&issuer, "client-abc", "n"));
+        let err = client.verify_id_token(&bogus, &params).await.unwrap_err();
+        assert_eq!(err, OidcError::UnknownKid(Some("made-up-kid".into())));
+        // The refresh was tried, and failed.
+        assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
+
+        // The cached keys survived: no fetch needed (the endpoint is down).
+        client
+            .verify_id_token(&good, &params)
+            .await
+            .expect("cached key still verifies");
+        assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn discovery_rejects_issuer_host_mismatch_in_endpoints() {
         // SSRF sanity: an advertised jwks_uri on a different host than the issuer
         // must be rejected even if the doc's `issuer` field matches.
@@ -1605,6 +1684,21 @@ mod tests {
     /// JWKS responder that serves `[old]` on the first hit and `[old, new]`
     /// afterwards — simulating an IdP that rolled in a new signing key.
     #[derive(Clone)]
+    /// Serves `body` once, then answers 503 (an IdP outage).
+    struct FirstThenDown {
+        body: serde_json::Value,
+        hits: Arc<AtomicUsize>,
+    }
+    impl Respond for FirstThenDown {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if self.hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(self.body.clone())
+            } else {
+                ResponseTemplate::new(503)
+            }
+        }
+    }
+
     struct RotatingJwks {
         hits: Arc<AtomicUsize>,
         old: serde_json::Value,
