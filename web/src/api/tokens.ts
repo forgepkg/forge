@@ -32,6 +32,23 @@ export interface TokenView {
   /** RFC3339 timestamp of the most recent use, else `null`. */
   last_used_at: string | null
   created_at: string
+  /**
+   * The token's privilege scope as stored, or `null` when unscoped (the
+   * owner's access without `admin`). A stored scope that does not parse is
+   * passed through as-is; the server denies such a token everything.
+   */
+  scope?: TokenScope | null
+}
+
+/**
+ * Per-token scope (`forge_core::authz::TokenScope`): it only narrows the
+ * owner's access. An absent `actions` means read/write/delete (never
+ * `admin`); an absent `repositories` means every repository the owner can
+ * reach.
+ */
+export interface TokenScope {
+  actions?: Array<'read' | 'write' | 'delete' | 'admin'> | null
+  repositories?: number[] | null
 }
 
 /** `POST /admin/users/{id}/tokens` request body (`CreateToken`). */

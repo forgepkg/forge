@@ -226,6 +226,27 @@ describe('Login', () => {
       )
       // No password step was revealed.
       expect(screen.queryByLabelText('Password')).not.toBeInTheDocument()
+      // The browser is leaving: Continue stays disabled, so a second click
+      // cannot start another flow.
+      expect(screen.getByRole('button', { name: 'Checking…' })).toBeDisabled()
+      expect(assignLocation).toHaveBeenCalledTimes(1)
+    })
+
+    it('re-enables Continue when the identify request fails', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () => new Response('boom', { status: 500 }),
+      })
+
+      await renderLogin()
+
+      await user.type(await screen.findByLabelText('Username'), 'bob')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+
+      expect(await screen.findByRole('alert')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Continue' })).toBeEnabled()
+      expect(assignLocation).not.toHaveBeenCalled()
     })
   })
 

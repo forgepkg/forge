@@ -239,6 +239,7 @@ function CreateUserForm() {
           <Label>Password</Label>
           <Input
             type="password"
+            autoComplete="new-password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />

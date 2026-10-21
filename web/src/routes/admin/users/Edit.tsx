@@ -8,7 +8,6 @@ import {
   useRevokeToken,
   useTokens,
 } from '~/queries/useTokens'
-import { Badge } from '~/components/catalyst/badge'
 import { Button } from '~/components/catalyst/button'
 import { Field, Label } from '~/components/catalyst/fieldset'
 import { Heading } from '~/components/catalyst/heading'
@@ -25,6 +24,7 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
+import { TokenScopeBadges, TokenStatusBadge } from '~/components/TokenBadges'
 
 export const Route = createFileRoute('/_app/manage/users/$userId')({
   component: UserTokens,
@@ -142,6 +142,7 @@ function UserTokens() {
               <TableHeader>Name</TableHeader>
               <TableHeader>Created</TableHeader>
               <TableHeader>Last used</TableHeader>
+              <TableHeader>Scope</TableHeader>
               <TableHeader>Status</TableHeader>
               <TableHeader>Actions</TableHeader>
             </TableRow>
@@ -208,11 +209,10 @@ function TokenRow({
         {formatTs(token.last_used_at)}
       </TableCell>
       <TableCell>
-        {revoked ? (
-          <Badge color="zinc">revoked</Badge>
-        ) : (
-          <Badge color="emerald">active</Badge>
-        )}
+        <TokenScopeBadges scope={token.scope} />
+      </TableCell>
+      <TableCell>
+        <TokenStatusBadge token={token} />
       </TableCell>
       <TableCell>
         {revoked ? (

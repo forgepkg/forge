@@ -200,6 +200,27 @@ describe('RepoBrowse (per-repo search)', () => {
     expect(await screen.findByText('No packages found')).toBeInTheDocument()
   })
 
+  it('a page past the last result offers a way back instead of looking empty', async () => {
+    // An old bookmark: 25 packages, but skip=40 is past the last page.
+    mockApi((url) => {
+      const skip = Number(url.searchParams.get('skip') ?? '0')
+      return jsonResponse(skip === 0 ? page(25, ['Alpha']) : page(25, []))
+    })
+
+    const user = userEvent.setup()
+    const router = await renderBrowse('/repos/nuget?q=a&skip=40')
+
+    expect(await screen.findByText('No packages on this page')).toBeInTheDocument()
+    expect(
+      screen.queryByText('This repository does not contain any packages yet.'),
+    ).toBeNull()
+
+    await user.click(screen.getByRole('link', { name: 'Back to page 1' }))
+
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
+    expect(router.state.location.search).toEqual({ q: 'a' })
+  })
+
   it('shows an error state with a retry on failure', async () => {
     mockApi(() => new Response('boom', { status: 500 }))
 
