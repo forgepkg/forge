@@ -6,6 +6,7 @@ import {
   useMembers,
   useRemoveMember,
   useRepositories,
+  useUpdateMember,
 } from '~/queries/useRepositories'
 import { Button } from '~/components/catalyst/button'
 import { Field, Label } from '~/components/catalyst/fieldset'
@@ -25,9 +26,13 @@ export const Route = createFileRoute(
 /**
  * Group-members editor (plan §Phase 4). Lists the group's members ordered by
  * priority and lets an admin add a member (a repository name + a unique
- * priority) or remove one. Priority is **unique per group** (the server returns
- * 409 on a duplicate); the add form pre-empts that with client-side validation,
- * and still surfaces a server 409 inline if a race slips through.
+ * priority), flag or unflag it as an owner of the group's package ids, or
+ * remove one. Priority is **unique per group** (the server returns 409 on a
+ * duplicate); the add form pre-empts that with client-side validation, and
+ * still surfaces a server 409 inline if a race slips through. Groups may be
+ * nested: the server refuses (409) a member that would create a cycle or
+ * exceed the nesting depth, and that reason is shown inline. An owner cannot
+ * be removed until it is unflagged.
  */
 function GroupMembers() {
   const { repo: name } = Route.useParams()
@@ -35,13 +40,15 @@ function GroupMembers() {
   const members = useMembers(name)
   const add = useAddMember(name)
   const remove = useRemoveMember(name)
+  const update = useUpdateMember(name)
 
-  // Candidate members = non-group repos that are not already members.
+  // Candidate members = every other repository (groups included) that is not
+  // already a member; the server guards cycles and the nesting depth.
   const allRepos = useRepositories()
   const memberNames = new Set((members.data ?? []).map((m) => m.name))
   const usedPriorities = new Set((members.data ?? []).map((m) => m.priority))
   const candidates = (allRepos.data ?? []).filter(
-    (r) => r.kind !== 'group' && r.name !== name && !memberNames.has(r.name),
+    (r) => r.name !== name && !memberNames.has(r.name),
   )
 
   const [member, setMember] = useState('')
@@ -99,7 +106,9 @@ function GroupMembers() {
         </Heading>
         <Text className="mt-1">
           Higher priority wins when the same package id + version is present in
-          more than one member.
+          more than one member. Once any member is an owner, only owners claim
+          package ids under &ldquo;Prefer hosted packages&rdquo; and serve the
+          reserved prefixes.
         </Text>
       </div>
 
@@ -108,14 +117,32 @@ function GroupMembers() {
       ) : (
         <PriorityList
           members={members.data ?? []}
-          busy={remove.isPending}
-          onRemove={(m) => remove.mutate(m)}
+          busy={remove.isPending || update.isPending}
+          onRemove={(m) => {
+            update.reset()
+            remove.mutate(m)
+          }}
+          onToggleOwner={(member, owner) => {
+            remove.reset()
+            update.mutate({ member, owner })
+          }}
         />
+      )}
+
+      {update.isError && (
+        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
+          Could not {update.variables?.owner ? 'flag' : 'unflag'}{' '}
+          {update.variables?.member} as owner:{' '}
+          {update.error.body || update.error.message}
+        </p>
       )}
 
       {remove.isError && (
         <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
           {remove.error.body || remove.error.message}
+          {/* 409 = the member is an owner; the toggle above unflags it. */}
+          {remove.error.status === 409 &&
+            ` Clear the owner box of ${remove.variables} first, then remove it.`}
         </p>
       )}
 
@@ -163,8 +190,8 @@ function GroupMembers() {
         )}
         {candidates.length === 0 && !allRepos.isLoading && (
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
-            No eligible repositories to add (groups cannot be nested, and a group
-            cannot contain itself).
+            No eligible repositories to add (every other repository is already
+            a member, and a group cannot contain itself).
           </p>
         )}
       </form>

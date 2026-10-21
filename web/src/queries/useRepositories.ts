@@ -14,6 +14,7 @@ import {
   fetchRepository,
   removeMember,
   repoKeys,
+  updateMember,
   updateRepository,
   type AddMember,
   type CreateRepo,
@@ -111,6 +112,17 @@ export function useRemoveMember(name: string) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, string>({
     mutationFn: (member) => removeMember(name, member),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
+    },
+  })
+}
+
+/** Flag or unflag a member as owner; invalidates that group's member list. */
+export function useUpdateMember(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, { member: string; owner: boolean }>({
+    mutationFn: ({ member, owner }) => updateMember(name, member, { owner }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
     },

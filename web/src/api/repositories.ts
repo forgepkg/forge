@@ -16,8 +16,10 @@ import { httpClient } from '~/lib/httpClient'
  *    field keeps the stored value; the nullable proxy fields (credentials,
  *    TTLs) are cleared by an explicit `null`. `kind` / `format` are not
  *    updatable.
- *  - `MemberView` / `AddMember` (`crates/server/src/admin/members.rs`) drive the
- *    group editor; `priority` is unique within a group (a duplicate → 409).
+ *  - `MemberView` / `AddMember` / `UpdateMember`
+ *    (`crates/server/src/admin/members.rs`) drive the group editor; `priority`
+ *    is unique within a group (a duplicate → 409). A member may itself be a
+ *    group; an add that would create a cycle or nest too deep → 409.
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.
@@ -115,7 +117,9 @@ export interface MemberView {
   /**
    * Owns the group's package ids: once any member is an owner, only owners
    * hide proxy versions (`prefer_hosted`) and serve reserved prefixes. Set
-   * through the admin API; an owner must be unflagged before removal.
+   * with `PATCH .../members/{member}` (the members screen's owner toggle); a
+   * proxy cannot be an owner (400), and an owner must be unflagged before
+   * it can be removed (409).
    */
   owner: boolean
 }
@@ -124,6 +128,11 @@ export interface MemberView {
 export interface AddMember {
   member: string
   priority: number
+}
+
+/** `PATCH /admin/repositories/{name}/members/{member}` body (`UpdateMember`). */
+export interface UpdateMember {
+  owner: boolean
 }
 
 /**
@@ -199,5 +208,17 @@ export function addMember(name: string, body: AddMember): Promise<void> {
 export function removeMember(name: string, member: string): Promise<void> {
   return httpClient.delete<void>(
     `/admin/repositories/${encodeURIComponent(name)}/members/${encodeURIComponent(member)}`,
+  )
+}
+
+/** `PATCH /admin/repositories/{name}/members/{member}` — set `owner` (204). */
+export function updateMember(
+  name: string,
+  member: string,
+  body: UpdateMember,
+): Promise<void> {
+  return httpClient.patch<void>(
+    `/admin/repositories/${encodeURIComponent(name)}/members/${encodeURIComponent(member)}`,
+    body,
   )
 }

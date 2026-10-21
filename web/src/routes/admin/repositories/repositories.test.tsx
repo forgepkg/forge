@@ -20,7 +20,9 @@ import { routeTree } from '~/routeTree.gen'
  * exercised:
  *  - the list renders repositories;
  *  - create-hosted POSTs the right body to `/admin/repositories`;
- *  - the group members editor prevents a duplicate priority before any request.
+ *  - the group members editor prevents a duplicate priority before any request,
+ *    toggles a member's owner flag, explains a refused owner removal, and
+ *    offers other groups as (nested) members.
  */
 
 const adminMe: Me = {
@@ -65,6 +67,8 @@ interface ApiHandlers {
   onCreate?: (body: unknown) => Response
   onUpdate?: (name: string, body: unknown) => Response
   onAddMember?: (body: unknown) => Response
+  onPatchMember?: (member: string, body: unknown) => Response
+  onRemoveMember?: (member: string) => Response
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -94,6 +98,24 @@ function mockApi(h: ApiHandlers) {
         const body = init?.body ? JSON.parse(init.body as string) : {}
         return Promise.resolve(
           h.onAddMember ? h.onAddMember(body) : json(null, 201),
+        )
+      }
+      const memberMatch = path.match(/\/members\/([^/]+)$/)
+      if (memberMatch && method === 'PATCH') {
+        const member = decodeURIComponent(memberMatch[1])
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onPatchMember
+            ? h.onPatchMember(member, body)
+            : new Response(null, { status: 204 }),
+        )
+      }
+      if (memberMatch && method === 'DELETE') {
+        const member = decodeURIComponent(memberMatch[1])
+        return Promise.resolve(
+          h.onRemoveMember
+            ? h.onRemoveMember(member)
+            : new Response(null, { status: 204 }),
         )
       }
       // A single repo GET (edit screen) — return the first repo.
@@ -270,7 +292,8 @@ describe('admin repositories', () => {
 
     // The existing member is shown with its priority, and an owner is marked.
     expect(await screen.findByText('existing')).toBeInTheDocument()
-    expect(screen.getAllByText('owner')).toHaveLength(1)
+    expect(screen.getByRole('checkbox', { name: 'existing owner' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'releases owner' })).toBeChecked()
 
     // Pick the candidate and reuse the existing priority (100) → blocked.
     await user.selectOptions(screen.getByLabelText('Repository'), 'inner')
@@ -313,5 +336,150 @@ describe('admin repositories', () => {
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({ member: 'inner', priority: 50 })
+  })
+
+  it('the owner toggle PATCHes the member and re-fetches the list', async () => {
+    const patches: Array<{ member: string; body: unknown }> = []
+    const members: MemberView[] = [
+      { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+      { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+      { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+    ]
+    const handlers: ApiHandlers = {
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members,
+      onPatchMember: (member, body) => {
+        patches.push({ member, body })
+        mockApi({
+          ...handlers,
+          members: members.map((m) =>
+            m.name === member ? { ...m, ...(body as { owner: boolean }) } : m,
+          ),
+        })
+        return new Response(null, { status: 204 })
+      },
+    }
+    mockApi(handlers)
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'existing owner' })
+    // A proxy cannot own package ids, so its toggle is off.
+    expect(screen.getByRole('checkbox', { name: 'nuget-org owner' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    )
+
+    await user.click(toggle)
+    await waitFor(() =>
+      expect(patches).toEqual([{ member: 'existing', body: { owner: true } }]),
+    )
+    await waitFor(() => expect(toggle).toBeChecked())
+
+    await user.click(screen.getByRole('checkbox', { name: 'releases owner' }))
+    await waitFor(() =>
+      expect(patches[1]).toEqual({ member: 'releases', body: { owner: false } }),
+    )
+  })
+
+  it('shows the server error when the owner toggle is refused', async () => {
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false }],
+      onPatchMember: () => new Response('membership not found', { status: 404 }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'existing owner' })
+    await user.click(toggle)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not flag existing as owner: membership not found',
+    )
+    expect(toggle).not.toBeChecked()
+  })
+
+  it('removing an owner shows the 409 reason with a hint to unflag it', async () => {
+    let removed: string | null = null
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [{ name: 'releases', kind: 'hosted', priority: 50, owner: true }],
+      onRemoveMember: (member) => {
+        removed = member
+        return new Response(
+          "this member owns the group's package ids; unflag it as owner before removing it",
+          { status: 409 },
+        )
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    await user.click(await screen.findByRole('button', { name: 'Remove' }))
+
+    await waitFor(() => expect(removed).toBe('releases'))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "this member owns the group's package ids; unflag it as owner before removing it Clear the owner box of releases first, then remove it.",
+    )
+    expect(screen.getByText('releases')).toBeInTheDocument()
+  })
+
+  it('offers other groups as members and shows a refused nesting', async () => {
+    let posted: unknown = null
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'grp', kind: 'group' }),
+        repo({ id: 2, name: 'inner', kind: 'hosted' }),
+        repo({ id: 3, name: 'outer', kind: 'group' }),
+      ],
+      members: [],
+      onAddMember: (body) => {
+        posted = body
+        return new Response(
+          'adding this member would create a cycle in the group graph',
+          { status: 409 },
+        )
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const select = await screen.findByLabelText('Repository')
+    await waitFor(() =>
+      expect(
+        Array.from((select as HTMLSelectElement).options).map((o) => o.value),
+      ).toEqual(['', 'inner', 'outer']),
+    )
+    // The group itself is never a candidate.
+    expect(screen.queryByRole('option', { name: 'grp (group)' })).toBeNull()
+
+    await user.selectOptions(select, 'outer')
+    await user.click(screen.getByRole('button', { name: 'Add member' }))
+
+    await waitFor(() => expect(posted).toEqual({ member: 'outer', priority: 100 }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'adding this member would create a cycle in the group graph',
+    )
+  })
+
+  it('says why no repository can be added, without claiming groups cannot nest', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'grp', kind: 'group' }),
+        repo({ id: 2, name: 'inner', kind: 'hosted' }),
+      ],
+      members: [{ name: 'inner', kind: 'hosted', priority: 100, owner: false }],
+    })
+
+    await renderAt('/manage/repositories/grp/members')
+
+    expect(
+      await screen.findByText(/No eligible repositories to add/),
+    ).not.toHaveTextContent(/nested/)
   })
 })
