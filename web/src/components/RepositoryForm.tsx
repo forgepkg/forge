@@ -30,7 +30,7 @@ import { Select } from '~/components/catalyst/select'
  *
  *  - **hosted** → `allow_redeploy` (NuGet) / `immutable_tags` +
  *                 `latest_mutable` (docker)
- *  - **proxy**  → `remote_url`, `package_delay_seconds` (NuGet only),
+ *  - **proxy**  → `remote_url`, `package_delay_seconds` (not docker),
  *                 metadata/not-found TTLs, and **write-only** upstream creds
  *                 (the password is never populated from a GET — slice-1
  *                 redaction; the form offers a "set new password" affordance and
@@ -278,7 +278,7 @@ export function RepositoryForm({
     if (values.kind === 'proxy' && values.remote_url.trim() === '') {
       next.remote_url = 'A proxy repository requires a remote URL.'
     }
-    if (values.kind === 'proxy' && values.format === 'nuget') {
+    if (values.kind === 'proxy' && values.format !== DOCKER_FORMAT.id) {
       const delay = Number(values.package_delay_seconds)
       if (!Number.isFinite(delay) || delay < 0) {
         next.package_delay_seconds = 'Delay must be a non-negative number.'
@@ -394,7 +394,7 @@ export function RepositoryForm({
                 ? 'NuGet packages, served as a NuGet V3 feed.'
                 : format.id === DOCKER_FORMAT.id
                   ? 'Container images and other OCI artifacts, served by the registry under /v2.'
-                  : 'A format plugin; its repositories are hosted or groups.')}
+                  : 'A format plugin.')}
         </Description>
       </Field>
 
@@ -532,7 +532,9 @@ export function RepositoryForm({
                 placeholder={
                   isDocker
                     ? 'https://registry-1.docker.io'
-                    : 'https://api.nuget.org/v3/index.json'
+                    : values.format === NUGET_FORMAT.id
+                      ? 'https://api.nuget.org/v3/index.json'
+                      : 'https://charts.example.com/stable'
                 }
                 invalid={!!errors.remote_url}
               />
