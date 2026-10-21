@@ -572,6 +572,33 @@ Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
 URLs). For a production deployment (TLS, secret encryption, trusted proxies,
 backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
+## CI and the merge queue
+
+CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) runs
+`fmt`, `clippy`, `audit`, `test`, `docker`, `kubernetes` and `web` on every
+pull request. The slow `e2e` and `web-e2e` jobs are skipped there; they run in
+the merge queue and on every push to `main`.
+
+`main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
+group is checked as the very commit that lands, `e2e` and `web-e2e` included.
+To turn it on, edit the ruleset (or branch protection rule) of `main`:
+
+1. Enable **Require merge queue**. Keep its **status check timeout** above
+   the run time of `e2e` and `web-e2e` (60 minutes by default).
+2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
+   `test`, `docker`, `kubernetes`, `web`, `e2e` and `web-e2e` from GitHub
+   Actions. On a pull request, `e2e` and `web-e2e` are skipped, which counts
+   as passed, so the pull request can join the queue; the queue runs them and
+   merges only once they passed. Leave them out and the queue merges without
+   waiting for them.
+
+The push to `main` still runs CI once more, and the release workflow tags
+only commits whose push run passed (see [Releasing](#releasing)).
+
+On GitLab, a merge train is the merge queue: enable **merged results
+pipelines** and **merge trains** under *Settings → Merge requests*. Merge
+train pipelines run `e2e` and `web-e2e` as well.
+
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
@@ -599,9 +626,10 @@ cargo xtask release 1.0.1
 
 It commits `release: v1.0.1` on a new `release-1.0.1` branch, pushes it, opens
 a pull request, waits for the pull request's CI run and merges the pull
-request once that run passed. Then it waits for the merge commit's CI run on
-`main`, **including `e2e` and `web-e2e`**: they run only on `main`, after the
-merge, never on the pull request. Every push to `main` gets its own CI run,
+request once that run passed; with a merge queue, it adds the pull request to
+the queue and waits (up to 90 minutes) for it to land. Then it waits for the
+merge commit's CI run on `main`, **including `e2e` and `web-e2e`**, which never
+run on the pull request. Every push to `main` gets its own CI run,
 which a later push never cancels. Once that run passed, it tags the merge
 commit `v1.0.1` and pushes the tag, which starts the release workflow. The
 release workflow checks CI as well: before it builds anything, it waits (up

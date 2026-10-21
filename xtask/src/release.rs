@@ -6,8 +6,9 @@
 //! the changelog's `[Unreleased]` section into the version's section, and
 //! commits on a `release-<version>` branch off the default branch. Then,
 //! through the GitHub CLI (`gh`), it opens a pull request, waits for its CI
-//! run, merges it, waits for the merge commit's CI run on the default branch
-//! (e2e and web-e2e run only there), and creates and pushes the annotated
+//! run, merges it (with a merge queue: queues it and waits for it to land),
+//! waits for the merge commit's CI run on the default branch (e2e and web-e2e
+//! never run on the pull request), and creates and pushes the annotated
 //! `v<version>` tag on the merge commit, which starts release.yml.
 //! `--no-tag` only commits, on the current branch, and pushes nothing.
 //! Every edit is computed before the first file is written, so a failed
@@ -241,7 +242,8 @@ fn merge_pull_request(branch: &str, base: &str, tag_name: &str) -> Result<String
     println!("Opened {url}. Waiting for its CI run.");
     wait_for_ci(&head, branch, "pull_request")
         .map_err(|e| format!("{e}. Push a fix to `{branch}` ({url})"))?;
-    // Merges nothing but the commit whose CI run passed.
+    // Merges nothing but the commit whose CI run passed. With a merge queue,
+    // gh queues it instead (the queue's merge method wins over `--merge`).
     Cmd::new("gh")
         .args(["pr", "merge", &url, "--merge", "--match-head-commit", &head])
         .run()

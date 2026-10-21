@@ -1,12 +1,13 @@
 # GitLab CI for envisia-forge.
 #
 # Mirrors .github/workflows/ci.yml job for job (fmt, clippy, audit, test,
-# docker, kubernetes, web; e2e and web-e2e on the default branch), with the
-# same tool versions and cargo settings; change both together. Images are
-# pinned by digest (tag kept for readability), as ci.yml pins its actions;
-# nothing bumps them here, so do it by hand. The images the test harnesses
-# start themselves (postgres:17, versity/versitygw:v1.4.1, redis) are named by
-# tag in their code, as on GitHub.
+# docker, kubernetes, web; e2e and web-e2e in merge trains, GitLab's merge
+# queue, and on the default branch), with the same tool versions and cargo
+# settings; change both together. Images are pinned by digest (tag kept for
+# readability), as ci.yml pins its actions; nothing bumps them here, so do it
+# by hand. The images the test harnesses start themselves (postgres:17,
+# versity/versitygw:v1.4.1, redis) are named by tag in their code, as on
+# GitHub.
 #
 # The GitHub runners come with a Docker daemon; here the jobs that need one
 # (test, docker, e2e, web-e2e) get a Docker-in-Docker service, which needs a
@@ -232,13 +233,15 @@ web:
 # ── E2E / integration tests (forge-e2e crate, testcontainers) ────────────────
 # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis) containers
 # via testcontainers on the dind service, so no other `services:` are needed.
-# Gated behind the `forge-e2e` feature; runs only on the default branch to keep
-# MR pipelines fast. The optional dotnet smoke test is skipped here (no SDK on
-# the rust image); add a dotnet SDK to the image to exercise it.
+# Gated behind the `forge-e2e` feature; left out of MR pipelines to keep them
+# fast, but runs in merge trains (so a change that breaks it never lands) and
+# on the default branch. The optional dotnet smoke test is skipped here (no SDK
+# on the rust image); add a dotnet SDK to the image to exercise it.
 e2e:
   stage: e2e
   needs: []
   rules:
+    - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
     - *dind-service
@@ -261,15 +264,16 @@ e2e:
 # Boots Postgres + versitygw via docker compose on the dind daemon, builds the
 # SPA + server, and runs the browser specs. The compose-published ports live on
 # the `docker` (dind) host, so the harness is pointed there via
-# FORGE_E2E_DOCKER_HOST. Default-branch only (slow). Uses the official
-# Playwright image (Ubuntu with Node, the browsers and their system deps) at
-# the version of @playwright/test in web/package.json; the Rust toolchain is
-# installed on top via rustup.
+# FORGE_E2E_DOCKER_HOST. Like e2e, only in merge trains and on the default
+# branch (slow). Uses the official Playwright image (Ubuntu with Node, the
+# browsers and their system deps) at the version of @playwright/test in
+# web/package.json; the Rust toolchain is installed on top via rustup.
 web-e2e:
   stage: e2e
   needs: []
   image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
   rules:
+    - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
     - *dind-service
