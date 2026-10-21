@@ -6,6 +6,10 @@
 //! host's bounds. What only the host can do (a download, a publish, a
 //! change) comes back as the action, for the test to inspect.
 //!
+//! [`converse`] does the same for the upstream side of a proxy
+//! ([`FormatPlugin::upstream`]): it answers every fetch the plugin asks for
+//! with `fetch`, as the host's proxy read path would.
+//!
 //! ```ignore
 //! let served = serve(&MyFormat, &repository(RepositoryKind::Hosted), &Request::new("GET", "/index.json"), |query| match query {
 //!     Query::Search(_) => Answer::Search(SearchResult { total: 0, hits: vec![] }),
@@ -15,7 +19,8 @@
 //! ```
 
 use crate::{Action, Answer, FormatPlugin, Loaded, Query, Rendered, Repository, RepositoryKind};
-use crate::{Request, Response};
+use crate::{Fetch, FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp};
+use crate::{Request, Response, UpstreamStep};
 
 /// The most rounds of queries one request may load (as the host).
 pub const MAX_ROUNDS: usize = 4;
@@ -108,4 +113,60 @@ pub fn serve(
         )),
         queries,
     }
+}
+
+/// The most rounds of one upstream conversation (as the host).
+pub const MAX_UPSTREAM_ROUNDS: usize = 4;
+
+/// The most fetches of one upstream conversation (as the host).
+pub const MAX_UPSTREAM_FETCHES: usize = 256;
+
+/// What came of an upstream conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversed {
+    /// The plugin's answer.
+    pub answer: UpstreamAnswer,
+    /// Every fetch the plugin asked for, in order.
+    pub fetches: Vec<Fetch>,
+}
+
+/// Run `op` against `remote` through `plugin`'s upstream side, answering
+/// its fetches with `fetch`. Errs with what the plugin returned, or when it
+/// needs more rounds or fetches than the host allows.
+pub fn converse(
+    plugin: &dyn FormatPlugin,
+    remote: &Remote,
+    op: &UpstreamOp,
+    mut fetch: impl FnMut(&Fetch) -> Fetched,
+) -> Result<Conversed, FormatError> {
+    let mut fetched: Vec<FetchResult> = Vec::new();
+    for _ in 0..MAX_UPSTREAM_ROUNDS {
+        match plugin.upstream(remote, op, &fetched)? {
+            UpstreamStep::Done(answer) => {
+                return Ok(Conversed {
+                    answer,
+                    fetches: fetched.into_iter().map(|f| f.fetch).collect(),
+                })
+            }
+            UpstreamStep::Fetch(wanted) => {
+                if wanted.is_empty() || fetched.len() + wanted.len() > MAX_UPSTREAM_FETCHES {
+                    return Err(FormatError::Internal(format!(
+                        "asked for {} fetches after {}",
+                        wanted.len(),
+                        fetched.len()
+                    )));
+                }
+                for want in wanted {
+                    let outcome = fetch(&want);
+                    fetched.push(FetchResult {
+                        fetch: want,
+                        outcome,
+                    });
+                }
+            }
+        }
+    }
+    Err(FormatError::Internal(format!(
+        "needed more than {MAX_UPSTREAM_ROUNDS} rounds"
+    )))
 }

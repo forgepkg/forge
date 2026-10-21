@@ -1,10 +1,13 @@
 //! Proxy-repository read operations (spec §7 "Proxy", plan Phase 8).
 //!
-//! A proxy repository mirrors an upstream NuGet **V3 service index** named by
-//! `repository.remote_url`. On a read miss it discovers the upstream's resource
-//! `@id`s, fetches metadata/artifacts on demand, content-addresses the bytes
-//! through the [`Cas`], and records a `proxy_cached_version` row so future reads
-//! are served locally.
+//! A proxy repository mirrors the upstream named by `repository.remote_url`.
+//! What the upstream speaks is its format's business: the format's upstream
+//! protocol ([`Format::upstream`], a format plugin's
+//! [`forge_plugin_api::FormatPlugin::upstream`]) says which documents to fetch
+//! for an operation and reads them; this module performs every request,
+//! content-addresses package bytes through the [`Cas`], and records a
+//! `proxy_cached_version` row so future reads are served locally. Everything
+//! below is the host's, whatever the format.
 //!
 //! ## Hard invariants enforced here
 //! * **Outbound scheme guard** — upstream URLs are validated to be http/https
@@ -87,12 +90,13 @@
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Duration, Utc};
+use base64::Engine as _;
+use chrono::{DateTime, Duration, Utc};
 use forge_cache::Cache;
 use forge_crypto::ExposeSecret;
 use forge_db::asset_dao::{self, NewAsset};
@@ -106,20 +110,20 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
+use forge_plugin_api as api;
+
 use crate::authz::PackageFilter;
-use crate::domain::{Dependency, DependencyGroup};
 use crate::format::Format;
 use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
 use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
-    SearchResult, VersionEntry, NUPKG_ASSET_PATH, NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH,
-    NUSPEC_CONTENT_TYPE,
+    SearchResult, VersionEntry,
 };
 
-/// Cache namespace for resolved upstream service indexes, keyed by
-/// `"{repo}/{repo_id}/{remote_url}"`.
+/// Cache namespace for resolved upstream indexes ([`api::UpstreamOp::Index`]),
+/// keyed by `"{repo}/{repo_id}/{remote_url}"`.
 pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// Cache namespace marking a package's upstream version listing as fresh,
 /// keyed by `"{scope}/{lower_id}"`. In this and the namespaces below, `scope`
@@ -127,29 +131,18 @@ pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// cached from a previous upstream, or before a repoint, is used once a proxy
 /// is repointed.
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
-/// Cache namespace for upstream `.nuspec` documents of not-yet-downloaded
-/// versions, keyed by `"{scope}/{lower_id}/{version}"`.
-pub const NS_UPSTREAM_NUSPEC: &str = "proxy_nuspec";
-/// Cache namespace for a package's upstream registration index (its pages,
-/// with any inlined leaves), keyed by `"{scope}/{lower_id}"`.
-pub const NS_UPSTREAM_REGISTRATION: &str = "proxy_registration";
-/// Cache namespace for one non-inlined upstream registration page, keyed by
-/// `"{scope}/{page url}"`.
-pub const NS_UPSTREAM_REGISTRATION_PAGE: &str = "proxy_registration_page";
-/// Cache namespace for one page of upstream search results, keyed by
-/// `"{scope}/{search url}"`.
-pub const NS_UPSTREAM_SEARCH: &str = "proxy_search";
+/// Cache namespace for the documents the format's upstream protocol fetched
+/// ([`api::Fetch`]), keyed by `"{scope}/{url}"`, for as long as its
+/// [`api::Freshness`] says.
+pub const NS_UPSTREAM_FETCH: &str = "proxy_fetch";
 /// Cache namespace marking a proxy whose upstream search failed, keyed by
 /// `"{scope}"`; see [`UPSTREAM_SEARCH_BACKOFF`].
 pub const NS_UPSTREAM_SEARCH_FAILED: &str = "proxy_search_failed";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
-/// Cache namespace for the creation time an upstream catalog entry names,
-/// keyed by `"{scope}/{catalog entry url}"`.
-pub const NS_UPSTREAM_CATALOG: &str = "proxy_catalog";
 
-/// The earliest upstream publish time the package delay trusts
+/// The earliest upstream creation time the package delay trusts
 /// (2010-01-01, before any NuGet feed): nuget.org reports unlisted versions as
 /// published in 1900.
 fn min_trusted_publish_time() -> DateTime<Utc> {
@@ -164,168 +157,41 @@ const UPSTREAM_SEARCH_BACKOFF: std::time::Duration = std::time::Duration::from_s
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
 pub const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
-/// A published `(id, version)`'s manifest is immutable, so an upstream
-/// `.nuspec` can be cached far longer than the version listing.
-const NUSPEC_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-/// At most this many non-inlined upstream registration pages are fetched for
-/// one registration request (newest first). nuget.org pages hold 64 versions,
-/// so this covers the newest ~640; older versions of a larger package fall
-/// back to the flat-container view.
-const MAX_REGISTRATION_PAGES: usize = 10;
-/// Dating the package delay of versions still inside it reads every upstream
-/// registration page that covers one, up to this many (8192 versions on
-/// nuget.org). It runs when a listing is refreshed, and a version leaves the
-/// delay once dated, so a package's older pages are read about once.
-const MAX_BACKDATE_REGISTRATION_PAGES: usize = 128;
-/// At most this many upstream catalog entries are read per listing refresh to
-/// date unlisted versions ([`ProxyRepo::date_delay_from_upstream`]); the rest
-/// are dated at the next refresh.
-const MAX_CATALOG_FETCHES: usize = 32;
-/// Concurrent upstream registration page fetches per request.
-const REGISTRATION_PAGE_CONCURRENCY: usize = 4;
+/// How long a document the upstream publishes once and never changes
+/// ([`api::Freshness::Immutable`]: a version's manifest, a catalog entry) is
+/// reused.
+const IMMUTABLE_FETCH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Rounds of one upstream conversation ([`ProxyRepo::converse`]).
+const MAX_UPSTREAM_ROUNDS: usize = 4;
+/// Fetches of one upstream conversation, all rounds together.
+const MAX_UPSTREAM_FETCHES: usize = 256;
+/// Concurrent fetches of one round.
+const FETCH_CONCURRENCY: usize = 4;
 
-/// The upstream resource `@id`s resolved from a V3 service index, persisted in
-/// the `proxy_upstream_index.resources` JSON (with the URL they came from) and
-/// cached.
-///
-/// Stored absolute (the upstream advertises absolute `@id`s); we always keep a
-/// trailing slash on the base-address style resources so we can append path
-/// segments directly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpstreamResources {
-    /// `PackageBaseAddress/3.0.0` base (flat container), trailing slash.
-    pub package_base_address: Option<String>,
-    /// `RegistrationsBaseUrl` base (any 3.x variant), trailing slash.
-    pub registrations_base_url: Option<String>,
-    /// `SearchQueryService` `@id` (any 3.x variant).
-    pub search_query_service: Option<String>,
-}
-
-impl UpstreamResources {
-    /// Resolve the resource `@id`s out of a V3 service-index JSON document.
-    ///
-    /// Picks the first match for each resource family, preferring exact
-    /// `PackageBaseAddress/3.0.0` etc. but accepting any `@type` whose prefix
-    /// matches (NuGet advertises versioned aliases like
-    /// `SearchQueryService/3.5.0`).
-    fn from_service_index(doc: &JsonValue) -> Self {
-        let mut out = UpstreamResources {
-            package_base_address: None,
-            registrations_base_url: None,
-            search_query_service: None,
-        };
-        // Rank of the registration variant picked so far: the SemVer 2.0.0
-        // variants (`3.6.0`, `Versioned`) list every version, the older ones
-        // omit SemVer 2.0.0 packages.
-        let mut registration_rank = 0;
-        let Some(resources) = doc.get("resources").and_then(|r| r.as_array()) else {
-            return out;
-        };
-        for res in resources {
-            let Some(id) = res.get("@id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            // `@type` can be a string or an array of strings.
-            let types: Vec<&str> = match res.get("@type") {
-                Some(JsonValue::String(s)) => vec![s.as_str()],
-                Some(JsonValue::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect(),
-                _ => continue,
-            };
-            for ty in types {
-                let family = ty.split('/').next().unwrap_or(ty);
-                match family {
-                    "PackageBaseAddress" if out.package_base_address.is_none() => {
-                        out.package_base_address = Some(with_trailing_slash(id));
-                    }
-                    "RegistrationsBaseUrl" => {
-                        let rank = match ty {
-                            "RegistrationsBaseUrl/3.6.0" => 3,
-                            "RegistrationsBaseUrl/Versioned" => 2,
-                            _ => 1,
-                        };
-                        if rank > registration_rank {
-                            registration_rank = rank;
-                            out.registrations_base_url = Some(with_trailing_slash(id));
-                        }
-                    }
-                    "SearchQueryService" if out.search_query_service.is_none() => {
-                        out.search_query_service = Some(id.to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        out
-    }
-}
-
-/// The `proxy_upstream_index.resources` JSON: the resolved resources and the
-/// `remote_url` they were resolved from. A row that came from another URL (the
-/// proxy has been repointed since), or that predates this field, is never used.
+/// The `proxy_upstream_index.resources` JSON: the index the format resolved
+/// ([`api::UpstreamOp::Index`], a JSON object) and the `remote_url` it was
+/// resolved from. A row that came from another URL (the proxy has been
+/// repointed since), or that predates this field, is never used.
 #[derive(Serialize, Deserialize)]
 struct PersistedIndex {
     remote_url: String,
     #[serde(flatten)]
-    resources: UpstreamResources,
+    index: serde_json::Map<String, JsonValue>,
 }
 
-/// One upstream dependency group as cached: `(targetFramework, [(id, range)])`.
-type UpstreamGroup = (Option<String>, Vec<(String, Option<String>)>);
-
-/// One version's metadata from the upstream registration (a leaf's inlined
-/// `catalogEntry`), as cached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct UpstreamLeaf {
-    /// Package id as the upstream publishes it (original casing).
-    id: Option<String>,
-    /// Whether the upstream lists the version.
-    listed: bool,
-    /// Upstream publish time.
-    published: Option<DateTime<Utc>>,
-    /// The dependency groups.
-    groups: Vec<UpstreamGroup>,
-    /// The `@id` of the version's catalog entry, which names when the
-    /// version was created even when it is unlisted.
-    #[serde(default)]
-    catalog_url: Option<String>,
-}
-
-impl UpstreamLeaf {
-    fn dependency_groups(&self) -> Vec<DependencyGroup> {
-        self.groups
-            .iter()
-            .map(|(tfm, deps)| DependencyGroup {
-                target_framework: tfm.clone(),
-                dependencies: deps
-                    .iter()
-                    .map(|(id, range)| Dependency {
-                        id: id.clone(),
-                        range: range.clone(),
-                    })
-                    .collect(),
-            })
-            .collect()
+impl PersistedIndex {
+    /// The index as the format reads it ([`api::Remote::index`]).
+    fn index(&self) -> String {
+        JsonValue::Object(self.index.clone()).to_string()
     }
 }
 
-/// One page of a package's upstream registration index, as cached.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct UpstreamRegistrationPage {
-    /// The page `@id`, fetched when its leaves are not inlined.
-    url: Option<String>,
-    /// Normalized lowest / highest version on the page (`None` = unknown).
-    lower: Option<String>,
-    upper: Option<String>,
-    /// Inlined leaves by normalized version; `None` ⇒ fetch [`Self::url`].
-    leaves: Option<BTreeMap<String, UpstreamLeaf>>,
-}
-
-fn with_trailing_slash(s: &str) -> String {
-    if s.ends_with('/') {
-        s.to_string()
-    } else {
-        format!("{s}/")
-    }
+/// A fetched document as cached: a body (base64, so the cache's JSON
+/// encoding stays compact) or a 404.
+#[derive(Clone, Serialize, Deserialize)]
+enum CachedFetch {
+    Found(String),
+    NotFound,
 }
 
 /// Map an upstream transport/size/parse failure onto the read-path error.
@@ -536,19 +402,114 @@ impl ProxyRepo {
         upstream_credentials(&self.pool, self.envelope.as_ref(), repo).await
     }
 
-    /// GET an upstream JSON document with the proxy's credentials. `None` on
-    /// a genuine 404.
-    async fn fetch_json(
+    /// Run one upstream conversation: ask the format what to fetch for `op`,
+    /// fetch it ([`Self::fetch`]), and ask again with everything fetched so
+    /// far, until the format answers. `index` is the resolved upstream index
+    /// (`None` while resolving it). Bounded to [`MAX_UPSTREAM_ROUNDS`] rounds
+    /// and [`MAX_UPSTREAM_FETCHES`] fetches; the format runs off the async
+    /// workers, as a format plugin may take its time.
+    async fn converse(
         &self,
         repo: &Repository,
-        url: &str,
-    ) -> Result<Option<JsonValue>, RepoError> {
-        let creds = self.credentials(repo).await?;
-        let auth = creds.as_ref().map(Credentials::auth);
-        self.http
-            .get_json(url, auth.as_ref())
+        index: Option<String>,
+        op: api::UpstreamOp,
+    ) -> Result<api::UpstreamAnswer, RepoError> {
+        use futures_util::StreamExt;
+        let remote = api::Remote {
+            url: repo.remote_url.clone().unwrap_or_default(),
+            index,
+        };
+        let mut fetched: Vec<api::FetchResult> = Vec::new();
+        for _ in 0..MAX_UPSTREAM_ROUNDS {
+            let format = self.format.clone();
+            let (asked, round) = (remote.clone(), op.clone());
+            let (step, back) = tokio::task::spawn_blocking(move || {
+                let step = format.upstream(&asked, &round, &fetched);
+                (step, fetched)
+            })
             .await
-            .map_err(upstream_err)
+            .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?;
+            fetched = back;
+            let wanted =
+                match step.map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))? {
+                    api::UpstreamStep::Done(answer) => return Ok(answer),
+                    api::UpstreamStep::Fetch(wanted) => wanted,
+                };
+            if wanted.is_empty() || fetched.len() + wanted.len() > MAX_UPSTREAM_FETCHES {
+                return Err(RepoError::Storage(format!(
+                    "upstream protocol asked for {} fetches after {}",
+                    wanted.len(),
+                    fetched.len()
+                )));
+            }
+            let results: Vec<api::FetchResult> = futures_util::stream::iter(wanted)
+                .map(|fetch| async move {
+                    let outcome = self.fetch(repo, &fetch).await;
+                    api::FetchResult { fetch, outcome }
+                })
+                .buffered(FETCH_CONCURRENCY)
+                .collect()
+                .await;
+            fetched.extend(results);
+        }
+        Err(RepoError::Storage(format!(
+            "upstream protocol needed more than {MAX_UPSTREAM_ROUNDS} rounds"
+        )))
+    }
+
+    /// GET one upstream document with the proxy's credentials, through the
+    /// local cache for as long as its freshness allows (never Redis: what an
+    /// upstream answered decides what is downloaded and served).
+    ///
+    /// A 404 is cached only for an immutable document: a metadata 404 (a
+    /// package the upstream does not know yet) is what the not-found
+    /// markers track, and they are cleared as soon as the package turns up.
+    async fn fetch(&self, repo: &Repository, fetch: &api::Fetch) -> api::Fetched {
+        let ttl = match fetch.freshness {
+            api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
+            api::Freshness::Immutable => IMMUTABLE_FETCH_TTL,
+        };
+        let key = format!("{}/{}", Self::upstream_scope(repo), fetch.url);
+        let cached: Result<CachedFetch, Option<String>> = self
+            .cache
+            .get_or_try_insert_local(NS_UPSTREAM_FETCH, &key, ttl, || async {
+                let creds = self
+                    .credentials(repo)
+                    .await
+                    .map_err(|e| Some(e.to_string()))?;
+                let auth = creds.as_ref().map(Credentials::auth);
+                match self.http.get_bytes(&fetch.url, auth.as_ref()).await {
+                    Ok(Some(bytes)) => Ok(CachedFetch::Found(
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    )),
+                    Ok(None) if fetch.freshness == api::Freshness::Immutable => {
+                        Ok(CachedFetch::NotFound)
+                    }
+                    Ok(None) => Err(None),
+                    Err(e) => Err(Some(e.to_string())),
+                }
+            })
+            .await;
+        match cached {
+            Ok(CachedFetch::Found(body)) => {
+                match base64::engine::general_purpose::STANDARD.decode(body) {
+                    Ok(bytes) => api::Fetched::Found(bytes),
+                    Err(e) => api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
+                }
+            }
+            Ok(CachedFetch::NotFound) | Err(None) => api::Fetched::NotFound,
+            Err(Some(e)) => api::Fetched::Failed(e),
+        }
+    }
+
+    /// The upstream index, resolved, for `op` on `repo`.
+    async fn converse_resolved(
+        &self,
+        repo: &Repository,
+        op: api::UpstreamOp,
+    ) -> Result<api::UpstreamAnswer, RepoError> {
+        let index = Box::pin(self.resolve_upstream_index(repo)).await?;
+        self.converse(repo, Some(index), op).await
     }
 
     /// Resolve the repository row by name, erroring if missing or not a proxy.
@@ -648,10 +609,11 @@ impl ProxyRepo {
         !Self::not_found_live(repo, row, now) && Self::delay_cleared(repo, row.first_seen_at, now)
     }
 
-    // ── Upstream service-index discovery (Task 8.1) ──────────────────────────
+    // ── Upstream index (Task 8.1) ────────────────────────────────────────────
 
-    /// Resolve the upstream resource `@id`s for `repo`, reading through the
-    /// per-instance cache (never Redis) and persisting to
+    /// Resolve `repo`'s upstream index ([`api::UpstreamOp::Index`]: for a
+    /// NuGet V3 feed, the resources of its service index), reading through
+    /// the per-instance cache (never Redis) and persisting to
     /// `proxy_upstream_index`.
     ///
     /// Layering:
@@ -661,19 +623,15 @@ impl ProxyRepo {
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`
     ///    is within metadata_ttl, reuse it without a network call. Only a row
     ///    fetched from the current `remote_url` is used, fresh or stale.
-    /// 3. **Refresh** — otherwise fetch the upstream index (no DB transaction
-    ///    or row lock held across the request), resolve the `@id`s, and
-    ///    upsert them. Concurrent instances may both refresh; the result is
-    ///    idempotent.
+    /// 3. **Refresh** — otherwise resolve the index again (no DB transaction
+    ///    or row lock held across the requests) and upsert it. Concurrent
+    ///    instances may both refresh; the result is idempotent.
     ///
     /// The cache key includes the repository id and `remote_url`, and the
     /// persisted row records its URL, so a changed upstream (or a
     /// deleted-and-recreated repository) never serves the old upstream's
-    /// resources.
-    pub async fn resolve_upstream_index(
-        &self,
-        repo: &Repository,
-    ) -> Result<UpstreamResources, RepoError> {
+    /// index.
+    pub async fn resolve_upstream_index(&self, repo: &Repository) -> Result<String, RepoError> {
         let ttl = Self::metadata_ttl(repo);
         let remote_url = repo
             .remote_url
@@ -703,74 +661,72 @@ impl ProxyRepo {
     }
 
     /// The uncached body of [`Self::resolve_upstream_index`]: DB-freshness
-    /// short-circuit, offline handling, and refetch.
+    /// short-circuit, offline handling, and refresh.
     async fn resolve_index_uncached(
         &self,
         repo: &Repository,
         ttl: Duration,
         remote_url: &str,
-    ) -> Result<UpstreamResources, RepoError> {
-        // An index fetched from another URL is not this upstream's: neither
+    ) -> Result<String, RepoError> {
+        // An index resolved from another URL is not this upstream's: neither
         // reused nor fallen back to below.
         let persisted = proxy_dao::get_upstream_index(&self.pool, repo.id)
             .await?
             .and_then(|idx| {
                 let stored: PersistedIndex = serde_json::from_value(idx.resources).ok()?;
-                (stored.remote_url == remote_url).then_some((stored.resources, idx.fetched_at))
+                (stored.remote_url == remote_url).then(|| (stored.index(), idx.fetched_at))
             });
-        if let Some((resources, fetched_at)) = &persisted {
+        if let Some((index, fetched_at)) = &persisted {
             if self.db_now().await? - *fetched_at < ttl {
-                return Ok(resources.clone());
+                return Ok(index.clone());
             }
         }
 
         // Offline: never fetch. Serve a persisted (possibly stale) index if present.
         if !repo.online {
             return match persisted {
-                Some((resources, _)) => Ok(resources),
+                Some((index, _)) => Ok(index),
                 None => Err(RepoError::Storage(
                     "proxy is offline and has no cached upstream index".into(),
                 )),
             };
         }
 
-        let doc = match self.fetch_json(repo, remote_url).await {
-            Ok(Some(doc)) => doc,
-            Ok(None) => {
-                return Err(RepoError::Storage(format!(
-                    "upstream service index {remote_url} returned 404"
-                )))
-            }
+        // An upstream that does not resolve (unreachable, a 404, a captive
+        // portal or a gateway's error page the format does not recognize)
+        // is an upstream failure, never stored over the last good index:
+        // taken for an empty upstream, it would answer every id 404.
+        let resolved = match self.converse(repo, None, api::UpstreamOp::Index).await {
+            Ok(api::UpstreamAnswer::Index(index)) => match serde_json::from_str(&index) {
+                Ok(JsonValue::Object(index)) => Ok(index),
+                _ => Err(RepoError::Storage(format!(
+                    "upstream {remote_url} resolved to an index that is not a JSON object"
+                ))),
+            },
+            Ok(api::UpstreamAnswer::Failed(reason)) => Err(RepoError::Storage(reason)),
+            Ok(_) => Err(RepoError::Storage(
+                "upstream protocol answered index with something else".into(),
+            )),
+            Err(e) => Err(e),
+        };
+        let index = match resolved {
+            Ok(index) => index,
             Err(e) => {
                 // A stale persisted index is better than failing every read
                 // while the upstream is briefly unreachable.
-                if let Some((resources, _)) = persisted {
+                if let Some((index, _)) = persisted {
                     tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
-                    return Ok(resources);
+                    return Ok(index);
                 }
                 return Err(e);
             }
         };
-        let resources = UpstreamResources::from_service_index(&doc);
-        // An index without a package base address is not a NuGet V3 service
-        // index (a captive portal, a gateway's error page, a mistyped URL):
-        // an upstream failure, never stored over the last good index. Taken
-        // for an empty upstream, it would answer every id 404.
-        if resources.package_base_address.is_none() {
-            let e = RepoError::Storage(format!(
-                "upstream service index {remote_url} advertises no PackageBaseAddress"
-            ));
-            if let Some((resources, _)) = persisted {
-                tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
-                return Ok(resources);
-            }
-            return Err(e);
-        }
-        let resources_json = serde_json::to_value(PersistedIndex {
+        let stored = PersistedIndex {
             remote_url: remote_url.to_string(),
-            resources: resources.clone(),
-        })
-        .map_err(|e| RepoError::Storage(format!("serialize resources: {e}")))?;
+            index,
+        };
+        let resources_json = serde_json::to_value(&stored)
+            .map_err(|e| RepoError::Storage(format!("serialize the upstream index: {e}")))?;
 
         sqlx::query!(
             r#"
@@ -785,7 +741,7 @@ impl ProxyRepo {
         .execute(&self.pool)
         .await?;
 
-        Ok(resources)
+        Ok(stored.index())
     }
 
     // ── Metadata discovery: enumerate upstream versions (Task 8.2) ───────────
@@ -835,32 +791,15 @@ impl ProxyRepo {
         }
     }
 
-    /// Fetch the upstream flat-container listing for `lower_id` and record
-    /// every version. Returns `false` when the upstream does not know the id.
+    /// Fetch the upstream's version listing of `lower_id`
+    /// ([`api::UpstreamOp::Versions`]) and record every version. Returns
+    /// `false` when the upstream does not know the id.
     async fn refresh_versions(&self, repo: &Repository, lower_id: &str) -> Result<bool, RepoError> {
-        let resources = Box::pin(self.resolve_upstream_index(repo)).await?;
-        let Some(base) = resources.package_base_address else {
-            return Err(RepoError::Storage(
-                "upstream advertises no PackageBaseAddress".into(),
-            ));
-        };
-        let url = format!("{base}{lower_id}/index.json");
-        match self.fetch_json(repo, &url).await? {
-            Some(doc) => {
-                // A document without a `versions` array is not a listing:
-                // treat it as an upstream failure (what is cached is served)
-                // rather than as "no versions", which would retire them all.
-                let Some(listed) = doc.get("versions").and_then(|v| v.as_array()) else {
-                    return Err(RepoError::Storage(format!(
-                        "upstream listing {url} has no versions array"
-                    )));
-                };
-                let versions: Vec<String> = listed
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|raw| self.format.normalize_version(raw).ok())
-                    .collect();
-
+        let answer = self
+            .converse_resolved(repo, api::UpstreamOp::Versions(lower_id.to_string()))
+            .await?;
+        match answer {
+            api::UpstreamAnswer::Versions(Some(versions)) => {
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
                 // upstream; still missing one metadata TTL after the first
@@ -886,13 +825,19 @@ impl ProxyRepo {
                 }
                 Ok(true)
             }
-            None => {
+            api::UpstreamAnswer::Versions(None) => {
                 // Genuine upstream 404 for the whole package id → negative cache.
                 // We model it on a synthetic `*` version row so a later request
                 // can short-circuit without re-hitting upstream within the TTL.
                 self.mark_not_found(repo.id, lower_id, "*").await?;
                 Ok(false)
             }
+            // An unusable listing is an upstream failure (what is cached is
+            // served), never "no versions", which would retire them all.
+            api::UpstreamAnswer::Failed(reason) => Err(RepoError::Storage(reason)),
+            _ => Err(RepoError::Storage(
+                "upstream protocol answered versions with something else".into(),
+            )),
         }
     }
 
@@ -1078,15 +1023,26 @@ impl ProxyRepo {
         }
 
         // ── Network I/O — performed with NO transaction held (A7). ───────────
-        let resources = self.resolve_upstream_index(repo).await?;
-        let Some(base) = resources.package_base_address else {
-            return Err(RepoError::Storage(
-                "upstream advertises no PackageBaseAddress".into(),
-            ));
+        // Where the package is, as the format's upstream protocol says (for
+        // NuGet, `{flat container}{id}/{version}/{id}.{version}.nupkg`).
+        let url = match self
+            .converse_resolved(
+                repo,
+                api::UpstreamOp::Package(api::PackageRef {
+                    id: lower_id.to_string(),
+                    version: version.to_string(),
+                }),
+            )
+            .await?
+        {
+            api::UpstreamAnswer::Package(url) => url,
+            api::UpstreamAnswer::Failed(reason) => return Err(RepoError::Storage(reason)),
+            _ => {
+                return Err(RepoError::Storage(
+                    "upstream protocol answered package with something else".into(),
+                ))
+            }
         };
-
-        // NuGet flat-container nupkg path: {base}{id}/{version}/{id}.{version}.nupkg
-        let url = format!("{base}{lower_id}/{version}/{lower_id}.{version}.nupkg");
         let requested_at = self.db_now().await?;
         // §12.5: decrypt-on-use; the plaintext lives only inside this request
         // (and the zeroizing secret wrapper) — never in a log or model.
@@ -1288,7 +1244,7 @@ impl ProxyRepo {
         // Attach the .nupkg / .nuspec assets if absent. Each blob reference is
         // taken only when its asset row is actually inserted; an unused ingest
         // lease simply expires.
-        if asset_dao::find_asset(&mut *tx, comp.id, NUPKG_ASSET_PATH)
+        if asset_dao::find_asset(&mut *tx, comp.id, self.format.package_asset_path())
             .await?
             .is_none()
         {
@@ -1298,8 +1254,8 @@ impl ProxyRepo {
                 &mut *tx,
                 NewAsset {
                     component_id: comp.id,
-                    path: NUPKG_ASSET_PATH.to_string(),
-                    content_type: NUPKG_CONTENT_TYPE.to_string(),
+                    path: self.format.package_asset_path().to_string(),
+                    content_type: self.format.package_content_type().to_string(),
                     blob_sha256: stored.sha256.clone(),
                     size,
                     sha512_base64: Some(stored.sha512_base64.clone()),
@@ -1307,7 +1263,7 @@ impl ProxyRepo {
             )
             .await?;
         }
-        if asset_dao::find_asset(&mut *tx, comp.id, NUSPEC_ASSET_PATH)
+        if asset_dao::find_asset(&mut *tx, comp.id, self.format.manifest_asset_path())
             .await?
             .is_none()
         {
@@ -1317,8 +1273,8 @@ impl ProxyRepo {
                 &mut *tx,
                 NewAsset {
                     component_id: comp.id,
-                    path: NUSPEC_ASSET_PATH.to_string(),
-                    content_type: NUSPEC_CONTENT_TYPE.to_string(),
+                    path: self.format.manifest_asset_path().to_string(),
+                    content_type: self.format.manifest_content_type().to_string(),
                     blob_sha256: nuspec.sha256.clone(),
                     size: nuspec_size,
                     sha512_base64: None,
@@ -1447,7 +1403,8 @@ impl ProxyRepo {
         else {
             return Ok(None);
         };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.package_asset_path()).await?
         else {
             return Ok(None);
         };
@@ -1518,7 +1475,8 @@ impl ProxyRepo {
         else {
             return Ok(None);
         };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUSPEC_ASSET_PATH).await?
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.manifest_asset_path()).await?
         else {
             return Ok(None);
         };
@@ -1528,306 +1486,98 @@ impl ProxyRepo {
         Ok(Some(blobs.fetch_all(&blob).await?))
     }
 
-    /// Fetch the upstream `.nuspec` for a known, not-yet-downloaded version.
-    /// Cached (L1/L2) — a published manifest never changes.
+    /// The upstream's manifest of a known, not-yet-downloaded version
+    /// ([`api::UpstreamOp::Manifest`]), without downloading the package.
     ///
-    /// The upstream controls these bytes (and where its redirects lead), so a
-    /// document is served or cached only when it parses as a manifest of
-    /// exactly `(lower_id, version)`. Anything else yields `None`, and the
-    /// caller falls back to the package itself, whose identity is verified
-    /// the same way.
-    async fn upstream_nuspec(
+    /// The upstream controls these bytes (and where its redirects lead), so
+    /// the format serves a manifest only when it declares exactly
+    /// `(lower_id, version)`. Anything else yields `None`, and the caller
+    /// falls back to the package itself, whose identity is verified the same
+    /// way.
+    async fn upstream_manifest(
         &self,
         repo: &Repository,
         lower_id: &str,
         version: &str,
     ) -> Result<Option<Vec<u8>>, RepoError> {
-        let key = format!("{}/{lower_id}/{version}", Self::upstream_scope(repo));
-        let fetched: Result<Option<Vec<u8>>, String> = self
-            .cache
-            // Local-only, like every upstream document clients act on: a
-            // manifest from Redis could rewrite a version's dependencies.
-            .get_or_try_insert_local(NS_UPSTREAM_NUSPEC, &key, NUSPEC_CACHE_TTL, || async {
-                let resources = Box::pin(self.resolve_upstream_index(repo))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let Some(base) = resources.package_base_address else {
-                    return Err("upstream advertises no PackageBaseAddress".to_string());
-                };
-                let url = format!("{base}{lower_id}/{version}/{lower_id}.nuspec");
-                let creds = self.credentials(repo).await.map_err(|e| e.to_string())?;
-                let auth = creds.as_ref().map(Credentials::auth);
-                let Some(bytes) = self
-                    .http
-                    .get_bytes(&url, auth.as_ref())
-                    .await
-                    .map_err(|e| e.to_string())?
-                else {
-                    return Ok(None);
-                };
-                match self.format.manifest_identity(&bytes) {
-                    Ok((id, v)) if id == lower_id && v == version => Ok(Some(bytes)),
-                    Ok((id, v)) => {
-                        tracing::warn!(%url, %id, version = %v, "upstream nuspec names another package; not serving it");
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        tracing::warn!(%url, error = %e, "upstream nuspec is not a valid manifest; not serving it");
-                        Ok(None)
-                    }
-                }
-            })
-            .await;
-        fetched.map_err(RepoError::Storage)
+        match self
+            .converse_resolved(
+                repo,
+                api::UpstreamOp::Manifest(api::PackageRef {
+                    id: lower_id.to_string(),
+                    version: version.to_string(),
+                }),
+            )
+            .await?
+        {
+            api::UpstreamAnswer::Manifest(manifest) => Ok(manifest),
+            api::UpstreamAnswer::Failed(reason) => Err(RepoError::Storage(reason)),
+            _ => Err(RepoError::Storage(
+                "upstream protocol answered manifest with something else".into(),
+            )),
+        }
     }
 
-    // ── Upstream registration metadata (M11) ────────────────────────────────
+    // ── Upstream metadata (M11) ──────────────────────────────────────────────
 
-    /// Upstream registration metadata for `wanted` versions of `lower_id`,
-    /// keyed by normalized version. Best effort and bounded: an offline proxy,
-    /// an upstream without a `RegistrationsBaseUrl`, and any upstream or parse
-    /// failure yield what could be gathered (possibly nothing), and the caller
-    /// falls back to the flat-container view. Inlined leaves cost no extra
-    /// request; of the non-inlined pages covering a wanted version, at most
-    /// `max_pages` (newest first) are fetched. The index and each page are
-    /// cached for the metadata TTL.
-    ///
-    /// Also returns the newest version the index names (the highest page
-    /// `upper`), whether or not its leaf was read.
-    async fn upstream_registration(
+    /// The upstream's metadata of `wanted` versions of `lower_id`, keyed by
+    /// normalized version ([`api::UpstreamOp::Metadata`], or
+    /// [`api::UpstreamOp::Dating`] with creation times). Best effort and
+    /// bounded by the format: an offline proxy and any upstream or protocol
+    /// failure yield nothing, and the caller falls back to the listing's
+    /// view (listed, no dependencies). Records the package id's upstream
+    /// casing for search (best effort): the newest version's, the one the
+    /// upstream shows, as the format reports it.
+    async fn upstream_metadata(
         &self,
         repo: &Repository,
         lower_id: &str,
         wanted: &[String],
-        max_pages: usize,
-    ) -> (HashMap<String, UpstreamLeaf>, Option<String>) {
-        let mut out = HashMap::new();
+        dating: bool,
+    ) -> HashMap<String, api::VersionMetadata> {
         if !repo.online || wanted.is_empty() {
-            return (out, None);
+            return HashMap::new();
         }
-        let pages = match Box::pin(self.upstream_registration_index(repo, lower_id)).await {
-            Ok(Some(pages)) => pages,
-            Ok(None) => return (out, None),
+        let versions = api::PackageVersions {
+            id: lower_id.to_string(),
+            versions: wanted.to_vec(),
+        };
+        let op = if dating {
+            api::UpstreamOp::Dating(versions)
+        } else {
+            api::UpstreamOp::Metadata(versions)
+        };
+        let metadata = match Box::pin(self.converse_resolved(repo, op)).await {
+            Ok(api::UpstreamAnswer::Metadata(metadata)) => metadata,
+            Ok(api::UpstreamAnswer::Failed(reason)) => {
+                tracing::warn!(repo = %repo.name, id = %lower_id, %reason, "upstream metadata unavailable; serving the listing's");
+                return HashMap::new();
+            }
+            Ok(_) => {
+                tracing::warn!(repo = %repo.name, id = %lower_id, "upstream protocol answered metadata with something else");
+                return HashMap::new();
+            }
             Err(e) => {
-                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream registration unavailable; serving flat-container metadata");
-                return (out, None);
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream metadata unavailable; serving the listing's");
+                return HashMap::new();
             }
         };
-        let newest = pages
-            .iter()
-            .filter_map(|page| page.upper.clone())
-            .max_by(|a, b| self.format.compare_versions(a, b));
-
-        let mut to_fetch: Vec<(Option<String>, String)> = Vec::new();
-        for page in pages {
-            match page.leaves {
-                Some(leaves) => out.extend(leaves),
-                None => {
-                    let covers = wanted.iter().any(|v| {
-                        page.lower.as_deref().is_none_or(|lo| {
-                            self.format.compare_versions(lo, v) != std::cmp::Ordering::Greater
-                        }) && page.upper.as_deref().is_none_or(|hi| {
-                            self.format.compare_versions(v, hi) != std::cmp::Ordering::Greater
-                        })
-                    });
-                    if let (true, Some(url)) = (covers, page.url) {
-                        to_fetch.push((page.upper, url));
-                    }
-                }
+        if let Some(original_id) = metadata
+            .original_id
+            .as_deref()
+            .filter(|id| self.format.lower_id(id) == lower_id)
+        {
+            if let Err(e) =
+                proxy_dao::record_original_id(&self.pool, repo.id, lower_id, original_id).await
+            {
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "recording the upstream id casing failed");
             }
         }
-        // Newest pages first; an unknown upper bound sorts last.
-        to_fetch.sort_by(|a, b| match (&a.0, &b.0) {
-            (Some(x), Some(y)) => self.format.compare_versions(y, x),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
-        to_fetch.truncate(max_pages);
-
-        use futures_util::StreamExt;
-        let fetched: Vec<_> = futures_util::stream::iter(to_fetch)
-            .map(|(_, url)| async move {
-                let res = self.upstream_registration_page(repo, &url).await;
-                (url, res)
-            })
-            .buffered(REGISTRATION_PAGE_CONCURRENCY)
+        metadata
+            .versions
+            .into_iter()
+            .map(|v| (v.version.clone(), v))
             .collect()
-            .await;
-        for (url, res) in fetched {
-            match res {
-                Ok(leaves) => out.extend(leaves),
-                Err(e) => {
-                    tracing::warn!(repo = %repo.name, id = %lower_id, %url, error = %e, "upstream registration page unavailable");
-                }
-            }
-        }
-        (out, newest)
-    }
-
-    /// The upstream registration index of `lower_id` (`None`: the upstream has
-    /// no registration resource or no registration for the id). Cached for the
-    /// metadata TTL.
-    async fn upstream_registration_index(
-        &self,
-        repo: &Repository,
-        lower_id: &str,
-    ) -> Result<Option<Vec<UpstreamRegistrationPage>>, RepoError> {
-        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{lower_id}", Self::upstream_scope(repo));
-        self.cache
-            // Local-only (listing state, dependencies; see NS_UPSTREAM_NUSPEC).
-            .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION, &key, ttl, || async {
-                let resources = Box::pin(self.resolve_upstream_index(repo))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let Some(base) = resources.registrations_base_url else {
-                    return Ok(None);
-                };
-                let url = format!("{base}{lower_id}/index.json");
-                let doc = self
-                    .fetch_json(repo, &url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(doc.map(|doc| self.registration_pages(&doc)))
-            })
-            .await
-            .map_err(RepoError::Storage)
-    }
-
-    /// The leaves of one non-inlined upstream registration page. Cached for
-    /// the metadata TTL.
-    async fn upstream_registration_page(
-        &self,
-        repo: &Repository,
-        url: &str,
-    ) -> Result<BTreeMap<String, UpstreamLeaf>, RepoError> {
-        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{url}", Self::upstream_scope(repo));
-        self.cache
-            // Local-only (see NS_UPSTREAM_REGISTRATION).
-            .get_or_try_insert_local(NS_UPSTREAM_REGISTRATION_PAGE, &key, ttl, || async {
-                let doc = self
-                    .fetch_json(repo, url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(doc
-                    .map(|doc| self.registration_leaves(&doc))
-                    .unwrap_or_default())
-            })
-            .await
-            .map_err(RepoError::Storage)
-    }
-
-    /// The pages of a registration index document (`items[]`).
-    fn registration_pages(&self, doc: &JsonValue) -> Vec<UpstreamRegistrationPage> {
-        let normalize = |v: Option<&JsonValue>| {
-            v.and_then(JsonValue::as_str)
-                .and_then(|raw| self.format.normalize_version(raw).ok())
-        };
-        doc.get("items")
-            .and_then(JsonValue::as_array)
-            .map(|pages| {
-                pages
-                    .iter()
-                    .map(|page| UpstreamRegistrationPage {
-                        url: page
-                            .get("@id")
-                            .and_then(JsonValue::as_str)
-                            .map(str::to_string),
-                        lower: normalize(page.get("lower")),
-                        upper: normalize(page.get("upper")),
-                        leaves: page
-                            .get("items")
-                            .filter(|items| items.is_array())
-                            .map(|_| self.registration_leaves(page)),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The leaves (`items[]`) of a registration page, by normalized version.
-    /// A leaf whose `catalogEntry` is not inlined carries no metadata and is
-    /// skipped.
-    fn registration_leaves(&self, page: &JsonValue) -> BTreeMap<String, UpstreamLeaf> {
-        let mut out = BTreeMap::new();
-        let Some(items) = page.get("items").and_then(JsonValue::as_array) else {
-            return out;
-        };
-        for item in items {
-            let Some(entry) = item.get("catalogEntry").filter(|e| e.is_object()) else {
-                continue;
-            };
-            let Some(version) = entry
-                .get("version")
-                .and_then(JsonValue::as_str)
-                .and_then(|raw| self.format.normalize_version(raw).ok())
-            else {
-                continue;
-            };
-            let published = entry
-                .get("published")
-                .and_then(JsonValue::as_str)
-                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-                .map(|at| at.with_timezone(&Utc));
-            // `listed` is optional; NuGet clients then treat nuget.org's
-            // 1900-01-01 `published` marker as unlisted.
-            let listed = entry
-                .get("listed")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or_else(|| published.is_none_or(|at| at.year() > 1900));
-            let groups = entry
-                .get("dependencyGroups")
-                .and_then(JsonValue::as_array)
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .map(|group| {
-                            let tfm = group
-                                .get("targetFramework")
-                                .and_then(JsonValue::as_str)
-                                .filter(|t| !t.is_empty())
-                                .map(str::to_string);
-                            let deps = group
-                                .get("dependencies")
-                                .and_then(JsonValue::as_array)
-                                .map(|deps| {
-                                    deps.iter()
-                                        .filter_map(|dep| {
-                                            let id = dep.get("id")?.as_str()?.to_string();
-                                            let range = dep
-                                                .get("range")
-                                                .and_then(JsonValue::as_str)
-                                                .map(str::to_string);
-                                            Some((id, range))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            (tfm, deps)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            out.insert(
-                version,
-                UpstreamLeaf {
-                    id: entry
-                        .get("id")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_string),
-                    listed,
-                    published,
-                    groups,
-                    catalog_url: entry
-                        .get("@id")
-                        .and_then(JsonValue::as_str)
-                        .map(str::to_string),
-                },
-            );
-        }
-        out
     }
 
     /// Search the locally known proxy corpus once, applying authorization
@@ -1993,12 +1743,11 @@ impl ProxyRepo {
             hit.nuspec_bytes = manifest;
         }
     }
+
     /// The registration entries of `id`: every listable version, or only
-    /// those in `only` (normalized). The upstream registration is consulted
-    /// for the versions returned only, so a registration page or leaf fetches
-    /// just the upstream pages covering its own versions (an index of more
-    /// versions than [`MAX_REGISTRATION_PAGES`] upstream pages hold is paged,
-    /// never rendered whole).
+    /// those in `only` (normalized). The upstream's metadata is asked for the
+    /// versions returned only, so a registration page or leaf reads just the
+    /// upstream documents covering its own versions.
     async fn registration_of(
         &self,
         repo: &str,
@@ -2027,7 +1776,7 @@ impl ProxyRepo {
 
         let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
         let upstream = self
-            .upstream_leaves(&repo_row, &lower, &wanted, MAX_REGISTRATION_PAGES)
+            .upstream_metadata(&repo_row, &lower, &wanted, false)
             .await;
 
         // Persist the upstream listing state so the flat index and search
@@ -2055,7 +1804,7 @@ impl ProxyRepo {
                     &self.pool,
                     repo_row.id,
                     &lower,
-                    NUPKG_ASSET_PATH,
+                    self.format.package_asset_path(),
                 )
                 .await?
             }
@@ -2065,7 +1814,7 @@ impl ProxyRepo {
                     repo_row.id,
                     &lower,
                     &wanted,
-                    NUPKG_ASSET_PATH,
+                    self.format.package_asset_path(),
                 )
                 .await?
             }
@@ -2118,22 +1867,15 @@ impl ProxyRepo {
                     _ => (None, None, None, None, None, None),
                 };
             let original_id = leaf
-                .and_then(|l| l.id.clone())
+                .and_then(|l| l.original_id.clone())
                 .unwrap_or_else(|| r.name.clone());
-            // Not downloaded: the dependency groups are known only from the
-            // upstream registration.
-            let nuspec_bytes = if summary.is_some() {
-                None
-            } else {
-                local.or_else(|| {
-                    leaf.and_then(|l| {
-                        self.format.synthesize_manifest(
-                            &original_id,
-                            &r.version,
-                            &l.dependency_groups(),
-                        )
-                    })
-                })
+            // Not downloaded (or its manifest unreadable): the manifest is
+            // known only from the upstream's metadata.
+            let summary = match (summary, &local) {
+                (None, None) => leaf
+                    .and_then(|l| l.summary.as_deref())
+                    .and_then(|summary| serde_json::from_str(summary).ok()),
+                (summary, _) => summary,
             };
             out.push(RegistrationEntry {
                 original_id,
@@ -2143,78 +1885,29 @@ impl ProxyRepo {
                 package_hash_sha512_base64: hash,
                 package_sha256: sha256,
                 package_size: size,
-                nuspec_bytes,
+                nuspec_bytes: local,
                 manifest_summary: summary,
-                // Only the upstream registration knows the publish time (the
-                // cache time would be misleading).
-                published: leaf.and_then(|l| l.published),
+                // Only the upstream knows the publish time (the cache time
+                // would be misleading).
+                published: leaf.and_then(|l| rfc3339(l.published.as_deref())),
             });
         }
         Ok(out)
     }
 
-    /// [`Self::upstream_registration`] for `wanted`, without leaves that name
-    /// another package (they are not this package's metadata). Records the
-    /// package id's upstream casing for search (best effort).
-    ///
-    /// Each version keeps the casing it was pushed with (`jQuery` /
-    /// `jquery`), so the casing recorded is the newest version's, the one
-    /// nuget.org shows for the package, and only when its leaf was read:
-    /// taking any leaf made the recorded casing, and search, flip between
-    /// reads.
-    async fn upstream_leaves(
-        &self,
-        repo: &Repository,
-        lower_id: &str,
-        wanted: &[String],
-        max_pages: usize,
-    ) -> HashMap<String, UpstreamLeaf> {
-        let (mut upstream, newest) = self
-            .upstream_registration(repo, lower_id, wanted, max_pages)
-            .await;
-        upstream.retain(|_, leaf| {
-            leaf.id
-                .as_deref()
-                .is_none_or(|id| self.format.lower_id(id) == lower_id)
-        });
-        let newest_leaf = upstream
-            .iter()
-            .filter_map(|(version, leaf)| leaf.id.as_deref().map(|id| (version, id)))
-            .max_by(|(a, _), (b, _)| self.format.compare_versions(a, b))
-            .filter(|(version, _)| {
-                newest.as_deref().is_none_or(|newest| {
-                    self.format.compare_versions(version, newest) != std::cmp::Ordering::Less
-                })
-            });
-        if let Some((_, original_id)) = newest_leaf {
-            if let Err(e) =
-                proxy_dao::record_original_id(&self.pool, repo.id, lower_id, original_id).await
-            {
-                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "recording the upstream id casing failed");
-            }
-        }
-        upstream
-    }
-
     /// Date the package delay of `lower_id`'s versions still inside it from
-    /// when the upstream published them, instead of from their first
-    /// sighting here. The delay quarantines *new releases*: without this, a
-    /// version published years ago but first seen now (every version of a
-    /// package this proxy has not served before, all of them on a fresh
-    /// install) was hidden for the whole delay.
+    /// when the upstream created them, instead of from their first sighting
+    /// here. The delay quarantines *new releases*: without this, a version
+    /// published years ago but first seen now (every version of a package
+    /// this proxy has not served before, all of them on a fresh install) was
+    /// hidden for the whole delay.
     ///
-    /// A listed version counts from its registration `published` time. An
-    /// unlisted one counts from when its catalog entry says it was `created`:
-    /// nuget.org reports unlisted versions as published in 1900, which would
-    /// let a release unlisted right after publishing skip the quarantine, so
-    /// that time is never used, but an old unlisted version that a lockfile
-    /// pins is still restorable at once (up to [`MAX_CATALOG_FETCHES`]
-    /// catalog reads per refresh; the rest at the next one). Only a plausible
-    /// time counts (not before 2010, not in the future), and it only ever
-    /// moves the clock back. Every registration page covering a pending
-    /// version is read, up to [`MAX_BACKDATE_REGISTRATION_PAGES`]. Best
-    /// effort: when the upstream registration is unavailable, the first
-    /// sighting stands.
+    /// The creation times are the format's ([`api::UpstreamOp::Dating`]; for
+    /// NuGet, a listed version's registration `published` time, an unlisted
+    /// one's catalog `created` time, as nuget.org reports unlisted versions as
+    /// published in 1900). Only a plausible time counts (not before 2010, not
+    /// in the future), and it only ever moves the clock back. Best effort:
+    /// when the upstream cannot say, the first sighting stands.
     async fn date_delay_from_upstream(&self, repo: &Repository, lower_id: &str) {
         let result: Result<(), RepoError> = async {
             let now = self.db_now().await?;
@@ -2228,25 +1921,19 @@ impl ProxyRepo {
                 return Ok(());
             }
             let wanted: Vec<String> = pending.iter().map(|r| r.version.clone()).collect();
-            let leaves = self
-                .upstream_leaves(repo, lower_id, &wanted, MAX_BACKDATE_REGISTRATION_PAGES)
-                .await;
-            let created = self.unlisted_created(repo, &pending, &leaves).await;
+            let metadata = self.upstream_metadata(repo, lower_id, &wanted, true).await;
             let plausible = |at: &DateTime<Utc>| *at >= min_trusted_publish_time() && *at <= now;
-            let (versions, published): (Vec<String>, Vec<DateTime<Utc>>) = pending
+            let (versions, created): (Vec<String>, Vec<DateTime<Utc>>) = pending
                 .iter()
                 .filter_map(|r| {
-                    let leaf = leaves.get(&r.version)?;
-                    let at = if leaf.listed {
-                        leaf.published
-                    } else {
-                        created.get(&r.version).copied()
-                    }
-                    .filter(plausible)?;
+                    let at = metadata
+                        .get(&r.version)
+                        .and_then(|m| rfc3339(m.created.as_deref()))
+                        .filter(plausible)?;
                     (at < r.first_seen_at).then(|| (r.version.clone(), at))
                 })
                 .unzip();
-            proxy_dao::backdate_first_seen(&self.pool, repo.id, lower_id, &versions, &published)
+            proxy_dao::backdate_first_seen(&self.pool, repo.id, lower_id, &versions, &created)
                 .await?;
             Ok(())
         }
@@ -2255,67 +1942,13 @@ impl ProxyRepo {
             tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "dating the package delay from the upstream failed");
         }
     }
+}
 
-    /// When the upstream created each of `pending`'s unlisted versions, read
-    /// from the catalog entries their registration leaves name (at most
-    /// [`MAX_CATALOG_FETCHES`]). An entry that cannot be read or names no
-    /// creation time is left out.
-    async fn unlisted_created(
-        &self,
-        repo: &Repository,
-        pending: &[forge_db::model::ProxyCachedVersion],
-        leaves: &HashMap<String, UpstreamLeaf>,
-    ) -> HashMap<String, DateTime<Utc>> {
-        use futures_util::StreamExt;
-        let to_read: Vec<(String, String)> = pending
-            .iter()
-            .filter_map(|r| {
-                let leaf = leaves.get(&r.version).filter(|leaf| !leaf.listed)?;
-                Some((r.version.clone(), leaf.catalog_url.clone()?))
-            })
-            .take(MAX_CATALOG_FETCHES)
-            .collect();
-        futures_util::stream::iter(to_read)
-            .map(|(version, url)| async move {
-                match self.upstream_catalog_created(repo, &url).await {
-                    Ok(created) => created.map(|at| (version, at)),
-                    Err(e) => {
-                        tracing::warn!(repo = %repo.name, %url, error = %e, "upstream catalog entry unavailable");
-                        None
-                    }
-                }
-            })
-            .buffered(REGISTRATION_PAGE_CONCURRENCY)
-            .filter_map(|dated| async move { dated })
-            .collect()
-            .await
-    }
-
-    /// The `created` time of one upstream catalog entry (`None` when it names
-    /// none). A catalog entry never changes, so it is cached like a manifest.
-    async fn upstream_catalog_created(
-        &self,
-        repo: &Repository,
-        url: &str,
-    ) -> Result<Option<DateTime<Utc>>, RepoError> {
-        let key = format!("{}/{url}", Self::upstream_scope(repo));
-        self.cache
-            // Local-only, like the registration it comes from.
-            .get_or_try_insert_local(NS_UPSTREAM_CATALOG, &key, NUSPEC_CACHE_TTL, || async {
-                let doc = self
-                    .fetch_json(repo, url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(doc
-                    .as_ref()
-                    .and_then(|doc| doc.get("created"))
-                    .and_then(JsonValue::as_str)
-                    .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-                    .map(|at| at.with_timezone(&Utc)))
-            })
-            .await
-            .map_err(RepoError::Storage)
-    }
+/// An RFC 3339 time the upstream reported, if it parses.
+fn rfc3339(raw: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw?)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// Concurrent local manifest reads while enriching one proxy search page.
@@ -2441,7 +2074,7 @@ impl RepoReadOps for ProxyRepo {
             return Ok(None);
         }
         if repo_row.online {
-            if let Some(bytes) = Box::pin(self.upstream_nuspec(&repo_row, &lower, &norm)).await? {
+            if let Some(bytes) = Box::pin(self.upstream_manifest(&repo_row, &lower, &norm)).await? {
                 return Ok(Some(bytes));
             }
         }
@@ -2457,11 +2090,10 @@ impl RepoReadOps for ProxyRepo {
     }
 
     /// Registration entries of the listable versions. `listed`, `published`
-    /// and — for versions not downloaded yet — the dependency groups come from
-    /// the upstream registration when it is available ([`Self::upstream_registration`]);
-    /// the dependency groups are handed to the format layer as a manifest
-    /// synthesized by [`Format::synthesize_manifest`]. A downloaded version
-    /// serves its stored manifest and package hash.
+    /// and — for versions not downloaded yet — the manifest summary come
+    /// from the upstream's metadata when it has any
+    /// ([`Self::upstream_metadata`]). A downloaded version serves its stored
+    /// manifest and package hash.
     async fn registration(
         &self,
         repo: &str,
@@ -2554,7 +2186,7 @@ impl RepoReadOps for ProxyRepo {
 
 /// One page of an upstream's search results, reduced to what a search hit
 /// renders.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct UpstreamSearchPage {
     /// The upstream's total hit count.
     total_hits: usize,
@@ -2562,13 +2194,13 @@ struct UpstreamSearchPage {
 }
 
 /// One package of an [`UpstreamSearchPage`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct UpstreamSearchHit {
     /// Package id as the upstream spells it.
     id: String,
     /// The versions the upstream lists, normalized, ascending.
     versions: Vec<String>,
-    /// Display metadata ([`Format::search_hit_summary`]).
+    /// A manifest summary of the latest version, as the upstream reports it.
     summary: Option<JsonValue>,
     total_downloads: Option<i64>,
 }
@@ -2632,117 +2264,67 @@ impl ProxyRepo {
             .is_ok()
     }
 
-    /// One page of the upstream's search results for `params`, cached for
-    /// the metadata TTL. `None` when the upstream advertises no search
-    /// service.
+    /// One page of the upstream's search results for `params`
+    /// ([`api::UpstreamOp::Search`]; its documents are cached for the
+    /// metadata TTL). `None` when the upstream offers no search. A hit
+    /// without a well-formed id (ids end up in Forge's URLs) is dropped, and
+    /// the upstream's total reduced by it.
     async fn upstream_search(
         &self,
         repo: &Repository,
         params: &SearchParams,
     ) -> Result<Option<UpstreamSearchPage>, RepoError> {
-        let resources = self.resolve_upstream_index(repo).await?;
-        let Some(service) = resources.search_query_service else {
-            return Ok(None);
-        };
-        let mut url = url::Url::parse(&service)
-            .map_err(|e| RepoError::Storage(format!("upstream search service {service}: {e}")))?;
         // As much of `q` as a local search honors.
         let mut q_end = params.q.len().min(SearchQuery::MAX_QUERY_BYTES);
         while !params.q.is_char_boundary(q_end) {
             q_end -= 1;
         }
-        let take = params.effective_take();
-        url.query_pairs_mut()
-            .append_pair("q", &params.q[..q_end])
-            .append_pair("skip", &params.skip.to_string())
-            .append_pair("take", &take.to_string())
-            .append_pair("prerelease", &params.prerelease.to_string())
-            .append_pair(
-                "semVerLevel",
-                if params.include_semver2 {
-                    "2.0.0"
-                } else {
-                    "1.0.0"
-                },
-            );
-        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = format!("{}/{url}", Self::upstream_scope(repo));
-        self.cache
-            // Local-only: which packages exist upstream (see NS_UPSTREAM_NUSPEC).
-            .get_or_try_insert_local(NS_UPSTREAM_SEARCH, &key, ttl, || async {
-                let doc = self
-                    .fetch_json(repo, url.as_str())
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("upstream search {url} returned 404"))?;
-                Ok(self.upstream_search_page(&doc, params.skip, take))
-            })
-            .await
-            .map(Some)
-            .map_err(RepoError::Storage)
-    }
-
-    /// Read an upstream search response: at most `take` hits. An entry
-    /// without a well-formed id (ids end up in Forge's URLs) is dropped, and
-    /// the upstream's total reduced by it.
-    fn upstream_search_page(
-        &self,
-        doc: &JsonValue,
-        skip: usize,
-        take: usize,
-    ) -> UpstreamSearchPage {
-        let entries: Vec<&JsonValue> = doc
-            .get("data")
-            .and_then(JsonValue::as_array)
-            .map(|data| data.iter().take(take).collect())
-            .unwrap_or_default();
-        let returned = entries.len();
-        let hits: Vec<UpstreamSearchHit> = entries
+        let query = api::SearchQuery {
+            text: params.q[..q_end].to_string(),
+            skip: u32::try_from(params.skip).unwrap_or(u32::MAX),
+            take: u32::try_from(params.effective_take()).unwrap_or(u32::MAX),
+            prerelease: params.prerelease,
+            semver2: params.include_semver2,
+            upstream: true,
+        };
+        let page = match self
+            .converse_resolved(repo, api::UpstreamOp::Search(query))
+            .await?
+        {
+            api::UpstreamAnswer::Search(Some(page)) => page,
+            api::UpstreamAnswer::Search(None) => return Ok(None),
+            api::UpstreamAnswer::Failed(reason) => return Err(RepoError::Storage(reason)),
+            _ => {
+                return Err(RepoError::Storage(
+                    "upstream protocol answered search with something else".into(),
+                ))
+            }
+        };
+        let returned = page.hits.len().min(params.effective_take());
+        let hits: Vec<UpstreamSearchHit> = page
+            .hits
             .into_iter()
-            .filter_map(|entry| self.upstream_search_hit(entry))
-            .collect();
-        let total_hits = doc
-            .get("totalHits")
-            .and_then(JsonValue::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0)
-            .saturating_sub(returned - hits.len())
-            .max(skip.saturating_add(hits.len()));
-        UpstreamSearchPage { total_hits, hits }
-    }
-
-    /// One upstream search result entry with its parseable versions; `None`
-    /// when its id is not well-formed.
-    fn upstream_search_hit(&self, entry: &JsonValue) -> Option<UpstreamSearchHit> {
-        let id = entry.get("id")?.as_str()?.trim();
-        self.format.validate_id(id).ok()?;
-        let normalize = |raw: &str| self.format.normalize_version(raw).ok();
-        let mut versions: Vec<String> = entry
-            .get("versions")
-            .and_then(JsonValue::as_array)
-            .map(|versions| {
-                versions
-                    .iter()
-                    .filter_map(|v| normalize(v.get("version")?.as_str()?))
-                    .collect()
+            .take(params.effective_take())
+            .filter(|hit| {
+                self.format
+                    .validate_id(&self.format.lower_id(&hit.id))
+                    .is_ok()
             })
-            .unwrap_or_default();
-        if versions.is_empty() {
-            versions.extend(
-                entry
-                    .get("version")
-                    .and_then(JsonValue::as_str)
-                    .and_then(normalize),
-            );
-        }
-        versions.sort_by(|a, b| self.format.compare_versions(a, b));
-        versions.dedup();
-        Some(UpstreamSearchHit {
-            id: id.to_string(),
-            versions,
-            summary: self.format.search_hit_summary(entry),
-            total_downloads: entry.get("totalDownloads").and_then(JsonValue::as_i64),
-        })
+            .map(|hit| UpstreamSearchHit {
+                id: hit.id,
+                versions: hit.versions,
+                summary: hit
+                    .summary
+                    .as_deref()
+                    .and_then(|summary| serde_json::from_str(summary).ok()),
+                total_downloads: hit.total_downloads.and_then(|n| i64::try_from(n).ok()),
+            })
+            .collect();
+        let total_hits = usize::try_from(page.total)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(returned.saturating_sub(hits.len()))
+            .max(params.skip.saturating_add(hits.len()));
+        Ok(Some(UpstreamSearchPage { total_hits, hits }))
     }
 
     /// The search result for an upstream `page`, with the caller's package
@@ -2847,77 +2429,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_index_prefers_the_semver2_registration_variant() {
-        let doc = serde_json::json!({
-            "resources": [
-                { "@id": "https://up/registration5-semver1/", "@type": "RegistrationsBaseUrl" },
-                { "@id": "https://up/registration5-gz-semver2/", "@type": "RegistrationsBaseUrl/3.6.0" },
-                { "@id": "https://up/registration5-gz-semver1", "@type": "RegistrationsBaseUrl/3.4.0" },
-                { "@id": "https://up/flat", "@type": "PackageBaseAddress/3.0.0" },
-            ]
-        });
-        let res = UpstreamResources::from_service_index(&doc);
-        assert_eq!(
-            res.registrations_base_url.as_deref(),
-            Some("https://up/registration5-gz-semver2/")
-        );
-        assert_eq!(
-            res.package_base_address.as_deref(),
-            Some("https://up/flat/")
-        );
-
-        let only_semver1 = serde_json::json!({
-            "resources": [ { "@id": "https://up/reg", "@type": "RegistrationsBaseUrl" } ]
-        });
-        assert_eq!(
-            UpstreamResources::from_service_index(&only_semver1)
-                .registrations_base_url
-                .as_deref(),
-            Some("https://up/reg/")
-        );
-    }
-
-    #[test]
     fn persisted_index_records_its_url() {
-        let resources = UpstreamResources {
-            package_base_address: Some("https://up/flat/".into()),
-            registrations_base_url: None,
-            search_query_service: None,
+        let index = serde_json::json!({
+            "package_base_address": "https://up/flat/",
+            "registrations_base_url": null,
+            "search_query_service": null,
+        });
+        let JsonValue::Object(map) = index.clone() else {
+            unreachable!()
         };
         let stored = serde_json::to_value(PersistedIndex {
             remote_url: "https://up/index.json".into(),
-            resources: resources.clone(),
+            index: map,
         })
         .unwrap();
-        // The resources keep their shape; the URL is one more field.
-        assert_eq!(
-            serde_json::from_value::<UpstreamResources>(stored.clone()).unwrap(),
-            resources
-        );
+        // The index keeps its shape; the URL is one more field, so a row
+        // written before the format's upstream protocol moved behind
+        // `Format::upstream` reads back as the same index.
+        assert_eq!(stored["package_base_address"], "https://up/flat/");
         let parsed: PersistedIndex = serde_json::from_value(stored).unwrap();
         assert_eq!(parsed.remote_url, "https://up/index.json");
-        assert_eq!(parsed.resources, resources);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&parsed.index()).unwrap(),
+            index
+        );
         // A row written before the URL was recorded belongs to no URL.
-        let legacy = serde_json::to_value(&resources).unwrap();
-        assert!(serde_json::from_value::<PersistedIndex>(legacy).is_err());
-    }
-
-    #[test]
-    fn upstream_leaf_maps_to_dependency_groups() {
-        let leaf = UpstreamLeaf {
-            id: Some("A".into()),
-            listed: true,
-            published: None,
-            groups: vec![(
-                Some("net8.0".into()),
-                vec![("B".into(), Some("[1.0.0, )".into())), ("C".into(), None)],
-            )],
-            catalog_url: None,
-        };
-        let groups = leaf.dependency_groups();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].target_framework.as_deref(), Some("net8.0"));
-        assert_eq!(groups[0].dependencies[0].id, "B");
-        assert_eq!(groups[0].dependencies[1].range, None);
+        assert!(serde_json::from_value::<PersistedIndex>(index).is_err());
     }
 }

@@ -407,3 +407,161 @@ pub enum Rendered {
     /// far (the host bounds the rounds and the number of queries).
     Load(Vec<Query>),
 }
+
+/// The upstream a proxy repository mirrors ([`FormatPlugin::upstream`]).
+///
+/// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// The upstream's URL as the repository is configured with it.
+    pub url: String,
+    /// What [`UpstreamOp::Index`] answered for it (a JSON object of the
+    /// plugin's own making); `None` while the index is being resolved.
+    pub index: Option<String>,
+}
+
+/// What the host wants to know about the upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamOp {
+    /// Resolve the upstream into the index every other operation gets as
+    /// [`Remote::index`]. The host keeps it, refreshes it once per metadata
+    /// TTL and falls back to the last good one when a refresh fails.
+    Index,
+    /// The versions the upstream lists of a package (canonical id).
+    Versions(String),
+    /// The URL of a version's package. The host downloads it, checks it
+    /// with `parse_package` against the version asked for, and stores it.
+    Package(PackageRef),
+    /// A version's manifest without its package, verified to be that
+    /// version's; `None` sends the host to the package instead.
+    Manifest(PackageRef),
+    /// The upstream's metadata of some versions of a package (listing state,
+    /// publish time, manifest summary), best effort.
+    Metadata(PackageVersions),
+    /// [`UpstreamOp::Metadata`], plus when each version was created
+    /// upstream ([`VersionMetadata::created`]): the package delay counts
+    /// from it. It may cost more requests.
+    Dating(PackageVersions),
+    /// A page of the upstream's search results.
+    Search(SearchQuery),
+}
+
+/// How long the host may reuse a fetched document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// For the repository's metadata TTL: listings, indexes, search pages.
+    Metadata,
+    /// For a day: a document that never changes once published (a
+    /// version's manifest, a catalog entry).
+    Immutable,
+}
+
+/// A GET the plugin asks the host to send to the upstream.
+///
+/// The host sends the repository's credentials only to the origin of
+/// [`Remote::url`], bounds the response's size and time, inflates a
+/// gzip-encoded body, and refuses link-local and cloud-metadata targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetch {
+    pub url: String,
+    pub freshness: Freshness,
+}
+
+/// How a [`Fetch`] went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// A 2xx, with its body.
+    Found(Vec<u8>),
+    /// A 404.
+    NotFound,
+    /// Anything else: a transport error, another status, a body over the
+    /// size limit.
+    Failed(String),
+}
+
+/// A fetch with how it went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchResult {
+    pub fetch: Fetch,
+    pub outcome: Fetched,
+}
+
+/// The upstream's metadata of one version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMetadata {
+    /// Normalized.
+    pub version: String,
+    /// The id as this version spells it, when the upstream says.
+    pub original_id: Option<String>,
+    pub listed: bool,
+    /// When the upstream published the version: RFC 3339, shown to clients.
+    pub published: Option<String>,
+    /// When the version was created upstream, RFC 3339 ([`UpstreamOp::Dating`]
+    /// only): the package delay of a version first seen now counts from it.
+    pub created: Option<String>,
+    /// A manifest summary (as [`FormatPlugin::manifest_summary`] returns
+    /// one) for a version the proxy has not downloaded yet.
+    ///
+    /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
+    pub summary: Option<String>,
+}
+
+/// The answer to [`UpstreamOp::Metadata`] and [`UpstreamOp::Dating`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PackageMetadata {
+    /// The id as the upstream spells the package (its newest version's),
+    /// when known.
+    pub original_id: Option<String>,
+    /// The versions the upstream has metadata of, among those asked for.
+    pub versions: Vec<VersionMetadata>,
+}
+
+/// One package of an upstream's search results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamHit {
+    /// The id as the upstream spells it.
+    pub id: String,
+    /// Normalized, ascending.
+    pub versions: Vec<String>,
+    /// A manifest summary of the latest version.
+    pub summary: Option<String>,
+    pub total_downloads: Option<u64>,
+}
+
+/// One page of an upstream's search results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamSearch {
+    /// Matching packages before paging, as the upstream counts them.
+    pub total: u64,
+    pub hits: Vec<UpstreamHit>,
+}
+
+/// What an [`UpstreamOp`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAnswer {
+    /// The answer to [`UpstreamOp::Index`]: a JSON object.
+    Index(String),
+    /// `None`: the upstream does not know the package.
+    Versions(Option<Vec<String>>),
+    /// The package's URL.
+    Package(String),
+    Manifest(Option<Vec<u8>>),
+    /// The answer to [`UpstreamOp::Metadata`] and [`UpstreamOp::Dating`].
+    Metadata(PackageMetadata),
+    /// `None`: the upstream offers no search.
+    Search(Option<UpstreamSearch>),
+    /// The upstream answered something unusable: the host serves what it
+    /// has cached.
+    Failed(String),
+}
+
+/// What a round of [`FormatPlugin::upstream`] produced.
+///
+/// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamStep {
+    /// Fetch these, then call `upstream` again with everything fetched so
+    /// far (the host bounds the rounds and the number of fetches).
+    Fetch(Vec<Fetch>),
+    Done(UpstreamAnswer),
+}

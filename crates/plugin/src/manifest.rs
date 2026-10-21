@@ -7,14 +7,12 @@
 //! id = "helm"               # the format id repositories are created with
 //! name = "Helm charts"
 //! version = "0.1.0"         # the plugin's own version (informational)
-//! api = "0.2.0"             # the forge:format contract it is built against
+//! api = "0.3.0"             # the forge:format contract it is built against
 //! component = "helm.wasm"   # built as a component: its file, relative to
 //!                           # the directory (unused when built in)
 //! mount = "/repository"     # optional: served at {mount}/{repository}/…
 //! kinds = ["hosted", "group"] # optional: the repository kinds it supports
-//!
-//! [proxy]                   # optional: proxy repositories, through an
-//! upstream = "nuget-v3"     # upstream protocol the host implements
+//!                           # ("proxy" too, when it implements `upstream`)
 //!
 //! [assets]                  # optional: how its files are stored
 //! package = "package"
@@ -94,29 +92,13 @@ pub struct Manifest {
     pub component: Option<PathBuf>,
     /// Where repositories of the format are served: `{mount}/{repository}/…`.
     pub mount: String,
-    /// The repository kinds the format supports.
+    /// The repository kinds the format supports. `proxy` means the plugin
+    /// implements [`forge_plugin_api::FormatPlugin::upstream`].
     pub kinds: Vec<RepositoryKind>,
-    /// The upstream protocol its proxy repositories speak, when it has any.
-    pub proxy: Option<Upstream>,
     /// How a version's files are stored.
     pub assets: Assets,
     /// Requested limits as a component (`None` → the host default).
     pub limits: RequestedLimits,
-}
-
-/// An upstream protocol the host implements for proxy repositories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum Upstream {
-    /// A NuGet V3 feed (service index, flat container, registration,
-    /// search), serving `.nupkg` packages with `.nuspec` manifests.
-    #[serde(rename = "nuget-v3")]
-    NugetV3,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawProxy {
-    upstream: Upstream,
 }
 
 /// The `[assets]` table: the names (within a version) and content types of
@@ -159,7 +141,6 @@ struct RawManifest {
     plugin: RawPlugin,
     #[serde(default)]
     assets: Assets,
-    proxy: Option<RawProxy>,
     #[serde(default)]
     limits: RequestedLimits,
 }
@@ -207,10 +188,9 @@ impl Manifest {
         }
         let mount = p.mount.unwrap_or_else(|| DEFAULT_MOUNT.to_string());
         validate_mount(&mount)?;
-        let proxy = raw.proxy.map(|p| p.upstream);
         let kinds = match p.kinds {
             None => vec![RepositoryKind::Hosted, RepositoryKind::Group],
-            Some(kinds) => parse_kinds(&kinds, proxy.is_some())?,
+            Some(kinds) => parse_kinds(&kinds)?,
         };
         validate_assets(&raw.assets)?;
         Ok(Manifest {
@@ -222,7 +202,6 @@ impl Manifest {
             component,
             mount,
             kinds,
-            proxy,
             assets: raw.assets,
             limits: raw.limits,
         })
@@ -261,19 +240,14 @@ pub fn validate_mount(mount: &str) -> Result<(), PluginError> {
 }
 
 /// The `kinds` of a manifest: some of `hosted`, `proxy` and `group`, each
-/// once. A proxy needs an upstream protocol (`[proxy]`).
-fn parse_kinds(kinds: &[String], has_upstream: bool) -> Result<Vec<RepositoryKind>, PluginError> {
+/// once.
+fn parse_kinds(kinds: &[String]) -> Result<Vec<RepositoryKind>, PluginError> {
     let mut parsed = Vec::new();
     for kind in kinds {
         let kind = match kind.as_str() {
             "hosted" => RepositoryKind::Hosted,
             "group" => RepositoryKind::Group,
-            "proxy" if has_upstream => RepositoryKind::Proxy,
-            "proxy" => {
-                return Err(PluginError::Manifest(
-                    "kind \"proxy\" needs an upstream protocol ([proxy] upstream)".into(),
-                ))
-            }
+            "proxy" => RepositoryKind::Proxy,
             other => {
                 return Err(PluginError::Manifest(format!(
                     "unknown repository kind {other:?} (hosted, proxy, group)"
@@ -360,7 +334,7 @@ mod tests {
         id = "helm"
         name = "Helm charts"
         version = "0.1.0"
-        api = "0.2.0"
+        api = "0.3.0"
         component = "helm.wasm"
 
         [limits]
@@ -442,21 +416,12 @@ mod tests {
                 "{mount:?} accepted"
             );
         }
-        // A proxy needs an upstream protocol.
-        let m = with(
-            "kinds = [\"hosted\", \"proxy\"]",
-            "[proxy]\nupstream = \"nuget-v3\"\n",
-        )
-        .unwrap();
+        // A plugin with an upstream side serves proxies.
+        let m = with("kinds = [\"hosted\", \"proxy\"]", "").unwrap();
         assert_eq!(m.kinds, [RepositoryKind::Hosted, RepositoryKind::Proxy]);
-        assert_eq!(m.proxy, Some(Upstream::NugetV3));
-        assert!(with("", "[proxy]\nupstream = \"maven\"\n").is_err());
-        for kinds in [
-            "[]",
-            "[\"proxy\"]",
-            "[\"mirror\"]",
-            "[\"hosted\", \"hosted\"]",
-        ] {
+        // `[proxy]` (0.2's host-side upstream protocols) is gone.
+        assert!(with("", "[proxy]\nupstream = \"nuget-v3\"\n").is_err());
+        for kinds in ["[]", "[\"mirror\"]", "[\"hosted\", \"hosted\"]"] {
             assert!(
                 with(&format!("kinds = {kinds}"), "").is_err(),
                 "{kinds} accepted"
@@ -479,9 +444,9 @@ mod tests {
 
     #[test]
     fn refuses_unknown_apis_and_keys() {
-        assert!(Manifest::parse(&GOOD.replace("api = \"0.2.0\"", "api = \"9.0.0\"")).is_err());
+        assert!(Manifest::parse(&GOOD.replace("api = \"0.3.0\"", "api = \"9.0.0\"")).is_err());
         // 0.1.0 was a preview that no release shipped.
-        assert!(Manifest::parse(&GOOD.replace("api = \"0.2.0\"", "api = \"0.1.0\"")).is_err());
+        assert!(Manifest::parse(&GOOD.replace("api = \"0.3.0\"", "api = \"0.2.0\"")).is_err());
         assert!(Manifest::parse(&format!("{GOOD}\nunknown = 1\n")).is_err());
         assert!(Manifest::parse(&GOOD.replace("memory_mib", "memory_gib")).is_err());
     }

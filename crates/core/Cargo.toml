@@ -13,6 +13,9 @@ forge-cache = { path = "../cache" }
 # Secret encryption at rest (slice 12.5): the proxy upstream fetch decrypts the
 # upstream password through the envelope service (the single sanctioned site).
 forge-crypto = { path = "../crypto" }
+# The format-plugin contract: the upstream conversation of proxy repositories
+# (`Format::upstream`) speaks its types. Nothing but std.
+forge-plugin-api = { path = "../plugin-api" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }

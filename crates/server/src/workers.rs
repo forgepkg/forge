@@ -471,11 +471,10 @@ async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        // Only NuGet proxies keep an upstream index: docker proxies
-        // revalidate per tag, and format plugins have no proxies.
-        let format = match state.formats.for_repository(&repo) {
-            Ok(format) if format.id() == "nuget" => format,
-            _ => continue,
+        // Proxies of package formats keep an upstream index; docker
+        // proxies revalidate per tag (and have no package format).
+        let Ok(format) = state.formats.for_repository(&repo) else {
+            continue;
         };
         // Same wiring as request-time reads: shared upstream client and the
         // envelope service, so credentialed upstreams refresh too.

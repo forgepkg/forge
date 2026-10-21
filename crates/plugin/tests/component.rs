@@ -453,4 +453,66 @@ fn the_component_answers_like_the_builtin_plugin() {
         wasm.render(&repo(), &req, &data),
         native.render(&repo(), &req, &data)
     );
+
+    // The upstream side, through the component's `upstream` export: a
+    // proxy of another chart repository.
+    let index = b"apiVersion: v1\nentries:\n  nginx:\n    - apiVersion: v2\n      name: nginx\n      version: 2.1.0\n      description: A web server\n      created: '2026-05-01T10:00:00Z'\n      urls: [charts/nginx-2.1.0.tgz]\n";
+    let fetched = [forge_plugin::api::FetchResult {
+        fetch: forge_plugin::api::Fetch {
+            url: "https://charts.example/index.yaml".into(),
+            freshness: forge_plugin::api::Freshness::Metadata,
+        },
+        outcome: forge_plugin::api::Fetched::Found(index.to_vec()),
+    }];
+    let unresolved = forge_plugin::api::Remote {
+        url: "https://charts.example".into(),
+        index: None,
+    };
+    let resolved = forge_plugin::api::Remote {
+        url: "https://charts.example".into(),
+        index: Some(r#"{"base":"https://charts.example"}"#.into()),
+    };
+    let nginx = |version: &str| forge_plugin::api::PackageRef {
+        id: "nginx".into(),
+        version: version.into(),
+    };
+    let wanted = forge_plugin::api::PackageVersions {
+        id: "nginx".into(),
+        versions: vec!["2.1.0".into()],
+    };
+    for (remote, op) in [
+        (&unresolved, forge_plugin::api::UpstreamOp::Index),
+        (
+            &resolved,
+            forge_plugin::api::UpstreamOp::Versions("nginx".into()),
+        ),
+        (
+            &resolved,
+            forge_plugin::api::UpstreamOp::Package(nginx("2.1.0")),
+        ),
+        (
+            &resolved,
+            forge_plugin::api::UpstreamOp::Manifest(nginx("2.1.0")),
+        ),
+        (&resolved, forge_plugin::api::UpstreamOp::Dating(wanted)),
+        (
+            &resolved,
+            forge_plugin::api::UpstreamOp::Search(forge_plugin::api::SearchQuery {
+                text: "ngi".into(),
+                skip: 0,
+                take: 0,
+                prerelease: true,
+                semver2: true,
+                upstream: true,
+            }),
+        ),
+    ] {
+        for fetched in [&fetched[..], &[]] {
+            assert_eq!(
+                wasm.upstream(remote, &op, fetched),
+                native.upstream(remote, &op, fetched),
+                "{op:?}"
+            );
+        }
+    }
 }

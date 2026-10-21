@@ -14,9 +14,6 @@ testing = []
 [dependencies]
 forge-core = { path = "../core" }
 forge-plugin-api = { path = "../plugin-api" }
-# NuGet's `.nuspec` reader, for the `nuget-v3` upstream protocol of proxies
-# (`upstream`).
-forge-format-nuget = { path = "../../plugins/nuget" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

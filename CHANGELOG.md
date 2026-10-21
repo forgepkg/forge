@@ -65,18 +65,20 @@ limitations still apply, except where an entry below says otherwise.
 
 - **Format plugins** (preview): further package formats, served under
   `/repository/{repo}/` (or a mount the plugin names) with the same
-  storage, RBAC and package selectors, hosted and group repositories,
-  retention, ranged downloads and audit log as NuGet. A plugin
-  is a crate implementing one contract (`forge-plugin-api`'s
-  `FormatPlugin`, mirrored by the `forge:format@0.2.0` WIT package) and
+  storage, RBAC and package selectors, hosted, proxy and group
+  repositories, retention, ranged downloads and audit log as NuGet. A
+  plugin is a crate implementing one contract (`forge-plugin-api`'s
+  `FormatPlugin`, mirrored by the `forge:format@0.3.0` WIT package; a
+  plugin's `upstream` side tells the host what to fetch for its proxies) and
   runs either built into the server or as a WebAssembly component run by
   Wasmtime. Components are loaded from `[plugins]` only when pinned by
   SHA-256, and each call runs with fuel, memory and time limits and no WASI
   capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
   `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
-  listing. **NuGet** is a built-in plugin too (`plugins/nuget`), served at
+  listing, and proxies of other chart repositories. **NuGet** is a built-in plugin too (`plugins/nuget`), served at
   `/v3/{repo}/` by the same dispatcher with the same paths, responses and
-  proxy behaviour as before. `GET /admin/formats` lists the installed
+  proxy behaviour as before; its proxies read the upstream feed through the
+  plugin's upstream side. `GET /admin/formats` lists the installed
   formats; the web UI offers them when creating a repository. See
   [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
 - **Docker / OCI registry** under `/v2/` (OCI Distribution Spec v1.1,
@@ -242,11 +244,12 @@ limitations still apply, except where an entry below says otherwise.
 - Behind an outbound proxy, a host name that resolves differently for the
   proxy than for Forge, or that only the proxy can resolve, still gets
   past the metadata guard; block those addresses on the proxy as well.
-- Format plugins have no proxy repositories, receive no request bodies
-  other than the published package (which must be the whole body or one
-  multipart part), accept only Basic credentials, and treat a version with
-  a `-` as a prerelease; a response of a plugin may load at most 2,048
-  query answers.
+- Format plugins receive no request bodies other than the published
+  package (which must be the whole body or one multipart part), accept only
+  Basic credentials, and treat a version with a `-` as a prerelease; a
+  response of a plugin may load at most 2,048 query answers. Their proxies
+  read the upstream with plain GETs of whole documents (Basic credentials
+  only, no token exchange).
 - A docker proxy downloads a blob completely and verifies it before it
   answers, so a client waits for a large layer's first fetch; concurrent
   pulls of one layer share a download per instance only. A registry upload

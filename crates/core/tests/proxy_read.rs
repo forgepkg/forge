@@ -49,7 +49,12 @@ use tokio::sync::Notify;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    forge_plugin::PluginFormat::nuget(Default::default())
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
 }
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────
@@ -2283,10 +2288,14 @@ async fn registration_uses_upstream_metadata_for_versions_not_downloaded() {
         reg[1].published,
         Some("2026-05-01T10:00:00Z".parse().unwrap())
     );
-    let groups = forge_format_nuget::nuspec::dependency_groups_from_nuspec(
-        reg[1].nuspec_bytes.as_deref().expect("dependency groups"),
+    // Not downloaded: the dependency groups come from the upstream
+    // registration, as a manifest summary.
+    assert!(reg[1].nuspec_bytes.is_none());
+    let groups = forge_format_nuget::nuspec::summary_of(
+        Some(reg[1].manifest_summary.as_ref().expect("dependency groups")),
+        None,
     )
-    .unwrap();
+    .dependency_groups;
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].target_framework.as_deref(), Some("net8.0"));
     assert_eq!(groups[0].dependencies[0].id, "Newtonsoft.Json");
@@ -2355,15 +2364,13 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
     assert_eq!(mock.registration_page_hits(), 10, "bounded page fetches");
     let with_deps: Vec<&str> = reg
         .iter()
-        .filter(|e| e.nuspec_bytes.is_some())
+        .filter(|e| e.manifest_summary.is_some())
         .map(|e| e.version.as_str())
         .collect();
     assert_eq!(with_deps.len(), 10);
     assert!(!with_deps.contains(&"1.0.0") && !with_deps.contains(&"2.0.0"));
-    let newest = forge_format_nuget::nuspec::dependency_groups_from_nuspec(
-        reg[11].nuspec_bytes.as_deref().unwrap(),
-    )
-    .unwrap();
+    let newest = forge_format_nuget::nuspec::summary_of(reg[11].manifest_summary.as_ref(), None)
+        .dependency_groups;
     assert_eq!(newest[0].target_framework, None);
     assert_eq!(newest[0].dependencies[0].id, "Dep.12.0.0");
 
@@ -2379,14 +2386,14 @@ async fn registration_pages_are_fetched_bounded_and_cached() {
         .await
         .unwrap();
     assert_eq!(old.len(), 2);
-    assert!(old.iter().all(|e| e.nuspec_bytes.is_some()), "{old:?}");
+    assert!(old.iter().all(|e| e.manifest_summary.is_some()), "{old:?}");
     assert_eq!(mock.registration_page_hits(), 12);
     let leaf = px
         .registration_entry(&repo, "Contoso.Lib", "1.0.0")
         .await
         .unwrap()
         .expect("leaf");
-    assert!(leaf.nuspec_bytes.is_some());
+    assert!(leaf.manifest_summary.is_some());
     // The versions alone (an index that does not inline its leaves) need no
     // upstream registration at all.
     assert_eq!(

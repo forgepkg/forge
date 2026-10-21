@@ -1736,8 +1736,7 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(resp.status(), 202);
     let worker = forge_core::retention::RetentionWorker::new(
         srv.pool.clone(),
-        Arc::new(forge_plugin::PluginFormat::nuget(Default::default()))
-            as Arc<dyn forge_core::format::Format>,
+        srv.state.formats.get("nuget").expect("NuGet is built in"),
         Arc::new(forge_core::repo::NoopCacheInvalidator),
         forge_core::retention::RetentionConfig::default(),
     );

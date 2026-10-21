@@ -7,7 +7,9 @@
 
 use std::cmp::Ordering;
 
-use crate::domain::{DependencyGroup, FormatError, ParsedUpload};
+use forge_plugin_api::{FetchResult, Remote, UpstreamOp, UpstreamStep};
+
+use crate::domain::{FormatError, ParsedUpload};
 
 /// A reader that supports seeking and is movable across threads.
 ///
@@ -98,16 +100,6 @@ pub trait Format: Send + Sync {
         None
     }
 
-    /// The summary (as [`Self::manifest_summary`] returns it) of the display
-    /// metadata an upstream search service reports for a package (`hit` is
-    /// one entry of its results). A proxy uses it for search hits whose
-    /// manifest it has not cached. `None` (the default) when the format reads
-    /// none.
-    fn search_hit_summary(&self, hit: &serde_json::Value) -> Option<serde_json::Value> {
-        let _ = hit;
-        None
-    }
-
     /// Whether `id` is a well-formed package id of this format. Read routes
     /// answer 404 for anything else, and a proxy never puts such an id into
     /// an upstream URL: an id is pasted into URL paths, so `/`, `..`, `?`,
@@ -131,32 +123,23 @@ pub trait Format: Send + Sync {
         }
     }
 
-    /// The identity a standalone manifest (e.g. a `.nuspec`) declares, as
-    /// `(lower_id, normalized version)`. A proxy verifies a manifest fetched
-    /// from its upstream with this before serving or caching it. The default
-    /// rejects every manifest, so a format without manifest support never has
-    /// an unverified upstream manifest served.
-    fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
-        let _ = manifest;
-        Err(FormatError::MalformedManifest(format!(
-            "{} manifests cannot be verified",
+    /// One step of the upstream side of a proxy repository
+    /// ([`forge_plugin_api::FormatPlugin::upstream`]): what to fetch from
+    /// `remote` for `op`, or what came of it. The proxy read path
+    /// ([`crate::repo::proxy::ProxyRepo`]) performs the fetches and calls
+    /// again with everything fetched so far. The default has no upstream: a
+    /// format without proxy repositories never gets here.
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        let _ = (remote, op, fetched);
+        Err(FormatError::InvalidPackage(format!(
+            "{} has no proxy repositories",
             self.id()
         )))
-    }
-
-    /// Render a minimal manifest declaring `id`, `version` and `deps`, for a
-    /// version whose metadata is known only from an upstream index (a proxied
-    /// version that is not downloaded yet), so it is read back through the
-    /// same manifest parsing as a stored one. `None` (the default) when the
-    /// format cannot express one.
-    fn synthesize_manifest(
-        &self,
-        id: &str,
-        version: &str,
-        deps: &[DependencyGroup],
-    ) -> Option<Vec<u8>> {
-        let _ = (id, version, deps);
-        None
     }
 }
 

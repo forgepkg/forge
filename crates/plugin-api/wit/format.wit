@@ -21,7 +21,7 @@
 // Versioning: a plugin is built against one version of this package and
 // declares it in its plugin.toml (`api`). A host supports a fixed set of
 // versions; changing anything in this file means a new package version.
-package forge:format@0.2.0;
+package forge:format@0.3.0;
 
 /// Types shared by the interfaces below.
 interface types {
@@ -330,11 +330,153 @@ interface protocol {
     render: func(repo: repository, req: request, data: list<loaded>) -> rendered;
 }
 
-/// What a format plugin is: it exports the format and its protocol and
-/// imports nothing but the package reader (and WASI, which the host provides
-/// without any file system, network, environment or arguments).
+/// The upstream side of the format's proxy repositories.
+///
+/// The host performs every request: it sends the repository's credentials
+/// only to the upstream's own origin, bounds each response's size and time,
+/// inflates gzip-encoded bodies, refuses link-local and cloud-metadata
+/// targets, and caches what it fetched as the plugin says. It also keeps
+/// everything else a proxy is: downloading and verifying packages (with
+/// `parse-package`), the package delay, the not-found markers, the offline
+/// mode. The plugin says what to fetch and reads what came back, so the
+/// conversation is stateless: every call gets everything fetched so far.
+interface upstream {
+    use types.{format-error};
+    use protocol.{package-ref, package-versions, search-query};
+
+    /// The upstream a proxy repository mirrors.
+    record remote {
+        /// The upstream's URL as the repository is configured with it.
+        url: string,
+        /// What `index` answered for it (a JSON object of the plugin's own
+        /// making); none while the index is being resolved.
+        index: option<string>,
+    }
+
+    /// What the host wants to know about the upstream.
+    variant upstream-op {
+        /// Resolve the upstream into the index every other operation gets.
+        /// The host keeps it, refreshes it once per metadata TTL and falls
+        /// back to the last good one when a refresh fails.
+        index,
+        /// The versions the upstream lists of a package (canonical id).
+        versions(string),
+        /// The URL of a version's package. The host downloads it, checks it
+        /// with `parse-package` against the version asked for, and stores it.
+        %package(package-ref),
+        /// A version's manifest without its package, verified to be that
+        /// version's; none sends the host to the package instead.
+        manifest(package-ref),
+        /// The upstream's metadata of some versions (listing state, publish
+        /// time, manifest summary), best effort.
+        metadata(package-versions),
+        /// `metadata`, plus when each version was created upstream: the
+        /// package delay counts from it. It may cost more requests.
+        dating(package-versions),
+        /// A page of the upstream's search results.
+        search(search-query),
+    }
+
+    /// How long the host may reuse a fetched document.
+    enum freshness {
+        /// For the repository's metadata TTL: listings, indexes, search pages.
+        metadata,
+        /// For a day: a document that never changes once published.
+        immutable,
+    }
+
+    /// A GET the plugin asks the host to send to the upstream.
+    record fetch {
+        url: string,
+        freshness: freshness,
+    }
+
+    variant fetched {
+        /// A 2xx, with its body.
+        found(list<u8>),
+        /// A 404.
+        not-found,
+        /// Anything else: a transport error, another status, a body over the
+        /// size limit.
+        failed(string),
+    }
+
+    record fetch-result {
+        fetch: fetch,
+        outcome: fetched,
+    }
+
+    record version-metadata {
+        /// Normalized.
+        version: string,
+        /// The id as this version spells it, when the upstream says.
+        original-id: option<string>,
+        listed: bool,
+        /// When the upstream published the version: RFC 3339, shown to
+        /// clients.
+        published: option<string>,
+        /// When the version was created upstream, RFC 3339 (`dating` only).
+        created: option<string>,
+        /// A manifest summary for a version the proxy has not downloaded.
+        summary: option<string>,
+    }
+
+    record package-metadata {
+        /// The id as the upstream spells the package (its newest version's).
+        original-id: option<string>,
+        versions: list<version-metadata>,
+    }
+
+    record upstream-hit {
+        /// The id as the upstream spells it.
+        id: string,
+        /// Normalized, ascending.
+        versions: list<string>,
+        /// A manifest summary of the latest version.
+        summary: option<string>,
+        total-downloads: option<u64>,
+    }
+
+    record upstream-search {
+        /// Matching packages before paging, as the upstream counts them.
+        total: u64,
+        hits: list<upstream-hit>,
+    }
+
+    variant upstream-answer {
+        /// The answer to `index`: a JSON object.
+        index(string),
+        /// None: the upstream does not know the package.
+        versions(option<list<string>>),
+        /// The package's URL.
+        %package(string),
+        manifest(option<list<u8>>),
+        /// The answer to `metadata` and `dating`.
+        metadata(package-metadata),
+        /// None: the upstream offers no search.
+        search(option<upstream-search>),
+        /// The upstream answered something unusable: the host serves what
+        /// it has cached.
+        failed(string),
+    }
+
+    variant upstream-step {
+        /// Fetch these, then call `upstream` again with everything fetched
+        /// so far (the host bounds the rounds and the number of fetches).
+        fetch(list<fetch>),
+        done(upstream-answer),
+    }
+
+    upstream: func(remote: remote, op: upstream-op, fetched: list<fetch-result>) -> result<upstream-step, format-error>;
+}
+
+/// What a format plugin is: it exports the format, its protocol and its
+/// upstream side, and imports nothing but the package reader (and WASI,
+/// which the host provides without any file system, network, environment or
+/// arguments).
 world format-plugin {
     import package-source;
     export format;
     export protocol;
+    export upstream;
 }
