@@ -8,13 +8,17 @@
 # the base branch, or the merge group ahead of it in the queue. A group thus
 # runs the jobs its own pull requests need. The ones ahead are checked by
 # their own groups, and with "Only merge non-failing pull requests" the queue
-# merges a group only once every group ahead of it passed as well. Any other
-# event (a push, a manual run), or a diff that fails, needs every group.
+# merges a group only once every group ahead of it passed as well. A manual
+# run given a base branch (DISPATCH_BASE; stack.yml names the default branch
+# for a pull request retargeted to it) is compared with the commit it forked
+# off that branch, as GitHub's compare API finds it. Any other event (a push,
+# a manual run without a base), or a diff that fails, needs every group.
 #
 # The groups are git pathspecs, each also covering the CI configuration
 # (COMMON).
 #
-# Usage: ci-changes.sh   (env: EVENT, and MERGE_GROUP_BASE for merge groups)
+# Usage: ci-changes.sh   (env: EVENT, and MERGE_GROUP_BASE for merge groups,
+#                         DISPATCH_BASE and GH_TOKEN for manual runs)
 
 # The group arrays are read by name, in changed().
 # shellcheck disable=SC2034
@@ -64,6 +68,14 @@ merge_group)
     if [ -n "${MERGE_GROUP_BASE:-}" ] &&
         git fetch --quiet --no-tags --depth=1 origin "$MERGE_GROUP_BASE"; then
         base=$MERGE_GROUP_BASE
+    fi
+    ;;
+workflow_dispatch)
+    if [ -n "${DISPATCH_BASE:-}" ] &&
+        fork=$(gh api "repos/$GITHUB_REPOSITORY/compare/$DISPATCH_BASE...$(git rev-parse HEAD)" \
+            --jq .merge_base_commit.sha) &&
+        git fetch --quiet --no-tags --depth=1 origin "$fork"; then
+        base=$fork
     fi
     ;;
 esac

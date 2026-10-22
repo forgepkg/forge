@@ -70,8 +70,9 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   Each further branch starts from the branch below it, and its pull request
   targets that branch, so its diff holds its own issue only. Its description
   names the pull request it builds on: `Stacked on #<m>; merge that first.`
-- Put an issue above every issue it builds on. CI runs on a stacked pull
-  request as on any other, with the fixes below it in place.
+- Put an issue above every issue it builds on. CI does not run on a stacked
+  pull request: it runs once the pull request targets `main`, with the fixes
+  below it in place. Until then, run the checks a change needs yourself.
 - In a cloud session, the session's branch is the bottom of the stack; push
   each further branch as `claude/<topic>`. A stack takes one branch per pull
   request, so these pushes are expected.
@@ -90,8 +91,8 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   targets `main`; a ruleset requires it on every branch but `main`, so the
   pull request cannot be merged into the branch below it. That pending
   status is not a CI failure to fix: it clears itself once the pull request
-  below has merged. Never retarget a pull request to `main` early to clear
-  it.
+  below has merged, and CI starts then. Never retarget a pull request to
+  `main` early to clear it.
 
 ## Pull requests: ready for review, never drafts
 
