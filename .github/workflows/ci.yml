@@ -254,16 +254,17 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.event_name == 'push' }}
-      - name: cargo test --workspace
+      - name: cargo test --workspace (test binaries in parallel)
         id: tests
         # forge-e2e feature is intentionally excluded here — unit tests only.
-        # Each test binary runs through test-timings-runner.sh, which adds
-        # every test's duration to its result line and records it for the
-        # job summary below.
+        # test-parallel.sh runs the test binaries as many at a time as the
+        # runner has CPUs (#340), each through test-timings-runner.sh, which
+        # adds every test's duration to its result line and records it for
+        # the job summary below.
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
           FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
-        run: cargo test --workspace
+        run: .github/scripts/test-parallel.sh --workspace
       - name: Test timings (job summary)
         if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         continue-on-error: true
