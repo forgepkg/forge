@@ -620,6 +620,27 @@ cargo test --workspace
 .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS"
 ```
 
+**Test binaries in parallel.** `cargo test` runs one test binary at a time,
+and every integration-test binary starts its own containers, so CI's `test`
+job runs them side by side with `.github/scripts/test-parallel.sh`, which
+takes `cargo test`'s arguments:
+
+```bash
+.github/scripts/test-parallel.sh --workspace    # FORGE_TEST_JOBS=<n> binaries at a time, default: CPUs
+```
+
+It builds and runs the doc tests through `cargo test`, with itself as the
+target runner recording how cargo would run each test binary (working
+directory, environment, arguments). Then it runs the recorded binaries, each
+through the runner set in `CARGO_TARGET_<triple>_RUNNER` if there is one (as
+above, for the timings), prints each binary's output in one piece when it is
+done and lists the failed binaries at the end. On CI's 4-CPU runner the test
+binaries take about 150 s this way instead of about 260 s, and the CPUs are
+then busy all the time; more binaries at a time than CPUs gains little. Running side by side loads the machine more, so
+a test with a tight timing bound, or one whose test threads disturb each
+other, fails more often than under plain `cargo test` (#345, #347): give it
+slack rather than running fewer binaries at a time.
+
 The test build leaves the workspace crates unoptimized but optimizes the
 dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
 `[profile.dev.package.*]`): the mock IdPs generate RSA keys, and every test
