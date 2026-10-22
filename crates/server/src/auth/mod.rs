@@ -55,6 +55,7 @@ use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
 use crate::config::OidcConfig;
+use crate::middleware::principal::auth_unavailable;
 use crate::state::AppState;
 
 mod realms;
@@ -183,11 +184,7 @@ pub fn auth_router() -> Router<AppState> {
 async fn snapshot_or_resp(state: &AppState) -> Result<Arc<realms::RealmSnapshot>, Response> {
     state.realms.snapshot().await.map_err(|e| {
         tracing::error!(error = %e, "realm snapshot failed");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authentication temporarily unavailable",
-        )
-            .into_response()
+        auth_unavailable()
     })
 }
 
@@ -401,7 +398,7 @@ async fn oidc_callback_inner(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -457,7 +454,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
         Err(e) => {
             tracing::warn!(error = %e, "logout session validate failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -472,7 +469,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
     // Revoke server-side BEFORE clearing the cookie. If the DB revoke fails the
     // session is still live cluster-wide, so we must NOT tell the client it has
-    // logged out (and must not clear its cookie as if it had): surface a 500 so
+    // logged out (and must not clear its cookie as if it had): surface a 503 so
     // the client knows the logout did not take effect and can retry. Silently
     // returning 200 here would leave a live session an attacker holding the
     // cookie could keep using.
@@ -480,7 +477,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(revoked) => revoked,
         Err(e) => {
             tracing::error!(error = %e, session_id = session.id, "logout session revoke failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -507,8 +504,8 @@ enum SessionAuthError {
     Unauthorized,
     /// Cookie valid but the `X-CSRF-Token` is missing or wrong → 403.
     CsrfFailed,
-    /// A backend error while validating → 500.
-    Internal,
+    /// The database failed while validating → 503 with `Retry-After`.
+    Unavailable,
 }
 
 impl IntoResponse for SessionAuthError {
@@ -520,9 +517,7 @@ impl IntoResponse for SessionAuthError {
             SessionAuthError::CsrfFailed => {
                 (StatusCode::FORBIDDEN, "missing or invalid csrf token").into_response()
             }
-            SessionAuthError::Internal => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response()
-            }
+            SessionAuthError::Unavailable => auth_unavailable(),
         }
     }
 }
@@ -575,7 +570,7 @@ async fn require_session(
         Ok(None) => return Err(SessionAuthError::Unauthorized),
         Err(e) => {
             tracing::warn!(error = %e, "session validate failed");
-            return Err(SessionAuthError::Internal);
+            return Err(SessionAuthError::Unavailable);
         }
     };
     match user_dao::find_user_by_id(&rt.pool, session.user_id).await {
@@ -583,7 +578,7 @@ async fn require_session(
         Ok(_) => Err(SessionAuthError::Unauthorized),
         Err(e) => {
             tracing::warn!(error = %e, "session user lookup failed");
-            Err(SessionAuthError::Internal)
+            Err(SessionAuthError::Unavailable)
         }
     }
 }
@@ -881,11 +876,7 @@ async fn password_login(
         }
         Err(_) => {
             attempt.released();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable",
-            )
-                .into_response();
+            return auth_unavailable();
         }
     }
     let cred = PasswordCredential {
@@ -906,11 +897,7 @@ async fn password_login(
         // Forge's own database failed: not a verdict on the credentials.
         ChainOutcome::Failed => {
             attempt.released();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable",
-            )
-                .into_response();
+            return auth_unavailable();
         }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
             attempt.failed();
@@ -927,11 +914,7 @@ async fn password_login(
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             attempt.released();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable",
-            )
-                .into_response();
+            return auth_unavailable();
         }
     };
     attempt.succeeded();
@@ -950,7 +933,7 @@ async fn password_login(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 

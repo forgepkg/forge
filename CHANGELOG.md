@@ -282,6 +282,10 @@ otherwise.
   ([#121](https://github.com/schmitch/forge/issues/121))
 - `PUT /admin/realms/order` answered 500 when it raced another realm
   change; it answers 409. ([#117](https://github.com/schmitch/forge/issues/117))
+- A database failure while checking a browser session or its CSRF token
+  answered 500; it answers 503 with `Retry-After`, like the token and
+  password checks, which now send `Retry-After` too.
+  ([#205](https://github.com/schmitch/forge/issues/205))
 - The browse API served offline hosted and group repositories; it answers
   503 like the feed, and the web UI says the repository is offline.
   ([#120](https://github.com/schmitch/forge/issues/120))

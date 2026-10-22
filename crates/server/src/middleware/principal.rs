@@ -11,9 +11,11 @@
 //!   is rejected with **401** — bad credentials are never downgraded to
 //!   anonymous.
 //! * If a source could not **check** the credentials (a database error looking
-//!   up a token or session), the request fails closed with **503**: not
-//!   anonymous, and not a 401 that would make a client discard a credential
-//!   that may be valid.
+//!   up a token or session), the request fails closed with **503** and
+//!   `Retry-After`: not anonymous, and not a 401 that would make a client
+//!   discard a credential that may be valid. The CSRF check of a
+//!   cookie-authenticated mutation answers the same when the session cannot
+//!   be read.
 //! * With no credentials, the anonymous policy decides between
 //!   [`Principal::Anonymous`] and [`Principal::Unauthenticated`]; the latter is
 //!   still passed downstream (authorization, not authentication, returns 401/403
@@ -255,13 +257,7 @@ pub async fn attach_principal(
             Err(AuthError::Unauthorized) => {
                 return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
             }
-            Err(AuthError::Unavailable) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication temporarily unavailable",
-                )
-                    .into_response();
-            }
+            Err(AuthError::Unavailable) => return auth_unavailable(),
         };
 
     if resolved.ambient && !req.method().is_safe() && !CSRF_EXEMPT_PATHS.contains(&req.uri().path())
@@ -310,9 +306,24 @@ async fn check_csrf(
         Ok(_) => Err(forbidden()),
         Err(e) => {
             tracing::warn!(error = %e, "csrf session validate failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response())
+            Err(auth_unavailable())
         }
     }
+}
+
+/// `Retry-After` (seconds) of [`auth_unavailable`].
+const AUTH_RETRY_AFTER_SECS: &str = "10";
+
+/// The **503** answer when authentication could not reach what it depends on
+/// (the database): no verdict on the credentials, so a client retries instead
+/// of discarding them as wrong.
+pub(crate) fn auth_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, AUTH_RETRY_AFTER_SECS)],
+        "authentication temporarily unavailable",
+    )
+        .into_response()
 }
 
 /// Extractor-free helper: read the [`Principal`] a prior `attach_principal`
@@ -882,6 +893,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], AUTH_RETRY_AFTER_SECS);
+        assert_eq!(
+            body_string(resp).await,
+            "authentication temporarily unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_check_with_the_database_down_yields_503_not_500() {
+        // The session's CSRF secret cannot be read: no verdict on the token,
+        // so the mutation answers the same 503 as any other credential check
+        // the database could not answer, and the handler never runs.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://forge:forge@127.0.0.1:1/forge")
+            .unwrap();
+        let sessions =
+            SessionService::new(pool, chrono::Duration::hours(1), chrono::Duration::hours(8));
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(AmbientStub)];
+        let mut layer = layer(sources, AnonPolicy::Off);
+        layer.sessions = Some(sessions);
+        let resp = post_app(layer)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/thing")
+                    .header("cookie", "forge_session=s")
+                    .header(CSRF_HEADER, "whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], AUTH_RETRY_AFTER_SECS);
         assert_eq!(
             body_string(resp).await,
             "authentication temporarily unavailable"
