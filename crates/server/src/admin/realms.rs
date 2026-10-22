@@ -346,9 +346,8 @@ pub async fn update(
     // The stored *logical* config (encrypted secrets merged in) — secrets are
     // write-only, so an omitted one must be kept from here. Sealed secrets
     // that no longer decrypt (the realm's issuer or client id was changed
-    // outside the API, or a pre-release blob without
-    // `crypto.accept_row_bound_secrets`) count as absent, so the update must
-    // carry them again: that is how such a realm is repaired.
+    // outside the API) count as absent, so the update must carry them again:
+    // that is how such a realm is repaired.
     let mut secrets_unreadable = false;
     let existing_config = match secret_dao::realm_config(state.envelope.as_deref(), &existing).await
     {

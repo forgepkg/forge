@@ -1825,13 +1825,6 @@ pub struct CryptoConfig {
     /// Rotation worker tuning.
     #[serde(default)]
     pub rotation: CryptoRotationConfig,
-    /// Also open secrets sealed by pre-release builds, which were bound to
-    /// their row but not to where they are sent, and re-seal them for their
-    /// destination at startup. Turn it on for one start after upgrading such
-    /// an installation, then off again: while on, someone who can write to
-    /// the database can replay such a blob into a repointed row.
-    #[serde(default)]
-    pub accept_row_bound_secrets: bool,
 }
 
 /// `crypto.root.*` — the root-key provider.

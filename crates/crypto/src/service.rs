@@ -72,12 +72,6 @@ pub struct EnvelopeServiceConfig {
     pub unwrapped_key_ttl: Duration,
     /// Max entries in the unwrapped-key cache.
     pub unwrapped_key_max: u64,
-    /// Also open secrets sealed by pre-release builds, which bound a secret to
-    /// its row but not to where it is sent ([`AeadBinding::row_only`]), so the
-    /// re-seal sweep can move them to the destination binding. Off by default:
-    /// while on, someone who can write to the database can replay such a blob
-    /// into a row they repointed.
-    pub accept_row_bound_secrets: bool,
 }
 
 impl Default for EnvelopeServiceConfig {
@@ -87,7 +81,6 @@ impl Default for EnvelopeServiceConfig {
             scope: "default".to_string(),
             unwrapped_key_ttl: Duration::from_secs(300),
             unwrapped_key_max: 64,
-            accept_row_bound_secrets: false,
         }
     }
 }
@@ -138,12 +131,6 @@ impl EnvelopeService {
     /// The configured key scope.
     pub fn scope(&self) -> &str {
         &self.config.scope
-    }
-
-    /// Whether secrets sealed under [`AeadBinding::row_only`] by pre-release
-    /// builds may still be opened (`crypto.accept_row_bound_secrets`).
-    pub fn accepts_row_bound_secrets(&self) -> bool {
-        self.config.accept_row_bound_secrets
     }
 
     // ── Bootstrap ────────────────────────────────────────────────────────────
