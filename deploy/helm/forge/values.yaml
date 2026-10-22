@@ -9,7 +9,7 @@ commonAnnotations: {}
 
 image:
   registry: ghcr.io
-  repository: schmitch/forge
+  repository: forgepkg/forge
   # Defaults to the chart's appVersion: the release this chart belongs to.
   # While tag and digest are empty, the published chart pulls that release by
   # the digest the release workflow signed (the Chart.yaml annotation

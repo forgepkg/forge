@@ -634,10 +634,10 @@ mod tests {
 
     #[test]
     fn image_tag_keeps_indentation() {
-        let k = "images:\n  - name: ghcr.io/schmitch/forge\n    newTag: 0.1.0\n";
+        let k = "images:\n  - name: ghcr.io/forgepkg/forge\n    newTag: 0.1.0\n";
         assert_eq!(
             set_image_tag(k, "0.2.0").unwrap(),
-            "images:\n  - name: ghcr.io/schmitch/forge\n    newTag: 0.2.0\n"
+            "images:\n  - name: ghcr.io/forgepkg/forge\n    newTag: 0.2.0\n"
         );
         let two = format!("{k}  - name: other\n    newTag: 1.0.0\n");
         assert!(set_image_tag(&two, "0.2.0").is_err());

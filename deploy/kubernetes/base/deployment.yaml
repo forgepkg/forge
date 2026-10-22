@@ -47,7 +47,7 @@ spec:
       containers:
         - name: forge
           # Tag set by `images:` in kustomization.yaml.
-          image: ghcr.io/schmitch/forge
+          image: ghcr.io/forgepkg/forge
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
