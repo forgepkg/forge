@@ -520,23 +520,3 @@ pub async fn ensure_auth_realms(
         .await
         .context("seed auth realms")
 }
-
-/// Apply the behavior-preserving RBAC legacy mapping **once** per install
-/// (§12.4 Phase 5).
-///
-/// Migration `0007` ran it and recorded the install-wide `legacy_open_access`
-/// default (open on upgrade, closed on a fresh install). This boot hook runs it
-/// one more time for installs that upgraded before the one-shot marker existed,
-/// then records the `legacy_rbac_synced` marker: re-running it on every boot
-/// would re-grant admin roles / anonymous grants an operator has since revoked
-/// through RBAC (the routine only ever adds). It never *opens* a fresh install:
-/// the `authenticated` auto-assignment is gated on `legacy_open_access`.
-pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
-    if authz_dao::apply_legacy_migration_once(pool)
-        .await
-        .context("apply legacy RBAC migration")?
-    {
-        tracing::info!("applied the one-shot legacy RBAC mapping");
-    }
-    Ok(())
-}

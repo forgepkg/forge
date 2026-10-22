@@ -2832,69 +2832,6 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
     assert!(anon_grant(explicit_id).await, "explicit RBAC grant kept");
 }
 
-/// M20: `legacy_open_access` is readable and can be switched off through the
-/// admin API (admin-only). The shared test DB is a fresh install (`false`), so
-/// only the idempotent "off" direction is exercised here; both directions and
-/// the effect on new users are covered by `forge-db`'s `rbac_migrate` tests
-/// and the e2e upgrade scenario.
-#[tokio::test]
-async fn legacy_open_access_setting_endpoint() {
-    let srv = common::start().await;
-    let (u, p) = srv.admin_basic();
-    let client = srv.client();
-    let url = format!("{}/admin/settings/legacy-open-access", srv.base_url);
-
-    let resp = client
-        .get(&url)
-        .basic_auth(&u, Some(&p))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.json::<Value>().await.unwrap(),
-        json!({"enabled": false})
-    );
-
-    let resp = client
-        .put(&url)
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.json::<Value>().await.unwrap(),
-        json!({"enabled": false})
-    );
-
-    let resp = client
-        .put(&url)
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"enable": false}))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_client_error(), "unknown key rejected");
-
-    // Admin-only.
-    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
-    let token = admin_token_with_scope(&srv, None).await;
-    let resp = client
-        .put(&url)
-        .header("X-NuGet-ApiKey", &token)
-        .json(&json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        403,
-        "an unscoped token cannot change settings"
-    );
-}
-
 // ── delete concurrency (review 2026-10-02 B1 / L3) ──────────────────────────
 
 /// A 64-hex-char test sha unique to this run (`tag` keeps tests apart).
