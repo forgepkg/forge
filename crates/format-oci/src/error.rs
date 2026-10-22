@@ -171,12 +171,59 @@ impl From<sqlx::Error> for OciError {
     }
 }
 
+impl OciError {
+    /// A failed read from the object store (through the local blob cache):
+    /// 503 with `Retry-After` while S3 cannot be reached, a server error
+    /// otherwise.
+    pub(crate) fn storage_read(context: &str, error: forge_storage::S3Error) -> Self {
+        if error.is_unavailable() {
+            tracing::warn!(%error, "registry: {context}: the object store is unavailable");
+            OciError::object_store_unavailable()
+        } else {
+            OciError::internal(context, error)
+        }
+    }
+
+    fn object_store_unavailable() -> Self {
+        OciError::unavailable("the object store is unavailable; retry later")
+    }
+}
+
+/// A request body that could not be read: the client aborted it, or it
+/// stalled past the idle timeout. Travels inside the I/O error staging the
+/// body fails with.
+#[derive(Debug)]
+pub(crate) struct RequestBodyError(pub axum::Error);
+
+impl std::fmt::Display for RequestBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reading the request body: {}", self.0)
+    }
+}
+
+impl std::error::Error for RequestBodyError {}
+
 impl From<forge_storage::CasError> for OciError {
     fn from(e: forge_storage::CasError) -> Self {
         match e {
             forge_storage::CasError::TooLarge { limit } => OciError::too_large(limit),
             forge_storage::CasError::StagingFull { .. } => {
                 OciError::unavailable("temporary storage is full; retry later")
+            }
+            e if e.is_unavailable() => {
+                tracing::warn!(error = %e, "registry: the object store is unavailable");
+                OciError::object_store_unavailable()
+            }
+            forge_storage::CasError::Io(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<RequestBodyError>()) =>
+            {
+                tracing::debug!(error = %e, "registry: the upload body could not be read");
+                OciError::new(
+                    StatusCode::BAD_REQUEST,
+                    Code::BlobUploadInvalid,
+                    "the request body could not be read",
+                )
             }
             other => OciError::internal("storage error", other),
         }
@@ -211,3 +258,49 @@ impl IntoResponse for OciError {
 
 /// Result alias of registry handlers.
 pub type OciResult<T> = Result<T, OciError>;
+
+#[cfg(test)]
+mod tests {
+    use forge_storage::{CasError, S3Error};
+
+    use super::*;
+
+    fn down() -> S3Error {
+        S3Error::Unavailable("connection refused".into())
+    }
+
+    #[test]
+    fn an_unavailable_object_store_answers_503_with_retry_after() {
+        // Also when a stream read from S3 failed while it was staged (the
+        // finish of a chunked upload).
+        for e in [
+            CasError::S3(down()),
+            CasError::Io(std::io::Error::other(down())),
+        ] {
+            let e = OciError::from(e);
+            assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(e.code, Code::Unavailable);
+            assert!(e
+                .headers
+                .iter()
+                .any(|(name, _)| name == header::RETRY_AFTER));
+        }
+        let e = OciError::storage_read("blob read", down());
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        let e = OciError::storage_read("blob read", S3Error::S3("access denied".into()));
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn an_unreadable_request_body_is_the_clients_error() {
+        let aborted = std::io::Error::other(RequestBodyError(axum::Error::new(
+            "connection reset by peer",
+        )));
+        let e = OciError::from(CasError::Io(aborted));
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.code, Code::BlobUploadInvalid);
+        // Staging's own I/O errors stay server errors.
+        let e = OciError::from(CasError::Io(std::io::Error::other("disk full")));
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
