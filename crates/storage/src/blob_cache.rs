@@ -381,6 +381,14 @@ impl BlobCache {
         // served as it: the directory must be Forge's alone (no sticky
         // exception, since anyone may create a shard directory in one).
         create_private_dir(&root, true)?;
+        if restore_after_fs_group(&root)? {
+            tracing::warn!(
+                dir = %root.display(),
+                "the blob cache directory was made group-writable (a Kubernetes fsGroup \
+                 pass?); restored it to Forge's user alone. Set the pod's \
+                 fsGroupChangePolicy to OnRootMismatch"
+            );
+        }
         crate::cas::ensure_owned_dir(&root, "blob cache directory", "blob_cache.path", false)?;
         let tmp = root.join(TMP_DIR);
         create_private_dir(&tmp, true)?;
@@ -1090,6 +1098,60 @@ fn clear_dir(dir: &Path) -> std::io::Result<usize> {
         }
     }
     Ok(removed)
+}
+
+/// Undo what the kubelet does to a volume of a pod with `fsGroup` (and no
+/// `fsGroupChangePolicy: OnRootMismatch`) each time it mounts it: every
+/// directory gets `mode | 02770`, every file `mode | 0660`. When `root` is
+/// this process's user's and shows that mark (setgid, group-writable, not
+/// writable by others), its directories go back to 0700 and its files to
+/// 0600, and `true` is returned. Anything else is left for
+/// [`crate::cas::ensure_owned_dir`] to judge.
+///
+/// Only Forge's user (or root) can have widened a directory it owns, and the
+/// entries the scan then finds are checked against their hash on their first
+/// hit, as after any restart.
+fn restore_after_fs_group(root: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::symlink_metadata(root)?;
+        let mode = meta.permissions().mode();
+        if !meta.is_dir()
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || mode & 0o2020 != 0o2020
+            || mode & 0o002 != 0
+        {
+            return Ok(false);
+        }
+        fn chmod(path: &Path, mode: u32) -> std::io::Result<()> {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot restore the mode of {}: {error}", path.display()),
+                )
+            })
+        }
+        fn restore(dir: &Path) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    restore(&entry.path())?;
+                } else if kind.is_file() {
+                    chmod(&entry.path(), 0o600)?;
+                }
+            }
+            chmod(dir, 0o700)
+        }
+        restore(root)?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(false)
+    }
 }
 
 /// The cached blobs under `root`: `(key, size, mtime)`. Anything that is not

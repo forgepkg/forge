@@ -182,6 +182,11 @@ podSecurityContext:
   runAsUser: 10001
   runAsGroup: 10001
   fsGroup: 10001
+  # Without it the kubelet makes every directory on a mounted volume
+  # group-writable at each pod start, and Forge refuses a blob cache
+  # directory its group can write. With it, only a volume whose root does
+  # not match yet (a new one) is walked.
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 

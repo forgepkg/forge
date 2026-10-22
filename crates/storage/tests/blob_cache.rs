@@ -679,6 +679,60 @@ async fn the_cache_is_private_to_forges_user() {
     }
 }
 
+/// What the kubelet does to a volume at each mount of a pod with `fsGroup`
+/// (without `fsGroupChangePolicy: OnRootMismatch`): every directory gets
+/// `mode | 02770`, every file `mode | 0660`.
+#[cfg(unix)]
+fn kubelet_fs_group_pass(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    let mode = meta.permissions().mode() & 0o7777;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            kubelet_fs_group_pass(&entry.unwrap().path());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o2770)).unwrap();
+    } else if meta.is_file() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o660)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cache_on_a_volume_the_kubelet_regrouped_reopens() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let (endpoint, fake) = spawn_fake_s3().await;
+    let volume = scratch("fs-group");
+    let dir = volume.join("blobs");
+    let blob = Blob::new(53, 4096);
+    fake.put(&blob.key, blob.bytes.clone());
+    {
+        let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+        let store = cached_store(&endpoint, cache.clone());
+        read(&store, &blob, None).await;
+        until_cached(&cache, &blob).await;
+    }
+    // The next pod start: the kubelet walks the volume before Forge starts.
+    kubelet_fs_group_pass(&volume);
+    assert_eq!(mode(&dir) & 0o2070, 0o2070);
+    assert_eq!(mode(&blob.file(&dir)) & 0o060, 0o060);
+
+    let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+    assert_eq!(mode(&dir), 0o700);
+    assert_eq!(mode(&dir.join("tmp")), 0o700);
+    assert_eq!(mode(blob.file(&dir).parent().unwrap()), 0o700);
+    assert_eq!(mode(&blob.file(&dir)), 0o600);
+    let store = cached_store(&endpoint, cache.clone());
+    assert_eq!(read(&store, &blob, None).await, blob.bytes);
+    assert_eq!(fake.gets(&blob.key), 1, "served from the cache it kept");
+
+    // Only that mark is undone: writable by others, it is still refused.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2777)).unwrap();
+    let err = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
 #[tokio::test]
 async fn garbage_collection_evicts_the_cached_copy() {
     let (endpoint, fake) = spawn_fake_s3().await;

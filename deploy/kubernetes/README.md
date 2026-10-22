@@ -201,7 +201,11 @@ reports `degraded` but keeps the pod in the Service.
   restarted during an S3 outage serves what it had. One pod can mount the
   volume, so it runs one replica with `strategy: Recreate` (a short gap on
   every rollout); it cannot be combined with `components/high-availability`.
-  The cache sizes itself from the volume (`auto`).
+  The cache sizes itself from the volume (`auto`). The base's
+  `fsGroupChangePolicy: OnRootMismatch` keeps the kubelet from walking the
+  volume at each pod start, which would make the cache directory
+  group-writable (Forge restores it, with a warning) and take long on a
+  large cache.
 
 For a dedicated disk per pod (e.g. local NVMe) with any number of replicas,
 use `components/local-cache` and swap its volume for a generic ephemeral
