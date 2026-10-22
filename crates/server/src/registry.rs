@@ -62,7 +62,11 @@ impl forge_oci::WorkloadCheck for WorkloadLiveness {
             return Ok(true);
         };
         let snapshot = self.realms.snapshot().await.map_err(|e| e.to_string())?;
-        if !crate::auth::realm_current(&snapshot, realm_id, &config_sha256) {
+        let current =
+            crate::auth::realm_current_now(&self.realms, &snapshot, realm_id, &config_sha256)
+                .await
+                .map_err(|e| e.to_string())?;
+        if !current {
             return Ok(false);
         }
         let Some(jti_sha256) = jti_sha256 else {

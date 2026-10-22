@@ -142,103 +142,29 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     }
 
     let source = WorkloadIdentitySource::new(state.realms.clone(), state.pool.clone());
-    let workload = match source.verify_for_exchange(token).await {
-        Ok(workload) => workload,
-        Err(ExchangeRefusal::NotWorkloadToken) => {
-            return refused(
-                StatusCode::UNAUTHORIZED,
-                "not an OIDC token of a configured workload identity realm",
-            )
-        }
-        Err(ExchangeRefusal::Rejected) => {
-            return refused(StatusCode::UNAUTHORIZED, "invalid credentials")
-        }
-        Err(ExchangeRefusal::Unavailable) => {
-            return refused(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable",
-            )
-        }
+    let redeemed = match redeem(&state.pool, &source, token, false).await {
+        // The database holds another realm configuration than this
+        // instance's snapshot: the realm was edited, possibly on another
+        // instance whose peers have not rebuilt their snapshots yet. Verify
+        // once more against a rebuilt snapshot before refusing.
+        Err(Refusal::RealmChanged) => redeem(&state.pool, &source, token, true).await,
+        other => other,
     };
-    // The one-time redemption is keyed on `jti`: a token without one could
-    // be exchanged again and again until it expires.
-    if workload
-        .jti
-        .as_deref()
-        .is_none_or(|jti| jti.trim().is_empty())
-    {
-        return refused(
-            StatusCode::UNAUTHORIZED,
-            "the token has no jti, so it cannot be exchanged (each token is redeemed once)",
-        );
-    }
-    let Principal::Workload {
+    let Redeemed {
+        api_key,
+        expires,
         realm_id,
         role_id,
-        issuer_sha256,
-        config_sha256,
         subject_sha256,
-        jti_sha256: Some(jti_sha256),
-        issued_at,
-    } = workload.principal
-    else {
-        return refused(StatusCode::UNAUTHORIZED, "invalid credentials");
-    };
-    let (Some(token_issued_at), Some(token_expires_at)) = (
-        DateTime::<Utc>::from_timestamp(issued_at, 0),
-        DateTime::<Utc>::from_timestamp(workload.expires_at, 0),
-    ) else {
-        return refused(StatusCode::UNAUTHORIZED, "invalid credentials");
-    };
-
-    let api_key = generate_workload_key();
-    let stored = store_key(
-        &state.pool,
-        NewWorkloadApiKey {
-            key_sha256: &workload_key_sha256(&api_key),
-            realm_id,
-            role_id,
-            issuer_sha256: &issuer_sha256,
-            config_sha256: &config_sha256,
-            subject_sha256: &subject_sha256,
-            jti_sha256: &jti_sha256,
-            token_issued_at,
-            token_expires_at,
-            ttl_seconds: i64::try_from(workload.api_key_ttl_seconds).unwrap_or(i64::MAX),
-        },
-    )
-    .await;
-    let expires = match stored {
-        Ok(Stored::Issued(expires)) => expires,
-        Ok(Stored::Replayed) => {
-            tracing::warn!(
-                realm_id,
-                role_id,
-                "workload token replayed at the token exchange"
-            );
-            return refused(
-                StatusCode::UNAUTHORIZED,
-                "this token was already exchanged; request a new one from the CI job",
-            );
-        }
-        Ok(Stored::RealmChanged) => {
-            tracing::warn!(
-                realm_id,
-                role_id,
-                "workload realm or role changed during the token exchange"
-            );
+    } = match redeemed {
+        Ok(redeemed) => redeemed,
+        Err(Refusal::RealmChanged) => {
             return refused(
                 StatusCode::UNAUTHORIZED,
                 "the workload identity realm changed during the exchange; try again",
-            );
+            )
         }
-        Err(e) => {
-            tracing::error!(error = %e, "storing a workload API key failed");
-            return refused(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication temporarily unavailable",
-            );
-        }
+        Err(Refusal::Answer(response)) => return response,
     };
     tracing::info!(
         target: "forge::audit",
@@ -254,6 +180,137 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         Json(ExchangeResponse { api_key, expires }),
     )
         .into_response()
+}
+
+/// A key [`redeem`] issued.
+struct Redeemed {
+    api_key: String,
+    expires: DateTime<Utc>,
+    realm_id: i64,
+    role_id: i64,
+    subject_sha256: [u8; 32],
+}
+
+/// Why [`redeem`] issued no key.
+enum Refusal {
+    /// The realm or role row no longer matches the snapshot the token was
+    /// verified against ([`Stored::RealmChanged`]).
+    RealmChanged,
+    /// Any other refusal, as the answer to send.
+    Answer(Response),
+}
+
+/// Verify `token` (against a rebuilt realm snapshot with `refresh`) and
+/// exchange it for a key.
+async fn redeem(
+    pool: &PgPool,
+    source: &WorkloadIdentitySource,
+    token: &str,
+    refresh: bool,
+) -> Result<Redeemed, Refusal> {
+    let refuse = |status, message| Err(Refusal::Answer(refused(status, message)));
+    let workload = match source.verify_for_exchange(token, refresh).await {
+        Ok(workload) => workload,
+        Err(ExchangeRefusal::NotWorkloadToken) => {
+            return refuse(
+                StatusCode::UNAUTHORIZED,
+                "not an OIDC token of a configured workload identity realm",
+            )
+        }
+        Err(ExchangeRefusal::Rejected) => {
+            return refuse(StatusCode::UNAUTHORIZED, "invalid credentials")
+        }
+        Err(ExchangeRefusal::Unavailable) => {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable",
+            )
+        }
+    };
+    // The one-time redemption is keyed on `jti`: a token without one could
+    // be exchanged again and again until it expires.
+    if workload
+        .jti
+        .as_deref()
+        .is_none_or(|jti| jti.trim().is_empty())
+    {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "the token has no jti, so it cannot be exchanged (each token is redeemed once)",
+        );
+    }
+    let Principal::Workload {
+        realm_id,
+        role_id,
+        issuer_sha256,
+        config_sha256,
+        subject_sha256,
+        jti_sha256: Some(jti_sha256),
+        issued_at,
+    } = workload.principal
+    else {
+        return refuse(StatusCode::UNAUTHORIZED, "invalid credentials");
+    };
+    let (Some(token_issued_at), Some(token_expires_at)) = (
+        DateTime::<Utc>::from_timestamp(issued_at, 0),
+        DateTime::<Utc>::from_timestamp(workload.expires_at, 0),
+    ) else {
+        return refuse(StatusCode::UNAUTHORIZED, "invalid credentials");
+    };
+
+    let api_key = generate_workload_key();
+    let stored = store_key(
+        pool,
+        NewWorkloadApiKey {
+            key_sha256: &workload_key_sha256(&api_key),
+            realm_id,
+            role_id,
+            issuer_sha256: &issuer_sha256,
+            config_sha256: &config_sha256,
+            subject_sha256: &subject_sha256,
+            jti_sha256: &jti_sha256,
+            token_issued_at,
+            token_expires_at,
+            ttl_seconds: i64::try_from(workload.api_key_ttl_seconds).unwrap_or(i64::MAX),
+        },
+    )
+    .await;
+    match stored {
+        Ok(Stored::Issued(expires)) => Ok(Redeemed {
+            api_key,
+            expires,
+            realm_id,
+            role_id,
+            subject_sha256,
+        }),
+        Ok(Stored::Replayed) => {
+            tracing::warn!(
+                realm_id,
+                role_id,
+                "workload token replayed at the token exchange"
+            );
+            refuse(
+                StatusCode::UNAUTHORIZED,
+                "this token was already exchanged; request a new one from the CI job",
+            )
+        }
+        Ok(Stored::RealmChanged) => {
+            tracing::warn!(
+                realm_id,
+                role_id,
+                refresh,
+                "workload realm or role changed during the token exchange"
+            );
+            Err(Refusal::RealmChanged)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "storing a workload API key failed");
+            refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable",
+            )
+        }
+    }
 }
 
 /// What [`store_key`] did.

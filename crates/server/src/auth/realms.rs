@@ -494,18 +494,25 @@ impl RealmSnapshot {
     }
 }
 
+/// How often [`RealmAuth::refreshed`] may rebuild the snapshot at most.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Per-instance snapshot cache over the `auth_realm` table.
 ///
 /// `snapshot()` serves a cached [`RealmSnapshot`] until the TTL lapses, then
 /// rebuilds it from the database (two cheap queries + pure construction).
 /// `invalidate()` drops the cached snapshot (call after every admin write so
 /// the local instance converges immediately; peers converge within TTL).
+/// `refreshed()` rebuilds early for a credential issued under a realm
+/// configuration a peer already has and this instance does not yet.
 pub struct RealmAuth {
     pool: PgPool,
     cache: Cache,
     config: Arc<Config>,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
+    /// When [`RealmAuth::refreshed`] last rebuilt the snapshot.
+    last_refresh: std::sync::Mutex<Option<Instant>>,
     /// Decrypts `auth_realm.secrets_enc` when secret encryption is enabled.
     envelope: Option<Arc<EnvelopeService>>,
     /// Per-provider bounds on concurrent upstream credential forwards
@@ -535,6 +542,7 @@ impl RealmAuth {
             config,
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
+            last_refresh: std::sync::Mutex::new(None),
             envelope: None,
             forward_limits,
             password_limiter,
@@ -571,6 +579,39 @@ impl RealmAuth {
             }
         }
         let snap = Arc::new(self.build().await?);
+        *slot = Some(snap.clone());
+        Ok(snap)
+    }
+
+    /// A snapshot built after `seen`, for a caller holding a credential issued
+    /// under a realm configuration `seen` does not have. Realm edits drop only
+    /// the snapshot of the instance that took them, so another instance may
+    /// already issue credentials under a configuration `seen` predates.
+    ///
+    /// Callers that saw the same snapshot share one rebuild. Such rebuilds run
+    /// at most once per [`MIN_REFRESH_INTERVAL`]; within it the current
+    /// snapshot is returned, so credentials that match no configuration cost
+    /// no more than that.
+    pub async fn refreshed(&self, seen: &Arc<RealmSnapshot>) -> anyhow::Result<Arc<RealmSnapshot>> {
+        let mut slot = self.snapshot.write().await;
+        if let Some(current) = slot.as_ref() {
+            if current.built_at > seen.built_at && current.built_at.elapsed() < self.ttl {
+                return Ok(current.clone());
+            }
+            let recent = self
+                .last_refresh
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some_and(|at| at.elapsed() < MIN_REFRESH_INTERVAL);
+            if recent {
+                return Ok(current.clone());
+            }
+        }
+        let snap = Arc::new(self.build().await?);
+        *self
+            .last_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         *slot = Some(snap.clone());
         Ok(snap)
     }

@@ -347,10 +347,28 @@ fn normalize_nonempty_values(mut values: Vec<String>, field: &str) -> Result<Vec
 /// Whether `snap` has realm `realm_id` enabled with the configuration
 /// `config_sha256` names: what a workload key, and a registry token minted
 /// for a workload, rest on. Any edit, disable or delete of the realm ends it.
-pub(crate) fn realm_current(snap: &RealmSnapshot, realm_id: i64, config_sha256: &[u8; 32]) -> bool {
+fn realm_current(snap: &RealmSnapshot, realm_id: i64, config_sha256: &[u8; 32]) -> bool {
     snap.workload
         .iter()
         .any(|realm| realm.realm_id == realm_id && realm.config_sha256 == *config_sha256)
+}
+
+/// [`realm_current`] in `snap`, or else in a snapshot rebuilt since
+/// ([`RealmAuth::refreshed`]): the realm may have been edited on another
+/// instance, which issues credentials under the new configuration before this
+/// instance's snapshot expires. Revocation does not rest on this check alone:
+/// a realm change ends the realm's keys in the database.
+pub(crate) async fn realm_current_now(
+    realms: &RealmAuth,
+    snap: &Arc<RealmSnapshot>,
+    realm_id: i64,
+    config_sha256: &[u8; 32],
+) -> anyhow::Result<bool> {
+    if realm_current(snap, realm_id, config_sha256) {
+        return Ok(true);
+    }
+    let fresh = realms.refreshed(snap).await?;
+    Ok(realm_current(&fresh, realm_id, config_sha256))
 }
 
 /// A built WIF realm in a [`super::RealmSnapshot`]: the realm identity, the
@@ -681,7 +699,7 @@ impl WorkloadIdentitySource {
     /// or whose realm is no longer enabled with the very configuration it was
     /// issued under (any realm edit revokes its keys) is rejected and never
     /// handed to another source.
-    async fn authenticate_key(&self, snap: &RealmSnapshot, key: &str) -> SourceOutcome {
+    async fn authenticate_key(&self, snap: &Arc<RealmSnapshot>, key: &str) -> SourceOutcome {
         let digest = forge_core::auth::workload_key_sha256(key);
         let row = match workload_api_key_dao::find_live(&self.pool, &digest).await {
             Ok(Some(row)) => row,
@@ -698,7 +716,15 @@ impl WorkloadIdentitySource {
         if row.key_sha256.ct_eq(&digest).unwrap_u8() != 1 {
             return SourceOutcome::Reject;
         }
-        if !realm_current(snap, row.realm_id, &row.config_sha256) {
+        let current =
+            match realm_current_now(&self.realms, snap, row.realm_id, &row.config_sha256).await {
+                Ok(current) => current,
+                Err(e) => {
+                    tracing::error!(error = %e, "WIF realm snapshot refresh failed");
+                    return SourceOutcome::Unavailable;
+                }
+            };
+        if !current {
             tracing::warn!(
                 realm_id = row.realm_id,
                 key_id = row.id,
@@ -723,15 +749,24 @@ impl WorkloadIdentitySource {
     }
 
     /// Verify `token`, a CI job's OIDC token, for the token exchange. Routes
-    /// and verifies exactly like [`PrincipalSource::resolve`] does.
+    /// and verifies exactly like [`PrincipalSource::resolve`] does; with
+    /// `refresh`, against a snapshot rebuilt since the current one (after the
+    /// database refused a key issued under the current one's configuration).
     pub(crate) async fn verify_for_exchange(
         &self,
         token: &str,
+        refresh: bool,
     ) -> Result<VerifiedWorkload, ExchangeRefusal> {
-        let snap = self.realms.snapshot().await.map_err(|e| {
+        let mut snap = self.realms.snapshot().await.map_err(|e| {
             tracing::error!(error = %e, "WIF realm snapshot failed");
             ExchangeRefusal::Unavailable
         })?;
+        if refresh {
+            snap = self.realms.refreshed(&snap).await.map_err(|e| {
+                tracing::error!(error = %e, "WIF realm snapshot refresh failed");
+                ExchangeRefusal::Unavailable
+            })?;
+        }
         let realm = match route_jwt(&snap, token) {
             JwtRoute::Realm(realm) => realm,
             JwtRoute::NotJwt | JwtRoute::Unclaimed => {
