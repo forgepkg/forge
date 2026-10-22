@@ -19,8 +19,32 @@ pub struct NewWorkloadApiKey<'a> {
     pub jti_sha256: &'a [u8; 32],
     pub token_issued_at: DateTime<Utc>,
     pub token_expires_at: DateTime<Utc>,
+    /// The clock skew the token's `exp` was accepted with (its realm's
+    /// `clock_skew_seconds`, at most [`MAX_TOKEN_LEEWAY_SECONDS`]).
+    pub token_leeway_seconds: u64,
     /// The key's lifetime from now, in seconds (> 0).
     pub ttl_seconds: i64,
+}
+
+/// The most clock skew any realm accepts a CI token's `exp` with.
+pub const MAX_TOKEN_LEEWAY_SECONDS: u64 = 5 * 60;
+
+/// How long [`reap_expired`] keeps a redemption past the latest moment its
+/// token can still be redeemed (`token_expires_at` plus
+/// [`MAX_TOKEN_LEEWAY_SECONDS`]), for instances whose clocks run behind the
+/// database's.
+pub const REAP_MARGIN_SECONDS: u64 = 10 * 60;
+
+/// What [`insert`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redemption {
+    /// The key was stored; it expires then.
+    Issued(DateTime<Utc>),
+    /// The CI token was exchanged before.
+    Replayed,
+    /// By the database's clock the CI token has expired (past its leeway),
+    /// whatever the instance that verified it believes.
+    TokenExpired,
 }
 
 /// A live (unexpired) workload key: the principal snapshot it authorizes as.
@@ -38,17 +62,30 @@ pub struct WorkloadApiKey {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Store a key, redeeming its CI token. Returns the key's expiry, or `None`
-/// when that token (`issuer_sha256`, `jti_sha256`) was already exchanged.
-/// The expiry is computed from the database clock, like every other expiry
-/// the server checks against `now()`. The caller holds the realm row
+/// Store a key, redeeming its CI token: [`Redemption::Issued`] with the
+/// key's expiry, [`Redemption::Replayed`] when that token (`issuer_sha256`,
+/// `jti_sha256`) was already exchanged, or [`Redemption::TokenExpired`] when
+/// the token is past `token_expires_at` plus its leeway by the database's
+/// clock. Expiries are decided on the database clock, like every other one
+/// the server checks against `now()`: the redemption row is reaped on it
+/// ([`reap_expired`]), so a token must not be redeemable on an instance clock
+/// that runs behind it. The caller holds the realm row
 /// (`trusted_publish_audit_dao::lock_identity_snapshot`), so a realm change
 /// either waits for this key and then revokes it ([`revoke_realm`]) or lands
 /// first and the key is never issued.
 pub async fn insert(
     conn: &mut PgConnection,
     new: NewWorkloadApiKey<'_>,
-) -> sqlx::Result<Option<DateTime<Utc>>> {
+) -> sqlx::Result<Redemption> {
+    let leeway = new.token_leeway_seconds.min(MAX_TOKEN_LEEWAY_SECONDS);
+    let live: bool = sqlx::query_scalar("SELECT $1 + make_interval(secs => $2) >= now()")
+        .bind(new.token_expires_at)
+        .bind(leeway as f64)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !live {
+        return Ok(Redemption::TokenExpired);
+    }
     // Runtime query rather than a macro keeps the new migration independently
     // buildable before CI refreshes the checked-in SQLx metadata cache.
     let row = sqlx::query(
@@ -76,7 +113,10 @@ pub async fn insert(
     .bind(new.ttl_seconds as f64)
     .fetch_optional(conn)
     .await?;
-    row.map(|row| row.try_get("expires_at")).transpose()
+    match row {
+        Some(row) => Ok(Redemption::Issued(row.try_get("expires_at")?)),
+        None => Ok(Redemption::Replayed),
+    }
 }
 
 /// End every live key of `realm_id` now, in the transaction that edits,
@@ -158,9 +198,9 @@ pub async fn redemption_ended(
 
 /// Delete the rows whose key **and** CI token have both expired: until the
 /// token's own expiry the row is the record that it was already redeemed.
-/// `leeway_seconds` is the most clock skew the token's `exp` is accepted
-/// with: until then the token still verifies, so its row must stay.
-pub async fn reap_expired(pool: &PgPool, leeway_seconds: u64) -> sqlx::Result<u64> {
+/// A row stays [`REAP_MARGIN_SECONDS`] past the latest moment [`insert`]
+/// accepts its token (`token_expires_at` plus [`MAX_TOKEN_LEEWAY_SECONDS`]).
+pub async fn reap_expired(pool: &PgPool) -> sqlx::Result<u64> {
     let res = sqlx::query(
         r#"
         DELETE FROM workload_api_key
@@ -168,7 +208,7 @@ pub async fn reap_expired(pool: &PgPool, leeway_seconds: u64) -> sqlx::Result<u6
           AND token_expires_at + make_interval(secs => $1) <= now()
         "#,
     )
-    .bind(leeway_seconds as f64)
+    .bind((MAX_TOKEN_LEEWAY_SECONDS + REAP_MARGIN_SECONDS) as f64)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())

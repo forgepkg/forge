@@ -68,8 +68,9 @@ fn default_positive_cache() -> u64 {
     60
 }
 
-/// The most leeway a realm may give a token's `exp`, `nbf` and `iat`.
-pub(crate) const MAX_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
+/// The most leeway a realm may give a token's `exp`, `nbf` and `iat`. The
+/// token exchange's redemption records are kept well past it.
+const MAX_CLOCK_SKEW_SECONDS: u64 = workload_api_key_dao::MAX_TOKEN_LEEWAY_SECONDS;
 const MAX_TOKEN_AGE_SECONDS: u64 = 24 * 60 * 60;
 const MAX_POSITIVE_CACHE_SECONDS: u64 = 5 * 60;
 /// Lifetime of an exchanged workload API key when the realm sets none: an
@@ -533,6 +534,8 @@ pub(crate) struct VerifiedWorkload {
     pub jti: Option<String>,
     /// The exchanged-key lifetime the token's realm grants.
     pub api_key_ttl_seconds: u64,
+    /// The clock skew the token's realm accepts its `exp` with.
+    pub clock_skew_seconds: u64,
 }
 
 /// Why the token exchange refused a presented token.
@@ -669,6 +672,7 @@ impl WorkloadIdentitySource {
                     expires_at: verified.claims.exp.expect("workload verifier requires exp"),
                     jti: verified.claims.jti.clone(),
                     api_key_ttl_seconds: realm.config.api_key_ttl_seconds(),
+                    clock_skew_seconds: realm.config.clock_skew_seconds,
                 })
             }
             Ok(None) => {
