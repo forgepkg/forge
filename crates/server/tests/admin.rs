@@ -1187,7 +1187,10 @@ async fn group_member_owner_flag() {
 // ── §12.5: secret encryption at rest ────────────────────────────────────────
 
 /// Serializes the crypto-enabled tests of this binary: they share the
-/// cluster-wide rotation advisory lock (and the `default` key scope).
+/// cluster-wide rotation advisory lock (and the `default` key scope). Each
+/// runs on a database of its own (`common::fresh_pool`): a server with
+/// `[crypto]` seals install-wide secrets, such as the registry token key,
+/// that a server without it refuses to open or replace.
 static CRYPTO_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Root-key env var for the crypto-enabled server below. One fixed key for the
@@ -1215,7 +1218,7 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
     );
     let admin = format!("admin{}", common::unique());
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
             crypto_block: Some(crypto_block),
@@ -1372,7 +1375,7 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
     );
     let admin = format!("admin{}", common::unique());
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
             crypto_block: Some(crypto_block),
@@ -2335,7 +2338,7 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
          [crypto.rotation]\nenabled = false\n"
     );
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
             crypto_block: Some(crypto_block),
@@ -2415,7 +2418,7 @@ async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
          [crypto.rotation]\nenabled = false\n"
     );
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
             crypto_block: Some(crypto_block),
