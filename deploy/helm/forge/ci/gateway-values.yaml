@@ -1,5 +1,6 @@
 # CI: an HTTPRoute on an existing Gateway listener, a LoadBalancer Service,
-# a pinned image digest, and a NetworkPolicy turned on by its `from` alone.
+# a pinned image digest, a NetworkPolicy turned on by its `from` alone, and
+# extraObjects as a map (a null entry renders nothing).
 httpRoute:
   enabled: true
   parentRefs:
@@ -23,3 +24,19 @@ service:
 image:
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 existingSecret: forge-credentials
+extraObjects:
+  extra:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: '{{ include "forge.fullname" . }}-extra'
+    data:
+      host: "{{ .Values.host }}"
+  extra-string: |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {{ .Release.Name }}-extra-string
+    data:
+      replicas: "{{ .Values.replicaCount }}"
+  dropped: null
