@@ -86,3 +86,12 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   its branch is deleted and GitHub retargets the next one to `main`; if the
   branch is still there, change the next pull request's base to `main`
   yourself.
+
+## Issues: every issue gets a milestone
+
+Never create an issue without a milestone; set it when you create the issue:
+
+- An issue that must ship in the next release carries the `release blocker`
+  label and goes in the earliest open milestone, the lowest version not yet
+  released.
+- Every other issue goes in `Backlog`.
