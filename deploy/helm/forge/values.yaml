@@ -196,7 +196,8 @@ securityContext:
   capabilities:
     drop: [ALL]
 
-# The port Forge listens on (server.bind); API, NuGet feed and web UI share it.
+# The port Forge listens on (server.bind); the API, the feeds, the registry
+# and the web UI share it.
 containerPort: 8421
 
 # On SIGTERM Forge stops accepting connections and drains in-flight requests;

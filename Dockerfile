@@ -136,7 +136,7 @@ FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595
 ARG FORGE_VERSION=0.0.0-dev
 ARG FORGE_GIT_SHA=unknown
 LABEL org.opencontainers.image.title="envisia-forge" \
-      org.opencontainers.image.description="Self-hosted NuGet V3 registry (hosted, proxy, group)" \
+      org.opencontainers.image.description="Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)" \
       org.opencontainers.image.version="${FORGE_VERSION}" \
       org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 RUN apt-get update \

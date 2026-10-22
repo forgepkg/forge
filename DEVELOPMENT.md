@@ -1,9 +1,9 @@
 # Developing & running envisia-forge locally
 
-envisia-forge is a Rust NuGet package registry. Locally it runs as a single
-`forge-server` process backed by **PostgreSQL** (metadata) and an **S3-compatible**
-object store (blobs) — both provided by `docker-compose.yml` (versitygw stands in
-for S3).
+envisia-forge is a NuGet, Docker / OCI and Helm registry written in Rust.
+Locally it runs as a single `forge-server` process backed by **PostgreSQL**
+(metadata) and an **S3-compatible** object store (blobs) — both provided by
+`docker-compose.yml` (versitygw stands in for S3).
 
 ## Prerequisites
 
