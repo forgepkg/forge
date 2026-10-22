@@ -49,6 +49,12 @@ async-trait = { workspace = true }
 # Basic credential when a workload presents its id_token as the password.
 base64 = { workspace = true }
 sha2 = { workspace = true }
+# Nexus imports: an asset whose listing carries no SHA-256 or SHA-512 (older
+# Nexus 3 versions) is verified against its SHA-1.
+sha1 = "0.11"
+# Nexus imports: the Nexus REST API and asset downloads, through forge-core's
+# upstream client.
+reqwest = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }

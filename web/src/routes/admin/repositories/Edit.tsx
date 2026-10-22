@@ -15,6 +15,7 @@ import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
+import { IMPORT_FORMATS } from '~/api/imports'
 
 export const Route = createFileRoute('/_app/manage/repositories/$repo')({
   component: EditRepository,
@@ -27,7 +28,8 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * never seeded from the GET and is only included in the update when the admin
  * typed a new one (an empty field leaves the stored secret unchanged — slice-1
  * redaction); "Remove stored credentials" clears it explicitly. Group repos
- * get a link to the Members editor; proxies, their cache invalidation.
+ * get a link to the Members editor; proxies, their cache invalidation; hosted
+ * NuGet, Helm and Docker repositories, the import from Nexus.
  */
 function EditRepository() {
   const { repo: name } = Route.useParams()
@@ -87,6 +89,16 @@ function EditRepository() {
             Manage members
           </Link>
         )}
+        {repo.data.kind === 'hosted' &&
+          IMPORT_FORMATS.includes(repo.data.format) && (
+            <Link
+              to="/manage/repositories/$repo/import"
+              params={{ repo: repo.data.name }}
+              className="rounded-lg border border-zinc-950/10 px-3 py-1.5 text-sm/6 font-medium text-zinc-950 hover:bg-zinc-950/[2.5%] dark:border-white/15 dark:text-white dark:hover:bg-white/5"
+            >
+              Import from Nexus
+            </Link>
+          )}
       </div>
 
       {update.isSuccess && (
