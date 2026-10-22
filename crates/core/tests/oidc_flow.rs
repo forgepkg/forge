@@ -567,6 +567,7 @@ async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
             admin_authoritative: false,
             auto_provision: true,
             realm_id: None,
+            captured_password_hash: None,
         },
     )
     .await

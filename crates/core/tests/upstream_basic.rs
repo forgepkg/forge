@@ -86,6 +86,7 @@ fn config_for(url: String) -> UpstreamBasicConfig {
         provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
         auto_provision: true,
         realm_id: None,
+        capture_password_hash: false,
     }
 }
 
