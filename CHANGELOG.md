@@ -191,8 +191,11 @@ otherwise.
   `Range` requests. Statistics at `GET /admin/blob-cache`; Kubernetes
   components `local-cache` (emptyDir) and `local-cache-persistent` (a
   PersistentVolume). The cache directory must belong to Forge's user and be
-  writable by no one else (startup refuses it otherwise), and its entries are
-  readable by that user alone. See
+  writable by no one else (startup refuses it otherwise; a directory a
+  Kubernetes `fsGroup` pass made group-writable is restored instead), and
+  its entries are readable by that user alone. The kustomize base and the
+  Helm chart set `fsGroupChangePolicy: OnRootMismatch`
+  ([#195](https://github.com/schmitch/forge/issues/195)). See
   [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#local-blob-cache).
 
 ### Fixed

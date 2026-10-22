@@ -597,7 +597,7 @@ anything from an `emptyDir` to a dedicated or persistent volume.
 
 | Setting | Meaning |
 | --- | --- |
-| `FORGE_BLOB_CACHE__PATH` | The cache directory, e.g. `/var/cache/forge/blobs`. Unset (the default) = no cache. Each instance needs a directory of its own. It must belong to Forge's user, and neither group nor others may write to it: startup refuses it otherwise, since a file placed there is served as the blob it is named after. Forge creates it (mode `0700`) when it is missing, so point it at a subdirectory of a mounted volume, whose root belongs to root. Entries are readable by Forge's user alone (`0600`). |
+| `FORGE_BLOB_CACHE__PATH` | The cache directory, e.g. `/var/cache/forge/blobs`. Unset (the default) = no cache. Each instance needs a directory of its own. It must belong to Forge's user, and neither group nor others may write to it: startup refuses it otherwise, since a file placed there is served as the blob it is named after. Forge creates it (mode `0700`) when it is missing, so point it at a subdirectory of a mounted volume, whose root belongs to root. Entries are readable by Forge's user alone (`0600`). On Kubernetes, give the pod `fsGroupChangePolicy: OnRootMismatch` next to its `fsGroup` (the shipped manifests and chart do): otherwise the kubelet makes the directory group-writable at each pod start. Forge then restores it to `0700` and its entries to `0600`, logging a warning, and checks each entry against its hash on its first hit. |
 | `FORGE_BLOB_CACHE__MAX_BYTES` | `auto` (default): the size of the filesystem holding the path, minus `min_free_bytes`, minus `server.max_staging_bytes` when staging is on the same filesystem; re-read every minute, so a resized volume is picked up without a restart. Or a fixed number of bytes. |
 | `FORGE_BLOB_CACHE__MIN_FREE_BYTES` | Free space the cache always leaves on its filesystem, evicting instead of filling it, even when something else uses the disk too. Default: 5 % of the filesystem. On a shared disk with less free space than that, nothing is cached (logged as a warning at startup). |
 
@@ -659,7 +659,10 @@ The same numbers are logged every ten minutes (`local blob cache`).
 - **A PersistentVolume** lets the cache survive pod restarts during an S3
   outage. A ReadWriteOnce volume needs a single replica replaced with
   `strategy: Recreate` (the `local-cache-persistent` component), or Forge as
-  a StatefulSet with a `volumeClaimTemplate` per pod.
+  a StatefulSet with a `volumeClaimTemplate` per pod. Keep
+  `fsGroupChangePolicy: OnRootMismatch` in the pod's security context (the
+  default of the manifests and the chart): with the kubelet's default,
+  `Always`, every pod start walks the whole cache to change its group.
 
 With the Helm chart, set `config.blob_cache` and mount the volume with
 `extraVolumes`/`extraVolumeMounts`:
