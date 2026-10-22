@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT base_url, registry_url, password, password_enc\n        FROM nexus_import WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "base_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "base_url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "registry_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "registry_url"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "password",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "password"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "password_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "password_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "568cdec9a55952dd9e150c0d405da137aeb942da79163ac18f28e3f674cf3bec"
+}

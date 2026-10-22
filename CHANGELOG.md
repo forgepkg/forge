@@ -10,6 +10,12 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Migration 0036 adds the `nexus_import` and `nexus_import_item` tables for
+  imports from Nexus; it changes no existing data.
+  ([#183](https://github.com/schmitch/forge/issues/183))
+
 ### Features
 
 - Credential forwarding: a realm can keep an argon2id hash of every password
@@ -39,6 +45,23 @@ The release workflow publishes the section whose heading matches the tag
   `null`; a list in a later file replaces the whole list. Lists keep
   working.
   ([#288](https://github.com/schmitch/forge/pull/288))
+- **Import from Nexus**: copy a Nexus 3 hosted repository into a Forge hosted
+  repository of the same format, one repository at a time: NuGet packages,
+  Helm charts, and Docker images with their digests, multi-platform
+  indexes, signatures and SBOMs. In the web UI (a hosted repository's
+  **Import from Nexus**) or the admin API
+  (`/admin/repositories/{name}/imports`). The source is checked before an
+  import starts; a dry run reports the counts, the size and the conflicts
+  without writing. Packages are verified against Nexus' checksums and
+  written through the normal push path, keep their publish dates, last
+  downloads and uploaders, and are audited as imports. A version Forge has
+  with other bytes is skipped and reported, overwritten, or fails the
+  import, as chosen. An import resumes after a restart, a failure or a
+  cancel, failed items can be retried on their own, and running it again
+  copies only what is new. The Nexus password is sealed with the secret
+  encryption and deleted when the import completes. See
+  [docs/nexus-import.md](docs/nexus-import.md).
+  ([#183](https://github.com/schmitch/forge/issues/183))
 
 ### Fixed
 

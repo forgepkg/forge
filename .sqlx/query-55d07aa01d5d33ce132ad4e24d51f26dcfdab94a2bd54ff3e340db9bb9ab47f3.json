@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE oci_manifest\n        SET created_at = CASE WHEN $2 THEN coalesce($3, created_at) ELSE created_at END,\n            last_pulled_at = greatest(last_pulled_at, $4)\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "55d07aa01d5d33ce132ad4e24d51f26dcfdab94a2bd54ff3e340db9bb9ab47f3"
+}

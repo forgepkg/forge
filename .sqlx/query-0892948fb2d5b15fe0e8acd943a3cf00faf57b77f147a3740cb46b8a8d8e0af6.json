@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE nexus_import\n        SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE state END,\n            finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,\n            cancel_requested = (state = 'running'),\n            updated_at = now()\n        WHERE id = $1 AND state IN ('queued', 'running')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0892948fb2d5b15fe0e8acd943a3cf00faf57b77f147a3740cb46b8a8d8e0af6"
+}

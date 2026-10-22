@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE component\n        SET created_at = coalesce($2, created_at),\n            last_downloaded_at = greatest(last_downloaded_at, $3)\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "76d73c9fc040c1d506a617827a8105e1fdf81593a083ddeb1ba9246b6b7bc3d0"
+}

@@ -137,6 +137,46 @@ pub enum PublishOutcome {
     Replaced,
 }
 
+/// How an import writes one package version
+/// ([`hosted::HostedWrite::import_staged`]).
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// Replace a version that exists with other bytes (otherwise it is
+    /// reported as [`ImportOutcome::Conflict`]), even where the repository
+    /// does not allow redeploys.
+    pub overwrite: bool,
+    /// Decide what would happen, and write nothing.
+    pub dry_run: bool,
+    /// When the source published the version: becomes its creation time,
+    /// which retention's age rules read.
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the source last served the version: becomes its last download.
+    pub downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Who published it at the source, for the audit trail.
+    pub uploader: Option<String>,
+    /// Where it came from, for the audit trail (`<nexus url> <repository>`).
+    pub source: String,
+}
+
+/// What an import did with one package version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// The version is new and was stored.
+    Created { id: String, version: String },
+    /// The version existed with other bytes and was replaced.
+    Replaced { id: String, version: String },
+    /// The version exists with the same bytes; nothing was written.
+    Identical { id: String, version: String },
+    /// The version exists with other bytes and was left alone.
+    Conflict { id: String, version: String },
+    /// Dry run: the version would be stored (`replaces`: over other bytes).
+    Planned {
+        id: String,
+        version: String,
+        replaces: bool,
+    },
+}
+
 /// Outcome of a delete / relist operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
