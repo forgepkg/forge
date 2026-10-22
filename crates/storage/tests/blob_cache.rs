@@ -393,6 +393,48 @@ async fn a_damaged_file_is_detected_and_fetched_again() {
 }
 
 #[tokio::test]
+async fn concurrent_hits_after_a_restart_check_the_hash_once() {
+    let (endpoint, fake) = spawn_fake_s3().await;
+    let dir = scratch("verify-once");
+    let blob = Blob::new(4, 4 << 20);
+    fake.put(&blob.key, blob.bytes.clone());
+    {
+        let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+        let store = cached_store(&endpoint, cache.clone());
+        read(&store, &blob, None).await;
+        until_cached(&cache, &blob).await;
+    }
+    // After a restart the entry is unverified: fifty clients at once, half
+    // of them asking for a single byte, share one read of the whole file.
+    let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+    let store = cached_store(&endpoint, cache.clone());
+    let reads = (0..50u64).map(|i| {
+        let (store, blob) = (&store, &blob);
+        async move {
+            let range = (i % 2 == 0).then_some(i..i + 1);
+            let expected = match &range {
+                Some(r) => blob.bytes[r.start as usize..r.end as usize].to_vec(),
+                None => blob.bytes.clone(),
+            };
+            assert_eq!(read(store, blob, range).await, expected);
+        }
+    });
+    futures_util::future::join_all(reads).await;
+    let stats = cache.stats();
+    assert_eq!(stats.verifications, 1, "one hash check for every hit");
+    assert_eq!(stats.hits, 50);
+    assert_eq!(
+        fake.gets(&blob.key),
+        1,
+        "S3 was read before the restart only"
+    );
+
+    // Verified now: later hits read no more than they serve.
+    read(&store, &blob, Some(0..1)).await;
+    assert_eq!(cache.stats().verifications, 1);
+}
+
+#[tokio::test]
 async fn s3_bytes_that_do_not_match_the_hash_are_not_cached() {
     let (endpoint, fake) = spawn_fake_s3().await;
     let dir = scratch("bad-source");
