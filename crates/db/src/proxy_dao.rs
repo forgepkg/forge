@@ -395,6 +395,62 @@ pub async fn reset_for_new_upstream(
     Ok(deleted)
 }
 
+/// Forget the upstream 404s a proxy remembers of package `name`, or of every
+/// package (`None`), inside the transaction of an administrator's cache
+/// invalidation, so the next request asks the upstream again. Package-level
+/// markers (`version = '*'`) and the rows of downloads that never found their
+/// version are deleted; the marker on any other row is cleared. Listings,
+/// downloads and the package-delay clock are kept. Returns how many markers
+/// were removed.
+pub async fn clear_not_found(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    name: Option<&str>,
+) -> sqlx::Result<u64> {
+    let deleted = sqlx::query!(
+        r#"
+        DELETE FROM proxy_cached_version
+        WHERE repository_id = $1 AND ($2::text IS NULL OR name = $2)
+          AND NOT downloaded
+          AND (version = '*' OR (not_found AND NOT confirmed))
+        "#,
+        repository_id,
+        name,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let cleared = sqlx::query!(
+        r#"
+        UPDATE proxy_cached_version
+        SET not_found = false, not_found_at = NULL
+        WHERE repository_id = $1 AND ($2::text IS NULL OR name = $2) AND not_found
+        "#,
+        repository_id,
+        name,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(deleted + cleared)
+}
+
+/// Make a proxy's persisted upstream index due for a refresh: the next read
+/// resolves the upstream again and falls back to this one only while that
+/// fails.
+pub async fn expire_upstream_index(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"UPDATE proxy_upstream_index SET fetched_at = 'epoch' WHERE repository_id = $1"#,
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Finalize a successful download of the row `id` inside the caller's
 /// transaction: mark it downloaded, clear any not-found marker and confirm it.
 /// A row confirmed only now (it was created by the download singleflight)

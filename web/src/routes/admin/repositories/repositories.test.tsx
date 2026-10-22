@@ -24,7 +24,9 @@ import { routeTree } from '~/routeTree.gen'
  *  - the group members editor prevents a duplicate priority before any request,
  *    toggles a member's owner flag, asks before removing a member or
  *    unflagging the last owner, explains a refused owner removal, and offers
- *    other groups (of the same format) as (nested) members.
+ *    other groups (of the same format) as (nested) members;
+ *  - a proxy's edit screen invalidates its cache, of one package or of all,
+ *    and a hosted one offers no such thing.
  */
 
 const adminMe: Me = {
@@ -78,6 +80,7 @@ interface ApiHandlers {
   onAddMember?: (body: unknown) => Response
   onPatchMember?: (member: string, body: unknown) => Response
   onRemoveMember?: (member: string) => Response
+  onInvalidate?: (name: string, body: unknown) => Response
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -128,6 +131,15 @@ function mockApi(h: ApiHandlers) {
           h.onRemoveMember
             ? h.onRemoveMember(member)
             : new Response(null, { status: 204 }),
+        )
+      }
+      const invalidateMatch = path.match(
+        /\/admin\/repositories\/([^/]+)\/proxy-cache\/invalidate$/,
+      )
+      if (invalidateMatch && method === 'POST' && h.onInvalidate) {
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onInvalidate(decodeURIComponent(invalidateMatch[1]), body),
         )
       }
       // A single repo GET (edit screen) — return the first repo.
@@ -396,6 +408,79 @@ describe('admin repositories', () => {
       ).toBeNull(),
     )
     expect(screen.getByLabelText('Upstream username')).toBeEnabled()
+  })
+
+  it('invalidates a proxy cache, of one package or of the whole repository', async () => {
+    const posts: [string, unknown][] = []
+    mockApi({
+      repositories: [
+        repo({
+          name: 'nuget-org',
+          kind: 'proxy',
+          remote_url: 'https://api.nuget.org/v3/index.json',
+        }),
+        repo({ name: 'hosted-1' }),
+      ],
+      onInvalidate: (name, body) => {
+        posts.push([name, body])
+        return json({ not_found_cleared: posts.length, tags_expired: 0 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/nuget-org')
+
+    await user.type(await screen.findByLabelText(/Package id/), ' Late.Pkg ')
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(
+      await screen.findByText(/Invalidated Late\.Pkg: 1 “not found” answer forgotten/),
+    ).toBeInTheDocument()
+
+    await user.clear(screen.getByLabelText(/Package id/))
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(
+      await screen.findByText(/Invalidated the whole cache: 2 “not found” answers/),
+    ).toBeInTheDocument()
+    expect(posts).toEqual([
+      ['nuget-org', { package: 'Late.Pkg' }],
+      ['nuget-org', {}],
+    ])
+  })
+
+  it('a docker proxy invalidates the tags of an image', async () => {
+    mockApi({
+      repositories: [
+        repo({
+          name: 'dockerhub',
+          kind: 'proxy',
+          format: 'docker',
+          remote_url: 'https://registry-1.docker.io',
+        }),
+      ],
+      onInvalidate: () => json('package is not a valid image name', 400),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/dockerhub')
+
+    await user.type(await screen.findByLabelText(/Image/), 'Nginx')
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'package is not a valid image name',
+    )
+  })
+
+  it('a hosted repository has no proxy cache', async () => {
+    mockApi({ repositories: [repo({ name: 'hosted-1' })] })
+
+    await renderAt('/manage/repositories/hosted-1')
+
+    expect(
+      await screen.findByRole('button', { name: 'Save changes' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Invalidate cache' }),
+    ).toBeNull()
   })
 
   it('group members editor blocks a duplicate priority before requesting', async () => {

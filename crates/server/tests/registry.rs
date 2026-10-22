@@ -1587,6 +1587,74 @@ async fn a_challenge_from_a_redirect_hop_is_not_followed() {
     assert_eq!(token_requests.load(Ordering::SeqCst), 0);
 }
 
+/// An administrator's cache invalidation re-validates a proxy's tags and
+/// forgets the upstream's "not found" answers before their TTLs run out.
+#[tokio::test]
+async fn invalidating_a_proxy_cache_asks_the_upstream_again() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let layer = b"invalidated layer".to_vec();
+    let manifest = image(&cfg, &[&layer]);
+    mock.put("library/base", "1.0", OCI_MANIFEST, &manifest);
+    mock.put("library/other", "1.0", OCI_MANIFEST, &manifest);
+    mock.put_blob(&cfg);
+    mock.put_blob(&layer);
+
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+            "metadata_ttl_seconds": 3600, "not_found_ttl_seconds": 3600
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let (base, other) = (
+        format!("{proxy}/library/base"),
+        format!("{proxy}/library/other"),
+    );
+    assert_eq!(oci.get(&base, "manifests/1.0").await.status(), 200);
+    assert_eq!(oci.get(&other, "manifests/1.0").await.status(), 200);
+    assert_eq!(oci.get(&base, "manifests/2.0").await.status(), 404);
+
+    // The upstream moves `1.0` and publishes `2.0`: within the TTLs the
+    // proxy still answers from its cache.
+    let cfg2 = config("arm64");
+    let manifest2 = image(&cfg2, &[&layer]);
+    mock.put("library/base", "1.0", OCI_MANIFEST, &manifest2);
+    mock.put("library/base", "2.0", OCI_MANIFEST, &manifest2);
+    mock.put_blob(&cfg2);
+    let resp = oci.get(&base, "manifests/1.0").await;
+    assert_eq!(
+        resp.headers()["docker-content-digest"],
+        sha(&manifest).as_str()
+    );
+    assert_eq!(oci.get(&base, "manifests/2.0").await.status(), 404);
+
+    let invalidate = format!("/admin/repositories/{proxy}/proxy-cache/invalidate");
+    let resp = admin_post(&srv, &invalidate, json!({"package": "library/base"})).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags_expired"], 1, "{body}");
+
+    let resp = oci.get(&base, "manifests/1.0").await;
+    assert_eq!(
+        resp.headers()["docker-content-digest"],
+        sha(&manifest2).as_str()
+    );
+    assert_eq!(oci.get(&base, "manifests/2.0").await.status(), 200);
+
+    // Without a package: every tag.
+    let resp = admin_post(&srv, &invalidate, json!({})).await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags_expired"], 3, "{body}");
+    let resp = admin_post(&srv, &invalidate, json!({"package": "Not A Name"})).await;
+    assert_eq!(resp.status(), 400);
+}
+
 #[tokio::test]
 async fn a_proxy_links_only_blobs_its_own_upstream_served() {
     let srv = common::start().await;

@@ -20,6 +20,8 @@
 //!   triggers (never returns key bytes or decrypted secrets).
 //! * [`settings`] — install-wide switches (`legacy_open_access`).
 //! * [`blob_cache`] — the local blob cache's statistics.
+//! * [`proxy_cache`] — invalidating what a proxy repository cached from its
+//!   upstream (its "not found" answers, listings and documents).
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -41,6 +43,7 @@ pub mod effective;
 pub mod formats;
 pub mod grants;
 pub mod members;
+pub mod proxy_cache;
 pub mod realms;
 pub mod repositories;
 pub mod retention;
@@ -179,6 +182,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/retention/audit",
             get(retention::audit),
+        )
+        .route(
+            "/repositories/{name}/proxy-cache/invalidate",
+            axum::routing::post(proxy_cache::invalidate),
         )
         .route(
             "/repositories/{name}/members",

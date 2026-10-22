@@ -165,6 +165,14 @@ fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published. One
 conversation gets at most 4 rounds and 256 fetches, 4 at a time.
 
+An administrator makes a proxy of any format ask its upstream again before
+those TTLs run out with *Invalidate cache* on the repository's page, or
+`POST /admin/repositories/{name}/proxy-cache/invalidate`: the proxy forgets
+its not-found markers (of one package with `{"package": "<id>"}`, or of
+all) and every document it fetched, on every instance, and invalidating the
+whole repository also refreshes its `index`. Downloaded packages stay
+cached.
+
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories

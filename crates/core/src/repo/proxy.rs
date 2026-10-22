@@ -82,6 +82,13 @@
 //!   came from: once it changes, nothing more is requested from the previous
 //!   upstream, and a failing new one is an error, never a fallback to the
 //!   previous upstream's index. Packages already downloaded stay cached.
+//! * **Invalidation** — an administrator makes a proxy ask its upstream again
+//!   (`POST /admin/repositories/{name}/proxy-cache/invalidate`): the
+//!   not-found markers of one package, or of all, are removed and
+//!   `updated_at` is bumped, which drops every cached listing, document and
+//!   verdict on every instance ([`ProxyRepo::upstream_scope`]); invalidating
+//!   the whole repository also makes the upstream index due for a refresh.
+//!   Downloaded packages and the package-delay clock are kept.
 //! * **Search** — forwarded to the upstream's `SearchQueryService` (cached
 //!   for the metadata TTL), so packages nobody has restored yet are found.
 //!   The caller's package filter, live not-found markers and the package
@@ -123,13 +130,14 @@ use crate::repo::{
 };
 
 /// Cache namespace for resolved upstream indexes ([`api::UpstreamOp::Index`]),
-/// keyed by `"{repo}/{repo_id}/{remote_url}"`.
+/// keyed by `"{scope}"`. In this and the namespaces below, `scope` is
+/// `"{repo}/{repo_id}/{remote_url digest}/{updated_at}"`, so nothing cached
+/// from a previous upstream, or before a repoint, is used once a proxy is
+/// repointed, and an administrator's cache invalidation (which bumps
+/// `updated_at`) drops all of it on every instance.
 pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 /// Cache namespace marking a package's upstream version listing as fresh,
-/// keyed by `"{scope}/{lower_id}"`. In this and the namespaces below, `scope`
-/// is `"{repo}/{repo_id}/{remote_url digest}/{updated_at}"`, so nothing
-/// cached from a previous upstream, or before a repoint, is used once a proxy
-/// is repointed.
+/// keyed by `"{scope}/{lower_id}"`.
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
 /// Cache namespace for the documents the format's upstream protocol fetched
 /// ([`api::Fetch`]), keyed by `"{scope}/{url}"`, for as long as its
@@ -535,9 +543,12 @@ impl ProxyRepo {
     /// versions not downloaded yet); without the timestamp, pointing back to
     /// an upstream within the metadata TTL found that upstream's "listing
     /// refreshed" marker still valid and served the emptied listing until
-    /// it expired. A digest rather than the URL itself keeps keys that
+    /// it expired. The timestamp is also how an administrator invalidates
+    /// the cache (`POST /admin/repositories/{name}/proxy-cache/invalidate`):
+    /// every instance reads the row per request, so bumping it reaches them
+    /// all, Redis or not. A digest rather than the URL itself keeps keys that
     /// append another URL unambiguous.
-    fn upstream_scope(repo: &Repository) -> String {
+    pub fn upstream_scope(repo: &Repository) -> String {
         let digest = Sha256::digest(repo.remote_url.as_deref().unwrap_or_default());
         format!(
             "{}/{}/{}/{}",
@@ -627,7 +638,7 @@ impl ProxyRepo {
     ///    or row lock held across the requests) and upsert it. Concurrent
     ///    instances may both refresh; the result is idempotent.
     ///
-    /// The cache key includes the repository id and `remote_url`, and the
+    /// The cache key is the [upstream scope](Self::upstream_scope) and the
     /// persisted row records its URL, so a changed upstream (or a
     /// deleted-and-recreated repository) never serves the old upstream's
     /// index.
@@ -637,7 +648,7 @@ impl ProxyRepo {
             .remote_url
             .clone()
             .ok_or_else(|| RepoError::Storage("proxy repository has no remote_url".into()))?;
-        let key = format!("{}/{}/{}", repo.name, repo.id, remote_url);
+        let key = Self::upstream_scope(repo);
 
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,

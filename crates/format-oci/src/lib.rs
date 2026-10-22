@@ -25,6 +25,7 @@ mod pull;
 mod push;
 mod service;
 
+pub use proxy::proxied_image;
 pub use service::{
     registry_origin, PublishRecorder, Registry, RegistryConfig, RegistryParts, WorkloadCheck,
 };

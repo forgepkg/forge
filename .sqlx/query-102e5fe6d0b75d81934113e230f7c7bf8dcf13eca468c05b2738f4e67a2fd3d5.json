@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version\n        SET not_found = false, not_found_at = NULL\n        WHERE repository_id = $1 AND ($2::text IS NULL OR name = $2) AND not_found\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "102e5fe6d0b75d81934113e230f7c7bf8dcf13eca468c05b2738f4e67a2fd3d5"
+}

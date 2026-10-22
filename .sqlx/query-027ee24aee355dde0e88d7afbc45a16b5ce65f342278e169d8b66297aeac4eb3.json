@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository\n        SET updated_at = greatest(now(), updated_at + interval '1 microsecond')\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "027ee24aee355dde0e88d7afbc45a16b5ce65f342278e169d8b66297aeac4eb3"
+}

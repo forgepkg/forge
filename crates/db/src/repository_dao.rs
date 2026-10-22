@@ -580,6 +580,27 @@ where
     .await
 }
 
+/// Bump a repository's `updated_at` without changing a setting, always to a
+/// new value. A proxy keys what it caches from its upstream by it, so this
+/// drops all of that on every instance. Returns `false` when no repository has
+/// that id.
+pub async fn touch_repository<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        UPDATE repository
+        SET updated_at = greatest(now(), updated_at + interval '1 microsecond')
+        WHERE id = $1
+        "#,
+        id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Lock a repository row `FOR UPDATE` inside the caller's transaction.
 /// Returns `false` when the row does not exist (or a concurrent delete removed
 /// it first).

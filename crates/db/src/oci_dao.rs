@@ -609,6 +609,27 @@ pub async fn mark_tag_checked(
     Ok(())
 }
 
+/// Make a proxy's cached tags of `image`, or of every image (`None`), due for
+/// revalidation: the next pull of each asks the upstream what it points at
+/// now. Returns how many tags.
+pub async fn expire_tags(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    image: Option<&str>,
+) -> sqlx::Result<u64> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE oci_tag SET checked_at = 'epoch'
+        WHERE repository_id = $1 AND ($2::text IS NULL OR image = $2)
+        "#,
+        repository_id,
+        image,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Record a pull of a manifest (at most hourly).
 pub async fn touch_manifest(pool: &PgPool, manifest_id: i64) -> sqlx::Result<()> {
     sqlx::query!(

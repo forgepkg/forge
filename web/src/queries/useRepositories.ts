@@ -14,6 +14,7 @@ import {
   fetchRepositories,
   fetchRepository,
   formatKeys,
+  invalidateProxyCache,
   removeMember,
   repoKeys,
   updateMember,
@@ -21,7 +22,9 @@ import {
   type AddMember,
   type CreateRepo,
   type FormatView,
+  type InvalidateProxyCache,
   type MemberView,
+  type ProxyCacheInvalidated,
   type RepoView,
   type UpdateRepo,
 } from '~/api/repositories'
@@ -98,6 +101,16 @@ export function useDeleteRepository() {
       void queryClient.invalidateQueries({ queryKey: repoKeys.list() })
       void queryClient.removeQueries({ queryKey: repoKeys.detail(name) })
     },
+  })
+}
+
+/**
+ * Invalidate a proxy's cache. Nothing to re-fetch: the repository's view does
+ * not change.
+ */
+export function useInvalidateProxyCache(name: string) {
+  return useMutation<ProxyCacheInvalidated, ApiError, InvalidateProxyCache>({
+    mutationFn: (body) => invalidateProxyCache(name, body),
   })
 }
 

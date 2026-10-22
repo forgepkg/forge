@@ -133,7 +133,7 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
 /// id/version check and then stay cached for good).
 #[tokio::test]
 async fn proxy_upstream_index_is_not_read_from_redis() {
-    use forge_core::repo::proxy::NS_UPSTREAM_INDEX;
+    use forge_core::repo::proxy::{ProxyRepo, NS_UPSTREAM_INDEX};
     use forge_e2e::{make_nupkg_with_desc, MockUpstream, UpstreamPackage};
 
     let genuine_bytes = make_nupkg_with_desc("Contoso.Lib", "1.0.0", "genuine");
@@ -168,7 +168,7 @@ async fn proxy_upstream_index_is_not_read_from_redis() {
         .unwrap();
 
     // Plant the forger's resources under the key the proxy caches its index.
-    let key = format!("{}/{}/{}", repo.name, repo.id, genuine.index_url());
+    let key = ProxyRepo::upstream_scope(&repo);
     a.state
         .cache
         .get_or_try_insert_with::<String, _, _, std::convert::Infallible>(

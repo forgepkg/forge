@@ -142,7 +142,7 @@ fn is_docker_hub(remote_url: &str) -> bool {
 }
 
 /// The image name a proxy stores and asks its upstream for.
-pub(crate) fn proxied_image(repo: &Repository, image: &str) -> String {
+pub fn proxied_image(repo: &Repository, image: &str) -> String {
     match &repo.remote_url {
         Some(remote) if is_docker_hub(remote) && !image.contains('/') => format!("library/{image}"),
         _ => image.to_string(),
@@ -426,8 +426,15 @@ impl Registry {
         })
     }
 
+    /// Keyed by the repository's `updated_at` too, so an administrator's
+    /// cache invalidation (which bumps it) forgets the upstream's "not found"
+    /// answers on every instance.
     fn not_found_key(repo: &Repository, image: &str, reference: &str) -> String {
-        format!("{}:{image}:{reference}", repo.id)
+        format!(
+            "{}:{}:{image}:{reference}",
+            repo.id,
+            repo.updated_at.timestamp_micros()
+        )
     }
 
     async fn negative_cached(&self, repo: &Repository, image: &str, reference: &str) -> bool {
