@@ -89,7 +89,9 @@ variables:
   DOCKER_TLS_CERTDIR: ""
 
 # ── Formatting, and the changelog fragments ────────────────────────────────
-# As on GitHub, the fragment check builds only xtask.
+# As on GitHub, the fragment check builds only xtask. No job waits for this
+# one: every job has `needs: []` and starts with the pipeline instead of after
+# its stage, as on GitHub (#337).
 fmt:
   stage: fmt
   script:
@@ -103,7 +105,7 @@ fmt:
 # like GitHub's, so the job waits for Postgres before using it.
 clippy:
   stage: clippy
-  needs: ["fmt"]
+  needs: []
   services:
     - name: mirror.gcr.io/library/postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
       alias: postgres
@@ -144,7 +146,7 @@ audit:
 # component for wasm32-wasip2. The tests that load a component run in `test`.
 plugins:
   stage: test
-  needs: ["fmt"]
+  needs: []
   cache:
     <<: *cargo-cache
   script:
@@ -162,7 +164,7 @@ plugins:
 # would rebuild most of it.
 test:
   stage: test
-  needs: ["fmt"]
+  needs: []
   services:
     - *dind-service
   variables:
@@ -187,11 +189,34 @@ test:
     - find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete || true
 
 # ── Container image (build only; releases push from release.yml) ─────────
-# Builds the production Dockerfile on every change so a broken image is
-# caught before a release tag, not by it.
+# Builds the production Dockerfile so a broken image is caught before a
+# release tag, not by it: in merge trains, branch pipelines and on the default
+# branch, and in a merge request pipeline when the change touches what the
+# image is built from (as on GitHub, #338; keep the paths in step with ci.yml).
+# Other merge requests leave the job out: clippy, test and web compile their
+# Rust code and SPA, and the merge train builds the image.
 docker:
   stage: build
-  needs: ["fmt"]
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+      changes:
+        - Dockerfile
+        - .dockerignore
+        - docker/**/*
+        - LICENSE
+        - "**/Cargo.toml"
+        - Cargo.lock
+        - rust-toolchain.toml
+        - .cargo/**/*
+        - web/package.json
+        - web/pnpm-lock.yaml
+        - web/pnpm-workspace.yaml
+        - web/.npmrc
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
+      when: never
+    - when: on_success
   image: mirror.gcr.io/library/docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
   services:
     - *dind-service
@@ -234,7 +259,7 @@ kubernetes:
 # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
 # output (web/dist/) is what the Rust server serves via ServeDir; building here
 # guards against TS/Vite breakage. Runs on the node image, independent of the
-# Rust jobs (only `needs: []` so it starts immediately).
+# Rust jobs (`needs: []` so it starts immediately).
 web:
   stage: web
   needs: []

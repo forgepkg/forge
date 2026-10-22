@@ -732,6 +732,17 @@ CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) runs
 pull request. The slow `e2e` and `web-e2e` jobs are skipped there; they run in
 the merge queue and on every push to `main`.
 
+On a pull request, `docker` builds the image only when the change touches what
+it is built from: the `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, a
+`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, the web
+manifest and lockfile (`web/package.json`, `web/pnpm-lock.yaml`,
+`web/pnpm-workspace.yaml`, `web/.npmrc`) or the CI configuration. Otherwise
+it passes without building (GitLab leaves the job out of the merge request
+pipeline). The merge queue and every push to `main` always build the image,
+so a change that breaks only the image build, such as an `include_str!` of a
+file `.dockerignore` leaves out, fails in the queue rather than on its pull
+request.
+
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, `e2e` and `web-e2e` included.
 To turn it on, edit the ruleset (or branch protection rule) of `main`:
