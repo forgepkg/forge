@@ -202,6 +202,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route("/users/{id}/reauth", axum::routing::post(users::reauth))
         .route(
+            "/users/{id}/convert-to-local",
+            axum::routing::post(users::convert_to_local),
+        )
+        .route(
             "/users/{id}/tokens",
             get(tokens::list_for_user).post(tokens::create),
         )
@@ -243,6 +247,14 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(realms::get)
                 .patch(realms::update)
                 .delete(realms::delete),
+        )
+        .route(
+            "/realms/{id}/captured-passwords",
+            get(realms::captured_passwords),
+        )
+        .route(
+            "/realms/{id}/convert-to-local",
+            axum::routing::post(realms::convert_to_local),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route(
