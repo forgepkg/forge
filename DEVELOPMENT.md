@@ -145,12 +145,7 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 > **Admin UI paths:** the admin screens live under **`/manage/*`**
 > (`/manage/repositories`, `/manage/users/<id>`, `/manage/realms`, ...);
 > `/admin/*` belongs to the admin REST API, which is routed before the SPA
-> fallback. (Before the first release, 1.0.0, the UI shared `/admin/*`, so a
-> refresh, bookmark or deep link of an admin screen got raw JSON, a 404 or a
-> 405.) A browser navigation (`Sec-Fetch-Dest: document`, or an `Accept`
-> preferring `text/html`) to a former UI path such as `/admin/repositories?x=1` is
-> 302-redirected to `/manage/repositories?x=1`; API requests to `/admin/*` are
-> unchanged. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
+> fallback. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
 > `crates/server/tests/web_ui.rs`. In Vite dev (`:8420`) `/manage/*` is served
 > by Vite itself; `/admin` is still proxied to the API.
 
