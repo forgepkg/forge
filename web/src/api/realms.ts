@@ -64,6 +64,10 @@ export interface CredentialForwardingConfig {
   allow_http?: boolean
   admin_group?: string
   auto_provision?: boolean
+  /** Keep an argon2id hash of every password the upstream accepts. */
+  capture_password_hash?: boolean
+  /** Stop forwarding: sign in with the kept hashes (needs `capture_password_hash`). */
+  captured_password_only?: boolean
   positive_ttl_secs?: number
   negative_ttl_secs?: number
   /** SECRET — write-only; required on create, omit to keep on update. */
@@ -152,6 +156,7 @@ export const realmKeys = {
   all: () => ['realms'] as const,
   list: () => ['realms', 'list'] as const,
   detail: (id: number) => ['realms', 'detail', id] as const,
+  capturedPasswords: (id: number) => ['realms', 'captured-passwords', id] as const,
 }
 
 /** `GET /admin/realms` — bare array, ordered by priority. */
@@ -177,6 +182,41 @@ export function updateRealm(id: number, body: UpdateRealm): Promise<RealmView> {
 /** `DELETE /admin/realms/{id}` — delete (400 for the built-in local realm). */
 export function deleteRealm(id: number): Promise<void> {
   return httpClient.delete<void>(`/admin/realms/${id}`)
+}
+
+/**
+ * How many of a credential-forwarding realm's accounts keep a password hash
+ * (`GET /admin/realms/{id}/captured-passwords`).
+ */
+export interface CapturedPasswords {
+  accounts: number
+  captured: number
+}
+
+/** Outcome of `POST /admin/realms/{id}/convert-to-local`. */
+export interface ConvertToLocal {
+  /** Accounts switched to local ones. */
+  converted: number
+  /** The realm's accounts left as they were (no kept hash). */
+  remaining: number
+}
+
+/** `GET /admin/realms/{id}/captured-passwords`. */
+export function fetchCapturedPasswords(
+  id: number,
+  signal?: AbortSignal,
+): Promise<CapturedPasswords> {
+  return httpClient.get<CapturedPasswords>(`/admin/realms/${id}/captured-passwords`, {
+    signal,
+  })
+}
+
+/**
+ * `POST /admin/realms/{id}/convert-to-local` — switch every account of the
+ * realm that keeps a password hash to a local account with that password.
+ */
+export function convertRealmToLocal(id: number): Promise<ConvertToLocal> {
+  return httpClient.post<ConvertToLocal>(`/admin/realms/${id}/convert-to-local`, {})
 }
 
 /** `PUT /admin/realms/order` — full new priority order (every id once). */

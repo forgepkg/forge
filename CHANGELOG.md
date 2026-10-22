@@ -10,6 +10,18 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Features
+
+- Credential forwarding: a realm can keep an argon2id hash of every password
+  its upstream (e.g. a Nexus) accepts (**Keep a password hash of successful
+  logins**, `capture_password_hash`, off by default; unchecking it deletes the
+  hashes). Once the hashes are in place the realm can stop asking the upstream
+  and sign its users in with them (`captured_password_only`), and its accounts
+  can be switched to local accounts with the same password, one by one or all
+  at once (`POST /admin/users/{id}/convert-to-local`,
+  `POST /admin/realms/{id}/convert-to-local`), so the upstream can be retired
+  without asking every user for a new password.
+
 ### Fixed
 
 - A database failure while checking a browser session or its CSRF token

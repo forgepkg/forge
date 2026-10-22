@@ -41,6 +41,7 @@ fn upstream_identity(username: &str, admin: bool, auto_provision: bool) -> Prove
         admin_authoritative: false,
         auto_provision,
         realm_id: None,
+        captured_password_hash: None,
     }
 }
 
