@@ -31,7 +31,15 @@
 //! `min_free_bytes` (default 5 % of its size): it evicts instead, so a disk
 //! shared with something else never fills up. [`BlobCache::maintain`]
 //! re-reads the filesystem, so a resized volume is picked up without a
-//! restart.
+//! restart; in between, fills go by what it read, less what the cache
+//! itself added since, so no request waits for `statvfs`.
+//!
+//! ## Locking
+//!
+//! One mutex guards the index and is held for bookkeeping only: an eviction
+//! drops entries under it and removes their files after releasing it, on
+//! the blocking pool, so a hit never waits for an unlink. Until its old
+//! file is gone, a key is neither filled nor written through again.
 //!
 //! ## Robustness
 //!
@@ -40,7 +48,7 @@
 //! are checked against their hash on their first hit, so a file damaged
 //! while the process was down is detected and fetched again.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -226,6 +234,13 @@ struct Index {
     reserved: u64,
     /// Fills in progress, joined by concurrent misses of the same blob.
     fills: HashMap<Key, Arc<watch::Sender<FillState>>>,
+    /// Keys whose entries are gone and whose files are being removed,
+    /// outside the lock: no fill or write-through of them starts, and none
+    /// commits, until the old file is gone.
+    unlinking: HashSet<Key>,
+    /// The filesystem as maintenance last read it, with the cache's bytes
+    /// at that moment.
+    space: Option<(FsSpace, u64)>,
     /// The limit last computed.
     limit: u64,
 }
@@ -476,14 +491,22 @@ impl BlobCache {
         }
     }
 
-    /// The limit for `space` (the last one when the filesystem is unknown).
-    fn limit(&self, index: &Index, space: Option<FsSpace>) -> u64 {
-        match (space, self.inner.max_bytes) {
-            (Some(space), max) => effective_limit(
+    /// The limit, from the filesystem as maintenance last read it (the last
+    /// limit when the filesystem is unknown). What the cache itself filled
+    /// or evicted since came out of, or went back to, the free space then.
+    fn limit(&self, index: &Index) -> u64 {
+        match (index.space, self.inner.max_bytes) {
+            (Some((space, bytes_then)), max) => effective_limit(
                 max,
                 self.inner.min_free_bytes,
                 self.inner.staging_reserve,
-                space,
+                FsSpace {
+                    total: space.total,
+                    available: space
+                        .available
+                        .saturating_add(bytes_then)
+                        .saturating_sub(index.bytes),
+                },
                 index.bytes,
             ),
             (None, CacheLimit::Bytes(bytes)) => bytes,
@@ -491,8 +514,9 @@ impl BlobCache {
         }
     }
 
-    /// Remove `key`'s file; the caller holds the lock and has dropped the
-    /// entry, so no lookup reaches the file while it goes.
+    /// Remove `key`'s file. Its entry is gone and the key is in
+    /// `unlinking`, so no lookup reaches the file and no fill replaces it
+    /// while it goes. Blocking.
     fn unlink(&self, key: &Key) {
         let path = self.path_of(key);
         if let Err(error) = std::fs::remove_file(&path) {
@@ -502,13 +526,58 @@ impl BlobCache {
         }
     }
 
-    /// Evict the oldest entries until `needed` more bytes fit under `limit`.
-    fn make_room(&self, index: &mut Index, limit: u64, needed: u64) -> bool {
+    /// Forget `key`'s entry (only the one at `seq`, when given) and mark its
+    /// file for removal: the caller removes it ([`Self::remove_files`])
+    /// after releasing the lock.
+    fn drop_entry(&self, index: &mut Index, key: &Key, seq: Option<u64>) -> Option<Entry> {
+        let entry = index.forget(key, seq)?;
+        index.unlinking.insert(*key);
+        Some(entry)
+    }
+
+    /// Remove the files of dropped entries (blocking), then let their keys
+    /// be filled again.
+    fn remove_files(&self, victims: Vec<Key>) {
+        if victims.is_empty() {
+            return;
+        }
+        for key in &victims {
+            self.unlink(key);
+        }
+        let mut index = self.lock();
+        for key in &victims {
+            index.unlinking.remove(key);
+        }
+    }
+
+    /// [`Self::remove_files`] on the blocking pool, so no runtime worker
+    /// waits for the filesystem (inline without a runtime).
+    fn remove_files_later(&self, victims: Vec<Key>) {
+        if victims.is_empty() {
+            return;
+        }
+        let cache = self.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || cache.remove_files(victims))),
+            Err(_) => cache.remove_files(victims),
+        }
+    }
+
+    /// Evict the oldest entries until `needed` more bytes fit under `limit`,
+    /// adding them to `victims` (their files go after the lock is released).
+    fn make_room(
+        &self,
+        index: &mut Index,
+        limit: u64,
+        needed: u64,
+        victims: &mut Vec<Key>,
+    ) -> bool {
         while index.bytes + index.reserved + needed > limit {
             let Some((key, entry)) = index.pop_oldest() else {
                 return false;
             };
-            self.unlink(&key);
+            index.unlinking.insert(key);
+            victims.push(key);
             self.inner
                 .counters
                 .evictions
@@ -522,15 +591,21 @@ impl BlobCache {
     }
 
     /// Re-read the filesystem, evict down to the limit, and report. Run it
-    /// periodically (blocking: it removes files).
+    /// periodically (blocking: it reads the filesystem and removes files);
+    /// between runs, fills go by the filesystem as it read it.
     pub fn maintain(&self) -> BlobCacheStats {
         let space = self.probe();
+        let mut victims = Vec::new();
         {
             let mut index = self.lock();
-            let limit = self.limit(&index, space);
+            if let Some(space) = space {
+                index.space = Some((space, index.bytes));
+            }
+            let limit = self.limit(&index);
             index.limit = limit;
-            self.make_room(&mut index, limit, 0);
+            self.make_room(&mut index, limit, 0, &mut victims);
         }
+        self.remove_files(victims);
         self.stats()
     }
 
@@ -572,20 +647,29 @@ impl BlobCache {
         parse_key(sha256).is_some_and(|key| self.lock().entries.contains_key(&key))
     }
 
-    /// Drop `sha256` from the cache (its object was deleted from S3).
-    pub fn evict(&self, sha256: &str) {
+    /// Drop `sha256` from the cache (its object was deleted from S3, or its
+    /// file failed a read), removing its file on the blocking pool.
+    pub async fn evict(&self, sha256: &str) {
         let Some(key) = parse_key(sha256) else { return };
-        let mut index = self.lock();
-        if let Some(entry) = index.forget(&key, None) {
-            self.unlink(&key);
-            self.inner
-                .counters
-                .evictions
-                .fetch_add(1, Ordering::Relaxed);
-            self.inner
-                .counters
-                .evicted_bytes
-                .fetch_add(entry.size, Ordering::Relaxed);
+        let Some(entry) = self.drop_entry(&mut self.lock(), &key, None) else {
+            return;
+        };
+        self.inner
+            .counters
+            .evictions
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .evicted_bytes
+            .fetch_add(entry.size, Ordering::Relaxed);
+        self.remove_files_now(vec![key]).await;
+    }
+
+    /// [`Self::remove_files`] on the blocking pool, waiting for it.
+    async fn remove_files_now(&self, victims: Vec<Key>) {
+        let cache = self.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || cache.remove_files(victims)).await {
+            tracing::warn!(%error, "removing blob cache files failed");
         }
     }
 
@@ -641,9 +725,10 @@ impl BlobCache {
             Err(error) => format!("check failed: {error}"),
         };
         tracing::warn!(sha256, problem = %problem, "dropping a damaged blob cache entry; reading it from S3");
-        let mut index = self.lock();
-        if index.forget(&key, Some(entry.seq)).is_some() {
-            self.unlink(&key);
+        let dropped = self.drop_entry(&mut self.lock(), &key, Some(entry.seq));
+        if dropped.is_some() {
+            // Gone before the caller fills it again.
+            self.remove_files_now(vec![key]).await;
         }
         None
     }
@@ -674,38 +759,48 @@ impl BlobCache {
     /// `size` bytes reserved. [`Begin::Bypass`] when it cannot be cached
     /// (no room, not a SHA-256); [`Begin::Cached`] when it was filled
     /// meanwhile (look it up again).
+    /// Its evictions remove their files on the blocking pool.
     pub(crate) fn begin_fill(&self, sha256: &str, size: u64) -> Begin {
         let Some(key) = parse_key(sha256) else {
             return Begin::Bypass;
         };
-        let space = self.probe();
-        let mut index = self.lock();
-        if index.entries.contains_key(&key) {
-            return Begin::Cached;
-        }
-        if let Some(fill) = index.fills.get(&key) {
-            return Begin::Join(fill.subscribe());
-        }
-        if !self.reserve(&mut index, space, size) {
-            return Begin::Bypass;
-        }
-        let state = Arc::new(watch::Sender::new(FillState::Starting));
-        index.fills.insert(key, state.clone());
-        Begin::Lead(FillSlot {
-            cache: self.clone(),
-            key,
-            size,
-            state,
-            finished: false,
-        })
+        let mut victims = Vec::new();
+        let begin = {
+            let mut index = self.lock();
+            if index.entries.contains_key(&key) {
+                return Begin::Cached;
+            }
+            if let Some(fill) = index.fills.get(&key) {
+                return Begin::Join(fill.subscribe());
+            }
+            if !self.reserve(&mut index, &key, size, &mut victims) {
+                Begin::Bypass
+            } else {
+                let state = Arc::new(watch::Sender::new(FillState::Starting));
+                index.fills.insert(key, state.clone());
+                Begin::Lead(FillSlot {
+                    cache: self.clone(),
+                    key,
+                    size,
+                    state,
+                    finished: false,
+                })
+            }
+        };
+        self.remove_files_later(victims);
+        begin
     }
 
-    /// Reserve `size` bytes, evicting as needed (counted as bypassed when
-    /// they cannot fit).
-    fn reserve(&self, index: &mut Index, space: Option<FsSpace>, size: u64) -> bool {
-        let limit = self.limit(index, space);
+    /// Reserve `size` bytes for `key`, evicting as needed into `victims`
+    /// (counted as bypassed when they cannot fit, or while `key`'s old file
+    /// is still being removed).
+    fn reserve(&self, index: &mut Index, key: &Key, size: u64, victims: &mut Vec<Key>) -> bool {
+        let limit = self.limit(index);
         index.limit = limit;
-        if size > limit || !self.make_room(index, limit, size) {
+        if index.unlinking.contains(key)
+            || size > limit
+            || !self.make_room(index, limit, size, victims)
+        {
             self.inner.counters.bypassed.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -734,7 +829,9 @@ impl BlobCache {
         let mut index = self.lock();
         self.release(&mut index, size);
         prepared?;
-        if index.entries.contains_key(&key) {
+        // Cached meanwhile, or an evicted copy's file is still going (which
+        // would take this one with it).
+        if index.entries.contains_key(&key) || index.unlinking.contains(&key) {
             return Ok(());
         }
         temp.persist(&target).map_err(|e| e.error)?;
@@ -750,15 +847,17 @@ impl BlobCache {
     /// caller may remove `staged` at once. Fails open: errors are logged.
     pub async fn insert_staged(&self, sha256: &str, size: u64, staged: &Path) {
         let Some(key) = parse_key(sha256) else { return };
-        let space = self.probe();
-        {
+        let mut victims = Vec::new();
+        let reserved = {
             let mut index = self.lock();
             if index.entries.contains_key(&key) || index.fills.contains_key(&key) {
                 return;
             }
-            if !self.reserve(&mut index, space, size) {
-                return;
-            }
+            self.reserve(&mut index, &key, size, &mut victims)
+        };
+        self.remove_files_later(victims);
+        if !reserved {
+            return;
         }
         let reservation = Reservation {
             cache: self.clone(),

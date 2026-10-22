@@ -250,7 +250,7 @@ impl Reader {
                         Err(error) => {
                             tracing::warn!(sha256 = %self.sha256, %error, "blob cache: reading a cached file failed; dropping it and continuing from S3");
                             if let Some(cache) = self.store.cache() {
-                                cache.evict(&self.sha256);
+                                cache.evict(&self.sha256).await;
                             }
                             if let Err(error) = self.fallback().await {
                                 return Some(Err(error));
