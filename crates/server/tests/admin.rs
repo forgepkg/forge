@@ -3274,3 +3274,46 @@ async fn deleting_a_proxy_waits_for_an_in_flight_download_instead_of_deadlocking
 
     assert_eq!(delete.await.unwrap(), 204);
 }
+
+/// Each instance has a blob cache of its own: `GET /admin/blob-cache` names
+/// the instance its numbers come from, with or without a cache.
+#[tokio::test]
+async fn blob_cache_statistics_name_their_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_cache = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            plugins_block: Some(format!(
+                "[blob_cache]\npath = {:?}\n",
+                dir.path().join("cache").display().to_string()
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let without_cache = common::start().await;
+    for (srv, enabled) in [(&with_cache, true), (&without_cache, false)] {
+        let (u, p) = srv.admin_basic();
+        let stats: Value = srv
+            .client()
+            .get(format!("{}/admin/blob-cache", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["enabled"], enabled, "{stats}");
+        let instance = &stats["instance"];
+        assert_eq!(instance["host"], json!(srv.state.instance.host), "{stats}");
+        let started: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(instance["started_at"].clone()).expect("a start time");
+        assert_eq!(started, srv.state.instance.started_at, "{stats}");
+    }
+    assert!(
+        with_cache.state.instance.host.is_some(),
+        "this host has a name (HOSTNAME or the kernel's)"
+    );
+}

@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::state::Instance;
 
 /// How often the cache re-reads its filesystem and evicts down to its limit.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -170,14 +171,16 @@ fn log_stats(stats: &BlobCacheStats) {
     );
 }
 
-/// The cache's statistics as JSON (`GET /admin/blob-cache`).
-pub fn stats_json(store: &BlobStore) -> Value {
+/// The cache's statistics as JSON (`GET /admin/blob-cache`). Every instance
+/// has a cache of its own: `instance` names the one they are from.
+pub fn stats_json(store: &BlobStore, instance: &Instance) -> Value {
     let Some(cache) = store.cache() else {
-        return json!({ "enabled": false });
+        return json!({ "enabled": false, "instance": instance });
     };
     let s = cache.stats();
     json!({
         "enabled": true,
+        "instance": instance,
         "path": s.path.display().to_string(),
         "object_store_down": store.is_unavailable(),
         "entries": s.entries,

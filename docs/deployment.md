@@ -653,6 +653,12 @@ fills a killed process left are removed at startup.
 effective limit (and whether it is `auto`), the hit ratio, bytes served from
 the cache, fills, fill failures, evictions and hits served while S3 was down.
 The same numbers are logged every ten minutes (`local blob cache`).
+Each instance has a cache of its own, so the numbers are those of the
+instance that answered the request: `instance` names it by its host name
+(`HOSTNAME`, the pod's name on Kubernetes) and start time. Behind a load
+balancer, consecutive requests may be answered by different replicas; to see
+one replica's numbers, ask it directly (its pod IP, or `kubectl
+port-forward pod/<name>`), or read its log.
 
 **On Kubernetes** (see [deploy/kubernetes](../deploy/kubernetes/README.md#local-blob-cache)):
 
