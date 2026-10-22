@@ -95,9 +95,6 @@ async fn main() -> anyhow::Result<()> {
         None => Cache::l1_only(config.cache.l1_max_capacity),
     };
 
-    // An account from before 1.1.0 may hold a name reserved since.
-    forge_server::app::warn_on_reserved_accounts(&pool).await;
-
     // Bootstrap admin (logs a warning while the seeded password is in use).
     ensure_bootstrap_admin(&config, &pool)
         .await

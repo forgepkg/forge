@@ -10,6 +10,14 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Startup no longer looks for an account named `oidc`, a name 1.0.0
+  allowed and 1.1.0 reserves for workload identity, and no longer warns
+  about one. Upgrading from 1.0.0, follow the 1.1.0 upgrade note on `oidc`
+  accounts: such an account can no longer sign in with its password.
+  ([#257](https://github.com/schmitch/forge/issues/257))
+
 ### Fixed
 
 - A database failure while checking a browser session or its CSRF token

@@ -2227,9 +2227,7 @@ impl Config {
             forge_core::auth::canonical_account_username(&ba.username, true).map_err(|e| {
                 ConfigError::Invalid(match e {
                     forge_core::auth::InvalidUsername::Reserved => format!(
-                        "auth.bootstrap_admin.username: {:?} is reserved for workload identity \
-                         since 1.1.0; rename the account and this setting (see the 1.1.0 \
-                         upgrade notes)",
+                        "auth.bootstrap_admin.username: {:?} is reserved for workload identity",
                         ba.username.trim()
                     ),
                     e => format!("auth.bootstrap_admin.username: {e}"),
@@ -4287,8 +4285,8 @@ mod tests {
         );
     }
 
-    /// A 1.0.0 bootstrap admin named `oidc` (reserved since, #199): the error
-    /// says why and where to look.
+    /// A bootstrap admin named `oidc`, in any case and padding: the error
+    /// says the name is reserved.
     #[test]
     fn bootstrap_admin_with_a_reserved_name_refused() {
         let toml = MINIMAL.replace(
@@ -4299,8 +4297,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("\"oidc\" is reserved for workload identity since 1.1.0")
-                && err.contains("upgrade notes"),
+            err.contains("\"oidc\" is reserved for workload identity"),
             "{err}"
         );
     }
