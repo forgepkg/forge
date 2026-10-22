@@ -17,4 +17,4 @@ component = ["dep:wit-bindgen"]
 testing = []
 
 [dependencies]
-wit-bindgen = { version = "0.61", optional = true, default-features = false, features = ["macros", "realloc", "std"] }
+wit-bindgen = { version = "0.63", optional = true, default-features = false, features = ["macros", "realloc", "std"] }
