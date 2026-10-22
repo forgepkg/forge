@@ -123,6 +123,39 @@ pub struct ProvenIdentity {
     /// from a realm row (12.7). Recorded as `app_user.realm_id` provenance on
     /// provision; `None` for the built-in/static wiring.
     pub realm_id: Option<i64>,
+    /// An argon2id hash of the presented password, set only when the vouching
+    /// realm keeps password hashes (`capture_password_hash`, migration 0035)
+    /// and this login asked the upstream, which accepted it (a cache hit
+    /// carries none). Provisioning keeps it on the account
+    /// ([`super::chain::provision_and_map`]). Always `None` for local.
+    pub captured_password_hash: Option<CapturedPasswordHash>,
+}
+
+/// The argon2id PHC hash of a password an upstream just accepted, to be kept
+/// on the account so an administrator can later switch it to a local one.
+///
+/// `Debug` is redacted like [`PasswordCredential`]'s: a leaked hash can be
+/// attacked offline, so it must never reach a log through a `{:?}` of the
+/// identity carrying it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CapturedPasswordHash(String);
+
+impl CapturedPasswordHash {
+    /// Wrap an argon2id PHC string.
+    pub fn new(phc: String) -> Self {
+        Self(phc)
+    }
+
+    /// The PHC string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapturedPasswordHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CapturedPasswordHash([REDACTED])")
+    }
 }
 
 impl ProvenIdentity {
@@ -137,6 +170,7 @@ impl ProvenIdentity {
             admin_authoritative: false,
             auto_provision: false,
             realm_id: None,
+            captured_password_hash: None,
         }
     }
 }
@@ -208,6 +242,21 @@ mod tests {
         assert!(!id.admin_authoritative);
         assert!(!id.auto_provision);
         assert!(id.realm_id.is_none());
+        assert!(id.captured_password_hash.is_none());
+    }
+
+    #[test]
+    fn captured_password_hash_debug_redacts() {
+        let hash = CapturedPasswordHash::new("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into());
+        let id = ProvenIdentity {
+            captured_password_hash: Some(hash.clone()),
+            ..ProvenIdentity::local("alice")
+        };
+        for rendered in [format!("{hash:?}"), format!("{id:?}")] {
+            assert!(!rendered.contains("argon2id"), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+        assert!(hash.as_str().starts_with("$argon2id$"));
     }
 
     #[test]
