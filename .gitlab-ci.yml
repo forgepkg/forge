@@ -425,9 +425,10 @@ e2e:
     - docker pull mirror.gcr.io/versity/versitygw:v1.9.0
     - docker pull mirror.gcr.io/library/redis:5.0
   script:
-    - rustup target add wasm32-wasip2
-    # Per-test timings, as in the test job.
-    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace --features forge-e2e
+    # The forge-e2e crate alone (as `cargo xtask e2e`): the test job of the
+    # same pipeline runs the rest of the workspace (#341). Per-test timings,
+    # as in the test job.
+    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test -p forge-e2e --features forge-e2e
   after_script:
     - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
     # Keep the test binaries out of the cache (archived after after_script):

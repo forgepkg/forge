@@ -506,9 +506,6 @@ jobs:
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
-        with:
-          # The format-plugin tests build plugins/ as WebAssembly components.
-          targets: wasm32-wasip2
       - name: Install .NET SDK (for the optional dotnet smoke test)
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -532,11 +529,13 @@ jobs:
 
       - name: Run e2e tests (forge-e2e feature)
         id: tests
+        # The forge-e2e crate alone (as `cargo xtask e2e`): the test job of
+        # the same merge group or push runs the rest of the workspace (#341).
         # Per-test timings for the job summary, as in the test job.
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
           FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
-        run: cargo test --workspace --features forge-e2e
+        run: cargo test -p forge-e2e --features forge-e2e
       - name: Test timings (job summary)
         if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         continue-on-error: true
