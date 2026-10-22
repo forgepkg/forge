@@ -23,6 +23,7 @@ The release workflow publishes the section whose heading matches the tag
   each new key published two days before it signs. The realm shows the
   issuer, subject (`<client id>@<realm issuer>`) and audience to register.
   See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
+  ([#302](https://github.com/schmitch/forge/pull/302))
 
 ### Fixed
 
