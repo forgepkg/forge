@@ -361,11 +361,15 @@ impl Registry {
                 Some(bytes) => bytes,
                 None => self.read_manifest_bytes(hit.blob()).await?,
             };
-            if let Err(e) = oci_dao::touch_manifest(&self.inner.pool, hit.manifest_id).await {
-                tracing::warn!(error = %e, "registry: recording a manifest pull failed");
-            }
             Response::new(Body::from(bytes))
         };
+        // A HEAD is a pull too: containerd (Kubernetes, nerdctl, BuildKit)
+        // resolves a tag with a HEAD and fetches nothing more while it holds
+        // the digest, and `tag_not_pulled_for_days` must not delete such a
+        // tag. Throttled to one write an hour per manifest.
+        if let Err(e) = oci_dao::touch_manifest(&self.inner.pool, hit.manifest_id).await {
+            tracing::warn!(error = %e, "registry: recording a manifest pull failed");
+        }
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_TYPE, header_value(&hit.media_type));
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(hit.size));

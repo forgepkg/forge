@@ -216,6 +216,14 @@ impl Oci {
             .unwrap()
     }
 
+    async fn head(&self, name: &str, path: &str) -> reqwest::Response {
+        self.request(Method::HEAD, &format!("/v2/{name}/{path}"), "pull", name)
+            .await
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn delete(&self, name: &str, path: &str) -> reqwest::Response {
         self.request(
             Method::DELETE,
@@ -2020,6 +2028,72 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     .await
     .unwrap();
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
+}
+
+/// A tag that clients only resolve with a HEAD, as containerd does while it
+/// holds the digest, counts as pulled for `tag_not_pulled_for_days` (#197).
+#[tokio::test]
+async fn a_manifest_head_counts_as_a_pull_for_retention() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    for tag in ["resolved", "idle"] {
+        oci.push_image(&name, tag, "amd64", format!("layer {tag}").as_bytes())
+            .await;
+    }
+    // Both pushed and last pulled long ago.
+    sqlx::query(
+        "UPDATE oci_tag SET updated_at = now() - interval '60 days' WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE oci_manifest SET last_pulled_at = now() - interval '60 days' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = oci.head(&name, "manifests/resolved").await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().contains_key("docker-content-digest"));
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": {"version": 1, "rules": [
+            {"id": "stale", "tag_not_pulled_for_days": 30}
+        ]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let preview: Value = admin_post(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention/preview"),
+        json!({}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let tags: Vec<&str> = preview["image_decisions"]["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["tag"].as_str().unwrap())
+        .collect();
+    assert_eq!(tags, vec!["idle"], "{preview}");
 }
 
 #[tokio::test]
