@@ -10,6 +10,58 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Fixed
+
+- A database failure while checking a browser session or its CSRF token
+  answered 500; it answers 503 with `Retry-After`, like the token and
+  password checks, which now send `Retry-After` too.
+  ([#205](https://github.com/schmitch/forge/issues/205))
+- Trusted publishing: a workload token answered 401 "invalid credentials"
+  while its issuer's discovery document or keys could not be fetched and
+  were not cached yet (after a restart, on a new replica, at the hourly key
+  refresh), so CI jobs failed instead of retrying. It answers 503 with
+  `Retry-After`, at the token exchange too.
+  ([#202](https://github.com/schmitch/forge/issues/202))
+- Trusted publishing: after a realm edit, the other instances refused the
+  workload keys the editing instance issued under the new configuration
+  for up to `auth.realm_cache_ttl_seconds`, and could refuse an exchange
+  with 401 "realm changed during the exchange". An instance now reloads
+  the realms when a key names a configuration it does not have yet.
+  ([#203](https://github.com/schmitch/forge/issues/203))
+- Trusted publishing: an instance whose clock ran behind the database's
+  could exchange a CI token a second time just after the record of its
+  first exchange was cleaned up. Whether a token has expired is decided on
+  the database's clock, and the record is kept 15 minutes past the token's
+  expiry. ([#204](https://github.com/schmitch/forge/issues/204))
+- Docker registry: a registry token got with a workload key
+  (`docker login -u oidc`) worked again once the key's record was cleaned
+  up, and one got with a CI token directly stopped working when a key
+  exchanged from that CI token ended. A registry token stands and falls
+  with the credential it was got with, and expires no later than it.
+  Registry tokens issued before the upgrade are refused once, and clients
+  ask for a new one. ([#201](https://github.com/schmitch/forge/issues/201))
+- S3 `default_chain` credentials: an STS or container credentials endpoint
+  that could not be reached counted as a refusal, so requests answered 500
+  instead of 503, and with the blob cache an instance restarted during the
+  outage failed to start instead of starting degraded.
+  ([#208](https://github.com/schmitch/forge/issues/208))
+- Blob cache: making room deleted the evicted files while every cache hit
+  on the instance waited, on the threads that serve requests, and each
+  miss read the disk's free space. Evicted files are deleted in the
+  background, and the free space is read once a minute.
+  ([#212](https://github.com/schmitch/forge/issues/212))
+- Blob cache: after a restart, concurrent downloads of a cached blob each
+  read and hashed the whole file before serving it; each file is checked
+  once. ([#210](https://github.com/schmitch/forge/issues/210))
+- Blob cache: a blob garbage collection deleted stayed in the other
+  instances' caches until it was evicted. Every instance drops such blobs
+  at startup and every 10 minutes.
+  ([#211](https://github.com/schmitch/forge/issues/211))
+- Docker registry: while S3 was unavailable, uncached pulls, pushes and the
+  finish of a chunked upload answered 500 instead of 503 with
+  `Retry-After`, and an upload whose body the client aborted answered 500
+  instead of 400. ([#209](https://github.com/schmitch/forge/issues/209))
+
 ## [1.1.0]
 
 The Docker / OCI registry, format plugins (Helm built in, NuGet ported to
@@ -282,16 +334,6 @@ otherwise.
   ([#121](https://github.com/schmitch/forge/issues/121))
 - `PUT /admin/realms/order` answered 500 when it raced another realm
   change; it answers 409. ([#117](https://github.com/schmitch/forge/issues/117))
-- A database failure while checking a browser session or its CSRF token
-  answered 500; it answers 503 with `Retry-After`, like the token and
-  password checks, which now send `Retry-After` too.
-  ([#205](https://github.com/schmitch/forge/issues/205))
-- Trusted publishing: a workload token answered 401 "invalid credentials"
-  while its issuer's discovery document or keys could not be fetched and
-  were not cached yet (after a restart, on a new replica, at the hourly key
-  refresh), so CI jobs failed instead of retrying. It answers 503 with
-  `Retry-After`, at the token exchange too.
-  ([#202](https://github.com/schmitch/forge/issues/202))
 - The browse API served offline hosted and group repositories; it answers
   503 like the feed, and the web UI says the repository is offline.
   ([#120](https://github.com/schmitch/forge/issues/120))
