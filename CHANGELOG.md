@@ -6,24 +6,14 @@ All notable changes to envisia-forge are documented here. The format follows
 major release, and each one is called out under **Upgrade notes**.
 
 The release workflow publishes the section whose heading matches the tag
-(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes.
+(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes. Entries for changes
+not released yet are fragments under [docs/changes/](docs/changes/README.md)
+until the release folds them in.
 
 ## [Unreleased]
 
 ### Upgrade notes
 
-- Startup no longer looks for an account named `oidc`, a name 1.0.0
-  allowed and 1.1.0 reserves for workload identity, and no longer warns
-  about one. Upgrading from 1.0.0, follow the 1.1.0 upgrade note on `oidc`
-  accounts: such an account can no longer sign in with its password.
-  ([#257](https://github.com/schmitch/forge/issues/257))
-- `server.max_upload_bytes` (`FORGE_SERVER__MAX_UPLOAD_BYTES`), deprecated
-  in 1.1.0, is removed, and startup refuses a config that still sets it.
-  Before upgrading, give every package repository that relied on it a limit
-  of its own (*Maximum upload size* in the web UI, `max_upload_bytes` in the
-  admin API), then remove the setting. A package repository without a limit
-  of its own accepts pushes of 512 MiB.
-  ([#259](https://github.com/schmitch/forge/issues/259))
 - Migration 0036 adds the `nexus_import` and `nexus_import_item` tables for
   imports from Nexus; it changes no existing data.
   ([#183](https://github.com/schmitch/forge/issues/183))
