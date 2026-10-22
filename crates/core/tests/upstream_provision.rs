@@ -6,7 +6,8 @@
 //!   * first upstream success provisions an `app_user` with
 //!     `auth_source = 'upstream-basic'`, NULL `password_hash`, active;
 //!   * a second login reuses the row (no duplicate, idempotent);
-//!   * an admin-group suggestion grants admin on provision;
+//!   * an authoritative admin-group reading grants the `admin` role on
+//!     provision;
 //!   * a provisioned admin is not downgraded by a non-authoritative login, but
 //!     is when the realm's admin mapping authoritatively says so;
 //!   * an existing LOCAL user is never clobbered NOR mapped (the upstream login
@@ -27,6 +28,13 @@ use common::{pool, unique};
 
 fn unique_user(prefix: &str) -> String {
     format!("{prefix}-{}", unique())
+}
+
+/// Whether the user holds the built-in `admin` role.
+async fn is_admin(pool: &sqlx::PgPool, user_id: i64) -> bool {
+    forge_db::authz_dao::user_has_role(pool, user_id, "admin")
+        .await
+        .unwrap()
 }
 
 /// An upstream-vouched identity whose provider allows auto-provisioning
@@ -60,7 +68,7 @@ async fn first_success_provisions_passwordless_upstream_user() {
         .await
         .unwrap()
         .expect("provisioned principal");
-    assert!(!principal.is_admin);
+    assert!(!is_admin(&pool, principal.user_id).await);
     assert!(principal.token_id.is_none());
 
     let user = user_dao::find_user_by_username(&pool, &username)
@@ -101,11 +109,13 @@ async fn admin_group_grants_admin_on_provision() {
     let pool = pool().await;
     let username = unique_user("prov-admin");
 
-    let principal = provision_and_map(&pool, &upstream_identity(&username, true, true))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(principal.is_admin, "suggested_is_admin grants admin");
+    let mut grant = upstream_identity(&username, true, true);
+    grant.admin_authoritative = true;
+    let principal = provision_and_map(&pool, &grant).await.unwrap().unwrap();
+    assert!(
+        is_admin(&pool, principal.user_id).await,
+        "the admin group grants the admin role"
+    );
 
     // A subsequent NON-authoritative login (cache hit / no mapping) must NOT
     // touch the granted admin.
@@ -113,27 +123,38 @@ async fn admin_group_grants_admin_on_provision() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(principal2.user_id, principal.user_id);
     assert!(
-        principal2.is_admin,
+        is_admin(&pool, principal.user_id).await,
         "non-authoritative login leaves admin alone"
     );
 
-    // An authoritative login without the admin group demotes (column + role).
+    // An authoritative login without the admin group demotes.
     let mut demote = upstream_identity(&username, false, true);
     demote.admin_authoritative = true;
     let principal3 = provision_and_map(&pool, &demote).await.unwrap().unwrap();
-    assert!(!principal3.is_admin, "upstream revocation tracked");
     assert!(
-        !forge_db::authz_dao::user_has_role(&pool, principal3.user_id, "admin")
-            .await
-            .unwrap(),
+        !is_admin(&pool, principal3.user_id).await,
         "admin role removed on authoritative demotion"
     );
 }
 
+/// Without an authoritative reading, provisioning grants nothing, whatever
+/// the suggestion says.
+#[tokio::test]
+async fn a_non_authoritative_suggestion_grants_no_admin() {
+    let pool = pool().await;
+    let username = unique_user("prov-suggest");
+    let principal = provision_and_map(&pool, &upstream_identity(&username, true, true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!is_admin(&pool, principal.user_id).await);
+}
+
 /// A realm switched to `auto_provision = false` still applies the upstream's
-/// authoritative admin verdict to an existing account: the demotion clears
-/// the column and the role and ends the sessions opened as an admin.
+/// authoritative admin verdict to an existing account: the demotion removes
+/// the `admin` role and ends the sessions opened as an admin.
 #[tokio::test]
 async fn demotion_applies_without_auto_provision() {
     let pool = pool().await;
@@ -142,7 +163,7 @@ async fn demotion_applies_without_auto_provision() {
     let mut grant = upstream_identity(&username, true, true);
     grant.admin_authoritative = true;
     let admin = provision_and_map(&pool, &grant).await.unwrap().unwrap();
-    assert!(admin.is_admin);
+    assert!(is_admin(&pool, admin.user_id).await);
     let now = chrono::Utc::now();
     let session = forge_db::session_dao::create(
         &pool,
@@ -165,17 +186,9 @@ async fn demotion_applies_without_auto_provision() {
     demote.admin_authoritative = true;
     let demoted = provision_and_map(&pool, &demote).await.unwrap().unwrap();
     assert_eq!(demoted.user_id, admin.user_id);
-    assert!(!demoted.is_admin, "authoritative demotion tracked");
-    let user = user_dao::find_user_by_id(&pool, admin.user_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!user.is_admin, "is_admin column cleared");
     assert!(
-        !forge_db::authz_dao::user_has_role(&pool, admin.user_id, "admin")
-            .await
-            .unwrap(),
-        "admin role removed"
+        !is_admin(&pool, admin.user_id).await,
+        "authoritative demotion removes the admin role"
     );
     assert!(
         forge_db::session_dao::find_valid_by_hash(&pool, &session.token_hash)
@@ -187,25 +200,15 @@ async fn demotion_applies_without_auto_provision() {
 
     // A non-authoritative login (no group reading) changes nothing, and an
     // authoritative one re-grants.
-    let plain = provision_and_map(&pool, &upstream_identity(&username, true, false))
+    provision_and_map(&pool, &upstream_identity(&username, true, false))
         .await
         .unwrap()
         .unwrap();
-    assert!(!plain.is_admin);
+    assert!(!is_admin(&pool, admin.user_id).await);
     let mut regrant = upstream_identity(&username, true, false);
     regrant.admin_authoritative = true;
-    assert!(
-        provision_and_map(&pool, &regrant)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_admin
-    );
-    assert!(
-        forge_db::authz_dao::user_has_role(&pool, admin.user_id, "admin")
-            .await
-            .unwrap()
-    );
+    provision_and_map(&pool, &regrant).await.unwrap().unwrap();
+    assert!(is_admin(&pool, admin.user_id).await);
 }
 
 #[tokio::test]
@@ -214,12 +217,15 @@ async fn existing_local_user_is_not_clobbered_or_mapped() {
     let username = unique_user("prov-local");
 
     // A pre-existing LOCAL admin (with a password hash).
-    user_dao::insert_user(
+    let local = user_dao::insert_user(
         &pool,
-        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), true, true),
+        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), true),
     )
     .await
     .unwrap();
+    forge_db::authz_dao::sync_admin_role(&pool, local.id, true)
+        .await
+        .unwrap();
 
     // An upstream login with the same username must be DENIED (never mapped
     // onto the local account), with or without auto-provisioning, and must not
@@ -240,7 +246,7 @@ async fn existing_local_user_is_not_clobbered_or_mapped() {
         .unwrap()
         .unwrap();
     assert_eq!(user.auth_source, "local", "local provenance preserved");
-    assert!(user.is_admin, "local admin flag untouched");
+    assert!(is_admin(&pool, user.id).await, "local admin untouched");
     assert!(
         user.password_hash.is_some(),
         "local password preserved, not nulled by upstream login"
@@ -357,11 +363,10 @@ async fn users_of_a_deleted_realm_are_never_adopted_by_another_realm() {
             .is_none()
     );
 
-    let user = user_dao::find_user_by_id(&pool, original.user_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!user.is_admin, "the orphan was not touched");
+    assert!(
+        !is_admin(&pool, original.user_id).await,
+        "the orphan was not touched"
+    );
 }
 
 #[tokio::test]
@@ -394,7 +399,6 @@ async fn deactivated_user_resolves_to_none() {
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: false,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(username.clone()),

@@ -30,13 +30,10 @@ async fn make_role(pool: &sqlx::PgPool, n: u64) -> i64 {
 }
 
 async fn make_user(pool: &sqlx::PgPool, n: u64) -> i64 {
-    user_dao::insert_user(
-        pool,
-        NewUser::local(format!("user-{n}"), "x".into(), false, true),
-    )
-    .await
-    .expect("insert user")
-    .id
+    user_dao::insert_user(pool, NewUser::local(format!("user-{n}"), "x".into(), true))
+        .await
+        .expect("insert user")
+        .id
 }
 
 async fn make_repo(pool: &sqlx::PgPool, n: u64) -> i64 {

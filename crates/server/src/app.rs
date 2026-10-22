@@ -372,9 +372,12 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     .context("hashing task")?
     .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?;
 
+    // The account and its `admin` role in one transaction: an account left
+    // without the role would not be an administrator.
+    let mut tx = pool.begin().await.context("begin bootstrap admin")?;
     let user = match user_dao::insert_user(
-        pool,
-        NewUser::local(ba.username.clone(), password_hash, true, true),
+        &mut *tx,
+        NewUser::local(ba.username.clone(), password_hash, true),
     )
     .await
     {
@@ -382,6 +385,7 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         // A peer instance booting concurrently created it first: adopt that
         // account (it does the role grant) and make sure the marker exists.
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            drop(tx);
             let existing = user_dao::find_user_by_username(pool, &ba.username)
                 .await
                 .context("bootstrap admin lookup")?
@@ -392,17 +396,14 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         Err(e) => return Err(anyhow::Error::new(e).context("insert bootstrap admin")),
     };
 
-    // §12.4 Phase 5: the bootstrap admin is granted the built-in `admin` role,
-    // not just the slice-1 `is_admin` flag, so it is an admin under fine-grained
-    // RBAC even after the `is_admin` column is eventually dropped. Idempotent.
-    if let Some(admin_role_id) = authz_dao::role_id_by_name(pool, authz_dao::ADMIN_ROLE)
+    let admin_role_id = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
         .await
         .context("look up admin role")?
-    {
-        authz_dao::assign_role(pool, user.id, admin_role_id)
-            .await
-            .context("grant admin role to bootstrap admin")?;
-    }
+        .context("the built-in admin role is missing")?;
+    authz_dao::assign_role(&mut *tx, user.id, admin_role_id)
+        .await
+        .context("grant admin role to bootstrap admin")?;
+    tx.commit().await.context("commit bootstrap admin")?;
     // A crash before this line leaves the account without the marker; the
     // next boot records it (see the existing-account branch above).
     record_bootstrap_marker(pool, &marker, user.id).await?;

@@ -32,6 +32,7 @@ use crate::state::AppState;
 pub struct UserView {
     pub id: i64,
     pub username: String,
+    /// Membership in the built-in `admin` role.
     pub is_admin: bool,
     pub active: bool,
     /// How the account signs in: `local` (a Forge password), `oidc` (an
@@ -46,28 +47,30 @@ pub struct UserView {
     pub captured_password_at: Option<DateTime<Utc>>,
 }
 
-impl From<&AppUser> for UserView {
-    fn from(u: &AppUser) -> Self {
+impl UserView {
+    fn new(u: &AppUser, is_admin: bool) -> Self {
         UserView {
             id: u.id,
             username: u.username.clone(),
-            is_admin: u.is_admin,
+            is_admin,
             active: u.active,
             auth_source: u.auth_source.clone(),
             captured_password_at: None,
         }
     }
-}
 
-impl UserView {
-    /// The view of `u`, with its kept-password time read from the database.
+    /// The view of `u`, reading its `admin` role membership and its
+    /// kept-password time from the database.
     async fn load(state: &AppState, u: &AppUser) -> Result<Self, Response> {
+        let is_admin = authz_dao::user_has_role(&state.pool, u.id, authz_dao::ADMIN_ROLE)
+            .await
+            .map_err(db_error)?;
         let captured_password_at = user_dao::captured_password_at(&state.pool, u.id)
             .await
             .map_err(db_error)?;
         Ok(UserView {
             captured_password_at,
-            ..UserView::from(u)
+            ..Self::new(u, is_admin)
         })
     }
 }
@@ -78,6 +81,7 @@ impl UserView {
 pub struct CreateUser {
     pub username: String,
     pub password: String,
+    /// Assigns the built-in `admin` role.
     #[serde(default)]
     pub is_admin: bool,
     #[serde(default = "default_true")]
@@ -105,6 +109,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
         Ok(users) => users,
         Err(e) => return db_error(e),
     };
+    let admins = match authz_dao::user_ids_with_role(&state.pool, authz_dao::ADMIN_ROLE).await {
+        Ok(admins) => admins,
+        Err(e) => return db_error(e),
+    };
     let captured: std::collections::HashMap<i64, DateTime<Utc>> =
         match user_dao::captured_password_times(&state.pool).await {
             Ok(times) => times.into_iter().collect(),
@@ -114,7 +122,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
         .iter()
         .map(|u| UserView {
             captured_password_at: captured.get(&u.id).copied(),
-            ..UserView::from(u)
+            ..UserView::new(u, admins.contains(&u.id))
         })
         .collect();
     Json(views).into_response()
@@ -140,24 +148,38 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(resp) => return resp,
     };
 
-    let new = NewUser::local(username, password_hash, body.is_admin, body.active);
-    let u = match user_dao::insert_user(&state.pool, new).await {
-        Ok(u) => u,
+    match insert_with_admin_role(
+        &state,
+        NewUser::local(username, password_hash, body.active),
+        body.is_admin,
+    )
+    .await
+    {
+        Ok(u) => (StatusCode::CREATED, Json(UserView::new(&u, body.is_admin))).into_response(),
         Err(e) if is_unique_violation(&e) => {
-            return (StatusCode::CONFLICT, "username already exists").into_response();
+            (StatusCode::CONFLICT, "username already exists").into_response()
         }
-        Err(e) => return db_error(e),
-    };
-
-    // An admin created here holds the built-in `admin` role as well as the
-    // legacy flag, so the role-assignment API sees (and can revoke) it.
-    if u.is_admin {
-        if let Err(e) = authz_dao::sync_admin_role(&state.pool, u.id, true).await {
-            return db_error(e);
-        }
+        Err(e) => db_error(e),
     }
+}
 
-    (StatusCode::CREATED, Json(UserView::from(&u))).into_response()
+/// Insert the user and, for an administrator, assign it the built-in
+/// `admin` role in the same transaction.
+async fn insert_with_admin_role(
+    state: &AppState,
+    new: NewUser,
+    is_admin: bool,
+) -> sqlx::Result<AppUser> {
+    let mut tx = state.pool.begin().await?;
+    let user = user_dao::insert_user(&mut *tx, new).await?;
+    if is_admin {
+        let role_id = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
+            .await?
+            .ok_or_else(|| sqlx::Error::Protocol("the built-in admin role is missing".into()))?;
+        authz_dao::assign_role(&mut *tx, user.id, role_id).await?;
+    }
+    tx.commit().await?;
+    Ok(user)
 }
 
 /// `PATCH /admin/users/{id}` — deactivate (`{"active": false}`) or reactivate
@@ -317,7 +339,10 @@ pub async fn convert_to_local(State(state): State<AppState>, Path(id): Path<i64>
         return resp;
     }
     match user_dao::find_user_by_id(&state.pool, id).await {
-        Ok(Some(user)) => Json(UserView::from(&user)).into_response(),
+        Ok(Some(user)) => match UserView::load(&state, &user).await {
+            Ok(view) => Json(view).into_response(),
+            Err(resp) => resp,
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => db_error(e),
     }

@@ -527,7 +527,7 @@ redirect_url          = "https://forge.example.com/auth/oidc/callback"
 ```
 
 When `admin_groups` is set, admin is **recomputed on every login** from the
-current claims — both the legacy flag and the built-in `admin` role (a user
+current claims: membership in the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
 downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
 OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =

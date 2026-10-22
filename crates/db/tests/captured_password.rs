@@ -31,7 +31,7 @@ async fn realm(pool: &PgPool, capture: bool) -> i64 {
 
 async fn upstream_user(pool: &PgPool, realm_id: i64) -> (i64, String) {
     let name = format!("kept-user-{}", unique());
-    let user = user_dao::provision_upstream_user(pool, &name, false, false, Some(realm_id))
+    let user = user_dao::provision_upstream_user(pool, &name, Some(realm_id))
         .await
         .unwrap()
         .expect("provisioned");
@@ -93,7 +93,7 @@ async fn a_hash_is_stored_only_on_an_opted_in_realms_own_account() {
     // Never on a local account, even one in the realm's name space.
     let local = user_dao::insert_user(
         &pool,
-        user_dao::NewUser::local(format!("kept-local-{}", unique()), HASH.into(), false, true),
+        user_dao::NewUser::local(format!("kept-local-{}", unique()), HASH.into(), true),
     )
     .await
     .unwrap();

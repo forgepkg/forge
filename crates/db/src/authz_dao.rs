@@ -138,11 +138,6 @@ pub struct EffectiveRows {
 /// are the union of every `repository_privilege` of every role the user holds,
 /// each with its content selector (if any). A user with no roles yields an empty
 /// set (fail-closed deny-all).
-///
-/// Note: this reads **role-derived** privileges only. The slice-1 `is_admin`
-/// column on `app_user` is intentionally *not* consulted here — the dual-read
-/// fallback during the migration window is layered on by the caller (later
-/// phase), keeping this query a clean single-source read.
 pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<EffectiveRows> {
     let is_admin = sqlx::query_scalar!(
         r#"
@@ -316,8 +311,8 @@ where
         .await
 }
 
-/// Whether a user holds a given role (by role name). Used by the dual-read admin
-/// check and tests.
+/// Whether a user holds a given role (by role name), e.g. whether it is an
+/// administrator ([`ADMIN_ROLE`]).
 pub async fn user_has_role<'e, E>(executor: E, user_id: i64, role_name: &str) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
@@ -335,6 +330,26 @@ where
     )
     .fetch_one(executor)
     .await
+}
+
+/// The ids of the users that hold a given role (by role name), e.g. the
+/// administrators ([`ADMIN_ROLE`]).
+pub async fn user_ids_with_role(
+    pool: &PgPool,
+    role_name: &str,
+) -> sqlx::Result<std::collections::HashSet<i64>> {
+    let ids = sqlx::query_scalar!(
+        r#"
+        SELECT ur.user_id
+        FROM user_role ur
+        JOIN role r ON r.id = ur.role_id
+        WHERE r.name = $1
+        "#,
+        role_name,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(ids.into_iter().collect())
 }
 
 /// Assign `role_id` to `user_id` (idempotent). Accepts any executor.
@@ -374,10 +389,10 @@ where
 /// Make the built-in `admin` role membership of `user_id` match `is_admin`
 /// (assign when true, remove when false) — used where an external identity
 /// source is authoritative for admin (an OIDC realm with `admin_groups`, a
-/// credential-forwarding realm with an `admin_group`), so a demotion revokes
-/// the role too and not only the legacy `app_user.is_admin` column. Returns
-/// whether the membership changed (the caller invalidates the user's cached
-/// effective set). A missing built-in role is a no-op.
+/// credential-forwarding realm with an `admin_group`), so a demotion there
+/// takes effect here. Returns whether the membership changed (the caller
+/// invalidates the user's cached effective set). A missing built-in role is a
+/// no-op.
 pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sqlx::Result<bool> {
     let Some(role_id) = role_id_by_name(pool, ADMIN_ROLE).await? else {
         return Ok(false);
@@ -411,8 +426,7 @@ pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sql
 /// The last-admin guard: whether taking `user_id`'s admin rights away
 /// (deactivating, deleting, or unassigning its `admin` role) would leave no
 /// active administrator. `true` iff `user_id` is an active admin and no other
-/// active user is. "Admin" is what the authz seam honours for a user: the
-/// built-in `admin` role or the slice-1 `app_user.is_admin` dual-read flag.
+/// active user is: a member of the built-in `admin` role.
 ///
 /// Call it in the transaction that applies the change, and apply it only on
 /// `false`. It first locks the built-in `admin` role row (`FOR NO KEY UPDATE`,
@@ -437,11 +451,11 @@ pub async fn would_leave_no_admin(
         WITH active_admin AS (
             SELECT u.id FROM app_user u
             WHERE u.active
-              AND (u.is_admin OR EXISTS (
+              AND EXISTS (
                   SELECT 1 FROM user_role ur
                   JOIN role r ON r.id = ur.role_id
                   WHERE ur.user_id = u.id AND r.name = $2
-              ))
+              )
         )
         SELECT EXISTS (SELECT 1 FROM active_admin WHERE id = $1)
            AND NOT EXISTS (SELECT 1 FROM active_admin WHERE id <> $1) AS "last!"

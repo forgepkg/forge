@@ -23,19 +23,17 @@ fn lookup_key(username: &str) -> Option<String> {
 pub struct NewUser {
     pub username: String,
     pub password_hash: Option<String>,
-    pub is_admin: bool,
     pub active: bool,
     pub auth_source: String,
     pub external_subject: Option<String>,
 }
 
 impl NewUser {
-    /// Convenience constructor for a slice-1 local (argon2 password) user.
-    pub fn local(username: String, password_hash: String, is_admin: bool, active: bool) -> Self {
+    /// Convenience constructor for a local (argon2 password) user.
+    pub fn local(username: String, password_hash: String, active: bool) -> Self {
         Self {
             username,
             password_hash: Some(password_hash),
-            is_admin,
             active,
             auth_source: "local".to_string(),
             external_subject: None,
@@ -51,46 +49,48 @@ impl NewUser {
 /// [`sqlx::Error::InvalidArgument`] (callers validate first to answer 400).
 /// An account with a local password must also have a name a password login
 /// accepts ([`crate::username::canonical_password_username`]: no `:`).
-pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
+///
+/// An administrator is a member of the built-in `admin` role: assign it
+/// separately ([`crate::authz_dao::assign_role`]), in the same transaction
+/// when the account must not exist without it.
+pub async fn insert_user<'e, E>(executor: E, new: NewUser) -> sqlx::Result<AppUser>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let username = canonical_account_username(&new.username, new.password_hash.is_some())
         .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
     sqlx::query_as!(
         AppUser,
         r#"
         INSERT INTO app_user
-            (username, password_hash, is_admin, active, auth_source, external_subject)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (username, password_hash, active, auth_source, external_subject)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         "#,
         username,
         new.password_hash,
-        new.is_admin,
         new.active,
         new.auth_source,
         new.external_subject,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
-/// Provision (or refresh) a user authenticated by the `upstream-basic` provider
-/// (slice 12.3, phase 5).
+/// Provision (or refresh) a user authenticated by the `upstream-basic` provider.
 ///
 /// Called by the auth chain after the upstream **definitively accepts** a
 /// credential. Idempotent and **never touches a non-upstream account**:
 ///
 /// * **New username** → insert a fresh user with `auth_source = 'upstream-basic'`,
 ///   `password_hash = NULL` (no local password — the DB CHECK only requires one
-///   for `'local'` users), `external_subject = username`, `active = true`,
-///   `realm_id` = the vouching realm, and `is_admin = suggested_is_admin`.
+///   for `'local'` users), `external_subject = username`, `active = true`, and
+///   `realm_id` = the vouching realm.
 /// * **Existing `'upstream-basic'` username of the same realm** (or, for the
 ///   realm-less static wiring, of no realm) → stamp `last_auth_source_at =
-///   now()`, and — only when `admin_authoritative` (the realm maps an admin
-///   group and the groups were freshly fetched) — set `is_admin` to the
-///   upstream's current verdict, so revocation upstream demotes here too.
-///   Without an authoritative reading the stored admin flag is left alone.
+///   now()`.
 /// * **Existing username owned by anything else** (a `'local'` or `'oidc'`
 ///   account, an upstream user of a different realm, or an **orphan** whose
 ///   realm was deleted — `realm_orphaned`, migration 0023) → **no row** is
@@ -98,8 +98,10 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 ///   account it did not create. A missing realm is never a wildcard. The
 ///   caller denies.
 ///
-/// The unique constraint on `username` makes the `ON CONFLICT` path race-safe
-/// across instances. The username is canonicalized first; an invalid one, a
+/// The upstream's admin verdict is the caller's to apply, as membership in the
+/// built-in `admin` role. The unique constraint on `username` makes the
+/// `ON CONFLICT` path race-safe across instances. The username is
+/// canonicalized first; an invalid one, a
 /// [reserved](crate::username::RESERVED_USERNAMES) one, or one containing `:`
 /// (the upstream verified the part before the colon, see
 /// [`crate::username::canonical_password_username`]), provisions nothing
@@ -107,83 +109,32 @@ pub async fn insert_user(pool: &PgPool, new: NewUser) -> sqlx::Result<AppUser> {
 pub async fn provision_upstream_user(
     pool: &PgPool,
     username: &str,
-    suggested_is_admin: bool,
-    admin_authoritative: bool,
     realm_id: Option<i64>,
 ) -> sqlx::Result<Option<AppUser>> {
-    Ok(provision_upstream_user_tracked(
-        pool,
-        username,
-        suggested_is_admin,
-        admin_authoritative,
-        realm_id,
-    )
-    .await?
-    .map(|(user, _)| user))
-}
-
-/// [`provision_upstream_user`], also reporting whether this call created the
-/// account (`true`) rather than refreshing an existing one. Takes any
-/// executor so the caller can create the user and its initial roles in one
-/// transaction.
-pub async fn provision_upstream_user_tracked<'e, E>(
-    executor: E,
-    username: &str,
-    suggested_is_admin: bool,
-    admin_authoritative: bool,
-    realm_id: Option<i64>,
-) -> sqlx::Result<Option<(AppUser, bool)>>
-where
-    E: sqlx::PgExecutor<'e>,
-{
     let Ok(username) = canonical_account_username(username, true) else {
         return Ok(None);
     };
-    let row = sqlx::query!(
+    sqlx::query_as!(
+        AppUser,
         r#"
         INSERT INTO app_user
-            (username, password_hash, is_admin, active, auth_source,
+            (username, password_hash, active, auth_source,
              external_subject, last_auth_source_at, realm_id)
-        VALUES ($1, NULL, $2, true, 'upstream-basic', $1, now(), $4)
+        VALUES ($1, NULL, true, 'upstream-basic', $1, now(), $2)
         ON CONFLICT (username) DO UPDATE SET
-            is_admin = CASE WHEN $3 THEN EXCLUDED.is_admin ELSE app_user.is_admin END,
-            last_auth_source_at = now(),
-            -- Touch updated_at only when the admin flag actually changes.
-            updated_at = CASE
-                WHEN $3 AND EXCLUDED.is_admin <> app_user.is_admin THEN now()
-                ELSE app_user.updated_at
-            END
+            last_auth_source_at = now()
         WHERE app_user.auth_source = 'upstream-basic'
           AND NOT app_user.realm_orphaned
           AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id
         RETURNING
-            id, username, password_hash, is_admin, active,
-            auth_source, external_subject, created_at, updated_at,
-            (xmax = 0) AS "inserted!"
+            id, username, password_hash, active,
+            auth_source, external_subject, created_at, updated_at
         "#,
         username,
-        suggested_is_admin,
-        admin_authoritative,
         realm_id,
     )
-    .fetch_optional(executor)
-    .await?;
-    Ok(row.map(|r| {
-        (
-            AppUser {
-                id: r.id,
-                username: r.username,
-                password_hash: r.password_hash,
-                is_admin: r.is_admin,
-                active: r.active,
-                auth_source: r.auth_source,
-                external_subject: r.external_subject,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            },
-            r.inserted,
-        )
-    }))
+    .fetch_optional(pool)
+    .await
 }
 
 /// Find the `'upstream-basic'` user an upstream realm vouched for: the username
@@ -203,7 +154,7 @@ pub async fn find_upstream_user(
         AppUser,
         r#"
         SELECT
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         FROM app_user
         WHERE username = $1
@@ -228,7 +179,7 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Resul
         AppUser,
         r#"
         SELECT
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         FROM app_user
         WHERE username = $1
@@ -245,7 +196,7 @@ pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppU
         AppUser,
         r#"
         SELECT
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         FROM app_user
         WHERE id = $1
@@ -262,41 +213,13 @@ pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
         AppUser,
         r#"
         SELECT
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         FROM app_user
         ORDER BY username
         "#,
     )
     .fetch_all(pool)
-    .await
-}
-
-/// Set a user's `is_admin` flag (bumping `updated_at` only when it changes) and
-/// return the resulting row.
-///
-/// Used by OIDC login to **recompute** admin on every sign-in from the IdP's
-/// group/role claim (slice 12.2 §3.6): a user added to or removed from the admin
-/// group gains/loses admin on their next login.
-pub async fn update_is_admin<'e, E>(executor: E, id: i64, is_admin: bool) -> sqlx::Result<AppUser>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_as!(
-        AppUser,
-        r#"
-        UPDATE app_user
-        SET is_admin = $2,
-            updated_at = CASE WHEN is_admin <> $2 THEN now() ELSE updated_at END
-        WHERE id = $1
-        RETURNING
-            id, username, password_hash, is_admin, active,
-            auth_source, external_subject, created_at, updated_at
-        "#,
-        id,
-        is_admin,
-    )
-    .fetch_one(executor)
     .await
 }
 
@@ -320,7 +243,7 @@ where
             updated_at = CASE WHEN active <> $2 THEN now() ELSE updated_at END
         WHERE id = $1
         RETURNING
-            id, username, password_hash, is_admin, active,
+            id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         "#,
         id,

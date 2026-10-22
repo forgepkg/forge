@@ -348,9 +348,9 @@ impl Registry {
     }
 
     /// Re-read what a token's principal rests on: a user's account must still
-    /// be active (and the API token it was minted from live), and the admin
-    /// flag is the current one; a workload's realm and key must still stand
-    /// ([`WorkloadCheck`]). Cached briefly per process.
+    /// be active (and the API token it was minted from live); a workload's
+    /// realm and key must still stand ([`WorkloadCheck`]). Cached briefly per
+    /// process.
     async fn refresh_principal(&self, principal: Principal) -> OciResult<Option<Principal>> {
         if let Principal::Workload {
             realm_id,
@@ -394,7 +394,7 @@ impl Registry {
         };
         let key = format!("{user_id}:{}", token_id.unwrap_or(0));
         let pool = self.inner.pool.clone();
-        let state: Result<Option<bool>, String> = self
+        let state: Result<bool, String> = self
             .inner
             .cache
             .get_or_try_insert_local(
@@ -409,13 +409,12 @@ impl Registry {
             )
             .await;
         match state {
-            Ok(Some(is_admin)) => Ok(Some(Principal::User {
+            Ok(true) => Ok(Some(Principal::User {
                 user_id,
                 token_id,
-                is_admin,
                 method,
             })),
-            Ok(None) => Ok(None),
+            Ok(false) => Ok(None),
             Err(e) => Err(OciError::internal("principal lookup", e)),
         }
     }
@@ -877,13 +876,11 @@ mod tests {
         assert!(!mutation_credential(&Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: true,
             method: AuthMethod::Session
         }));
         assert!(mutation_credential(&Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: AuthMethod::Password
         }));
         assert!(!mutation_credential(&Principal::Unauthenticated));

@@ -564,7 +564,9 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
         .await
         .expect("provision");
     assert_eq!(user.username, username);
-    assert!(user.is_admin);
+    assert!(forge_db::authz_dao::user_has_role(&pool, user.id, "admin")
+        .await
+        .unwrap());
     let first_id = user.id;
 
     // A second login for the same (issuer, sub) loads the SAME user (no dup),
@@ -576,7 +578,12 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
         .await
         .expect("relink");
     assert_eq!(user2.id, first_id, "same app_user, not a duplicate");
-    assert!(!user2.is_admin, "admin recomputed/revoked on login");
+    assert!(
+        !forge_db::authz_dao::user_has_role(&pool, user2.id, "admin")
+            .await
+            .unwrap(),
+        "admin recomputed/revoked on login"
+    );
 }
 
 #[tokio::test]
@@ -589,10 +596,13 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
     // Pre-create a local user (a bootstrap admin) with this username.
     let local = user_dao::insert_user(
         &pool,
-        NewUser::local(username.clone(), "argon2-hash".into(), true, true),
+        NewUser::local(username.clone(), "argon2-hash".into(), true),
     )
     .await
     .expect("local user");
+    forge_db::authz_dao::sync_admin_role(&pool, local.id, true)
+        .await
+        .unwrap();
 
     let validated = run_login(
         &pool,
@@ -691,7 +701,6 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "oidc".into(),
             external_subject: None,
@@ -749,7 +758,6 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
         NewUser {
             username: upstream_name.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".into(),
             external_subject: Some(upstream_name.clone()),
@@ -827,12 +835,11 @@ async fn resolve_user_demotion_removes_admin_role() {
     let user2 = oidc::resolve_user(&pool, &validated2, &mapped2, &ResolvePolicy::default())
         .await
         .expect("relogin");
-    assert!(!user2.is_admin);
     assert!(
         !forge_db::authz_dao::user_has_role(&pool, user2.id, "admin")
             .await
             .unwrap(),
-        "demotion removes the admin role, not just the column"
+        "demotion removes the admin role"
     );
 }
 
@@ -964,7 +971,7 @@ async fn session_create_validate_revoke_round_trip() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("sess-user-{n}"), "x".into(), false, true),
+        NewUser::local(format!("sess-user-{n}"), "x".into(), true),
     )
     .await
     .expect("user");
@@ -1013,7 +1020,7 @@ async fn session_rotate_issues_new_and_revokes_old() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("rot-user-{n}"), "x".into(), false, true),
+        NewUser::local(format!("rot-user-{n}"), "x".into(), true),
     )
     .await
     .expect("user");

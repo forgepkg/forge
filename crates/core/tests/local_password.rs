@@ -49,15 +49,26 @@ fn hash(password: &str) -> String {
 }
 
 /// Insert a local (argon2 password) user with a unique username.
-async fn insert_local(pool: &PgPool, password: &str, is_admin: bool, active: bool) -> String {
+async fn insert_local(pool: &PgPool, password: &str, active: bool) -> String {
     let username = format!("alice-{}", common::unique());
     user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), hash(password), is_admin, active),
+        NewUser::local(username.clone(), hash(password), active),
     )
     .await
     .expect("insert local user");
     username
+}
+
+/// Make `username` an administrator: a member of the built-in `admin` role.
+async fn make_admin(pool: &PgPool, username: &str) {
+    let user = user_dao::find_user_by_username(pool, username)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(forge_db::authz_dao::sync_admin_role(pool, user.id, true)
+        .await
+        .unwrap());
 }
 
 fn cred<'a>(username: &'a str, password: &'a str) -> PasswordCredential<'a> {
@@ -83,7 +94,7 @@ fn basic_header(username: &str, secret: &str) -> HeaderMap {
 #[tokio::test]
 async fn local_provider_authenticates_correct_password() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "s3cr3t", false, true).await;
+    let username = insert_local(&pool, "s3cr3t", true).await;
     let provider = LocalPasswordProvider::new(pool.clone());
 
     let out = provider.authenticate(&cred(&username, "s3cr3t")).await;
@@ -106,7 +117,7 @@ async fn local_provider_rejects_wrong_password() {
     // A known local user with a wrong password is a definitive Rejected, not a
     // Skip — the account exists, the credential is simply wrong.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "right", false, true).await;
+    let username = insert_local(&pool, "right", true).await;
     let provider = LocalPasswordProvider::new(pool.clone());
 
     assert_eq!(
@@ -134,7 +145,7 @@ async fn local_provider_rejects_inactive_user() {
     // a local password account's: a definitive Rejected (never a Skip that
     // would hand the password to a later provider), whatever the password.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, false).await;
+    let username = insert_local(&pool, "pw", false).await;
     for forwarding_follows in [false, true] {
         let provider =
             LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
@@ -159,7 +170,6 @@ async fn local_provider_skips_user_without_local_password() {
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(username.clone()),
@@ -180,7 +190,8 @@ async fn local_provider_admin_flag_is_not_in_identity() {
     // The provider only vouches for the username; admin-ness is resolved by the
     // mapping step from the app_user row, not carried in ProvenIdentity.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", true, true).await;
+    let username = insert_local(&pool, "pw", true).await;
+    make_admin(&pool, &username).await;
     let provider = LocalPasswordProvider::new(pool.clone());
     match provider.authenticate(&cred(&username, "pw")).await {
         AuthOutcome::Authenticated(id) => assert!(!id.suggested_is_admin),
@@ -191,9 +202,9 @@ async fn local_provider_admin_flag_is_not_in_identity() {
 // ── Chain (local-only) → mapping to a concrete principal ─────────────────────
 
 #[tokio::test]
-async fn chain_local_only_maps_to_principal_with_admin_flag() {
+async fn chain_local_only_maps_to_principal() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", true, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -211,7 +222,6 @@ async fn chain_local_only_maps_to_principal_with_admin_flag() {
                 .expect("map")
                 .expect("active user exists");
             assert_eq!(principal.user_id, user.id);
-            assert!(principal.is_admin);
             // Password auth never carries a token id.
             assert!(principal.token_id.is_none());
         }
@@ -224,11 +234,11 @@ async fn chain_local_only_maps_to_principal_with_admin_flag() {
 #[tokio::test]
 async fn basic_password_authenticates_when_enabled() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let src = BasicAuthSource::new(pool.clone(), /* allow_password_basic */ true);
 
     match src.resolve(&basic_header(&username, "pw"), ip()).await {
-        SourceOutcome::Authenticated(Principal::User { is_admin, .. }) => assert!(!is_admin),
+        SourceOutcome::Authenticated(Principal::User { .. }) => {}
         other => panic!("expected Authenticated User, got {other:?}"),
     }
 }
@@ -238,7 +248,7 @@ async fn basic_password_disabled_does_not_authenticate() {
     // allow_password_basic = false → password path is entirely off; a valid
     // password is treated as an invalid basic credential (slice-1 behaviour).
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let src = BasicAuthSource::new(pool.clone(), false);
 
     assert_eq!(
@@ -250,7 +260,7 @@ async fn basic_password_disabled_does_not_authenticate() {
 #[tokio::test]
 async fn basic_wrong_password_is_invalid_not_anonymous() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "right", false, true).await;
+    let username = insert_local(&pool, "right", true).await;
     let src = BasicAuthSource::new(pool.clone(), true);
 
     assert_eq!(
@@ -279,7 +289,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
     // which runs *ahead* of the password chain — unchanged from slice 1.
     let pool = common::pool().await;
     // Make a user + a token for them.
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -326,7 +336,7 @@ async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
     // A revoked token used as the basic secret is not a valid token, and a
     // token Forge issued is never run through the password chain (#71).
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -360,7 +370,7 @@ async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
 #[tokio::test]
 async fn basic_with_explicit_chain_matches_default() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let chain = Arc::new(Chain::new(vec![Box::new(LocalPasswordProvider::new(
         pool.clone(),
     ))]));
@@ -443,7 +453,6 @@ async fn foreign_names_cost_the_same_as_each_other() {
         NewUser {
             username: federated.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(federated.clone()),
@@ -451,7 +460,7 @@ async fn foreign_names_cost_the_same_as_each_other() {
     )
     .await
     .expect("insert federated user");
-    let inactive = insert_local(&pool, "pw", false, false).await;
+    let inactive = insert_local(&pool, "pw", false).await;
     let ghost = format!("ghost-{}", common::unique());
 
     let forwarding = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter())
@@ -485,7 +494,7 @@ async fn foreign_names_cost_the_same_as_each_other() {
 #[tokio::test]
 async fn inactive_local_account_is_never_forwarded() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, false).await;
+    let username = insert_local(&pool, "pw", false).await;
     let (upstream, upstream_calls) = CountingProvider::new(
         AuthSource::UpstreamBasic,
         AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity {
@@ -528,7 +537,7 @@ async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
     // M4(b): with every argon2 slot busy, a local account's correct password
     // is neither a failure (no lockout) nor forwarded to a later provider.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let (upstream, upstream_calls) = CountingProvider::new(
         AuthSource::UpstreamBasic,
         AuthOutcome::Rejected,
@@ -657,7 +666,7 @@ async fn concurrent_correct_passwords_are_serialized_not_locked_out() {
     // parallel requests than the budget (a NuGet restore over Basic): the
     // extra attempts wait for a slot and then succeed.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let (provider, calls) = CountingProvider::new(
         AuthSource::Local,
         AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity::local(username.clone())),
@@ -727,7 +736,7 @@ async fn oversized_basic_username_is_invalid_and_never_tracked() {
 #[tokio::test]
 async fn database_failures_on_the_password_path_are_unavailable() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
 
     // The local provider on a failing database (a closed pool fails every
     // query, like an exhausted one).

@@ -115,7 +115,7 @@ impl Default for ResolvePolicy {
 ///    is the identity of an OIDC user — never the username or email.
 /// 2. **No link, matching username** + `link_existing_by_username` (off by
 ///    default) → link the existing user, but **only** if no other credential
-///    owns it: no local password, not an admin (column or `admin` role), not a
+///    owns it: no local password, not an admin (`admin` role), not a
 ///    credential-forwarding (`upstream-basic`) account, and not linked to any
 ///    IdP identity yet (of this or another issuer). A colliding
 ///    `preferred_username` must never take over a password account, an
@@ -171,7 +171,6 @@ pub async fn resolve_user(
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
             if user.password_hash.is_none()
-                && !user.is_admin
                 && !is_admin_role
                 && user.auth_source != "upstream-basic"
                 && !already_linked
@@ -246,7 +245,6 @@ async fn provision_oidc_user(
                 // None); the (issuer, subject) link in external_identity is the
                 // authority for OIDC logins.
                 password_hash: None,
-                is_admin: mapped.is_admin,
                 active: true,
                 auth_source: "oidc".to_string(),
                 external_subject: Some(login.subject.clone()),
@@ -332,18 +330,10 @@ async fn finalize(
 
     // Recompute admin on every login so IdP grant/revoke takes effect — but
     // only when the realm maps admin groups; otherwise admins are managed
-    // locally and a login must not touch them. Both the legacy column and the
-    // built-in `admin` role follow the claim, so a demotion also removes the
-    // role (the column alone is only a dual-read fallback). The caller
-    // invalidates the user's cached effective set.
-    let user = if mapped.admin_managed {
-        let user = if user.is_admin != mapped.is_admin {
-            user_dao::update_is_admin(pool, user.id, mapped.is_admin)
-                .await
-                .map_err(|e| ResolveError::Db(e.to_string()))?
-        } else {
-            user
-        };
+    // locally and a login must not touch them. The built-in `admin` role
+    // follows the claim, for a new account too. The caller invalidates the
+    // user's cached effective set.
+    if mapped.admin_managed {
         let changed = authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?;
@@ -352,10 +342,7 @@ async fn finalize(
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
         }
-        user
-    } else {
-        user
-    };
+    }
 
     Ok(user)
 }

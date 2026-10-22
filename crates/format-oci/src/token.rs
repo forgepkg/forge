@@ -156,9 +156,9 @@ impl TokenPrincipal {
         }
     }
 
-    /// Back to a request principal. `is_admin` is re-read by the caller
-    /// (see [`crate::service`]); `fallback` is the request's own principal,
-    /// used for anonymous tokens.
+    /// Back to a request principal. Whether the user is still active is
+    /// re-read by the caller (see [`crate::service`]); `fallback` is the
+    /// request's own principal, used for anonymous tokens.
     pub fn to_principal(&self, fallback: Principal) -> Option<Principal> {
         fn arr(hex_str: &str) -> Option<[u8; 32]> {
             hex::decode(hex_str).ok()?.try_into().ok()
@@ -168,7 +168,6 @@ impl TokenPrincipal {
             TokenPrincipal::User { uid, tid, pw } => Principal::User {
                 user_id: *uid,
                 token_id: *tid,
-                is_admin: false,
                 method: if tid.is_some() {
                     AuthMethod::Token
                 } else if *pw {
@@ -527,7 +526,6 @@ mod tests {
         let session = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: true,
             method: AuthMethod::Session,
         };
         assert_eq!(TokenPrincipal::of(&session), TokenPrincipal::Anonymous);
