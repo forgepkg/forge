@@ -41,7 +41,16 @@ IMAGE=(
     ':(glob)**/Cargo.toml' Cargo.lock rust-toolchain.toml .cargo
     web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc
 )
-JOB_GROUPS=(rust changelog audit web image)
+# The kubernetes job: the manifests and the chart, and what its digest-pin
+# check reads besides them (Dockerfiles, the workflows, .gitlab-ci.yml).
+KUBERNETES=(
+    deploy
+    ':(glob)**/Dockerfile' ':(glob)**/*.Dockerfile' ':(glob)**/Containerfile'
+    .github/workflows .gitlab-ci.yml
+    .github/scripts/image-pin-check.sh .github/scripts/kustomize-check.sh
+    .github/scripts/helm-check.sh
+)
+JOB_GROUPS=(rust changelog audit web image kubernetes)
 
 out=${GITHUB_OUTPUT:-/dev/stdout}
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}

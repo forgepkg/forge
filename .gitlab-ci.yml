@@ -92,7 +92,8 @@ variables:
 # A merge request pipeline, a merge train's included, runs a job only when the
 # merge request changes one of the job's groups of paths below (`rules:
 # changes` compares it with the target branch). Branch pipelines, the default
-# branch and tags run every job. The groups are those of
+# branch and tags run every job. A merge request that touches no group gets no
+# pipeline. The groups are those of
 # .github/scripts/ci-changes.sh (keep them in step), each with this file in
 # place of ci.yml. In a merge train, the merge requests ahead count through
 # their own pipelines: a failed one leaves the train, and the pipelines
@@ -142,6 +143,18 @@ variables:
     - web/pnpm-lock.yaml
     - web/pnpm-workspace.yaml
     - web/.npmrc
+    - .gitlab-ci.yml
+  # The kubernetes job: the manifests, and what its digest-pin check reads
+  # besides them (Dockerfiles, the workflows, this file).
+  kubernetes: &kubernetes-paths
+    - deploy/**/*
+    - "**/Dockerfile"
+    - "**/*.Dockerfile"
+    - "**/Containerfile"
+    - .github/workflows/**/*
+    - .github/scripts/image-pin-check.sh
+    - .github/scripts/kustomize-check.sh
+    - .github/scripts/helm-check.sh
     - .gitlab-ci.yml
 
 # ── Formatting, and the changelog fragments ────────────────────────────────
@@ -306,13 +319,19 @@ docker:
 # Checks that every image reference (Dockerfile, deploy/, the workflows) is
 # pinned by digest, builds every overlay, and the base with each component,
 # and validates the output against the Kubernetes schemas. Both tools are
-# pinned by checksum.
-# Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
+# pinned by checksum. In merge requests, only when they touch any of these
+# (the kubernetes group). Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
 # chart (.github/scripts/helm-check.sh, Helm built with `go install`), which
 # needs a pinned Go image here.
 kubernetes:
   stage: test
   needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *kubernetes-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   variables:
     KUSTOMIZE_VERSION: "5.7.1"
     KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8

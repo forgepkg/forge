@@ -746,10 +746,10 @@ groups of paths:
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
 | Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, `.gitlab-ci.yml`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
-A change to the CI configuration counts for every group. `kubernetes` (a few
-seconds) always runs. A job left out is skipped, which passes a required
-check. If the `changes` job fails, every job runs. Pushes to `main` and manual
+A change to the CI configuration counts for every group. A job left out is
+skipped, which passes a required check. If the `changes` job fails, every job runs. Pushes to `main` and manual
 runs run every job, which the release gate requires. A file that Rust code or
 its tests read from outside the crates belongs in the Rust group: add a new
 one to `ci-changes.sh` and to the `.paths` of `.gitlab-ci.yml`.
@@ -760,7 +760,8 @@ only the image build, such as an `include_str!` of a file `.dockerignore`
 leaves out, therefore fails on the push to `main` rather than in the queue.
 
 On GitLab, the same groups are `rules: changes` in merge request pipelines
-and merge trains. A merge train pipeline compares only its own merge request
+and merge trains; a merge request that touches none of them gets no
+pipeline. A merge train pipeline compares only its own merge request
 with the target branch: the merge requests ahead count through their own
 pipelines, since a failed one leaves the train and the pipelines behind it
 restart without it.
