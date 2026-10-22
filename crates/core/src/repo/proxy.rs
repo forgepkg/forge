@@ -2338,7 +2338,8 @@ impl ProxyRepo {
     ///   inside the window.
     ///
     /// An id left without versions is dropped, and the upstream's total is
-    /// reduced by the ids dropped from this page.
+    /// reduced by the ids dropped from this page; for a caller whose filter
+    /// hides packages, the total is what it sees instead.
     async fn upstream_search_result(
         &self,
         repo: &Repository,
@@ -2416,7 +2417,15 @@ impl ProxyRepo {
                 total_downloads: hit.total_downloads,
             });
         }
-        let total_hits = page.total_hits.saturating_sub(returned - out.len());
+        // The upstream's total counts the packages the caller's filter hides
+        // as well: a caller who may see only some is told only what it sees,
+        // plus one while the upstream's page was full (so paging goes on).
+        let total_hits = if matches!(filter, PackageFilter::AllowAll) {
+            page.total_hits.saturating_sub(returned - out.len())
+        } else {
+            let more = params.take > 0 && returned >= params.take;
+            params.skip + out.len() + usize::from(more)
+        };
         Ok(SearchResult {
             total_hits,
             hits: out,
