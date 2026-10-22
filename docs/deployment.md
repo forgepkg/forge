@@ -307,8 +307,10 @@ the returned CSRF token), or mint an admin-scoped token
 ## Secret encryption at rest
 
 Upstream proxy passwords, authentication-realm secrets (OIDC client
-secrets, credential-forwarding peppers) and the generated registry-token key
-(without `docker.token_secret`) are stored with double-envelope encryption:
+secrets, credential-forwarding peppers), the generated registry-token key
+(without `docker.token_secret`) and the keys Forge signs its OIDC client
+assertions with (a realm with a federated credential) are stored with
+double-envelope encryption:
 DEK → KEK → a root key that never enters the database. Without a `[crypto]`
 section these values are stored in **plaintext**. Enable it before you
 configure proxies or realms:
@@ -329,7 +331,8 @@ supported yet.
 Enabling encryption on an existing installation is safe, but enable it on
 **every instance at once** (a full restart, not a rolling one): at startup
 (and on every pass of the rotation worker) existing plaintext proxy passwords,
-realm secrets and the registry-token key are encrypted and the plaintext
+realm secrets, the registry-token key and the OIDC issuer keys are encrypted
+and the plaintext
 copies are removed, and an
 instance still running without `[crypto]` cannot read them from then on.
 Turning encryption off again is not supported: an instance without `[crypto]`

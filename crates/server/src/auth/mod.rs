@@ -46,7 +46,7 @@ use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
     begin_login, browser_binding, complete_login, map_claims, resolve_user, CallbackParams,
-    ClaimMapping, ClientParams, OidcMetadataClient, ResolvePolicy,
+    ClaimMapping, ClientAuth, ClientParams, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::{AppUser, Session};
@@ -58,16 +58,21 @@ use crate::config::OidcConfig;
 use crate::middleware::principal::auth_unavailable;
 use crate::state::AppState;
 
+mod issuer;
 mod realms;
 mod redirect;
 mod token_exchange;
 mod wif;
 
+pub use issuer::{
+    issuer_router, spawn_issuer_refresh, AssertionIssuer, DISCOVERY_PATH, ISSUER_KEYS_SETTING,
+    JWKS_PATH,
+};
 pub(crate) use realms::normalize_endpoint_hosts;
 pub use realms::{
-    forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config,
-    OidcRealmRuntime, RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC,
-    KIND_WORKLOAD_IDENTITY,
+    federated_credential, forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms,
+    validate_config, FederatedCredential, OidcRealmRuntime, RealmAuth, RealmSnapshot,
+    KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
@@ -94,15 +99,17 @@ pub struct OidcRuntime {
 }
 
 impl OidcRuntime {
-    /// Build the runtime from the validated `[oidc]` config + the DB pool + the
-    /// public base URL (which decides the cookie `Secure` attribute) + the
-    /// shared cache.
+    /// Build the runtime from the validated `[oidc]` config + how the client
+    /// authenticates at the token endpoint (`auth`; the config's
+    /// `client_secret` is not read) + the DB pool + the public base URL (which
+    /// decides the cookie `Secure` attribute) + the shared cache.
     ///
     /// The HTTP client follows no redirects and is https-only unless the realm
     /// allows a plain-http development issuer (see
     /// [`outbound_metadata_client`]); it serves discovery/JWKS/token calls.
     pub fn build(
         oidc: &OidcConfig,
+        auth: ClientAuth,
         pool: sqlx::PgPool,
         public_base_url: &str,
         cache: Cache,
@@ -114,7 +121,7 @@ impl OidcRuntime {
 
         let client = ClientParams {
             client_id: oidc.client_id.clone(),
-            client_secret: oidc.client_secret.clone(),
+            auth,
             redirect_url: oidc.redirect_url.clone(),
             scopes: oidc.effective_scopes(),
             leeway_seconds: oidc.clock_skew_seconds,
