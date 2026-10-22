@@ -730,7 +730,9 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
 `plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
-queue and on every push to `main`.
+queue and on every push to `main`. It runs on pull requests that target
+`main` only; a stacked one waits (see [Stacked pull
+requests](#stacked-pull-requests)).
 
 On a pull request and in the merge queue, a job runs only when the change
 touches what it checks (#353). The `changes` job
@@ -809,6 +811,16 @@ and Dependabot's:
   stacked pull request, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
   token has to be added to the bypass list.
+
+CI runs only on pull requests that target `main`, so a stacked pull request
+runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
+on every pull request above it. When a pull request is retargeted to `main`,
+the `Stack` workflow starts CI on its branch. That run checks the branch as
+it is, not its merge with `main`, and, as a manual run, with every job but
+`e2e` and `web-e2e`, not only those the change touches; the next push, and
+the merge queue, check the merge. To check a stacked branch earlier, run CI on it by hand:
+**Actions → CI → Run workflow**, or `gh workflow run ci.yml --ref <branch>`.
+A pull request from a fork gets no such run: a push to it starts CI.
 
 ## Changelog entries
 

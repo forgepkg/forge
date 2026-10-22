@@ -6,10 +6,16 @@ name: CI
 # checks), and only the default branch runs on `push` (post-merge). Pushing to
 # a PR branch no longer triggers a second, identical `push` run. Branches
 # without a PR can be checked on demand via `workflow_dispatch`.
+#
+# Only a pull request that targets the default branch runs CI. A stacked pull
+# request, which targets the branch of the one below it, runs the Stack
+# workflow alone; once GitHub retargets it to the default branch, stack.yml
+# starts this workflow on its branch via `workflow_dispatch`.
 on:
   push:
     branches: [main, master]
   pull_request:
+    branches: [main, master]
   merge_group:
   workflow_dispatch:
 

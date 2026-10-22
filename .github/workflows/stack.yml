@@ -12,6 +12,13 @@ name: Stack
 # `stack` on every other branch, so neither the merge button nor auto-merge
 # merges a pull request into the branch of another one.
 #
+# CI (ci.yml) runs on pull requests that target the default branch only, so
+# a stacked pull request runs this workflow alone. Once it is retargeted to
+# the default branch, this workflow starts CI on its branch: as a
+# `workflow_dispatch` run, the one event a GITHUB_TOKEN may start a workflow
+# with, whose check runs land on the head commit the default branch's rules
+# check. Every later push runs CI on the pull request as usual.
+#
 # A pull request opened against the default branch gets no status: the
 # ruleset does not apply there, and Dependabot's and forks' read-only tokens
 # could not post one.
@@ -20,7 +27,8 @@ on:
     types: [opened, reopened, synchronize, edited]
 
 permissions:
-  statuses: write
+  statuses: write # the `stack` status
+  actions: write # start CI on a retargeted pull request
 
 # One run at a time per pull request, the newest event last, so a pull
 # request retargeted twice in a row ends with the status of its final base.
@@ -57,3 +65,11 @@ jobs:
           gh api "repos/$REPO/statuses/$SHA" \
             -f state="$state" -f context=stack \
             -f description="${description:0:140}" -f target_url="$DOCS" > /dev/null
+      # A fork's branch cannot be dispatched to; a push to it starts CI.
+      - name: Start CI on a pull request retargeted to the default branch
+        if: github.base_ref == github.event.repository.default_branch && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: gh workflow run ci.yml --repo "$REPO" --ref "$HEAD_REF"
