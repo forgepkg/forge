@@ -1722,13 +1722,13 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     assert!(again.iter().all(|r| ![spaced, upper, twin].contains(&r.id)));
 }
 
-/// Migration 0036 stores a docker group's writable member by id: the name
+/// Migration 0037 stores a docker group's writable member by id: the name
 /// a group held becomes the id of the hosted docker repository so named,
 /// and a name no such repository has is dropped. The migration's statement
 /// only touches groups still holding a name, so it runs again here on
 /// groups seeded as before it.
 #[tokio::test]
-async fn migration_0036_stores_a_writable_member_by_id() {
+async fn migration_0037_stores_a_writable_member_by_id() {
     let pool = pool().await;
     let n = unique();
     let insert = |name: String, kind: &'static str, config: serde_json::Value| {
@@ -1761,7 +1761,7 @@ async fn migration_0036_stores_a_writable_member_by_id() {
     .await;
 
     sqlx::raw_sql(include_str!(
-        "../../../migrations/0036_docker_writable_member_id.sql"
+        "../../../migrations/0037_docker_writable_member_id.sql"
     ))
     .execute(&pool)
     .await

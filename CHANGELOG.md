@@ -155,7 +155,7 @@ The release workflow publishes the section whose heading matches the tag
 - Docker groups named their `writable_member` by name: renaming that
   repository broke group pushes, and a repository created later under the
   old name silently became the push target. The member is stored by id
-  (migration 0036 converts existing groups; a name no hosted docker
+  (migration 0037 converts existing groups; a name no hosted docker
   repository has any more is dropped), and the admin API and web UI show
   its current name. Downgrading to 1.1.0 leaves docker groups without a
   writable member until it is set again.
