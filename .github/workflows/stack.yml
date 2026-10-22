@@ -1,0 +1,59 @@
+name: Stack
+
+# A stacked pull request targets the branch of the pull request below it
+# (AGENTS.md, "Pull requests: one per issue, stacked"). Merged there, its fix
+# would land in that other pull request; it has to wait until the one below
+# has merged and GitHub has retargeted it to the default branch.
+#
+# This workflow reports that as the commit status `stack`: pending while the
+# pull request targets another branch, success once it is retargeted to the
+# default branch. The "Stacked pull requests" ruleset
+# (.github/rulesets/stacked-pull-requests.json, see DEVELOPMENT.md) requires
+# `stack` on every other branch, so neither the merge button nor auto-merge
+# merges a pull request into the branch of another one.
+#
+# A pull request opened against the default branch gets no status: the
+# ruleset does not apply there, and Dependabot's and forks' read-only tokens
+# could not post one.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  statuses: write
+
+# One run at a time per pull request, the newest event last, so a pull
+# request retargeted twice in a row ends with the status of its final base.
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  stack:
+    # Not `stack`: a required check matches check runs and commit statuses
+    # by name alike, so a job named like the status would satisfy the
+    # ruleset with its own success.
+    name: stack-status
+    if: github.base_ref != github.event.repository.default_branch || github.event.changes.base
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report whether the pull request targets the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DOCS: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.repository.default_branch }}/DEVELOPMENT.md#stacked-pull-requests
+        run: |
+          if [ "$BASE" = "$DEFAULT_BRANCH" ]; then
+            state=success
+            description="Targets $DEFAULT_BRANCH"
+          else
+            state=pending
+            description="Stacked on $BASE: waits until that merges and GitHub retargets this to $DEFAULT_BRANCH"
+          fi
+          echo "$state: $description"
+          gh api "repos/$REPO/statuses/$SHA" \
+            -f state="$state" -f context=stack \
+            -f description="${description:0:140}" -f target_url="$DOCS" > /dev/null
