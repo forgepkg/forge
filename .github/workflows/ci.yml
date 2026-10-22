@@ -10,7 +10,8 @@ name: CI
 # Only a pull request that targets the default branch runs CI. A stacked pull
 # request, which targets the branch of the one below it, runs the Stack
 # workflow alone; once GitHub retargets it to the default branch, stack.yml
-# starts this workflow on its branch via `workflow_dispatch`.
+# starts this workflow on its branch via `workflow_dispatch`, with the
+# default branch as `base`, so that run too runs the jobs the change needs.
 on:
   push:
     branches: [main, master]
@@ -18,6 +19,11 @@ on:
     branches: [main, master]
   merge_group:
   workflow_dispatch:
+    inputs:
+      base:
+        description: Run only the jobs the branch's change since it forked off this branch needs (empty runs every job)
+        type: string
+        default: ""
 
 # Pull requests: a newer commit on the same PR supersedes (cancels) the running
 # check. Every other run (a merge group, a push to the default branch, a manual
@@ -74,8 +80,8 @@ jobs:
   # base (a merge group with the group ahead of it in the queue, or main) and
   # sets one output per group of paths (rust, changelog, audit, web, image,
   # kubernetes), and a job whose groups are all `false` is skipped,
-  # which passes a required check. Pushes to the default branch and manual
-  # runs set every group. The conditions run a job unless its output is
+  # which passes a required check. Pushes to the default branch set every
+  # group, and so does a manual run without a `base` branch to compare with. The conditions run a job unless its output is
   # `false`, so if this job fails, every job runs. Every job waits for this
   # one, a second turn in the runner queue for a few seconds of work (see
   # fmt); in exchange most changes leave most jobs out.
@@ -100,6 +106,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          DISPATCH_BASE: ${{ inputs.base }}
+          GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-changes.sh
 
   # ── Formatting, and the changelog fragments ────────────────────────────────
@@ -279,7 +287,7 @@ jobs:
   # Builds the production Dockerfile so a broken image is caught before a
   # release tag, not by it, whenever a change touches what the image is built
   # from (the image group, #338 and #353), on pushes to the default branch and
-  # on manual runs. clippy, test and web compile the Rust code and the SPA of
+  # on manual runs without a `base`. clippy, test and web compile the Rust code and the SPA of
   # every other change; one that breaks only the image (a release-only cfg, a
   # file .dockerignore leaves out) fails on the next push to the default
   # branch.

@@ -17,7 +17,9 @@ name: Stack
 # the default branch, this workflow starts CI on its branch: as a
 # `workflow_dispatch` run, the one event a GITHUB_TOKEN may start a workflow
 # with, whose check runs land on the head commit the default branch's rules
-# check. Every later push runs CI on the pull request as usual.
+# check. Its `base` input makes it run only the jobs the pull request's
+# change needs, as a pull request run does. Every later push runs CI on the
+# pull request as usual.
 #
 # A pull request opened against the default branch gets no status: the
 # ruleset does not apply there, and Dependabot's and forks' read-only tokens
@@ -72,4 +74,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD_REF: ${{ github.head_ref }}
-        run: gh workflow run ci.yml --repo "$REPO" --ref "$HEAD_REF"
+          BASE: ${{ github.base_ref }}
+        run: gh workflow run ci.yml --repo "$REPO" --ref "$HEAD_REF" -f base="$BASE"
