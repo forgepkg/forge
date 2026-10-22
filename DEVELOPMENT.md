@@ -608,9 +608,9 @@ cargo test -p forge-server
 ```
 
 **Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
-tests in their job summary (GitLab: at the end of the job log). Every result
-line in the log carries its test's duration (`test foo ... ok <1.234s>`).
-Locally, run any `cargo test` through the same runner, then summarize:
+tests in their job summary. Every result line in the log carries its test's
+duration (`test foo ... ok <1.234s>`). Locally, run any `cargo test` through
+the same runner, then summarize:
 
 ```bash
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
@@ -618,6 +618,27 @@ export FORGE_TEST_TIMINGS=$(mktemp -d)
 cargo test --workspace
 .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS"
 ```
+
+**Test binaries in parallel.** `cargo test` runs one test binary at a time,
+and every integration-test binary starts its own containers, so CI's `test`
+job runs them side by side with `.github/scripts/test-parallel.sh`, which
+takes `cargo test`'s arguments:
+
+```bash
+.github/scripts/test-parallel.sh --workspace    # FORGE_TEST_JOBS=<n> binaries at a time, default: CPUs
+```
+
+It builds and runs the doc tests through `cargo test`, with itself as the
+target runner recording how cargo would run each test binary (working
+directory, environment, arguments). Then it runs the recorded binaries, each
+through the runner set in `CARGO_TARGET_<triple>_RUNNER` if there is one (as
+above, for the timings), prints each binary's output in one piece when it is
+done and lists the failed binaries at the end. On CI's 4-CPU runner the test
+binaries take about 150 s this way instead of about 260 s, and the CPUs are
+then busy all the time; more binaries at a time than CPUs gains little. Running side by side loads the machine more, so
+a test with a tight timing bound, or one whose test threads disturb each
+other, fails more often than under plain `cargo test` (#345, #347): give it
+slack rather than running fewer binaries at a time.
 
 The test build leaves the workspace crates unoptimized but optimizes the
 dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
@@ -726,10 +747,12 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) has
-the jobs `fmt`, `clippy`, `audit`, `plugins`, `test`, `docker`, `kubernetes`,
-`web` and `oci-e2e`, and the slow `e2e` and `web-e2e`, which pull requests
-skip: those two run in the merge queue and on every push to `main`.
+CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
+`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`e2e` and `web-e2e`, which pull requests skip: those two run in the merge
+queue and on every push to `main`. It runs on pull requests that target
+`main` only; a stacked one waits (see [Stacked pull
+requests](#stacked-pull-requests)).
 
 On a pull request and in the merge queue, a job runs only when the change
 touches what it checks (#353). The `changes` job
@@ -747,26 +770,20 @@ of it passed too (see below). It sorts the change into groups of paths:
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
 | Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
-| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, `.gitlab-ci.yml`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to the CI configuration counts for every group. A job left out is
 skipped, which passes a required check. If the `changes` job fails, every job
-runs. Pushes to `main` and manual runs run every job, which the release gate
-requires. A file that Rust code or its tests read from outside the crates
-belongs in the Rust group: add a new one to `ci-changes.sh` and to the
-`.paths` of `.gitlab-ci.yml`.
+runs. Pushes to `main` run every job, which the release gate requires, and
+so does a manual run, unless it names a `base` branch: then it compares the
+branch with the commit it forked off that one. A file that Rust code or its
+tests read from outside the crates belongs in the Rust group: add a new one
+to `ci-changes.sh`.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
 only the image build, such as an `include_str!` of a file `.dockerignore`
 leaves out, therefore fails on the push to `main` rather than in the queue.
-
-On GitLab, the same groups are `rules: changes` in merge request pipelines
-and merge trains; a merge request that touches none of them gets no
-pipeline. As in a GitHub merge group, a merge train pipeline checks only its
-own merge request: the merge requests ahead count through their own
-pipelines, since a failed one leaves the train and the pipelines behind it
-restart without it.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, with the jobs its changes
@@ -788,11 +805,6 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).
-
-On GitLab, a merge train is the merge queue: enable **merged results
-pipelines** and **merge trains** under *Settings → Merge requests*. Merge
-train pipelines run `e2e` and `web-e2e` as well, when the change touches
-their groups.
 
 ### Stacked pull requests
 
@@ -822,6 +834,17 @@ and Dependabot's:
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
   token has to be added to the bypass list.
 
+CI runs only on pull requests that target `main`, so a stacked pull request
+runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
+on every pull request above it. When a pull request is retargeted to `main`,
+the `Stack` workflow starts CI on its branch, with `main` as its `base`, so
+it runs the jobs the pull request's change needs, as a pull request run
+does. That run checks the branch as it is, not its merge with `main`; the
+next push, and the merge queue, check the merge. To check a stacked branch
+earlier, run CI on it by hand: **Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`.
+A pull request from a fork gets no such run: a push to it starts CI.
+
 ## Changelog entries
 
 A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its
@@ -848,8 +871,8 @@ next milestone.
 
 A `v<version>` tag on the default branch publishes the release: the release
 workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/schmitch/forge:<version>`, packages the Helm chart pinned to that
-image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
+`ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned to that
+image's digest, pushes and signs it as `oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
@@ -938,15 +961,18 @@ files:
    **Restrict deletions** and an empty bypass list, so nobody moves or
    deletes a release tag.
 
-**First release only.** GHCR creates a package of a user account as
-**private**, whatever the repository's visibility, and there is no REST API
-to change it. After the first release run, open each package's settings
-(profile → **Packages** → the package → **Package settings**) for
-`ghcr.io/schmitch/forge` (the image) and `ghcr.io/schmitch/charts/forge` (the
-chart):
+**First release under forgepkg only.** The repository moved from
+`schmitch/forge` to `forgepkg/forge`, and the release publishes to the
+packages of the repository's owner: from 1.2.0 on `ghcr.io/forgepkg/forge`
+(the image) and `ghcr.io/forgepkg/charts/forge` (the chart), while the
+releases up to 1.1.0 stay at `ghcr.io/schmitch/forge` and
+`ghcr.io/schmitch/charts/forge`. GHCR creates a new package as **private**,
+whatever the repository's visibility, and there is no REST API to change it.
+After the first release run, open each package's settings (the
+organization's **Packages** tab → the package → **Package settings**):
 
 1. Under **Danger Zone → Change visibility**, make both **Public**.
-2. On the chart, under **Manage Actions access**, give the `schmitch/forge`
+2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
    repository the **Write** role if it is not listed. Without it the next
    release's `helm push` fails after the image tags have already moved.
 
@@ -959,5 +985,5 @@ the first `sources` entry of `Chart.yaml` into that annotation.
 
 ```bash
 docker logout ghcr.io; helm registry logout ghcr.io
-docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
+docker pull ghcr.io/forgepkg/forge:<version> && helm pull oci://ghcr.io/forgepkg/charts/forge --version <version>
 ```

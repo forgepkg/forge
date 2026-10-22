@@ -32,7 +32,7 @@ The base pins the image to the release it belongs to:
 
 ```yaml
 images:
-  - name: ghcr.io/schmitch/forge
+  - name: ghcr.io/forgepkg/forge
     newTag: 1.0.0
 ```
 

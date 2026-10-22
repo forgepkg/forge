@@ -44,9 +44,9 @@ updates:
       interval: weekly
     ignore:
       # The Rust image must match rust-toolchain.toml, which Dependabot cannot
-      # edit: bump both (and the rust image in .gitlab-ci.yml) by hand. A newer
-      # image builds only because rustup downloads the pinned toolchain at
-      # build time. Digest updates of the pinned tag still come.
+      # edit: bump both by hand. A newer image builds only because rustup
+      # downloads the pinned toolchain at build time. Digest updates of the
+      # pinned tag still come.
       - dependency-name: rust
         update-types:
           - version-update:semver-major

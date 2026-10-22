@@ -90,9 +90,39 @@ pub struct AppState {
     /// [`AppState::with_registry_keys`]) so every instance accepts every
     /// instance's tokens.
     pub registry_keys: forge_oci::token::TokenKeys,
+    /// This process among the instances of an install, as per-instance
+    /// reports (the local blob cache's statistics) name it.
+    pub instance: Arc<Instance>,
     /// Forge's own OIDC issuer: the keys a `federated_credential` OIDC realm
     /// signs its client assertions with, published under `/.well-known/`.
     pub assertion_issuer: AssertionIssuer,
+}
+
+/// One instance of Forge: each replica of an install has state of its own
+/// (the local blob cache), and what reports it names the instance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Instance {
+    /// The host name: `HOSTNAME` (a container's name, a pod's on
+    /// Kubernetes), else the kernel's; `None` when neither is known.
+    pub host: Option<String>,
+    /// When this process built its state, i.e. started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Instance {
+    /// This process, starting now.
+    pub fn current() -> Self {
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+            .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
+        Instance {
+            host,
+            started_at: chrono::Utc::now(),
+        }
+    }
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
@@ -312,6 +342,7 @@ impl AppState {
                 rand::rng().fill_bytes(&mut key);
                 key
             }]),
+            instance: Arc::new(Instance::current()),
             assertion_issuer,
         }
     }

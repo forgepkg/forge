@@ -104,8 +104,9 @@ cargo xtask dev --db none    # assume the DB is already up; don't start one
 ### Run via the Docker image
 
 Every release publishes the signed image to GitHub Packages as
-[`ghcr.io/schmitch/forge`](https://github.com/schmitch/forge/pkgs/container/forge)
-(see [docs/deployment.md](docs/deployment.md#image)). To build it from a
+[`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)
+(from 1.2.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
+[docs/deployment.md](docs/deployment.md#image)). To build it from a
 checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
 server into one image (no Node in prod):
 
@@ -167,7 +168,7 @@ docker pull localhost:8421/docker-hosted/team/alpine:3.20
   and reverse proxy, secret encryption, health probes, backup/restore and
   upgrades. Kubernetes: a Helm chart published with every release
   (**[deploy/helm/forge](./deploy/helm/forge/README.md)**, on GitHub Packages
-  as [`oci://ghcr.io/schmitch/charts/forge`](https://github.com/schmitch/forge/pkgs/container/charts%2Fforge)), or kustomize
+  as [`oci://ghcr.io/forgepkg/charts/forge`](https://github.com/forgepkg/forge/pkgs/container/charts%2Fforge)), or kustomize
   manifests (**[deploy/kubernetes](./deploy/kubernetes/README.md)**).
 - **[CHANGELOG.md](./CHANGELOG.md)** — release notes, upgrade notes and known
   limitations; **[SECURITY.md](./SECURITY.md)** — how to report a

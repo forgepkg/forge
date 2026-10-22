@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Markdown summary of the timings test-timings-runner.sh recorded: the
 # slowest test binaries (wall time) and the slowest tests. ci.yml appends it
-# to the job summary ($GITHUB_STEP_SUMMARY); .gitlab-ci.yml prints it to the
-# job log.
+# to the job summary ($GITHUB_STEP_SUMMARY).
 #
 # A test's time runs from its start to its result. The tests of one binary
 # run in parallel, so their times overlap, and a test waiting on a lock its
