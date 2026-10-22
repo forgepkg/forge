@@ -12,7 +12,7 @@ CI publishing without stored API keys see
 | PostgreSQL 15+ (17 tested) | The authority for all metadata, sessions, RBAC and coordination. Migrations run automatically at startup. From PostgreSQL 15 on, `public` no longer grants CREATE to every role, so the role in `FORGE_DATABASE__URL` must own the database (`CREATE DATABASE forge OWNER forge`) or hold CREATE on its schema. |
 | S3-compatible object store | Package blobs (content-addressed). AWS S3, MinIO, Ceph RGW, versitygw, … A missing bucket is created in the configured region; see [S3 permissions](#s3-permissions). Static keys or [short-lived credentials](#short-lived-s3-credentials) (IRSA, EKS Pod Identity, STS web identity). |
 | TLS termination | A reverse proxy or load balancer in front of Forge (nginx, Traefik, an ingress, an ALB). Forge itself speaks plain HTTP. |
-| Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. |
+| Valkey or Redis 6+ (optional) | Shared L2 cache and cross-instance invalidation. Recommended as soon as you run more than one instance. TLS via `rediss://`. The Helm chart (`valkey.enabled`) and the kustomize component `valkey` can run a Valkey in the cluster. |
 
 Forge is a single stateless process. The API, the NuGet feed and the web UI
 share one port (`8421`), so one upstream on the reverse proxy is enough.

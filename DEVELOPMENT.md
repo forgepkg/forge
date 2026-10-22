@@ -600,7 +600,7 @@ SBOM attestation covers the npm packages and crates, not just Debian's.
 
 Every image the build and the deployment use is pinned by digest
 (`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
-BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Redis
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Valkey
 and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
 fails on a reference without one; Forge's own image is exempt, since the
 release pins it. Dependabot bumps the base images and the `deploy/` images;

@@ -1,16 +1,16 @@
-# Redis for Forge (forge chart: `redis:`). Anything that can write to Redis
-# can write Forge's shared cache, so keep it password-protected and reachable
-# from Forge only (docs/deployment.md).
+# Valkey for Forge (forge chart: `valkey:`). Anything that can write to
+# Valkey can write Forge's shared cache, so keep it password-protected and
+# reachable from Forge only (docs/deployment.md).
 
 nameOverride: ""
 fullnameOverride: ""
 
 image:
   registry: docker.io
-  repository: library/redis
+  repository: valkey/valkey
   # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
   # Dependabot bumps together with the tag; `digest`, when set, replaces it.
-  tag: 8.10-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+  tag: 9.1-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -18,18 +18,19 @@ imagePullSecrets: []
 
 auth:
   enabled: true
-  # Generated on install and kept when empty. Forge pastes it into its Redis
-  # URL unescaped: use a URL-safe value (`openssl rand -hex 24`).
+  # Generated on install and kept when empty. Forge pastes it into its
+  # FORGE_REDIS__URL (Valkey speaks the Redis protocol) unescaped: use a
+  # URL-safe value (`openssl rand -hex 24`).
   password: ""
   # An existing Secret holding the password instead of the chart's.
   existingSecret: ""
   secretKey: password
-  # A change of auth.password restarts Redis through a pod annotation that
+  # A change of auth.password restarts Valkey through a pod annotation that
   # holds its SHA-256 salted with a random value, so the annotation (which
   # anyone who can read the pods sees) cannot be tested against guesses. The
   # salt is generated on install and kept in the chart's Secret (key
   # checksum-salt). Tools that render without a cluster (Argo CD, `helm
-  # template`) would generate a new one, and restart Redis, on every render:
+  # template`) would generate a new one, and restart Valkey, on every render:
   # set one here for them (`openssl rand -hex 16`).
   checksumSalt: ""
 
@@ -39,7 +40,7 @@ service:
   annotations: {}
   labels: {}
 
-# Further redis-server arguments, e.g. ["--maxmemory", "200mb",
+# Further valkey-server arguments, e.g. ["--maxmemory", "200mb",
 # "--maxmemory-policy", "allkeys-lru"]. The chart already turns persistence
 # off (--save "" --appendonly no).
 extraArgs: []
@@ -53,7 +54,7 @@ resources:
     memory: 256Mi
 
 podSecurityContext:
-  # The image's `redis` user.
+  # The image's `valkey` user.
   runAsNonRoot: true
   runAsUser: 999
   runAsGroup: 1000
@@ -67,7 +68,7 @@ securityContext:
   capabilities:
     drop: [ALL]
 
-# Probe timing; the handler is a TCP check of the redis port.
+# Probe timing; the handler is a TCP check of the valkey port.
 readinessProbe:
   periodSeconds: 5
 livenessProbe:
@@ -80,7 +81,7 @@ tolerations: []
 affinity: {}
 priorityClassName: ""
 
-# Only Forge reaches Redis (where the CNI enforces NetworkPolicy).
+# Only Forge reaches Valkey (where the CNI enforces NetworkPolicy).
 networkPolicy:
   enabled: true
   extraFrom: []

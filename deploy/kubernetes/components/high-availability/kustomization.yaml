@@ -1,6 +1,6 @@
 # Two Forge instances spread over nodes, with a PodDisruptionBudget so a node
 # drain keeps one serving. Instances coordinate through PostgreSQL; give them
-# a shared Redis too (../redis, or FORGE_REDIS__URL in the forge-env Secret),
+# a shared Valkey too (../valkey, or FORGE_REDIS__URL in the forge-env Secret),
 # or caches and invalidations converge only by TTL.
 #
 # Every instance opens up to database.max_connections (default 20): keep

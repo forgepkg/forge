@@ -376,8 +376,8 @@ certificate:
   # Further Certificate spec fields (duration, privateKey, usages, ...).
   extraSpec: {}
 
-# Several replicas need Redis (redis.enabled or FORGE_REDIS__URL) so caches
-# and invalidations converge immediately, and replicas x
+# Several replicas need Valkey or Redis (valkey.enabled or FORGE_REDIS__URL)
+# so caches and invalidations converge immediately, and replicas x
 # database.max_connections (20) must fit PostgreSQL's max_connections.
 podDisruptionBudget:
   enabled: false
@@ -415,9 +415,9 @@ networkPolicy:
   # Further ingress rules.
   extraIngress: []
   # Egress rules. Empty leaves egress unrestricted; once set, allow DNS,
-  # PostgreSQL, S3, Redis and every proxy upstream / OIDC issuer, and for
-  # short-lived S3 credentials the STS (EKS Pod Identity: the node's agent at
-  # 169.254.170.23, TCP 80).
+  # PostgreSQL, S3, Valkey (or Redis) and every proxy upstream / OIDC issuer,
+  # and for short-lived S3 credentials the STS (EKS Pod Identity: the node's
+  # agent at 169.254.170.23, TCP 80).
   egress: []
 
 # Further objects to render with the release, as YAML or as strings; both are
@@ -439,16 +439,18 @@ extraObjects: []
 # Generated passwords are kept across upgrades (looked up in the cluster) and
 # survive `helm uninstall` with the data. Tools that render without a cluster
 # (Argo CD, `helm template`) generate a new one on every render: set
-# auth.password or auth.existingSecret there (and, for Redis with
+# auth.password or auth.existingSecret there (and, for Valkey with
 # auth.password, auth.checksumSalt).
 
 # PostgreSQL 17 StatefulSet; sets FORGE_DATABASE__URL.
 postgresql:
   enabled: false
 
-# Redis (cache only, no persistence); sets FORGE_REDIS__URL. Recommended as
-# soon as more than one Forge instance runs.
-redis:
+# Valkey (cache only, no persistence); sets FORGE_REDIS__URL. Recommended as
+# soon as more than one Forge instance runs. Leave it disabled to run without
+# a shared cache (one instance) or to use your own Valkey or Redis through
+# FORGE_REDIS__URL in secretEnv or existingSecret.
+valkey:
   enabled: false
 
 # versitygw S3 gateway on a PersistentVolume; sets FORGE_S3__ACCESS_KEY /

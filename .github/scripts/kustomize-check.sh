@@ -54,7 +54,7 @@ secretGenerator:
   - name: forge-env
     literals:
       - POSTGRES_PASSWORD=check
-      - REDIS_PASSWORD=check
+      - VALKEY_PASSWORD=check
       - FORGE_S3__ACCESS_KEY=check
       - FORGE_S3__SECRET_KEY=check
 EOF

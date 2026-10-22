@@ -1,28 +1,28 @@
-{{- $fullname := include "forge-redis.fullname" . }}
-{{- $tcpCheck := dict "tcpSocket" (dict "port" "redis") }}
+{{- $fullname := include "forge-valkey.fullname" . }}
+{{- $tcpCheck := dict "tcpSocket" (dict "port" "valkey") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ $fullname }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "forge-redis.labels" . | nindent 4 }}
+    {{- include "forge-valkey.labels" . | nindent 4 }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "forge-redis.selectorLabels" . | nindent 6 }}
+      {{- include "forge-valkey.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "forge-redis.labels" . | nindent 8 }}
+        {{- include "forge-valkey.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        # A changed auth.password or existingSecret restarts Redis; the
-        # password is hashed with a salt (forge-redis.authChecksum).
-        checksum/auth: {{ include "forge-redis.authChecksum" . }}
+        # A changed auth.password or existingSecret restarts Valkey; the
+        # password is hashed with a salt (forge-valkey.authChecksum).
+        checksum/auth: {{ include "forge-valkey.authChecksum" . }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -53,19 +53,19 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: redis
-          image: {{ include "forge-redis.image" . | quote }}
+        - name: valkey
+          image: {{ include "forge-valkey.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- $args := list }}
           {{- if .Values.auth.enabled }}
-          {{- $args = list "--requirepass" "$(REDIS_PASSWORD)" }}
+          {{- $args = list "--requirepass" "$(VALKEY_PASSWORD)" }}
           {{- end }}
           args:
             {{- toYaml (concat $args (list "--save" "" "--appendonly" "no") .Values.extraArgs) | nindent 12 }}
           {{- if or .Values.auth.enabled .Values.extraEnv }}
           env:
             {{- if .Values.auth.enabled }}
-            - name: REDIS_PASSWORD
+            - name: VALKEY_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ default $fullname .Values.auth.existingSecret }}
@@ -76,7 +76,7 @@ spec:
             {{- end }}
           {{- end }}
           ports:
-            - name: redis
+            - name: valkey
               containerPort: 6379
               protocol: TCP
           readinessProbe:

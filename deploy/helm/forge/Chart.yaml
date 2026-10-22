@@ -30,14 +30,15 @@ annotations:
 
 # Optional in-cluster backing services for evaluation and small installs,
 # shipped inside this chart (charts/). Each one is off by default; production
-# installs point Forge at a managed PostgreSQL, object store and Redis.
+# installs point Forge at a managed PostgreSQL, object store and Valkey or
+# Redis.
 dependencies:
   - name: postgresql
     version: 1.0.0
     condition: postgresql.enabled
-  - name: redis
+  - name: valkey
     version: 1.0.0
-    condition: redis.enabled
+    condition: valkey.enabled
   - name: versitygw
     version: 1.0.0
     condition: versitygw.enabled

@@ -53,7 +53,7 @@ updates:
           - version-update:semver-minor
           - version-update:semver-patch
 
-  # Images of the in-cluster dependencies (PostgreSQL, Redis, versitygw),
+  # Images of the in-cluster dependencies (PostgreSQL, Valkey, versitygw),
   # pinned by digest: the kustomize components' manifests and the Helm
   # sub-charts' values.yaml (`image.tag: <tag>@sha256:…`, the form Dependabot
   # updates). Tag and digest are bumped together. Dependabot does not see the
@@ -64,10 +64,10 @@ updates:
   - package-ecosystem: docker
     directories:
       - /deploy/kubernetes/components/postgres
-      - /deploy/kubernetes/components/redis
+      - /deploy/kubernetes/components/valkey
       - /deploy/kubernetes/components/s3-versitygw
       - /deploy/helm/forge/charts/postgresql
-      - /deploy/helm/forge/charts/redis
+      - /deploy/helm/forge/charts/valkey
       - /deploy/helm/forge/charts/versitygw
     schedule:
       interval: weekly
