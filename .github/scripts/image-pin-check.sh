@@ -12,7 +12,7 @@
 #     with `generator=…@sha256:…`).
 #
 # Exempt on purpose:
-#   - Forge's own image, ghcr.io/schmitch/forge, which the release pins
+#   - Forge's own image, ghcr.io/forgepkg/forge, which the release pins
 #     itself: the published chart pulls it by the digest the release workflow
 #     signed (Chart.yaml annotation forge.envisia.de/image-digest), and the
 #     Kubernetes base names the release's tag, which the release workflow
@@ -35,7 +35,7 @@ function pinned(ref,   at) {
   return at > 0 && length(ref) - at - 7 == 64 && substr(ref, at + 8) ~ /^[0-9a-f]+$/
 }
 function own(ref) {
-  return ref ~ /^ghcr\.io\/schmitch\/forge([:@]|$)/
+  return ref ~ /^ghcr\.io\/forgepkg\/forge([:@]|$)/
 }
 function check(ref, what, file, line) {
   if (ref == "" || own(ref) || pinned(ref)) return

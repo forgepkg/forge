@@ -753,8 +753,8 @@ train pipelines run `e2e` and `web-e2e` as well.
 
 A `v<version>` tag on the default branch publishes the release: the release
 workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/schmitch/forge:<version>`, packages the Helm chart pinned to that
-image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
+`ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned to that
+image's digest, pushes and signs it as `oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
@@ -838,15 +838,18 @@ files:
    **Restrict deletions** and an empty bypass list, so nobody moves or
    deletes a release tag.
 
-**First release only.** GHCR creates a package of a user account as
-**private**, whatever the repository's visibility, and there is no REST API
-to change it. After the first release run, open each package's settings
-(profile → **Packages** → the package → **Package settings**) for
-`ghcr.io/schmitch/forge` (the image) and `ghcr.io/schmitch/charts/forge` (the
-chart):
+**First release under forgepkg only.** The repository moved from
+`schmitch/forge` to `forgepkg/forge`, and the release publishes to the
+packages of the repository's owner: from 1.2.0 on `ghcr.io/forgepkg/forge`
+(the image) and `ghcr.io/forgepkg/charts/forge` (the chart), while the
+releases up to 1.1.0 stay at `ghcr.io/schmitch/forge` and
+`ghcr.io/schmitch/charts/forge`. GHCR creates a new package as **private**,
+whatever the repository's visibility, and there is no REST API to change it.
+After the first release run, open each package's settings (the
+organization's **Packages** tab → the package → **Package settings**):
 
 1. Under **Danger Zone → Change visibility**, make both **Public**.
-2. On the chart, under **Manage Actions access**, give the `schmitch/forge`
+2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
    repository the **Write** role if it is not listed. Without it the next
    release's `helm push` fails after the image tags have already moved.
 
@@ -859,5 +862,5 @@ the first `sources` entry of `Chart.yaml` into that annotation.
 
 ```bash
 docker logout ghcr.io; helm registry logout ghcr.io
-docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
+docker pull ghcr.io/forgepkg/forge:<version> && helm pull oci://ghcr.io/forgepkg/charts/forge --version <version>
 ```
