@@ -2324,9 +2324,9 @@ impl Config {
 
     /// A docker default (`default` bytes): with an explicit staging budget
     /// smaller than it, what fits the budget (less `nuget.max_nuspec_bytes`,
-    /// like a repository's own limit). The docker defaults came with 1.1.0,
-    /// and a staging budget sized for a 1.0.0 install must not refuse to
-    /// start for them.
+    /// like a repository's own limit). An operator who sizes the budget
+    /// below the docker defaults gets smaller defaults rather than a refusal
+    /// to start; [`Self::deployment_warnings`] says so.
     fn docker_default(&self, default: u64) -> u64 {
         match self.server.max_staging_bytes {
             Some(budget) if budget > 0 => {
@@ -4028,18 +4028,17 @@ mod tests {
         assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
     }
 
-    /// A staging budget sized for a 1.0.0 install keeps starting after the
-    /// upgrade (#198): the 1 GiB docker defaults shrink to fit it, with a
-    /// warning, and only settings the operator can change decide the minimum,
-    /// which the error names.
+    /// An explicit staging budget below the 1 GiB docker defaults starts:
+    /// they shrink to fit it, with a warning, and only settings the operator
+    /// can change decide the minimum, which the error names.
     #[test]
     fn an_explicit_staging_budget_bounds_the_docker_defaults() {
         const MIB: u64 = 1024 * 1024;
-        let v1 = MINIMAL.replace(
+        let budget = MINIMAL.replace(
             "[server]",
             "[server]\nmax_upload_bytes = 268435456\nmax_staging_bytes = 805306368",
         ) + "\n[proxy]\nmax_package_bytes = 268435456\n";
-        let cfg = Config::from_figment(fig_from_toml(&v1)).expect("a valid 1.0.0 config starts");
+        let cfg = Config::from_figment(fig_from_toml(&budget)).expect("a small budget starts");
         let fits = 768 * MIB - cfg.nuget.max_nuspec_bytes;
         assert_eq!(cfg.default_upload_limit("docker"), fits);
         assert_eq!(cfg.docker_max_blob_bytes(), fits);
@@ -4052,7 +4051,7 @@ mod tests {
 
         // An explicit docker.max_blob_bytes is the operator's and must fit;
         // the error names it.
-        let explicit = format!("{v1}\n[docker]\nmax_blob_bytes = 1073741824\n");
+        let explicit = format!("{budget}\n[docker]\nmax_blob_bytes = 1073741824\n");
         let err = Config::from_figment(fig_from_toml(&explicit)).unwrap_err();
         assert!(
             err.to_string().contains("lower docker.max_blob_bytes"),
