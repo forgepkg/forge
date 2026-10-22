@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT c.created_at, c.last_downloaded_at\n        FROM component c JOIN repository r ON r.id = c.repository_id\n        WHERE r.name = $1 AND c.name = 'acme.core'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_downloaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "last_downloaded_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "4a31af4ec2a7e0ee7f4b2a1ca245e4ced1c380df88ca4f293ea949354b75e748"
+}

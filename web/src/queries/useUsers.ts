@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
+import { realmKeys } from '~/api/realms'
 import {
+  convertUserToLocal,
   createUser,
   deleteUser,
   fetchUsers,
@@ -43,6 +45,21 @@ export function useDeleteUser() {
     mutationFn: (id) => deleteUser(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+    },
+  })
+}
+
+/**
+ * Switch a credential-forwarding account to a local one with its kept
+ * password; invalidates the list (and realm counts) on success.
+ */
+export function useConvertUserToLocal() {
+  const queryClient = useQueryClient()
+  return useMutation<UserView, ApiError, number>({
+    mutationFn: (id) => convertUserToLocal(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+      void queryClient.invalidateQueries({ queryKey: realmKeys.all() })
     },
   })
 }

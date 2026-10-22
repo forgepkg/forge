@@ -43,6 +43,16 @@
 //!    cache's filesystem every minute, evicts down to the limit, and logs the
 //!    cache's statistics. Per instance, like the cache itself.
 //!
+//! 7. **Issuer key refresh** — re-reads forge's OIDC issuer keys (the client
+//!    assertions of a `federated_credential` realm), creates them once such a
+//!    realm is enabled, and rotates them when due. The rotation is a
+//!    compare-and-swap on the shared setting, safe on every instance.
+//!
+//! 8. **Nexus imports** — claims a queued import (or one whose instance
+//!    died) with `FOR UPDATE SKIP LOCKED` and a lease it renews, so an import
+//!    runs on one instance at a time; every instance runs the loop
+//!    ([`crate::nexus_import`]).
+//!
 //! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process, and runs under [`supervise`]: a loop that
@@ -82,6 +92,8 @@ pub struct WorkerHandles {
     /// Re-reads the shared registry token key, so a key another instance
     /// had to replace is picked up. Not run with `docker.token_secret`.
     pub registry_key_refresh: JoinHandle<()>,
+    /// Re-reads, creates and rotates forge's OIDC issuer keys.
+    pub issuer_refresh: JoinHandle<()>,
     /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
     /// when `[crypto]` is enabled and its rotation worker is not turned off.
     /// Cluster-coordinated via a Postgres advisory lock (see
@@ -91,6 +103,8 @@ pub struct WorkerHandles {
     /// Local blob cache maintenance (re-read the disk size, evict down to the
     /// limit). Present only with `[blob_cache]`; per instance, like the cache.
     pub blob_cache: Option<JoinHandle<()>>,
+    /// Runs imports from Nexus, one at a time per instance.
+    pub nexus_import: JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -106,12 +120,14 @@ impl WorkerHandles {
         self.cred_reaper.abort();
         self.registry_sweeper.abort();
         self.registry_key_refresh.abort();
+        self.issuer_refresh.abort();
         if let Some(h) = &self.crypto_rotation {
             h.abort();
         }
         if let Some(h) = &self.blob_cache {
             h.abort();
         }
+        self.nexus_import.abort();
     }
 }
 
@@ -228,6 +244,15 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         tokio::spawn(async {})
     };
 
+    // Forge's OIDC issuer keys: shared through the database, so every
+    // instance re-reads them; any one of them rotates.
+    let issuer_refresh = {
+        let state = state.clone();
+        supervise("issuer-refresh", move || {
+            crate::auth::spawn_issuer_refresh(state.clone())
+        })
+    };
+
     // Crypto rotation/backfill worker (slice 12.5): only when secret
     // encryption is enabled. One instance at a time performs a pass (advisory
     // lock); every step is idempotent/resumable so crashes are harmless.
@@ -263,6 +288,14 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     });
 
+    // Nexus imports: the lease decides which instance runs an import.
+    let nexus_import = {
+        let state = state.clone();
+        supervise("nexus-import", move || {
+            crate::nexus_import::ImportWorker::new(state.clone()).spawn_loop()
+        })
+    };
+
     WorkerHandles {
         outbox,
         reconciler,
@@ -272,8 +305,10 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         cred_reaper,
         registry_sweeper,
         registry_key_refresh,
+        issuer_refresh,
         crypto_rotation,
         blob_cache,
+        nexus_import,
     }
 }
 

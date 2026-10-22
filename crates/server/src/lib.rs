@@ -21,6 +21,7 @@ pub mod health;
 pub mod me;
 pub mod me_tokens;
 pub mod middleware;
+pub mod nexus_import;
 pub mod object_store;
 pub mod plugins;
 pub mod registry;

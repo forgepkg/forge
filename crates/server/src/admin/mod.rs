@@ -22,6 +22,8 @@
 //! * [`blob_cache`] — the local blob cache's statistics.
 //! * [`proxy_cache`] — invalidating what a proxy repository cached from its
 //!   upstream (its "not found" answers, listings and documents).
+//! * [`imports`] — importing a Nexus hosted repository into a hosted
+//!   repository (start with a preflight, progress, cancel, resume, retry).
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -42,6 +44,7 @@ pub mod crypto;
 pub mod effective;
 pub mod formats;
 pub mod grants;
+pub mod imports;
 pub mod members;
 pub mod proxy_cache;
 pub mod realms;
@@ -188,6 +191,26 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::post(proxy_cache::invalidate),
         )
         .route(
+            "/repositories/{name}/imports",
+            get(imports::list).post(imports::create),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}",
+            get(imports::get).delete(imports::delete),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/items",
+            get(imports::items),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/cancel",
+            axum::routing::post(imports::cancel),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/resume",
+            axum::routing::post(imports::resume),
+        )
+        .route(
             "/repositories/{name}/members",
             get(members::list).post(members::add),
         )
@@ -201,6 +224,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::patch(users::update).delete(users::delete),
         )
         .route("/users/{id}/reauth", axum::routing::post(users::reauth))
+        .route(
+            "/users/{id}/convert-to-local",
+            axum::routing::post(users::convert_to_local),
+        )
         .route(
             "/users/{id}/tokens",
             get(tokens::list_for_user).post(tokens::create),
@@ -243,6 +270,14 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(realms::get)
                 .patch(realms::update)
                 .delete(realms::delete),
+        )
+        .route(
+            "/realms/{id}/captured-passwords",
+            get(realms::captured_passwords),
+        )
+        .route(
+            "/realms/{id}/convert-to-local",
+            axum::routing::post(realms::convert_to_local),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route(
