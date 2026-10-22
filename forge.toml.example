@@ -21,9 +21,7 @@ allow_insecure_defaults = true  # (default: false)
 # Edit → "Maximum upload size") or the admin API (max_upload_bytes); without
 # one a repository accepts pushes of 512 MiB (docker: blobs of 1 GiB). Uploads
 # stream to a temp file (never buffered in memory); larger pushes get HTTP 413.
-# Deprecated: max_upload_bytes here is still honoured as the default of package
-# repositories without a limit of their own (startup warns); docker ignores it.
-# max_upload_bytes = 536870912
+# (server.max_upload_bytes is gone: startup refuses a config that sets it.)
 # Pushes and first-time proxy downloads are staged here; files a killed process
 # left behind are removed at startup. All staged files of this instance share
 # max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
