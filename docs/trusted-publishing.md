@@ -147,6 +147,14 @@ upstream. No account can be created, bootstrapped or provisioned under the name
 (an OIDC login whose username claim is `oidc` is provisioned as `oidc-2`), and
 the browser login refuses it.
 
+1.0.0 reserved no names. An account named `oidc` from before 1.1.0 keeps
+existing, but can no longer sign in with its password, and its API tokens
+work only as `X-NuGet-ApiKey`; startup logs a warning naming it. Rename it
+with SQL (`UPDATE app_user SET username = '<new name>' WHERE username =
+'oidc';`, the account keeps its id, password, roles and tokens), and change
+`auth.bootstrap_admin.username` if it was `oidc`: such a config refuses to
+start.
+
 Other Basic usernames still work with a direct token, as before. Prefer `oidc`:
 it is the one name that can never mean an account.
 
