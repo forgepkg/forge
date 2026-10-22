@@ -78,6 +78,14 @@ The release workflow publishes the section whose heading matches the tag
   policy or lease changes, and applies an image's decisions only after
   evaluating its current state again.
   ([#215](https://github.com/schmitch/forge/issues/215))
+- Docker proxies: a tag list was cut short, without a link to the next
+  page, when the upstream paged its tags (`Link: rel="next"`, as Quay
+  does) or refused a large `n` (then only the cached tags were listed), so
+  Renovate, Flux or `skopeo list-tags` missed tags; groups inherited it. A
+  proxy follows the upstream's pages, asks again without `n` when one is
+  refused, and links to its next page when the upstream has more. A group
+  ends its page where a member left tags out.
+  ([#216](https://github.com/schmitch/forge/issues/216))
 
 ## [1.1.0]
 
