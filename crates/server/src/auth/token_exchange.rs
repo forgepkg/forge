@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use super::wif::{ExchangeRefusal, WorkloadIdentitySource};
+use crate::middleware::principal::auth_unavailable;
 use crate::state::AppState;
 
 /// Where the exchange is served (nuget.org's path).
@@ -79,10 +80,12 @@ struct ExchangeResponse {
 }
 
 fn refused(status: StatusCode, message: &'static str) -> Response {
-    if status == StatusCode::UNAUTHORIZED {
-        (status, [(header::WWW_AUTHENTICATE, "Bearer")], message).into_response()
-    } else {
-        (status, message).into_response()
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            (status, [(header::WWW_AUTHENTICATE, "Bearer")], message).into_response()
+        }
+        StatusCode::SERVICE_UNAVAILABLE => auth_unavailable(),
+        _ => (status, message).into_response(),
     }
 }
 
