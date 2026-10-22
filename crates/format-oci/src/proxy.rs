@@ -170,6 +170,24 @@ fn next_link(response: &reqwest::Response, base: &str) -> Option<String> {
         })
 }
 
+/// Inside a transaction that caches what `repo`'s upstream served: lock the
+/// repository row and make sure the proxy still points at the upstream the
+/// content came from ([`oci_dao::lock_proxy_upstream`]). A proxy repointed
+/// meanwhile purged its cache, and content of the previous upstream must
+/// not land in it after that: the client is asked to retry.
+pub(crate) async fn still_upstream(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &Repository,
+) -> OciResult<()> {
+    if oci_dao::lock_proxy_upstream(tx, repo.id, repo.remote_url.as_deref()).await? {
+        Ok(())
+    } else {
+        Err(OciError::unavailable(
+            "the proxy was pointed at another upstream while this was fetched; retry",
+        ))
+    }
+}
+
 fn is_docker_hub(remote_url: &str) -> bool {
     url::Url::parse(remote_url)
         .ok()
@@ -727,6 +745,7 @@ impl Registry {
                     .await?;
                 if head.status().is_success() {
                     let mut tx = pool.begin().await?;
+                    still_upstream(&mut tx, repo).await?;
                     match oci_dao::insert_link_existing(
                         &mut tx,
                         repo.id,
@@ -796,6 +815,7 @@ impl Registry {
         };
         let stored = self.inner.cas.commit(staged).await?;
         let mut tx = pool.begin().await?;
+        still_upstream(&mut tx, repo).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
             repo.id,

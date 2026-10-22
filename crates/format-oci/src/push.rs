@@ -933,6 +933,7 @@ impl Registry {
         let stored = self.inner.cas.commit(staged).await?;
         let subject = parsed.subject.as_ref().map(|s| s.digest.to_string());
         let mut tx = self.inner.pool.begin().await?;
+        crate::proxy::still_upstream(&mut tx, &t.repo).await?;
         let (manifest_id, _) = oci_dao::insert_manifest(
             &mut tx,
             NewManifest {
