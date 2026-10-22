@@ -595,6 +595,12 @@ impl WorkloadIdentitySource {
     ) -> Result<VerifiedWorkload, SourceOutcome> {
         let verified = match realm.verify_token(token).await {
             Ok(v) => v,
+            // The issuer's discovery document or keys could not be fetched:
+            // no verdict on the token, so 503 and the CI job retries.
+            Err(e) if e.is_unavailable() => {
+                tracing::warn!(realm = %realm.realm_name, error = %e, "WIF issuer unreachable; token not checked");
+                return Err(SourceOutcome::Unavailable);
+            }
             Err(e) => {
                 tracing::warn!(realm = %realm.realm_name, error = %e, "WIF token validation failed");
                 return Err(SourceOutcome::Reject);

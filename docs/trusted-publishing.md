@@ -432,6 +432,12 @@ metadata according to the configured anonymous policy.
   so this does not force signing-key revocation to be fetched on every request.
   The positive verdict cache itself never extends past its configured TTL or
   token expiry.
+- When the issuer's discovery document or JWKS cannot be fetched (a timeout,
+  a refused connection, a 5xx) and is not cached yet, a workload token
+  cannot be checked: the exchange, the feeds and `/v2/token` answer 503 with
+  `Retry-After` rather than 401, so clients that retry do. This happens on a
+  cold cache only: after a restart, on a new replica, or when the JWKS cache
+  expires (hourly by default) during the issuer's outage.
 - Treat a token as a bearer credential until `exp`, and a workload key until
   its `expires`: mask both in CI logs and do not persist them as an artifact,
   cache entry, or repository secret. Exchange right before restoring or

@@ -11,11 +11,11 @@
 //!   is rejected with **401** — bad credentials are never downgraded to
 //!   anonymous.
 //! * If a source could not **check** the credentials (a database error looking
-//!   up a token or session), the request fails closed with **503** and
-//!   `Retry-After`: not anonymous, and not a 401 that would make a client
-//!   discard a credential that may be valid. The CSRF check of a
-//!   cookie-authenticated mutation answers the same when the session cannot
-//!   be read.
+//!   up a token or session, a workload token's issuer that cannot be
+//!   reached), the request fails closed with **503** and `Retry-After`: not
+//!   anonymous, and not a 401 that would make a client discard a credential
+//!   that may be valid. The CSRF check of a cookie-authenticated mutation
+//!   answers the same when the session cannot be read.
 //! * With no credentials, the anonymous policy decides between
 //!   [`Principal::Anonymous`] and [`Principal::Unauthenticated`]; the latter is
 //!   still passed downstream (authorization, not authentication, returns 401/403
@@ -315,8 +315,8 @@ async fn check_csrf(
 const AUTH_RETRY_AFTER_SECS: &str = "10";
 
 /// The **503** answer when authentication could not reach what it depends on
-/// (the database): no verdict on the credentials, so a client retries instead
-/// of discarding them as wrong.
+/// (the database, a workload token's issuer): no verdict on the credentials,
+/// so a client retries instead of discarding them as wrong.
 pub(crate) fn auth_unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,

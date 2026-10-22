@@ -90,6 +90,17 @@ pub enum OidcError {
     NonceMismatch,
 }
 
+impl OidcError {
+    /// Whether the issuer could not be asked rather than refusing the token:
+    /// its discovery document or JWKS could not be fetched (a transport error,
+    /// a timeout, a non-success status) or read (too large, not the expected
+    /// JSON). Such an error is no verdict on the token, so a caller answers
+    /// "try again later" instead of "invalid credentials".
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, OidcError::Http { .. } | OidcError::Parse { .. })
+    }
+}
+
 /// The subset of the OIDC discovery document we use.
 ///
 /// Cached as JSON via [`forge_cache::Cache`], so it is `Serialize`/`Deserialize`.
@@ -1135,6 +1146,7 @@ mod tests {
             .await
             .expect_err("metadata over one MiB must be rejected before full buffering");
         assert!(matches!(err, OidcError::Parse { .. }), "got {err:?}");
+        assert!(err.is_unavailable(), "no verdict on any token: {err:?}");
     }
 
     #[tokio::test]
@@ -1164,6 +1176,37 @@ mod tests {
             .await
             .expect_err("slow metadata response must honor the client deadline");
         assert!(matches!(err, OidcError::Http { .. }), "got {err:?}");
+        assert!(err.is_unavailable(), "no verdict on any token: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_jwks_is_unavailable_not_a_verdict_on_the_token() {
+        // Discovery answers, the JWKS endpoint fails with a 5xx, and nothing
+        // is cached: the token could not be checked, which callers must tell
+        // apart from a token that failed its check.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("k1");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_json(&issuer, &issuer)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let token = signer.sign(&workload_claims(&issuer, "forge-ci"));
+        let err = client_for(&issuer, &server)
+            .verify_workload_jwt(&token, &["forge-ci"], &[], 60, 3600)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::Http { .. }), "got {err:?}");
+        assert!(err.is_unavailable());
     }
 
     #[tokio::test]
@@ -1283,6 +1326,7 @@ mod tests {
         };
         let err = client.verify_id_token(&token, &params).await.unwrap_err();
         assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+        assert!(!err.is_unavailable(), "a verdict on the token: {err:?}");
     }
 
     #[tokio::test]
@@ -1513,6 +1557,7 @@ mod tests {
         };
         let err = client.verify_id_token(&token, &params).await.unwrap_err();
         assert_eq!(err, OidcError::UnknownKid(Some("absent-kid".into())));
+        assert!(!err.is_unavailable(), "a verdict on the token: {err:?}");
         // Cold load + one refetch, then give up — no infinite refetch loop.
         assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
 

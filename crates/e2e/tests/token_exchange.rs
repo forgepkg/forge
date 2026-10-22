@@ -439,6 +439,57 @@ async fn a_registry_token_dies_with_its_workload_key() {
 }
 
 #[tokio::test]
+async fn an_unreachable_issuer_answers_503_so_the_job_retries() {
+    // The issuer goes away before any instance fetched its discovery
+    // document or keys (a restart, a new replica): the token cannot be
+    // checked, which is no verdict on it. Every path answers 503 with
+    // `Retry-After`, never the 401 that makes NuGet and docker give up.
+    let idp = MockOidc::start_workload_only("unused-wif-client").await;
+    let srv = start_stack().await;
+    setup(&srv, &idp, json!({})).await;
+    let token = idp.sign_token(job_claims(&idp)).await;
+    drop(idp);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let unavailable = |response: reqwest::Response, what: &str| {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{what}");
+        assert!(
+            response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER),
+            "{what}"
+        );
+    };
+    unavailable(
+        exchange(
+            &srv,
+            &token,
+            json!({"username": "oidc", "tokenType": "ApiKey"}),
+        )
+        .await,
+        "token exchange",
+    );
+    unavailable(
+        srv.client()
+            .get(format!("{}/v3/ci-hosted/index.json", srv.base_url))
+            .basic_auth("oidc", Some(&token))
+            .send()
+            .await
+            .unwrap(),
+        "feed with the CI token",
+    );
+    unavailable(
+        srv.client()
+            .get(format!("{}/v2/token", srv.base_url))
+            .basic_auth("oidc", Some(&token))
+            .send()
+            .await
+            .unwrap(),
+        "registry token",
+    );
+}
+
+#[tokio::test]
 async fn a_key_dies_with_its_expiry_and_any_realm_change() {
     let idp = MockOidc::start_workload_only("unused-wif-client").await;
     let srv = start_stack().await;
