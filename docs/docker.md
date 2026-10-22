@@ -255,6 +255,14 @@ A docker repository's retention policy (`PUT
   audit work as for NuGet repositories; audit rows carry the image as
   `package_name` and the tag or digest as `version`. Group repositories have
   no policy of their own.
+- A run applies its decisions image by image, in batches of up to 100. As
+  for NuGet repositories, a batch first checks that the policy is still the
+  one the run evaluated and that the run still holds its lease; otherwise
+  the run stops, so disabling the policy, switching it to dry run or
+  editing it takes effect at once. The batch then evaluates the image's
+  current tags and manifests again and skips what they no longer warrant:
+  a tag pulled or pushed since, a tag that newer tags deleted meanwhile now
+  keep, or a signature whose image was tagged again.
 
 ## Configuration
 

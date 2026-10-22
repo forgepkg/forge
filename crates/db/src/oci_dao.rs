@@ -1521,6 +1521,52 @@ pub async fn retention_manifests(
     .await
 }
 
+/// Lock (`FOR UPDATE`) and load one image's manifests and tags, as
+/// [`retention_manifests`] and [`retention_tags`] load a repository's: for
+/// image retention to re-evaluate its decisions against the image's current
+/// state, which stays put until the caller's transaction ends. Manifests are
+/// locked before tags, in id and tag order.
+pub async fn lock_image_for_retention(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    image: &str,
+) -> sqlx::Result<(Vec<RetentionTag>, Vec<RetentionManifest>)> {
+    let manifests = sqlx::query_as!(
+        RetentionManifest,
+        r#"
+        SELECT m.id, m.image, m.digest, m.created_at, m.untagged_since, m.last_pulled_at,
+               m.subject_digest,
+               ARRAY(SELECT r.digest FROM oci_manifest_ref r
+                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!"
+        FROM oci_manifest m
+        WHERE m.repository_id = $1 AND m.image = $2
+        ORDER BY m.id
+        FOR UPDATE OF m
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let tags = sqlx::query_as!(
+        RetentionTag,
+        r#"
+        SELECT t.image, t.tag, t.manifest_id, m.digest, t.updated_at, m.last_pulled_at
+        FROM oci_tag t
+        JOIN oci_manifest m ON m.id = t.manifest_id
+        WHERE t.repository_id = $1 AND t.image = $2
+        ORDER BY t.tag
+        FOR UPDATE OF t
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok((tags, manifests))
+}
+
 /// Delete `tag` only if it still points at `manifest_id` (retention decided
 /// on that). `false`: it moved or is gone.
 pub async fn delete_tag_if(

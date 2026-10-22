@@ -2214,6 +2214,276 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
 }
 
+/// Claim `repo_id`'s retention run and evaluate its image policy as the
+/// worker does, stopping before the apply step so a test can change state
+/// in between.
+async fn claim_image_run(
+    srv: &TestServer,
+    repo: &str,
+    repo_id: i64,
+) -> (
+    forge_db::retention_dao::ClaimedRepo,
+    uuid::Uuid,
+    forge_core::retention::images::ImageRetentionPolicy,
+    forge_core::retention::images::ImageDecisions,
+    chrono::DateTime<chrono::Utc>,
+) {
+    let resp = admin_post(
+        srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    let mut tx = srv.pool.begin().await.unwrap();
+    let (claimed, run_id) = forge_db::retention_dao::claim_next_due_repo(
+        &mut tx,
+        chrono::Utc::now(),
+        chrono::Duration::seconds(300),
+        Some(repo_id),
+    )
+    .await
+    .unwrap()
+    .expect("due");
+    tx.commit().await.unwrap();
+    let policy: forge_core::retention::images::ImageRetentionPolicy =
+        serde_json::from_value(claimed.policy.clone()).unwrap();
+    let now = forge_db::db_now(&srv.pool).await.unwrap();
+    let (decisions, _) =
+        forge_core::retention::images::evaluate_repository(&srv.pool, repo_id, now, &policy)
+            .await
+            .unwrap();
+    (claimed, run_id, policy, decisions, now)
+}
+
+async fn apply_image_run(
+    srv: &TestServer,
+    claimed: &forge_db::retention_dao::ClaimedRepo,
+    run_id: uuid::Uuid,
+    policy: &forge_core::retention::images::ImageRetentionPolicy,
+    decisions: &forge_core::retention::images::ImageDecisions,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> forge_db::retention_dao::RunSummary {
+    let fence = forge_core::retention::images::ImageRunFence {
+        stored_policy: &claimed.policy,
+        policy,
+        evaluated_at,
+    };
+    forge_core::retention::images::apply_images(
+        &srv.pool,
+        claimed.repository_id,
+        run_id,
+        decisions,
+        chrono::Duration::seconds(60),
+        false,
+        Some(&fence),
+    )
+    .await
+    .unwrap()
+}
+
+/// An image retention run stops applying once its policy changes (here: to
+/// dry run) or it loses its lease, as a package retention run does (#215).
+#[tokio::test]
+async fn image_retention_stops_when_its_policy_changes_or_its_lease_is_lost() {
+    let srv = common::start().await;
+    let oci = admin_oci(&srv).await;
+    let policy = json!({"version": 1, "rules": [{"id": "keep-1", "keep_last_n_tags": 1}]});
+    for lose_lease in [false, true] {
+        let repo = repo_name("dock");
+        let created = create_repo(
+            &srv,
+            json!({"name": repo, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+        let repo_id = created["id"].as_i64().unwrap();
+        let name = format!("{repo}/app");
+        for i in 0..4 {
+            oci.push_image(
+                &name,
+                &format!("v{i}"),
+                "amd64",
+                format!("layer {repo} {i}").as_bytes(),
+            )
+            .await;
+            sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND tag = $3")
+                .bind(10 - i)
+                .bind(repo_id)
+                .bind(format!("v{i}"))
+                .execute(&srv.pool)
+                .await
+                .unwrap();
+        }
+        let resp = admin_put(
+            &srv,
+            &format!("/admin/repositories/{repo}/retention"),
+            json!({"policy": policy}),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+        assert_eq!(decisions.tags.len(), 3);
+
+        if lose_lease {
+            sqlx::query("UPDATE retention_run SET current_run_id = gen_random_uuid() WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&srv.pool)
+                .await
+                .unwrap();
+        } else {
+            let mut dry_run = policy.clone();
+            dry_run["dry_run_only"] = json!(true);
+            forge_db::retention_dao::write_policy(&srv.pool, repo_id, Some(&dry_run))
+                .await
+                .unwrap();
+        }
+
+        let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+        assert_eq!(
+            (summary.deleted, summary.skipped),
+            (0, 3),
+            "lose_lease={lose_lease}"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                oci.get(&name, &format!("manifests/v{i}")).await.status(),
+                200,
+                "lose_lease={lose_lease}"
+            );
+        }
+    }
+}
+
+/// Image retention re-evaluates an image under its lock before applying
+/// what it decided for it (#215): a tag newer ones deleted since now keeps,
+/// a tag pulled since, and a referrer whose subject was tagged again are
+/// skipped; the rest is applied.
+#[tokio::test]
+async fn image_retention_re_evaluates_each_image_under_its_lock() {
+    let srv = common::start().await;
+    let oci = admin_oci(&srv).await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let pushed_days_ago = |image: &'static str, tag: String, days: i32| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND image = $3 AND tag = $4")
+                .bind(days)
+                .bind(repo_id)
+                .bind(image)
+                .bind(tag)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // `keep`: five tags, the two newest kept.
+    let keep = format!("{repo}/keep");
+    for i in 0..5 {
+        oci.push_image(
+            &keep,
+            &format!("k{i}"),
+            "amd64",
+            format!("keep {repo} {i}").as_bytes(),
+        )
+        .await;
+        pushed_days_ago("keep", format!("k{i}"), 10 - i).await;
+    }
+    // `pulled`: a tag pushed long ago and never pulled.
+    let pulled = format!("{repo}/pulled");
+    oci.push_image(&pulled, "p0", "amd64", format!("pulled {repo}").as_bytes())
+        .await;
+    pushed_days_ago("pulled", "p0".into(), 60).await;
+    // `signed`: an image and its signature, both untagged for a month.
+    let signed = format!("{repo}/signed");
+    let layer = format!("signed {repo}").into_bytes();
+    let subject = oci.push_image(&signed, "s", "amd64", &layer).await;
+    let subject_manifest = image(&config("amd64"), &[&layer]);
+    let empty_cfg = b"{}";
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(empty_cfg), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": subject, "size": subject_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    let resp = oci
+        .put_manifest(&signed, &sha(&sig), OCI_MANIFEST, &sig)
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    assert_eq!(oci.delete(&signed, "manifests/s").await.status(), 202);
+    sqlx::query("UPDATE oci_manifest SET untagged_since = now() - interval '30 days' WHERE repository_id = $1 AND image = 'signed'")
+        .bind(repo_id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+
+    let policy = json!({"version": 1, "rules": [
+        {"id": "keep-2", "image_prefix": "keep", "keep_last_n_tags": 2},
+        {"id": "unpulled", "image_prefix": "pulled", "tag_not_pulled_for_days": 30},
+        {"id": "untagged", "image_prefix": "signed", "delete_untagged_after_days": 7}
+    ]});
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut tags: Vec<&str> = decisions.tags.iter().map(|t| t.tag.as_str()).collect();
+    tags.sort_unstable();
+    assert_eq!(tags, ["k0", "k1", "k2", "p0"]);
+    let mut manifests: Vec<&str> = decisions
+        .manifests
+        .iter()
+        .map(|m| m.digest.as_str())
+        .collect();
+    manifests.sort_unstable();
+    let sig_digest = sha(&sig);
+    let mut doomed = vec![subject.as_str(), sig_digest.as_str()];
+    doomed.sort_unstable();
+    assert_eq!(manifests, doomed);
+
+    // Meanwhile: the newest `keep` tag is deleted, `p0` is pulled, and the
+    // signed image is tagged again.
+    assert_eq!(oci.delete(&keep, "manifests/k4").await.status(), 202);
+    assert_eq!(oci.get(&pulled, "manifests/p0").await.status(), 200);
+    let resp = oci
+        .put_manifest(&signed, "again", OCI_MANIFEST, &subject_manifest)
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (2, 4), "{summary:?}");
+    for (tag, status) in [("k0", 404), ("k1", 404), ("k2", 200), ("k3", 200)] {
+        assert_eq!(
+            oci.get(&keep, &format!("manifests/{tag}")).await.status(),
+            status,
+            "{tag}"
+        );
+    }
+    assert_eq!(oci.get(&pulled, "manifests/p0").await.status(), 200);
+    for digest in [&subject, &sig_digest] {
+        assert_eq!(
+            oci.get(&signed, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
+}
+
 /// A tag that clients only resolve with a HEAD, as containerd does while it
 /// holds the digest, counts as pulled for `tag_not_pulled_for_days` (#197).
 #[tokio::test]

@@ -70,6 +70,14 @@ The release workflow publishes the section whose heading matches the tag
   which one. The response names it in `instance` (host name and start
   time), and the deployment guide says the numbers are per instance.
   ([#214](https://github.com/schmitch/forge/issues/214))
+- Docker image retention kept deleting what a run had decided after its
+  policy was disabled, switched to dry run or changed, after the run lost
+  its lease, and when the image changed meanwhile: it deleted a tag pulled
+  since, older tags after the newest were deleted, and the signature of an
+  image tagged again. Like package retention, a run now stops when its
+  policy or lease changes, and applies an image's decisions only after
+  evaluating its current state again.
+  ([#215](https://github.com/schmitch/forge/issues/215))
 
 ## [1.1.0]
 
