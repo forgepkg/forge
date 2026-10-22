@@ -209,7 +209,8 @@ password supplied to NuGet should be a **token**.
   points at on a different host — and must not be embedded in `remote_url`.
   NuGet V2-only feeds cannot be proxied. Version listings are refreshed at
   most once per `metadata_ttl_seconds`; a failing upstream degrades to what
-  is already cached.
+  is already cached, and for a minute after a listing failed, ids with
+  cached versions are answered from the cache without asking it again.
 - **group** — `{"name":"all","kind":"group"}`, then
   `POST /admin/repositories/all/members` with `{"member":"nuget","priority":100}`
   (higher priority wins ties). A member that errors (e.g. an unreachable
