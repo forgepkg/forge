@@ -73,6 +73,10 @@ The release workflow publishes the section whose heading matches the tag
   finish of a chunked upload answered 500 instead of 503 with
   `Retry-After`, and an upload whose body the client aborted answered 500
   instead of 400. ([#209](https://github.com/schmitch/forge/issues/209))
+- Blob cache: a docker blob pushed in several chunks was cached about twice:
+  every chunk was written through to the cache next to the assembled blob,
+  and evicted as much content that is downloaded. Only the blob is cached.
+  ([#213](https://github.com/schmitch/forge/issues/213))
 
 ## [1.1.0]
 
