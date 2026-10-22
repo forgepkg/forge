@@ -232,6 +232,8 @@ A docker repository's retention policy (`PUT
   set), the `keep_last_n_tags` most recently pushed tags and the
   `protected_tags` stay; any other tag goes when every trigger the rule sets
   holds (`tag_older_than_days` since its push, `tag_not_pulled_for_days`). A
+  `GET` or a `HEAD` of a tag's manifest counts as a pull, so a tag that
+  containerd (Kubernetes, nerdctl, BuildKit) only resolves stays pulled. A
   rule with only `keep_last_n_tags` keeps N tags per image.
 - **Untagged rules** (`delete_untagged_after_days`) delete manifests without a
   tag for that long, except what something kept refers to: the platforms of

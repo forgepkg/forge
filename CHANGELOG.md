@@ -125,8 +125,9 @@ otherwise.
   where allowed, or a workload OIDC token), anonymous pulls follow the
   repository's anonymous read, and repositories are addressed by path or by
   an optional host name of their own. Image retention rules (keep the last N
-  tags, stale tags, untagged manifests) and a sweeper release layers only
-  when no image references them. The web UI lists images, tags, manifests,
+  tags, stale tags, untagged manifests; a `HEAD` of a manifest counts as a
+  pull, [#197](https://github.com/schmitch/forge/issues/197)) and a sweeper
+  release layers only when no image references them. The web UI lists images, tags, manifests,
   platforms and referrers. New `[docker]` settings; see
   [docs/docker.md](https://github.com/schmitch/forge/blob/main/docs/docker.md).
   ([#40](https://github.com/schmitch/forge/issues/40))
