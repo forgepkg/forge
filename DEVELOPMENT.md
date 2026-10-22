@@ -752,6 +752,34 @@ On GitLab, a merge train is the merge queue: enable **merged results
 pipelines** and **merge trains** under *Settings → Merge requests*. Merge
 train pipelines run `e2e` and `web-e2e` as well.
 
+### Stacked pull requests
+
+A stacked pull request targets the branch of the pull request below it (see
+[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
+that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
+gives every pull request whose base is not `main` the commit status `stack`,
+pending and naming the branch it waits for. Once the pull request below has
+merged, GitHub retargets the stacked one to `main` and `stack` turns to
+success. A pull request opened against `main` gets no `stack` status.
+
+The ruleset that enforces it is
+`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
+Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
+every branch except `main`, the merge queue's `gh-readonly-queue/` branches
+and Dependabot's:
+
+- A stacked pull request cannot be merged into the branch below it, and
+  auto-merge enabled on it does not merge it there. Once it targets `main`,
+  `main`'s own rules decide. A pull request whose branch predates the
+  workflow has no `stack` status at all, which blocks it just the same.
+- A required status check guards pushes too: a branch only moves to a
+  commit that already carries it. So repository admins, maintainers and
+  writers, and organization owners, bypass the ruleset: their pushes to a
+  pull request's branch go through as before, and they can still merge a
+  stacked pull request, but only by ticking **Merge without waiting for
+  requirements to be met (bypass rules)**. A GitHub App pushing with its own
+  token has to be added to the bypass list.
+
 ## Changelog entries
 
 A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its
