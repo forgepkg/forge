@@ -11,7 +11,8 @@
 //! * [`provider`] / [`chain`] — the pluggable, ordered [`AuthProvider`] chain
 //!   for the password-style auth path (slice 12.3). The local-password and
 //!   upstream-basic providers plug in here; OIDC stays its own interactive
-//!   path.
+//!   path. [`captured_password`] stands in for upstream-basic once a realm
+//!   stops forwarding and signs its accounts in with the hashes it kept.
 //! * [`cred_cache`] — the validated-credential cache (slice 12.3): an HMAC-keyed
 //!   L1/L2 + Postgres cache of upstream verdicts so NuGet's per-request Basic
 //!   auth does not hammer the upstream. Plaintext is never stored; fail-closed.
@@ -21,6 +22,7 @@
 //!   exchange issues for CI workloads.
 
 pub mod authz;
+pub mod captured_password;
 pub mod chain;
 pub mod client_ip;
 pub mod cred_cache;
@@ -34,6 +36,7 @@ pub mod upstream_basic;
 pub mod workload_key;
 
 pub use authz::Authz;
+pub use captured_password::CapturedPasswordProvider;
 pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
     ChainUnavailable, StaticChainSource,
@@ -53,7 +56,9 @@ pub use login_throttle::{
     LoginThrottle, PgKnownNetworks, WindowLimiter, MAX_USERNAME_BYTES,
 };
 pub use principal::{AuthMethod, Principal, UserPrincipal};
-pub use provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
+pub use provider::{
+    AuthOutcome, AuthProvider, AuthSource, CapturedPasswordHash, PasswordCredential, ProvenIdentity,
+};
 pub use session_source::{
     cookie_value, session_cookie_name, unique_cookie_value, DuplicateCookie, SessionCookieSource,
     SECURE_SESSION_COOKIE, SESSION_COOKIE,

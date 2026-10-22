@@ -14,8 +14,10 @@ import { httpClient } from '~/lib/httpClient'
  *    `false` and `active` to `true` server-side; we always send them explicitly.
  *  - There is **no update-user endpoint** in slice 1 (the plan's "edit /
  *    activate-deactivate" is not backed by the API yet). The only per-user
- *    write beyond create is `DELETE /admin/users/{id}` and token management
- *    (see `tokens.ts`).
+ *    write beyond create is `DELETE /admin/users/{id}`, switching a
+ *    credential-forwarding account to a local one
+ *    (`POST /admin/users/{id}/convert-to-local`) and token management (see
+ *    `tokens.ts`).
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.
@@ -32,6 +34,12 @@ export interface UserView {
    * provider) or `upstream-basic` (credential-forwarding realm).
    */
   auth_source: string
+  /**
+   * When the account's credential-forwarding realm last kept a hash of the
+   * password its upstream accepted; `null` when it keeps none. Such an
+   * account can be switched to a local one (`convertUserToLocal`).
+   */
+  captured_password_at: string | null
 }
 
 const AUTH_SOURCE_LABELS: Record<string, string> = {
@@ -74,6 +82,15 @@ export function fetchUsers(signal?: AbortSignal): Promise<UserView[]> {
 /** `POST /admin/users` — create a user (201 → the created view). */
 export function createUser(body: CreateUser): Promise<UserView> {
   return httpClient.post<UserView>('/admin/users', body)
+}
+
+/**
+ * `POST /admin/users/{id}/convert-to-local` — switch a credential-forwarding
+ * account to a local one whose password is its kept hash (409 when it keeps
+ * none).
+ */
+export function convertUserToLocal(id: number): Promise<UserView> {
+  return httpClient.post<UserView>(`/admin/users/${id}/convert-to-local`, {})
 }
 
 /** `DELETE /admin/users/{id}` — delete a user (204). */
