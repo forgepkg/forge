@@ -23,7 +23,7 @@ use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use crate::digest::Digest;
-use crate::error::{Code, OciError, OciResult};
+use crate::error::{Code, OciError, OciResult, RequestBodyError};
 use crate::manifest::{
     self, config_platform, is_image_config, media, ManifestError, ManifestKind, ParsedManifest,
     EMPTY_JSON, EMPTY_JSON_DIGEST, MAX_MANIFEST_BYTES,
@@ -47,9 +47,13 @@ pub(crate) fn require_linked(outcome: LinkOutcome) -> OciResult<()> {
     }
 }
 
-/// A request body as an `AsyncRead`.
+/// A request body as an `AsyncRead`. A body that cannot be read fails with a
+/// [`RequestBodyError`] inside the I/O error, which answers 400.
 fn body_reader(body: Body) -> impl tokio::io::AsyncRead + Unpin + Send {
-    StreamReader::new(body.into_data_stream().map_err(std::io::Error::other))
+    StreamReader::new(
+        body.into_data_stream()
+            .map_err(|e| std::io::Error::other(RequestBodyError(e))),
+    )
 }
 
 /// Read a whole (small) request body, refusing more than `limit` bytes.

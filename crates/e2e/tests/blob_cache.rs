@@ -9,6 +9,8 @@
 //!   200 and reports `degraded`, an instance restarted on its persistent
 //!   cache starts and serves, and once S3 returns everything recovers
 //!   without a restart.
+//! * The docker registry answers the same 503s while S3 is down: uncached
+//!   blob and manifest pulls, pushes, and the finish of a chunked upload.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -320,4 +322,173 @@ async fn cached_packages_keep_resolving_while_s3_is_down() {
         .await;
     assert_eq!(resp.status(), 201, "pushes work again");
     download_bytes(&srv, "proxy", "proxied.two", "1.0.0").await;
+}
+
+/// A registry token for `actions` on `image`, as the admin.
+async fn registry_token(srv: &TestServer, image: &str, actions: &str) -> String {
+    let (user, password) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .get(format!(
+            "{}/v2/token?scope=repository:{image}:{actions}",
+            srv.base_url
+        ))
+        .basic_auth(user, Some(password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "registry token");
+    resp.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+/// `POST /v2/<image>/blobs/uploads/?digest=` with the whole blob.
+async fn push_blob(srv: &TestServer, token: &str, image: &str, bytes: &[u8]) -> reqwest::Response {
+    srv.client()
+        .post(format!(
+            "{}/v2/{image}/blobs/uploads/?digest={}",
+            srv.base_url,
+            digest(bytes)
+        ))
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A 503 with `Retry-After`, the registry's `UNAVAILABLE`.
+async fn assert_unavailable(resp: reqwest::Response, what: &str) {
+    assert_eq!(resp.status(), 503, "{what}");
+    assert!(resp.headers().contains_key("retry-after"), "{what}");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNAVAILABLE", "{what}: {body}");
+}
+
+#[tokio::test]
+async fn the_registry_answers_503_while_s3_is_down() {
+    let gate = S3Gate::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let srv = StackBuilder::default()
+        .s3_endpoint(gate.endpoint())
+        .blob_cache(cache.path(), None)
+        .start()
+        .await;
+    let resp = srv
+        .create_repo(serde_json::json!({"name": "images", "kind": "hosted", "format": "docker"}))
+        .await;
+    assert_eq!(resp.status(), 201, "create docker repo");
+    let image = "images/app";
+
+    // An image this instance has not cached: pushed through one without a
+    // cache.
+    let layer = b"a layer this instance never read".to_vec();
+    let config =
+        br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
+            .to_vec();
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest(&config), "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": digest(&layer), "size": layer.len()}],
+    })
+    .to_string()
+    .into_bytes();
+    {
+        let mut other = StackBuilder::default()
+            .no_bootstrap_admin()
+            .start_on(&srv.db_url)
+            .await;
+        share_admin(&srv, &mut other);
+        let token = registry_token(&other, image, "pull,push").await;
+        for blob in [&config, &layer] {
+            assert_eq!(push_blob(&other, &token, image, blob).await.status(), 201);
+        }
+        let resp = other
+            .client()
+            .put(format!("{}/v2/{image}/manifests/1", other.base_url))
+            .bearer_auth(&token)
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "push the manifest");
+    }
+
+    // A chunked upload whose chunks reached S3 before the outage.
+    let token = registry_token(&srv, image, "pull,push").await;
+    let resp = srv
+        .client()
+        .post(format!("{}/v2/{image}/blobs/uploads/", srv.base_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let mut location = resp.headers()["location"].to_str().unwrap().to_string();
+    let chunks: [&[u8]; 2] = [b"first chunk, ", b"second chunk"];
+    let mut offset = 0;
+    for chunk in chunks {
+        let resp = srv
+            .client()
+            .patch(format!("{}{location}", srv.base_url))
+            .bearer_auth(&token)
+            .header(
+                "content-range",
+                format!("{}-{}", offset, offset + chunk.len() - 1),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202, "chunk");
+        offset += chunk.len();
+        location = resp.headers()["location"].to_str().unwrap().to_string();
+    }
+
+    // ── S3 goes down ──
+    gate.set_down(true);
+
+    let get = |path: String| {
+        let (srv, token) = (&srv, &token);
+        async move {
+            srv.client()
+                .get(format!("{}/v2/{image}/{path}", srv.base_url))
+                .bearer_auth(token)
+                .header("accept", "application/vnd.oci.image.manifest.v1+json")
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    assert_unavailable(get(format!("blobs/{}", digest(&layer))).await, "blob pull").await;
+    assert_unavailable(get("manifests/1".into()).await, "manifest pull").await;
+    assert_unavailable(
+        push_blob(&srv, &token, image, b"a layer pushed during the outage").await,
+        "blob push",
+    )
+    .await;
+    let resp = srv
+        .client()
+        .put(format!(
+            "{}{location}{}digest={}",
+            srv.base_url,
+            if location.contains('?') { '&' } else { '?' },
+            digest(&chunks.concat())
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_unavailable(resp, "chunked upload finish").await;
 }

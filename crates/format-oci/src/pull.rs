@@ -317,7 +317,7 @@ impl Registry {
             .store
             .read_all(blob)
             .await
-            .map_err(|e| OciError::internal("manifest read", e))?;
+            .map_err(|e| OciError::storage_read("manifest read", e))?;
         if bytes.len() as u64 != blob.size {
             return Err(OciError::internal(
                 "manifest read",
@@ -425,7 +425,7 @@ impl Registry {
                     .store
                     .open(hit.blob(), range.map(|(start, end)| start..end + 1))
                     .await
-                    .map_err(|e| OciError::internal("blob read", e))?;
+                    .map_err(|e| OciError::storage_read("blob read", e))?;
                 match range {
                     Some((start, end)) => (
                         StatusCode::PARTIAL_CONTENT,

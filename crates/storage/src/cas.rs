@@ -83,9 +83,18 @@ pub enum CasError {
 
 impl CasError {
     /// Whether S3 could not be reached (see [`S3Error::Unavailable`]): the
-    /// caller should answer "try again later".
+    /// caller should answer "try again later". That includes staging a
+    /// stream read from S3 whose read failed so (the [`S3Error`] inside the
+    /// I/O error).
     pub fn is_unavailable(&self) -> bool {
-        matches!(self, CasError::S3(e) if e.is_unavailable())
+        match self {
+            CasError::S3(e) => e.is_unavailable(),
+            CasError::Io(e) => e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<S3Error>())
+                .is_some_and(S3Error::is_unavailable),
+            _ => false,
+        }
     }
 }
 
