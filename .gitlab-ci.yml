@@ -88,14 +88,16 @@ variables:
   DOCKER_HOST: "tcp://docker:2375"
   DOCKER_TLS_CERTDIR: ""
 
-# ── Formatting ─────────────────────────────────────────────────────────────
-# No job waits for this one: every job has `needs: []` and starts with the
-# pipeline instead of after its stage, as on GitHub (#337).
+# ── Formatting, and the changelog fragments ────────────────────────────────
+# As on GitHub, the fragment check builds only xtask. No job waits for this
+# one: every job has `needs: []` and starts with the pipeline instead of after
+# its stage, as on GitHub (#337).
 fmt:
   stage: fmt
   script:
     - rustup component add rustfmt
     - cargo fmt --all --check
+    - cargo xtask changelog --check
 
 # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
 # Both are check builds; as on GitHub, the drift guard runs here rather than
