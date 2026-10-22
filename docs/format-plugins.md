@@ -480,13 +480,17 @@ to lift them:
   proxy reads the upstream's `index.yaml` (cached for the metadata TTL, and
   at most `proxy.max_metadata_bytes`, 32 MiB by default); the contract has
   no ranged or streamed reads of an upstream document. The built-in plugin
-  keeps the parsed index while the upstream serves the same document (as
-  many upstreams as fit in 128 MiB, about twice the document's size each,
-  the least recently used giving way) and parses one index at a time, so a
-  chart listing through a proxy, or through a group of several proxies,
-  parses each upstream's index once, not once per chart. A WebAssembly
-  build of the plugin keeps nothing and parses the index for every
-  operation.
+  keeps the parsed index while the upstream serves the same document and
+  parses one index at a time, so a chart listing through a proxy, or
+  through a group of several proxies, parses each upstream's index once,
+  not once per chart. The kept indexes of an instance, of all its Helm
+  proxies together, may hold 128 MiB, about twice the size of their
+  documents, so about 60 MB of `index.yaml`. A new index that does not fit
+  takes the place of kept ones nobody used for a minute; while all of them
+  are in use, it is parsed for each operation instead of being kept. So
+  past the budget, a group's listing keeps the indexes that fit and parses
+  the others once per chart. A WebAssembly build of the plugin keeps
+  nothing and parses the index for every operation.
 
 ### NuGet as a plugin
 
