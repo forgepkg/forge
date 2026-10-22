@@ -221,22 +221,52 @@ jobs:
         run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Container image (build only; releases push from release.yml) ─────────
-  # Builds the production Dockerfile on every change so a broken image is
-  # caught before a release tag, not by it.
+  # Builds the production Dockerfile so a broken image is caught before a
+  # release tag, not by it: in every merge group, push to the default branch
+  # and manual run, and on a pull request that changes what the image is
+  # built from (#338). Any other pull request passes without a build: clippy,
+  # test and web compile its Rust code and SPA, and a change that breaks only
+  # the image (a release-only cfg, a file .dockerignore leaves out) fails in
+  # the merge queue.
   docker:
     name: docker
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request's merge commit and its first parent, the base
+          # branch: what differs between them is the pull request's change.
+          fetch-depth: 2
+      # The image's inputs; keep in step with the docker job's
+      # `rules: changes` in .gitlab-ci.yml. A failing diff builds.
+      - name: Does the change touch the image's inputs?
+        id: inputs
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo build=true >>"$GITHUB_OUTPUT"
+          elif git diff --quiet HEAD^1 HEAD -- \
+              Dockerfile .dockerignore docker LICENSE \
+              ':(glob)**/Cargo.toml' Cargo.lock rust-toolchain.toml .cargo \
+              web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc \
+              .github/workflows/ci.yml; then
+            echo build=false >>"$GITHUB_OUTPUT"
+            echo "Image not built: this pull request changes none of its inputs (Dockerfile, docker/, manifests and Cargo.lock, toolchain, web lockfile, CI); the merge queue builds it." >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo build=true >>"$GITHUB_OUTPUT"
+          fi
       # The BuildKit release.yml builds with (pinned by digest; keep in step),
       # which pulls the Dockerfile's Docker Hub images through mirror.gcr.io.
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: steps.inputs.outputs.build == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - name: Build image (no push)
+        if: steps.inputs.outputs.build == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
