@@ -182,6 +182,23 @@ export interface FormatView {
   max_upload_bytes_limit?: number | null
 }
 
+/**
+ * `POST /admin/repositories/{name}/proxy-cache/invalidate` request body
+ * (`InvalidateBody`): without `package`, the whole proxy's cache.
+ */
+export interface InvalidateProxyCache {
+  /** A package id (a docker proxy: an image name, e.g. `library/nginx`). */
+  package?: string
+}
+
+/** What a proxy cache invalidation removed (`Invalidated`). */
+export interface ProxyCacheInvalidated {
+  /** Remembered upstream "not found" answers removed (NuGet, Helm). */
+  not_found_cleared: number
+  /** Cached tags due for re-validation against the upstream (docker). */
+  tags_expired: number
+}
+
 /** A group member view (`MemberView`). */
 export interface MemberView {
   name: string
@@ -265,6 +282,22 @@ export function updateRepository(
 export function deleteRepository(name: string): Promise<void> {
   return httpClient.delete<void>(
     `/admin/repositories/${encodeURIComponent(name)}`,
+  )
+}
+
+/**
+ * `POST /admin/repositories/{name}/proxy-cache/invalidate` — make a proxy ask
+ * its upstream again: forgets its "not found" answers (of one package, or of
+ * all), its cached listings and documents, and re-validates docker tags.
+ * Downloaded packages stay cached.
+ */
+export function invalidateProxyCache(
+  name: string,
+  body: InvalidateProxyCache,
+): Promise<ProxyCacheInvalidated> {
+  return httpClient.post<ProxyCacheInvalidated>(
+    `/admin/repositories/${encodeURIComponent(name)}/proxy-cache/invalidate`,
+    body,
   )
 }
 

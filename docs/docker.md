@@ -166,6 +166,13 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   come from the upstream, or from the cache while it is unreachable.
 - An offline proxy (`"online": false`) serves only what it cached. Pointing a
   proxy at another `remote_url` empties its cache.
+- To ask the upstream again before those TTLs run out (a tag moved, an image
+  published after the proxy answered "not found"), invalidate the proxy's
+  cache: *Invalidate cache* on its page in the web UI, or
+  `curl … /admin/repositories/docker-hub/proxy-cache/invalidate -d
+  '{"package": "library/nginx"}'` (with `-d '{}'`: every image). The proxy
+  forgets its "not found" answers, on every instance, and re-validates the
+  image's tags on their next pull; blobs and manifests stay cached.
 - A proxy is read-only (`405` on pushes).
 
 ## Group repositories

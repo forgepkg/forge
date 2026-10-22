@@ -14,6 +14,7 @@ import {
 import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
+import { ProxyCachePanel } from '~/components/ProxyCachePanel'
 
 export const Route = createFileRoute('/_app/manage/repositories/$repo')({
   component: EditRepository,
@@ -26,7 +27,7 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * never seeded from the GET and is only included in the update when the admin
  * typed a new one (an empty field leaves the stored secret unchanged — slice-1
  * redaction); "Remove stored credentials" clears it explicitly. Group repos
- * get a link to the Members editor.
+ * get a link to the Members editor; proxies, their cache invalidation.
  */
 function EditRepository() {
   const { repo: name } = Route.useParams()
@@ -108,6 +109,10 @@ function EditRepository() {
         onSubmit={handleSubmit}
         onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
+
+      {current.kind === 'proxy' && (
+        <ProxyCachePanel key={current.name} repo={current} />
+      )}
     </section>
   )
 }

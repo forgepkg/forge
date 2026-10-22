@@ -205,6 +205,17 @@ otherwise.
   account can be created, bootstrapped or provisioned under the name (an
   OIDC login whose username claim is `oidc` gets `oidc-2`).
   ([#169](https://github.com/schmitch/forge/issues/169))
+- **Proxy cache invalidation**: `POST
+  /admin/repositories/{name}/proxy-cache/invalidate`, and *Invalidate
+  cache* on a proxy's page in the web UI, make a NuGet, Helm or docker proxy
+  ask its upstream again before its TTLs run out, for example once a package
+  it answered "not found" for is published upstream. The proxy forgets the
+  upstream's "not found" answers (of one package with `{"package": "<id>"}`,
+  or of all) and the listings and documents it cached from the upstream, on
+  every instance; invalidating the whole repository also refreshes the
+  upstream's service index, and a docker proxy re-validates its tags (of one
+  image, or of all) on their next pull. Downloaded packages, blobs and
+  manifests stay cached, and so does the package-delay clock.
 
 - **Local blob cache** (optional, `[blob_cache]`): a copy of downloaded and
   pushed blobs on a local disk, sized from the disk (`max_bytes = "auto"`)
