@@ -758,6 +758,73 @@ async fn the_repository_upload_limit_bounds_blob_pushes() {
     assert_eq!(resp.status(), 413);
 }
 
+/// With the local blob cache, a blob pushed in several chunks is cached
+/// once, assembled, without its chunks; one streamed in a single `PATCH`,
+/// as docker, podman and containerd push a layer, is written through.
+#[tokio::test]
+async fn chunked_uploads_cache_the_blob_not_its_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            plugins_block: Some(format!(
+                "[blob_cache]\npath = {:?}\n",
+                dir.path().join("cache").display().to_string()
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let cache = srv
+        .state
+        .blob_store
+        .cache()
+        .expect("the blob cache")
+        .clone();
+    let cached = |digest: &str| cache.contains(digest.trim_start_matches("sha256:"));
+    let eventually_cached = |digest: String| {
+        let cache = cache.clone();
+        async move {
+            for _ in 0..200 {
+                if cache.contains(digest.trim_start_matches("sha256:")) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        }
+    };
+    let repo = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+
+    let chunks: Vec<Vec<u8>> = (0..3)
+        .map(|i| format!("chunk {i} of a layer {}", unique()).into_bytes())
+        .collect();
+    let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    let digest = oci.push_blob_chunked(&name, &refs).await;
+    assert!(
+        eventually_cached(digest.clone()).await,
+        "the assembled blob"
+    );
+    for chunk in &chunks {
+        assert!(!cached(&sha(chunk)), "a chunk stays out of the cache");
+    }
+
+    let layer = format!("a layer in one chunk {}", unique()).into_bytes();
+    let digest = oci.push_blob_chunked(&name, &[&layer]).await;
+    assert!(
+        eventually_cached(digest).await,
+        "a single chunk is the blob"
+    );
+}
+
 #[tokio::test]
 async fn bad_digests_and_out_of_order_chunks_are_refused() {
     let srv = common::start().await;
