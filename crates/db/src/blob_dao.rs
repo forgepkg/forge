@@ -247,6 +247,15 @@ async fn begin_ingest_attempt(
     }))
 }
 
+/// Which of `sha256s` name a blob that exists and is not being deleted (in
+/// no particular order).
+pub async fn live_among(pool: &PgPool, sha256s: &[String]) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT sha256 FROM blob WHERE sha256 = ANY($1) AND state <> 'deleting'")
+        .bind(sha256s)
+        .fetch_all(pool)
+        .await
+}
+
 /// Fetch a blob by content hash.
 pub async fn get_blob(pool: &PgPool, sha256: &str) -> sqlx::Result<Option<Blob>> {
     sqlx::query_as!(

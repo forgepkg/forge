@@ -846,6 +846,37 @@ async fn garbage_collection_evicts_the_cached_copy() {
 }
 
 #[tokio::test]
+async fn a_fill_of_a_blob_deleted_meanwhile_is_not_cached() {
+    // The fill read the object before garbage collection deleted it: it
+    // still serves its reader, but must not put the bytes back.
+    let (endpoint, fake) = spawn_fake_s3().await;
+    fake.slow.store(true, Ordering::SeqCst);
+    let dir = scratch("gc-during-fill");
+    let blob = Arc::new(Blob::new(51, 200_000));
+    fake.put(&blob.key, blob.bytes.clone());
+    let cache = BlobCache::open_with(config(&dir, CacheLimit::Auto), roomy()).unwrap();
+    let store = cached_store(&endpoint, cache.clone());
+    let reader = {
+        let (store, blob) = (store.clone(), blob.clone());
+        tokio::spawn(async move { read(&store, &blob, None).await })
+    };
+    for _ in 0..200 {
+        if cache.stats().reserved_bytes > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(cache.stats().reserved_bytes > 0, "the fill is running");
+    store.delete_blob(&blob.sha256, &blob.key).await.unwrap();
+    assert_eq!(reader.await.unwrap(), blob.bytes);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stats = cache.stats();
+    assert_eq!((stats.entries, stats.reserved_bytes), (0, 0));
+    assert!(!cache.contains(&blob.sha256));
+    assert!(!blob.file(&dir).exists());
+}
+
+#[tokio::test]
 async fn while_s3_is_down_hits_are_served_and_misses_fail_fast() {
     let (endpoint, fake) = spawn_fake_s3().await;
     let dir = scratch("outage");

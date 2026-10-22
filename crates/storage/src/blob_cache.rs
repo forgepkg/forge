@@ -237,6 +237,9 @@ struct Index {
     /// Hash checks of entries found by the startup scan, joined by
     /// concurrent hits of the same entry.
     verifying: HashMap<Key, Arc<watch::Sender<Check>>>,
+    /// Keys evicted while a fill of them ran (its object was deleted from
+    /// S3): the fill still serves its readers, but does not join the cache.
+    doomed: HashSet<Key>,
     /// Keys whose entries are gone and whose files are being removed,
     /// outside the lock: no fill or write-through of them starts, and none
     /// commits, until the old file is gone.
@@ -660,16 +663,38 @@ impl BlobCache {
         }
     }
 
+    /// The SHA-256s of the cached blobs as of now, `chunk` at a time (hex,
+    /// as the database names blobs). Holds 32 bytes per entry until drained.
+    pub fn sha256_chunks(&self, chunk: usize) -> impl Iterator<Item = Vec<String>> {
+        let keys: Vec<Key> = self.lock().entries.keys().copied().collect();
+        let chunk = chunk.max(1);
+        (0..keys.len()).step_by(chunk).map(move |start| {
+            keys[start..(start + chunk).min(keys.len())]
+                .iter()
+                .map(hex)
+                .collect()
+        })
+    }
+
     /// Whether `sha256` is cached.
     pub fn contains(&self, sha256: &str) -> bool {
         parse_key(sha256).is_some_and(|key| self.lock().entries.contains_key(&key))
     }
 
     /// Drop `sha256` from the cache (its object was deleted from S3, or its
-    /// file failed a read), removing its file on the blocking pool.
+    /// file failed a read), removing its file on the blocking pool. A fill
+    /// of it in progress, which may have read the deleted object, does not
+    /// add it back.
     pub async fn evict(&self, sha256: &str) {
         let Some(key) = parse_key(sha256) else { return };
-        let Some(entry) = self.drop_entry(&mut self.lock(), &key, None) else {
+        let dropped = {
+            let mut index = self.lock();
+            if index.fills.contains_key(&key) {
+                index.doomed.insert(key);
+            }
+            self.drop_entry(&mut index, &key, None)
+        };
+        let Some(entry) = dropped else {
             return;
         };
         self.inner
@@ -958,9 +983,13 @@ impl BlobCache {
         let mut index = self.lock();
         self.release(&mut index, size);
         prepared?;
-        // Cached meanwhile, or an evicted copy's file is still going (which
-        // would take this one with it).
-        if index.entries.contains_key(&key) || index.unlinking.contains(&key) {
+        // Evicted while it was filled (deleted from S3), cached meanwhile,
+        // or an evicted copy's file is still going (which would take this
+        // one with it).
+        if index.doomed.remove(&key)
+            || index.entries.contains_key(&key)
+            || index.unlinking.contains(&key)
+        {
             return Ok(());
         }
         temp.persist(&target).map_err(|e| e.error)?;
@@ -1279,6 +1308,7 @@ impl Drop for FillSlot {
                 .is_some_and(|s| Arc::ptr_eq(s, &self.state))
             {
                 index.fills.remove(&self.key);
+                index.doomed.remove(&self.key);
             }
         }
         self.state.send_replace(FillState::Failed);
