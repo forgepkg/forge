@@ -23,7 +23,7 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
 use forge_core::auth::client_ip::AnonPolicy;
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -1606,8 +1606,19 @@ pub struct OidcConfig {
     pub issuer: String,
     /// OAuth client (application) id.
     pub client_id: String,
-    /// OAuth client secret. **Redacted** from `Debug`/API output.
+    /// OAuth client secret. **Redacted** from `Debug`/API output. Required
+    /// with `client_authentication = "client_secret"` (the default), unused
+    /// with `"federated_credential"`.
+    #[serde(default)]
     pub client_secret: String,
+    /// How forge authenticates at the IdP's token endpoint (see
+    /// [`ClientAuthentication`]).
+    #[serde(default)]
+    pub client_authentication: ClientAuthentication,
+    /// `aud` of forge's client assertions with `"federated_credential"`.
+    /// Unset: Entra's `api://AzureADTokenExchange`.
+    #[serde(default)]
+    pub assertion_audience: Option<String>,
     /// Absolute redirect URL registered with the IdP; must equal
     /// `{public_base_url}/auth/oidc/callback` (host is validated against
     /// `server.public_base_url`).
@@ -1683,6 +1694,27 @@ pub struct OidcConfig {
     pub session_absolute_ttl_seconds: u64,
 }
 
+/// How an OIDC client authenticates at the IdP's token endpoint (an `oidc`
+/// realm's `client_authentication`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthentication {
+    /// The client secret the IdP issued (`client_secret`).
+    #[default]
+    ClientSecret,
+    /// A client assertion forge signs itself as an OIDC issuer (its public
+    /// base URL, publishing `/.well-known/openid-configuration` and a JWKS):
+    /// a Microsoft Entra federated identity credential. No secret is stored.
+    FederatedCredential,
+}
+
+impl ClientAuthentication {
+    /// Whether this is the default, [`ClientAuthentication::ClientSecret`].
+    pub fn is_client_secret(&self) -> bool {
+        *self == ClientAuthentication::ClientSecret
+    }
+}
+
 /// Manual `Debug` that **redacts `client_secret`** so it never lands in logs.
 impl std::fmt::Debug for OidcConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1691,6 +1723,8 @@ impl std::fmt::Debug for OidcConfig {
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
+            .field("client_authentication", &self.client_authentication)
+            .field("assertion_audience", &self.assertion_audience)
             .field("redirect_url", &self.redirect_url)
             .field("scopes", &self.scopes)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
@@ -2819,7 +2853,8 @@ impl Config {
     /// Validate the optional `[oidc]` section when present and enabled.
     ///
     /// Checks (per plan §3.5/§4 Phase 0): issuer is a non-empty `https` URL,
-    /// `client_id`/`client_secret`/`redirect_url` are non-empty, and the
+    /// `client_id`/`redirect_url` are non-empty, so is `client_secret` unless
+    /// the client authenticates with a federated credential, and the
     /// `redirect_url` shares scheme+host (+port) with `server.public_base_url`
     /// and ends in the canonical `/auth/oidc/callback` path. A disabled section
     /// is not validated (an operator may keep an incomplete block while off).
@@ -2850,9 +2885,9 @@ impl Config {
                 "oidc.client_id must not be empty".into(),
             ));
         }
-        if oidc.client_secret.trim().is_empty() {
+        if oidc.client_authentication.is_client_secret() && oidc.client_secret.trim().is_empty() {
             return Err(ConfigError::Invalid(
-                "oidc.client_secret must not be empty".into(),
+                "oidc.client_secret must not be empty (or set oidc.client_authentication = \"federated_credential\")".into(),
             ));
         }
 
@@ -3735,6 +3770,39 @@ mod tests {
         let toml = minimal_with_oidc("").replace("client_id = \"abc-123\"", "client_id = \"\"");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("oidc.client_id"), "{err}");
+    }
+
+    #[test]
+    fn oidc_client_secret_is_required_unless_a_federated_credential_is_used() {
+        let without_secret = minimal_with_oidc("").replace("client_secret = \"shhh-secret\"\n", "");
+        let err = Config::from_figment(fig_from_toml(&without_secret)).unwrap_err();
+        assert!(err.to_string().contains("oidc.client_secret"), "{err}");
+
+        let cfg = Config::from_figment(fig_from_toml(&format!(
+            "{without_secret}\nclient_authentication = \"federated_credential\"\nassertion_audience = \"api://AzureADTokenExchangeUSGov\""
+        )))
+        .expect("valid without a secret");
+        let oidc = cfg.oidc.expect("present");
+        assert_eq!(
+            oidc.client_authentication,
+            ClientAuthentication::FederatedCredential
+        );
+        assert_eq!(
+            oidc.assertion_audience.as_deref(),
+            Some("api://AzureADTokenExchangeUSGov")
+        );
+        assert_eq!(
+            Config::from_figment(fig_from_toml(&minimal_with_oidc("")))
+                .expect("valid")
+                .oidc
+                .expect("present")
+                .client_authentication,
+            ClientAuthentication::ClientSecret,
+            "a client secret by default"
+        );
+
+        let unknown = format!("{without_secret}\nclient_authentication = \"certificate\"");
+        assert!(Config::from_figment(fig_from_toml(&unknown)).is_err());
     }
 
     #[test]

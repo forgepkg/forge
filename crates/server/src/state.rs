@@ -37,7 +37,7 @@ use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
-use crate::auth::RealmAuth;
+use crate::auth::{AssertionIssuer, RealmAuth};
 use crate::config::Config;
 
 /// Shared, cheaply-cloneable application state.
@@ -93,6 +93,9 @@ pub struct AppState {
     /// This process among the instances of an install, as per-instance
     /// reports (the local blob cache's statistics) name it.
     pub instance: Arc<Instance>,
+    /// Forge's own OIDC issuer: the keys a `federated_credential` OIDC realm
+    /// signs its client assertions with, published under `/.well-known/`.
+    pub assertion_issuer: AssertionIssuer,
 }
 
 /// One instance of Forge: each replica of an install has state of its own
@@ -292,7 +295,13 @@ impl AppState {
             chrono::Duration::seconds(absolute as i64),
         );
         let cookie_secure = config.public_base_url().starts_with("https://");
-        let realms = Arc::new(RealmAuth::new(pool.clone(), cache.clone(), config.clone()));
+        let assertion_issuer = AssertionIssuer::new(pool.clone(), None, config.public_base_url());
+        let realms = Arc::new(RealmAuth::new(
+            pool.clone(),
+            cache.clone(),
+            config.clone(),
+            assertion_issuer.clone(),
+        ));
         let upstream = UpstreamHttp::new(config.proxy.upstream_http()).unwrap_or_else(|e| {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
@@ -334,6 +343,7 @@ impl AppState {
                 key
             }]),
             instance: Arc::new(Instance::current()),
+            assertion_issuer,
         }
     }
 
@@ -377,11 +387,22 @@ impl AppState {
         mut self,
         envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     ) -> Self {
-        // Realm secrets may be encrypted too (P1.5): rebuild the (still
-        // unshared, empty) realm snapshot cache with the envelope attached.
+        // Realm secrets may be encrypted too (P1.5), and so are the issuer
+        // keys: rebuild both (still unshared and empty) with the envelope
+        // attached.
+        self.assertion_issuer = AssertionIssuer::new(
+            self.pool.clone(),
+            envelope.clone(),
+            self.config.public_base_url(),
+        );
         self.realms = Arc::new(
-            RealmAuth::new(self.pool.clone(), self.cache.clone(), self.config.clone())
-                .with_envelope(envelope.clone()),
+            RealmAuth::new(
+                self.pool.clone(),
+                self.cache.clone(),
+                self.config.clone(),
+                self.assertion_issuer.clone(),
+            )
+            .with_envelope(envelope.clone()),
         );
         self.envelope = envelope;
         self

@@ -80,6 +80,9 @@ pub enum FlowError {
     /// The token endpoint response could not be parsed or omitted `id_token`.
     #[error("oidc token exchange response invalid: {0}")]
     TokenResponse(String),
+    /// The client assertion for the token request could not be signed.
+    #[error("oidc client assertion unavailable: {0}")]
+    ClientAssertion(String),
     /// A database error while persisting/consuming the flow row.
     #[error("oidc flow db error: {0}")]
     Db(String),
@@ -90,14 +93,12 @@ pub enum FlowError {
 /// Built by the server from its `OidcConfig`; kept separate from
 /// [`super::OidcMetadataClient`] (which owns discovery/JWKS/verification) so the
 /// flow functions stay pure given a DB handle + a metadata client.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClientParams {
     /// OAuth client (application) id; also the expected ID-token `aud`.
     pub client_id: String,
-    /// OAuth client secret. **Never logged** — the manual [`std::fmt::Debug`]
-    /// impl below redacts it; it is sent only to the token endpoint over the
-    /// No-redirect, https-only TLS client.
-    pub client_secret: String,
+    /// How the client authenticates at the token endpoint.
+    pub auth: ClientAuth,
     /// Absolute redirect URL registered with the IdP
     /// (`{public_base_url}/auth/oidc/callback`).
     pub redirect_url: String,
@@ -107,19 +108,37 @@ pub struct ClientParams {
     pub leeway_seconds: u64,
 }
 
-/// Manual `Debug` that **redacts `client_secret`** so a stray `{:?}` (a log
+/// How the client authenticates at the token endpoint. Either credential is
+/// sent only there, over the no-redirect, https-only TLS client.
+#[derive(Clone)]
+pub enum ClientAuth {
+    /// The OAuth client secret, in the request body (`client_secret_post`).
+    /// **Never logged** — the manual [`std::fmt::Debug`] impl below redacts
+    /// it.
+    Secret(String),
+    /// A JWT client assertion (RFC 7523) signed per token request, e.g. one
+    /// forge issues itself ([`super::assertion`]) for an Entra federated
+    /// identity credential.
+    Assertion(std::sync::Arc<dyn ClientAssertion>),
+}
+
+/// Manual `Debug` that **redacts the client secret** so a stray `{:?}` (a log
 /// line, a `dbg!`, an error wrapper) can never spill it — defense in depth on
 /// top of the "never logged" discipline, mirroring `OidcConfig`'s treatment.
-impl std::fmt::Debug for ClientParams {
+impl std::fmt::Debug for ClientAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientParams")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
-            .field("redirect_url", &self.redirect_url)
-            .field("scopes", &self.scopes)
-            .field("leeway_seconds", &self.leeway_seconds)
-            .finish()
+        match self {
+            ClientAuth::Secret(_) => f.write_str("Secret(<redacted>)"),
+            ClientAuth::Assertion(_) => f.write_str("Assertion"),
+        }
     }
+}
+
+/// Signs the `client_assertion` of a token request.
+#[async_trait::async_trait]
+pub trait ClientAssertion: Send + Sync {
+    /// A freshly signed assertion (a compact JWS).
+    async fn client_assertion(&self) -> Result<String, String>;
 }
 
 /// The outcome of [`begin_login`]: the URL to 302 the browser to, plus the
@@ -343,14 +362,29 @@ async fn exchange_code(
     code: &str,
     pkce_verifier: &str,
 ) -> Result<String, FlowError> {
-    let form = [
+    // Outlives `form`, which borrows it.
+    let assertion: String;
+    let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", client.redirect_url.as_str()),
         ("client_id", client.client_id.as_str()),
-        ("client_secret", client.client_secret.as_str()),
         ("code_verifier", pkce_verifier),
     ];
+    match &client.auth {
+        ClientAuth::Secret(secret) => form.push(("client_secret", secret.as_str())),
+        ClientAuth::Assertion(signer) => {
+            assertion = signer
+                .client_assertion()
+                .await
+                .map_err(FlowError::ClientAssertion)?;
+            form.push((
+                "client_assertion_type",
+                super::assertion::CLIENT_ASSERTION_TYPE,
+            ));
+            form.push(("client_assertion", assertion.as_str()));
+        }
+    }
 
     let resp = meta
         .http_client()
@@ -362,7 +396,7 @@ async fn exchange_code(
 
     let status = resp.status();
     // A redirect is never followed (the request body carries the client
-    // secret); report it rather than parsing the 3xx body.
+    // credential); report it rather than parsing the 3xx body.
     if status.is_redirection() {
         return Err(FlowError::TokenHttp(format!(
             "status {status} (redirects are not followed)"
@@ -382,7 +416,7 @@ async fn exchange_code(
         .map_err(|e| FlowError::TokenResponse(format!("parse: {e}")))?;
 
     if let Some(error) = parsed.error {
-        // Surface the OAuth error; never echo the client_secret or full body.
+        // Surface the OAuth error; never echo the client credential or full body.
         return Err(FlowError::Provider {
             error,
             description: parsed.error_description,
@@ -479,7 +513,7 @@ mod tests {
     fn authorize_url_has_pkce_and_state_params() {
         let client = ClientParams {
             client_id: "client-abc".into(),
-            client_secret: "shh".into(),
+            auth: ClientAuth::Secret("shh".into()),
             redirect_url: "https://forge.test/auth/oidc/callback".into(),
             scopes: vec!["openid".into(), "profile".into()],
             leeway_seconds: 60,
@@ -510,7 +544,7 @@ mod tests {
     fn client_params_debug_redacts_secret() {
         let client = ClientParams {
             client_id: "client-abc".into(),
-            client_secret: "super-secret-value".into(),
+            auth: ClientAuth::Secret("super-secret-value".into()),
             redirect_url: "https://forge.test/auth/oidc/callback".into(),
             scopes: vec!["openid".into()],
             leeway_seconds: 60,
