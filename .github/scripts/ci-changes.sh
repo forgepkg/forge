@@ -12,7 +12,7 @@
 # event (a push, a manual run), or a diff that fails, needs every group.
 #
 # The groups are git pathspecs, each also covering the CI configuration
-# (COMMON). Keep the `rules: changes` lists of .gitlab-ci.yml in step.
+# (COMMON).
 #
 # Usage: ci-changes.sh   (env: EVENT, and MERGE_GROUP_BASE for merge groups)
 
@@ -44,11 +44,11 @@ IMAGE=(
     web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc
 )
 # The kubernetes job: the manifests and the chart, and what its digest-pin
-# check reads besides them (Dockerfiles, the workflows, .gitlab-ci.yml).
+# check reads besides them (Dockerfiles, the workflows).
 KUBERNETES=(
     deploy
     ':(glob)**/Dockerfile' ':(glob)**/*.Dockerfile' ':(glob)**/Containerfile'
-    .github/workflows .gitlab-ci.yml
+    .github/workflows
     .github/scripts/image-pin-check.sh .github/scripts/kustomize-check.sh
     .github/scripts/helm-check.sh
 )

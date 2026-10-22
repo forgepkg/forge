@@ -609,9 +609,9 @@ cargo test -p forge-server
 ```
 
 **Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
-tests in their job summary (GitLab: at the end of the job log). Every result
-line in the log carries its test's duration (`test foo ... ok <1.234s>`).
-Locally, run any `cargo test` through the same runner, then summarize:
+tests in their job summary. Every result line in the log carries its test's
+duration (`test foo ... ok <1.234s>`). Locally, run any `cargo test` through
+the same runner, then summarize:
 
 ```bash
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
@@ -727,10 +727,10 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) has
-the jobs `fmt`, `clippy`, `audit`, `plugins`, `test`, `docker`, `kubernetes`,
-`web` and `oci-e2e`, and the slow `e2e` and `web-e2e`, which pull requests
-skip: those two run in the merge queue and on every push to `main`.
+CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
+`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`e2e` and `web-e2e`, which pull requests skip: those two run in the merge
+queue and on every push to `main`.
 
 On a pull request and in the merge queue, a job runs only when the change
 touches what it checks (#353). The `changes` job
@@ -748,26 +748,18 @@ of it passed too (see below). It sorts the change into groups of paths:
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
 | Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
-| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, `.gitlab-ci.yml`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to the CI configuration counts for every group. A job left out is
 skipped, which passes a required check. If the `changes` job fails, every job
 runs. Pushes to `main` and manual runs run every job, which the release gate
 requires. A file that Rust code or its tests read from outside the crates
-belongs in the Rust group: add a new one to `ci-changes.sh` and to the
-`.paths` of `.gitlab-ci.yml`.
+belongs in the Rust group: add a new one to `ci-changes.sh`.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
 only the image build, such as an `include_str!` of a file `.dockerignore`
 leaves out, therefore fails on the push to `main` rather than in the queue.
-
-On GitLab, the same groups are `rules: changes` in merge request pipelines
-and merge trains; a merge request that touches none of them gets no
-pipeline. As in a GitHub merge group, a merge train pipeline checks only its
-own merge request: the merge requests ahead count through their own
-pipelines, since a failed one leaves the train and the pipelines behind it
-restart without it.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, with the jobs its changes
@@ -789,11 +781,6 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).
-
-On GitLab, a merge train is the merge queue: enable **merged results
-pipelines** and **merge trains** under *Settings → Merge requests*. Merge
-train pipelines run `e2e` and `web-e2e` as well, when the change touches
-their groups.
 
 ### Stacked pull requests
 

@@ -25,7 +25,6 @@ web/e2e/.harness-facts.json
 .git
 .gitignore
 .github
-.gitlab-ci.yml
 .env
 .env.*
 forge.toml
