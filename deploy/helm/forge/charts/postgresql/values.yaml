@@ -9,7 +9,7 @@ image:
   # (.github/workflows/mirror-images.yml). `registry: docker.io` and
   # `repository: library/postgres` pull the original.
   registry: ghcr.io
-  repository: schmitch/forge/postgres
+  repository: forgepkg/forge/postgres
   # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
   # Dependabot bumps together with the tag; `digest`, when set, replaces it.
   tag: "17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939"

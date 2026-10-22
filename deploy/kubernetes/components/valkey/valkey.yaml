@@ -50,7 +50,7 @@ spec:
           # Docker Hub's valkey/valkey, mirrored to ghcr.io under the same
           # digest (.github/workflows/mirror-images.yml). Pinned by digest;
           # Dependabot bumps tag and digest together.
-          image: ghcr.io/schmitch/forge/valkey:9.1-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+          image: ghcr.io/forgepkg/forge/valkey:9.1-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
           args:
             - --requirepass
             - $(VALKEY_PASSWORD)

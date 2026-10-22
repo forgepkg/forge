@@ -262,7 +262,7 @@ Each one only accepts connections from this release's Forge pods (a
 NetworkPolicy), and every value is listed in
 `charts/<name>/values.yaml`; set them under the dependency's key.
 
-Their images come from ghcr.io, like Forge's: `ghcr.io/schmitch/forge/<name>`
+Their images come from ghcr.io, like Forge's: `ghcr.io/forgepkg/forge/<name>`
 holds byte-for-byte copies of the Docker Hub images (`library/postgres`,
 `valkey/valkey`, `versity/versitygw`) under the same digests, so a cluster
 needs no access to Docker Hub. To pull the originals instead, set

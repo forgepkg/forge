@@ -690,7 +690,7 @@ and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
 fails on a reference without one; Forge's own image is exempt, since the
 release pins it. `deploy/` pulls PostgreSQL, Valkey and versitygw from
 byte-for-byte copies of their Docker Hub images on ghcr.io
-(`ghcr.io/schmitch/forge/<name>`, the same digests), which
+(`ghcr.io/forgepkg/forge/<name>`, the same digests), which
 `.github/workflows/mirror-images.yml` keeps in line with Docker Hub daily and
 fills with every newly pinned digest once it lands on `main`. Dependabot
 bumps the base images and the `deploy/` images (watching those ghcr.io tags);
@@ -949,9 +949,9 @@ organization's **Packages** tab → the package → **Package settings**):
    release's `helm push` fails after the image tags have already moved.
 
 The same goes for the dependency images' copies, which the first run of
-`mirror-images.yml` on `main` creates: `ghcr.io/schmitch/forge/postgres`,
-`ghcr.io/schmitch/forge/valkey` and `ghcr.io/schmitch/forge/versitygw`. Make
-them **Public** and check that `schmitch/forge` has the **Write** role under
+`mirror-images.yml` on `main` creates: `ghcr.io/forgepkg/forge/postgres`,
+`ghcr.io/forgepkg/forge/valkey` and `ghcr.io/forgepkg/forge/versitygw`. Make
+them **Public** and check that `forgepkg/forge` has the **Write** role under
 **Manage Actions access**; until then the mirror run warns, and the release
 refuses to publish a chart that pulls them. They keep Docker Hub's
 `org.opencontainers.image.source` (a byte-for-byte copy cannot change it),

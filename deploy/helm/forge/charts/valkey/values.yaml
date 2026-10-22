@@ -10,7 +10,7 @@ image:
   # (.github/workflows/mirror-images.yml). `registry: docker.io` and
   # `repository: valkey/valkey` pull the original.
   registry: ghcr.io
-  repository: schmitch/forge/valkey
+  repository: forgepkg/forge/valkey
   # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
   # Dependabot bumps together with the tag; `digest`, when set, replaces it.
   tag: 9.1-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11

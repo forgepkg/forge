@@ -34,7 +34,7 @@ The `Dockerfile` keeps the canonical Docker Hub names, for Dependabot; CI's
 BuildKit pulls them through the mirror as its `docker.io` registry mirror.
 `deploy/` names no Docker Hub image at all: the chart and the manifests pull
 the dependencies' byte-for-byte copies on ghcr.io
-(`ghcr.io/schmitch/forge/<name>`, the same digests), which
+(`ghcr.io/forgepkg/forge/<name>`, the same digests), which
 `.github/workflows/mirror-images.yml` makes from `mirror.gcr.io`. A new
 dependency image goes there too: add it to `.github/scripts/mirror-images.sh`
 and name its ghcr.io copy.
