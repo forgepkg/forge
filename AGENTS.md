@@ -31,8 +31,8 @@ sudo dockerd &
 ```
 
 The `Dockerfile` and `deploy/` keep the canonical Docker Hub names, for
-Dependabot and for deployments; CI's BuildKit and GitLab's Docker daemon pull
-them through the mirror as their `docker.io` registry mirror.
+Dependabot and for deployments; CI's BuildKit pulls them through the mirror
+as its `docker.io` registry mirror.
 
 ## Changelog: a fragment per change, never CHANGELOG.md
 

@@ -242,8 +242,7 @@ jobs:
           # A pull request's merge commit and its first parent, the base
           # branch: what differs between them is the pull request's change.
           fetch-depth: 2
-      # The image's inputs; keep in step with the docker job's
-      # `rules: changes` in .gitlab-ci.yml. A failing diff builds.
+      # The image's inputs. A failing diff builds.
       - name: Does the change touch the image's inputs?
         id: inputs
         env:

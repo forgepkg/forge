@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cargo target runner for `cargo test` in CI (ci.yml and .gitlab-ci.yml set
+# Cargo target runner for `cargo test` in CI (ci.yml sets
 # CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER to it): runs each test binary
 # with libtest's per-test timings and records them for
 # test-timings-summary.sh.

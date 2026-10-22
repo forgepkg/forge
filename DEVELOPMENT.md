@@ -609,9 +609,9 @@ cargo test -p forge-server
 ```
 
 **Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
-tests in their job summary (GitLab: at the end of the job log). Every result
-line in the log carries its test's duration (`test foo ... ok <1.234s>`).
-Locally, run any `cargo test` through the same runner, then summarize:
+tests in their job summary. Every result line in the log carries its test's
+duration (`test foo ... ok <1.234s>`). Locally, run any `cargo test` through
+the same runner, then summarize:
 
 ```bash
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
@@ -727,21 +727,20 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) runs
-`fmt`, `clippy`, `audit`, `test`, `docker`, `kubernetes` and `web` on every
-pull request. The slow `e2e` and `web-e2e` jobs are skipped there; they run in
-the merge queue and on every push to `main`.
+CI (`.github/workflows/ci.yml`) runs `fmt`, `clippy`, `audit`, `test`,
+`docker`, `kubernetes` and `web` on every pull request. The slow `e2e` and
+`web-e2e` jobs are skipped there; they run in the merge queue and on every
+push to `main`.
 
 On a pull request, `docker` builds the image only when the change touches what
 it is built from: the `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, a
 `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, the web
 manifest and lockfile (`web/package.json`, `web/pnpm-lock.yaml`,
 `web/pnpm-workspace.yaml`, `web/.npmrc`) or the CI configuration. Otherwise
-it passes without building (GitLab leaves the job out of the merge request
-pipeline). The merge queue and every push to `main` always build the image,
-so a change that breaks only the image build, such as an `include_str!` of a
-file `.dockerignore` leaves out, fails in the queue rather than on its pull
-request.
+it passes without building. The merge queue and every push to `main` always
+build the image, so a change that breaks only the image build, such as an
+`include_str!` of a file `.dockerignore` leaves out, fails in the queue
+rather than on its pull request.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, `e2e` and `web-e2e` included.
@@ -758,10 +757,6 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).
-
-On GitLab, a merge train is the merge queue: enable **merged results
-pipelines** and **merge trains** under *Settings → Merge requests*. Merge
-train pipelines run `e2e` and `web-e2e` as well.
 
 ## Changelog entries
 
