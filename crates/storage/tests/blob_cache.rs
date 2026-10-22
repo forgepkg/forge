@@ -271,6 +271,17 @@ async fn read(store: &BlobStore, blob: &Blob, range: Option<std::ops::Range<u64>
     out
 }
 
+/// Wait for an evicted entry's file to be removed (in the background).
+async fn until_gone(path: &Path) {
+    for _ in 0..200 {
+        if !path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{} was never removed", path.display());
+}
+
 /// Wait for a background fill or copy to land in the cache.
 async fn until_cached(cache: &BlobCache, blob: &Blob) {
     for _ in 0..200 {
@@ -423,7 +434,7 @@ async fn eviction_is_fifo_and_survives_a_restart() {
         read(&store, d, None).await;
         until_cached(&cache, d).await;
         assert!(!cache.contains(&a.sha256), "the oldest fill went first");
-        assert!(!a.file(&dir).exists());
+        until_gone(&a.file(&dir)).await;
         assert_eq!(cache.stats().evictions, 1);
     }
     // The order comes back from the files' mtimes.
@@ -491,6 +502,48 @@ async fn limits_follow_the_disk_min_free_and_staging() {
 }
 
 #[tokio::test]
+async fn only_maintenance_reads_the_filesystem_size() {
+    // A miss runs on a runtime worker: it goes by the size maintenance last
+    // read, and evicts without unlinking files under the cache's lock.
+    let (endpoint, fake) = spawn_fake_s3().await;
+    let dir = scratch("probe");
+    let probes = Arc::new(AtomicUsize::new(0));
+    let counted = probes.clone();
+    let available = Arc::new(Mutex::new(10_000u64));
+    let disk = fake_fs(1 << 30, available.clone());
+    let probe: FsProbe = Arc::new(move |path: &Path| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        disk(path)
+    });
+    let cache = BlobCache::open_with(
+        BlobCacheConfig {
+            min_free_bytes: Some(0),
+            ..config(&dir, CacheLimit::Auto)
+        },
+        probe,
+    )
+    .unwrap();
+    let opened = probes.load(Ordering::SeqCst);
+    let store = cached_store(&endpoint, cache.clone());
+    let blobs: Vec<Blob> = (60..66).map(|seed| Blob::new(seed, 3_000)).collect();
+    for blob in &blobs {
+        fake.put(&blob.key, blob.bytes.clone());
+        assert_eq!(read(&store, blob, None).await, blob.bytes);
+        until_cached(&cache, blob).await;
+    }
+    assert_eq!(probes.load(Ordering::SeqCst), opened, "no probe on a miss");
+    // The cache's own fills count against the space read then: 10 000
+    // bytes hold three blobs, and the older ones were evicted.
+    let stats = cache.stats();
+    assert_eq!((stats.entries, stats.size_bytes), (3, 9_000));
+    for old in &blobs[..3] {
+        until_gone(&old.file(&dir)).await;
+    }
+    cache.maintain();
+    assert_eq!(probes.load(Ordering::SeqCst), opened + 1);
+}
+
+#[tokio::test]
 async fn a_full_disk_serves_from_s3_without_caching() {
     let (endpoint, fake) = spawn_fake_s3().await;
     let dir = scratch("full");
@@ -511,8 +564,9 @@ async fn a_full_disk_serves_from_s3_without_caching() {
     assert!(!cache.contains(&blob.sha256));
     assert_eq!(cache.stats().bypassed, 1);
 
-    // Room again: cached.
+    // Room again, as the next maintenance finds: cached.
     *available.lock().unwrap() = 1 << 30;
+    cache.maintain();
     read(&store, &blob, None).await;
     until_cached(&cache, &blob).await;
 

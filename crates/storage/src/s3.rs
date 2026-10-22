@@ -617,7 +617,7 @@ impl BlobStore {
     pub async fn delete_blob(&self, sha256: &str, key: &str) -> Result<(), S3Error> {
         self.delete(key).await?;
         if let Some(cache) = &self.cache {
-            cache.evict(sha256);
+            cache.evict(sha256).await;
         }
         Ok(())
     }
