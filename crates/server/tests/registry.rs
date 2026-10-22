@@ -764,12 +764,14 @@ async fn the_repository_upload_limit_bounds_blob_pushes() {
 #[tokio::test]
 async fn chunked_uploads_cache_the_blob_not_its_chunks() {
     let dir = tempfile::tempdir().unwrap();
+    // A fixed size, and no free space to keep: the cache fills however full
+    // the test machine's disk is.
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
             plugins_block: Some(format!(
-                "[blob_cache]\npath = {:?}\n",
+                "[blob_cache]\npath = {:?}\nmax_bytes = 1048576\nmin_free_bytes = 0\n",
                 dir.path().join("cache").display().to_string()
             )),
             ..Default::default()
