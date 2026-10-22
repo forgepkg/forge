@@ -735,9 +735,11 @@ skip: those two run in the merge queue and on every push to `main`.
 On a pull request and in the merge queue, a job runs only when the change
 touches what it checks (#353). The `changes` job
 (`.github/scripts/ci-changes.sh`) compares a pull request with its base
-branch, and a merge group with the base-branch commit it is built on, so the
-pull requests ahead of it in the queue count too. It sorts the change into
-groups of paths:
+branch, and a merge group with the commit it is built on: `main`, or the
+merge group ahead of it in the queue. A merge group therefore runs only the
+jobs its own pull request needs; the pull requests ahead of it are checked by
+their own groups, and the queue merges a group only once every group ahead
+of it passed too (see below). It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
@@ -749,10 +751,11 @@ groups of paths:
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, `.gitlab-ci.yml`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to the CI configuration counts for every group. A job left out is
-skipped, which passes a required check. If the `changes` job fails, every job runs. Pushes to `main` and manual
-runs run every job, which the release gate requires. A file that Rust code or
-its tests read from outside the crates belongs in the Rust group: add a new
-one to `ci-changes.sh` and to the `.paths` of `.gitlab-ci.yml`.
+skipped, which passes a required check. If the `changes` job fails, every job
+runs. Pushes to `main` and manual runs run every job, which the release gate
+requires. A file that Rust code or its tests read from outside the crates
+belongs in the Rust group: add a new one to `ci-changes.sh` and to the
+`.paths` of `.gitlab-ci.yml`.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
@@ -761,8 +764,8 @@ leaves out, therefore fails on the push to `main` rather than in the queue.
 
 On GitLab, the same groups are `rules: changes` in merge request pipelines
 and merge trains; a merge request that touches none of them gets no
-pipeline. A merge train pipeline compares only its own merge request
-with the target branch: the merge requests ahead count through their own
+pipeline. As in a GitHub merge group, a merge train pipeline checks only its
+own merge request: the merge requests ahead count through their own
 pipelines, since a failed one leaves the train and the pipelines behind it
 restart without it.
 
@@ -779,6 +782,10 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
    as passed, so the pull request can join the queue; the queue runs them and
    merges only once they passed. Leave them out and the queue merges without
    waiting for them.
+3. Keep **Only merge non-failing pull requests** enabled (the default). A
+   merge group runs only the jobs its own pull request needs, so a pull
+   request must not land on the strength of a later group that skipped the
+   jobs its own change needed.
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).

@@ -4,10 +4,12 @@
 # the job summary; without GitHub's files, it prints the lines.
 #
 # A pull request's merge commit is compared with its first parent, the base
-# branch; a merge group with the base-branch commit it is built on
-# (MERGE_GROUP_BASE), so the pull requests ahead of it in the queue count too.
-# Any other event (a push, a manual run), or a diff that fails, needs every
-# group.
+# branch; a merge group with the commit it is built on (MERGE_GROUP_BASE):
+# the base branch, or the merge group ahead of it in the queue. A group thus
+# runs the jobs its own pull requests need. The ones ahead are checked by
+# their own groups, and with "Only merge non-failing pull requests" the queue
+# merges a group only once every group ahead of it passed as well. Any other
+# event (a push, a manual run), or a diff that fails, needs every group.
 #
 # The groups are git pathspecs, each also covering the CI configuration
 # (COMMON). Keep the `rules: changes` lists of .gitlab-ci.yml in step.

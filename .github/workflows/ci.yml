@@ -65,8 +65,9 @@ jobs:
   # ── What the change touches ────────────────────────────────────────────────
   # On a pull request and in the merge queue, a job runs only when the change
   # touches what it checks (#353): ci-changes.sh compares the commit with its
-  # base and sets one output per group of paths (rust, changelog, audit, web,
-  # image, kubernetes), and a job whose groups are all `false` is skipped,
+  # base (a merge group with the group ahead of it in the queue, or main) and
+  # sets one output per group of paths (rust, changelog, audit, web, image,
+  # kubernetes), and a job whose groups are all `false` is skipped,
   # which passes a required check. Pushes to the default branch and manual
   # runs set every group. The conditions run a job unless its output is
   # `false`, so if this job fails, every job runs. Every job waits for this
