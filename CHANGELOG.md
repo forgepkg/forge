@@ -285,7 +285,10 @@ otherwise.
   be active, and a browser session never pushes or deletes. The token
   endpoint takes the same Basic credentials as the feeds, so it adds no new
   password path. The signing key is `docker.token_secret`, or a generated
-  key kept in the database and sealed when `[crypto]` is enabled.
+  key kept in the database, sealed when `[crypto]` is enabled and re-sealed
+  by DEK rotation; an instance replaces it only when it can never be opened,
+  and the others pick the new key up within 30 seconds
+  ([#196](https://github.com/schmitch/forge/issues/196)).
 - Registry digests are verified on every upload and every proxied blob and
   manifest. Blobs are linked per image: knowing a layer digest grants no
   read on another image's copy, and a mount needs read on the source image.

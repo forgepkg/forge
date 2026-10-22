@@ -1438,6 +1438,79 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
     assert_eq!(resp.status(), 200, "the admin rotation released the lock");
 }
 
+/// The generated registry token key survives DEK rotation (#196): rotation
+/// re-seals it, and its DEK stays until then. An instance that starts after
+/// the old DEK is revoked loads the same key, so it accepts the tokens the
+/// running instances sign, instead of generating a key of its own.
+#[tokio::test]
+async fn registry_token_key_survives_dek_rotation() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}", common::unique());
+    // A database of its own: the key and the DEKs are install-wide.
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let stored = || async {
+        forge_db::authz_dao::get_setting(&srv.pool, forge_server::registry::TOKEN_KEY_SETTING)
+            .await
+            .unwrap()
+            .expect("the generated key is stored")
+    };
+    let before = stored().await;
+    assert!(before.starts_with("sealed:"), "{before}");
+
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rot: Value = resp.json().await.unwrap();
+    assert!(rot["revoked_deks"].as_u64().unwrap() >= 1, "{rot}");
+    let after = stored().await;
+    assert_ne!(after, before, "re-sealed under the new DEK");
+
+    let restarted = forge_server::registry::load_token_keys(
+        &srv.state.config,
+        &srv.pool,
+        srv.state.envelope.as_deref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored().await, after, "not replaced");
+    let now = chrono::Utc::now().timestamp();
+    let claims = forge_oci::token::Claims {
+        iss: forge_oci::token::issuer("https://forge.example.com"),
+        aud: "forge.example.com".into(),
+        sub: "anonymous".into(),
+        iat: now,
+        nbf: now,
+        exp: now + 300,
+        jti: "j".into(),
+        access: Vec::new(),
+        fp: forge_oci::token::TokenPrincipal::Anonymous,
+    };
+    let token = forge_oci::token::issue(&srv.state.registry_keys, &claims).unwrap();
+    assert!(
+        forge_oci::token::verify(&restarted, &token, &claims.iss, &claims.aud).is_some(),
+        "a restarted instance accepts the running instance's tokens"
+    );
+}
+
 /// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
 /// disabled (slice-1 plaintext behavior stays untouched).
 #[tokio::test]

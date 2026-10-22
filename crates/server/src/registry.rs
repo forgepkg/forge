@@ -13,9 +13,9 @@ use base64::Engine;
 use forge_core::auth::Principal;
 use forge_core::repo::PublishPolicy;
 use forge_crypto::service::EnvelopeService;
-use forge_crypto::{AeadBinding, ExposeSecret, PlaintextSecret};
+use forge_crypto::{ExposeSecret, PlaintextSecret};
 use forge_db::model::Repository;
-use forge_db::{authz_dao, workload_api_key_dao};
+use forge_db::{authz_dao, secret_dao, workload_api_key_dao};
 use forge_oci::token::TokenKeys;
 use sha2::Digest;
 use sqlx::PgPool;
@@ -25,7 +25,7 @@ use crate::middleware::principal_of;
 use crate::state::AppState;
 
 /// `forge_setting` key of the generated registry-token signing key.
-pub const TOKEN_KEY_SETTING: &str = "docker_token_key";
+pub const TOKEN_KEY_SETTING: &str = secret_dao::REGISTRY_TOKEN_KEY_SETTING;
 
 /// The `/v2` handler.
 pub async fn registry(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -111,7 +111,13 @@ pub(crate) fn amend_registry_rejection(public_base_url: &str, response: Response
 /// The registry-token signing keys: derived from `docker.token_secret`, or
 /// the install's generated key (created on first use and shared by every
 /// instance through `forge_setting`; sealed with the envelope service when
-/// secret encryption is enabled).
+/// secret encryption is enabled, and re-sealed by DEK rotation like every
+/// other secret).
+///
+/// A stored key is replaced only when it can never be opened (malformed, or
+/// sealed under a data key that does not open it). A database, key store or
+/// configuration error fails startup instead: replacing the shared key would
+/// split the instances that still hold it from this one.
 pub async fn load_token_keys(
     config: &Config,
     pool: &PgPool,
@@ -124,41 +130,86 @@ pub async fn load_token_keys(
         return Ok(TokenKeys::new(vec![hasher.finalize().to_vec()]));
     }
     for _ in 0..5 {
-        match authz_dao::get_setting(pool, TOKEN_KEY_SETTING)
+        let stored = authz_dao::get_setting(pool, TOKEN_KEY_SETTING)
             .await
-            .context("read the registry token key")?
-        {
-            Some(stored) => match open_key(&stored, envelope).await {
+            .context("read the registry token key")?;
+        if let Some(stored) = &stored {
+            match open_key(stored, envelope).await {
                 Ok(key) => return Ok(TokenKeys::new(vec![key])),
-                Err(error) => {
-                    // Sealed under a key this instance cannot open (crypto
-                    // turned off, a retired DEK): tokens only live minutes,
-                    // so a new key costs nothing but a re-login.
+                Err(error) if secret_dao::is_unreadable_setting(&error) => {
+                    // Tokens only live minutes, so a new key costs the
+                    // instances still holding the old one a re-login, once
+                    // they have picked it up (`spawn_token_key_refresh`).
                     tracing::warn!(%error, "registry token key unreadable; generating a new one");
-                    let key = new_key();
-                    let encoded = seal_key(&key, envelope).await?;
-                    if authz_dao::replace_setting(pool, TOKEN_KEY_SETTING, &stored, &encoded)
-                        .await
-                        .context("replace the registry token key")?
-                    {
-                        return Ok(TokenKeys::new(vec![key]));
-                    }
                 }
-            },
-            None => {
-                let key = new_key();
-                let encoded = seal_key(&key, envelope).await?;
-                if authz_dao::insert_setting_if_absent(pool, TOKEN_KEY_SETTING, &encoded)
-                    .await
-                    .context("store the registry token key")?
-                {
-                    return Ok(TokenKeys::new(vec![key]));
-                }
-                // Another instance stored one first: use theirs.
+                Err(error) => return Err(error).context("open the registry token key"),
             }
+        }
+        let key = new_key();
+        let secret = PlaintextSecret::from(base64::engine::general_purpose::STANDARD.encode(&key));
+        // Replaces only the value read above; another instance that stored
+        // one first wins, and the next round uses theirs.
+        if secret_dao::store_secret_setting(
+            pool,
+            envelope,
+            TOKEN_KEY_SETTING,
+            &secret,
+            stored.as_deref(),
+        )
+        .await
+        .context("store the registry token key")?
+        .is_some()
+        {
+            return Ok(TokenKeys::new(vec![key]));
         }
     }
     anyhow::bail!("could not settle the registry token key with the other instances")
+}
+
+/// How often [`spawn_token_key_refresh`] re-reads the shared key.
+pub const TOKEN_KEY_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pick up a registry token key another instance stored (one that could not
+/// open the previous key replaced it): sign with it from then on, and keep
+/// accepting the previous key's tokens ([`TokenKeys::rotate_to`]). Runs every
+/// [`TOKEN_KEY_REFRESH`]; only for the generated key, not with
+/// `docker.token_secret`. A key that does not open is logged and left to the
+/// instance that next starts.
+pub fn spawn_token_key_refresh(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seen: Option<String> = None;
+        let mut ticker = tokio::time::interval(TOKEN_KEY_REFRESH);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let stored = match authz_dao::get_setting(&state.pool, TOKEN_KEY_SETTING).await {
+                Ok(Some(stored)) => stored,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot re-read the registry token key");
+                    continue;
+                }
+            };
+            if seen.as_deref() == Some(stored.as_str()) {
+                continue;
+            }
+            match open_key(&stored, state.envelope.as_deref()).await {
+                Ok(key) => {
+                    if state.registry_keys.rotate_to(key) {
+                        tracing::info!("picked up a new registry token key");
+                    }
+                    seen = Some(stored);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot open the stored registry token key");
+                    // Warn once about a key that never opens; retry others.
+                    if secret_dao::is_unreadable_setting(&error) {
+                        seen = Some(stored);
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn new_key() -> Vec<u8> {
@@ -168,48 +219,19 @@ fn new_key() -> Vec<u8> {
     key
 }
 
-fn binding() -> AeadBinding<'static> {
-    AeadBinding {
-        table: "forge_setting",
-        column: "value",
-        row_pk: 0,
-        destination: Some(TOKEN_KEY_SETTING),
+/// Open a stored registry token key (base64 key material, as a secret
+/// setting). Bad key material counts as malformed.
+async fn open_key(
+    stored: &str,
+    envelope: Option<&EnvelopeService>,
+) -> Result<Vec<u8>, secret_dao::SecretDbError> {
+    let malformed = || secret_dao::SecretDbError::MalformedSetting(TOKEN_KEY_SETTING.to_string());
+    let secret = secret_dao::open_secret_setting(envelope, TOKEN_KEY_SETTING, stored).await?;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(secret.expose_secret())
+        .map_err(|_| malformed())?;
+    if key.len() < 32 {
+        return Err(malformed());
     }
-}
-
-async fn seal_key(key: &[u8], envelope: Option<&EnvelopeService>) -> anyhow::Result<String> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    match envelope {
-        Some(envelope) => {
-            let sealed = envelope
-                .seal(&PlaintextSecret::from(b64.encode(key)), binding())
-                .await
-                .context("seal the registry token key")?;
-            Ok(format!("sealed:{}", b64.encode(sealed)))
-        }
-        None => Ok(format!("plain:{}", b64.encode(key))),
-    }
-}
-
-async fn open_key(stored: &str, envelope: Option<&EnvelopeService>) -> anyhow::Result<Vec<u8>> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let key = if let Some(plain) = stored.strip_prefix("plain:") {
-        b64.decode(plain).context("decode the registry token key")?
-    } else if let Some(sealed) = stored.strip_prefix("sealed:") {
-        let envelope =
-            envelope.context("the registry token key is sealed but [crypto] is not configured")?;
-        let blob = b64
-            .decode(sealed)
-            .context("decode the sealed registry token key")?;
-        let opened = envelope
-            .open(&blob, binding())
-            .await
-            .context("open the registry token key")?;
-        b64.decode(opened.expose_secret())
-            .context("decode the registry token key")?
-    } else {
-        anyhow::bail!("unknown registry token key encoding");
-    };
-    anyhow::ensure!(key.len() >= 32, "registry token key too short");
     Ok(key)
 }
