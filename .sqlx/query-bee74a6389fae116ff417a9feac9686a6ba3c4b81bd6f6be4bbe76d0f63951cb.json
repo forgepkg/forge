@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM repository WHERE upstream_password_enc IS NOT NULL\n        ) OR EXISTS (\n            SELECT 1 FROM auth_realm WHERE secrets_enc IS NOT NULL\n        ) OR EXISTS (\n            SELECT 1 FROM nexus_import WHERE password_enc IS NOT NULL\n        ) AS \"present!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "present!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "bee74a6389fae116ff417a9feac9686a6ba3c4b81bd6f6be4bbe76d0f63951cb"
+}

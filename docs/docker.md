@@ -128,6 +128,10 @@ with any `artifactType`; Docker schema 1 is refused.
   Upload sessions are shared by all instances; an abandoned one expires
   after `docker.upload_ttl_seconds`.
 
+The images of a Nexus docker-hosted repository move over with an import,
+digests, multi-platform indexes, signatures and SBOMs included
+([nexus-import.md](nexus-import.md)).
+
 ### Signatures, SBOMs and attestations
 
 The referrers API (`GET /v2/<name>/referrers/<digest>`, with the

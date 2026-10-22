@@ -215,6 +215,16 @@ pub struct Credentials {
 }
 
 impl Credentials {
+    /// Basic credentials sent only to the origin of `url` (and to a token
+    /// service that origin's challenge names, see [`Self::auth_for`]).
+    pub fn for_url(url: &str, username: String, password: forge_crypto::PlaintextSecret) -> Self {
+        Credentials {
+            origin: Origin::of(url),
+            username,
+            password,
+        }
+    }
+
     /// The credentials, scoped to the origin of the `remote_url` they were
     /// stored for.
     pub fn auth(&self) -> UpstreamAuth<'_> {

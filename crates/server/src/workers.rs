@@ -48,6 +48,11 @@
 //!    realm is enabled, and rotates them when due. The rotation is a
 //!    compare-and-swap on the shared setting, safe on every instance.
 //!
+//! 8. **Nexus imports** — claims a queued import (or one whose instance
+//!    died) with `FOR UPDATE SKIP LOCKED` and a lease it renews, so an import
+//!    runs on one instance at a time; every instance runs the loop
+//!    ([`crate::nexus_import`]).
+//!
 //! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process, and runs under [`supervise`]: a loop that
@@ -98,6 +103,8 @@ pub struct WorkerHandles {
     /// Local blob cache maintenance (re-read the disk size, evict down to the
     /// limit). Present only with `[blob_cache]`; per instance, like the cache.
     pub blob_cache: Option<JoinHandle<()>>,
+    /// Runs imports from Nexus, one at a time per instance.
+    pub nexus_import: JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -120,6 +127,7 @@ impl WorkerHandles {
         if let Some(h) = &self.blob_cache {
             h.abort();
         }
+        self.nexus_import.abort();
     }
 }
 
@@ -280,6 +288,14 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     });
 
+    // Nexus imports: the lease decides which instance runs an import.
+    let nexus_import = {
+        let state = state.clone();
+        supervise("nexus-import", move || {
+            crate::nexus_import::ImportWorker::new(state.clone()).spawn_loop()
+        })
+    };
+
     WorkerHandles {
         outbox,
         reconciler,
@@ -292,6 +308,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         issuer_refresh,
         crypto_rotation,
         blob_cache,
+        nexus_import,
     }
 }
 
