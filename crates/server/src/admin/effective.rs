@@ -1,4 +1,4 @@
-//! Admin effective-set explain endpoint (§12.4 Phase 6).
+//! Admin effective-set explain endpoint.
 //!
 //! * `GET /admin/users/{id}/effective` — the resolved effective grant set for a
 //!   user (admin flag + flat grant list), for support and the test matrix.

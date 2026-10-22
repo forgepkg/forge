@@ -1,4 +1,4 @@
-//! DB-backed auth realms (slice 12.7, design doc 2026-06-03 §3).
+//! DB-backed auth realms.
 //!
 //! The `auth_realm` table is the **authority** for how password logins and the
 //! interactive OIDC login are wired. This module owns:
@@ -18,8 +18,8 @@
 //!   through the *logical* config ([`forge_db::secret_dao::realm_config`]),
 //!   legacy plaintext rows keep working and are re-encrypted on write / by the
 //!   crypto backfill;
-//! * the **legacy-config import** ([`seed_auth_realms`]): the 12.2 `[oidc]`
-//!   and 12.3 `[auth.upstream_basic]` TOML blocks become realm rows, with
+//! * the **legacy-config import** ([`seed_auth_realms`]): the `[oidc]` and
+//!   `[auth.upstream_basic]` TOML blocks become realm rows, with
 //!   drift detection — a changed block keeps re-applying only while the row is
 //!   untouched since the last seed; the moment an admin edits the row through
 //!   the API, the database is the authority and the TOML stops clobbering it.
@@ -66,7 +66,7 @@ pub const KIND_WORKLOAD_IDENTITY: &str = "workload_identity";
 
 // ─── typed realm configs ─────────────────────────────────────────────────────
 
-/// `config` shape for a `credential_forwarding` realm. Mirrors the 12.3
+/// `config` shape for a `credential_forwarding` realm. Mirrors the
 /// `[auth.upstream_basic]` block (flattened — the cache TTLs and pepper live at
 /// the top level of the json document).
 ///
@@ -158,8 +158,8 @@ impl std::fmt::Debug for CredForwardRealmConfig {
     }
 }
 
-/// `config` shape for an `oidc` realm. Mirrors the 12.2 `[oidc]` block, minus
-/// what is now derived: the redirect URL is always
+/// `config` shape for an `oidc` realm. Mirrors the `[oidc]` block, minus what
+/// is derived: the redirect URL is always
 /// `{public_base_url}/auth/oidc/callback`, and session TTLs are global
 /// (`auth.session_*`).
 ///
@@ -201,7 +201,7 @@ pub struct OidcRealmConfig {
     /// Permit a plain-`http` issuer (dev/test IdPs only).
     #[serde(default)]
     pub allow_http_issuer: bool,
-    /// Claim used as the username (12.7 decision: `preferred_username`).
+    /// Claim used as the username (default `preferred_username`).
     #[serde(default = "default_username_claim")]
     pub username_claim: String,
     /// Claim carrying the user's email.
@@ -228,7 +228,7 @@ pub struct OidcRealmConfig {
     /// for a multi-tenant Entra app, `{"hd": ["corp.example"]}` for Google).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
-    /// Identifier-first routing rule (§3.4): a login identifier whose email
+    /// Identifier-first routing rule: a login identifier whose email
     /// domain (the part after `@`, case-insensitive) is in this list is routed
     /// to this realm (`oidc_redirect`). Empty ⇒ never matched by identifier;
     /// the realm is still offered as a button in `combined` mode.
@@ -569,14 +569,13 @@ pub struct RealmSnapshot {
     /// `credential_forwarding`), or `None` when none are enabled.
     pub chain: Option<Arc<Chain>>,
     /// Whether the **wire** Basic password path is enabled: the config flag
-    /// `auth.allow_password_basic`, or any enabled credential-forwarding realm
-    /// (mirrors the 12.3 rule where configuring an upstream enabled the path).
+    /// `auth.allow_password_basic`, or any enabled credential-forwarding realm.
     pub wire_password_enabled: bool,
     /// The (at most one — admin API invariant) enabled OIDC realm's runtime.
     pub oidc: Option<OidcRealmRuntime>,
-    /// Enabled `workload_identity` (WIF) realms (slice 12.8), each with its
-    /// issuer-scoped JWKS verifier. Multiple issuers are supported (GitLab,
-    /// GitHub Actions, …) — unlike OIDC there is no single-realm invariant.
+    /// Enabled `workload_identity` (WIF) realms, each with its issuer-scoped
+    /// JWKS verifier. Multiple issuers are supported (GitLab, GitHub Actions,
+    /// …) — unlike OIDC there is no single-realm invariant.
     pub workload: Vec<super::wif::WorkloadIdentityRealm>,
     /// Normalized issuer strings from every enabled WIF row, including rows
     /// whose remaining config is malformed. Token routing consults this before
@@ -789,7 +788,7 @@ impl RealmAuth {
                     if oidc.is_some() {
                         // The admin API refuses a second enabled OIDC realm;
                         // a raw DB write could still create one — first wins.
-                        tracing::error!(realm = %realm.name, "second enabled oidc realm ignored (multi-IdP is a later slice)");
+                        tracing::error!(realm = %realm.name, "second enabled oidc realm ignored (only one oidc realm can be enabled)");
                         continue;
                     }
                     match self.build_oidc(realm, &config) {
@@ -1032,8 +1031,8 @@ impl RealmAuth {
     }
 }
 
-/// The wire Basic source asks here for the current password chain (12.7: the
-/// chain follows runtime realm edits). Fail-closed: a snapshot error reports
+/// The wire Basic source asks here for the current password chain (the chain
+/// follows runtime realm edits). Fail-closed: a snapshot error reports
 /// "no chain", which denies the password path without touching token/anon
 /// handling.
 #[async_trait::async_trait]
@@ -1373,7 +1372,7 @@ mod tests {
         assert_eq!(ok["success_status"], json!([200]));
         assert_eq!(ok["positive_ttl_secs"], 300);
 
-        // Loopback/private upstream URLs are fine (12.7 §3.6); bad scheme is not.
+        // Loopback/private upstream URLs are fine; bad scheme is not.
         assert!(validate_config(
             KIND_CRED_FORWARD,
             &json!({"url": "http://127.0.0.1:8081/s", "key_pepper": "p"}),
@@ -1574,7 +1573,7 @@ mod tests {
             validate_config(KIND_LOCAL, &json!({"anything": 1})).unwrap(),
             json!({})
         );
-        // workload_identity now validates through the WIF module (slice 12.8):
+        // workload_identity validates through the WIF module:
         // an empty config is rejected (no issuer/audiences/rules)…
         assert!(validate_config(KIND_WORKLOAD_IDENTITY, &json!({})).is_err());
         // …and a complete one is accepted.

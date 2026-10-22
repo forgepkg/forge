@@ -9,15 +9,15 @@
 //! * [`format`] — the object-safe [`format::Format`] seam every package format
 //!   implements (parse, version normalize/compare, id lowercasing).
 //! * [`auth`] — principal extraction (token/password/anonymous), client-IP
-//!   resolution behind trusted proxies, and the coarse Slice-1 authorization
-//!   seam.
+//!   resolution behind trusted proxies, and the authorization seam over the
+//!   fine-grained RBAC evaluator ([`authz`]).
 //! * [`net`] — outbound-networking helpers, notably the [`net::ssrf`] guard.
-//! * [`retention`] — the slice-12.1 retention policy model + pure evaluator
+//! * [`retention`] — the retention policy model + pure evaluator
 //!   (decides which versions to delete/unlist; no I/O).
-//! * [`oidc`] — the slice-12.2 OpenID Connect support: discovery + JWKS fetch
+//! * [`oidc`] — OpenID Connect support: discovery + JWKS fetch
 //!   (cached via [`forge_cache`]), ID-token verification, the authorization-code
 //!   + PKCE flow, and claim → user resolution/provisioning.
-//! * [`session`] — the slice-12.2 server-side login-session service
+//! * [`session`] — the server-side login-session service
 //!   (create/validate/rotate/revoke + CSRF), backed by the shared `session`
 //!   table so sessions are correct and revocable across instances.
 

@@ -1,6 +1,5 @@
-//! Authorization and write plumbing shared by every format's feed (spec §6,
-//! plan 10.3), served by [`crate::plugins`] under each format's mount
-//! (NuGet: `/v3/{repo}`).
+//! Authorization and write plumbing shared by every format's feed, served by
+//! [`crate::plugins`] under each format's mount (NuGet: `/v3/{repo}`).
 //!
 //! ## Authorization
 //! Resolution runs **before** a format sees the request:

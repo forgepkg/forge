@@ -32,7 +32,7 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
 })
 
 /**
- * Per-user token management (plan §Phase 5). Slice 1 scopes tokens to a user
+ * Per-user token management. Tokens belong to a user
  * (`/admin/users/{id}/tokens`), so this is the user's "edit" screen: it lists
  * the user's tokens (metadata only — the secret is never returned), issues new
  * tokens (the plaintext is shown **once** via `ShowOnceSecret`), and revokes
@@ -46,7 +46,7 @@ function UserTokens() {
   const { userId } = Route.useParams()
   const id = Number(userId)
 
-  // The username comes from the cached users list (no per-user GET in slice 1).
+  // The username comes from the cached users list (there is no per-user GET).
   const users = useUsers()
   const user = users.data?.find((u) => u.id === id)
 

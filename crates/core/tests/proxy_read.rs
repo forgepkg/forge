@@ -1,4 +1,4 @@
-//! Integration tests for proxy-repository read ops (Phase 8).
+//! Integration tests for proxy-repository read ops.
 //!
 //! Drives [`forge_core::repo::proxy::ProxyRepo`] against real Postgres +
 //! versitygw containers, with an **in-process mock upstream NuGet feed** (an
@@ -473,8 +473,8 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&p).unwrap_or_else(|e| panic!("read fixture {}: {e}", p.display()))
 }
 
-/// Create a proxy repository pointing at `remote_url` (loopback mocks are fine
-/// since 12.7 §3.6 — only the scheme is checked) with the given delay.
+/// Create a proxy repository pointing at `remote_url` (loopback mocks are fine:
+/// only the scheme is checked) with the given delay.
 async fn make_proxy(
     pool: &PgPool,
     remote_url: &str,
@@ -625,7 +625,7 @@ async fn cache_on_demand_fetches_upstream_once() {
 ///
 /// The `proxy_cached_version` row lock is held only for the short state-decision
 /// and finalize transactions, never across the upstream fetch / CAS PUT
-/// (Addendum A7 — never hold a DB tx across a network/S3 call). The singleflight
+/// (no DB transaction is ever held across a network/S3 call). The singleflight
 /// is therefore *best-effort*: under contention more than one caller may fetch
 /// from upstream, but the CAS is content-addressed and the finalize tx re-checks
 /// `downloaded`, so the writers converge on an identical cached row — and

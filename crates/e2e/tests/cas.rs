@@ -1,7 +1,7 @@
 //! E2E: content-addressed storage — dedup + refcount transitions (2→1→0) with
 //! the outbox worker performing the deferred S3 delete, and the orphan
-//! reconciler reclaiming a never-committed `pending` blob (spec §9). Gated
-//! behind `forge-e2e`.
+//! reconciler reclaiming a never-committed `pending` blob. Gated behind
+//! `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -109,7 +109,7 @@ async fn dedup_refcount_2_to_1_to_0_with_outbox_delete() {
 
     // The worker (poll 1s, grace 0) removes the blob row + S3 object AND marks
     // every outbox row processed. Poll all three together: the outbox finalize
-    // (set processed_at) happens in a short tx *after* the blob-row delete (A7),
+    // (set processed_at) happens in a short tx *after* the blob-row delete,
     // so `pending == 0` is the authoritative "fully drained" signal.
     let mut gone = false;
     for _ in 0..40 {

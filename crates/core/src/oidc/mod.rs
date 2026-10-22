@@ -1,4 +1,4 @@
-//! OpenID Connect support (slice 12.2).
+//! OpenID Connect support.
 //!
 //! This module implements the IdP-facing half of interactive OIDC login:
 //!
@@ -14,13 +14,13 @@
 //! * [`assertion`] — forge as the issuer of its own client assertions: the
 //!   rotating RSA key set, its JWKS, and the signed `client_assertion` an
 //!   `oidc` realm can authenticate with instead of a client secret.
-//! * [`claims`] — pure claim → user mapping + `is_admin` derivation (§3.6).
+//! * [`claims`] — pure claim → user mapping + `is_admin` derivation.
 //! * [`resolve_user`] — identity resolution: find via `external_identity`, else
 //!   auto-provision / link an existing local user / reject; recompute `is_admin`.
 //!
 //! ## Multi-instance / no-advisory-lock posture
 //!
-//! Discovery and JWKS are cached via the slice-1 [`forge_cache::Cache`]
+//! Discovery and JWKS are cached via [`forge_cache::Cache`]
 //! (L1 moka + optional Redis L2 + invalidation backplane). Request coalescing is
 //! moka's per-instance [`try_get_with`](forge_cache::Cache::get_or_try_insert_with);
 //! an occasional duplicate JWKS fetch across instances is harmless, so we use
@@ -50,9 +50,9 @@ pub use jwks::{
     DiscoveryDocument, IdTokenClaims, OidcError, OidcMetadataClient, Verified, VerifyParams,
 };
 
-// Re-export the slice-1 DAOs that the server's `/auth` routes (Phase 5) drive,
-// so callers reach them through `forge_core::oidc::*` without depending on
-// `forge_db` directly for the OIDC tables.
+// Re-export the DAO types the server's `/auth` routes drive, so callers reach
+// them through `forge_core::oidc::*` without depending on `forge_db` directly
+// for the OIDC tables.
 pub use external_identity_dao::IdentityClaims;
 pub use oidc_flow_dao::NewOidcFlow;
 pub use session_dao::NewSession;
@@ -65,7 +65,7 @@ pub enum ResolveError {
     #[error("oidc user not provisioned")]
     NotProvisioned,
     /// The resolved/linked `app_user` is `active = false`: reject even though the
-    /// IdP authenticated successfully (§6 account-state check).
+    /// IdP authenticated successfully.
     #[error("oidc user is inactive")]
     Inactive,
     /// A database error during resolution.
@@ -107,7 +107,7 @@ impl Default for ResolvePolicy {
 }
 
 /// Resolve (and, per policy, provision or link) the `app_user` for a validated
-/// login, recomputing `is_admin` from the current claims (§3.6).
+/// login, recomputing `is_admin` from the current claims.
 ///
 /// Order:
 /// 1. **Existing link** `(issuer, subject)` → load that user, recompute admin,
@@ -252,11 +252,11 @@ async fn provision_oidc_user(
             pool,
             NewUser {
                 username,
-                // No local password: slice 12.3 made password_hash nullable and
-                // records provenance instead. A NULL hash means password-basic
-                // can never authenticate this user (token.rs short-circuits on
-                // None); the (issuer, subject) link in external_identity is the
-                // authority for OIDC logins.
+                // No local password; `auth_source` records provenance instead.
+                // A NULL hash means password-basic can never authenticate this
+                // user (the local-password provider skips it); the (issuer,
+                // subject) link in external_identity is the authority for OIDC
+                // logins.
                 password_hash: None,
                 is_admin: mapped.is_admin,
                 active: true,

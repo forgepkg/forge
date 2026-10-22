@@ -1,4 +1,4 @@
-//! Authorization-code + PKCE flow (slice 12.2, §3.3.1).
+//! Authorization-code + PKCE flow.
 //!
 //! Two halves, each correct across instances because **all** ephemeral state is
 //! persisted in Postgres (`oidc_flow`), never in process memory:
@@ -31,10 +31,11 @@
 //!
 //! The `code_verifier` is a 256-bit URL-safe base64 (no-pad) CSPRNG string and
 //! the `code_challenge` is `base64url(sha256(verifier))` — both built here from
-//! `rand` + `sha2` + `base64` (already slice-1 deps). No `oauth2`/`openidconnect`
-//! crate is pulled: the flow is small, fully under our control (so we choose
-//! where state lives — Postgres), and consistent with the Phase-2 verifier that
-//! also uses `jsonwebtoken` directly rather than the heavier `openidconnect`.
+//! `rand` + `sha2` + `base64` (existing dependencies). No `oauth2` /
+//! `openidconnect` crate is pulled: the flow is small, fully under our control
+//! (so we choose where state lives — Postgres), and consistent with the
+//! ID-token verifier ([`super::jwks`]) that also uses `jsonwebtoken` directly
+//! rather than the heavier `openidconnect`.
 
 use base64::Engine;
 use chrono::Duration as ChronoDuration;

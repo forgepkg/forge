@@ -1,4 +1,4 @@
-//! E2E: read-side browse / search endpoints (plan §12.6 Phase 0, §8).
+//! E2E: read-side browse / search endpoints.
 //!
 //! Exercises the full HTTP stack: publish a package, then browse + view detail;
 //! the signed-in-users-only rule (anonymous browse is 401 even for
@@ -35,10 +35,10 @@ async fn publish_one(
         resp.status()
     );
 
-    // Under §12.4 RBAC, anonymous read flows through a grant on the built-in
-    // `anonymous` role (what the data migration converts the slice-1
+    // Under RBAC, anonymous read flows through a grant on the built-in
+    // `anonymous` role (what the RBAC data migration converted the
     // `anonymous_read` flag into), not the column. Seed that grant directly,
-    // mirroring the migration, so anonymous browse/search honors it.
+    // mirroring the migration, so the `/v3` feed serves the repo anonymously.
     if anonymous_read {
         let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, repo)
             .await

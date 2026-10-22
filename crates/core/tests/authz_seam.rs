@@ -1,4 +1,4 @@
-//! Integration tests for the cached authorization seam (§12.4 Phase 3).
+//! Integration tests for the cached authorization seam.
 //!
 //! These drive the real [`Authz`] service (cache → DB) against a Postgres
 //! testcontainer with the seeded built-in roles from migration 0005 plus
@@ -289,7 +289,7 @@ async fn token_scope_narrows_actions() {
     .await
     .expect("token");
 
-    // Set the token scope to read-only via raw SQL (admin API lands in Phase 6).
+    // Set the token scope to read-only via raw SQL.
     sqlx::query!(
         r#"UPDATE token SET scope = $2 WHERE id = $1"#,
         token.id,

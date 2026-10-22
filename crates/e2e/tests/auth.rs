@@ -1,6 +1,7 @@
 //! E2E: authentication / authorization — anonymous modes (off / allowlist /
-//! all), allowed vs denied client IP, admin gating + bootstrap, and SSRF
-//! rejection of a private upstream (spec §9). Gated behind `forge-e2e`.
+//! all), allowed vs denied client IP, admin gating + bootstrap, and the
+//! scheme-only outbound guard on a proxy upstream URL. Gated behind
+//! `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -218,10 +219,9 @@ async fn admin_api_requires_admin_and_bootstrap_works() {
     );
 }
 
-/// Outbound guard (12.7 §3.6): a proxy `remote_url` is only scheme-checked —
-/// a non-http(s) scheme is rejected, while private/loopback addresses are now
-/// permitted (the slice-1 SSRF range restriction was dropped; upstream config
-/// is admin-only).
+/// Outbound guard: a proxy `remote_url` is only scheme-checked — a non-http(s)
+/// scheme is rejected, while private/loopback addresses are permitted (upstream
+/// config is admin-only).
 #[tokio::test]
 async fn remote_url_scheme_checked_private_allowed() {
     let srv = start_stack().await;

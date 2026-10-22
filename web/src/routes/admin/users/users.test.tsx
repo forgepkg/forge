@@ -16,9 +16,8 @@ import type { TokenView } from '~/api/tokens'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Admin users + tokens screens (plan §Phase 5 testing), driven against the
- * **real** route tree + query hooks so the admin guard, routing, and mutations
- * are all exercised:
+ * Admin users + tokens screens, driven against the **real** route tree + query
+ * hooks so the admin guard, routing, and mutations are all exercised:
  *  - the users list renders users with how each signs in, and create-user
  *    POSTs the right body + the list re-fetches (invalidation);
  *  - delete-user invalidates the list, and a refused delete (409 for the last

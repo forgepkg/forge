@@ -26,13 +26,12 @@ export const Route = createFileRoute('/_app/manage/users')({
 })
 
 /**
- * Admin users screen (plan §Phase 5). Lists every user with how they sign in
- * (password, identity provider, credential forwarding: look-alike usernames
- * from different sources are different accounts) and their admin / active
- * flags, offers an inline create form (`CreateUser`), links each user to its
- * token-management screen, and deletes with a confirm step. Slice 1 has no
- * update-user endpoint, so there is no edit-in-place beyond create/delete + the
- * per-user token screen.
+ * Admin users screen. Lists every user with how they sign in (password,
+ * identity provider, credential forwarding: look-alike usernames from
+ * different sources are different accounts) and their admin / active flags,
+ * offers an inline create form (`CreateUser`), links each user to its
+ * token-management screen, and deletes with a confirm step. There is no
+ * edit-in-place beyond create/delete + the per-user token screen.
  */
 function UsersList() {
   const users = useUsers()

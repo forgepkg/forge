@@ -372,9 +372,9 @@ pub struct StackBuilder {
     cache_ttl_seconds: u64,
     /// `None` ⇒ OIDC disabled.
     oidc_block_fn: Option<OidcBlockFn>,
-    /// `None` ⇒ default local-only provider chain (slice 12.3 disabled). When
-    /// set, this is the `providers = [...]` line plus the `[auth.upstream_basic]`
-    /// table injected into the `[auth]` config section.
+    /// `None` ⇒ default local-only provider chain (no credential forwarding).
+    /// When set, this is the `providers = [...]` line plus the
+    /// `[auth.upstream_basic]` table injected into the `[auth]` config section.
     auth_block: Option<String>,
     /// `None` ⇒ the shared versitygw.
     s3_endpoint: Option<String>,
@@ -448,7 +448,7 @@ impl StackBuilder {
         self
     }
 
-    /// Enable the slice-12.3 credential-forwarding auth chain. `block` is the
+    /// Enable the credential-forwarding auth chain. `block` is the
     /// `providers = [...]` line plus the `[auth.upstream_basic]` table (typically
     /// `mock.upstream_basic_block(...)`). Injected into the `[auth]` config
     /// section so the server builds the real `AuthProvider` chain at startup.
@@ -596,7 +596,7 @@ impl StackBuilder {
             .await
             .expect("bootstrap admin");
 
-        // 12.7: one-shot import of [oidc]/[auth.upstream_basic] into realms.
+        // Seed auth realms from the [oidc]/[auth.upstream_basic] config blocks.
         forge_server::app::ensure_auth_realms(&config, &pool, None)
             .await
             .expect("seed auth realms");
@@ -840,8 +840,8 @@ impl TestServer {
     }
 
     /// Like [`spawn_peer`](Self::spawn_peer) but the peer also enables the
-    /// slice-12.3 credential-forwarding chain with the same `[auth.upstream_basic]`
-    /// block, so a first-time login can be raced across both instances (the
+    /// credential-forwarding chain with the same `[auth.upstream_basic]` block,
+    /// so a first-time login can be raced across both instances (the
     /// scale-out singleflight scenario) and a reauth on one instance invalidates
     /// the cached verdict on the other (the shared validated_credential table +
     /// cache backplane).
@@ -909,12 +909,12 @@ impl TestServer {
     }
 
     /// Grant the built-in `anonymous` role `read` on `repo` directly in the DB,
-    /// mirroring the §12.4 data migration that converts the slice-1
-    /// `anonymous_read` flag into an anonymous-role grant. Under fine-grained
-    /// RBAC, anonymous read flows through this grant (not the column), so a test
-    /// that wants an anonymously-readable repo creates it with
-    /// `anonymous_read: true` **and** calls this. Done before any anonymous
-    /// request, so the (cold) anonymous cache entry loads the grant on first use.
+    /// mirroring the RBAC data migration that converted the `anonymous_read`
+    /// flag into an anonymous-role grant. Under fine-grained RBAC, anonymous
+    /// read flows through this grant (not the column), so a test that wants an
+    /// anonymously-readable repo creates it with `anonymous_read: true` **and**
+    /// calls this. Done before any anonymous request, so the (cold) anonymous
+    /// cache entry loads the grant on first use.
     pub async fn grant_anonymous_read(&self, repo: &str) {
         let repo_id = forge_db::repository_dao::find_repository_by_name(&self.pool, repo)
             .await
@@ -962,7 +962,7 @@ impl TestServer {
             .unwrap()
     }
 
-    // ── §12.4 RBAC admin helpers (Phase 7 e2e) ───────────────────────────────
+    // ── RBAC admin helpers ───────────────────────────────────────────────────
 
     /// Create a non-admin user via the admin API and return its numeric id.
     pub async fn create_user(&self, username: &str, password: &str) -> i64 {

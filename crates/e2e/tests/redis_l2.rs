@@ -1,7 +1,7 @@
 //! E2E (optional): Redis L2 invalidation backplane. Two server instances share
 //! a Redis L2; an `invalidate` on instance A drops the corresponding stale L1
-//! entry on instance B via the pub/sub backplane (spec §9). Gated behind
-//! `forge-e2e`; additionally boots a Redis container.
+//! entry on instance B via the pub/sub backplane. Gated behind `forge-e2e`;
+//! additionally boots a Redis container.
 
 #![cfg(feature = "forge-e2e")]
 

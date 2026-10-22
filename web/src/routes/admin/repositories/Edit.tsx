@@ -22,14 +22,14 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
 })
 
 /**
- * Edit-repository screen (plan §Phase 4). Loads the (redacted) repository, seeds
- * the shared form, and PUTs a partial `UpdateRepo` holding only the changed
- * fields (`toUpdateBody`). The `upstream_password` is **write-only**: it is
- * never seeded from the GET and is only included in the update when the admin
- * typed a new one (an empty field leaves the stored secret unchanged — slice-1
- * redaction); "Remove stored credentials" clears it explicitly. Group repos
- * get a link to the Members editor; proxies, their cache invalidation; hosted
- * NuGet, Helm and Docker repositories, the import from Nexus.
+ * Edit-repository screen. Loads the (redacted) repository, seeds the shared
+ * form, and PUTs a partial `UpdateRepo` holding only the changed fields
+ * (`toUpdateBody`). The `upstream_password` is **write-only**: it is never
+ * seeded from the GET and is only included in the update when the admin typed
+ * a new one (an empty field leaves the stored secret unchanged); "Remove
+ * stored credentials" clears it explicitly. Group repos get a link to the
+ * Members editor; proxies, their cache invalidation; hosted NuGet, Helm and
+ * Docker repositories, the import from Nexus.
  */
 function EditRepository() {
   const { repo: name } = Route.useParams()

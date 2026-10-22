@@ -1,5 +1,5 @@
-//! Integration tests for the slice-12.1 retention DAO (`retention_dao`) against
-//! a real Postgres (testcontainers). Focus: the `FOR UPDATE SKIP LOCKED` claim
+//! Integration tests for the retention DAO (`retention_dao`) against a real
+//! Postgres (testcontainers). Focus: the `FOR UPDATE SKIP LOCKED` claim
 //! never lets two instances grab the same repo, stale leases get reclaimed, and
 //! the candidate/audit/policy queries round-trip.
 

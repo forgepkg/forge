@@ -1,8 +1,8 @@
-//! Integration tests for the slice-12.3 `upstream-basic` AuthProvider (Phase 4)
-//! against an in-process mock HTTP upstream (`wiremock`) + a real Postgres
-//! testcontainer backing the validated-credential cache.
+//! Integration tests for the `upstream-basic` AuthProvider against an
+//! in-process mock HTTP upstream (`wiremock`) + a real Postgres testcontainer
+//! backing the validated-credential cache.
 //!
-//! These exercise the plan §3 Phase-4 behaviours:
+//! These exercise:
 //!   * 200 → `Authenticated`, positive cached;
 //!   * 401/403 → `Rejected`, negative cached;
 //!   * a second identical credential → **no** second upstream call (cache hit);
@@ -322,10 +322,10 @@ async fn admin_group_sets_suggested_is_admin() {
 #[tokio::test]
 async fn unreachable_upstream_is_unavailable() {
     // An upstream that refuses connections (an unbound port on loopback):
-    // forward errors → Unavailable (fail-closed), nothing cached. (The slice-1
-    // SSRF private-range test lived here; 12.7 §3.6 dropped that restriction —
-    // only the scheme is checked, and scheme rejection is covered by the ssrf
-    // module's unit tests + config validation.)
+    // forward errors → Unavailable (fail-closed), nothing cached. (Upstream
+    // URLs are not restricted to public addresses — only the scheme is checked,
+    // and scheme rejection is covered by the ssrf module's unit tests + config
+    // validation.)
     let config = config_for("http://127.0.0.1:1/status".to_string());
     let provider = make_provider(config, Duration::from_secs(300)).await;
     let user = unique_user("up-unreachable");

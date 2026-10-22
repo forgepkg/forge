@@ -1,7 +1,7 @@
-//! Integration tests for the slice-12.2 OIDC **core service layer** (Phases 3 &
-//! 4) against a real Postgres testcontainer plus an in-process mock IdP
-//! (wiremock serving discovery / JWKS / token endpoints, signing self-issued ID
-//! tokens with a throwaway RSA key).
+//! Integration tests for the OIDC **core service layer** against a real
+//! Postgres testcontainer plus an in-process mock IdP (wiremock serving
+//! discovery / JWKS / token endpoints, signing self-issued ID tokens with a
+//! throwaway RSA key).
 //!
 //! These exercise the logic above the DAOs (the single-use / nonce properties of
 //! the DAOs themselves are covered by `forge-db`'s `oidc.rs`):
@@ -11,7 +11,7 @@
 //!     fails), exchanges the code, and verifies the ID token (nonce mismatch is
 //!     rejected);
 //!   * `resolve_user` provisions on first login, links by username, recomputes
-//!     `is_admin` from the group/role claim, and rejects inactive users;
+//!     the `admin` role from the group/role claim, and rejects inactive users;
 //!   * concurrent first logins for one identity all resolve to the single
 //!     linked account and leave no orphan accounts behind (review L7(c));
 //!   * `SessionService` round-trips create → validate → revoke and rotates.

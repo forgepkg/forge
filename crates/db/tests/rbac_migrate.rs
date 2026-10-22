@@ -1,9 +1,9 @@
-//! Integration tests for the §12.4 Phase 5 behavior-preserving data migration
+//! Integration tests for the behavior-preserving RBAC data migration
 //! (`0007_rbac_migrate.sql`) against a real Postgres testcontainer.
 //!
 //! Two properties matter and are both proven here:
 //!
-//!   * **Upgrade preserves slice-1 behavior.** A DB that already had users +
+//!   * **Upgrade preserves pre-RBAC access.** A DB that already had users +
 //!     `anonymous_read` repos *before* RBAC existed must keep working after the
 //!     migration: existing users still read/write everywhere (the
 //!     `authenticated` role), `is_admin` users are still admin (the `admin`
@@ -116,7 +116,7 @@ async fn migrator_up_to(target: i64) -> Migrator {
 const RBAC_MIGRATE_VERSION: i64 = 7;
 
 #[tokio::test]
-async fn upgrade_preserves_slice1_behavior() {
+async fn upgrade_preserves_pre_rbac_access() {
     let (pool, _container) = fresh_pool().await;
 
     // 1. Bring the DB up to *before* the data migration (schema through 0006:
@@ -127,8 +127,8 @@ async fn upgrade_preserves_slice1_behavior() {
         .await
         .expect("migrate 0001..0006");
 
-    // 2. Seed pre-RBAC rows exactly as a slice-1 deployment would have: a normal
-    //    user, an admin user, a public (anonymous_read) repo, and a private one.
+    // 2. Seed the rows a pre-RBAC deployment would have: a normal user, an
+    //    admin user, a public (anonymous_read) repo, and a private one.
     let normal_user: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('normal', 'x', false) RETURNING id",
     )
@@ -166,8 +166,8 @@ async fn upgrade_preserves_slice1_behavior() {
         "upgrade must record legacy_open_access = true"
     );
 
-    // Every existing user holds `authenticated` ⇒ read/write everywhere (slice-1
-    // open access preserved).
+    // Every existing user holds `authenticated` ⇒ read/write everywhere (the
+    // pre-RBAC open access is preserved).
     for uid in [normal_user, admin_user] {
         assert!(
             authz_dao::user_has_role(&pool, uid, AUTHENTICATED_ROLE)

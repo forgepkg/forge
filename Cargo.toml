@@ -80,8 +80,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
 
-# Glob matching for RBAC content selectors (slice 12.4): compile a GlobSet once
-# per selector and match lowercased package names. Audited, standard choice.
+# Glob matching for RBAC content selectors: compile a GlobSet once per
+# selector and match lowercased package names. Audited, standard choice.
 globset = { version = "0.4" }
 
 # Redis (optional)
@@ -119,19 +119,19 @@ argon2 = { version = "0.6" }
 # Constant-time comparison
 subtle = { version = "2.6" }
 
-# AEAD ciphers for secret encryption at rest (slice 12.5). AES-256-GCM is the
-# default (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the
-# opt-in alternative whose 192-bit extended nonce makes pure-random nonces
+# AEAD ciphers for secret encryption at rest. AES-256-GCM is the default
+# (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the opt-in
+# alternative whose 192-bit extended nonce makes pure-random nonces
 # collision-safe without any per-key counter state. `zeroize` scrubs the
 # expanded key schedule (AES round keys, GHASH/ChaCha state) when a cipher
-# instance is dropped; without it only our own key buffers were wiped.
+# instance is dropped; without it only our own key buffers would be wiped.
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 
-# Scrub unwrapped key bytes / transient plaintext from memory on drop (12.5).
+# Scrub unwrapped key bytes / transient plaintext from memory on drop.
 zeroize = { version = "1.8" }
 
-# Secret wrappers that redact Debug/Display and zeroize on drop (12.5): the
+# Secret wrappers that redact Debug/Display and zeroize on drop: the
 # plaintext-secret type handed to callers so it can never leak into logs.
 secrecy = { version = "0.10" }
 
@@ -153,12 +153,12 @@ async-trait = { version = "0.1" }
 # Base64 (RFC 4648 standard alphabet)
 base64 = { version = "0.23" }
 
-# JWT decode/verify (OIDC ID-token signature + claim validation, slice 12.2).
-# We use `jsonwebtoken` (not the heavier `openidconnect`) for Phase 2: it gives
-# explicit control over the signing-key (RSA n/e from JWKS), the algorithm
-# allowlist (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots
-# cleanly behind the existing SSRF `guarded_client` + `forge-cache` rather than
-# bringing its own HTTP-client abstraction.
+# JWT decode/verify (OIDC ID-token signature + claim validation).
+# We use `jsonwebtoken` (not the heavier `openidconnect`): it gives explicit
+# control over the signing-key (RSA n/e from JWKS), the algorithm allowlist
+# (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots cleanly
+# behind our own outbound metadata client (`outbound_metadata_client`) +
+# `forge-cache` rather than bringing its own HTTP-client abstraction.
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 # RSA key generation and signing for the client assertions forge issues

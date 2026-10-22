@@ -1,4 +1,4 @@
-//! Admin REST API (spec §5/§8, plan 10.4). **Admin-only.**
+//! Admin REST API. **Admin-only.**
 //!
 //! Mounted under `/admin`. Every route is gated by [`require_admin`], which
 //! reads the [`Principal`] the principal middleware attached and returns:
@@ -10,13 +10,12 @@
 //! * [`repositories`] — repository CRUD (incl. proxy fields; `upstream_password`
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
 //!   duplicate member priorities are rejected, nested groups only when they
-//!   would form a cycle or exceed the depth limit) and package hard-delete
-//!   (A12).
+//!   would form a cycle or exceed the depth limit) and package hard-delete.
 //! * [`users`] — user CRUD with argon2id password hashing.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
-//! * [`crypto`] — §12.5 secret-encryption key **metadata** + per-layer rotation
+//! * [`crypto`] — secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
 //! * [`settings`] — install-wide switches (`legacy_open_access`).
 //! * [`blob_cache`] — the local blob cache's statistics.
@@ -233,7 +232,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(tokens::list_for_user).post(tokens::create),
         )
         .route("/tokens/{id}", axum::routing::delete(tokens::revoke))
-        // --- §12.4 Phase 6: RBAC management ---------------------------------
+        // --- RBAC management -----------------------------------------------
         .route("/roles", get(roles::list).post(roles::create))
         .route(
             "/roles/{id}",
@@ -262,7 +261,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .patch(content_selectors::update)
                 .delete(content_selectors::delete),
         )
-        // --- 12.7: auth realm management -------------------------------------
+        // --- auth realm management -----------------------------------------
         .route("/realms", get(realms::list).post(realms::create))
         .route("/realms/order", axum::routing::put(realms::reorder))
         .route(
@@ -286,7 +285,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route("/users/{id}/effective", get(effective::for_user))
         .route("/anonymous/effective", get(effective::for_anonymous))
-        // --- §12.5: secret encryption at rest -------------------------------
+        // --- secret encryption at rest -------------------------------------
         .route("/crypto/keys", get(crypto::list_keys))
         // --- local blob cache ----------------------------------------------
         .route("/blob-cache", get(blob_cache::stats))

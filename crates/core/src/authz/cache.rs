@@ -1,11 +1,11 @@
-//! The cached effective-set loader (§12.4 Phase 3).
+//! The cached effective-set loader.
 //!
 //! The [`Authz`](crate::auth::authz::Authz) seam answers `can_read` /
 //! `can_write` / `can_admin` from a principal's resolved
 //! [`EffectiveSet`](super::EffectiveSet). Computing that set is a DB round trip
 //! (`user_role → repository_privilege`), far too costly to run on every
-//! download/restore request. This module sits in front of that load with the
-//! slice-1 [`forge_cache::Cache`] — **in-process only**
+//! download/restore request. This module sits in front of that load with
+//! [`forge_cache::Cache`] — **in-process only**
 //! ([`forge_cache::Cache::get_or_try_insert_local`]): an effective set is an
 //! authorization decision, so it is never read from or written to Redis,
 //! where anyone with access to Redis could plant an admin set. Redis carries
@@ -41,8 +41,8 @@
 //!   `authz:user:{U}` via [`invalidate_user`].
 //! * **Blanket** — a change to a *role*'s grants/selectors (which can affect many
 //!   principals) invalidates the whole `authz` namespace via
-//!   [`invalidate_all`]. This is the "epoch roll" of the plan, realized with the
-//!   cache crate's `invalidate_ns` (drop all `authz:*` and broadcast);
+//!   [`invalidate_all`]. This is an "epoch roll", realized with the cache
+//!   crate's `invalidate_ns` (drop all `authz:*` and broadcast);
 //!   it is O(1) to publish and always correct. Enumerating affected users is a
 //!   future optimization, not a correctness requirement.
 //!
@@ -139,7 +139,7 @@ pub async fn load_anonymous_effective(
 }
 
 /// Load (cached) the effective set granted by a **single role**, for a
-/// workload-identity (WIF) principal (slice 12.8). The validated CI token is
+/// workload-identity (WIF) principal. The validated CI token is
 /// mapped to one forge role; this resolves that role's grants directly (no
 /// `app_user` / `user_role` membership). `is_admin` is set iff the role is the
 /// built-in `admin` role — never via a dual-read fallback (a workload has no

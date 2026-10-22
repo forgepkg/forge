@@ -29,7 +29,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
 use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
-use super::local_password::{LocalPasswordProvider, PasswordHashLimiter};
+use super::local_password::PasswordHashLimiter;
 use super::login_throttle::{username_for_log, AttemptRefused, LoginThrottle, MAX_USERNAME_BYTES};
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
@@ -288,29 +288,24 @@ impl PrincipalSource for TokenHeaderSource {
 
 /// Resolves HTTP Basic auth. The basic secret is tried as a **token** first,
 /// then (only if password-basic is enabled) as a **password** for the supplied
-/// username — and the password path now runs through the
-/// [`crate::auth::Chain`] of [`crate::auth::AuthProvider`]s.
-///
-/// ## Slice 12.3 refactor (phase 2)
-/// Slice 1 inlined a single argon2id check here (`verify_password`). That check
-/// is now the [`crate::auth::LocalPasswordProvider`], invoked via the chain.
-/// With the default chain (`["local-password"]`) this is **byte-for-byte** the
-/// slice-1 behaviour:
-/// * token-as-basic still wins first and is unchanged;
-/// * the password path is still gated — when no chain is configured (slice-1
-///   `allow_password_basic = false`) the password path is skipped entirely;
-/// * a present-but-wrong / unknown password still yields
+/// username, run through the [`crate::auth::Chain`] of
+/// [`crate::auth::AuthProvider`]s:
+/// * token-as-basic always wins first;
+/// * the password path is gated — when no chain is configured (neither
+///   `allow_password_basic` nor an enabled credential-forwarding realm) the
+///   password path is skipped entirely;
+/// * a present-but-wrong / unknown password yields
 ///   [`SourceOutcome::Invalid`] (→ 401, never downgraded to anonymous).
 ///
-/// The chain lets `upstream-basic` (phase 4) slot in behind the local provider
-/// without any change to this source.
+/// The local argon2id check is the [`crate::auth::LocalPasswordProvider`];
+/// `upstream-basic` providers slot in behind it without any change to this
+/// source.
 pub struct BasicAuthSource {
     pool: PgPool,
     /// Where the *current* password chain comes from. A [`StaticChainSource`]
-    /// reproduces the slice-12.3 startup-built chain; the realm-driven server
-    /// wiring (12.7) plugs in a snapshot-cached source rebuilt from the
-    /// `auth_realm` table. `password_chain() == None` reproduces slice-1
-    /// `allow_password_basic = false` (password path disabled).
+    /// holds a fixed chain; the realm-driven server wiring plugs in a
+    /// snapshot-cached source rebuilt from the `auth_realm` table.
+    /// `password_chain() == None` means the password path is disabled.
     chain: Arc<dyn ChainSource>,
     /// Password-failure lockout per `(client IP, username)`, shared with the
     /// browser login endpoint. Disabled unless wired via
@@ -322,25 +317,6 @@ pub struct BasicAuthSource {
 }
 
 impl BasicAuthSource {
-    /// Build a source over the given pool, reproducing the slice-1
-    /// `allow_password_basic` flag: when `true`, the password path is enabled
-    /// with the default chain (`["local-password"]`); when `false`, only the
-    /// token-as-basic path runs.
-    ///
-    /// Preserved for slice-1 / existing callers and tests. Newer wiring should
-    /// use [`BasicAuthSource::with_chain`] / [`BasicAuthSource::with_source`].
-    pub fn new(pool: PgPool, allow_password_basic: bool) -> Self {
-        let chain = if allow_password_basic {
-            Some(Arc::new(Chain::new(vec![
-                Box::new(LocalPasswordProvider::new(pool.clone()))
-                    as Box<dyn super::provider::AuthProvider>,
-            ])))
-        } else {
-            None
-        };
-        Self::with_chain(pool, chain)
-    }
-
     /// Build a source with an explicit, fixed password-auth chain. Pass `None`
     /// to disable the password path entirely. Auto-provisioning of
     /// upstream-vouched users is decided per identity (the vouching provider
@@ -349,8 +325,8 @@ impl BasicAuthSource {
         Self::with_source(pool, Arc::new(StaticChainSource(chain)))
     }
 
-    /// Build a source whose chain is re-resolved per attempt (12.7: the
-    /// realm-driven server wiring hands in its snapshot-cached source).
+    /// Build a source whose chain is re-resolved per attempt (the realm-driven
+    /// server wiring hands in its snapshot-cached source).
     pub fn with_source(pool: PgPool, chain: Arc<dyn ChainSource>) -> Self {
         Self {
             pool,
@@ -425,11 +401,11 @@ impl PrincipalSource for BasicAuthSource {
             return SourceOutcome::Invalid;
         }
 
-        // Try the secret as a token first (unchanged from slice 1, runs ahead
-        // of the password chain). A token Forge issued is never a password,
-        // even one that cannot be used now, and a lookup that failed has not
-        // ruled out a live token: neither is run through the password chain
-        // (a credential-forwarding realm would send it upstream).
+        // Try the secret as a token first, ahead of the password chain. A
+        // token Forge issued is never a password, even one that cannot be
+        // used now, and a lookup that failed has not ruled out a live token:
+        // neither is run through the password chain (a credential-forwarding
+        // realm would send it upstream).
         match check_token(&self.pool, &secret).await {
             Ok(TokenCheck::Live(up)) => {
                 return SourceOutcome::Authenticated(Principal::from_user(up))
@@ -440,7 +416,7 @@ impl PrincipalSource for BasicAuthSource {
         }
         // Then, if a password chain is configured, run the secret as a password
         // through the AuthProvider chain. The chain is re-resolved per attempt
-        // so runtime realm edits (12.7) take effect without a restart.
+        // so runtime realm edits take effect without a restart.
         let chain = match self.chain.password_chain().await {
             Ok(chain) => chain,
             Err(_) => return SourceOutcome::Unavailable,
@@ -479,7 +455,7 @@ impl PrincipalSource for BasicAuthSource {
                 ChainOutcome::Authenticated { identity, .. } => {
                     // Map the vouched-for username back to a concrete principal,
                     // auto-provisioning an upstream-vouched user on first login
-                    // when configured (phase 5).
+                    // when its realm allows it.
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             attempt.succeeded();
@@ -511,8 +487,7 @@ impl PrincipalSource for BasicAuthSource {
                     }
                 }
                 // A definitive rejection (wrong local password) means:
-                // credentials were presented and not accepted. Slice 1 mapped a
-                // failed password verify to Invalid (→ 401); we preserve that.
+                // credentials were presented and not accepted → Invalid (401).
                 ChainOutcome::Rejected => {
                     attempt.failed();
                     return SourceOutcome::Invalid;
@@ -532,9 +507,7 @@ impl PrincipalSource for BasicAuthSource {
                 }
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still
-                // an attempted-but-invalid login — exactly slice 1, where an
-                // unknown username made `verify_password` return `None` and the
-                // basic source fell through to `Invalid`.
+                // an attempted-but-invalid login (401), never anonymous.
                 ChainOutcome::NoCredentials => {
                     attempt.failed();
                     return SourceOutcome::Invalid;

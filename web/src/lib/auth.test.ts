@@ -10,10 +10,10 @@ import {
 } from './auth'
 
 /**
- * Behavior tests for the single auth module (§12.7 sessions). The UI holds only
- * a cookie session: the CSRF token is stored (the session itself lives in the
- * httpOnly cookie) and attached as `X-CSRF-Token`; no Authorization header is
- * ever emitted — registry tokens are not a UI credential.
+ * Behavior tests for the single auth module. The UI holds only a cookie
+ * session: the CSRF token is stored (the session itself lives in the httpOnly
+ * cookie) and attached as `X-CSRF-Token`; no Authorization header is ever
+ * emitted — registry tokens are not a UI credential.
  */
 describe('auth', () => {
   beforeEach(() => clearSession())

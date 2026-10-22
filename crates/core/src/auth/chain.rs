@@ -1,4 +1,4 @@
-//! The ordered [`AuthProvider`] chain (slice 12.3, phase 1).
+//! The ordered [`AuthProvider`] chain.
 //!
 //! The chain owns *only* the password-style authentication path. Token auth
 //! runs before it (see [`super::token`]). Given a [`PasswordCredential`], the
@@ -35,9 +35,9 @@
 //!    so is a reserved one ([`forge_db::username::RESERVED_USERNAMES`]).
 //! 5. No provider authenticated and none rejected/was-unavailable (all
 //!    [`AuthOutcome::Skip`] or an empty chain) → [`ChainOutcome::NoCredentials`]:
-//!    the password path simply had nothing to say, and the caller falls back to
-//!    its anonymous-access policy (exactly as slice 1 did when password-basic
-//!    was off / the user was unknown).
+//!    the password path simply had nothing to say. Credentials were still
+//!    presented, so the callers (the Basic source and the browser login) treat
+//!    it as a failed login (401), never as anonymous.
 
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ pub enum ChainOutcome {
         /// The identity the winning provider vouched for.
         identity: ProvenIdentity,
         /// The `id()` of the provider that authenticated (owned: realm-driven
-        /// providers carry per-realm ids, 12.7).
+        /// providers carry per-realm ids).
         provider_id: String,
     },
     /// No provider authenticated and at least one definitively **rejected** the
@@ -64,14 +64,15 @@ pub enum ChainOutcome {
     /// No provider authenticated and at least one was **unavailable** (and none
     /// rejected). Fail-closed: the caller denies. Surfaced distinctly from
     /// [`ChainOutcome::Rejected`] so the caller can log/metric upstream health,
-    /// but per §12.3 the wire response is still a denial (typically 401 to
-    /// avoid leaking upstream health).
+    /// but the wire response is still a denial (typically 401 to avoid
+    /// leaking upstream health).
     Unavailable,
     /// A provider's own store failed ([`AuthOutcome::Failed`]): the chain
     /// stopped there. The caller denies, as "temporarily unavailable" (503).
     Failed,
     /// No provider had anything to say about this credential (all skipped, or
-    /// the chain is empty). The caller applies its anonymous-access policy.
+    /// the chain is empty). Credentials were presented, so the caller still
+    /// denies it as a failed login.
     NoCredentials,
 }
 
@@ -161,11 +162,10 @@ impl Chain {
 
 /// Supplies the *current* password-auth [`Chain`] to the Basic source.
 ///
-/// Slice 12.3 built the chain once at startup from static config. With 12.7
-/// the realms live in the database and are editable at runtime, so the source
+/// The realms live in the database and are editable at runtime, so the source
 /// asks this seam on every password attempt and the server hands back its
 /// (snapshot-cached) realm-built chain. `None` means the password path is
-/// disabled entirely (slice-1 `allow_password_basic = false` parity).
+/// disabled entirely.
 #[async_trait::async_trait]
 pub trait ChainSource: Send + Sync {
     /// The chain to run a password credential through right now, or `None`
@@ -237,8 +237,7 @@ pub async fn map_identity_to_principal(
 
 /// Resolve a chain-vouched [`ProvenIdentity`] to a [`UserPrincipal`],
 /// **auto-provisioning** an `app_user` when the identity's vouching provider
-/// allows it (slice 12.3 phase 5; per-realm since 12.7 — the flag rides on the
-/// identity instead of a chain-global setting).
+/// allows it (a per-realm flag the vouching provider stamps on the identity).
 ///
 /// This is [`map_identity_to_principal`] plus the upstream auto-provision step:
 ///

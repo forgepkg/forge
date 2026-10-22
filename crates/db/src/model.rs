@@ -95,14 +95,14 @@ pub struct Repository {
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
     /// Plaintext upstream password: the storage of deployments **without**
-    /// secret encryption at rest. With `[crypto]` enabled (slice 12.5) it is
+    /// secret encryption at rest. With `[crypto]` enabled it is
     /// superseded by [`Self::upstream_password_enc`]: new writes go through
     /// the envelope service (which clears this column), and the backfill pass
     /// moves existing values into the envelope and NULLs this column in the
     /// same guarded UPDATE. Until a row is backfilled it remains that row's
     /// read fallback.
     pub upstream_password: Option<String>,
-    /// Envelope-encrypted upstream password (slice 12.5): an opaque AEAD blob
+    /// Envelope-encrypted upstream password: an opaque AEAD blob
     /// bound to this row. Decrypted **only** via
     /// [`crate::secret_dao::get_upstream_password`] at the proxy upstream
     /// fetch; everywhere else only its presence matters.
@@ -383,7 +383,7 @@ pub struct ProxyUpstreamIndex {
 ///
 /// `password_hash` is `None` for users with no local password (auth_source
 /// `'upstream-basic'` or `'oidc'`); a `'local'` user always has one (DB CHECK
-/// `app_user_local_password_hash_check`, slice 12.3). `auth_source` records how
+/// `app_user_local_password_hash_check`). `auth_source` records how
 /// the user last authenticated / was provisioned; `external_subject` is the
 /// opaque upstream identifier for non-local sources.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -410,12 +410,12 @@ pub struct Token {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    /// The per-token privilege scope jsonb (§12.4), exactly as stored; `None`
+    /// The per-token privilege scope jsonb, exactly as stored; `None`
     /// for an unscoped token. Evaluated by `forge-core`'s `parse_token_scope`.
     pub scope: Option<JsonValue>,
 }
 
-/// A row of `external_identity` (slice 12.2).
+/// A row of `external_identity`.
 ///
 /// Maps an IdP identity `(issuer, subject)` to an `app_user`. The denormalized
 /// claim columns are for display/debugging only and carry no authority — the
@@ -434,7 +434,7 @@ pub struct ExternalIdentity {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A row of `session` (slice 12.2).
+/// A row of `session`.
 ///
 /// Server-side login session — the authority behind the opaque `forge_session`
 /// cookie. `token_hash` is `sha256(cookie_secret)` (mirrors `token.token_hash`);
@@ -455,7 +455,7 @@ pub struct Session {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// A row of `oidc_flow` (slice 12.2).
+/// A row of `oidc_flow`.
 ///
 /// Ephemeral authorization-code-flow state, shared across instances so any
 /// instance can complete a callback started by another. Rows are single-use:
@@ -471,7 +471,7 @@ pub struct OidcFlow {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A row of `validated_credential` (slice 12.3): the durable, authoritative
+/// A row of `validated_credential`: the durable, authoritative
 /// record of one forwarded credential-validation decision.
 ///
 /// The plaintext password is **never** stored — `cred_hmac` is
@@ -495,13 +495,13 @@ pub struct ValidatedCredential {
     pub created_at: DateTime<Utc>,
 }
 
-/// A configured authentication realm (slice 12.7, design doc 2026-06-03 §3).
+/// A configured authentication realm.
 ///
 /// One row per authentication mechanism instance: the built-in `local`
-/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or (12.8,
-/// reserved) a `workload_identity` issuer. `priority` orders the realms — LOWER
-/// tries/lists first; `config` is kind-specific jsonb whose secrets are
-/// write-only at the API layer (redacted from every response).
+/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or a
+/// `workload_identity` (trusted-publishing) issuer. `priority` orders the
+/// realms — LOWER tries/lists first; `config` is kind-specific jsonb whose
+/// secrets are write-only at the API layer (redacted from every response).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuthRealm {
     pub id: i64,

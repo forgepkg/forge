@@ -7,15 +7,16 @@
 //!   anonymous-access policy ([`AnonPolicy`]).
 //! * [`authz`] — the authorization seam: the [`Authz`] service whose
 //!   `can_read` / `can_write` / `can_admin` methods are the single decision
-//!   point every gate routes through (§12.4).
+//!   point every gate routes through.
 //! * [`provider`] / [`chain`] — the pluggable, ordered [`AuthProvider`] chain
-//!   for the password-style auth path (slice 12.3). The local-password and
+//!   for the password-style auth path. The local-password and
 //!   upstream-basic providers plug in here; OIDC stays its own interactive
 //!   path. [`captured_password`] stands in for upstream-basic once a realm
 //!   stops forwarding and signs its accounts in with the hashes it kept.
-//! * [`cred_cache`] — the validated-credential cache (slice 12.3): an HMAC-keyed
-//!   L1/L2 + Postgres cache of upstream verdicts so NuGet's per-request Basic
-//!   auth does not hammer the upstream. Plaintext is never stored; fail-closed.
+//! * [`cred_cache`] — the validated-credential cache: an HMAC-keyed
+//!   in-process + Postgres cache of upstream verdicts so NuGet's per-request
+//!   Basic auth does not hammer the upstream. Plaintext is never stored;
+//!   fail-closed.
 //! * [`login_throttle`] — per `(client IP, username)` password-failure lockout
 //!   shared by the browser login and the wire Basic password path.
 //! * [`workload_key`] — the short-lived API keys the trusted-publishing token

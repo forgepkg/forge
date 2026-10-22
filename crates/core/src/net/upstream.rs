@@ -28,7 +28,8 @@
 //!   ([`is_metadata_target`]). Resource `@id`s and redirects are chosen by the
 //!   upstream, not the admin, and such a target is never a package feed, but
 //!   it is where a malicious upstream would bounce Forge to read instance
-//!   credentials. Private and loopback upstreams stay allowed (12.7 §3.6).
+//!   credentials. Private and loopback upstreams stay allowed (see
+//!   [`super::ssrf`]).
 //!   Behind an outbound proxy (`HTTP(S)_PROXY`) the proxy resolves host names,
 //!   not this client's resolver, so a name the proxy will reach is resolved
 //!   here first and refused when any of its addresses is such a target.
@@ -789,7 +790,7 @@ mod tests {
         ] {
             assert!(target(bad), "{bad} must be refused");
         }
-        // Private and loopback upstreams are legitimate (12.7 §3.6).
+        // Private and loopback upstreams are legitimate.
         for ok in [
             "https://api.nuget.org/v3/index.json",
             "http://127.0.0.1:8081/repository/nuget/index.json",

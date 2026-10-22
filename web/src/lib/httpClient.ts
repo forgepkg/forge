@@ -4,8 +4,8 @@ import { authHeaders, clearSession, getCsrfToken, setSession } from './auth'
 /**
  * Centralized HTTP client. **Every** API call goes through here so the auth
  * header / cookie credentials and the base URL are injected in exactly one
- * place — switching token-header for §12.2 cookie-session touches only
- * `auth.ts`, never the call sites.
+ * place — how the SPA authenticates is known only to `auth.ts`, never to the
+ * call sites.
  */
 
 /** An API error carrying the HTTP status + the server's (text) body. */
@@ -131,8 +131,8 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     method,
     headers,
     body,
-    // Same-origin so a future §12.2 session cookie is sent automatically; no
-    // cross-origin credentials (prod is single-origin, dev uses the Vite proxy).
+    // Same-origin so the session cookie is sent automatically; no cross-origin
+    // credentials (prod is single-origin, dev uses the Vite proxy).
     credentials: 'same-origin',
     signal: opts.signal,
   })

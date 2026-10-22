@@ -9,7 +9,7 @@ import {
 } from '../helpers'
 
 /**
- * Create-a-repo flow + push-then-see-package (plan §Testing #4, #5).
+ * Create-a-repo flow + push-then-see-package.
  *
  * An admin creates a hosted repo through the UI; it appears in the repositories
  * list and its V3 index advertises PackagePublish. A `.nupkg` pushed via the

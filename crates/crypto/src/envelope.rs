@@ -1,4 +1,4 @@
-//! The versioned AEAD envelope format (plan §2.3).
+//! The versioned AEAD envelope format.
 //!
 //! Every encrypted value stored in a database column is a self-describing
 //! binary blob:
@@ -45,7 +45,7 @@ const SECRET_AAD_V2_PREFIX: &[u8] = b"forge.secret.v2";
 /// Domain-separation prefix for DEK-wrapped-by-KEK AADs (versioned).
 const KEY_WRAP_AAD_PREFIX: &[u8] = b"forge.key.wrap.v1";
 
-/// AAD under which the static root provider wraps KEK bytes (plan §2.5).
+/// AAD under which the static root provider wraps KEK bytes.
 pub const ROOT_WRAP_AAD: &[u8] = b"forge.root.wrap";
 
 /// Field separator inside AADs (ASCII Unit Separator — cannot appear in
@@ -116,7 +116,7 @@ impl std::fmt::Display for Algorithm {
     }
 }
 
-/// The row identity a secret ciphertext is bound to via AAD (plan §2.4).
+/// The row identity a secret ciphertext is bound to via AAD.
 ///
 /// Kept **explicit** at every call site (rather than hidden in a sqlx codec)
 /// because the row-pk binding is the whole security property and must not be

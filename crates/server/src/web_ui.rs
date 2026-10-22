@@ -1,4 +1,4 @@
-//! Static SPA serving (plan §12.6 Phase 1, §1/§2).
+//! Static SPA serving.
 //!
 //! The Rust `server` serves the **built TanStack Start SPA** so the UI and the
 //! API live on a **single origin** — no CORS, no Node proxy in front of the Rust

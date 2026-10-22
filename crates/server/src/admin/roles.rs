@@ -1,10 +1,10 @@
-//! Admin role management (§12.4 Phase 6).
+//! Admin role management.
 //!
 //! Roles are named, assignable bundles of grants. This module CRUDs the `role`
 //! table; grants are managed by [`super::grants`] and assignments by
 //! [`super::user_roles`].
 //!
-//! Built-in protections (plan §3, §6 "Builtin-role tampering"):
+//! Built-in protections:
 //! * **DELETE** of a built-in role (`admin`/`authenticated`/`anonymous`) is
 //!   forbidden (**403**).
 //! * **PATCH** may edit a built-in role's `description` but never its identity

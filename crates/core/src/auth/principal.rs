@@ -5,8 +5,9 @@ use std::net::IpAddr;
 /// Identity established for an authenticated user.
 ///
 /// This is the success payload of token/password verification and the body of
-/// [`Principal::User`]. The `user_id` and `token_id` fields are a **cross-slice
-/// contract**: later slices (auditing, RBAC) rely on them being present here.
+/// [`Principal::User`]. The `user_id` and `token_id` fields are a **contract**:
+/// authorization (RBAC, token scopes) and the audit log rely on them being
+/// present here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserPrincipal {
     /// `app_user.id` of the authenticated user.
@@ -56,7 +57,7 @@ pub enum Principal {
         /// The kind of credential that authenticated this request.
         method: AuthMethod,
     },
-    /// A verified **workload** (slice 12.8, WIF): a non-interactive CI/automation
+    /// A verified **workload** (WIF): a non-interactive CI/automation
     /// caller authenticated by a validated OIDC `id_token` (no `app_user` row,
     /// no session). It is authorized solely by the forge **role** its realm's
     /// claim-rules mapped it to — the role id is resolved at token-validation

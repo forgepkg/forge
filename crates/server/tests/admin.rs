@@ -1,6 +1,7 @@
 //! E2E: admin API gating, bootstrap admin, repository/user/token/member CRUD,
-//! password redaction, SSRF rejection, nested-group + duplicate-priority
-//! rejection (plan 10.4). Requires Docker (Postgres + versitygw).
+//! password redaction, the scheme-only `remote_url` guard, and group-member
+//! validation (nested groups accepted, cycles and duplicate priorities
+//! rejected). Requires Docker (Postgres + versitygw).
 
 mod common;
 
@@ -273,9 +274,9 @@ async fn usernames_with_a_colon_are_refused() {
     }
 }
 
-/// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
-/// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
-/// for a non-admin caller.
+/// `POST /admin/users/{id}/reauth`: admin-only, 204 on a known user
+/// (idempotent even with no cached verdicts), 404 for an unknown id, 403 for a
+/// non-admin caller.
 #[tokio::test]
 async fn reauth_endpoint_admin_only_and_idempotent() {
     let srv = common::start().await;
@@ -366,9 +367,9 @@ async fn proxy_password_is_write_only_and_redacted() {
     assert_eq!(body["has_upstream_password"], json!(true));
 }
 
-/// 12.7 §3.6: a proxy `remote_url` is only scheme-checked — a non-http(s)
-/// scheme is rejected (400), while a private/loopback address is accepted
-/// (the slice-1 SSRF range guard is gone; upstream config is admin-only).
+/// A proxy `remote_url` is only scheme-checked — a non-http(s) scheme is
+/// rejected (400), while a private/loopback address is accepted (upstream
+/// config is admin-only).
 #[tokio::test]
 async fn remote_url_scheme_guarded_private_accepted() {
     let srv = common::start().await;
@@ -963,9 +964,9 @@ async fn delete_hosted_repo_with_packages_refused() {
         .is_some());
 }
 
-/// Group membership (§12.4 Phase 4): a hosted member and a **nested group**
-/// member are accepted; an edge that would create a cycle is rejected with 409;
-/// duplicate priorities are rejected with 409.
+/// Group membership: a hosted member and a **nested group** member are
+/// accepted; an edge that would create a cycle is rejected with 409; duplicate
+/// priorities are rejected with 409.
 #[tokio::test]
 async fn group_member_validation() {
     let srv = common::start().await;
@@ -1018,7 +1019,7 @@ async fn group_member_validation() {
 
     // Hosted member at priority 10 → created.
     assert_eq!(add(group.clone(), hosted.clone(), 10).await, 201);
-    // Nested group member is now ALLOWED (§12.4): group2 nested under group.
+    // A nested group member is ALLOWED: group2 nested under group.
     assert_eq!(
         add(group.clone(), group2.clone(), 20).await,
         201,
@@ -1184,7 +1185,7 @@ async fn group_member_owner_flag() {
     assert_eq!(remove.status(), 204);
 }
 
-// ── §12.5: secret encryption at rest ────────────────────────────────────────
+// ── secret encryption at rest ───────────────────────────────────────────────
 
 /// Serializes the crypto-enabled tests of this binary: they share the
 /// cluster-wide rotation advisory lock (and the `default` key scope). Each
@@ -1573,7 +1574,7 @@ async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
 }
 
 /// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
-/// disabled (slice-1 plaintext behavior stays untouched).
+/// disabled.
 #[tokio::test]
 async fn crypto_disabled_reports_and_rejects() {
     let srv = common::start().await;

@@ -20,9 +20,9 @@ import {
 import { userKeys } from '~/api/users'
 
 /**
- * TanStack Query hooks for the admin auth-realm resource (§12.7). Reads use
- * `useQuery`; mutations invalidate the realm queries on success so the UI
- * re-fetches the authoritative server state (order, redacted config, ...).
+ * TanStack Query hooks for the admin auth-realm resource. Reads use `useQuery`;
+ * mutations invalidate the realm queries on success so the UI re-fetches the
+ * authoritative server state (order, redacted config, ...).
  */
 
 /** List all realms in priority order (`GET /admin/realms`). */

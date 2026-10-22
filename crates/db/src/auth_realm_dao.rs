@@ -1,4 +1,4 @@
-//! Auth-realm data access (slice 12.7).
+//! Auth-realm data access.
 //!
 //! The `auth_realm` table is the **authority** for the server's authentication
 //! configuration: the password chain and the OIDC login runtime are rebuilt

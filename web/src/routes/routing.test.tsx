@@ -14,7 +14,7 @@ import type { Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Router-integration tests against the **real** route tree (plan §2 testing):
+ * Router-integration tests against the **real** route tree:
  *   - the Admin nav link is hidden for a reader and shown for an admin;
  *   - the `_app/manage` guard redirects a non-admin to Browse and an
  *     unauthenticated visitor to /login;

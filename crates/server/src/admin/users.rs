@@ -1,5 +1,5 @@
-//! Admin user CRUD (plan 10.4). Passwords are hashed with argon2id; the hash is
-//! never returned.
+//! Admin user CRUD. Passwords are hashed with argon2id; the hash is never
+//! returned.
 //!
 //! Cutting a user off (review M5) works the same for every account kind,
 //! federated ones included: `PATCH /admin/users/{id}` with `{"active": false}`
@@ -259,7 +259,7 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 }
 
 /// `POST /admin/users/{id}/reauth` — force re-validation of a user's forwarded
-/// credentials (slice 12.3, plan §2.5/§2.7).
+/// credentials.
 ///
 /// Purges every cached `validated_credential` verdict for the user (across all
 /// providers) and broadcasts a cache-layer invalidation, so the **next**

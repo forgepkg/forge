@@ -1,13 +1,12 @@
-//! Integration tests for the slice-12.3 **phase 2** `local-password` provider
-//! and the refactored [`BasicAuthSource`], against a real Postgres
-//! testcontainer.
+//! Integration tests for the `local-password` provider and the
+//! [`BasicAuthSource`] that runs it, against a real Postgres testcontainer.
 //!
-//! The point of phase 2 is a **zero-behavior-change** refactor: slice 1's
-//! inline argon2id password check is now [`LocalPasswordProvider`] invoked
-//! through the [`Chain`], but the observable auth behaviour — token-as-basic
-//! first, gated password fallback, invalid-creds → 401 — is unchanged. These
-//! tests assert both the provider's outcomes directly and that the slice-1
-//! `BasicAuthSource` semantics are preserved end-to-end.
+//! The argon2id password check is the [`LocalPasswordProvider`], invoked
+//! through the [`Chain`]. [`BasicAuthSource`] tries a token presented as the
+//! basic secret first, then falls back to the password chain only when
+//! password-basic is enabled; invalid credentials → 401. These tests assert
+//! both the provider's outcomes directly and the `BasicAuthSource` semantics
+//! end-to-end.
 //!
 //! Requires Docker.
 
@@ -58,6 +57,17 @@ async fn insert_local(pool: &PgPool, password: &str, is_admin: bool, active: boo
     .await
     .expect("insert local user");
     username
+}
+
+/// A Basic source whose password path is the local provider (`password`), or
+/// off, so that only the token-as-Basic path runs.
+fn basic_source(pool: &PgPool, password: bool) -> BasicAuthSource {
+    let chain = password.then(|| {
+        Arc::new(Chain::new(vec![
+            Box::new(LocalPasswordProvider::new(pool.clone())) as Box<dyn AuthProvider>,
+        ]))
+    });
+    BasicAuthSource::with_chain(pool.clone(), chain)
 }
 
 fn cred<'a>(username: &'a str, password: &'a str) -> PasswordCredential<'a> {
@@ -219,13 +229,13 @@ async fn chain_local_only_maps_to_principal_with_admin_flag() {
     }
 }
 
-// ── BasicAuthSource end-to-end: slice-1 behavior is preserved ────────────────
+// ── BasicAuthSource end-to-end ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn basic_password_authenticates_when_enabled() {
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), /* allow_password_basic */ true);
+    let src = basic_source(&pool, true);
 
     match src.resolve(&basic_header(&username, "pw"), ip()).await {
         SourceOutcome::Authenticated(Principal::User { is_admin, .. }) => assert!(!is_admin),
@@ -236,10 +246,10 @@ async fn basic_password_authenticates_when_enabled() {
 #[tokio::test]
 async fn basic_password_disabled_does_not_authenticate() {
     // allow_password_basic = false → password path is entirely off; a valid
-    // password is treated as an invalid basic credential (slice-1 behaviour).
+    // password is treated as an invalid basic credential.
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), false);
+    let src = basic_source(&pool, false);
 
     assert_eq!(
         src.resolve(&basic_header(&username, "pw"), ip()).await,
@@ -251,7 +261,7 @@ async fn basic_password_disabled_does_not_authenticate() {
 async fn basic_wrong_password_is_invalid_not_anonymous() {
     let pool = common::pool().await;
     let username = insert_local(&pool, "right", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
 
     assert_eq!(
         src.resolve(&basic_header(&username, "wrong"), ip()).await,
@@ -262,7 +272,7 @@ async fn basic_wrong_password_is_invalid_not_anonymous() {
 #[tokio::test]
 async fn basic_unknown_user_is_invalid() {
     let pool = common::pool().await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     assert_eq!(
         src.resolve(
             &basic_header(&format!("ghost-{}", common::unique()), "pw"),
@@ -276,7 +286,7 @@ async fn basic_unknown_user_is_invalid() {
 #[tokio::test]
 async fn basic_token_in_basic_wins_before_password_chain() {
     // A token presented as the basic secret authenticates via the token path,
-    // which runs *ahead* of the password chain — unchanged from slice 1.
+    // which runs *ahead* of the password chain.
     let pool = common::pool().await;
     // Make a user + a token for them.
     let username = insert_local(&pool, "pw", false, true).await;
@@ -299,7 +309,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
     .expect("insert token");
 
     // Even with password-basic OFF, the token-as-basic path still works.
-    let src = BasicAuthSource::new(pool.clone(), false);
+    let src = basic_source(&pool, false);
     match src.resolve(&basic_header(&username, &secret), ip()).await {
         SourceOutcome::Authenticated(Principal::User {
             user_id, token_id, ..
@@ -314,7 +324,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
 #[tokio::test]
 async fn basic_no_authorization_header_is_no_credentials() {
     let pool = common::pool().await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     assert_eq!(
         src.resolve(&HeaderMap::new(), ip()).await,
         SourceOutcome::NoCredentials
@@ -348,7 +358,7 @@ async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
         .await
         .expect("revoke");
 
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     // The revoked secret is neither a valid token nor the user's password.
     assert_eq!(
         src.resolve(&basic_header(&username, &secret), ip()).await,

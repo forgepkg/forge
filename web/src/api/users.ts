@@ -3,21 +3,20 @@ import { httpClient } from '~/lib/httpClient'
 /**
  * Admin user CRUD API.
  *
- * Types mirror the **real** Rust DTOs (reconciled against slice 1, not the
- * forward-looking plan):
+ * Types mirror the **real** Rust DTOs:
  *
  *  - `UserView` (`crates/server/src/admin/users.rs`) is the password-free
  *    response shape — the argon2id hash is never returned.
  *  - `GET /admin/users` returns a **bare array** of `UserView` (no
- *    `{ total, items }` envelope — slice-1 admin list is unpaginated).
+ *    `{ total, items }` envelope — the admin list is unpaginated).
  *  - `CreateUser` is the `POST /admin/users` body. `is_admin` defaults to
  *    `false` and `active` to `true` server-side; we always send them explicitly.
- *  - There is **no update-user endpoint** in slice 1 (the plan's "edit /
- *    activate-deactivate" is not backed by the API yet). The only per-user
- *    write beyond create is `DELETE /admin/users/{id}`, switching a
- *    credential-forwarding account to a local one
- *    (`POST /admin/users/{id}/convert-to-local`) and token management (see
- *    `tokens.ts`).
+ *  - The UI does not edit users: its only per-user writes beyond create are
+ *    `DELETE /admin/users/{id}`, switching a credential-forwarding account to
+ *    a local one (`POST /admin/users/{id}/convert-to-local`) and token
+ *    management (see `tokens.ts`). The server's `PATCH /admin/users/{id}`
+ *    (activate / deactivate) and `POST /admin/users/{id}/reauth` are not used
+ *    here.
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.

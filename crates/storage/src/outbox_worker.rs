@@ -5,7 +5,7 @@
 //! `blob_outbox` in the same transaction as the decref. This worker drains that
 //! queue.
 //!
-//! **Invariant (Addendum A7):** never hold a database transaction open across an
+//! **Invariant:** never hold a database transaction open across an
 //! S3 network call. We therefore split each unit of work into short
 //! transactions around the network I/O:
 //!   1. claim a batch (leases the rows) — short tx, committed immediately;

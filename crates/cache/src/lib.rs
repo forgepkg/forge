@@ -1,4 +1,4 @@
-//! `forge-cache` — a HybridCache analogue (design spec §2.1).
+//! `forge-cache` — a HybridCache analogue.
 //!
 //! A two-tier cache that is **generic over value types via `serde`**:
 //!
@@ -6,7 +6,7 @@
 //!   per-entry TTL). Always present.
 //! * **L2** — an *optional* Redis cache (shared across instances). When absent
 //!   the cache is still fully correct — it just rebuilds from the factory more
-//!   often (the "default-correct" mode from the spec).
+//!   often.
 //! * **Backplane** — an *optional* Redis pub/sub channel that broadcasts tag
 //!   generations so every instance immediately observes logical invalidations.
 //!   Only present when L2 is.
@@ -397,8 +397,8 @@ fn install_tls_crypto_provider() {
 }
 
 impl Cache {
-    /// Build an **L1-only** cache. No Redis calls are ever made; this is the
-    /// default-correct mode from the spec.
+    /// Build an **L1-only** cache. No Redis calls are ever made; the cache is
+    /// still fully correct, it just rebuilds from the factory more often.
     ///
     /// `l1_max_capacity` bounds the number of entries held in process.
     pub fn l1_only(l1_max_capacity: u64) -> Self {

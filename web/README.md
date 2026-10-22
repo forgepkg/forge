@@ -48,7 +48,7 @@ pnpm test          # vitest (jsdom + React Testing Library)
 
 - `src/lib/` — cross-cutting, no JSX: `config.ts` (API base URL),
   `httpClient.ts` (fetch wrapper + auth injection + 401 handling),
-  `auth.ts` (the single module a §12.2 cookie-session swap touches),
+  `auth.ts` (the single module that knows which credential the SPA holds),
   `queryClient.ts`.
 - `src/api/` — one typed module per resource (request fns + query-key
   factories + DTO types mirroring the Rust DTOs).

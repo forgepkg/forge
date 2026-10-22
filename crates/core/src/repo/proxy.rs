@@ -1,4 +1,4 @@
-//! Proxy-repository read operations (spec §7 "Proxy", plan Phase 8).
+//! Proxy-repository read operations.
 //!
 //! A proxy repository mirrors the upstream named by `repository.remote_url`.
 //! What the upstream speaks is its format's business: the format's upstream
@@ -12,7 +12,7 @@
 //! ## Hard invariants enforced here
 //! * **Outbound scheme guard** — upstream URLs are validated to be http/https
 //!   at config time ([`crate::net::ssrf::validate_url`]). Private/loopback
-//!   upstreams are permitted (12.7 §3.6 — admin-only config).
+//!   upstreams are permitted (admin-only config).
 //! * **Bounded upstream I/O** — every request goes through the shared
 //!   [`UpstreamHttp`] client: connect / idle-read / total deadlines, size caps
 //!   enforced while streaming, metadata spooled (memory → temp file) and
@@ -28,7 +28,7 @@
 //!   guarantee a row exists, then [`proxy_dao::lock_or_insert_cached_version`]
 //!   (SELECT … FOR UPDATE). The lock is held only for the short state-decision
 //!   and finalize transactions; it is **released before** the upstream HTTP
-//!   fetch and the CAS/S3 PUT (Addendum A7), so the reconciler may prune a
+//!   fetch and the CAS/S3 PUT, so the reconciler may prune a
 //!   still-unconfirmed row meanwhile; the next lock then creates it again.
 //!   Within one instance, concurrent first-time fetches of the same version
 //!   are serialized by an in-process
@@ -249,7 +249,7 @@ impl Credentials {
 }
 
 /// Resolve the upstream password for the outbound Basic header — the
-/// **single sanctioned decrypt site** of the proxy credential (plan §2.4),
+/// **single sanctioned decrypt site** of the proxy credential,
 /// shared by every format's proxy: an encrypted row decrypts through
 /// `forge_db::secret_dao` (re-reading the row so the AAD binds to fresh data,
 /// its `remote_url` origin included); a not-yet-backfilled row falls back to
@@ -348,8 +348,8 @@ pub struct ProxyRepo {
     /// Byte access to locally stored blobs (the cached `.nuspec`). `None` ⇒
     /// manifests are only served from upstream.
     blobs: Option<Arc<dyn BlobFetch>>,
-    /// Envelope service decrypting the encrypted `upstream_password_enc`
-    /// (slice 12.5). `None` ⇒ secret encryption is not configured; only the
+    /// Envelope service decrypting the encrypted `upstream_password_enc`.
+    /// `None` ⇒ secret encryption is not configured; only the
     /// legacy plaintext column can be used and a row that holds an encrypted
     /// blob fails the fetch (fail closed — never a silent unauthenticated
     /// request against a credentialed upstream).
@@ -405,7 +405,7 @@ impl ProxyRepo {
     }
 
     /// Attach the envelope service so this proxy can decrypt an encrypted
-    /// `upstream_password_enc` (slice 12.5). Without it, only legacy plaintext
+    /// `upstream_password_enc`. Without it, only legacy plaintext
     /// passwords work and encrypted rows fail closed.
     pub fn with_envelope(
         mut self,
@@ -1018,8 +1018,8 @@ impl ProxyRepo {
 
         // ── Singleflight gate (short tx, NO network/S3 held under the lock) ──
         //
-        // Addendum A7: never hold a DB transaction across an S3/network call.
-        // We therefore split the work into three phases:
+        // Never hold a DB transaction across an S3/network call. We therefore
+        // split the work into three phases:
         //   1. a short tx that locks the row, re-checks state, and decides
         //      whether this caller must perform the upstream fetch — then
         //      *commits immediately*, releasing the row lock;
@@ -1065,7 +1065,7 @@ impl ProxyRepo {
             )));
         }
 
-        // ── Network I/O — performed with NO transaction held (A7). ───────────
+        // ── Network I/O — performed with NO transaction held ─────────────────
         // Where the package is, as the format's upstream protocol says (for
         // NuGet, `{flat container}{id}/{version}/{id}.{version}.nupkg`).
         let url = match self
@@ -1087,7 +1087,7 @@ impl ProxyRepo {
             }
         };
         let requested_at = self.db_now().await?;
-        // §12.5: decrypt-on-use; the plaintext lives only inside this request
+        // Decrypt-on-use: the plaintext lives only inside this request
         // (and the zeroizing secret wrapper) — never in a log or model.
         let resp = {
             let creds = self.credentials(repo).await?;
@@ -2042,9 +2042,9 @@ impl RepoReadOps for ProxyRepo {
             .map_err(|e| RepoError::Storage(format!("normalize version: {e}")))?;
         let loc = Box::pin(self.ensure_downloaded(&repo_row, &lower, &norm)).await?;
         if loc.is_some() {
-            // Download tracking (slice 12.1 §3.7): a served cached `.nupkg` is a
-            // pull. Stamp `proxy_cached_version.last_downloaded_at` (drives the
-            // proxy "not pulled in X days" eviction) + mirror onto the parallel
+            // Download tracking: a served cached `.nupkg` is a pull. Stamp
+            // `proxy_cached_version.last_downloaded_at` (drives the proxy "not
+            // pulled in X days" eviction) + mirror onto the parallel
             // component/asset. Best-effort, counted in memory and written in a
             // batch — never blocks or fails the download.
             self.downloads.count_proxy(repo_row.id, &lower, &norm);

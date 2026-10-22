@@ -30,7 +30,7 @@ import { Textarea } from '~/components/catalyst/textarea'
 import { Select } from '~/components/catalyst/select'
 
 /**
- * Shared auth-realm create/edit form (§12.7). Kind-conditional fields:
+ * Shared auth-realm create/edit form. Kind-conditional fields:
  *
  *  - **oidc** → issuer / client / write-only secret or a federated credential
  *    (Forge's own client assertions: no secret; shows the issuer, subject and

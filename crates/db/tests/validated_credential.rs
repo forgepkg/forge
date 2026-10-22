@@ -1,5 +1,5 @@
-//! Integration tests for the slice-12.3 `validated_credential` DAO against a
-//! real Postgres testcontainer.
+//! Integration tests for the `validated_credential` DAO against a real
+//! Postgres testcontainer.
 //!
 //! Covers the durable-cache properties the credential-forwarding design hinges
 //! on:

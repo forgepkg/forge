@@ -1,4 +1,4 @@
-//! The **pure** fine-grained-RBAC evaluator (§12.4 Phase 2).
+//! The **pure** fine-grained-RBAC evaluator.
 //!
 //! This module is deliberately free of any database, cache, or async concern.
 //! It defines the in-memory shape of a principal's resolved authorization —
@@ -14,7 +14,7 @@
 //!   is visible iff at least one held `read` grant covering the repo either has
 //!   no selector or matches the package name.
 //!
-//! ## Model (plan §3 "The permission model")
+//! ## Model
 //!
 //! A principal holds a flat, **additive** set of [`Grant`]s (the union of all
 //! its roles' grants). Each grant is `(action, repo|ANY, selector?)`. There are
@@ -29,7 +29,7 @@
 //! the owner's set (cached); the token scope is intersected **after** the cache
 //! lookup so the owner set stays shared across that user's tokens.
 //!
-//! ## Selector semantics (plan §3 "Content scoping")
+//! ## Selector semantics (content scoping)
 //!
 //! Selectors are glob include/exclude lists matched against the **lowercased**
 //! package name (NuGet ids are case-insensitive). An empty include list means

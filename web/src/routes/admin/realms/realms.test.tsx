@@ -15,8 +15,8 @@ import type { RealmView } from '~/api/realms'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Admin authentication-realms screens (§12.7), driven against the real route
- * tree + query hooks so the admin guard, routing, and mutations are exercised:
+ * Admin authentication-realms screens, driven against the real route tree +
+ * query hooks so the admin guard, routing, and mutations are exercised:
  *  - the list renders realms in priority order with kind badges and hides the
  *    delete affordance for the built-in local realm;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;

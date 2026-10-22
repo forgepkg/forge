@@ -1,5 +1,4 @@
-//! Persistence seam for **wrapped** key material (the `encryption_key` table,
-//! plan §2.2).
+//! Persistence seam for **wrapped** key material (the `encryption_key` table).
 //!
 //! The store holds only ciphertext: KEK rows wrapped by the root, DEK rows
 //! wrapped by a KEK. No unwrapped key bytes are ever persisted — cold-start
@@ -7,7 +6,7 @@
 //! KEKs". `forge-db` implements [`KeyStore`] over Postgres;
 //! [`InMemoryKeyStore`] backs the hermetic unit tests in this crate.
 //!
-//! ## Lifecycle (plan §2.2)
+//! ## Lifecycle
 //!
 //! * `active`   — used for **new** wraps/encrypts; exactly one per layer+scope
 //!   (the Postgres impl enforces this with a partial unique index, the
@@ -57,7 +56,7 @@ impl std::fmt::Display for KeyLayer {
     }
 }
 
-/// Lifecycle state of a stored key (plan §2.2).
+/// Lifecycle state of a stored key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyState {
     /// Used for new wraps/encrypts. Exactly one per layer+scope.
@@ -121,7 +120,7 @@ pub struct KeyRecord {
     pub wrapping_kek_version: Option<i32>,
     /// Lifecycle state.
     pub state: KeyState,
-    /// Multi-tenant / multi-purpose discriminator; `"default"` in §12.5.
+    /// Multi-tenant / multi-purpose discriminator; always `"default"` today.
     pub scope: String,
     /// Row creation time.
     pub created_at: DateTime<Utc>,
@@ -204,11 +203,11 @@ pub trait KeyStore: Send + Sync {
     /// serialization as [`Self::revoke_kek_if_unreferenced`].
     async fn insert_active(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError>;
 
-    /// Create-if-absent bootstrap (plan §2.8 step 2): atomically either insert
-    /// `new` as the first **active** key of its layer+scope or return the
-    /// already-active key. Unlike [`Self::insert_active`] this never retires an
-    /// existing key, so concurrent bootstrapping instances converge on exactly
-    /// one key with no spurious retired siblings.
+    /// Create-if-absent bootstrap: atomically either insert `new` as the
+    /// first **active** key of its layer+scope or return the already-active
+    /// key. Unlike [`Self::insert_active`] this never retires an existing key,
+    /// so concurrent bootstrapping instances converge on exactly one key with
+    /// no spurious retired siblings.
     async fn insert_active_if_absent(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError>;
 
     /// The single `active` key for a layer+scope, if one exists.
