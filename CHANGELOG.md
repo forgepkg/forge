@@ -35,6 +35,12 @@ until the release folds them in.
   issuer, subject (`<client id>@<realm issuer>`) and audience to register.
   See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
   ([#302](https://github.com/schmitch/forge/pull/302))
+- Helm: `extraObjects` can also be a map, whose keys only name its entries.
+  Helm merges a map across values files, so each file can add its own
+  objects, and a later one replaces an entry by its key or drops it with
+  `null`; a list in a later file replaces the whole list. Lists keep
+  working.
+  ([#288](https://github.com/schmitch/forge/pull/288))
 
 ### Fixed
 

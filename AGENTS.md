@@ -1,4 +1,4 @@
-# Notes for Claude
+# Notes for agents
 
 [DEVELOPMENT.md](DEVELOPMENT.md) describes the build, the tests and the
 release process; this file holds what an agent working in the repository
