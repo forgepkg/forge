@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::blob_dao;
 use crate::model::Repository;
 
-/// Links and manifests are "used" again at most this often, so pulls do not
-/// write a row on every request.
+/// Manifests are "pulled" again at most this often, so pulls do not write a
+/// row on every request (links: [`touch_link`]'s caller says how often).
 const TOUCH_INTERVAL_SECS: f64 = 3600.0;
 
 // ── Repositories ────────────────────────────────────────────────────────────
@@ -191,12 +191,14 @@ pub async fn find_link(
     .await
 }
 
-/// Record a use of a link (at most hourly).
+/// Record a use of a link, unless one was recorded less than `every` ago
+/// (so pulls do not write a row on every request).
 pub async fn touch_link(
     pool: &PgPool,
     repository_id: i64,
     image: &str,
     digest: &str,
+    every: chrono::Duration,
 ) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
@@ -208,7 +210,7 @@ pub async fn touch_link(
         repository_id,
         image,
         digest,
-        TOUCH_INTERVAL_SECS,
+        every.num_milliseconds() as f64 / 1000.0,
     )
     .execute(pool)
     .await?;
@@ -220,7 +222,9 @@ pub async fn touch_link(
 pub enum LinkOutcome {
     /// A new link; one reference taken.
     Inserted,
-    /// The image already had it; nothing changed.
+    /// The image already had it: only its use was recorded
+    /// (`last_used_at`), since a client pushing it again is about to name
+    /// it in a manifest.
     AlreadyLinked,
     /// The CAS blob is gone or being deleted. The link row was inserted
     /// before this was known: the caller **must roll back**.
@@ -281,6 +285,9 @@ pub async fn insert_link_existing(
     }
 }
 
+/// Insert the link row; `false` when the image already had it, whose use is
+/// recorded instead (the sweeper releases a link unused for
+/// `docker.unreferenced_blob_ttl_seconds`).
 async fn insert_link_row(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -303,7 +310,21 @@ async fn insert_link_row(
     )
     .execute(&mut **tx)
     .await?;
-    Ok(inserted.rows_affected() == 1)
+    if inserted.rows_affected() == 1 {
+        return Ok(true);
+    }
+    sqlx::query!(
+        r#"
+        UPDATE oci_blob_link SET last_used_at = now()
+        WHERE repository_id = $1 AND image = $2 AND digest = $3
+        "#,
+        repository_id,
+        image,
+        digest,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(false)
 }
 
 /// A committed CAS blob by its SHA-256 that another image of the same

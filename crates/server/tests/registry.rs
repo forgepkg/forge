@@ -2222,6 +2222,100 @@ async fn ref_count(srv: &TestServer, digest: &str) -> Option<i64> {
         .unwrap()
 }
 
+/// A client confirming a blob it is about to name in a manifest records the
+/// use of its link, so the sweeper does not release it first (#218): a push
+/// of a blob the image already has, a mount of it, and a `HEAD` of it,
+/// recorded every tenth of `docker.unreferenced_blob_ttl_seconds` (six
+/// minutes for the smallest TTL, an hour) instead of hourly.
+#[tokio::test]
+async fn confirming_a_blob_records_the_use_of_its_link() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            plugins_block: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("confirmed layer {}", unique()).into_bytes();
+    let digest = oci.push_blob(&name, &layer).await;
+    let unused_for = |minutes: i32| {
+        let pool = srv.pool.clone();
+        let digest = digest.clone();
+        async move {
+            sqlx::query(
+                "UPDATE oci_blob_link SET last_used_at = now() - make_interval(mins => $1) \
+                 WHERE repository_id = $2 AND digest = $3",
+            )
+            .bind(minutes)
+            .bind(repo_id)
+            .bind(digest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let used_recently = || {
+        let pool = srv.pool.clone();
+        let digest = digest.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT last_used_at > now() - interval '1 minute' FROM oci_blob_link \
+                 WHERE repository_id = $1 AND digest = $2",
+            )
+            .bind(repo_id)
+            .bind(digest)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    unused_for(59).await;
+    oci.push_blob(&name, &layer).await;
+    assert!(used_recently().await, "pushed again");
+
+    unused_for(59).await;
+    let resp = oci
+        .request(
+            Method::POST,
+            &format!("/v2/{name}/blobs/uploads/"),
+            "pull,push",
+            &name,
+        )
+        .await
+        .query(&[("mount", &digest)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert!(used_recently().await, "mounted");
+
+    unused_for(7).await;
+    assert_eq!(
+        oci.head(&name, &format!("blobs/{digest}")).await.status(),
+        200
+    );
+    assert!(used_recently().await, "a HEAD after a tenth of the TTL");
+
+    unused_for(2).await;
+    assert_eq!(
+        oci.head(&name, &format!("blobs/{digest}")).await.status(),
+        200
+    );
+    assert!(!used_recently().await, "not recorded on every request");
+}
+
 #[tokio::test]
 async fn deleting_an_image_never_frees_a_layer_another_image_uses() {
     // Sweeps with zero TTLs release every unreferenced link of the database,

@@ -406,9 +406,14 @@ impl Registry {
             .await?
             .ok_or_else(|| OciError::blob_unknown(digest.as_str()))?;
         if hit.linked {
-            if let Err(e) =
-                oci_dao::touch_link(&self.inner.pool, hit.repository_id, &hit.image, &hit.digest)
-                    .await
+            if let Err(e) = oci_dao::touch_link(
+                &self.inner.pool,
+                hit.repository_id,
+                &hit.image,
+                &hit.digest,
+                self.inner.config.link_touch_interval(),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "registry: recording a blob pull failed");
             }

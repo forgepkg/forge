@@ -39,6 +39,19 @@ pub struct RegistryConfig {
     pub delete_grace: chrono::Duration,
     /// `groups.max_nesting_depth`.
     pub max_group_depth: u32,
+    /// `docker.unreferenced_blob_ttl_seconds`: a blob link no manifest names
+    /// is released after this long unused.
+    pub unreferenced_blob_ttl: chrono::Duration,
+}
+
+impl RegistryConfig {
+    /// How often a pull (or `HEAD`) of a blob records a use of its link: a
+    /// tenth of the unreferenced-blob TTL, at most hourly. A link a client
+    /// confirmed then stays at least nine tenths of the TTL, whereas an
+    /// hourly record with the smallest TTL (an hour) could leave it none.
+    pub fn link_touch_interval(&self) -> chrono::Duration {
+        (self.unreferenced_blob_ttl / 10).min(chrono::Duration::hours(1))
+    }
 }
 
 /// Builds the request-scoped policy that records a workload's publishes
