@@ -231,10 +231,75 @@ impl DefaultChain {
             })
             .await;
         chain.provide_credentials().await.map_err(|e| {
-            let unreachable = matches!(e, CredentialsError::ProviderTimedOut(_));
-            CredentialsFailure::new("default_chain", unreachable, DisplayErrorContext(&e))
-                .into_error()
+            CredentialsFailure::new(
+                "default_chain",
+                chain_unreachable(&e),
+                DisplayErrorContext(&e),
+            )
+            .into_error()
         })
+    }
+}
+
+/// Whether the default chain failed because the credential endpoint it uses
+/// could not be reached (as opposed to refusing, or nothing being
+/// configured), judged like [`WebIdentityProvider`] judges STS: a
+/// connection that fails, a timeout or a 5xx. The chain wraps those as a
+/// provider error (IRSA's STS call, instance metadata) or an unhandled one
+/// (the container endpoint of ECS and EKS Pod Identity), with the cause
+/// further down the source chain.
+fn chain_unreachable(e: &CredentialsError) -> bool {
+    match e {
+        CredentialsError::ProviderTimedOut(_) => true,
+        CredentialsError::ProviderError(_) | CredentialsError::Unhandled(_) => {
+            let mut next = e.source();
+            while let Some(err) = next {
+                if cause_unreachable(err) {
+                    return true;
+                }
+                next = err.source();
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// [`chain_unreachable`] for one error of the source chain.
+fn cause_unreachable(err: &(dyn Error + 'static)) -> bool {
+    use aws_sdk_sts::error::ConnectorError;
+    use aws_sdk_sts::operation::assume_role::AssumeRoleError;
+    use aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError;
+
+    if let Some(e) = err.downcast_ref::<SdkError<AssumeRoleWithWebIdentityError, HttpResponse>>() {
+        return sdk_unreachable(e);
+    }
+    if let Some(e) = err.downcast_ref::<SdkError<AssumeRoleError, HttpResponse>>() {
+        return sdk_unreachable(e);
+    }
+    // The container credentials endpoint (ECS, EKS Pod Identity).
+    if let Some(e) = err.downcast_ref::<SdkError<CredentialsError, HttpResponse>>() {
+        return sdk_unreachable(e);
+    }
+    if err.is::<ConnectorError>() {
+        return true;
+    }
+    // The container endpoint's answer with an error status comes as text
+    // only: "Non-success status from HTTP credential provider: StatusCode(503)".
+    err.to_string()
+        .split_once("Non-success status from HTTP credential provider: StatusCode(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(status, _)| status.parse::<u16>().ok())
+        .is_some_and(|status| status >= 500)
+}
+
+/// Whether an SDK call failed because its endpoint could not be reached: the
+/// request was not sent or not answered in time, or the answer was a 5xx.
+fn sdk_unreachable<E>(e: &SdkError<E, HttpResponse>) -> bool {
+    match e {
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => true,
+        SdkError::ServiceError(se) => se.raw().status().is_server_error(),
+        _ => false,
     }
 }
 
@@ -302,11 +367,7 @@ impl WebIdentityProvider {
             .send()
             .await
             .map_err(|e| {
-                let unreachable = match &e {
-                    SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => true,
-                    SdkError::ServiceError(se) => se.raw().status().is_server_error(),
-                    _ => false,
-                };
+                let unreachable = sdk_unreachable(&e);
                 // The error code and message STS answered with; neither
                 // repeats the token.
                 let reason = match e.code() {
