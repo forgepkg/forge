@@ -60,7 +60,19 @@
 //! first success with `auth_source = 'upstream-basic'` and **no** local password
 //! — is the chain caller's job ([`super::chain::provision_and_map`], phase 5), so
 //! this file stays free of the DB-provision policy.
+//!
+//! ## Keeping a password hash (opt-in)
+//!
+//! With `capture_password_hash` set, a login that asked the upstream and was
+//! accepted also carries an argon2id hash of the password on its
+//! [`ProvenIdentity`], which provisioning keeps on the account (migration
+//! 0035) so an administrator can later switch the account to a local one and
+//! retire the upstream. A cache hit carries none: the hash is refreshed once
+//! per positive-TTL window, like the verdict. Hashing never queues for an
+//! argon2 slot ([`PasswordHashLimiter::try_hash`]); when none is free the
+//! login goes ahead without a hash and a later one keeps it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -68,7 +80,10 @@ use base64::Engine;
 use reqwest::Client;
 
 use super::cred_cache::{CredCacheError, UpstreamVerdict, ValidatedCredentialCache};
-use super::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
+use super::local_password::{LimiterSaturated, PasswordHashLimiter};
+use super::provider::{
+    AuthOutcome, AuthProvider, AuthSource, CapturedPasswordHash, PasswordCredential, ProvenIdentity,
+};
 
 /// The stable provider id (matches the config chain spelling + the
 /// `app_user.auth_source` value).
@@ -172,6 +187,10 @@ pub struct UpstreamBasicConfig {
     /// The `auth_realm.id` this provider was built from, recorded as
     /// provenance on provisioned users. `None` for static-config wiring.
     pub realm_id: Option<i64>,
+    /// Hash every password the upstream accepts, for the account to keep
+    /// (see the [module docs](self)). Needs a `realm_id`: the hash is kept
+    /// only while the realm row opts in.
+    pub capture_password_hash: bool,
 }
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
@@ -182,6 +201,7 @@ pub struct UpstreamBasicProvider {
     config: UpstreamBasicConfig,
     client: Client,
     cache: ValidatedCredentialCache,
+    hash_limiter: Arc<PasswordHashLimiter>,
 }
 
 impl UpstreamBasicProvider {
@@ -199,6 +219,34 @@ impl UpstreamBasicProvider {
             config,
             client,
             cache,
+            hash_limiter: PasswordHashLimiter::shared_default(),
+        }
+    }
+
+    /// Hash kept passwords (`capture_password_hash`) in the slots of
+    /// `limiter` — the server shares one with local password verification —
+    /// instead of the process-wide default.
+    pub fn with_hash_limiter(mut self, limiter: Arc<PasswordHashLimiter>) -> Self {
+        self.hash_limiter = limiter;
+        self
+    }
+
+    /// Hash a password the upstream just accepted, for the account to keep.
+    /// Best effort: without a free argon2 slot, or when hashing fails, the
+    /// login goes ahead without one.
+    async fn capture(&self, password: &str) -> Option<CapturedPasswordHash> {
+        match self.hash_limiter.try_hash(password.to_string()).await {
+            Ok(Some(phc)) => Some(CapturedPasswordHash::new(phc)),
+            Ok(None) => {
+                tracing::warn!("upstream-basic: password hash could not be computed; not kept");
+                None
+            }
+            Err(LimiterSaturated) => {
+                tracing::debug!(
+                    "upstream-basic: no free argon2 slot; password hash not kept this time"
+                );
+                None
+            }
         }
     }
 
@@ -452,6 +500,16 @@ impl AuthProvider for UpstreamBasicProvider {
                 // group AND this login actually saw the upstream's groups; a
                 // cache hit must never demote an upstream admin.
                 let admin_authoritative = admin_mapped && fetched.is_some();
+                // Likewise only a login the upstream itself accepted refreshes
+                // the kept password hash.
+                let captured_password_hash = if self.config.capture_password_hash
+                    && self.config.realm_id.is_some()
+                    && fetched.is_some()
+                {
+                    self.capture(cred.password).await
+                } else {
+                    None
+                };
                 let groups = fetched.unwrap_or_default();
                 let suggested_is_admin =
                     admin_mapped && groups.iter().any(|g| g == &self.config.admin_group);
@@ -464,6 +522,7 @@ impl AuthProvider for UpstreamBasicProvider {
                     admin_authoritative,
                     auto_provision: self.config.auto_provision,
                     realm_id: self.config.realm_id,
+                    captured_password_hash,
                 })
             }
             Ok(false) => AuthOutcome::Rejected,

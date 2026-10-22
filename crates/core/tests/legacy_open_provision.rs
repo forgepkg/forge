@@ -30,6 +30,7 @@ async fn removing_authenticated_survives_the_next_upstream_login() {
         admin_authoritative: false,
         auto_provision: true,
         realm_id: None,
+        captured_password_hash: None,
     };
     let roles = |user_id: i64| {
         let pool = pool.clone();
