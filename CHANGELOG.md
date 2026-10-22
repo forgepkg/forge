@@ -119,7 +119,10 @@ otherwise.
   SHA-256, and each call runs with fuel, memory and time limits and no WASI
   capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
   `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
-  listing, and proxies of other chart repositories. **NuGet** is a built-in plugin too (`plugins/nuget`), served at
+  listing, and proxies of other chart repositories. The index lists chart
+  metadata with the types Helm reads, so a Chart.yaml with `appVersion: 2`
+  or an annotation `false` does not break it
+  ([#206](https://github.com/schmitch/forge/issues/206)). **NuGet** is a built-in plugin too (`plugins/nuget`), served at
   `/v3/{repo}/` by the same dispatcher with the same paths, responses and
   proxy behaviour as before; its proxies read the upstream feed through the
   plugin's upstream side. `GET /admin/formats` lists the installed

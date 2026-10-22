@@ -43,14 +43,19 @@ fn chart(name: &str, version: &str) -> Vec<u8> {
 
 /// [`chart`] with `values` as its `values.yaml`.
 fn chart_with_values(name: &str, version: &str, values: &str) -> Vec<u8> {
+    chart_archive(
+        name,
+        &format!("apiVersion: v2\nname: {name}\nversion: {version}\ndescription: {name} chart\n"),
+        values,
+    )
+}
+
+/// A gzipped chart archive of the chart `name` with `chart_yaml` as its
+/// Chart.yaml.
+fn chart_archive(name: &str, chart_yaml: &str, values: &str) -> Vec<u8> {
     let entries: [(String, String); 2] = [
         (format!("{name}/values.yaml"), values.into()),
-        (
-            format!("{name}/Chart.yaml"),
-            format!(
-                "apiVersion: v2\nname: {name}\nversion: {version}\ndescription: {name} chart\n"
-            ),
-        ),
+        (format!("{name}/Chart.yaml"), chart_yaml.into()),
     ];
     let mut tar = Vec::new();
     for (path, data) in &entries {
@@ -703,6 +708,184 @@ impl ChartUpstream {
 
     fn downloads(&self) -> usize {
         self.downloads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Check `index` against the types Helm gives an index's fields (its
+/// `repo.ChartVersion` and `chart.Metadata`). Helm reads a JSON index with
+/// Go's `encoding/json` and refuses the whole index when one value has
+/// another type; fields it does not know it ignores.
+fn assert_helm_types(index: &Value) {
+    const STRINGS: &[&str] = &[
+        "name",
+        "home",
+        "version",
+        "description",
+        "icon",
+        "apiVersion",
+        "condition",
+        "tags",
+        "appVersion",
+        "kubeVersion",
+        "type",
+        "created",
+        "digest",
+    ];
+    let strings = |v: &Value| v.as_array().is_some_and(|a| a.iter().all(Value::is_string));
+    let fields = |v: &Value, strs: &[&str], lists: &[&str], bools: &[&str], any: &[&str]| {
+        v.as_object().is_some_and(|o| {
+            o.iter().all(|(k, v)| {
+                (strs.contains(&k.as_str()) && v.is_string())
+                    || (lists.contains(&k.as_str()) && strings(v))
+                    || (bools.contains(&k.as_str()) && v.is_boolean())
+                    || (any.contains(&k.as_str()) && v.is_array())
+            })
+        })
+    };
+    assert!(index["apiVersion"].is_string());
+    for (chart, versions) in index["entries"].as_object().expect("entries") {
+        for version in versions.as_array().expect("versions") {
+            for (key, value) in version.as_object().expect("a chart version") {
+                let ok = match key.as_str() {
+                    key if STRINGS.contains(&key) => value.is_string(),
+                    "sources" | "keywords" | "urls" => strings(value),
+                    "deprecated" | "removed" => value.is_boolean(),
+                    "annotations" => value
+                        .as_object()
+                        .is_some_and(|m| m.values().all(Value::is_string)),
+                    "maintainers" => value.as_array().is_some_and(|a| {
+                        a.iter()
+                            .all(|m| fields(m, &["name", "email", "url"], &[], &[], &[]))
+                    }),
+                    "dependencies" => value.as_array().is_some_and(|a| {
+                        a.iter().all(|d| {
+                            fields(
+                                d,
+                                &["name", "version", "repository", "condition", "alias"],
+                                &["tags"],
+                                &["enabled"],
+                                &["import-values"],
+                            )
+                        })
+                    }),
+                    _ => true,
+                };
+                assert!(ok, "{chart}: Helm cannot read {key} = {value}");
+            }
+        }
+    }
+}
+
+/// A Chart.yaml (or an upstream's YAML index) may hold a number or a
+/// boolean where Helm wants a string, as Helm's YAML reader accepts: the
+/// index lists it as a string, so it does not break the index (#206).
+#[tokio::test]
+async fn an_index_lists_scalars_as_the_strings_helm_reads() {
+    const QUIRKS: &str = concat!(
+        "appVersion: 2\n",
+        "kubeVersion: 1.30\n",
+        "icon: 7\n",
+        "keywords: [web, 8, true]\n",
+        "annotations:\n",
+        "  artifacthub.io/prerelease: false\n",
+        "  revision: 3\n",
+        "  nested: {a: b}\n",
+        "maintainers:\n",
+        "  - name: 42\n",
+        "    email: ops@example.com\n",
+        "    extra: [x]\n",
+        "dependencies:\n",
+        "  - name: redis\n",
+        "    version: 18\n",
+        "    repository: https://charts.example\n",
+        "    enabled: true\n",
+        "    tags: [cache, 1]\n",
+        "    import-values: [data]\n",
+        "deprecated: false\n",
+        "home: {not: a string}\n",
+        "sources: just-one\n",
+    );
+    let upstream_index = format!(
+        "apiVersion: v1\nentries:\n  quirky:\n    - apiVersion: v2\n      name: quirky\n      \
+         version: 1.0.0\n      urls: [charts/quirky-1.0.0.tgz]\n{}",
+        QUIRKS
+            .lines()
+            .map(|l| format!("      {l}\n"))
+            .collect::<String>()
+    );
+    let upstream = ChartUpstream::start(upstream_index).await;
+
+    let srv = start_helm(ServerOpts::default()).await;
+    let creds = credentials(&srv).await;
+    let hosted = helm_repo(&srv, false).await;
+    let archive = chart_archive(
+        "quirks",
+        &format!("apiVersion: v2\nname: quirks\nversion: 0.1.0\n{QUIRKS}"),
+        "replicas: 1\n",
+    );
+    let resp = push(&srv, &hosted, &creds, archive).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let proxy = format!("proxy{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": proxy, "kind": "proxy", "format": "helm", "remote_url": upstream.base }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let group = format!("group{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": group, "kind": "group", "format": "helm" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let (u, p) = srv.admin_basic();
+    for (member, priority) in [(&hosted, 10), (&proxy, 1)] {
+        let resp = srv
+            .client()
+            .post(format!(
+                "{}/admin/repositories/{group}/members",
+                srv.base_url
+            ))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({ "member": member, "priority": priority }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    }
+
+    for (repo, chart) in [
+        (&hosted, "quirks"),
+        (&proxy, "quirky"),
+        (&group, "quirks"),
+        (&group, "quirky"),
+    ] {
+        let resp = get_index(&srv, repo, Some(&creds)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let index: Value = resp.json().await.unwrap();
+        assert_helm_types(&index);
+        let entry = &index["entries"][chart][0];
+        assert_eq!(entry["appVersion"], "2", "{repo}: {entry}");
+        assert_eq!(entry["kubeVersion"], "1.30");
+        assert_eq!(entry["keywords"], json!(["web", "8", "true"]));
+        assert_eq!(entry["annotations"]["artifacthub.io/prerelease"], "false");
+        assert_eq!(entry["annotations"]["revision"], "3");
+        assert!(entry["annotations"].get("nested").is_none());
+        assert_eq!(
+            entry["maintainers"][0],
+            json!({"name": "42", "email": "ops@example.com"})
+        );
+        assert_eq!(entry["dependencies"][0]["version"], "18");
+        assert_eq!(entry["dependencies"][0]["tags"], json!(["cache", "1"]));
+        assert_eq!(entry["dependencies"][0]["enabled"], true);
+        assert_eq!(entry["deprecated"], false);
+        assert!(entry.get("home").is_none() && entry.get("sources").is_none());
     }
 }
 

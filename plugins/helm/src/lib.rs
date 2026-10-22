@@ -211,11 +211,7 @@ impl FormatPlugin for Helm {
 /// entry): the chart metadata an index entry carries, and the description
 /// and dependency groups Forge's web UI shows.
 fn summary(metadata: &Map<String, Value>) -> String {
-    let chart: Map<String, Value> = metadata
-        .iter()
-        .filter(|(k, _)| METADATA_KEYS.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let chart = helm_metadata(metadata);
     let deps: Vec<Value> = dependencies(metadata)
         .into_iter()
         .map(|d| json!({ "id": d.id, "range": d.range }))
@@ -230,6 +226,116 @@ fn summary(metadata: &Map<String, Value>) -> String {
         },
     })
     .to_string()
+}
+
+/// The [`METADATA_KEYS`] of `metadata`, each as the type Helm's
+/// `chart.Metadata` declares for it.
+///
+/// Helm reads an index that is valid JSON with Go's `encoding/json`, straight
+/// into those types, and refuses the whole index when one value has another
+/// type. A Chart.yaml (or a YAML index of an upstream) may hold
+/// `appVersion: 2` or an annotation `false`: Helm's YAML reader turns such a
+/// scalar into the string its field wants, so the chart is valid, but its
+/// JSON number or boolean would break every chart of the index. So scalars
+/// become strings where Helm wants strings, and a value that has no such
+/// form (a mapping where a string belongs) is left out.
+fn helm_metadata(metadata: &Map<String, Value>) -> Map<String, Value> {
+    metadata
+        .iter()
+        .filter_map(|(key, value)| {
+            let value = match key.as_str() {
+                "keywords" | "sources" => string_list(value),
+                "deprecated" => value.is_boolean().then(|| value.clone()),
+                "annotations" => string_map(value),
+                "maintainers" => objects(value, |maintainer| {
+                    pick(maintainer, &["name", "email", "url"], &[], &[])
+                }),
+                "dependencies" => objects(value, |dependency| {
+                    let mut picked = pick(
+                        dependency,
+                        &["name", "version", "repository", "condition", "alias"],
+                        &["tags"],
+                        &["enabled"],
+                    );
+                    // `[]interface{}`: any list.
+                    if let Some(values @ Value::Array(_)) = dependency.get("import-values") {
+                        picked.insert("import-values".into(), values.clone());
+                    }
+                    picked
+                }),
+                key if METADATA_KEYS.contains(&key) => scalar_string(value),
+                _ => None,
+            }?;
+            Some((key.clone(), value))
+        })
+        .collect()
+}
+
+/// A scalar as the string Helm's YAML reader makes of it.
+fn scalar_string(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(_) => Some(value.clone()),
+        Value::Number(n) => Some(Value::String(n.to_string())),
+        Value::Bool(b) => Some(Value::String(b.to_string())),
+        _ => None,
+    }
+}
+
+/// A list of strings (`[]string`): its scalars as strings.
+fn string_list(value: &Value) -> Option<Value> {
+    let items = value.as_array()?;
+    Some(Value::Array(
+        items.iter().filter_map(scalar_string).collect(),
+    ))
+}
+
+/// A string map (`map[string]string`): its scalar values as strings.
+fn string_map(value: &Value) -> Option<Value> {
+    let map = value.as_object()?;
+    Some(Value::Object(
+        map.iter()
+            .filter_map(|(k, v)| Some((k.clone(), scalar_string(v)?)))
+            .collect(),
+    ))
+}
+
+/// A list of objects (`[]*Maintainer`, `[]*Dependency`), each made by `one`.
+fn objects(
+    value: &Value,
+    one: impl Fn(&Map<String, Value>) -> Map<String, Value>,
+) -> Option<Value> {
+    let items = value.as_array()?;
+    Some(Value::Array(
+        items
+            .iter()
+            .filter_map(|item| Some(Value::Object(one(item.as_object()?))))
+            .collect(),
+    ))
+}
+
+/// The `strings`, `lists` (of strings) and `bools` of `object`, as such.
+fn pick(
+    object: &Map<String, Value>,
+    strings: &[&str],
+    lists: &[&str],
+    bools: &[&str],
+) -> Map<String, Value> {
+    let mut picked = Map::new();
+    for (key, value) in object {
+        let value = if strings.contains(&key.as_str()) {
+            scalar_string(value)
+        } else if lists.contains(&key.as_str()) {
+            string_list(value)
+        } else if bools.contains(&key.as_str()) {
+            value.is_boolean().then(|| value.clone())
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            picked.insert(key.clone(), value);
+        }
+    }
+    picked
 }
 
 /// Chart.yaml `dependencies` as Forge dependencies.
@@ -411,7 +517,7 @@ fn hit_entries(repo: &Repository, hit: &SearchHit) -> Vec<Value> {
         .as_deref()
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .and_then(|s| match s.get("chart") {
-            Some(Value::Object(map)) => Some(map.clone()),
+            Some(Value::Object(map)) => Some(helm_metadata(map)),
             _ => None,
         })
         .unwrap_or_default();
@@ -464,13 +570,13 @@ fn newest_first(versions: &mut [&PackageInfo]) {
 
 /// One chart version as the index and the ChartMuseum API list it.
 fn entry(repo: &Repository, p: &PackageInfo) -> Value {
+    // Typed for Helm again: a summary stored before may not be.
     let mut chart = p
         .summary
         .as_deref()
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|s| s.get("chart").cloned())
-        .and_then(|c| match c {
-            Value::Object(map) => Some(map),
+        .and_then(|s| match s.get("chart") {
+            Some(Value::Object(map)) => Some(helm_metadata(map)),
             _ => None,
         })
         .unwrap_or_default();
@@ -492,6 +598,29 @@ fn entry(repo: &Repository, p: &PackageInfo) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_metadata_has_the_types_helm_reads() {
+        let chart = chart::parse_chart_yaml(
+            b"apiVersion: v2\nname: demo\nversion: 1.0.0\nappVersion: 2\ndeprecated: true\n\
+              annotations: {a: false, b: 1.5, c: [x]}\nkeywords: [k, 3]\nhome: [x]\nextra: 1\n"
+                .to_vec(),
+        )
+        .unwrap();
+        let metadata = helm_metadata(&chart.metadata);
+        assert_eq!(
+            Value::Object(metadata),
+            json!({
+                "apiVersion": "v2",
+                "name": "demo",
+                "version": "1.0.0",
+                "appVersion": "2",
+                "deprecated": true,
+                "annotations": {"a": "false", "b": "1.5"},
+                "keywords": ["k", "3"],
+            })
+        );
+    }
 
     #[test]
     fn plugin_toml_names_this_crate() {
