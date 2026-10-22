@@ -41,6 +41,7 @@ use forge_core::auth::{
     ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
+use forge_core::oidc::{AssertionClaims, ClientAuth};
 use forge_crypto::service::EnvelopeService;
 use forge_db::model::AuthRealm;
 use forge_db::{auth_realm_dao, authz_dao, secret_dao};
@@ -48,8 +49,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use super::issuer::{AssertionIssuer, RealmAssertion};
 use super::OidcRuntime;
-use crate::config::{Config, OidcConfig};
+use crate::config::{ClientAuthentication, Config, OidcConfig};
 
 /// `forge_setting` key marking the first realm import as done. Gates only the
 /// initial `local`-realm priority adjustment; per-kind seed fingerprints (see
@@ -162,7 +164,9 @@ impl std::fmt::Debug for CredForwardRealmConfig {
 /// (`auth.session_*`).
 ///
 /// `client_secret` is a **secret** (write-only / redacted), like `key_pepper`
-/// above. Unknown keys are refused, as there (a misspelled `required_claims`
+/// above. With `client_authentication = "federated_credential"` there is none:
+/// forge signs a client assertion itself ([`OidcRealmConfig::federated_credential`]).
+/// Unknown keys are refused, as there (a misspelled `required_claims`
 /// would let every account of a multi-tenant issuer sign in).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,9 +175,23 @@ pub struct OidcRealmConfig {
     pub issuer: String,
     /// OAuth client (application) id.
     pub client_id: String,
-    /// OAuth client secret. **Write-only / redacted.**
-    #[serde(default)]
+    /// OAuth client secret. **Write-only / redacted.** Not kept with
+    /// `client_authentication = "federated_credential"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_secret: String,
+    /// How forge authenticates at the IdP's token endpoint: with
+    /// `client_secret` (the default), or with a client assertion it signs
+    /// itself (`federated_credential`, an Entra federated identity
+    /// credential).
+    #[serde(
+        default,
+        skip_serializing_if = "ClientAuthentication::is_client_secret"
+    )]
+    pub client_authentication: ClientAuthentication,
+    /// `aud` of the client assertions (`federated_credential`); unset:
+    /// Entra's `api://AzureADTokenExchange` (sovereign clouds use their own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion_audience: Option<String>,
     /// Requested scopes (`openid` added implicitly when missing).
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
@@ -233,8 +251,58 @@ impl std::fmt::Debug for OidcRealmConfig {
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
+            .field("client_authentication", &self.client_authentication)
             .finish_non_exhaustive()
     }
+}
+
+/// What the IdP's federated credential for an `oidc` realm must name: the
+/// claims of the client assertions forge signs for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FederatedCredential {
+    /// Forge's issuer URL (`server.public_base_url`).
+    pub issuer: String,
+    /// `{client_id}@{issuer of the realm}`
+    /// ([`forge_core::oidc::assertion::federated_subject`]).
+    pub subject: String,
+    /// The realm's `assertion_audience`.
+    pub audience: String,
+}
+
+impl OidcRealmConfig {
+    /// The federated credential this realm authenticates with when it uses
+    /// `client_authentication = "federated_credential"`, forge being the
+    /// issuer `forge_issuer`.
+    pub fn federated_credential(&self, forge_issuer: &str) -> Option<FederatedCredential> {
+        (self.client_authentication == ClientAuthentication::FederatedCredential).then(|| {
+            FederatedCredential {
+                issuer: forge_issuer.trim_end_matches('/').to_string(),
+                subject: forge_core::oidc::assertion::federated_subject(
+                    &self.issuer,
+                    &self.client_id,
+                ),
+                audience: self.assertion_audience.clone().unwrap_or_else(|| {
+                    forge_core::oidc::assertion::DEFAULT_ASSERTION_AUDIENCE.to_string()
+                }),
+            }
+        })
+    }
+}
+
+/// [`OidcRealmConfig::federated_credential`] of a stored realm `config`, for
+/// API responses (`None` for any other realm, or a config that does not
+/// parse).
+pub fn federated_credential(
+    kind: &str,
+    config: &JsonValue,
+    forge_issuer: &str,
+) -> Option<FederatedCredential> {
+    if kind != KIND_OIDC {
+        return None;
+    }
+    serde_json::from_value::<OidcRealmConfig>(config.clone())
+        .ok()?
+        .federated_credential(forge_issuer)
 }
 
 fn default_method() -> String {
@@ -348,8 +416,19 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             if cfg.client_id.trim().is_empty() {
                 return Err("client_id must not be empty".into());
             }
-            if cfg.client_secret.trim().is_empty() {
-                return Err("client_secret must not be empty".into());
+            cfg.assertion_audience = cfg
+                .assertion_audience
+                .map(|audience| audience.trim().to_string())
+                .filter(|audience| !audience.is_empty());
+            match cfg.client_authentication {
+                ClientAuthentication::ClientSecret => {
+                    if cfg.client_secret.trim().is_empty() {
+                        return Err("client_secret must not be empty".into());
+                    }
+                }
+                // Nothing sends a secret any more: it is not kept (switching
+                // back takes a new one, as for another issuer).
+                ClientAuthentication::FederatedCredential => cfg.client_secret.clear(),
             }
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
@@ -475,6 +554,8 @@ pub struct OidcRealmRuntime {
     pub label: String,
     /// Identifier-first routing domains (lowercased).
     pub login_domains: Vec<String>,
+    /// Whether the realm authenticates with forge's own client assertions.
+    pub federated: bool,
     /// The flow runtime (discovery/JWKS client, claim mapping, sessions).
     pub runtime: OidcRuntime,
 }
@@ -513,6 +594,12 @@ impl RealmSnapshot {
     pub fn oidc(&self) -> Option<&OidcRealmRuntime> {
         self.oidc.as_ref()
     }
+
+    /// Whether the enabled OIDC realm authenticates with forge's own client
+    /// assertions (so the issuer keys must exist).
+    pub fn uses_assertion_issuer(&self) -> bool {
+        self.oidc.as_ref().is_some_and(|o| o.federated)
+    }
 }
 
 /// How often [`RealmAuth::refreshed`] may rebuild the snapshot at most.
@@ -546,11 +633,20 @@ pub struct RealmAuth {
     /// verifications and the hashes credential-forwarding realms keep.
     /// Outlives rebuilds.
     password_limiter: Arc<PasswordHashLimiter>,
+    /// Signs the client assertions of a `federated_credential` OIDC realm.
+    assertion_issuer: AssertionIssuer,
 }
 
 impl RealmAuth {
     /// Build the (empty) cache; the first `snapshot()` call populates it.
-    pub fn new(pool: PgPool, cache: Cache, config: Arc<Config>) -> Self {
+    /// A `federated_credential` OIDC realm signs its client assertions with
+    /// `assertion_issuer`.
+    pub fn new(
+        pool: PgPool,
+        cache: Cache,
+        config: Arc<Config>,
+        assertion_issuer: AssertionIssuer,
+    ) -> Self {
         let ttl = Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1));
         let forward_limits = Arc::new(ForwardLimits::new(
             config.auth.credential_forward_max_concurrent,
@@ -569,6 +665,7 @@ impl RealmAuth {
             envelope: None,
             forward_limits,
             password_limiter,
+            assertion_issuer,
         }
     }
 
@@ -862,6 +959,28 @@ impl RealmAuth {
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         let base = self.config.public_base_url();
         let (idle, absolute) = self.config.session_ttls();
+        let federated = cfg.federated_credential(self.assertion_issuer.issuer());
+        let auth = match &federated {
+            None => ClientAuth::Secret(cfg.client_secret.clone()),
+            Some(credential) => {
+                if !credential.issuer.starts_with("https://") {
+                    tracing::warn!(
+                        realm = %realm.name,
+                        issuer = %credential.issuer,
+                        "oidc realm authenticates with a federated credential, but the public base \
+                         URL forge publishes as its issuer is not https: Entra refuses such an issuer"
+                    );
+                }
+                ClientAuth::Assertion(Arc::new(RealmAssertion {
+                    issuer: self.assertion_issuer.clone(),
+                    claims: AssertionClaims {
+                        issuer: credential.issuer.clone(),
+                        subject: credential.subject.clone(),
+                        audience: credential.audience.clone(),
+                    },
+                }))
+            }
+        };
         // Synthesize the legacy-shaped OidcConfig the runtime builder takes;
         // the redirect URL is always derived from the public base URL.
         let oidc_config = OidcConfig {
@@ -869,6 +988,8 @@ impl RealmAuth {
             issuer: cfg.issuer.clone(),
             client_id: cfg.client_id.clone(),
             client_secret: cfg.client_secret.clone(),
+            client_authentication: cfg.client_authentication,
+            assertion_audience: cfg.assertion_audience.clone(),
             redirect_url: format!("{base}/auth/oidc/callback"),
             scopes: cfg.scopes.clone(),
             clock_skew_seconds: cfg.clock_skew_seconds,
@@ -885,8 +1006,13 @@ impl RealmAuth {
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
-        let runtime =
-            OidcRuntime::build(&oidc_config, self.pool.clone(), &base, self.cache.clone())?;
+        let runtime = OidcRuntime::build(
+            &oidc_config,
+            auth,
+            self.pool.clone(),
+            &base,
+            self.cache.clone(),
+        )?;
         Ok(OidcRealmRuntime {
             realm_name: realm.name.clone(),
             label: cfg
@@ -900,6 +1026,7 @@ impl RealmAuth {
                 .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
                 .filter(|d| !d.is_empty())
                 .collect(),
+            federated: federated.is_some(),
             runtime,
         })
     }
@@ -1070,10 +1197,23 @@ pub async fn seed_auth_realms(
     }
 
     if let Some(o) = config.oidc.as_ref().filter(|o| o.enabled) {
+        let federated = o.client_authentication == ClientAuthentication::FederatedCredential;
         let cfg = OidcRealmConfig {
             issuer: o.issuer.clone(),
             client_id: o.client_id.clone(),
-            client_secret: o.client_secret.clone(),
+            // Never kept for a federated credential (see `validate_config`).
+            client_secret: if federated {
+                String::new()
+            } else {
+                o.client_secret.clone()
+            },
+            client_authentication: o.client_authentication,
+            assertion_audience: o
+                .assertion_audience
+                .as_deref()
+                .map(str::trim)
+                .filter(|audience| !audience.is_empty())
+                .map(str::to_string),
             scopes: o.scopes.clone(),
             clock_skew_seconds: o.clock_skew_seconds,
             allow_http_issuer: o.allow_private_issuer,
@@ -1374,6 +1514,58 @@ mod tests {
         let mut nosecret = base.clone();
         nosecret["client_secret"] = json!("");
         assert!(validate_config(KIND_OIDC, &nosecret).is_err());
+    }
+
+    #[test]
+    fn a_federated_credential_oidc_realm_keeps_no_secret_and_names_its_credential() {
+        let config = validate_config(
+            KIND_OIDC,
+            &json!({
+                "issuer": "https://login.microsoftonline.com/tenant/v2.0/",
+                "client_id": "app",
+                "client_authentication": "federated_credential",
+                "client_secret": "nothing sends it",
+                "assertion_audience": "  ",
+            }),
+        )
+        .expect("valid without a secret");
+        assert!(config.get("client_secret").is_none(), "{config}");
+        assert!(config.get("assertion_audience").is_none(), "{config}");
+        assert_eq!(
+            config["client_authentication"],
+            json!("federated_credential")
+        );
+        assert_eq!(
+            redact_config(KIND_OIDC, &config)["client_secret_set"],
+            json!(false)
+        );
+        assert_eq!(
+            federated_credential(KIND_OIDC, &config, "https://forge.example/"),
+            Some(FederatedCredential {
+                issuer: "https://forge.example".into(),
+                subject: "app@https://login.microsoftonline.com/tenant/v2.0".into(),
+                audience: "api://AzureADTokenExchange".into(),
+            })
+        );
+
+        // A client-secret realm is stored exactly as before.
+        let secret = validate_config(
+            KIND_OIDC,
+            &json!({"issuer": "https://idp.example", "client_id": "c", "client_secret": "s"}),
+        )
+        .unwrap();
+        assert!(secret.get("client_authentication").is_none(), "{secret}");
+        assert!(secret.get("assertion_audience").is_none(), "{secret}");
+        assert!(federated_credential(KIND_OIDC, &secret, "https://forge.example").is_none());
+        assert!(
+            federated_credential(KIND_CRED_FORWARD, &config, "https://forge.example").is_none()
+        );
+
+        assert!(validate_config(
+            KIND_OIDC,
+            &json!({"issuer": "https://idp.example", "client_id": "c", "client_authentication": "certificate"}),
+        )
+        .is_err());
     }
 
     #[test]

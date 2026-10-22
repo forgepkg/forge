@@ -45,6 +45,9 @@ futures-util = { workspace = true }
 # OIDC ID-token verification (slice 12.2 Phase 2): explicit JWT decode + RSA
 # JWKS key construction + iss/aud/exp/nonce validation with an alg allowlist.
 jsonwebtoken = { workspace = true }
+# Forge's own client assertions (oidc::assertion): RSA key generation, PKCS#8
+# storage and RS256 signing.
+aws-lc-rs = { workspace = true }
 
 # Networking / SSRF guard
 ipnet = { workspace = true }
