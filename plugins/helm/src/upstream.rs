@@ -124,10 +124,13 @@ fn failed(reason: impl Into<String>) -> UpstreamStep {
 
 /// The parsed `index.yaml` at `url` whose bytes are `body`.
 ///
-/// The built-in plugin keeps the last few it parsed, one per URL, and reuses
-/// one while the upstream serves the same bytes (the host hands every
-/// operation the document it caches for the metadata TTL): comparing the
-/// bytes takes a millisecond where parsing takes half a second. Since the
+/// The built-in plugin keeps what it parsed, one index per URL, as many as
+/// fit in [`parsed::BUDGET`], and reuses one while the upstream serves the
+/// same bytes (the host hands every operation the document it caches for the
+/// metadata TTL): comparing the bytes takes a millisecond where parsing
+/// takes half a second. A group asks its members in turn for every chart, so
+/// the indexes of all its upstreams are needed at once: kept fewer, they
+/// would push each other out and be parsed again for every chart. Since the
 /// result depends on the bytes alone, it is the same for every repository
 /// that fetches them. Parses run one at a time: concurrent operations on a
 /// document nobody has parsed yet wait for the first parse instead of each
@@ -153,27 +156,94 @@ mod parsed {
 
     use super::{parse_index, Index};
 
-    /// How many parsed indexes are kept, the most recently used.
-    pub(super) const KEPT: usize = 4;
+    /// What the kept indexes may hold together ([`retained`]), about twice
+    /// the size of their documents: the indexes of a few dozen typical chart
+    /// repositories, or of a handful of the largest public ones. Past it,
+    /// the least recently used give way; the index parsed last is kept
+    /// whatever its size.
+    pub(super) const BUDGET: usize = 128 * 1024 * 1024;
 
     /// A parsed index and the bytes it was parsed from.
-    struct Parsed {
+    pub(super) struct Parsed {
         url: String,
         body: Arc<[u8]>,
         index: Arc<Index>,
+        /// What it holds ([`retained`]).
+        bytes: usize,
         /// When it was last used ([`State::clock`]).
         used: u64,
     }
 
-    struct State {
+    impl Parsed {
+        pub(super) fn new(url: &str, body: &[u8], index: Arc<Index>) -> Self {
+            Self {
+                url: url.to_string(),
+                bytes: retained(body, &index),
+                body: body.into(),
+                index,
+                used: 0,
+            }
+        }
+    }
+
+    pub(super) struct State {
         parsed: Vec<Parsed>,
         clock: u64,
     }
 
-    static STATE: Mutex<State> = Mutex::new(State {
-        parsed: Vec::new(),
-        clock: 0,
-    });
+    impl State {
+        pub(super) const fn new() -> Self {
+            Self {
+                parsed: Vec::new(),
+                clock: 0,
+            }
+        }
+
+        /// The bytes and the index kept for `url`.
+        pub(super) fn find(&self, url: &str) -> Option<(Arc<[u8]>, Arc<Index>)> {
+            let p = self.parsed.iter().find(|p| p.url == url)?;
+            Some((Arc::clone(&p.body), Arc::clone(&p.index)))
+        }
+
+        /// Marks `index`, kept for `url`, as just used.
+        pub(super) fn touch(&mut self, url: &str, index: &Arc<Index>) {
+            self.clock += 1;
+            let now = self.clock;
+            if let Some(p) = self
+                .parsed
+                .iter_mut()
+                .find(|p| p.url == url && Arc::ptr_eq(&p.index, index))
+            {
+                p.used = now;
+            }
+        }
+
+        /// Keeps `parsed` as the index of its URL. The least recently used
+        /// others give way until all fit in `budget`. Returns the indexes it
+        /// no longer keeps.
+        pub(super) fn keep(&mut self, mut parsed: Parsed, budget: usize) -> Vec<Parsed> {
+            let mut removed = Vec::new();
+            if let Some(i) = self.parsed.iter().position(|p| p.url == parsed.url) {
+                removed.push(self.parsed.swap_remove(i));
+            }
+            let mut total: usize = self.parsed.iter().map(|p| p.bytes).sum();
+            while total + parsed.bytes > budget {
+                let Some(oldest) = (0..self.parsed.len()).min_by_key(|&i| self.parsed[i].used)
+                else {
+                    break;
+                };
+                let oldest = self.parsed.swap_remove(oldest);
+                total -= oldest.bytes;
+                removed.push(oldest);
+            }
+            self.clock += 1;
+            parsed.used = self.clock;
+            self.parsed.push(parsed);
+            removed
+        }
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State::new());
 
     /// Held while an index is parsed.
     static PARSING: Mutex<()> = Mutex::new(());
@@ -188,46 +258,54 @@ mod parsed {
             return Ok(index);
         }
         let index = Arc::new(parse_index(body)?);
-        let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-        state.clock += 1;
-        let used = state.clock;
-        state.parsed.retain(|p| p.url != url);
-        if state.parsed.len() >= KEPT {
-            if let Some(oldest) = (0..state.parsed.len()).min_by_key(|&i| state.parsed[i].used) {
-                state.parsed.swap_remove(oldest);
-            }
-        }
-        state.parsed.push(Parsed {
-            url: url.to_string(),
-            body: body.into(),
-            index: Arc::clone(&index),
-            used,
-        });
+        // Sized, copied and dropped outside the lock: a large index takes a
+        // moment.
+        let parsed = Parsed::new(url, body, Arc::clone(&index));
+        let removed = STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keep(parsed, BUDGET);
+        drop(removed);
         Ok(index)
     }
 
     /// The index kept for `url`, when it was parsed from `body`.
     fn lookup(url: &str, body: &[u8]) -> Option<Arc<Index>> {
-        let (kept, index) = {
-            let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            let p = state.parsed.iter().find(|p| p.url == url)?;
-            (Arc::clone(&p.body), Arc::clone(&p.index))
-        };
+        let (kept, index) = STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .find(url)?;
         // Compared outside the lock: a large index takes a moment.
         if *kept != *body {
             return None;
         }
-        let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
-        state.clock += 1;
-        let now = state.clock;
-        if let Some(p) = state
-            .parsed
-            .iter_mut()
-            .find(|p| p.url == url && Arc::ptr_eq(&p.index, &index))
-        {
-            p.used = now;
-        }
+        STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .touch(url, &index);
         Some(index)
+    }
+
+    /// About what `index`, parsed from `body`, holds while kept: the
+    /// document and the entries.
+    pub(super) fn retained(body: &[u8], index: &Index) -> usize {
+        let entries: usize = index
+            .iter()
+            .map(|(name, versions)| {
+                name.len()
+                    + versions
+                        .iter()
+                        .map(|e| {
+                            std::mem::size_of_val(e)
+                                + e.name.len()
+                                + e.created.as_ref().map_or(0, String::len)
+                                + e.url.as_ref().map_or(0, String::len)
+                                + e.metadata.len()
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        body.len() + entries
     }
 }
 
@@ -451,17 +529,62 @@ mod tests {
         let again = parsed_index(url, changed.as_bytes()).unwrap();
         assert!(!Arc::ptr_eq(&again, &first[0]));
         assert_eq!(again["demo"].len(), 2);
+    }
 
-        // A few are kept: more push the least recently used out.
-        for n in 0..parsed::KEPT {
-            parsed_index(
-                &format!("https://other{n}.example/index.yaml"),
-                body.as_bytes(),
-            )
-            .unwrap();
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_group_of_many_upstreams_parses_each_index_once() {
+        // A group asks its members in turn for every chart: each member's
+        // index is parsed for the first chart and kept for the others.
+        let body = "apiVersion: v1\nentries:\n  demo:\n    - name: demo\n      version: 1.0.0\n";
+        let urls: Vec<String> = (0..12)
+            .map(|n| format!("https://member{n}.example/index.yaml"))
+            .collect();
+        let first: Vec<Arc<Index>> = urls
+            .iter()
+            .map(|url| parsed_index(url, body.as_bytes()).unwrap())
+            .collect();
+        for _chart in 0..3 {
+            for (url, first) in urls.iter().zip(&first) {
+                assert!(Arc::ptr_eq(
+                    &parsed_index(url, body.as_bytes()).unwrap(),
+                    first
+                ));
+            }
         }
-        let evicted = parsed_index(url, changed.as_bytes()).unwrap();
-        assert!(!Arc::ptr_eq(&evicted, &again));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn kept_indexes_fit_in_the_budget() {
+        let body = b"apiVersion: v1\nentries:\n  demo:\n    - name: demo\n      version: 1.0.0\n";
+        let index = Arc::new(parse_index(body).unwrap());
+        let one = parsed::retained(body, &index);
+        assert!(one > body.len());
+        let kept = |state: &parsed::State| -> Vec<&str> {
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .filter(|url| state.find(url).is_some())
+                .collect()
+        };
+
+        let parsed = |url| parsed::Parsed::new(url, body, Arc::clone(&index));
+
+        let mut state = parsed::State::new();
+        for url in ["a", "b", "c"] {
+            state.keep(parsed(url), 3 * one);
+        }
+        assert_eq!(kept(&state), ["a", "b", "c"]);
+        // Past the budget, the least recently used gives way.
+        state.touch("a", &index);
+        state.keep(parsed("d"), 3 * one);
+        assert_eq!(kept(&state), ["a", "c", "d"]);
+        // A document parsed again replaces the index of its URL.
+        state.keep(parsed("c"), 3 * one);
+        assert_eq!(kept(&state), ["a", "c", "d"]);
+        // The index parsed last is kept, even alone past the budget.
+        state.keep(parsed("e"), one - 1);
+        assert_eq!(kept(&state), ["e"]);
     }
 
     #[test]
