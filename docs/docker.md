@@ -76,7 +76,9 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 A registry token grants only what the caller may do when it is issued:
 `pull` needs `read` on the repository, `push` needs `write`, and `delete`
-needs `delete`; content selectors match image names (`team/*`). Every
+needs `delete`; content selectors match image names (`team/*`). One token
+request may name at most 32 repositories (clients ask for one to three); a
+request naming more is refused with `400 UNSUPPORTED`. Every
 request is authorized again against the current permissions, and the user
 and API token behind a registry token must still be active; a workload's
 realm must still be enabled with the configuration it was verified under,

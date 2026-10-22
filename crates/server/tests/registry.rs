@@ -412,6 +412,55 @@ async fn version_check_challenges_and_tokens_authenticate() {
     assert_eq!(resp.status(), 401);
 }
 
+/// One token request names at most `MAX_SCOPES` repositories, so an
+/// anonymous caller cannot make it run thousands of lookups; a repository
+/// named again is one scope, with its actions merged (#200).
+#[tokio::test]
+async fn token_requests_name_a_bounded_number_of_repositories() {
+    use base64::Engine;
+    let srv = common::start().await;
+    let max = forge_oci::token::MAX_SCOPES;
+    let request = |scopes: Vec<String>| {
+        let mut req = srv
+            .client()
+            .get(format!("{}/v2/token", srv.base_url))
+            .query(&[("service", "test.local")]);
+        for scope in scopes {
+            req = req.query(&[("scope", scope)]);
+        }
+        req.send()
+    };
+    let distinct = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| format!("repository:team/app{i}:pull"))
+            .collect()
+    };
+
+    let resp = request(distinct(max + 1)).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "UNSUPPORTED", "{body}");
+    // Space-separated in one value counts the same.
+    let resp = request(vec![distinct(max + 1).join(" ")]).await.unwrap();
+    assert_eq!(resp.status(), 400);
+
+    assert_eq!(request(distinct(max)).await.unwrap().status(), 200);
+
+    // The same repository a thousand times is one scope.
+    let mut repeated = vec!["repository:team/app:push".to_string(); 1000];
+    repeated.push("repository:team/app:pull,bogus".into());
+    let resp = request(repeated).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let jwt = body["token"].as_str().unwrap();
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(jwt.split('.').nth(1).unwrap())
+        .unwrap();
+    let claims: Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(claims["access"].as_array().unwrap().len(), 1, "{claims}");
+    assert_eq!(claims["access"][0]["name"], "team/app");
+}
+
 #[tokio::test]
 async fn tokens_grant_only_what_rbac_allows() {
     let srv = common::start().await;
