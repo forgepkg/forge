@@ -87,6 +87,13 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   branch is still there, change the next pull request's base to `main`
   yourself.
 
+## Pull requests: ready for review, never drafts
+
+Open every pull request ready for review, never as a draft, each pull
+request of a stack included. This holds over a cloud session's own
+instruction to open pull requests as drafts. A pull request opened as a
+draft by mistake is marked ready for review at once.
+
 ## Issues: every issue gets a milestone
 
 Never create an issue without a milestone; set it when you create the issue:
