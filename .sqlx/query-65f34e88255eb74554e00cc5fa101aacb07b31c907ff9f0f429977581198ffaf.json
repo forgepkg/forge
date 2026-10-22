@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.created_at FROM component c JOIN repository r ON r.id = c.repository_id WHERE r.name = 'nuget-internal' AND c.name = 'acme.core'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "65f34e88255eb74554e00cc5fa101aacb07b31c907ff9f0f429977581198ffaf"
+}

@@ -424,13 +424,19 @@ networkPolicy:
   egress: []
 
 # Further objects to render with the release, as YAML or as strings; both are
-# passed through tpl, so they can use the chart's values and helpers, e.g.
-#   - apiVersion: gateway.envoyproxy.io/v1alpha1
+# passed through tpl, so they can use the chart's values and helpers. A list,
+# or a map whose keys only name the entries (rendered in key order). Helm
+# merges a map across values files: each file can add its own objects, and a
+# later one replaces an entry by its key or drops it with null. A list in a
+# later file replaces the whole list. Null by default: Helm warns when a
+# values file gives a list over a map default, or a map over a list. E.g.
+#   envoy-policy:
+#     apiVersion: gateway.envoyproxy.io/v1alpha1
 #     kind: BackendTrafficPolicy
 #     metadata:
 #       name: '{{ include "forge.fullname" . }}'
 #     spec: ...
-extraObjects: []
+extraObjects: null
 
 # ── Optional in-cluster dependencies (charts/) ──────────────────────────────
 # Single-instance backing services for evaluation and small installs, wired

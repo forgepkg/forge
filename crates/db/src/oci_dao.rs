@@ -658,6 +658,54 @@ pub async fn expire_tags(
     Ok(res.rows_affected())
 }
 
+/// Give what an import stored the times its source recorded: a manifest
+/// the import created (`created`) is as old as `published_at`, a tag it
+/// created or moved (`tag`) was pushed then, and the manifest was last
+/// pulled at `downloaded_at` unless Forge saw a later pull.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_imported_times(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+    manifest_id: i64,
+    created: bool,
+    tag: Option<&str>,
+    published_at: Option<DateTime<Utc>>,
+    downloaded_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query!(
+        r#"
+        UPDATE oci_manifest
+        SET created_at = CASE WHEN $2 THEN coalesce($3, created_at) ELSE created_at END,
+            last_pulled_at = greatest(last_pulled_at, $4)
+        WHERE id = $1
+        "#,
+        manifest_id,
+        created,
+        published_at,
+        downloaded_at,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if let (Some(tag), Some(published_at)) = (tag, published_at) {
+        sqlx::query!(
+            r#"
+            UPDATE oci_tag SET created_at = $5, updated_at = $5
+            WHERE repository_id = $1 AND image = $2 AND tag = $3 AND manifest_id = $4
+            "#,
+            repository_id,
+            image,
+            tag,
+            manifest_id,
+            published_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 /// Record a pull of a manifest (at most hourly).
 pub async fn touch_manifest(pool: &PgPool, manifest_id: i64) -> sqlx::Result<()> {
     sqlx::query!(

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM nexus_import WHERE id = $1 AND state NOT IN ('queued', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "514969a81cf1fbe6b56a5e16b77fcd037828f51721884ce144e1585c30d77743"
+}

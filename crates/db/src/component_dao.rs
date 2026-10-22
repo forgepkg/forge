@@ -572,3 +572,42 @@ where
     .await?;
     Ok(())
 }
+
+/// Give an imported component the times its source recorded: `published_at`
+/// becomes its creation time, and `downloaded_at` its (and its package
+/// asset's, at `package_path`) last download unless Forge saw a later one.
+pub async fn set_imported_times(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    component_id: i64,
+    package_path: &str,
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
+    downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE component
+        SET created_at = coalesce($2, created_at),
+            last_downloaded_at = greatest(last_downloaded_at, $3)
+        WHERE id = $1
+        "#,
+        component_id,
+        published_at,
+        downloaded_at,
+    )
+    .execute(&mut **tx)
+    .await?;
+    if downloaded_at.is_some() {
+        sqlx::query!(
+            r#"
+            UPDATE asset SET last_downloaded_at = greatest(last_downloaded_at, $3)
+            WHERE component_id = $1 AND path = $2
+            "#,
+            component_id,
+            package_path,
+            downloaded_at,
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}

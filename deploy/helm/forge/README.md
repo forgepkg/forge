@@ -214,11 +214,13 @@ Gateway `BackendTrafficPolicy`, …), or an Ingress if you need one, with
 
 `extraObjects` renders further objects with the release, given as YAML or as
 strings. Both go through `tpl`, so they can use values and the chart's
-helpers:
+helpers. It is a list or a map; the keys of a map only name its entries,
+which render in key order:
 
 ```yaml
 extraObjects:
-  - apiVersion: gateway.envoyproxy.io/v1alpha1
+  envoy-policy:
+    apiVersion: gateway.envoyproxy.io/v1alpha1
     kind: BackendTrafficPolicy
     metadata:
       name: '{{ include "forge.fullname" . }}'
@@ -231,6 +233,11 @@ extraObjects:
         http:
           connectionIdleTimeout: 120s
 ```
+
+Helm merges a map across values files (`-f base.yaml -f production.yaml`):
+each file can add its own objects, and a later one replaces an entry by its
+key or drops it with `null` (`--set extraObjects.envoy-policy=null`). A list
+in a later file replaces the whole list.
 
 ## Optional dependencies
 
