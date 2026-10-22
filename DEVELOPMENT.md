@@ -727,24 +727,47 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) runs
-`fmt`, `clippy`, `audit`, `test`, `docker`, `kubernetes` and `web` on every
-pull request. The slow `e2e` and `web-e2e` jobs are skipped there; they run in
-the merge queue and on every push to `main`.
+CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) has
+the jobs `fmt`, `clippy`, `audit`, `plugins`, `test`, `docker`, `kubernetes`,
+`web` and `oci-e2e`, and the slow `e2e` and `web-e2e`, which pull requests
+skip: those two run in the merge queue and on every push to `main`.
 
-On a pull request, `docker` builds the image only when the change touches what
-it is built from: the `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, a
-`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, the web
-manifest and lockfile (`web/package.json`, `web/pnpm-lock.yaml`,
-`web/pnpm-workspace.yaml`, `web/.npmrc`) or the CI configuration. Otherwise
-it passes without building (GitLab leaves the job out of the merge request
-pipeline). The merge queue and every push to `main` always build the image,
-so a change that breaks only the image build, such as an `include_str!` of a
-file `.dockerignore` leaves out, fails in the queue rather than on its pull
-request.
+On a pull request and in the merge queue, a job runs only when the change
+touches what it checks (#353). The `changes` job
+(`.github/scripts/ci-changes.sh`) compares a pull request with its base
+branch, and a merge group with the base-branch commit it is built on, so the
+pull requests ahead of it in the queue count too. It sorts the change into
+groups of paths:
+
+| Group | Paths | Jobs |
+|---|---|---|
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `migrations/`, `.sqlx/`, `fixtures/`, `.github/scripts/`; and the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`, `web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Changelog | `docs/changes/` | `fmt` |
+| Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
+| Web | `web/` | `web`, `web-e2e` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+
+A change to the CI configuration counts for every group. `kubernetes` (a few
+seconds) always runs. A job left out is skipped, which passes a required
+check. If the `changes` job fails, every job runs. Pushes to `main` and manual
+runs run every job, which the release gate requires. A file that Rust code or
+its tests read from outside the crates belongs in the Rust group: add a new
+one to `ci-changes.sh` and to the `.paths` of `.gitlab-ci.yml`.
+
+The image is built only when its own inputs change: clippy, test and web
+compile the Rust code and the SPA of every other change. A change that breaks
+only the image build, such as an `include_str!` of a file `.dockerignore`
+leaves out, therefore fails on the push to `main` rather than in the queue.
+
+On GitLab, the same groups are `rules: changes` in merge request pipelines
+and merge trains. A merge train pipeline compares only its own merge request
+with the target branch: the merge requests ahead count through their own
+pipelines, since a failed one leaves the train and the pipelines behind it
+restart without it.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
-group is checked as the very commit that lands, `e2e` and `web-e2e` included.
+group is checked as the very commit that lands, with the jobs its changes
+need, `e2e` and `web-e2e` included.
 To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 1. Enable **Require merge queue**. Keep its **status check timeout** above
@@ -761,7 +784,8 @@ only commits whose push run passed (see [Releasing](#releasing)).
 
 On GitLab, a merge train is the merge queue: enable **merged results
 pipelines** and **merge trains** under *Settings → Merge requests*. Merge
-train pipelines run `e2e` and `web-e2e` as well.
+train pipelines run `e2e` and `web-e2e` as well, when the change touches
+their groups.
 
 ## Changelog entries
 
