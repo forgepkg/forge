@@ -1009,6 +1009,31 @@ async fn cross_repository_mount_needs_read_on_the_source() {
         .await
         .unwrap();
     assert!(refs >= 2, "{refs}");
+
+    // An offline source serves nothing, mounts included.
+    let digest = admin.push_blob(&format!("{a}/src"), b"another layer").await;
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{a}"),
+        json!({"online": false}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let token = admin
+        .token(&[
+            format!("repository:{target}:pull,push"),
+            format!("repository:{a}/src:pull"),
+        ])
+        .await;
+    let resp = srv
+        .client()
+        .post(format!("{}/v2/{target}/blobs/uploads/", srv.base_url))
+        .query(&[("mount", digest.as_str()), ("from", &format!("{a}/src"))])
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202, "falls back to an upload");
 }
 
 #[tokio::test]
@@ -1153,6 +1178,8 @@ struct MockRegistry {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     down: AtomicBool,
     corrupt: AtomicBool,
+    /// Redirect authorized blob GETs to this base URL.
+    redirect_blobs: Mutex<Option<String>>,
     /// Answer every blob `HEAD` with 200, whether the blob exists or not.
     lie_on_head: AtomicBool,
     manifest_gets: AtomicUsize,
@@ -1267,6 +1294,14 @@ impl MockRegistry {
                 };
                 if head {
                     return StatusCode::OK.into_response();
+                }
+                if let Some(to) = self.redirect_blobs.lock().unwrap().clone() {
+                    let mut resp = StatusCode::TEMPORARY_REDIRECT.into_response();
+                    resp.headers_mut().insert(
+                        header::LOCATION,
+                        HeaderValue::from_str(&format!("{to}{path}")).unwrap(),
+                    );
+                    return resp;
                 }
                 self.blob_gets.fetch_add(1, Ordering::SeqCst);
                 if self.corrupt.load(Ordering::SeqCst) {
@@ -1435,6 +1470,64 @@ async fn proxies_cache_verify_and_serve_stale_tags() {
             .status(),
         404
     );
+}
+
+/// A host that challenges every request, naming its own token realm, and
+/// counts the token requests it gets.
+async fn challenging_host() -> (String, Arc<AtomicUsize>) {
+    let tokens = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (count, realm) = (tokens.clone(), format!("{base}/token"));
+    let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let (count, realm) = (count.clone(), realm.clone());
+        async move {
+            if req.uri().path() == "/token" {
+                count.fetch_add(1, Ordering::SeqCst);
+                return axum::Json(json!({"token": "foreign"})).into_response();
+            }
+            let mut resp = StatusCode::UNAUTHORIZED.into_response();
+            resp.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_str(&format!("Bearer realm=\"{realm}\",service=\"x\"")).unwrap(),
+            );
+            resp
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, tokens)
+}
+
+#[tokio::test]
+async fn a_challenge_from_a_redirect_hop_is_not_followed() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let layer = b"redirected layer".to_vec();
+    let manifest = image(&cfg, &[&layer]);
+    mock.put("library/base", "1", OCI_MANIFEST, &manifest);
+    mock.put_blob(&layer);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret"
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/base");
+    // The upstream's own token is cached for the image.
+    assert_eq!(oci.get(&name, "manifests/1").await.status(), 200);
+
+    // The upstream redirects the blob to a host that challenges in turn:
+    // the proxy's credentials never go to the realm that host names.
+    let (host, token_requests) = challenging_host().await;
+    *mock.redirect_blobs.lock().unwrap() = Some(host);
+    let resp = oci.get(&name, &format!("blobs/{}", sha(&layer))).await;
+    assert_ne!(resp.status(), 200);
+    assert_eq!(token_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -308,6 +308,12 @@ impl Upstream<'_> {
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
+        // Only the upstream itself names where its credentials go: a 401
+        // from a host it redirected to (a CDN, an object store) is answered
+        // as the failure it is, never followed to the realm it names.
+        if Origin::of(response.url().as_str()) != Origin::of(&self.base) {
+            return Ok(response);
+        }
         let challenge = response
             .headers()
             .get(WWW_AUTHENTICATE)

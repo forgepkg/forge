@@ -242,9 +242,14 @@ impl Registry {
         let Ok(Some(source)) = self.resolve(&ctx.site, from).await else {
             return Ok(false);
         };
-        if !matches!(source.repo.kind(), RepoKind::Hosted | RepoKind::Proxy)
-            || self.decide(&ctx.caller, &source, Action::Read).await != Decision::Allow
-        {
+        // What the source would serve: an offline hosted repository serves
+        // nothing (an offline proxy still serves its cache).
+        let serves = match source.repo.kind() {
+            RepoKind::Hosted => source.repo.online,
+            RepoKind::Proxy => true,
+            RepoKind::Group => false,
+        };
+        if !serves || self.decide(&ctx.caller, &source, Action::Read).await != Decision::Allow {
             return Ok(false);
         }
         let Some(link) =
