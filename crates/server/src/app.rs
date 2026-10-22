@@ -144,6 +144,10 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Trusted publishing: a CI job's OIDC token for a short-lived API key
         // (`POST /api/v2/token`, nuget.org's path and shape).
         .merge(crate::auth::token_exchange_router())
+        // Forge's own OIDC issuer (discovery + JWKS), public: what an IdP
+        // verifies the client assertions of a `federated_credential` realm
+        // against. 404 until forge has signing keys.
+        .merge(crate::auth::issuer_router())
         // The Docker / OCI registry: clients always talk to `/v2/` at the
         // host root; the registry resolves repositories from the name (or
         // the host) itself.

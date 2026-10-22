@@ -62,6 +62,9 @@ config:
   #   issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
   #   client_id: 00000000-0000-0000-0000-000000000000
   #   redirect_url: https://forge.example.com/auth/oidc/callback
+  #   # no FORGE_OIDC__CLIENT_SECRET: an Entra federated credential instead
+  #   # (Forge's /.well-known/* must be reachable by Entra)
+  #   client_authentication: federated_credential
 
 # RUST_LOG (tracing filter), e.g. "info,forge::audit=info,sqlx=warn".
 logLevel: info
