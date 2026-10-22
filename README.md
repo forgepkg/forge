@@ -184,6 +184,9 @@ docker pull localhost:8421/docker-hosted/team/alpine:3.20
 - **[Format plugins](./docs/format-plugins.md)** — further package formats
   (Helm charts), built in or as sandboxed WebAssembly components: design,
   operation, and writing one.
+- **[Importing from Nexus](./docs/nexus-import.md)** — copy a Nexus hosted
+  repository (NuGet, Helm, Docker) into Forge, with its publish dates:
+  dry run, conflicts, resuming, and the cutover.
 
 Run `cargo xtask help` for the complete command list.
 

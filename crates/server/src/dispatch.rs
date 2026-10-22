@@ -117,23 +117,46 @@ impl HostedWriteAdapter {
         package_filter: PackageFilter,
         replace_filter: PackageFilter,
     ) -> Self {
-        let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
-            filter: package_filter.clone(),
-            replace_filter,
+        let inner = hosted_write(
+            state,
+            format,
             repository_id,
             repository_name,
-        });
-        let inner = HostedWrite::new(
-            state.pool.clone(),
-            format,
-            state.cas.clone(),
-            state.cache_invalidator(),
-            state.config.outbox.grace(),
-        )
-        .with_publish_policy(principal, policy)
-        .with_mutation_filter(package_filter);
+            principal,
+            package_filter,
+            replace_filter,
+        );
         HostedWriteAdapter { inner }
     }
+}
+
+/// The hosted write path of `principal` in a repository: publishes limited
+/// to `package_filter`, replacing a version to `replace_filter`, and the
+/// trusted-publishing ledger of a workload.
+pub(crate) fn hosted_write(
+    state: &AppState,
+    format: Arc<dyn Format>,
+    repository_id: i64,
+    repository_name: String,
+    principal: Principal,
+    package_filter: PackageFilter,
+    replace_filter: PackageFilter,
+) -> HostedWrite {
+    let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
+        filter: package_filter.clone(),
+        replace_filter,
+        repository_id,
+        repository_name,
+    });
+    HostedWrite::new(
+        state.pool.clone(),
+        format,
+        state.cas.clone(),
+        state.cache_invalidator(),
+        state.config.outbox.grace(),
+    )
+    .with_publish_policy(principal, policy)
+    .with_mutation_filter(package_filter)
 }
 
 /// The trusted-publishing ledger policy of a registry push to `repository`:
