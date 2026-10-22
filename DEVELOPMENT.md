@@ -651,6 +651,9 @@ Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 
 Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
 
+Changelog: `changelog <milestone>` (fold a milestone's fragments into
+`CHANGELOG.md`) · `changelog --check` (see [Changelog entries](#changelog-entries)).
+
 Release: `release <version> [--no-tag]` (see [Releasing](#releasing)).
 
 ## Single-container Docker image
@@ -749,6 +752,28 @@ On GitLab, a merge train is the merge queue: enable **merged results
 pipelines** and **merge trains** under *Settings → Merge requests*. Merge
 train pipelines run `e2e` and `web-e2e` as well.
 
+## Changelog entries
+
+A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its
+own, `docs/changes/<milestone>/<issue>.<kind>.md`, for example
+`docs/changes/1.2.0/205.fixed.md`. Here `<milestone>` is the issue's GitHub
+milestone and `<kind>` the section (`upgrade`, `feature`, `fixed`,
+`security`, `docs`, `limitation`). The file holds the entry's text; the
+release adds the `- ` and the issue's link. Pull requests merged side by side
+therefore never conflict over the changelog, and an entry never lands under a
+release it is not part of. [docs/changes/README.md](docs/changes/README.md)
+describes the format.
+
+`cargo xtask release <version>` folds `docs/changes/<version>/` into the
+changelog (see [Releasing](#releasing)). To edit the notes before that, for
+example to write the release's introduction, `cargo xtask changelog
+<milestone>` folds the milestone's fragments into `[Unreleased]` and deletes
+them; commit that in a pull request of its own. CI's `fmt` job runs `cargo
+xtask changelog --check`. It refuses a file under `docs/changes` that is not a
+fragment, and a fragment whose milestone is released already. When a pull
+request written before a release merges after it, move its fragment to the
+next milestone.
+
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
@@ -760,8 +785,9 @@ image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
 Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
 `version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
-unless the `[Unreleased]` section of `CHANGELOG.md` is empty (entries left
-there would be missing from the release notes).
+unless the `[Unreleased]` section of `CHANGELOG.md` is empty and
+`docs/changes/` holds no changelog fragments (entries left there would be
+missing from the release notes).
 
 `main` only accepts commits whose required checks passed, so the release
 commit goes through a pull request and the tag goes on the merge commit; a
@@ -806,14 +832,18 @@ git push origin v1.0.1
 ```
 
 The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
---workspace`), `web/package.json`, the Kubernetes base and the Helm chart,
-renames `## [Unreleased]` in `CHANGELOG.md` to `## [1.0.1]` under a new, empty
-`[Unreleased]`, updates the links at its bottom, and commits
-`release: v1.0.1`. A `## [1.0.1]` section drafted ahead of time is kept as it
-is, but only while `[Unreleased]` is empty; with entries in both, the release
-is refused. It also refuses a changelog with a version section whose tag does
-not exist (a section drafted for a release that then got another number):
-fold its entries into `[Unreleased]` first.
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart. It
+folds the changelog fragments of `docs/changes/1.0.1/` into `## [Unreleased]`
+in `CHANGELOG.md` and deletes them (see [Changelog entries](#changelog-entries)).
+It renames that section to `## [1.0.1]` under a new, empty `[Unreleased]`,
+updates the links at its bottom, and commits `release: v1.0.1`. A `## [1.0.1]`
+section drafted ahead of time is kept as it is, but only while `[Unreleased]`
+and the fragments are empty; with entries in both, the release is refused. It
+also refuses a changelog with a version section whose tag does not exist (a
+section drafted for a release that then got another number): fold its
+entries into `[Unreleased]` first. Fragments under another milestone are
+refused too, because their changes are on `main` and ship in this release:
+move them to `docs/changes/1.0.1/`.
 
 **A failed release run** can simply be re-run. It never builds a version
 twice: a new build would have another digest, and pushing it would move the
