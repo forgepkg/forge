@@ -35,7 +35,20 @@ impl Registry {
         let mut account = None;
         for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
-                "scope" => scopes.extend(token::parse_scopes(&value)),
+                "scope" => {
+                    for scope in token::parse_scopes(&value) {
+                        if !token::add_scope(&mut scopes, scope) {
+                            return Err(OciError::new(
+                                StatusCode::BAD_REQUEST,
+                                Code::Unsupported,
+                                format!(
+                                    "a token request may name at most {} repositories",
+                                    token::MAX_SCOPES
+                                ),
+                            ));
+                        }
+                    }
+                }
                 "account" => account = Some(value.into_owned()),
                 _ => {}
             }

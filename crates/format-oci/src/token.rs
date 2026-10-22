@@ -274,8 +274,19 @@ pub struct Scope {
     pub actions: Vec<String>,
 }
 
+/// Most distinct repositories one token request may name. Docker,
+/// containerd and Helm ask for one to three (a push that mounts layers from
+/// other repositories names those too). Each one costs a repository lookup
+/// and authorization checks, and `/v2/token` answers anonymous callers, so
+/// the bound keeps one request from running thousands of them.
+pub const MAX_SCOPES: usize = 32;
+
+/// The actions a scope can be granted; [`parse_scopes`] drops any other.
+const ACTIONS: &[&str] = &["pull", "push", "delete", "*"];
+
 /// Parse a `scope` query value. Docker sends one per resource; several
-/// space-separated scopes in one value are accepted too.
+/// space-separated scopes in one value are accepted too. Actions are the
+/// grantable ones ([`ACTIONS`]), each once.
 pub fn parse_scopes(value: &str) -> Vec<Scope> {
     value
         .split(' ')
@@ -287,16 +298,37 @@ pub fn parse_scopes(value: &str) -> Vec<Scope> {
             if kind != "repository" || name.is_empty() {
                 return None;
             }
+            let mut wanted = Vec::new();
+            for action in actions.split(',') {
+                if ACTIONS.contains(&action) && !wanted.iter().any(|a| a == action) {
+                    wanted.push(action.to_string());
+                }
+            }
             Some(Scope {
                 name: name.to_string(),
-                actions: actions
-                    .split(',')
-                    .filter(|a| !a.is_empty())
-                    .map(str::to_string)
-                    .collect(),
+                actions: wanted,
             })
         })
         .collect()
+}
+
+/// Add `scope` to `scopes`, merging its actions into an earlier scope of the
+/// same repository. Returns `false`, adding nothing, when that would name
+/// more than [`MAX_SCOPES`] repositories.
+pub fn add_scope(scopes: &mut Vec<Scope>, scope: Scope) -> bool {
+    if let Some(earlier) = scopes.iter_mut().find(|s| s.name == scope.name) {
+        for action in scope.actions {
+            if !earlier.actions.contains(&action) {
+                earlier.actions.push(action);
+            }
+        }
+        return true;
+    }
+    if scopes.len() >= MAX_SCOPES {
+        return false;
+    }
+    scopes.push(scope);
+    true
 }
 
 #[cfg(test)]
@@ -405,6 +437,36 @@ mod tests {
         );
         assert!(parse_scopes("registry:catalog:*").is_empty());
         assert!(parse_scopes("nonsense").is_empty());
+        assert_eq!(
+            parse_scopes("repository:a/b:pull,bogus,pull,,push,pull")[0].actions,
+            vec!["pull", "push"],
+            "grantable actions, each once"
+        );
+    }
+
+    #[test]
+    fn scopes_are_merged_per_repository_and_bounded() {
+        let scope = |name: &str, actions: &[&str]| Scope {
+            name: name.into(),
+            actions: actions.iter().map(|a| a.to_string()).collect(),
+        };
+        let mut scopes = Vec::new();
+        assert!(add_scope(&mut scopes, scope("a/x", &["pull"])));
+        assert!(add_scope(&mut scopes, scope("a/y", &["pull"])));
+        assert!(add_scope(&mut scopes, scope("a/x", &["push", "pull"])));
+        assert_eq!(
+            scopes,
+            vec![scope("a/x", &["pull", "push"]), scope("a/y", &["pull"])]
+        );
+
+        for n in scopes.len()..MAX_SCOPES {
+            assert!(add_scope(&mut scopes, scope(&format!("a/{n}"), &["pull"])));
+        }
+        assert!(!add_scope(&mut scopes, scope("a/one-too-many", &["pull"])));
+        assert_eq!(scopes.len(), MAX_SCOPES);
+        // A repository already named still merges.
+        assert!(add_scope(&mut scopes, scope("a/y", &["delete"])));
+        assert_eq!(scopes[1].actions, vec!["pull", "delete"]);
     }
 
     #[test]

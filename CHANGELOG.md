@@ -299,7 +299,9 @@ otherwise.
   ([#133](https://github.com/schmitch/forge/issues/133)).
 - Docker registry tokens are HS256 JWTs bound to `public_base_url`, live
   for `docker.token_ttl_seconds` (5 minutes), grant only the scopes the
-  caller held when they were issued, and are accepted under `/v2` only.
+  caller held when they were issued, and are accepted under `/v2` only. A
+  token request names at most 32 repositories
+  ([#200](https://github.com/schmitch/forge/issues/200)).
   Every registry request is authorized again against current permissions
   and content selectors, the user and API token behind a token must still
   be active, and a browser session never pushes or deletes. The token
