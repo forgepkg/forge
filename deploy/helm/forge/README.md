@@ -262,10 +262,15 @@ Each one only accepts connections from this release's Forge pods (a
 NetworkPolicy), and every value is listed in
 `charts/<name>/values.yaml`; set them under the dependency's key.
 
-Their images are pinned by digest: `image.tag` is `<tag>@sha256:…` (the
-multi-arch index), which Dependabot bumps together with the tag. A digest in
-`image.digest` replaces the pinned one; a plain `image.tag` such as `"16"`
-pulls by tag.
+Their images come from ghcr.io, like Forge's: `ghcr.io/schmitch/forge/<name>`
+holds byte-for-byte copies of the Docker Hub images (`library/postgres`,
+`valkey/valkey`, `versity/versitygw`) under the same digests, so a cluster
+needs no access to Docker Hub. To pull the originals instead, set
+`image.registry: docker.io` and `image.repository` to the Docker Hub name;
+the pinned digest stays valid. They are pinned by digest: `image.tag` is
+`<tag>@sha256:…` (the multi-arch index), which Dependabot bumps together with
+the tag. A digest in `image.digest` replaces the pinned one; a plain
+`image.tag` such as `"16"` pulls by tag.
 
 Passwords are generated on install and kept across upgrades by looking up the
 existing Secret; the PostgreSQL and S3 Secrets also survive `helm uninstall`
