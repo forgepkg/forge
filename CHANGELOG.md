@@ -10,6 +10,8 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+## [1.1.0]
+
 The Docker / OCI registry, format plugins (Helm built in, NuGet ported to
 one), the trusted-publishing token exchange, short-lived S3 credentials and a
 local blob cache, and the fixes for the findings of the 1.0.0 release review.
@@ -682,5 +684,6 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/forge/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/schmitch/forge/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/schmitch/forge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/schmitch/forge/releases/tag/v1.0.0
