@@ -286,6 +286,12 @@ otherwise.
   answered 500; it answers 503 with `Retry-After`, like the token and
   password checks, which now send `Retry-After` too.
   ([#205](https://github.com/schmitch/forge/issues/205))
+- Trusted publishing: a workload token answered 401 "invalid credentials"
+  while its issuer's discovery document or keys could not be fetched and
+  were not cached yet (after a restart, on a new replica, at the hourly key
+  refresh), so CI jobs failed instead of retrying. It answers 503 with
+  `Retry-After`, at the token exchange too.
+  ([#202](https://github.com/schmitch/forge/issues/202))
 - The browse API served offline hosted and group repositories; it answers
   503 like the feed, and the web UI says the repository is offline.
   ([#120](https://github.com/schmitch/forge/issues/120))
