@@ -207,6 +207,10 @@ async fn rotate_locked(
                 Ok(n) => resealed += n,
                 Err(e) => return crypto_error(e),
             }
+            match secret_dao::reseal_import_passwords(&state.pool, envelope).await {
+                Ok(n) => resealed += n,
+                Err(e) => return crypto_error(e),
+            }
             let revoked = match secret_dao::revoke_unreferenced_deks(&state.pool, envelope).await {
                 Ok(n) => n,
                 Err(e) => return crypto_error(e),

@@ -515,11 +515,22 @@
       }
     },
     "extraObjects": {
-      "type": "array",
+      "type": [
+        "array",
+        "object",
+        "null"
+      ],
       "items": {
         "type": [
           "object",
           "string"
+        ]
+      },
+      "additionalProperties": {
+        "type": [
+          "object",
+          "string",
+          "null"
         ]
       }
     },

@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, password_enc AS \"password_enc!\" FROM nexus_import WHERE password_enc IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "password_enc!",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "password_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "6deebbc753318b4d9542a4bdc25bb39500dc50f8d5e769bafd70ab13f73f60d4"
+}
