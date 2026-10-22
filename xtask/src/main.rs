@@ -5,6 +5,7 @@
 //! Every subcommand shells out to docker / cargo / pnpm / sqlx and streams their
 //! output; a non-zero child exit makes `xtask` exit non-zero too.
 
+mod changelog;
 mod proc;
 mod release;
 
@@ -82,6 +83,7 @@ fn main() -> ExitCode {
         "docker-build" => docker_build(),
         "docker-run" => docker_run(),
         // Release
+        "changelog" => changelog::changelog(rest),
         "release" => release::release(rest),
         other => {
             eprintln!("xtask: unknown command `{other}`\n");
@@ -158,17 +160,29 @@ Docker image (single container: web SPA + Rust server):
   docker-run    Run the built image against the dev Postgres + versitygw
                 (docker-compose.yml + docker-compose.app.yml), API + SPA on :8421.
 
+Changelog (a fragment per change, docs/changes/<milestone>/<ref>.<kind>.md;
+see docs/changes/README.md):
+  changelog <milestone>
+                Fold the milestone's fragments into CHANGELOG.md's [Unreleased]
+                and delete them, to edit the notes in a pull request before the
+                release.
+  changelog --check
+                Check that every file under docs/changes is a fragment and that
+                no fragment's milestone is released already (CI).
+
 Release:
   release <version> [--no-tag]
                 Set <version> in Cargo.toml/Cargo.lock, web/package.json, the
-                Kubernetes base's image tag and the Helm chart, turn CHANGELOG.md's
-                [Unreleased] into its section and commit on release-<version>
-                (HEAD must be origin/main). Then, with `gh`: open a pull request,
-                wait for its CI run, merge it, wait for the merge commit's CI run
-                on main, tag the merge commit v<version> and push the tag. When
-                main already carries <version>, tags main's head once its CI passed.
-                Refuses a changelog with an untagged version section, or with
-                entries under [Unreleased] next to a drafted <version> section.
+                Kubernetes base's image tag and the Helm chart, fold the fragments
+                of docs/changes/<version>/ into CHANGELOG.md's [Unreleased] and
+                delete them, turn [Unreleased] into its section and commit on
+                release-<version> (HEAD must be origin/main). Then, with `gh`:
+                open a pull request, wait for its CI run, merge it, wait for the
+                merge commit's CI run on main, tag the merge commit v<version> and
+                push the tag. When main already carries <version>, tags main's
+                head once its CI passed. Refuses a changelog with an untagged
+                version section, entries under [Unreleased] or fragments next to
+                a drafted <version> section, and fragments of another milestone.
                 --no-tag: only commit, on the current branch; never pushes.
 
   help          Show this help.

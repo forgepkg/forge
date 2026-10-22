@@ -1,4 +1,4 @@
-# Notes for Claude
+# Notes for agents
 
 [DEVELOPMENT.md](DEVELOPMENT.md) describes the build, the tests and the
 release process; this file holds what an agent working in the repository
@@ -33,6 +33,24 @@ sudo dockerd &
 The `Dockerfile` and `deploy/` keep the canonical Docker Hub names, for
 Dependabot and for deployments; CI's BuildKit and GitLab's Docker daemon pull
 them through the mirror as their `docker.io` registry mirror.
+
+## Changelog: a fragment per change, never CHANGELOG.md
+
+A change never edits `CHANGELOG.md`. Its entry goes in a new file,
+`docs/changes/<milestone>/<issue>.<kind>.md` (for example
+`docs/changes/1.2.0/205.fixed.md`):
+
+- `<milestone>` is the issue's GitHub milestone, or the next release's when
+  the issue has none.
+- `<kind>` is one of `upgrade`, `feature`, `fixed`, `security`, `docs` or
+  `limitation`.
+- The file holds the entry's text alone. `cargo xtask release` adds the `- `
+  and the issue's link when it folds the fragments into the changelog.
+
+[docs/changes/README.md](docs/changes/README.md) has the format. `cargo xtask
+changelog --check` checks it in CI, and refuses a milestone that is released
+already. When a release went out before the pull request merged, move the
+fragment to the next milestone.
 
 ## Pull requests: one per issue, stacked
 

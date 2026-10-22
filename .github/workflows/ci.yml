@@ -62,7 +62,10 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
-  # ── Formatting ─────────────────────────────────────────────────────────────
+  # ── Formatting, and the changelog fragments ────────────────────────────────
+  # The fragment check builds only xtask, which has no dependencies. On a
+  # pull request it sees the merge with the base, so a fragment under a
+  # milestone that was released after the pull request was written fails.
   # No job waits for this one (`needs: [fmt]`): a job behind `needs` joins
   # the runner queue only once fmt is done, so when the runners are busy the
   # long jobs would queue twice (#337).
@@ -77,6 +80,8 @@ jobs:
           components: rustfmt
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
+      - name: Changelog fragments (docs/changes)
+        run: cargo xtask changelog --check
 
   # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
   # Both are check builds; the drift guard runs here rather than in `test`,
