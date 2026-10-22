@@ -88,6 +88,8 @@ interface ApiHandlers {
   onPatch?: (id: number, body: unknown) => Response
   onDelete?: (id: number) => Response
   onReorder?: (body: unknown) => Response
+  capturedPasswords?: () => { accounts: number; captured: number }
+  onConvert?: (id: number) => Response
 }
 
 /** Route the mock by method + pathname against the realms admin API. */
@@ -105,6 +107,20 @@ function mockApi(h: ApiHandlers) {
       if (path.endsWith('/admin/realms/order') && method === 'PUT') {
         return Promise.resolve(
           h.onReorder ? h.onReorder(body()) : json(h.realms ?? []),
+        )
+      }
+
+      const keptMatch = path.match(/\/admin\/realms\/(\d+)\/captured-passwords$/)
+      if (keptMatch && method === 'GET') {
+        return Promise.resolve(
+          json(h.capturedPasswords?.() ?? { accounts: 0, captured: 0 }),
+        )
+      }
+      const convertMatch = path.match(/\/admin\/realms\/(\d+)\/convert-to-local$/)
+      if (convertMatch && method === 'POST') {
+        const id = Number(convertMatch[1])
+        return Promise.resolve(
+          h.onConvert ? h.onConvert(id) : json({ converted: 0, remaining: 0 }),
         )
       }
 
@@ -744,6 +760,87 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
         button_label: 'Corp SSO',
       },
     })
+  })
+
+  const nexus = realm({
+    id: 3,
+    kind: 'credential_forwarding',
+    name: 'nexus',
+    priority: 2,
+    config: {
+      url: 'https://nexus.example.com/status',
+      key_pepper_set: true,
+      auto_provision: true,
+      capture_password_hash: true,
+    },
+  })
+
+  it('stops forwarding only while hashes are kept', async () => {
+    let patched: { config?: Record<string, unknown> } | null = null
+    mockApi({
+      realms: [nexus],
+      onPatch: (_id, body) => {
+        patched = body as typeof patched
+        return json(nexus)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/3')
+
+    const keep = await screen.findByRole('checkbox', {
+      name: 'Keep a password hash of successful logins',
+    })
+    const only = screen.getByRole('checkbox', {
+      name: 'Stop forwarding: sign in with kept passwords only',
+    })
+    expect(keep).toBeChecked()
+    await u.click(only)
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched!.config).toMatchObject({
+      capture_password_hash: true,
+      captured_password_only: true,
+    })
+
+    // Without kept hashes there is nothing to sign in with.
+    await u.click(keep)
+    expect(only).not.toBeChecked()
+    expect(only).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it('switches the accounts with a kept password to local ones after confirming', async () => {
+    let counts = { accounts: 3, captured: 2 }
+    let converted: number | null = null
+    mockApi({
+      realms: [nexus],
+      capturedPasswords: () => counts,
+      onConvert: (id) => {
+        converted = id
+        counts = { accounts: 1, captured: 0 }
+        return json({ converted: 2, remaining: 1 })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/3')
+
+    expect(
+      await screen.findByText(/2 of 3 accounts keep a password hash/),
+    ).toBeInTheDocument()
+    await u.click(
+      screen.getByRole('button', { name: 'Switch accounts to local passwords…' }),
+    )
+    expect(converted).toBeNull()
+    await u.click(screen.getByRole('button', { name: 'Switch 2 to local passwords' }))
+
+    await waitFor(() => expect(converted).toBe(3))
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Switched 2 to local passwords; 1 left on this realm.',
+    )
+    expect(
+      await screen.findByText(/0 of 1 account keeps a password hash/),
+    ).toBeInTheDocument()
   })
 
   it('requires a new client secret after the issuer changes', async () => {

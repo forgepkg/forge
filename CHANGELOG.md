@@ -24,6 +24,56 @@ The release workflow publishes the section whose heading matches the tag
   admin API), then remove the setting. A package repository without a limit
   of its own accepts pushes of 512 MiB.
   ([#259](https://github.com/schmitch/forge/issues/259))
+- Migration 0036 adds the `nexus_import` and `nexus_import_item` tables for
+  imports from Nexus; it changes no existing data.
+  ([#183](https://github.com/schmitch/forge/issues/183))
+
+### Features
+
+- Credential forwarding: a realm can keep an argon2id hash of every password
+  its upstream (e.g. a Nexus) accepts (**Keep a password hash of successful
+  logins**, `capture_password_hash`, off by default; unchecking it deletes the
+  hashes). Once the hashes are in place the realm can stop asking the upstream
+  and sign its users in with them (`captured_password_only`), and its accounts
+  can be switched to local accounts with the same password, one by one or all
+  at once (`POST /admin/users/{id}/convert-to-local`,
+  `POST /admin/realms/{id}/convert-to-local`), so the upstream can be retired
+  without asking every user for a new password.
+- **OIDC login without a client secret**: an `oidc` realm can authenticate
+  at Microsoft Entra with a federated identity credential instead
+  (`client_authentication = "federated_credential"`). Forge signs a
+  short-lived client assertion itself, as an OpenID Connect issuer of its
+  own (`server.public_base_url`), publishing
+  `/.well-known/openid-configuration` and its keys at
+  `/.well-known/jwks.json`. The keys are RSA-2048, shared by every instance
+  through the database (sealed with `[crypto]`), and rotated every 30 days,
+  each new key published two days before it signs. The realm shows the
+  issuer, subject (`<client id>@<realm issuer>`) and audience to register.
+  See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
+  ([#302](https://github.com/schmitch/forge/pull/302))
+- Helm: `extraObjects` can also be a map, whose keys only name its entries.
+  Helm merges a map across values files, so each file can add its own
+  objects, and a later one replaces an entry by its key or drops it with
+  `null`; a list in a later file replaces the whole list. Lists keep
+  working.
+  ([#288](https://github.com/schmitch/forge/pull/288))
+- **Import from Nexus**: copy a Nexus 3 hosted repository into a Forge hosted
+  repository of the same format, one repository at a time: NuGet packages,
+  Helm charts, and Docker images with their digests, multi-platform
+  indexes, signatures and SBOMs. In the web UI (a hosted repository's
+  **Import from Nexus**) or the admin API
+  (`/admin/repositories/{name}/imports`). The source is checked before an
+  import starts; a dry run reports the counts, the size and the conflicts
+  without writing. Packages are verified against Nexus' checksums and
+  written through the normal push path, keep their publish dates, last
+  downloads and uploaders, and are audited as imports. A version Forge has
+  with other bytes is skipped and reported, overwritten, or fails the
+  import, as chosen. An import resumes after a restart, a failure or a
+  cancel, failed items can be retried on their own, and running it again
+  copies only what is new. The Nexus password is sealed with the secret
+  encryption and deleted when the import completes. See
+  [docs/nexus-import.md](docs/nexus-import.md).
+  ([#183](https://github.com/schmitch/forge/issues/183))
 
 ### Fixed
 
@@ -76,6 +126,10 @@ The release workflow publishes the section whose heading matches the tag
   finish of a chunked upload answered 500 instead of 503 with
   `Retry-After`, and an upload whose body the client aborted answered 500
   instead of 400. ([#209](https://github.com/schmitch/forge/issues/209))
+- Blob cache: a docker blob pushed in several chunks was cached about twice:
+  every chunk was written through to the cache next to the assembled blob,
+  and evicted as much content that is downloaded. Only the blob is cached.
+  ([#213](https://github.com/schmitch/forge/issues/213))
 
 ## [1.1.0]
 

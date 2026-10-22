@@ -31,11 +31,18 @@
 //! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
 //! Secrets kept in `forge_setting` ([`SECRET_SETTINGS`]: the generated
-//! registry-token key) are text values, `sealed:<base64 envelope>` with the
+//! registry-token key, the OIDC issuer keys) are text values, `sealed:<base64 envelope>` with the
 //! envelope service and `plain:<secret>` without it, AAD-bound to
 //! `('forge_setting', 'value', 0)` plus the setting's key. They take part in
 //! the backfill, the re-encrypt sweep and the DEK reference scan like the
 //! secret columns ([`store_secret_setting`], [`open_secret_setting`]).
+//!
+//! An import from Nexus keeps the Nexus password in
+//! `nexus_import.password_enc` until it completes, AAD-bound to
+//! `('nexus_import', 'password_enc', <row id>)` plus the origins it is sent
+//! to ([`import_destination`]); without an envelope service it is kept in the
+//! plaintext `password` column, which the backfill seals once encryption is
+//! enabled ([`set_import_password`], [`get_import_password`]).
 //!
 //! ## DEK revocation vs. concurrent writers
 //!
@@ -138,6 +145,12 @@ pub enum SecretDbError {
     /// fail closed (and never overwrite it with a plaintext value).
     #[error("setting {0} is sealed but secret encryption is not configured")]
     SettingSealedWithoutEnvelope(String),
+    /// An import's password is sealed but no envelope service is configured.
+    #[error("the password of import {0} is sealed but secret encryption is not configured")]
+    ImportSealedWithoutEnvelope(i64),
+    /// The referenced import row does not exist.
+    #[error("import {0} not found")]
+    ImportNotFound(i64),
 }
 
 /// Store (or clear) a repository's upstream password, **encrypted** under the
@@ -612,8 +625,8 @@ pub async fn reseal_upstream_passwords_batch(
 
 /// Every DEK version still referenced by stored ciphertext, across all
 /// encrypted columns (`repository.upstream_password_enc`,
-/// `auth_realm.secrets_enc`, the sealed [`SECRET_SETTINGS`]; future secret
-/// columns add their scan here). Used
+/// `auth_realm.secrets_enc`, `nexus_import.password_enc`, the sealed
+/// [`SECRET_SETTINGS`]; future secret columns add their scan here). Used
 /// by the sweep to decide which `retiring` DEKs are safe to revoke.
 pub async fn referenced_dek_versions(
     pool: &PgPool,
@@ -675,6 +688,21 @@ async fn scan_referenced_dek_versions(
             }
         }
     }
+    let import_blobs = sqlx::query!(
+        r#"SELECT id, password_enc AS "password_enc!" FROM nexus_import WHERE password_enc IS NOT NULL"#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in &import_blobs {
+        match EnvelopeService::blob_dek_version(&row.password_enc) {
+            Ok(version) => {
+                versions.insert(version);
+            }
+            Err(e) => {
+                tracing::warn!(import_id = row.id, error = %e, "unreadable import password envelope; skipped");
+            }
+        }
+    }
     for (key, value) in sealed_settings(&mut *conn).await? {
         match sealed_setting_blob(&key, &value)
             .and_then(|blob| Ok(EnvelopeService::blob_dek_version(&blob)?))
@@ -691,7 +719,8 @@ async fn scan_referenced_dek_versions(
 }
 
 /// Whether any repository row still carries a plaintext upstream password —
-/// not yet backfilled, or a leftover copy next to its envelope (operator
+/// not yet backfilled, or a leftover copy next to its envelope — or any
+/// import a plaintext Nexus password (operator
 /// visibility: with encryption enabled this must reach `false` once the
 /// backfill pass has run).
 pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
@@ -699,6 +728,8 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
         r#"
         SELECT EXISTS (
             SELECT 1 FROM repository WHERE upstream_password IS NOT NULL
+        ) OR EXISTS (
+            SELECT 1 FROM nexus_import WHERE password IS NOT NULL
         ) AS "pending!"
         "#,
     )
@@ -707,8 +738,9 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
     Ok(row.pending)
 }
 
-/// Whether any secret is stored sealed (an upstream password, realm secrets
-/// or a [`SECRET_SETTINGS`] value): such a database needs the envelope
+/// Whether any secret is stored sealed (an upstream password, realm secrets,
+/// an import's Nexus password or a [`SECRET_SETTINGS`] value): such a
+/// database needs the envelope
 /// service to be usable.
 pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError> {
     let row = sqlx::query!(
@@ -717,6 +749,8 @@ pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError
             SELECT 1 FROM repository WHERE upstream_password_enc IS NOT NULL
         ) OR EXISTS (
             SELECT 1 FROM auth_realm WHERE secrets_enc IS NOT NULL
+        ) OR EXISTS (
+            SELECT 1 FROM nexus_import WHERE password_enc IS NOT NULL
         ) AS "present!"
         "#,
     )
@@ -1141,8 +1175,12 @@ pub async fn reseal_realm_secrets(
 /// `forge_setting` key of the generated registry-token signing key.
 pub const REGISTRY_TOKEN_KEY_SETTING: &str = "docker_token_key";
 
+/// `forge_setting` key of the private keys forge signs its own OIDC client
+/// assertions with.
+pub const OIDC_ISSUER_KEYS_SETTING: &str = "oidc_issuer_keys";
+
 /// The `forge_setting` keys whose values are secrets (module docs).
-pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING];
+pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING, OIDC_ISSUER_KEYS_SETTING];
 
 /// Prefix of a sealed secret setting: `sealed:<base64 envelope>`.
 const SEALED_SETTING: &str = "sealed:";
@@ -1361,6 +1399,198 @@ pub async fn reseal_secret_settings(
             Err(SecretDbError::Crypto(CryptoError::KeyRevoked { .. })) => {}
             Err(e) => return Err(e),
         }
+    }
+    Ok(resealed)
+}
+
+// ── Nexus import passwords ───────────────────────────────────────────────────
+
+/// Owning table of an import's sealed Nexus password (AAD component).
+pub const IMPORT_PASSWORD_TABLE: &str = "nexus_import";
+/// Owning column of an import's sealed Nexus password (AAD component).
+pub const IMPORT_PASSWORD_COLUMN: &str = "password_enc";
+
+/// Where an import's Nexus password may be sent: the origin of its
+/// `base_url` and, when it is elsewhere, of its Docker `registry_url`.
+pub fn import_destination(base_url: &str, registry_url: Option<&str>) -> String {
+    let base = upstream_destination(Some(base_url));
+    match registry_url.map(|url| upstream_destination(Some(url))) {
+        Some(registry) if registry != base => format!("{base} {registry}"),
+        _ => base,
+    }
+}
+
+/// The AAD binding of `nexus_import.password_enc` of one row.
+fn import_binding(import_id: i64, destination: &str) -> AeadBinding<'_> {
+    AeadBinding {
+        table: IMPORT_PASSWORD_TABLE,
+        column: IMPORT_PASSWORD_COLUMN,
+        row_pk: import_id,
+        destination: Some(destination),
+    }
+}
+
+/// Store an import's Nexus password: sealed with `envelope` (bound to the
+/// row and to [`import_destination`]), or in the plaintext column without
+/// one. Runs on the connection of the transaction that created the import.
+pub async fn set_import_password(
+    conn: &mut sqlx::PgConnection,
+    envelope: Option<&EnvelopeService>,
+    import_id: i64,
+    secret: &PlaintextSecret,
+) -> Result<(), SecretDbError> {
+    let row = sqlx::query!(
+        r#"SELECT base_url, registry_url FROM nexus_import WHERE id = $1 FOR UPDATE"#,
+        import_id,
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(SecretDbError::ImportNotFound(import_id))?;
+    let Some(envelope) = envelope else {
+        sqlx::query!(
+            r#"UPDATE nexus_import SET password = $2, password_enc = NULL WHERE id = $1"#,
+            import_id,
+            secret.expose_secret(),
+        )
+        .execute(&mut *conn)
+        .await?;
+        return Ok(());
+    };
+    let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+    let blob = envelope
+        .seal(secret, import_binding(import_id, &destination))
+        .await?;
+    lock_sealing_dek(conn, envelope, &blob).await?;
+    sqlx::query!(
+        r#"UPDATE nexus_import SET password_enc = $2, password = NULL WHERE id = $1"#,
+        import_id,
+        &blob,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// An import's Nexus password, `None` when it has none (an anonymous
+/// source, or the import completed). A sealed password without an envelope
+/// service fails closed.
+pub async fn get_import_password(
+    pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
+    import_id: i64,
+) -> Result<Option<PlaintextSecret>, SecretDbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT base_url, registry_url, password, password_enc
+        FROM nexus_import WHERE id = $1
+        "#,
+        import_id,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(SecretDbError::ImportNotFound(import_id))?;
+    match (row.password_enc, row.password) {
+        (Some(blob), _) => {
+            let envelope = envelope.ok_or(SecretDbError::ImportSealedWithoutEnvelope(import_id))?;
+            let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+            let (secret, _) =
+                open_bound(envelope, &blob, import_binding(import_id, &destination)).await?;
+            Ok(Some(secret))
+        }
+        (None, Some(plaintext)) => Ok(Some(PlaintextSecret::from(plaintext))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Seal the import passwords stored in plaintext (written before secret
+/// encryption was enabled). Returns how many were sealed.
+pub async fn backfill_import_passwords(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<usize, SecretDbError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, base_url, registry_url, password AS "password!"
+        FROM nexus_import WHERE password IS NOT NULL
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut done = 0;
+    for row in rows {
+        let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+        let secret = PlaintextSecret::from(row.password.clone());
+        let blob = envelope
+            .seal(&secret, import_binding(row.id, &destination))
+            .await?;
+        let res = sqlx::query!(
+            r#"
+            WITH dek AS (
+                SELECT 1 FROM encryption_key
+                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
+                FOR SHARE
+            )
+            UPDATE nexus_import SET password_enc = $2, password = NULL
+            WHERE id = $1 AND password = $3 AND EXISTS (SELECT 1 FROM dek)
+            "#,
+            row.id,
+            &blob,
+            row.password,
+            envelope.scope(),
+            EnvelopeService::blob_dek_version(&blob)?,
+        )
+        .execute(pool)
+        .await?;
+        done += usize::try_from(res.rows_affected()).unwrap_or(0);
+    }
+    Ok(done)
+}
+
+/// The DEK re-encrypt sweep over the sealed import passwords. Returns how
+/// many were re-sealed. A password that does not open is left as it is
+/// (logged).
+pub async fn reseal_import_passwords(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<usize, SecretDbError> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, base_url, registry_url, password_enc AS "password_enc!"
+        FROM nexus_import WHERE password_enc IS NOT NULL
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut resealed = 0;
+    for row in rows {
+        let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+        let bound = import_binding(row.id, &destination);
+        let Some(new_blob) = reseal_if_due(envelope, &row.password_enc, bound).await? else {
+            continue;
+        };
+        // Guarded on the old blob, so a racing sweep or a completed import
+        // (which deletes the password) is never overwritten.
+        let res = sqlx::query!(
+            r#"
+            WITH dek AS (
+                SELECT 1 FROM encryption_key
+                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
+                FOR SHARE
+            )
+            UPDATE nexus_import SET password_enc = $2
+            WHERE id = $1 AND password_enc = $3 AND EXISTS (SELECT 1 FROM dek)
+            "#,
+            row.id,
+            &new_blob,
+            &row.password_enc,
+            envelope.scope(),
+            EnvelopeService::blob_dek_version(&new_blob)?,
+        )
+        .execute(pool)
+        .await?;
+        resealed += usize::try_from(res.rows_affected()).unwrap_or(0);
     }
     Ok(resealed)
 }

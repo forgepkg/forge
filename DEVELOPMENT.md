@@ -311,7 +311,8 @@ them under **Admin → Authentication** (`/manage/realms`) or via the `/admin/re
 `PUT /admin/realms/order`); changes apply at runtime — no redeploy. Secrets in
 a realm config (`client_secret`, `key_pepper`) are write-only: responses carry
 `<key>_set` markers, and an update that omits/blanks a secret keeps the stored
-one.
+one. An `oidc` realm can do without a client secret, authenticating with a
+[federated credential](#without-a-client-secret-a-federated-credential).
 
 For trust-policy validation, direct-token replay/cache limits, and GitHub
 Actions/GitLab CI examples, see
@@ -361,6 +362,41 @@ at most 1 MiB of a success body for `groups_path` / `identity_path`. With the
 account is never forwarded: a wrong password, or any password for a
 deactivated local account, is refused locally.
 
+### Retiring the upstream: kept password hashes
+
+A `credential_forwarding` realm stores no password by default: its verdict
+cache keeps only a peppered HMAC that expires with the TTL. To be able to
+switch the upstream off later without asking every user for a new password,
+check **Keep a password hash of successful logins** on the realm
+(`"capture_password_hash": true`). Every login the upstream accepts then keeps
+an argon2id hash of that password on the user's account (migration 0035). It
+is refreshed whenever a login actually asks the upstream (once per
+`positive_ttl_secs` per credential), never on a cache hit and never for a
+rejected password, so it is the last password the upstream accepted. The hash
+is not a local password while the realm forwards: the upstream stays in
+charge, so a password changed or revoked upstream keeps or loses access as
+before. Unchecking the option deletes the realm's kept hashes; deleting the
+realm keeps them on its (then orphaned) accounts.
+
+Two ways to stop depending on the upstream once the hashes are in place
+(the realm page shows how many of its accounts keep one):
+
+- **Stop forwarding: sign in with kept passwords only**
+  (`"captured_password_only": true`, which requires `capture_password_hash`).
+  The realm no longer contacts the upstream; it checks the password against
+  the account's kept hash, through the same verdict cache. The accounts stay
+  the realm's (same roles, tokens and admin flags). An account without a kept
+  hash can no longer sign in through the realm.
+- **Switch accounts to local passwords**: `POST
+  /admin/realms/{id}/convert-to-local` (every account of the realm with a
+  kept hash) or `POST /admin/users/{id}/convert-to-local` (one account, an
+  orphan of a deleted realm too). The kept hash becomes the account's Forge
+  password and the account becomes a `local` one with the same id, roles and
+  tokens; the upstream is never asked about it again. The `local` realm must
+  be enabled, and come before every realm that still forwards, for these
+  users to sign in. `GET /admin/realms/{id}/captured-passwords` counts the
+  realm's accounts and those that keep a hash.
+
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
 recorded in `forge_setting`); afterwards the database is the authority.
@@ -379,6 +415,7 @@ combined form with per-realm OIDC buttons.
 | `POST` | `/auth/login` | Username/password through the realm chain; mints the session cookie; uniform 401 on failure. |
 | `GET` | `/auth/oidc/login?redirect_to=/path` | Start OIDC login; 302 → IdP. Writes an `oidc_flow` row (state/nonce/PKCE). |
 | `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
+| `GET` | `/.well-known/openid-configuration`, `/.well-known/jwks.json` | Public: Forge as the OIDC issuer of its own client assertions (a realm with a federated credential); 404 until it has keys. |
 | `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
 | `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
 | `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens (unscoped; `/admin/me/tokens` also takes a `scope`). |
@@ -442,6 +479,51 @@ scopes        = ["openid", "profile", "email"]
 # admin via Entra app role:
 admin_groups  = ["forge-admins"]
 admin_claim   = "roles"
+```
+
+### Without a client secret: a federated credential
+
+Instead of a client secret, Forge can authenticate at Entra with a client
+assertion it signs itself: workload identity federation, the
+[federated-credential case](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#third-case-access-token-request-with-a-federated-credential)
+of Entra's token request. Forge is then an OpenID Connect issuer of its own,
+`server.public_base_url`: it publishes `/.well-known/openid-configuration` and
+its signing keys at `/.well-known/jwks.json`, and nothing secret is configured
+or stored besides those keys, which Forge generates and rotates itself.
+
+1. Set the realm's **Client authentication** to *Federated credential*
+   (admin API: `"client_authentication": "federated_credential"` and no
+   `client_secret`; legacy block: `client_authentication =
+   "federated_credential"`). Saving the realm publishes the issuer, and the
+   realm form shows the **issuer**, **subject identifier** and **audience** to
+   register (`federated_credential` in the API's realm view).
+2. In the app registration: *Certificates & secrets* → *Federated
+   credentials* → *Add credential* → scenario *Other issuer*, with those three
+   values. The subject is `<client id>@<the realm's issuer>`, e.g.
+   `00000000-0000-0000-0000-000000000000@https://login.microsoftonline.com/<tenant-id>/v2.0`:
+   an assertion is only accepted for the IdP and client it was signed for, so
+   pointing a realm at another issuer never yields one the real app
+   registration accepts. The audience is `api://AzureADTokenExchange` unless
+   the realm's `assertion_audience` says otherwise (sovereign clouds).
+3. Entra fetches `<public_base_url>/.well-known/openid-configuration` and
+   `/.well-known/jwks.json` from the internet over https. A Forge that is
+   otherwise internal only needs these two paths exposed.
+
+The keys are RSA-2048 (RS256, the only algorithm Entra accepts from another
+issuer), shared by every instance through the database and sealed like other
+secrets with `[crypto]`. Forge creates them when such a realm is saved or
+enabled, adds a new key every 30 days and publishes it two days before it
+signs (Entra caches an issuer's keys for up to a day), and keeps the previous
+keys published until the next rotation. An assertion is valid for five
+minutes and carries its own `jti`. Before Forge has keys, both endpoints
+answer 404.
+
+```toml
+[oidc]
+issuer                = "https://login.microsoftonline.com/<tenant-id>/v2.0"
+client_id             = "00000000-0000-0000-0000-000000000000"
+client_authentication = "federated_credential"   # no client_secret
+redirect_url          = "https://forge.example.com/auth/oidc/callback"
 ```
 
 When `admin_groups` is set, admin is **recomputed on every login** from the

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM repository WHERE upstream_password IS NOT NULL\n        ) OR EXISTS (\n            SELECT 1 FROM nexus_import WHERE password IS NOT NULL\n        ) AS \"pending!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pending!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "36c2f17e3dd90d2e433827618f30fb706b39a7aed9ca77ac2691e93594cc762f"
+}

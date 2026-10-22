@@ -36,10 +36,12 @@ use std::time::{Duration, Instant};
 use forge_cache::Cache;
 use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper, ForwardLimits,
-    LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
+    AuthProvider, CapturedPasswordProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper,
+    ForwardLimits, LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider,
+    ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
+use forge_core::oidc::{AssertionClaims, ClientAuth};
 use forge_crypto::service::EnvelopeService;
 use forge_db::model::AuthRealm;
 use forge_db::{auth_realm_dao, authz_dao, secret_dao};
@@ -47,8 +49,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+use super::issuer::{AssertionIssuer, RealmAssertion};
 use super::OidcRuntime;
-use crate::config::{Config, OidcConfig};
+use crate::config::{ClientAuthentication, Config, OidcConfig};
 
 /// `forge_setting` key marking the first realm import as done. Gates only the
 /// initial `local`-realm priority adjustment; per-kind seed fingerprints (see
@@ -120,6 +123,19 @@ pub struct CredForwardRealmConfig {
     /// Auto-provision an `app_user` on first successful upstream login.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
+    /// Keep an argon2id hash of every password the upstream accepts on the
+    /// account (migration 0035), so an administrator can later switch the
+    /// realm's accounts to local ones and retire the upstream. Off by default;
+    /// turning it off deletes the kept hashes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_password_hash: bool,
+    /// Stop forwarding: sign the realm's accounts in with the password hashes
+    /// it kept instead of asking the upstream
+    /// ([`forge_core::auth::CapturedPasswordProvider`]); an account without
+    /// one can no longer sign in. Requires `capture_password_hash`, which
+    /// keeps the hashes from being deleted under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub captured_password_only: bool,
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
     pub positive_ttl_secs: u64,
@@ -148,7 +164,9 @@ impl std::fmt::Debug for CredForwardRealmConfig {
 /// (`auth.session_*`).
 ///
 /// `client_secret` is a **secret** (write-only / redacted), like `key_pepper`
-/// above. Unknown keys are refused, as there (a misspelled `required_claims`
+/// above. With `client_authentication = "federated_credential"` there is none:
+/// forge signs a client assertion itself ([`OidcRealmConfig::federated_credential`]).
+/// Unknown keys are refused, as there (a misspelled `required_claims`
 /// would let every account of a multi-tenant issuer sign in).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -157,9 +175,23 @@ pub struct OidcRealmConfig {
     pub issuer: String,
     /// OAuth client (application) id.
     pub client_id: String,
-    /// OAuth client secret. **Write-only / redacted.**
-    #[serde(default)]
+    /// OAuth client secret. **Write-only / redacted.** Not kept with
+    /// `client_authentication = "federated_credential"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_secret: String,
+    /// How forge authenticates at the IdP's token endpoint: with
+    /// `client_secret` (the default), or with a client assertion it signs
+    /// itself (`federated_credential`, an Entra federated identity
+    /// credential).
+    #[serde(
+        default,
+        skip_serializing_if = "ClientAuthentication::is_client_secret"
+    )]
+    pub client_authentication: ClientAuthentication,
+    /// `aud` of the client assertions (`federated_credential`); unset:
+    /// Entra's `api://AzureADTokenExchange` (sovereign clouds use their own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion_audience: Option<String>,
     /// Requested scopes (`openid` added implicitly when missing).
     #[serde(default = "default_oidc_scopes")]
     pub scopes: Vec<String>,
@@ -219,8 +251,58 @@ impl std::fmt::Debug for OidcRealmConfig {
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
+            .field("client_authentication", &self.client_authentication)
             .finish_non_exhaustive()
     }
+}
+
+/// What the IdP's federated credential for an `oidc` realm must name: the
+/// claims of the client assertions forge signs for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FederatedCredential {
+    /// Forge's issuer URL (`server.public_base_url`).
+    pub issuer: String,
+    /// `{client_id}@{issuer of the realm}`
+    /// ([`forge_core::oidc::assertion::federated_subject`]).
+    pub subject: String,
+    /// The realm's `assertion_audience`.
+    pub audience: String,
+}
+
+impl OidcRealmConfig {
+    /// The federated credential this realm authenticates with when it uses
+    /// `client_authentication = "federated_credential"`, forge being the
+    /// issuer `forge_issuer`.
+    pub fn federated_credential(&self, forge_issuer: &str) -> Option<FederatedCredential> {
+        (self.client_authentication == ClientAuthentication::FederatedCredential).then(|| {
+            FederatedCredential {
+                issuer: forge_issuer.trim_end_matches('/').to_string(),
+                subject: forge_core::oidc::assertion::federated_subject(
+                    &self.issuer,
+                    &self.client_id,
+                ),
+                audience: self.assertion_audience.clone().unwrap_or_else(|| {
+                    forge_core::oidc::assertion::DEFAULT_ASSERTION_AUDIENCE.to_string()
+                }),
+            }
+        })
+    }
+}
+
+/// [`OidcRealmConfig::federated_credential`] of a stored realm `config`, for
+/// API responses (`None` for any other realm, or a config that does not
+/// parse).
+pub fn federated_credential(
+    kind: &str,
+    config: &JsonValue,
+    forge_issuer: &str,
+) -> Option<FederatedCredential> {
+    if kind != KIND_OIDC {
+        return None;
+    }
+    serde_json::from_value::<OidcRealmConfig>(config.clone())
+        .ok()?
+        .federated_credential(forge_issuer)
 }
 
 fn default_method() -> String {
@@ -301,6 +383,13 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             if !cfg.required_groups.is_empty() && cfg.groups_path.trim().is_empty() {
                 return Err("required_groups is set but groups_path is empty".into());
             }
+            if cfg.captured_password_only && !cfg.capture_password_hash {
+                return Err(
+                    "captured_password_only needs capture_password_hash (the kept hashes \
+                     are what the accounts then sign in with)"
+                        .into(),
+                );
+            }
             if !matches!(
                 cfg.method.to_ascii_uppercase().as_str(),
                 "GET" | "POST" | "HEAD" | "PUT"
@@ -327,8 +416,19 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             if cfg.client_id.trim().is_empty() {
                 return Err("client_id must not be empty".into());
             }
-            if cfg.client_secret.trim().is_empty() {
-                return Err("client_secret must not be empty".into());
+            cfg.assertion_audience = cfg
+                .assertion_audience
+                .map(|audience| audience.trim().to_string())
+                .filter(|audience| !audience.is_empty());
+            match cfg.client_authentication {
+                ClientAuthentication::ClientSecret => {
+                    if cfg.client_secret.trim().is_empty() {
+                        return Err("client_secret must not be empty".into());
+                    }
+                }
+                // Nothing sends a secret any more: it is not kept (switching
+                // back takes a new one, as for another issuer).
+                ClientAuthentication::FederatedCredential => cfg.client_secret.clear(),
             }
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
@@ -454,6 +554,8 @@ pub struct OidcRealmRuntime {
     pub label: String,
     /// Identifier-first routing domains (lowercased).
     pub login_domains: Vec<String>,
+    /// Whether the realm authenticates with forge's own client assertions.
+    pub federated: bool,
     /// The flow runtime (discovery/JWKS client, claim mapping, sessions).
     pub runtime: OidcRuntime,
 }
@@ -492,6 +594,12 @@ impl RealmSnapshot {
     pub fn oidc(&self) -> Option<&OidcRealmRuntime> {
         self.oidc.as_ref()
     }
+
+    /// Whether the enabled OIDC realm authenticates with forge's own client
+    /// assertions (so the issuer keys must exist).
+    pub fn uses_assertion_issuer(&self) -> bool {
+        self.oidc.as_ref().is_some_and(|o| o.federated)
+    }
 }
 
 /// How often [`RealmAuth::refreshed`] may rebuild the snapshot at most.
@@ -520,14 +628,25 @@ pub struct RealmAuth {
     /// snapshot, so a snapshot rebuild never resets a bound while forwards
     /// started by the previous build are still in flight.
     forward_limits: Arc<ForwardLimits>,
-    /// Bounds concurrent argon2 verifications across every snapshot's local
-    /// provider (`auth.password_verify_concurrency`); outlives rebuilds.
+    /// Bounds concurrent argon2 work across every snapshot's providers
+    /// (`auth.password_verify_concurrency`): the local provider's
+    /// verifications and the hashes credential-forwarding realms keep.
+    /// Outlives rebuilds.
     password_limiter: Arc<PasswordHashLimiter>,
+    /// Signs the client assertions of a `federated_credential` OIDC realm.
+    assertion_issuer: AssertionIssuer,
 }
 
 impl RealmAuth {
     /// Build the (empty) cache; the first `snapshot()` call populates it.
-    pub fn new(pool: PgPool, cache: Cache, config: Arc<Config>) -> Self {
+    /// A `federated_credential` OIDC realm signs its client assertions with
+    /// `assertion_issuer`.
+    pub fn new(
+        pool: PgPool,
+        cache: Cache,
+        config: Arc<Config>,
+        assertion_issuer: AssertionIssuer,
+    ) -> Self {
         let ttl = Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1));
         let forward_limits = Arc::new(ForwardLimits::new(
             config.auth.credential_forward_max_concurrent,
@@ -546,6 +665,7 @@ impl RealmAuth {
             envelope: None,
             forward_limits,
             password_limiter,
+            assertion_issuer,
         }
     }
 
@@ -758,7 +878,8 @@ impl RealmAuth {
         // in the clear to a non-loopback host unless the realm says so.
         ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
             .map_err(|e| anyhow::anyhow!("url: {e}"))?;
-        if cfg.auto_provision && cfg.identity_path.trim().is_empty() {
+        if cfg.auto_provision && !cfg.captured_password_only && cfg.identity_path.trim().is_empty()
+        {
             tracing::warn!(
                 realm = %realm.name,
                 "credential-forwarding realm provisions accounts without identity_path: \
@@ -795,6 +916,17 @@ impl RealmAuth {
         // The request's own timeout normally fires first (and is logged as
         // such); the cache's deadline is the backstop its lease is sized by.
         .with_forward_timeout(request_timeout + Duration::from_secs(1));
+        if cfg.captured_password_only {
+            // The upstream is no longer asked; the accounts' kept hashes
+            // decide, through the same (re-keyed) verdict cache.
+            return Ok(Box::new(CapturedPasswordProvider::new(
+                provider_id,
+                realm.id,
+                self.pool.clone(),
+                cred_cache,
+                self.password_limiter.clone(),
+            )));
+        }
         let core = forge_core::auth::UpstreamBasicConfig {
             url: cfg.url,
             method: cfg.method.to_ascii_uppercase(),
@@ -809,10 +941,12 @@ impl RealmAuth {
             provider_id,
             auto_provision: cfg.auto_provision,
             realm_id: Some(realm.id),
+            capture_password_hash: cfg.capture_password_hash,
         };
-        Ok(Box::new(UpstreamBasicProvider::new(
-            core, client, cred_cache,
-        )))
+        Ok(Box::new(
+            UpstreamBasicProvider::new(core, client, cred_cache)
+                .with_hash_limiter(self.password_limiter.clone()),
+        ))
     }
 
     /// Build the OIDC login runtime from a realm row.
@@ -825,6 +959,28 @@ impl RealmAuth {
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         let base = self.config.public_base_url();
         let (idle, absolute) = self.config.session_ttls();
+        let federated = cfg.federated_credential(self.assertion_issuer.issuer());
+        let auth = match &federated {
+            None => ClientAuth::Secret(cfg.client_secret.clone()),
+            Some(credential) => {
+                if !credential.issuer.starts_with("https://") {
+                    tracing::warn!(
+                        realm = %realm.name,
+                        issuer = %credential.issuer,
+                        "oidc realm authenticates with a federated credential, but the public base \
+                         URL forge publishes as its issuer is not https: Entra refuses such an issuer"
+                    );
+                }
+                ClientAuth::Assertion(Arc::new(RealmAssertion {
+                    issuer: self.assertion_issuer.clone(),
+                    claims: AssertionClaims {
+                        issuer: credential.issuer.clone(),
+                        subject: credential.subject.clone(),
+                        audience: credential.audience.clone(),
+                    },
+                }))
+            }
+        };
         // Synthesize the legacy-shaped OidcConfig the runtime builder takes;
         // the redirect URL is always derived from the public base URL.
         let oidc_config = OidcConfig {
@@ -832,6 +988,8 @@ impl RealmAuth {
             issuer: cfg.issuer.clone(),
             client_id: cfg.client_id.clone(),
             client_secret: cfg.client_secret.clone(),
+            client_authentication: cfg.client_authentication,
+            assertion_audience: cfg.assertion_audience.clone(),
             redirect_url: format!("{base}/auth/oidc/callback"),
             scopes: cfg.scopes.clone(),
             clock_skew_seconds: cfg.clock_skew_seconds,
@@ -848,8 +1006,13 @@ impl RealmAuth {
             session_idle_ttl_seconds: idle,
             session_absolute_ttl_seconds: absolute,
         };
-        let runtime =
-            OidcRuntime::build(&oidc_config, self.pool.clone(), &base, self.cache.clone())?;
+        let runtime = OidcRuntime::build(
+            &oidc_config,
+            auth,
+            self.pool.clone(),
+            &base,
+            self.cache.clone(),
+        )?;
         Ok(OidcRealmRuntime {
             realm_name: realm.name.clone(),
             label: cfg
@@ -863,6 +1026,7 @@ impl RealmAuth {
                 .map(|d| d.trim().trim_start_matches('@').to_ascii_lowercase())
                 .filter(|d| !d.is_empty())
                 .collect(),
+            federated: federated.is_some(),
             runtime,
         })
     }
@@ -1015,6 +1179,8 @@ pub async fn seed_auth_realms(
             allow_http: ub.allow_http,
             admin_group: ub.admin_group.clone(),
             auto_provision: ub.auto_provision,
+            capture_password_hash: false,
+            captured_password_only: false,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
             negative_ttl_secs: ub.cache.negative_ttl_secs,
             key_pepper: ub.cache.key_pepper.clone(),
@@ -1031,10 +1197,23 @@ pub async fn seed_auth_realms(
     }
 
     if let Some(o) = config.oidc.as_ref().filter(|o| o.enabled) {
+        let federated = o.client_authentication == ClientAuthentication::FederatedCredential;
         let cfg = OidcRealmConfig {
             issuer: o.issuer.clone(),
             client_id: o.client_id.clone(),
-            client_secret: o.client_secret.clone(),
+            // Never kept for a federated credential (see `validate_config`).
+            client_secret: if federated {
+                String::new()
+            } else {
+                o.client_secret.clone()
+            },
+            client_authentication: o.client_authentication,
+            assertion_audience: o
+                .assertion_audience
+                .as_deref()
+                .map(str::trim)
+                .filter(|audience| !audience.is_empty())
+                .map(str::to_string),
             scopes: o.scopes.clone(),
             clock_skew_seconds: o.clock_skew_seconds,
             allow_http_issuer: o.allow_private_issuer,
@@ -1227,6 +1406,35 @@ mod tests {
     }
 
     #[test]
+    fn kept_password_options_validate() {
+        let base = json!({"url": "https://nexus.internal/status", "key_pepper": "p"});
+        let with = |extra: serde_json::Value| {
+            let mut config = base.clone();
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            validate_config(KIND_CRED_FORWARD, &config)
+        };
+        // Off by default, and then absent from the stored document.
+        let plain = with(json!({})).unwrap();
+        assert!(plain.get("capture_password_hash").is_none());
+        assert!(plain.get("captured_password_only").is_none());
+        // The key the database fences a kept hash on.
+        let keep = with(json!({"capture_password_hash": true})).unwrap();
+        assert_eq!(
+            keep[forge_db::user_dao::CAPTURE_PASSWORD_HASH_KEY],
+            json!(true)
+        );
+        // Stopping forwarding needs the hashes to be kept.
+        let err = with(json!({"captured_password_only": true})).unwrap_err();
+        assert!(err.contains("capture_password_hash"), "{err}");
+        let only =
+            with(json!({"capture_password_hash": true, "captured_password_only": true})).unwrap();
+        assert_eq!(only["captured_password_only"], json!(true));
+    }
+
+    #[test]
     fn realm_configs_refuse_unknown_keys_but_not_secret_markers() {
         let cred = json!({"url": "https://nexus.internal/status", "key_pepper": "p"});
         let oidc = json!({
@@ -1306,6 +1514,58 @@ mod tests {
         let mut nosecret = base.clone();
         nosecret["client_secret"] = json!("");
         assert!(validate_config(KIND_OIDC, &nosecret).is_err());
+    }
+
+    #[test]
+    fn a_federated_credential_oidc_realm_keeps_no_secret_and_names_its_credential() {
+        let config = validate_config(
+            KIND_OIDC,
+            &json!({
+                "issuer": "https://login.microsoftonline.com/tenant/v2.0/",
+                "client_id": "app",
+                "client_authentication": "federated_credential",
+                "client_secret": "nothing sends it",
+                "assertion_audience": "  ",
+            }),
+        )
+        .expect("valid without a secret");
+        assert!(config.get("client_secret").is_none(), "{config}");
+        assert!(config.get("assertion_audience").is_none(), "{config}");
+        assert_eq!(
+            config["client_authentication"],
+            json!("federated_credential")
+        );
+        assert_eq!(
+            redact_config(KIND_OIDC, &config)["client_secret_set"],
+            json!(false)
+        );
+        assert_eq!(
+            federated_credential(KIND_OIDC, &config, "https://forge.example/"),
+            Some(FederatedCredential {
+                issuer: "https://forge.example".into(),
+                subject: "app@https://login.microsoftonline.com/tenant/v2.0".into(),
+                audience: "api://AzureADTokenExchange".into(),
+            })
+        );
+
+        // A client-secret realm is stored exactly as before.
+        let secret = validate_config(
+            KIND_OIDC,
+            &json!({"issuer": "https://idp.example", "client_id": "c", "client_secret": "s"}),
+        )
+        .unwrap();
+        assert!(secret.get("client_authentication").is_none(), "{secret}");
+        assert!(secret.get("assertion_audience").is_none(), "{secret}");
+        assert!(federated_credential(KIND_OIDC, &secret, "https://forge.example").is_none());
+        assert!(
+            federated_credential(KIND_CRED_FORWARD, &config, "https://forge.example").is_none()
+        );
+
+        assert!(validate_config(
+            KIND_OIDC,
+            &json!({"issuer": "https://idp.example", "client_id": "c", "client_authentication": "certificate"}),
+        )
+        .is_err());
     }
 
     #[test]

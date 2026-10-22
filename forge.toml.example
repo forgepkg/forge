@@ -227,6 +227,11 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # issuer         = "https://login.microsoftonline.com/<tenant-id>/v2.0"        # must be https
 # client_id      = "00000000-0000-0000-0000-000000000000"
 # client_secret  = "<application-client-secret>"                               # redacted from APIs/logs
+# # or no secret: Forge signs a client assertion as an OIDC issuer of its own
+# # (public_base_url, publishing /.well-known/openid-configuration + jwks.json);
+# # register it as an Entra federated credential (see DEVELOPMENT.md)
+# client_authentication = "federated_credential"                               # (default: "client_secret")
+# assertion_audience    = "api://AzureADTokenExchange"                          # (default) the assertion's aud
 # redirect_url   = "http://localhost:8421/auth/oidc/callback"                  # must match public_base_url host + this path
 # scopes         = ["openid", "profile", "email"]                              # (default) openid is always added
 # clock_skew_seconds = 60                                                      # (default: 60) exp/nbf/iat leeway
