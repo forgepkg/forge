@@ -30,7 +30,10 @@ concurrency:
 
 jobs:
   stack:
-    name: stack
+    # Not `stack`: a required check matches check runs and commit statuses
+    # by name alike, so a job named like the status would satisfy the
+    # ruleset with its own success.
+    name: stack-status
     if: github.base_ref != github.event.repository.default_branch || github.event.changes.base
     runs-on: ubuntu-latest
     steps:
