@@ -10,6 +10,20 @@ The release workflow publishes the section whose heading matches the tag
 
 ## [Unreleased]
 
+### Features
+
+- **OIDC login without a client secret**: an `oidc` realm can authenticate
+  at Microsoft Entra with a federated identity credential instead
+  (`client_authentication = "federated_credential"`). Forge signs a
+  short-lived client assertion itself, as an OpenID Connect issuer of its
+  own (`server.public_base_url`), publishing
+  `/.well-known/openid-configuration` and its keys at
+  `/.well-known/jwks.json`. The keys are RSA-2048, shared by every instance
+  through the database (sealed with `[crypto]`), and rotated every 30 days,
+  each new key published two days before it signs. The realm shows the
+  issuer, subject (`<client id>@<realm issuer>`) and audience to register.
+  See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
+
 ### Fixed
 
 - A database failure while checking a browser session or its CSRF token

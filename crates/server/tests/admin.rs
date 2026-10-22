@@ -1514,6 +1514,64 @@ async fn registry_token_key_survives_dek_rotation() {
     );
 }
 
+/// The OIDC issuer keys are sealed like every other secret and survive DEK
+/// rotation: rotation re-seals them, and an instance that starts afterwards
+/// publishes and signs with the same keys instead of generating its own.
+#[tokio::test]
+async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}", common::unique());
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let kids = |keys: &forge_core::oidc::IssuerKeySet| {
+        keys.keys()
+            .iter()
+            .map(|k| k.kid().to_string())
+            .collect::<Vec<_>>()
+    };
+    let created = srv.state.assertion_issuer.ensure().await.unwrap();
+    let stored = || async {
+        forge_db::authz_dao::get_setting(&srv.pool, forge_server::auth::ISSUER_KEYS_SETTING)
+            .await
+            .unwrap()
+            .expect("the issuer keys are stored")
+    };
+    let before = stored().await;
+    assert!(before.starts_with("sealed:"), "{before}");
+
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let after = stored().await;
+    assert_ne!(after, before, "re-sealed under the new DEK");
+
+    let restarted = forge_server::auth::AssertionIssuer::new(
+        srv.pool.clone(),
+        srv.state.envelope.clone(),
+        srv.state.config.public_base_url(),
+    );
+    assert_eq!(kids(&restarted.ensure().await.unwrap()), kids(&created));
+    assert_eq!(stored().await, after, "not replaced");
+}
+
 /// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
 /// disabled (slice-1 plaintext behavior stays untouched).
 #[tokio::test]

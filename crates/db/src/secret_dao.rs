@@ -31,7 +31,7 @@
 //! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
 //! Secrets kept in `forge_setting` ([`SECRET_SETTINGS`]: the generated
-//! registry-token key) are text values, `sealed:<base64 envelope>` with the
+//! registry-token key, the OIDC issuer keys) are text values, `sealed:<base64 envelope>` with the
 //! envelope service and `plain:<secret>` without it, AAD-bound to
 //! `('forge_setting', 'value', 0)` plus the setting's key. They take part in
 //! the backfill, the re-encrypt sweep and the DEK reference scan like the
@@ -1141,8 +1141,12 @@ pub async fn reseal_realm_secrets(
 /// `forge_setting` key of the generated registry-token signing key.
 pub const REGISTRY_TOKEN_KEY_SETTING: &str = "docker_token_key";
 
+/// `forge_setting` key of the private keys forge signs its own OIDC client
+/// assertions with.
+pub const OIDC_ISSUER_KEYS_SETTING: &str = "oidc_issuer_keys";
+
 /// The `forge_setting` keys whose values are secrets (module docs).
-pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING];
+pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING, OIDC_ISSUER_KEYS_SETTING];
 
 /// Prefix of a sealed secret setting: `sealed:<base64 envelope>`.
 const SEALED_SETTING: &str = "sealed:";

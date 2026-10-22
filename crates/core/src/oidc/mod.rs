@@ -11,6 +11,9 @@
 //!   [`flow::complete_login`] consumes that row (single-use), exchanges the code,
 //!   and verifies the ID token. All flow state lives in Postgres, so any instance
 //!   can complete a callback another instance began.
+//! * [`assertion`] — forge as the issuer of its own client assertions: the
+//!   rotating RSA key set, its JWKS, and the signed `client_assertion` an
+//!   `oidc` realm can authenticate with instead of a client secret.
 //! * [`claims`] — pure claim → user mapping + `is_admin` derivation (§3.6).
 //! * [`resolve_user`] — identity resolution: find via `external_identity`, else
 //!   auto-provision / link an existing local user / reject; recompute `is_admin`.
@@ -27,6 +30,7 @@
 //! state and sessions live in Postgres (`oidc_flow` / `session`), never process
 //! memory.
 
+pub mod assertion;
 pub mod claims;
 pub mod flow;
 pub mod jwks;
@@ -36,10 +40,11 @@ use forge_db::user_dao::{self, NewUser};
 use forge_db::{authz_dao, external_identity_dao, oidc_flow_dao, session_dao};
 use sqlx::PgPool;
 
+pub use assertion::{AssertionClaims, IssuerKeySet};
 pub use claims::{map_claims, ClaimMapping, MappedClaims};
 pub use flow::{
-    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientParams,
-    FlowError, ValidatedLogin,
+    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientAssertion,
+    ClientAuth, ClientParams, FlowError, ValidatedLogin,
 };
 pub use jwks::{
     DiscoveryDocument, IdTokenClaims, OidcError, OidcMetadataClient, Verified, VerifyParams,

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { RealmView } from '~/api/realms'
 import type { RealmFormValues } from './RealmForm'
 import {
+  federatedSubject,
   formatClaimRules,
   parseClaimRules,
   parseLines,
@@ -71,6 +72,18 @@ describe('list fields', () => {
       },
     ],
     [
+      'oidc',
+      {
+        issuer: 'https://login.microsoftonline.com/tenant/v2.0',
+        client_id: 'app-id',
+        auto_provision: true,
+        link_existing_by_username: false,
+        allow_http_issuer: false,
+        client_authentication: 'federated_credential',
+        assertion_audience: 'api://AzureADTokenExchangeUSGov',
+      },
+    ],
+    [
       'credential_forwarding',
       {
         url: 'https://auth.example.com/check',
@@ -126,5 +139,39 @@ describe('workload identity config', () => {
 
   it('omits a blank exchanged-key lifetime so the server default applies', () => {
     expect(toRealmConfig(values(''))).not.toHaveProperty('api_key_ttl_seconds')
+  })
+})
+
+describe('OIDC federated credential', () => {
+  const values = (overrides: Partial<RealmFormValues>): RealmFormValues => ({
+    ...seedRealmFormValues(),
+    issuer: 'https://login.microsoftonline.com/tenant/v2.0/',
+    client_id: ' app-id ',
+    ...overrides,
+  })
+
+  it('sends no secret and only a non-default audience', () => {
+    const config = toRealmConfig(
+      values({
+        client_authentication: 'federated_credential',
+        client_secret: 'typed before switching',
+        assertion_audience: ' ',
+      }),
+    )
+    expect(config).toMatchObject({ client_authentication: 'federated_credential' })
+    expect(config).not.toHaveProperty('client_secret')
+    expect(config).not.toHaveProperty('assertion_audience')
+  })
+
+  it('leaves the default client secret authentication implicit', () => {
+    const config = toRealmConfig(values({ client_secret: 's3cret' }))
+    expect(config).toMatchObject({ client_secret: 's3cret' })
+    expect(config).not.toHaveProperty('client_authentication')
+  })
+
+  it('derives the subject as the server does', () => {
+    expect(federatedSubject(' https://login.microsoftonline.com/t/v2.0/ ', ' app ')).toBe(
+      'app@https://login.microsoftonline.com/t/v2.0',
+    )
   })
 })

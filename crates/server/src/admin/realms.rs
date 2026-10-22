@@ -27,8 +27,8 @@ use serde_json::Value as JsonValue;
 
 use super::db_error;
 use crate::auth::{
-    forget_seed, merge_secrets, redact_config, secret_keys, validate_config, KIND_LOCAL, KIND_OIDC,
-    KIND_WORKLOAD_IDENTITY,
+    federated_credential, forget_seed, merge_secrets, redact_config, secret_keys, validate_config,
+    FederatedCredential, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 use crate::state::AppState;
 
@@ -44,12 +44,18 @@ pub struct RealmView {
     pub enabled: bool,
     pub priority: i32,
     pub config: JsonValue,
+    /// An `oidc` realm with `client_authentication = "federated_credential"`:
+    /// the issuer, subject and audience the IdP's federated credential must
+    /// name (derived, read-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federated_credential: Option<FederatedCredential>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-impl From<&AuthRealm> for RealmView {
-    fn from(r: &AuthRealm) -> Self {
+impl RealmView {
+    /// The view of `r`, forge publishing its OIDC issuer as `forge_issuer`.
+    fn of(r: &AuthRealm, forge_issuer: &str) -> Self {
         let mut config = redact_config(&r.kind, &r.config);
         // Encrypted secrets are stripped from `config`; validation requires every
         // secret key, so a sealed secrets document means all of them are set.
@@ -67,9 +73,29 @@ impl From<&AuthRealm> for RealmView {
             enabled: r.enabled,
             priority: r.priority,
             config,
+            federated_credential: federated_credential(&r.kind, &r.config, forge_issuer),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
+    }
+}
+
+/// The views of `realms`.
+fn views(state: &AppState, realms: &[AuthRealm]) -> Vec<RealmView> {
+    let issuer = state.assertion_issuer.issuer();
+    realms.iter().map(|r| RealmView::of(r, issuer)).collect()
+}
+
+/// After `r` was written: a realm that signs in with forge's client
+/// assertions needs the issuer keys published before the IdP's federated
+/// credential can be set up and before its first login. Best effort: the
+/// issuer worker and the first login create them as well.
+async fn ensure_issuer_keys(state: &AppState, r: &AuthRealm) {
+    if federated_credential(&r.kind, &r.config, state.assertion_issuer.issuer()).is_none() {
+        return;
+    }
+    if let Err(error) = state.assertion_issuer.ensure().await {
+        tracing::warn!(realm = %r.name, error = %format!("{error:#}"), "cannot create the issuer keys");
     }
 }
 
@@ -201,10 +227,7 @@ async fn assert_single_enabled_oidc(
 /// `GET /admin/realms` — all realms in try-order, configs redacted.
 pub async fn list(State(state): State<AppState>) -> Response {
     match auth_realm_dao::list_realms(&state.pool).await {
-        Ok(realms) => {
-            let views: Vec<RealmView> = realms.iter().map(RealmView::from).collect();
-            Json(views).into_response()
-        }
+        Ok(realms) => Json(views(&state, &realms)).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -212,7 +235,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// `GET /admin/realms/{id}`
 pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     match auth_realm_dao::find_realm_by_id(&state.pool, id).await {
-        Ok(Some(r)) => Json(RealmView::from(&r)).into_response(),
+        Ok(Some(r)) => Json(RealmView::of(&r, state.assertion_issuer.issuer())).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "realm not found").into_response(),
         Err(e) => db_error(e),
     }
@@ -278,7 +301,12 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
         Ok(r) => {
             state.realms.invalidate().await;
             tracing::info!(realm = %r.name, kind = %r.kind, "auth realm created");
-            (StatusCode::CREATED, Json(RealmView::from(&r))).into_response()
+            ensure_issuer_keys(&state, &r).await;
+            (
+                StatusCode::CREATED,
+                Json(RealmView::of(&r, state.assertion_issuer.issuer())),
+            )
+                .into_response()
         }
         Err(e) if is_wif_issuer_unique_violation(&e) => (
             StatusCode::CONFLICT,
@@ -407,7 +435,8 @@ pub async fn update(
         Ok(Some(r)) => {
             state.realms.invalidate().await;
             tracing::info!(realm = %r.name, kind = %r.kind, enabled = r.enabled, "auth realm updated");
-            Json(RealmView::from(&r)).into_response()
+            ensure_issuer_keys(&state, &r).await;
+            Json(RealmView::of(&r, state.assertion_issuer.issuer())).into_response()
         }
         // The row changed between the read above and the write: re-storing
         // the config read here would undo that change.
@@ -593,10 +622,7 @@ pub async fn reorder(State(state): State<AppState>, Json(body): Json<ReorderReal
         Ok(ReorderOutcome::Reordered) => {
             state.realms.invalidate().await;
             match auth_realm_dao::list_realms(&state.pool).await {
-                Ok(realms) => {
-                    let views: Vec<RealmView> = realms.iter().map(RealmView::from).collect();
-                    Json(views).into_response()
-                }
+                Ok(realms) => Json(views(&state, &realms)).into_response(),
                 Err(e) => db_error(e),
             }
         }

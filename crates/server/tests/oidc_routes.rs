@@ -32,7 +32,7 @@ use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{start_with, ServerOpts};
@@ -137,6 +137,22 @@ redirect_url = "http://test.local/auth/oidc/callback"
 allow_private_issuer = true
 admin_groups = ["forge-admins"]
 admin_claim = "roles"
+"#,
+            issuer = self.issuer,
+        )
+    }
+
+    /// The `[oidc]` block of a client that authenticates with forge's own
+    /// client assertions (an Entra federated identity credential).
+    fn federated_oidc_block(&self) -> String {
+        format!(
+            r#"
+[oidc]
+issuer = "{issuer}"
+client_id = "{CLIENT_ID}"
+client_authentication = "federated_credential"
+redirect_url = "http://test.local/auth/oidc/callback"
+allow_private_issuer = true
 "#,
             issuer = self.issuer,
         )
@@ -415,6 +431,127 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["user"]["username"], json!(username));
     assert_eq!(body["is_admin"], json!(true), "roles claim granted admin");
+}
+
+/// A realm with `client_authentication = "federated_credential"` signs in
+/// without a client secret: the token request carries a client assertion
+/// that verifies against the JWKS forge publishes as its issuer, and names
+/// the subject and audience an Entra federated credential expects.
+#[tokio::test]
+async fn federated_credential_login_presents_a_forge_signed_client_assertion() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    // Its own database: the issuer keys are install-wide.
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            oidc_block: Some(idp.federated_oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = no_redirect_client();
+    let n = common::unique();
+
+    let resp = client
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let state = state_from_url(resp.headers().get("location").unwrap().to_str().unwrap());
+    let flow = flow_cookie_header(&resp);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    // Only a token request authenticated by a client assertion gets a token.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": idp.signer.sign(&id_claims(
+                &idp.issuer,
+                &format!("sub-{n}"),
+                &format!("dora-{n}"),
+                &nonce,
+                json!([]),
+            )),
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let resp = client
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .header("cookie", &flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    assert_eq!(resp.headers().get("location").unwrap(), "/browse");
+    assert!(resp.headers().get("set-cookie").is_some(), "signed in");
+
+    // The assertion the IdP received.
+    let requests = idp.server.received_requests().await.expect("recorded");
+    let body = &requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("token request")
+        .body;
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(body).into_owned().collect();
+    assert!(!form.contains_key("client_secret"), "{form:?}");
+    assert_eq!(form["client_id"], CLIENT_ID);
+    let assertion = &form["client_assertion"];
+
+    // Verified as the IdP does: discovery → JWKS → the key named by `kid`.
+    let discovery: Value = client
+        .get(format!("{}/.well-known/openid-configuration", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discovery["issuer"], json!("http://test.local"));
+    let jwks: Value = client
+        .get(format!("{}/.well-known/jwks.json", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kid = jsonwebtoken::decode_header(assertion)
+        .unwrap()
+        .kid
+        .expect("kid");
+    let jwk = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"] == json!(kid))
+        .expect("signing key published");
+    let key = jsonwebtoken::DecodingKey::from_rsa_components(
+        jwk["n"].as_str().unwrap(),
+        jwk["e"].as_str().unwrap(),
+    )
+    .unwrap();
+    let mut validation = jsonwebtoken::Validation::new(Algorithm::RS256);
+    validation.set_issuer(&["http://test.local"]);
+    validation.set_audience(&["api://AzureADTokenExchange"]);
+    validation.sub = Some(format!("{CLIENT_ID}@{}", idp.issuer.trim_end_matches('/')));
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    let claims = jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+        .expect("the assertion verifies against forge's JWKS")
+        .claims;
+    assert!(claims["jti"].as_str().is_some_and(|j| !j.is_empty()));
 }
 
 /// Review L7(b): an issuer that ends in `/` (Auth0: `https://tenant.auth0.com/`)

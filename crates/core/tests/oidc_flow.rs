@@ -24,8 +24,8 @@ use base64::Engine;
 use chrono::Duration as ChronoDuration;
 use forge_cache::Cache;
 use forge_core::oidc::{
-    self, begin_login, complete_login, map_claims, CallbackParams, ClaimMapping, ClientParams,
-    FlowError, OidcMetadataClient, ResolvePolicy,
+    self, begin_login, complete_login, map_claims, CallbackParams, ClaimMapping, ClientAssertion,
+    ClientAuth, ClientParams, FlowError, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::SessionService;
 use forge_db::oidc_flow_dao;
@@ -35,7 +35,7 @@ use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{pool, unique};
@@ -152,7 +152,7 @@ impl MockIdp {
     fn client(&self) -> ClientParams {
         ClientParams {
             client_id: "client-abc".into(),
-            client_secret: "shh-secret".into(),
+            auth: ClientAuth::Secret("shh-secret".into()),
             redirect_url: "https://forge.test/auth/oidc/callback".into(),
             scopes: vec!["openid".into(), "profile".into(), "email".into()],
             leeway_seconds: 60,
@@ -286,6 +286,107 @@ async fn complete_login_happy_path_then_replay_fails() {
         matches!(replay, Err(FlowError::UnknownState)),
         "got {replay:?}"
     );
+}
+
+/// A client assertion signer that hands out a fixed assertion, or fails.
+struct FixedAssertion(Result<&'static str, &'static str>);
+
+#[async_trait::async_trait]
+impl ClientAssertion for FixedAssertion {
+    async fn client_assertion(&self) -> Result<String, String> {
+        self.0.map(str::to_string).map_err(str::to_string)
+    }
+}
+
+#[tokio::test]
+async fn complete_login_authenticates_with_a_client_assertion_instead_of_a_secret() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let client = ClientParams {
+        auth: ClientAuth::Assertion(std::sync::Arc::new(FixedAssertion(Ok(
+            "signed.client.assertion",
+        )))),
+        ..idp.client()
+    };
+
+    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+        .await
+        .expect("begin");
+    let nonce = peek_nonce(&pool, &begun.state).await;
+    // Only a request carrying the assertion gets an ID token.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+        ))
+        .and(body_string_contains("client_assertion=signed.client.assertion"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": idp.signer.sign(&id_claims(
+                &idp.issuer,
+                &format!("sub-{n}"),
+                &format!("carol-{n}"),
+                &nonce,
+                json!([]),
+            )),
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let validated = complete_login(
+        &pool,
+        &idp.meta(),
+        &client,
+        &CallbackParams {
+            code: Some("the-code".into()),
+            state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("complete_login with a client assertion");
+    assert_eq!(validated.subject, format!("sub-{n}"));
+
+    let requests = idp.server.received_requests().await.expect("recorded");
+    let token_request = requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("token request");
+    let body = String::from_utf8_lossy(&token_request.body);
+    assert!(!body.contains("client_secret"), "{body}");
+}
+
+#[tokio::test]
+async fn complete_login_fails_without_calling_the_idp_when_the_assertion_cannot_be_signed() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let client = ClientParams {
+        auth: ClientAuth::Assertion(std::sync::Arc::new(FixedAssertion(Err("no keys")))),
+        ..idp.client()
+    };
+    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+        .await
+        .expect("begin");
+
+    let result = complete_login(
+        &pool,
+        &idp.meta(),
+        &client,
+        &CallbackParams {
+            code: Some("the-code".into()),
+            state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(FlowError::ClientAssertion(e)) if e == "no keys"),
+        "got {result:?}"
+    );
+    let requests = idp.server.received_requests().await.expect("recorded");
+    assert!(requests.iter().all(|r| r.url.path() != "/token"));
 }
 
 #[tokio::test]
