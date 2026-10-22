@@ -5,8 +5,15 @@
 //! version, and where each version's archive is. Every operation reads it
 //! (the host caches it for the repository's metadata TTL). The upstream's
 //! index ([`Remote::index`]) is just its base URL.
+//!
+//! Parsing a large index takes long (half a second and some 200 MB for a
+//! 10 MB one), and a proxy's chart listing runs several operations per
+//! chart, so the built-in plugin keeps the parsed index while the upstream
+//! serves the same document, and parses one index at a time
+//! ([`parsed_index`]).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use forge_plugin_api::{
     Fetch, FetchResult, Fetched, FormatError, Freshness, PackageMetadata, PackageRef,
@@ -21,21 +28,26 @@ use crate::semver::Version;
 /// The default page of an upstream search.
 const DEFAULT_TAKE: usize = 20;
 
-/// One chart version an upstream index lists.
+/// One chart version an upstream index lists. Compact, since parsed
+/// indexes are kept ([`parsed_index`]): the entry itself stays JSON text,
+/// read back only for the versions an operation describes.
 struct Entry {
     /// The chart name, as written.
     name: String,
     version: Version,
-    /// The index entry (Chart.yaml's metadata, `urls`, `created`, `digest`).
-    metadata: Map<String, Value>,
+    /// Its `created`.
+    created: Option<String>,
+    /// The first of its `urls`.
+    url: Option<String>,
+    /// The index entry (Chart.yaml's metadata, `urls`, `created`, `digest`),
+    /// as JSON.
+    metadata: Box<str>,
 }
 
 impl Entry {
-    fn created(&self) -> Option<String> {
-        self.metadata
-            .get("created")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+    /// The index entry ([`Entry::metadata`]).
+    fn metadata(&self) -> Map<String, Value> {
+        serde_json::from_str(&self.metadata).unwrap_or_default()
     }
 }
 
@@ -78,7 +90,7 @@ pub(crate) fn step(
                 freshness: Freshness::Metadata,
             }]))
         }
-        Some(Fetched::Found(body)) => match parse_index(body) {
+        Some(Fetched::Found(body)) => match parsed_index(&url, body) {
             Ok(index) => index,
             Err(e) => return Ok(failed(format!("upstream index {url}: {e}"))),
         },
@@ -108,6 +120,115 @@ fn done(answer: UpstreamAnswer) -> UpstreamStep {
 
 fn failed(reason: impl Into<String>) -> UpstreamStep {
     done(UpstreamAnswer::Failed(reason.into()))
+}
+
+/// The parsed `index.yaml` at `url` whose bytes are `body`.
+///
+/// The built-in plugin keeps the last few it parsed, one per URL, and reuses
+/// one while the upstream serves the same bytes (the host hands every
+/// operation the document it caches for the metadata TTL): comparing the
+/// bytes takes a millisecond where parsing takes half a second. Since the
+/// result depends on the bytes alone, it is the same for every repository
+/// that fetches them. Parses run one at a time: concurrent operations on a
+/// document nobody has parsed yet wait for the first parse instead of each
+/// running their own, and memory holds one parse at most.
+///
+/// A WebAssembly build parses for every operation: its instances are
+/// recycled and their memory is bounded, so it keeps nothing.
+fn parsed_index(url: &str, body: &[u8]) -> Result<Arc<Index>, String> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        parsed::get_or_parse(url, body)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = url;
+        parse_index(body).map(Arc::new)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod parsed {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::{parse_index, Index};
+
+    /// How many parsed indexes are kept, the most recently used.
+    pub(super) const KEPT: usize = 4;
+
+    /// A parsed index and the bytes it was parsed from.
+    struct Parsed {
+        url: String,
+        body: Arc<[u8]>,
+        index: Arc<Index>,
+        /// When it was last used ([`State::clock`]).
+        used: u64,
+    }
+
+    struct State {
+        parsed: Vec<Parsed>,
+        clock: u64,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        parsed: Vec::new(),
+        clock: 0,
+    });
+
+    /// Held while an index is parsed.
+    static PARSING: Mutex<()> = Mutex::new(());
+
+    pub(super) fn get_or_parse(url: &str, body: &[u8]) -> Result<Arc<Index>, String> {
+        if let Some(index) = lookup(url, body) {
+            return Ok(index);
+        }
+        let _parsing = PARSING.lock().unwrap_or_else(PoisonError::into_inner);
+        // Parsed while this one waited.
+        if let Some(index) = lookup(url, body) {
+            return Ok(index);
+        }
+        let index = Arc::new(parse_index(body)?);
+        let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        state.clock += 1;
+        let used = state.clock;
+        state.parsed.retain(|p| p.url != url);
+        if state.parsed.len() >= KEPT {
+            if let Some(oldest) = (0..state.parsed.len()).min_by_key(|&i| state.parsed[i].used) {
+                state.parsed.swap_remove(oldest);
+            }
+        }
+        state.parsed.push(Parsed {
+            url: url.to_string(),
+            body: body.into(),
+            index: Arc::clone(&index),
+            used,
+        });
+        Ok(index)
+    }
+
+    /// The index kept for `url`, when it was parsed from `body`.
+    fn lookup(url: &str, body: &[u8]) -> Option<Arc<Index>> {
+        let (kept, index) = {
+            let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+            let p = state.parsed.iter().find(|p| p.url == url)?;
+            (Arc::clone(&p.body), Arc::clone(&p.index))
+        };
+        // Compared outside the lock: a large index takes a moment.
+        if *kept != *body {
+            return None;
+        }
+        let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        state.clock += 1;
+        let now = state.clock;
+        if let Some(p) = state
+            .parsed
+            .iter_mut()
+            .find(|p| p.url == url && Arc::ptr_eq(&p.index, &index))
+        {
+            p.used = now;
+        }
+        Some(index)
+    }
 }
 
 /// Read an `index.yaml` (or a JSON one: JSON is YAML). Entries that are not
@@ -152,7 +273,17 @@ fn parse_index(body: &[u8]) -> Result<Index, String> {
                 .push(Entry {
                     name: name.to_string(),
                     version,
-                    metadata: metadata.clone(),
+                    created: metadata
+                        .get("created")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    url: metadata
+                        .get("urls")
+                        .and_then(Value::as_array)
+                        .and_then(|urls| urls.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    metadata: serde_json::to_string(metadata).unwrap_or_default().into(),
                 });
         }
     }
@@ -174,14 +305,7 @@ fn package_url(base: &str, index: &Index, target: &PackageRef) -> String {
             .iter()
             .find(|e| e.version.to_string() == target.version)
     });
-    let url = listed.and_then(|e| {
-        e.metadata
-            .get("urls")?
-            .as_array()?
-            .first()?
-            .as_str()
-            .map(str::to_string)
-    });
+    let url = listed.and_then(|e| e.url.clone());
     match url {
         Some(url) => resolve(base, &url),
         None => format!("{base}/{}-{}.tgz", target.id, target.version),
@@ -222,9 +346,9 @@ fn metadata(index: &Index, wanted: &PackageVersions, dating: bool) -> UpstreamSt
                 version: e.version.to_string(),
                 original_id: Some(e.name.clone()),
                 listed: true,
-                published: e.created(),
-                created: if dating { e.created() } else { None },
-                summary: Some(crate::summary(&e.metadata)),
+                published: e.created.clone(),
+                created: if dating { e.created.clone() } else { None },
+                summary: Some(crate::summary(&e.metadata())),
             })
             .collect(),
     }))
@@ -268,7 +392,7 @@ fn search(index: &Index, query: &SearchQuery) -> UpstreamSearch {
             UpstreamHit {
                 id: newest.name.clone(),
                 versions: versions.iter().map(|e| e.version.to_string()).collect(),
-                summary: Some(crate::summary(&newest.metadata)),
+                summary: Some(crate::summary(&newest.metadata())),
                 total_downloads: None,
             }
         })
@@ -302,6 +426,42 @@ mod tests {
             resolve(base, "https://cdn.example/x-1.0.0.tgz"),
             "https://cdn.example/x-1.0.0.tgz"
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_parsed_index_is_kept_while_the_upstream_serves_the_same_document() {
+        let url = "https://kept.example/stable/index.yaml";
+        let body = "apiVersion: v1\nentries:\n  demo:\n    - name: demo\n      version: 1.0.0\n";
+        // Concurrent operations on a new document share one parse.
+        let first: Vec<Arc<Index>> = std::thread::scope(|s| {
+            let parses: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| parsed_index(url, body.as_bytes()).unwrap()))
+                .collect();
+            parses.into_iter().map(|p| p.join().unwrap()).collect()
+        });
+        assert!(first.iter().all(|p| Arc::ptr_eq(p, &first[0])));
+        assert!(Arc::ptr_eq(
+            &parsed_index(url, body.as_bytes()).unwrap(),
+            &first[0]
+        ));
+
+        // A changed document is parsed again.
+        let changed = format!("{body}    - name: demo\n      version: 2.0.0\n");
+        let again = parsed_index(url, changed.as_bytes()).unwrap();
+        assert!(!Arc::ptr_eq(&again, &first[0]));
+        assert_eq!(again["demo"].len(), 2);
+
+        // A few are kept: more push the least recently used out.
+        for n in 0..parsed::KEPT {
+            parsed_index(
+                &format!("https://other{n}.example/index.yaml"),
+                body.as_bytes(),
+            )
+            .unwrap();
+        }
+        let evicted = parsed_index(url, changed.as_bytes()).unwrap();
+        assert!(!Arc::ptr_eq(&evicted, &again));
     }
 
     #[test]

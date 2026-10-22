@@ -122,7 +122,10 @@ otherwise.
   listing, and proxies of other chart repositories. The index lists chart
   metadata with the types Helm reads, so a Chart.yaml with `appVersion: 2`
   or an annotation `false` does not break it
-  ([#206](https://github.com/schmitch/forge/issues/206)). **NuGet** is a built-in plugin too (`plugins/nuget`), served at
+  ([#206](https://github.com/schmitch/forge/issues/206)). A Helm proxy
+  parses its upstream's index once while the upstream serves the same
+  document, one parse at a time, instead of once per operation
+  ([#207](https://github.com/schmitch/forge/issues/207)). **NuGet** is a built-in plugin too (`plugins/nuget`), served at
   `/v3/{repo}/` by the same dispatcher with the same paths, responses and
   proxy behaviour as before; its proxies read the upstream feed through the
   plugin's upstream side. `GET /admin/formats` lists the installed
