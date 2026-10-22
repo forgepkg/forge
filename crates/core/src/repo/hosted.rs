@@ -27,9 +27,9 @@ use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::repo::downloads::DownloadTally;
 use crate::repo::{
-    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
-    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
-    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
+    CacheInvalidator, DeleteOutcome, ImportOptions, ImportOutcome, NupkgLocation, PackageMutation,
+    PublishAuthorizationContext, PublishOutcome, PublishPolicy, RegistrationEntry, RepoError,
+    RepoReadOps, SearchHit, SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
 };
 
 /// Fetch raw bytes of a stored blob.
@@ -631,6 +631,108 @@ impl HostedWrite {
         // but deliberately does not touch the database or S3: authorization
         // needs the canonical identity extracted by the format parser first.
         let staged_nupkg = self.cas.stage(reader, max_upload_bytes).await?;
+        let (_, _, published) = self
+            .publish_staged(&repo_row, staged_nupkg, max_upload_bytes, None)
+            .await?;
+        match published {
+            Published::Created => Ok(PublishOutcome::Created),
+            Published::Replaced => Ok(PublishOutcome::Replaced),
+            other => Err(WriteError::Repo(RepoError::Storage(format!(
+                "a publish reported the import outcome {other:?}"
+            )))),
+        }
+    }
+
+    /// Import a package a migration staged from another registry (and
+    /// verified against that registry's checksums) through the same path as
+    /// a publish: parsing, the publish policy, CAS, the repository's
+    /// upload limit. Unlike a publish, a version that exists is not an
+    /// error: with the same bytes it is [`ImportOutcome::Identical`], with
+    /// other bytes it is replaced only with [`ImportOptions::overwrite`]
+    /// (even where the repository refuses redeploys) and otherwise reported
+    /// as [`ImportOutcome::Conflict`]. A stored version takes the source's
+    /// publish and last-download times, so retention judges it by its real
+    /// age.
+    pub async fn import_staged(
+        &self,
+        repo: &str,
+        staged: forge_storage::StagedBlob,
+        max_upload_bytes: u64,
+        options: &ImportOptions,
+    ) -> Result<ImportOutcome, WriteError> {
+        let repo_row = self.hosted_repo(repo).await?;
+        if staged.size > max_upload_bytes {
+            return Err(WriteError::TooLarge {
+                limit: max_upload_bytes,
+            });
+        }
+        let (id, version, published) = self
+            .publish_staged(&repo_row, staged, max_upload_bytes, Some(options))
+            .await?;
+        Ok(match published {
+            Published::Created => ImportOutcome::Created { id, version },
+            Published::Replaced => ImportOutcome::Replaced { id, version },
+            Published::Identical => ImportOutcome::Identical { id, version },
+            Published::Conflict => ImportOutcome::Conflict { id, version },
+            Published::Planned { replaces } => ImportOutcome::Planned {
+                id,
+                version,
+                replaces,
+            },
+        })
+    }
+
+    /// The SHA-256 of the package file of `(id, version)` in the hosted
+    /// repository `repository_id`, if the version exists: what an import
+    /// compares the source's checksum with before downloading anything.
+    pub async fn package_sha256(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<String>, WriteError> {
+        let Ok(version) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+        let lower = self.format.lower_id(id);
+        let Some(comp) = component_dao::find_component(&self.pool, repository_id, &lower, &version)
+            .await
+            .map_err(RepoError::from)?
+        else {
+            return Ok(None);
+        };
+        self.stored_package_sha256(&self.pool, comp.id).await
+    }
+
+    /// The SHA-256 of a component's package file.
+    async fn stored_package_sha256<'e, E>(
+        &self,
+        executor: E,
+        component_id: i64,
+    ) -> Result<Option<String>, WriteError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        Ok(
+            asset_dao::find_asset(executor, component_id, self.format.package_asset_path())
+                .await
+                .map_err(RepoError::from)?
+                .map(|asset| asset.blob_sha256),
+        )
+    }
+
+    /// Steps 2 to 5 of [`Self::store_upload`] for a staged package; with
+    /// `import`, an existing version is compared instead of refused (see
+    /// [`Self::import_staged`]). Returns the package's id (original casing)
+    /// and normalized version with the outcome.
+    async fn publish_staged(
+        &self,
+        repo_row: &forge_db::model::Repository,
+        staged_nupkg: forge_storage::StagedBlob,
+        max_upload_bytes: u64,
+        import: Option<&ImportOptions>,
+    ) -> Result<(String, String, Published), WriteError> {
+        let repo = repo_row.name.as_str();
 
         // 2. Parse the package from the temp file. parse_upload is sync and a
         //    package may be hundreds of MiB, so it runs on the blocking pool.
@@ -652,6 +754,13 @@ impl HostedWrite {
             .await
             .map_err(|e| WriteError::Repo(RepoError::Storage(format!("parse upload: {e}"))))??
         };
+        let done = |published: Published| {
+            Ok((
+                parsed.original_id.clone(),
+                parsed.version.clone(),
+                published,
+            ))
+        };
 
         let publish_context =
             self.publish_policy
@@ -672,17 +781,34 @@ impl HostedWrite {
         // S3: a CI job that re-pushes an unchanged version with
         // `--skip-duplicate` on every build would otherwise upload it each
         // time. The check in the transaction below stays the authority (a
-        // concurrent first push).
-        if !repo_row.allow_redeploy
-            && component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
+        // concurrent first push). An import compares the bytes instead.
+        let existing =
+            component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
                 .await
-                .map_err(RepoError::from)?
-                .is_some()
-        {
-            return Err(WriteError::Conflict {
-                id: parsed.original_id.clone(),
-                version: parsed.version.clone(),
-            });
+                .map_err(RepoError::from)?;
+        match (import, existing) {
+            (Some(options), Some(comp)) => {
+                let stored = self.stored_package_sha256(&self.pool, comp.id).await?;
+                if stored.as_deref() == Some(staged_nupkg.sha256.as_str()) {
+                    return done(Published::Identical);
+                }
+                if !options.overwrite {
+                    return done(Published::Conflict);
+                }
+                if options.dry_run {
+                    return done(Published::Planned { replaces: true });
+                }
+            }
+            (Some(options), None) if options.dry_run => {
+                return done(Published::Planned { replaces: false });
+            }
+            (None, Some(_)) if !repo_row.allow_redeploy => {
+                return Err(WriteError::Conflict {
+                    id: parsed.original_id.clone(),
+                    version: parsed.version.clone(),
+                });
+            }
+            _ => {}
         }
 
         // Authorization succeeded: the staged bytes may now be promoted into
@@ -729,13 +855,26 @@ impl HostedWrite {
         let mut component_id = existing.as_ref().map(|c| c.id);
         let replaced = match existing {
             Some(comp) => {
-                if !repo_row.allow_redeploy {
-                    // Duplicate and redeploy disabled → 409. Drop the tx; the
-                    // pending blobs become orphans the reconciler cleans up.
-                    return Err(WriteError::Conflict {
-                        id: parsed.original_id.clone(),
-                        version: parsed.version.clone(),
-                    });
+                match import {
+                    // Stored concurrently since the check above.
+                    Some(options) if !options.overwrite => {
+                        let stored = self.stored_package_sha256(&mut *tx, comp.id).await?;
+                        return done(if stored.as_deref() == Some(nupkg_sha.as_str()) {
+                            Published::Identical
+                        } else {
+                            Published::Conflict
+                        });
+                    }
+                    Some(_) => {}
+                    None if !repo_row.allow_redeploy => {
+                        // Duplicate and redeploy disabled → 409. Drop the tx; the
+                        // pending blobs become orphans the reconciler cleans up.
+                        return Err(WriteError::Conflict {
+                            id: parsed.original_id.clone(),
+                            version: parsed.version.clone(),
+                        });
+                    }
+                    None => {}
                 }
                 // Replacing the bytes destroys the old ones: the caller must
                 // also be allowed to delete this version (refusal drops the
@@ -765,7 +904,7 @@ impl HostedWrite {
         };
 
         let outcome = if replaced {
-            PublishOutcome::Replaced
+            Published::Replaced
         } else {
             let inserted = self
                 .insert_new_in_tx(
@@ -788,6 +927,9 @@ impl HostedWrite {
                 // did not exist yet, so the unique index decides. Report it as
                 // the documented conflict, not an internal error.
                 Err(WriteError::Repo(RepoError::Db(e))) if is_unique_violation(&e) => {
+                    if import.is_some() {
+                        return done(Published::Conflict);
+                    }
                     return Err(WriteError::Conflict {
                         id: parsed.original_id.clone(),
                         version: parsed.version.clone(),
@@ -795,13 +937,24 @@ impl HostedWrite {
                 }
                 Err(e) => return Err(e),
             }
-            PublishOutcome::Created
+            Published::Created
         };
 
         if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
             component_dao::set_manifest_summary(&mut *tx, id, summary)
                 .await
                 .map_err(RepoError::from)?;
+        }
+        if let (Some(id), Some(options)) = (component_id, import) {
+            component_dao::set_imported_times(
+                &mut tx,
+                id,
+                self.format.package_asset_path(),
+                options.published_at,
+                options.downloaded_at,
+            )
+            .await
+            .map_err(RepoError::from)?;
         }
 
         if let (Some((_, policy)), Some(context)) =
@@ -811,23 +964,38 @@ impl HostedWrite {
         }
 
         tx.commit().await.map_err(RepoError::from)?;
-        tracing::info!(
-            target: "forge::audit",
-            repo,
-            id = %parsed.id,
-            version = %parsed.version,
-            outcome = ?outcome,
-            principal = %self
-                .publish_policy
-                .as_ref()
-                .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label()),
-            "package published"
-        );
+        let principal = self
+            .publish_policy
+            .as_ref()
+            .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label());
+        match import {
+            Some(options) => tracing::info!(
+                target: "forge::audit",
+                action = "import",
+                repo,
+                id = %parsed.id,
+                version = %parsed.version,
+                outcome = ?outcome,
+                principal = %principal,
+                source = %options.source,
+                uploader = options.uploader.as_deref().unwrap_or(""),
+                "package imported"
+            ),
+            None => tracing::info!(
+                target: "forge::audit",
+                repo,
+                id = %parsed.id,
+                version = %parsed.version,
+                outcome = ?outcome,
+                principal = %principal,
+                "package published"
+            ),
+        }
 
         // 5. Invalidate the per-(repo,id) cache namespace.
         self.cache.invalidate_package(repo, &parsed.id).await;
 
-        Ok(outcome)
+        done(outcome)
     }
 
     /// Insert a brand-new component + `.nupkg`/`.nuspec` assets, increfing both
@@ -1257,6 +1425,21 @@ impl crate::repo::RepoWriteOps for HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         HostedWrite::relist(self, repo, id, version).await
     }
+}
+
+/// What [`HostedWrite::publish_staged`] did with a package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    Created,
+    Replaced,
+    /// Import only: the version exists with the same bytes.
+    Identical,
+    /// Import only: the version exists with other bytes and stays.
+    Conflict,
+    /// Import dry run only: what would be stored.
+    Planned {
+        replaces: bool,
+    },
 }
 
 /// Whether a `sqlx::Error` is a Postgres unique violation (SQLSTATE 23505).

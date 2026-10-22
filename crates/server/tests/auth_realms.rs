@@ -521,6 +521,213 @@ async fn admin_realm_crud_with_write_only_secrets() {
     assert_eq!(resp.status(), 204);
 }
 
+/// An `oidc` realm with `client_authentication = "federated_credential"`
+/// needs no client secret: forge publishes itself as the OIDC issuer of its
+/// client assertions (created with the realm), and the realm shows what the
+/// IdP's federated credential must name.
+#[tokio::test]
+async fn a_federated_credential_realm_needs_no_secret_and_publishes_the_issuer() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let discovery_url = format!("{}/.well-known/openid-configuration", srv.base_url);
+
+    // Forge has signed nothing yet: no issuer.
+    let resp = client.get(&discovery_url).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let issuer = "https://login.microsoftonline.com/tenant-id/v2.0";
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "oidc",
+            "name": format!("entra{}", common::unique()),
+            "enabled": false,
+            "config": {
+                "issuer": issuer,
+                "client_id": "app-id",
+                "client_authentication": "federated_credential",
+                // Not kept: nothing would send it.
+                "client_secret": "unused",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    let realm_id = created["id"].as_i64().unwrap();
+    assert_eq!(created["config"]["client_secret_set"], json!(false));
+    assert_eq!(
+        created["config"]["client_authentication"],
+        json!("federated_credential")
+    );
+    assert_eq!(
+        created["federated_credential"],
+        json!({
+            "issuer": "http://test.local",
+            "subject": format!("app-id@{issuer}"),
+            "audience": "api://AzureADTokenExchange",
+        })
+    );
+
+    // Saving the realm published the issuer, unauthenticated.
+    let resp = client.get(&discovery_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("public")));
+    let discovery: Value = resp.json().await.unwrap();
+    assert_eq!(discovery["issuer"], json!("http://test.local"));
+    assert_eq!(
+        discovery["jwks_uri"],
+        json!("http://test.local/.well-known/jwks.json")
+    );
+    assert_eq!(
+        discovery["id_token_signing_alg_values_supported"],
+        json!(["RS256"])
+    );
+    let jwks: Value = client
+        .get(format!("{}/.well-known/jwks.json", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let keys = jwks["keys"].as_array().expect("keys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kty"], json!("RSA"));
+    assert_eq!(keys[0]["use"], json!("sig"));
+    assert_eq!(keys[0]["alg"], json!("RS256"));
+    assert!(keys[0].get("d").is_none(), "public parts only");
+
+    // A sovereign cloud's audience.
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "config": {
+                "issuer": issuer,
+                "client_id": "app-id",
+                "client_authentication": "federated_credential",
+                "assertion_audience": " api://AzureADTokenExchangeUSGov ",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(
+        updated["federated_credential"]["audience"],
+        json!("api://AzureADTokenExchangeUSGov")
+    );
+
+    // Back to a client secret: one must be supplied.
+    let secret_config = json!({ "issuer": issuer, "client_id": "app-id" });
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "config": secret_config }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let mut with_secret = secret_config.clone();
+    with_secret["client_secret"] = json!("s3cret");
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "config": with_secret }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(updated["config"]["client_secret_set"], json!(true));
+    assert!(updated.get("federated_credential").is_none(), "{updated}");
+    assert!(updated["config"].get("client_authentication").is_none());
+
+    let resp = client
+        .delete(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+/// Instances share the issuer keys: the first creates them, the others pick
+/// them up, and a due rotation is done once (compare-and-swap) and then
+/// published by every instance before the new key signs.
+#[tokio::test]
+async fn instances_share_and_rotate_the_issuer_keys() {
+    use forge_core::oidc::assertion::{IssuerKeySet, KEY_ACTIVATION, KEY_ROTATION};
+    use forge_server::auth::{AssertionIssuer, ISSUER_KEYS_SETTING};
+
+    let pool = common::fresh_pool().await;
+    let a = AssertionIssuer::new(pool.clone(), None, "https://forge.test/".into());
+    let b = AssertionIssuer::new(pool.clone(), None, "https://forge.test".into());
+    assert_eq!(a.issuer(), "https://forge.test");
+    let kids = |keys: &IssuerKeySet| {
+        keys.keys()
+            .iter()
+            .map(|k| k.kid().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(a.published().await.unwrap().is_none());
+    let created = a.ensure().await.unwrap();
+    // `b` asked recently and found nothing: it asks again after a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let seen = b.published().await.unwrap().expect("b sees a's keys");
+    assert_eq!(kids(&created), kids(&seen));
+    assert_eq!(kids(&b.ensure().await.unwrap()), kids(&created));
+
+    // Age the stored keys past a rotation.
+    let stored = forge_db::authz_dao::get_setting(&pool, ISSUER_KEYS_SETTING)
+        .await
+        .unwrap()
+        .expect("stored keys");
+    let old = IssuerKeySet::generate(chrono::Utc::now() - KEY_ROTATION).unwrap();
+    forge_db::secret_dao::store_secret_setting(
+        &pool,
+        None,
+        ISSUER_KEYS_SETTING,
+        &forge_crypto::PlaintextSecret::from(old.to_stored()),
+        Some(&stored),
+    )
+    .await
+    .unwrap()
+    .expect("replaced");
+
+    a.refresh().await.unwrap();
+    let rotated = a.published().await.unwrap().unwrap();
+    assert_eq!(
+        rotated.keys().len(),
+        2,
+        "a fresh key in front of the old one"
+    );
+    assert_eq!(rotated.keys()[1].kid(), old.keys()[0].kid());
+    // The new key is published, but the old one signs until it is old enough.
+    let now = chrono::Utc::now();
+    assert_eq!(rotated.signing_key(now).kid(), old.keys()[0].kid());
+    assert_eq!(
+        rotated.signing_key(now + KEY_ACTIVATION).kid(),
+        rotated.keys()[0].kid()
+    );
+
+    // `b` rotates nothing more: it picks up `a`'s rotation.
+    b.refresh().await.unwrap();
+    assert_eq!(kids(&b.published().await.unwrap().unwrap()), kids(&rotated));
+    a.refresh().await.unwrap();
+    assert_eq!(kids(&a.published().await.unwrap().unwrap()), kids(&rotated));
+}
+
 /// #71: an API token Forge issued is never tried as a password, even when it
 /// cannot be used (its owner is deactivated, it expired or was revoked): a
 /// credential-forwarding realm would send the live secret upstream on every
@@ -689,10 +896,13 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
         Arc::new(tokio::sync::Semaphore::new(0)),
         std::time::Duration::from_millis(10),
     ));
+    let issuer =
+        forge_server::auth::AssertionIssuer::new(pool.clone(), None, config.public_base_url());
     let realms = forge_server::auth::RealmAuth::new(
         pool.clone(),
         forge_cache::Cache::l1_only(100),
         Arc::new(config),
+        issuer,
     )
     .with_password_limiter(no_slot);
     let snapshot = realms.snapshot().await.expect("snapshot");
@@ -1021,4 +1231,266 @@ async fn a_reorder_waits_for_a_realm_change_instead_of_deadlocking() {
     let (status, body) = reorder.await.unwrap();
     assert_eq!(status, 200, "{body}");
     assert_eq!(realm_order(&srv).await, order);
+}
+
+/// A credential-forwarding realm that keeps password hashes
+/// (`capture_password_hash`, migration 0035): an accepted login keeps one,
+/// turning the option off deletes them, `captured_password_only` signs the
+/// accounts in with them while the upstream is never asked, and the accounts
+/// can then be switched to local ones that keep signing in with the same
+/// password.
+#[tokio::test]
+async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
+    use wiremock::matchers::{any, header};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let basic = |user: &str, password: &str| {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    };
+    let alice = format!("alice{}", common::unique());
+    let bob = format!("bob{}", common::unique());
+    let upstream = MockServer::start().await;
+    let accepting = || async {
+        for (user, password) in [(&alice, "alice-pw"), (&bob, "bob-pw")] {
+            Mock::given(header("authorization", basic(user, password).as_str()))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+    };
+    accepting().await;
+
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let url = format!("{}/status", upstream.uri());
+    let login = |user: String, password: &'static str| {
+        let client = client.clone();
+        let url = format!("{}/auth/login", srv.base_url);
+        async move {
+            client
+                .post(url)
+                .json(&json!({ "username": user, "password": password }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let admin_call = |method: reqwest::Method, path: String, body: Option<Value>| {
+        let client = client.clone();
+        let url = format!("{}{path}", srv.base_url);
+        let (admin, password) = (admin.clone(), password.clone());
+        async move {
+            let mut req = client
+                .request(method, url)
+                .basic_auth(&admin, Some(&password));
+            if let Some(body) = body {
+                req = req.json(&body);
+            }
+            let resp = req.send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            (
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            )
+        }
+    };
+    let config = |extra: Value| {
+        let mut config = json!({ "url": url, "key_pepper": "pepper" });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        config
+    };
+
+    // Stopping forwarding without keeping hashes is refused.
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        "/admin/realms".into(),
+        Some(json!({
+            "kind": "credential_forwarding",
+            "name": "nexus-only",
+            "config": config(json!({ "captured_password_only": true })),
+        })),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("capture_password_hash"), "{body}");
+
+    let (status, realm) = admin_call(
+        reqwest::Method::POST,
+        "/admin/realms".into(),
+        Some(json!({
+            "kind": "credential_forwarding",
+            "name": "nexus",
+            "config": config(json!({ "capture_password_hash": true })),
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "{realm}");
+    assert_eq!(realm["config"]["capture_password_hash"], json!(true));
+    let realm_id = realm["id"].as_i64().unwrap();
+    let realm_path = format!("/admin/realms/{realm_id}");
+    let counts = || {
+        admin_call(
+            reqwest::Method::GET,
+            format!("{realm_path}/captured-passwords"),
+            None,
+        )
+    };
+
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(bob.clone(), "wrong").await, 401);
+    assert_eq!(
+        counts().await,
+        (
+            reqwest::StatusCode::OK,
+            json!({ "accounts": 1, "captured": 1 })
+        )
+    );
+    let (_, users) = admin_call(reqwest::Method::GET, "/admin/users".into(), None).await;
+    let alice_view = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(alice))
+        .expect("alice provisioned")
+        .clone();
+    assert_eq!(alice_view["auth_source"], json!("upstream-basic"));
+    assert!(
+        alice_view["captured_password_at"].is_string(),
+        "{alice_view}"
+    );
+
+    // Turning the option off deletes the kept hashes...
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({})) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(counts().await.1, json!({ "accounts": 1, "captured": 0 }));
+    // ...and turning it on again keeps them from each account's next upstream
+    // check on. Alice's verdict from before is cached again (the config is
+    // the one it was cached under), so her login keeps nothing until a
+    // re-authentication makes it ask the upstream.
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({ "capture_password_hash": true })) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(bob.clone(), "bob-pw").await, 200);
+    assert_eq!(counts().await.1, json!({ "accounts": 2, "captured": 1 }));
+    let alice_id = alice_view["id"].as_i64().unwrap();
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{alice_id}/reauth"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(counts().await.1, json!({ "accounts": 2, "captured": 2 }));
+
+    // Stop forwarding: the upstream must not be asked any more.
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({
+            "capture_password_hash": true,
+            "captured_password_only": true,
+        })) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    upstream.reset().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(alice.clone(), "wrong").await, 401);
+    assert_eq!(login(format!("carol{}", common::unique()), "x").await, 401);
+    // Basic auth on the wire works the same way.
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&bob, Some("bob-pw"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["user"]["username"],
+        json!(bob)
+    );
+
+    // Only a forwarded account with a kept password converts.
+    let admin_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(admin))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{admin_id}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409);
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        "/admin/users/0/convert-to-local".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    // One account, then the rest of the realm.
+    let (status, view) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{alice_id}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["auth_source"], json!("local"));
+    assert_eq!(view["captured_password_at"], Value::Null);
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        format!("{realm_path}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "converted": 1, "remaining": 0 }));
+
+    // Local accounts now, signing in with the same passwords; the upstream is
+    // still never asked (the mock verifies on drop).
+    for (user, pw) in [(&alice, "alice-pw"), (&bob, "bob-pw")] {
+        assert_eq!(login(user.clone(), pw).await, 200, "{user}");
+        let account = forge_db::user_dao::find_user_by_username(&srv.pool, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.auth_source, "local");
+    }
 }

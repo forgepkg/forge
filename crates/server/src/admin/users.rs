@@ -10,13 +10,18 @@
 //!
 //! Neither may remove the last active administrator: deactivating or deleting
 //! that user answers **409** ([`super::last_admin_conflict`]).
+//!
+//! A credential-forwarding account whose realm keeps password hashes
+//! (`capture_password_hash`) can be switched to a local account with the last
+//! password its upstream accepted: `POST /admin/users/{id}/convert-to-local`.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use chrono::{DateTime, Utc};
 use forge_db::authz_dao;
 use forge_db::model::AppUser;
-use forge_db::user_dao::{self, NewUser};
+use forge_db::user_dao::{self, ConvertedUser, NewUser};
 use serde::{Deserialize, Serialize};
 
 use super::{db_error, hash_password, last_admin_conflict};
@@ -34,6 +39,11 @@ pub struct UserView {
     /// realm). Two accounts can look alike by name (`bob`, `bob@entra`); this
     /// tells them apart before a grant goes to the wrong one.
     pub auth_source: String,
+    /// When the account's realm last kept a hash of the password its upstream
+    /// accepted (`capture_password_hash`); `null` when it keeps none. Such an
+    /// account can be switched to a local one
+    /// (`POST /admin/users/{id}/convert-to-local`).
+    pub captured_password_at: Option<DateTime<Utc>>,
 }
 
 impl From<&AppUser> for UserView {
@@ -44,7 +54,21 @@ impl From<&AppUser> for UserView {
             is_admin: u.is_admin,
             active: u.active,
             auth_source: u.auth_source.clone(),
+            captured_password_at: None,
         }
+    }
+}
+
+impl UserView {
+    /// The view of `u`, with its kept-password time read from the database.
+    async fn load(state: &AppState, u: &AppUser) -> Result<Self, Response> {
+        let captured_password_at = user_dao::captured_password_at(&state.pool, u.id)
+            .await
+            .map_err(db_error)?;
+        Ok(UserView {
+            captured_password_at,
+            ..UserView::from(u)
+        })
     }
 }
 
@@ -77,13 +101,23 @@ pub struct UpdateUser {
 
 /// `GET /admin/users`
 pub async fn list(State(state): State<AppState>) -> Response {
-    match user_dao::list_users(&state.pool).await {
-        Ok(users) => {
-            let views: Vec<UserView> = users.iter().map(UserView::from).collect();
-            Json(views).into_response()
-        }
-        Err(e) => db_error(e),
-    }
+    let users = match user_dao::list_users(&state.pool).await {
+        Ok(users) => users,
+        Err(e) => return db_error(e),
+    };
+    let captured: std::collections::HashMap<i64, DateTime<Utc>> =
+        match user_dao::captured_password_times(&state.pool).await {
+            Ok(times) => times.into_iter().collect(),
+            Err(e) => return db_error(e),
+        };
+    let views: Vec<UserView> = users
+        .iter()
+        .map(|u| UserView {
+            captured_password_at: captured.get(&u.id).copied(),
+            ..UserView::from(u)
+        })
+        .collect();
+    Json(views).into_response()
 }
 
 /// `POST /admin/users`
@@ -190,7 +224,10 @@ pub async fn update(
         tracing::info!(user_id = user.id, username = %user.username, "user deactivated");
     }
     forge_core::authz::cache::invalidate_user(&state.cache, user.id).await;
-    Json(UserView::from(&user)).into_response()
+    match UserView::load(&state, &user).await {
+        Ok(view) => Json(view).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// `DELETE /admin/users/{id}` — delete the user (sessions, tokens, role
@@ -258,6 +295,68 @@ pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         }
         Err(e) => db_error(e),
     }
+}
+
+/// `POST /admin/users/{id}/convert-to-local` — switch a credential-forwarding
+/// account to a local one whose password is the hash its realm kept
+/// (`capture_password_hash`): the last password the upstream accepted for it.
+///
+/// The account keeps its id, roles, tokens and admin and active flags, and
+/// leaves its realm: from then on the local-password realm owns the name, so
+/// the password is never forwarded upstream again, and a password changed
+/// upstream since the hash was kept no longer works here. The account signs
+/// in only while the local realm is enabled and comes before any
+/// credential-forwarding realm whose upstream still accepts the name. An
+/// orphan of a deleted realm converts the same way. Its cached upstream
+/// verdicts are purged.
+///
+/// Returns the updated [`UserView`]; **409** when the account is not a
+/// credential-forwarding one or keeps no password.
+pub async fn convert_to_local(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let converted = match user_dao::convert_to_local(&state.pool, id).await {
+        Ok(Some(converted)) => converted,
+        Ok(None) => {
+            return match user_dao::find_user_by_id(&state.pool, id).await {
+                Ok(Some(_)) => (
+                    StatusCode::CONFLICT,
+                    "only a credential-forwarding account with a kept password can be \
+                     switched to a local one",
+                )
+                    .into_response(),
+                Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+                Err(e) => db_error(e),
+            }
+        }
+        Err(e) => return db_error(e),
+    };
+    if let Err(resp) = purge_converted(&state, std::slice::from_ref(&converted)).await {
+        return resp;
+    }
+    match user_dao::find_user_by_id(&state.pool, id).await {
+        Ok(Some(user)) => Json(UserView::from(&user)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// After accounts were switched to local ones: purge their cached upstream
+/// verdicts (all providers, broadcast to peer caches), which no longer speak
+/// for them.
+pub(crate) async fn purge_converted(
+    state: &AppState,
+    converted: &[ConvertedUser],
+) -> Result<(), Response> {
+    for user in converted {
+        tracing::info!(user_id = user.id, username = %user.username, "account switched to a local password");
+        if let Err(e) =
+            forge_core::auth::revoke_credentials_for_user(&state.cache, &state.pool, &user.username)
+                .await
+        {
+            tracing::error!(error = %e, user_id = user.id, "credential verdict revoke failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
+        }
+    }
+    Ok(())
 }
 
 /// Set `active` in a transaction under the last-admin guard (only a

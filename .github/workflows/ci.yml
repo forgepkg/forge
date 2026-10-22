@@ -466,6 +466,7 @@ jobs:
           docker pull mirror.gcr.io/versity/versitygw:v1.4.1
           docker pull mirror.gcr.io/versity/versitygw:v1.9.0
           docker pull mirror.gcr.io/library/redis:5.0
+          docker pull mirror.gcr.io/sonatype/nexus3:3.70.1
 
       - name: Run e2e tests (forge-e2e feature)
         id: tests

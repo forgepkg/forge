@@ -161,6 +161,11 @@ base64 = { version = "0.23" }
 # bringing its own HTTP-client abstraction.
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
+# RSA key generation and signing for the client assertions forge issues
+# itself (forge_core::oidc::assertion): the crypto backend `jsonwebtoken`
+# already links, used directly where `jsonwebtoken` has no key generation.
+aws-lc-rs = { version = "1.18" }
+
 # Temp files
 tempfile = { version = "3" }
 
