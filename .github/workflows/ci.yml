@@ -63,6 +63,9 @@ env:
 
 jobs:
   # ── Formatting ─────────────────────────────────────────────────────────────
+  # No job waits for this one (`needs: [fmt]`): a job behind `needs` joins
+  # the runner queue only once fmt is done, so when the runners are busy the
+  # long jobs would queue twice (#337).
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -82,7 +85,6 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    needs: [fmt]
 
     services:
       # For `cargo sqlx prepare --check`: the migrations run against it, then
@@ -157,7 +159,6 @@ jobs:
   plugins:
     name: plugins
     runs-on: ubuntu-latest
-    needs: [fmt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml) (with clippy, wasm32-wasip2)
@@ -181,7 +182,6 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
-    needs: [fmt]
 
     env:
       SQLX_OFFLINE: "true"
@@ -226,7 +226,6 @@ jobs:
   docker:
     name: docker
     runs-on: ubuntu-latest
-    needs: [fmt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The BuildKit release.yml builds with (pinned by digest; keep in step),
@@ -348,7 +347,6 @@ jobs:
   oci-e2e:
     name: oci-e2e
     runs-on: ubuntu-latest
-    needs: [fmt]
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939

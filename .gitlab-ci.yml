@@ -89,6 +89,8 @@ variables:
   DOCKER_TLS_CERTDIR: ""
 
 # ── Formatting ─────────────────────────────────────────────────────────────
+# No job waits for this one: every job has `needs: []` and starts with the
+# pipeline instead of after its stage, as on GitHub (#337).
 fmt:
   stage: fmt
   script:
@@ -101,7 +103,7 @@ fmt:
 # like GitHub's, so the job waits for Postgres before using it.
 clippy:
   stage: clippy
-  needs: ["fmt"]
+  needs: []
   services:
     - name: mirror.gcr.io/library/postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
       alias: postgres
@@ -142,7 +144,7 @@ audit:
 # component for wasm32-wasip2. The tests that load a component run in `test`.
 plugins:
   stage: test
-  needs: ["fmt"]
+  needs: []
   cache:
     <<: *cargo-cache
   script:
@@ -160,7 +162,7 @@ plugins:
 # would rebuild most of it.
 test:
   stage: test
-  needs: ["fmt"]
+  needs: []
   services:
     - *dind-service
   variables:
@@ -189,7 +191,7 @@ test:
 # caught before a release tag, not by it.
 docker:
   stage: build
-  needs: ["fmt"]
+  needs: []
   image: mirror.gcr.io/library/docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
   services:
     - *dind-service
@@ -232,7 +234,7 @@ kubernetes:
 # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
 # output (web/dist/) is what the Rust server serves via ServeDir; building here
 # guards against TS/Vite breakage. Runs on the node image, independent of the
-# Rust jobs (only `needs: []` so it starts immediately).
+# Rust jobs (`needs: []` so it starts immediately).
 web:
   stage: web
   needs: []
