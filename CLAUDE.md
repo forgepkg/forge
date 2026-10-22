@@ -33,3 +33,38 @@ sudo dockerd &
 The `Dockerfile` and `deploy/` keep the canonical Docker Hub names, for
 Dependabot and for deployments; CI's BuildKit and GitLab's Docker daemon pull
 them through the mirror as their `docker.io` registry mirror.
+
+## Pull requests: one per issue, stacked
+
+One pull request fixes one issue, and one issue is fixed by one pull request:
+its description says `Fixes #<n>` for that issue alone. Never fold the fixes
+of several issues into one pull request, however small each is, and never
+spread one issue over several. A change no issue asks for goes in a pull
+request of its own, not into an issue's.
+
+Several issues at once (the findings of a release review, a batch handed to
+one session) become a stack of pull requests, one per issue, even when the
+issues are independent: each pull request is then reviewed and checked on
+top of the fixes that land before it. Only an issue that must not wait for
+the others, such as an urgent fix, gets a pull request of its own off `main`.
+
+- The bottom branch starts from `main`, and its pull request targets `main`.
+  Each further branch starts from the branch below it, and its pull request
+  targets that branch, so its diff holds its own issue only. Its description
+  names the pull request it builds on: `Stacked on #<m>; merge that first.`
+- Put an issue above every issue it builds on. CI runs on a stacked pull
+  request as on any other, with the fixes below it in place.
+- In a cloud session, the session's branch is the bottom of the stack; push
+  each further branch as `claude/<topic>`. A stack takes one branch per pull
+  request, so these pushes are expected.
+- A change to a lower pull request (a review or CI fix, a merge of `main`)
+  is pushed to its branch, then merged up the stack: into the branch above,
+  that one into the next, pushing each. Merge, never rebase: a rebase
+  rewrites every branch above and force-pushes pull requests under review.
+- Merge from the bottom: only a pull request that targets `main` is merged
+  or queued. Never merge a stacked pull request into the branch below it:
+  its fix would land in the other pull request, and `Fixes #<n>` closes an
+  issue only on a merge into `main`. Once the bottom pull request is merged,
+  its branch is deleted and GitHub retargets the next one to `main`; if the
+  branch is still there, change the next pull request's base to `main`
+  yourself.
