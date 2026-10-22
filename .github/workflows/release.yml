@@ -9,7 +9,8 @@ name: Release
 # signature, and a GitHub release whose notes come from the matching
 # CHANGELOG.md section. The Helm chart (deploy/helm/forge) is published next
 # to it as oci://ghcr.io/<owner>/charts/forge:<version>, pinned to the signed
-# image digest and signed the same way.
+# image digest and signed the same way, once the dependency images it and the
+# Kubernetes manifests pin are on ghcr.io and public (mirror-images.yml).
 #
 # Order of operations: the image is pushed BY DIGEST (untagged), the digest is
 # signed and the signature verified, and only then are the tags attached
@@ -137,9 +138,21 @@ jobs:
             sleep 30
           done
 
+  # The pinned PostgreSQL, Valkey and versitygw images, on ghcr.io and
+  # public before a chart that pulls them is published.
+  mirror:
+    name: mirror dependency images
+    needs: [ci]
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    uses: ./.github/workflows/mirror-images.yml
+    with:
+      release: true
+
   image:
     name: build, push, sign
-    needs: [ci]
+    needs: [ci, mirror]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release

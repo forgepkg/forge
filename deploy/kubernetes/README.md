@@ -56,9 +56,13 @@ only go forward, read the changelog before that happens.
 
 Release images are signed; the cosign command is in each GitHub release. If
 the GHCR package is not public, give the `forge` ServiceAccount an
-`imagePullSecrets` entry. The images of the postgres, valkey and s3-versitygw
-components are pinned by digest (`tag@sha256:…`); Dependabot proposes
-updates.
+`imagePullSecrets` entry. The postgres, valkey and s3-versitygw components
+pull from ghcr.io too: `ghcr.io/schmitch/forge/<name>` holds byte-for-byte
+copies of the Docker Hub images under the same digests, pinned by digest
+(`tag@sha256:…`); Dependabot proposes updates. To pull the originals
+instead, add an `images:` entry to your overlay (`name:
+ghcr.io/schmitch/forge/valkey`, `newName: valkey/valkey`); the digest stays
+valid.
 
 ## Configuration and secrets
 

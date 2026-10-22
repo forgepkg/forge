@@ -30,9 +30,14 @@ echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/da
 sudo dockerd &
 ```
 
-The `Dockerfile` and `deploy/` keep the canonical Docker Hub names, for
-Dependabot and for deployments; CI's BuildKit and GitLab's Docker daemon pull
-them through the mirror as their `docker.io` registry mirror.
+The `Dockerfile` keeps the canonical Docker Hub names, for Dependabot; CI's
+BuildKit and GitLab's Docker daemon pull them through the mirror as their
+`docker.io` registry mirror. `deploy/` names no Docker Hub image at all: the
+chart and the manifests pull the dependencies' byte-for-byte copies on
+ghcr.io (`ghcr.io/schmitch/forge/<name>`, the same digests), which
+`.github/workflows/mirror-images.yml` makes from `mirror.gcr.io`. A new
+dependency image goes there too: add it to `.github/scripts/mirror-images.sh`
+and name its ghcr.io copy.
 
 ## Pull requests: one per issue, stacked
 

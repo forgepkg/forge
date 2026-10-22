@@ -1,0 +1,63 @@
+name: Mirror images
+
+# Copies the images of the in-cluster dependencies (PostgreSQL, Valkey,
+# versitygw) from Docker Hub to ghcr.io/<owner>/<repo>/<name> under the same
+# digests, so the Helm chart and the Kubernetes manifests pull every image
+# from ghcr.io (.github/scripts/mirror-images.sh). Runs when a change of
+# deploy/ lands on the default branch, so a new pin pulls right after the
+# merge; daily, so the tags Dependabot watches on ghcr.io follow Docker Hub;
+# on demand; and from the release workflow (the pinned digests only, which
+# must be public) before it publishes the chart.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - deploy/**
+      - .github/scripts/mirror-images.sh
+      - .github/workflows/mirror-images.yml
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: Mirror only the pinned digests, and fail on one that cannot be pulled anonymously.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    name: mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    env:
+      # Built from source by `go install`, so the Go checksum database
+      # verifies it (go-containerregistry publishes no checksums we could pin
+      # here).
+      CRANE_VERSION: v0.22.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install crane
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Mirror the dependency images
+        env:
+          RELEASE: ${{ inputs.release || false }}
+        run: |
+          if [ "$RELEASE" = true ]; then
+            .github/scripts/mirror-images.sh --pinned-only --require-public
+          else
+            .github/scripts/mirror-images.sh
+          fi
