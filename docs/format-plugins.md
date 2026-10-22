@@ -471,7 +471,12 @@ to lift them:
 - **A Helm upstream is read whole.** Every upstream operation of a Helm
   proxy reads the upstream's `index.yaml` (cached for the metadata TTL, and
   at most `proxy.max_metadata_bytes`, 32 MiB by default); the contract has
-  no ranged or streamed reads of an upstream document.
+  no ranged or streamed reads of an upstream document. The built-in plugin
+  keeps the parsed index while the upstream serves the same document (the
+  last four upstreams, about twice the document's size each) and parses one
+  index at a time, so a chart listing through a proxy parses the index
+  once, not once per chart. A WebAssembly build of the plugin keeps nothing
+  and parses the index for every operation.
 
 ### NuGet as a plugin
 
