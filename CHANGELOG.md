@@ -120,6 +120,11 @@ until the release folds them in.
   every chunk was written through to the cache next to the assembled blob,
   and evicted as much content that is downloaded. Only the blob is cached.
   ([#213](https://github.com/schmitch/forge/issues/213))
+- Blob cache: with several replicas, `GET /admin/blob-cache` answered with
+  the statistics of whichever replica served the request, without saying
+  which one. The response names it in `instance` (host name and start
+  time), and the deployment guide says the numbers are per instance.
+  ([#214](https://github.com/schmitch/forge/issues/214))
 
 ## [1.1.0]
 
