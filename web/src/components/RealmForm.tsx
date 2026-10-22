@@ -1,6 +1,7 @@
 import { useState } from 'react'
 
 import type {
+  ClientAuthentication,
   CredentialForwardingConfig,
   OidcRealmConfig,
   RealmConfig,
@@ -9,6 +10,7 @@ import type {
   WorkloadIdentityConfig,
 } from '~/api/realms'
 import { Button } from '~/components/catalyst/button'
+import { CommandSnippet } from '~/components/CopyButton'
 import {
   Checkbox,
   CheckboxField,
@@ -30,7 +32,9 @@ import { Select } from '~/components/catalyst/select'
 /**
  * Shared auth-realm create/edit form (§12.7). Kind-conditional fields:
  *
- *  - **oidc** → issuer / client / write-only secret / claims / provisioning /
+ *  - **oidc** → issuer / client / write-only secret or a federated credential
+ *    (Forge's own client assertions: no secret; shows the issuer, subject and
+ *    audience the IdP's credential must name) / claims / provisioning /
  *    login domains / button label
  *  - **credential_forwarding** → upstream URL / acceptance criteria /
  *    timeouts / groups / caching TTLs / write-only key pepper
@@ -69,6 +73,9 @@ export interface RealmFormValues {
   client_id: string
   /** Newly-typed secret; blank ⇒ "leave unchanged" on edit / invalid on create. */
   client_secret: string
+  client_authentication: ClientAuthentication
+  /** Blank ⇒ the server default, `api://AzureADTokenExchange`. */
+  assertion_audience: string
   /** One scope per line. */
   scopes: string
   clock_skew_seconds: string
@@ -218,6 +225,8 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
     client_secret: '',
+    client_authentication: oidc.client_authentication ?? 'client_secret',
+    assertion_audience: oidc.assertion_audience ?? '',
     scopes: joinLines(oidc.scopes),
     clock_skew_seconds:
       existing?.kind === 'workload_identity'
@@ -301,9 +310,11 @@ export function RealmForm({
   // ID stay the same (it must not reach another IdP), so after changing
   // either one the save needs a new secret.
   const storedOidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
+  const usesClientSecret = values.client_authentication === 'client_secret'
   const secretWillDrop =
     mode === 'edit' &&
     values.kind === 'oidc' &&
+    usesClientSecret &&
     hasStoredSecret(existing, 'client_secret_set') &&
     (secretBinding(values.issuer) !== secretBinding(storedOidc.issuer ?? '') ||
       secretBinding(values.client_id) !== secretBinding(storedOidc.client_id ?? ''))
@@ -324,7 +335,12 @@ export function RealmForm({
       if (values.client_id.trim() === '') {
         next.client_id = 'A client ID is required.'
       }
-      if (mode === 'create' && values.client_secret === '') {
+      if (!usesClientSecret) {
+        // Forge signs a client assertion instead: no secret.
+      } else if (
+        (mode === 'create' || !hasStoredSecret(existing, 'client_secret_set')) &&
+        values.client_secret === ''
+      ) {
         next.client_secret = 'A client secret is required.'
       } else if (secretWillDrop && values.client_secret === '') {
         next.client_secret =
@@ -564,6 +580,23 @@ export function RealmForm({
                   <ErrorMessage role="alert">{errors.client_id}</ErrorMessage>
                 )}
               </Field>
+              <Field>
+                <Label>Client authentication</Label>
+                <Select
+                  value={values.client_authentication}
+                  onChange={(e) =>
+                    set('client_authentication', e.target.value as ClientAuthentication)
+                  }
+                >
+                  <option value="client_secret">Client secret</option>
+                  <option value="federated_credential">
+                    Federated credential (no secret)
+                  </option>
+                </Select>
+              </Field>
+            </div>
+
+            {usesClientSecret ? (
               <SecretField
                 label="Client secret"
                 error={errors.client_secret}
@@ -572,7 +605,13 @@ export function RealmForm({
                 stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
                 willDrop={secretWillDrop}
               />
-            </div>
+            ) : (
+              <FederatedCredentialFields
+                values={values}
+                saved={existing?.federated_credential}
+                onAudienceChange={(v) => set('assertion_audience', v)}
+              />
+            )}
 
             {secretWillDrop && values.client_secret === '' && (
               <p
@@ -1331,6 +1370,82 @@ export function RealmForm({
   )
 }
 
+/** The audience Entra recommends for a federated identity credential. */
+const DEFAULT_ASSERTION_AUDIENCE = 'api://AzureADTokenExchange'
+
+/**
+ * The subject of Forge's client assertions for a realm, as the server derives
+ * it: `<client id>@<issuer without a trailing slash>`.
+ */
+export function federatedSubject(issuer: string, clientId: string): string {
+  return `${clientId.trim()}@${issuer.trim().replace(/\/+$/, '')}`
+}
+
+/**
+ * The federated-credential half of the OIDC fields: the assertion audience,
+ * and the issuer, subject and audience to enter in the IdP's federated
+ * credential (Entra: Certificates & secrets → Federated credentials → Other
+ * issuer). Subject and audience follow the form; Forge's issuer URL is known
+ * once the realm is saved.
+ */
+function FederatedCredentialFields({
+  values,
+  saved,
+  onAudienceChange,
+}: {
+  values: RealmFormValues
+  saved?: RealmView['federated_credential']
+  onAudienceChange: (value: string) => void
+}) {
+  const subject =
+    values.issuer.trim() !== '' && values.client_id.trim() !== ''
+      ? federatedSubject(values.issuer, values.client_id)
+      : null
+  const audience = values.assertion_audience.trim() || DEFAULT_ASSERTION_AUDIENCE
+  return (
+    <div className="space-y-4">
+      <Field>
+        <Label>Assertion audience</Label>
+        <Input
+          type="text"
+          value={values.assertion_audience}
+          onChange={(e) => onAudienceChange(e.target.value)}
+          placeholder={DEFAULT_ASSERTION_AUDIENCE}
+        />
+        <Description>
+          Leave blank for Entra&apos;s default. Sovereign clouds use their own
+          (e.g. <code>api://AzureADTokenExchangeUSGov</code>).
+        </Description>
+      </Field>
+      <div className="space-y-3 rounded-lg bg-zinc-950/[2.5%] px-3 py-3 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:ring-white/10">
+        <p className="text-sm/6 text-zinc-600 dark:text-zinc-400">
+          Forge signs in at the IdP with a client assertion it signs itself, as
+          an OpenID Connect issuer publishing{' '}
+          <code>/.well-known/openid-configuration</code> and its keys (rotated
+          automatically). Add a federated credential for an <em>other
+          issuer</em> to the app registration with these values; the IdP must
+          reach Forge&apos;s issuer URL over https.
+        </p>
+        {saved ? (
+          <CommandSnippet command={saved.issuer} label="Issuer" copyLabel="Copy issuer" />
+        ) : (
+          <p className="text-sm/6 text-zinc-600 dark:text-zinc-400">
+            Forge&apos;s issuer URL is shown once the realm is saved.
+          </p>
+        )}
+        {subject && (
+          <CommandSnippet
+            command={subject}
+            label="Subject identifier"
+            copyLabel="Copy subject identifier"
+          />
+        )}
+        <CommandSnippet command={audience} label="Audience" copyLabel="Copy audience" />
+      </div>
+    </div>
+  )
+}
+
 function hasStoredSecret(
   existing: RealmView | undefined,
   flag: 'client_secret_set' | 'key_pepper_set',
@@ -1523,7 +1638,13 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       link_existing_by_username: values.link_existing_by_username,
       allow_http_issuer: values.allow_http_issuer,
     }
-    if (values.client_secret !== '') config.client_secret = values.client_secret
+    if (values.client_authentication === 'federated_credential') {
+      config.client_authentication = 'federated_credential'
+      const audience = values.assertion_audience.trim()
+      if (audience !== '') config.assertion_audience = audience
+    } else if (values.client_secret !== '') {
+      config.client_secret = values.client_secret
+    }
     const scopes = parseLines(values.scopes)
     if (scopes.length > 0) config.scopes = scopes
     const skew = parseNumber(values.clock_skew_seconds)

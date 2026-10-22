@@ -21,6 +21,13 @@ import { httpClient } from '~/lib/httpClient'
 /** Realm kinds. */
 export type RealmKind = 'local' | 'oidc' | 'credential_forwarding' | 'workload_identity'
 
+/**
+ * How an OIDC realm authenticates at the IdP's token endpoint: its client
+ * secret, or a client assertion Forge signs itself as an OIDC issuer (an
+ * Entra federated identity credential; no secret is stored).
+ */
+export type ClientAuthentication = 'client_secret' | 'federated_credential'
+
 /** OIDC realm config (redacted on read: `client_secret` -> `client_secret_set`). */
 export interface OidcRealmConfig {
   issuer: string
@@ -29,6 +36,10 @@ export interface OidcRealmConfig {
   client_secret?: string
   /** Read-side redaction flag: a secret is stored. */
   client_secret_set?: boolean
+  /** Absent: `client_secret`. */
+  client_authentication?: ClientAuthentication
+  /** `aud` of Forge's client assertions; absent: `api://AzureADTokenExchange`. */
+  assertion_audience?: string
   scopes?: string[]
   clock_skew_seconds?: number
   allow_http_issuer?: boolean
@@ -121,6 +132,18 @@ export type RealmConfig =
   | WorkloadIdentityConfig
   | Record<string, never>
 
+/**
+ * What the IdP's federated credential must name for an OIDC realm that
+ * authenticates with Forge's client assertions (derived by the server).
+ */
+export interface FederatedCredential {
+  /** Forge's issuer URL (its public base URL). */
+  issuer: string
+  /** `<client id>@<the realm's issuer>`. */
+  subject: string
+  audience: string
+}
+
 /** Redacted realm view (`GET /admin/realms[/{id}]`). */
 export interface RealmView {
   id: number
@@ -129,6 +152,8 @@ export interface RealmView {
   enabled: boolean
   priority: number
   config: RealmConfig
+  /** Only for an OIDC realm with `client_authentication: 'federated_credential'`. */
+  federated_credential?: FederatedCredential
   created_at: string
   updated_at: string
 }
