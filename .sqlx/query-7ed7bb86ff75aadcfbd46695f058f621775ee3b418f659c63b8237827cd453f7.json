@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT base_url, registry_url FROM nexus_import WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "base_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "base_url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "registry_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "nexus_import",
+            "name": "registry_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "7ed7bb86ff75aadcfbd46695f058f621775ee3b418f659c63b8237827cd453f7"
+}
