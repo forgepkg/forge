@@ -234,6 +234,9 @@ struct Index {
     reserved: u64,
     /// Fills in progress, joined by concurrent misses of the same blob.
     fills: HashMap<Key, Arc<watch::Sender<FillState>>>,
+    /// Hash checks of entries found by the startup scan, joined by
+    /// concurrent hits of the same entry.
+    verifying: HashMap<Key, Arc<watch::Sender<Check>>>,
     /// Keys whose entries are gone and whose files are being removed,
     /// outside the lock: no fill or write-through of them starts, and none
     /// commits, until the old file is gone.
@@ -290,9 +293,20 @@ impl Index {
     }
 }
 
+/// How far the hash check of an entry found by the startup scan has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Running,
+    /// The file matches its hash: the entry is verified.
+    Matches,
+    /// The file is damaged or unreadable: the entry is gone.
+    Failed,
+}
+
 /// Cache activity counters.
 #[derive(Debug, Default)]
 struct Counters {
+    verifications: AtomicU64,
     hits: AtomicU64,
     hit_bytes: AtomicU64,
     hits_while_store_down: AtomicU64,
@@ -316,6 +330,9 @@ pub struct BlobCacheStats {
     pub size_bytes: u64,
     /// Bytes promised to fills in progress.
     pub reserved_bytes: u64,
+    /// Entries found by the startup scan whose files were checked against
+    /// their hash (on their first hit).
+    pub verifications: u64,
     /// The effective limit.
     pub limit_bytes: u64,
     /// Whether the limit is sized from the disk (`max_bytes = "auto"`).
@@ -627,6 +644,7 @@ impl BlobCache {
             entries,
             size_bytes,
             reserved_bytes,
+            verifications: get(&c.verifications),
             limit_bytes,
             limit_auto: self.inner.max_bytes == CacheLimit::Auto,
             hits: get(&c.hits),
@@ -675,48 +693,28 @@ impl BlobCache {
 
     /// The cached file of `sha256`, open for reading, when it is cached
     /// with `size` bytes. An entry first hit after the startup scan is
-    /// checked against its hash before it is served. A file that is missing,
-    /// unreadable, of another size or damaged is dropped (`None`: fetch it
-    /// from S3 again).
+    /// checked against its hash before it is served ([`Self::verify`]). A
+    /// file that is missing, unreadable, of another size or damaged is
+    /// dropped (`None`: fetch it from S3 again).
     pub(crate) async fn lookup(&self, sha256: &str, size: u64) -> Option<Arc<File>> {
         let key = parse_key(sha256)?;
         let entry = *self.lock().entries.get(&key)?;
+        if !entry.verified && !self.verify(key, entry).await {
+            return None;
+        }
         let path = self.path_of(&key);
         let check =
             tokio::task::spawn_blocking(move || -> std::io::Result<Result<File, String>> {
-                let mut file = File::open(&path)?;
+                let file = File::open(&path)?;
                 let len = file.metadata()?.len();
                 if len != size || len != entry.size {
                     return Ok(Err(format!("{len} bytes on disk, {size} expected")));
-                }
-                if !entry.verified {
-                    let mut hasher = Sha256::new();
-                    let mut buf = vec![0u8; 256 * 1024];
-                    loop {
-                        let n = file.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buf[..n]);
-                    }
-                    if hasher.finalize()[..] != key[..] {
-                        return Ok(Err("content does not match its sha256".into()));
-                    }
                 }
                 Ok(Ok(file))
             })
             .await;
         let problem = match check {
-            Ok(Ok(Ok(file))) => {
-                if !entry.verified {
-                    if let Some(current) = self.lock().entries.get_mut(&key) {
-                        if current.seq == entry.seq {
-                            current.verified = true;
-                        }
-                    }
-                }
-                return Some(Arc::new(file));
-            }
+            Ok(Ok(Ok(file))) => return Some(Arc::new(file)),
             Ok(Ok(Err(damage))) => {
                 self.inner.counters.corrupt.fetch_add(1, Ordering::Relaxed);
                 damage
@@ -731,6 +729,137 @@ impl BlobCache {
             self.remove_files_now(vec![key]).await;
         }
         None
+    }
+
+    /// Check the file of `entry`, found by the startup scan, against its
+    /// hash: `true` once it matches (the entry is then verified), `false`
+    /// when it is damaged (the entry and its file are gone) or the entry was
+    /// replaced meanwhile (look it up again).
+    ///
+    /// Concurrent hits of the entry share one check, which runs on the
+    /// blocking pool to its end even when every caller gives up waiting, so
+    /// a crowd of clients pulling a large blob after a restart reads and
+    /// hashes it once.
+    async fn verify(&self, key: Key, entry: Entry) -> bool {
+        let mut check = {
+            let mut index = self.lock();
+            match index.entries.get(&key) {
+                Some(current) if current.seq == entry.seq => {
+                    if current.verified {
+                        return true;
+                    }
+                }
+                _ => return false,
+            }
+            match index.verifying.get(&key) {
+                Some(running) => running.subscribe(),
+                None => {
+                    let running = Arc::new(watch::Sender::new(Check::Running));
+                    index.verifying.insert(key, running.clone());
+                    let check = running.subscribe();
+                    let cache = self.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            cache.run_verification(key, entry, &running);
+                        }));
+                        if ran.is_err() {
+                            // Never leave the waiters (and later hits) waiting.
+                            let mut index = cache.lock();
+                            if index
+                                .verifying
+                                .get(&key)
+                                .is_some_and(|r| Arc::ptr_eq(r, &running))
+                            {
+                                index.verifying.remove(&key);
+                            }
+                            drop(index);
+                            running.send_replace(Check::Failed);
+                        }
+                    }));
+                    check
+                }
+            }
+        };
+        loop {
+            match *check.borrow_and_update() {
+                Check::Matches => return true,
+                Check::Failed => return false,
+                Check::Running => {}
+            }
+            if check.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// Hash `entry`'s file and publish the outcome on `check` (blocking).
+    fn run_verification(&self, key: Key, entry: Entry, check: &watch::Sender<Check>) {
+        self.inner
+            .counters
+            .verifications
+            .fetch_add(1, Ordering::Relaxed);
+        let path = self.path_of(&key);
+        let hashed = (|| -> std::io::Result<Result<(), String>> {
+            let mut file = File::open(&path)?;
+            let len = file.metadata()?.len();
+            if len != entry.size {
+                return Ok(Err(format!("{len} bytes on disk, {} expected", entry.size)));
+            }
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            if hasher.finalize()[..] != key[..] {
+                return Ok(Err("content does not match its sha256".into()));
+            }
+            Ok(Ok(()))
+        })();
+        let problem = match hashed {
+            Ok(Ok(())) => None,
+            Ok(Err(damage)) => {
+                self.inner.counters.corrupt.fetch_add(1, Ordering::Relaxed);
+                Some(damage)
+            }
+            Err(error) => Some(format!("read error: {error}")),
+        };
+        let mut victims = Vec::new();
+        {
+            let mut index = self.lock();
+            if index
+                .verifying
+                .get(&key)
+                .is_some_and(|running| std::ptr::eq(running.as_ref(), check))
+            {
+                index.verifying.remove(&key);
+            }
+            match &problem {
+                None => {
+                    if let Some(current) = index.entries.get_mut(&key) {
+                        if current.seq == entry.seq {
+                            current.verified = true;
+                        }
+                    }
+                }
+                Some(_) => {
+                    if self.drop_entry(&mut index, &key, Some(entry.seq)).is_some() {
+                        victims.push(key);
+                    }
+                }
+            }
+        }
+        if let Some(problem) = problem {
+            tracing::warn!(sha256 = %hex(&key), problem = %problem, "dropping a damaged blob cache entry; reading it from S3");
+            // Gone before the waiting callers fill it again.
+            self.remove_files(victims);
+            check.send_replace(Check::Failed);
+        } else {
+            check.send_replace(Check::Matches);
+        }
     }
 
     /// Count a hit (`store_down`: while S3 is known to be down).
