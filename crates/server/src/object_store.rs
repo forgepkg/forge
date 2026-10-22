@@ -2,17 +2,25 @@
 //! optional local blob cache in front of it (`[blob_cache]`), the bucket
 //! check, and the cache's periodic maintenance.
 //!
+//! Garbage collection drops a blob it deletes from S3 from the cache of the
+//! instance that deletes it. Every other instance drops its copy at its next
+//! check of the cached blobs against the `blob` table
+//! ([`drop_deleted`], every [`DROP_DELETED_EVERY`] maintenance runs), so no
+//! instance keeps deleted bytes on disk for long.
+//!
 //! Without the cache, an S3 that cannot be reached at startup fails startup,
 //! as before. With it, the instance starts **degraded**: it serves what its
 //! cache holds (a persistent cache survives the restart), `/readyz` reports
 //! the object store `degraded` instead of failing, and the bucket check is
 //! retried in the background until S3 answers.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
 use forge_storage::{BlobCache, BlobCacheStats, BlobStore};
 use serde_json::{json, Value};
+use sqlx::PgPool;
 
 use crate::config::Config;
 
@@ -21,6 +29,13 @@ pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Every this many maintenance runs, the cache's statistics are logged.
 const LOG_EVERY: u64 = 10;
+
+/// Every this many maintenance runs (the first included), the cached blobs
+/// are checked against the database ([`drop_deleted`]).
+pub const DROP_DELETED_EVERY: u64 = 10;
+
+/// Cached blobs looked up in the database per query by [`drop_deleted`].
+const DROP_DELETED_BATCH: usize = 1000;
 
 /// Longest pause between two bucket checks while S3 is down at startup.
 const BUCKET_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -76,28 +91,63 @@ pub async fn ensure_bucket(store: &BlobStore) -> anyhow::Result<()> {
 }
 
 /// Re-read the cache's filesystem and evict down to its limit every
-/// `interval`, logging its statistics now and then.
-pub fn spawn_maintenance(cache: BlobCache, interval: Duration) -> tokio::task::JoinHandle<()> {
+/// `interval`, drop the blobs garbage collection deleted elsewhere every
+/// [`DROP_DELETED_EVERY`] runs, and log the cache's statistics now and then.
+pub fn spawn_maintenance(
+    cache: BlobCache,
+    pool: PgPool,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut runs = 0u64;
         loop {
             ticker.tick().await;
-            let cache = cache.clone();
-            let stats = match tokio::task::spawn_blocking(move || cache.maintain()).await {
+            runs += 1;
+            if runs % DROP_DELETED_EVERY == 1 {
+                match drop_deleted(&cache, &pool).await {
+                    Ok(0) => {}
+                    Ok(dropped) => tracing::info!(
+                        dropped,
+                        "dropped cached blobs that garbage collection deleted"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "checking the blob cache against the database failed")
+                    }
+                }
+            }
+            let maintained = cache.clone();
+            let stats = match tokio::task::spawn_blocking(move || maintained.maintain()).await {
                 Ok(stats) => stats,
                 Err(error) => {
                     tracing::warn!(%error, "blob cache maintenance failed");
                     continue;
                 }
             };
-            runs += 1;
             if runs % LOG_EVERY == 1 {
                 log_stats(&stats);
             }
         }
     })
+}
+
+/// Drop the cached blobs the database no longer holds (or is deleting):
+/// garbage collection deleted them from S3, on this instance or another.
+/// Returns how many were dropped.
+pub async fn drop_deleted(cache: &BlobCache, pool: &PgPool) -> anyhow::Result<u64> {
+    let mut dropped = 0;
+    for chunk in cache.sha256_chunks(DROP_DELETED_BATCH) {
+        let live: HashSet<String> = forge_db::blob_dao::live_among(pool, &chunk)
+            .await?
+            .into_iter()
+            .collect();
+        for sha256 in chunk.iter().filter(|sha256| !live.contains(*sha256)) {
+            cache.evict(sha256).await;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 fn log_stats(stats: &BlobCacheStats) {

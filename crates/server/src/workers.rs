@@ -250,11 +250,14 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     };
 
     // Local blob cache (per instance): pick up a resized volume or a disk
-    // something else fills, and log the cache's statistics now and then.
+    // something else fills, drop what garbage collection deleted on another
+    // instance, and log the cache's statistics now and then.
     let blob_cache = state.blob_store.cache().cloned().map(|cache| {
+        let pool = state.pool.clone();
         supervise("blob-cache", move || {
             crate::object_store::spawn_maintenance(
                 cache.clone(),
+                pool.clone(),
                 crate::object_store::MAINTENANCE_INTERVAL,
             )
         })

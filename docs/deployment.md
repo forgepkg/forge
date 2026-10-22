@@ -621,7 +621,10 @@ on, package downloads also answer `Range` requests.
 ago go first, however often they are read (a read changes nothing on disk).
 A file's modification time is its fill time, so the order survives a restart
 on a persistent volume. A blob that garbage collection deletes from S3 is
-dropped from the cache as well.
+dropped from the cache of the instance that deletes it at once, also when a
+download was filling it at the time. Every other instance checks its cached
+blobs against the database at startup and every 10 minutes, and drops those
+garbage collection deleted (one query per 1,000 cached blobs).
 
 **While S3 is down:**
 

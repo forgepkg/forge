@@ -126,3 +126,68 @@ async fn outbox_drained_once_across_two_instances() {
     drop(a);
     drop(b);
 }
+
+/// Garbage collection on one instance evicts the blob from that instance's
+/// cache only; every other instance drops its copy when it checks its cached
+/// blobs against the `blob` table (`object_store::drop_deleted`).
+#[tokio::test]
+async fn cached_blobs_garbage_collection_deleted_are_dropped() {
+    use forge_storage::{BlobCache, BlobCacheConfig, CacheLimit};
+    use sha2::{Digest, Sha256};
+
+    // Its own database: a zero-ref blob row would hold up the outbox test.
+    let pool = common::fresh_pool().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = BlobCache::open(BlobCacheConfig {
+        path: dir.path().join("cache"),
+        max_bytes: CacheLimit::Bytes(1 << 20),
+        min_free_bytes: Some(0),
+        staging: None,
+    })
+    .unwrap();
+    let mut blobs = Vec::new();
+    for state in ["committed", "deleting", "gone"] {
+        let bytes = format!("{state} blob {}", common::unique()).into_bytes();
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let staged = dir.path().join(&sha256);
+        std::fs::write(&staged, &bytes).unwrap();
+        cache
+            .insert_staged(&sha256, bytes.len() as u64, &staged)
+            .await;
+        match state {
+            "committed" => sqlx::query(
+                "INSERT INTO blob (sha256, size, s3_key, ref_count, state) \
+                 VALUES ($1, $2, $3, 1, 'committed')",
+            ),
+            "deleting" => sqlx::query(
+                "INSERT INTO blob (sha256, size, s3_key, ref_count, state, delete_token, \
+                 delete_previous_state, delete_started_at) \
+                 VALUES ($1, $2, $3, 0, 'deleting', gen_random_uuid(), 'committed', now())",
+            ),
+            _ => sqlx::query("SELECT $1, $2, $3"),
+        }
+        .bind(&sha256)
+        .bind(bytes.len() as i64)
+        .bind(format!("blobs/{sha256}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        blobs.push(sha256);
+    }
+    for _ in 0..200 {
+        if blobs.iter().all(|sha256| cache.contains(sha256)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(blobs.iter().all(|sha256| cache.contains(sha256)));
+
+    let dropped = forge_server::object_store::drop_deleted(&cache, &pool)
+        .await
+        .unwrap();
+    assert_eq!(dropped, 2);
+    assert!(cache.contains(&blobs[0]), "a live blob stays");
+    assert!(!cache.contains(&blobs[1]), "a blob being deleted goes");
+    assert!(!cache.contains(&blobs[2]), "a deleted blob goes");
+    assert_eq!(cache.stats().evictions, 2);
+}
