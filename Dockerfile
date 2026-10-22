@@ -160,10 +160,10 @@ COPY --from=web /web/dist /app/web/dist
 # can inspect/run them out-of-band, and to keep the layout self-documenting.
 COPY migrations /app/migrations
 # A baked, secret-free base config. Real secrets come from FORGE_* env at runtime
-# and override these values (FORGE_DATABASE__URL, FORGE_S3__*). Its placeholder
-# S3 keys (minioadmin) are REFUSED at startup unless overridden (or
-# FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true for local dev). It bakes NO
-# bootstrap admin: that comes only from FORGE_AUTH__BOOTSTRAP_ADMIN__* env.
+# (FORGE_DATABASE__URL, FORGE_S3__*): it holds no S3 keys, so an image started
+# without them (and without short-lived S3 credentials) refuses to start. It
+# bakes NO bootstrap admin: that comes only from FORGE_AUTH__BOOTSTRAP_ADMIN__*
+# env.
 COPY docker/forge.docker.toml /app/forge.toml
 
 # Numeric UID:GID (the `forge` user above) so Kubernetes `runAsNonRoot` can

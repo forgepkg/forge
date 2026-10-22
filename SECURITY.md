@@ -3,8 +3,10 @@
 ## Supported versions
 
 Security fixes are released as a patch release of the most recent minor
-release line (currently 1.0.x). Older release lines do not receive them:
-upgrade to the latest release to stay supported.
+release line, the one of the
+[latest release](https://github.com/schmitch/forge/releases/latest). Older
+release lines do not receive them: upgrade to the latest release to stay
+supported.
 
 ## Reporting a vulnerability
 

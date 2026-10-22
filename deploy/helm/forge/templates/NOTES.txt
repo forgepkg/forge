@@ -20,7 +20,7 @@ WARNING: no secrets are configured. Forge needs FORGE_DATABASE__URL and the S3
 credentials (secretEnv, existingSecret or env; or postgresql.enabled and
 versitygw.enabled) and refuses to start without them.
 {{- end }}
-{{- $secretKeys := list "database.url" "redis.url" "s3.access_key" "s3.secret_key" "auth.bootstrap_admin.password" "auth.upstream_basic.cache.key_pepper" "oidc.client_secret" }}
+{{- $secretKeys := list "database.url" "redis.url" "s3.access_key" "s3.secret_key" "auth.bootstrap_admin.password" "auth.upstream_basic.cache.key_pepper" "oidc.client_secret" "docker.token_secret" }}
 {{- range $secretKeys }}
 {{- $value := $.Values.config }}
 {{- range splitList "." . }}
