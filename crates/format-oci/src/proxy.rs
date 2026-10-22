@@ -250,7 +250,7 @@ fn parse_challenge(value: &str) -> Option<Challenge> {
 }
 
 /// Read at most `limit` bytes of an upstream body.
-async fn read_limited(response: reqwest::Response, limit: usize) -> OciResult<Bytes> {
+pub(crate) async fn read_limited(response: reqwest::Response, limit: usize) -> OciResult<Bytes> {
     if response.content_length().is_some_and(|l| l > limit as u64) {
         return Err(OciError::unavailable("the upstream response is too large"));
     }
@@ -290,17 +290,19 @@ fn upstream_status(status: reqwest::StatusCode) -> OciError {
     }
 }
 
-/// One proxy repository's upstream, for one request.
-struct Upstream<'a> {
-    reg: &'a Registry,
-    repo: &'a Repository,
-    base: String,
-    creds: Option<Credentials>,
+/// An upstream registry (a proxy repository's, or an import's source), for
+/// one request.
+pub(crate) struct Upstream<'a> {
+    pub(crate) reg: &'a Registry,
+    /// Who the cached tokens belong to: a proxy repository's id, an import.
+    pub(crate) owner: String,
+    pub(crate) base: String,
+    pub(crate) creds: Option<Arc<Credentials>>,
 }
 
 impl Upstream<'_> {
     fn token_key(&self, scope: &str) -> String {
-        format!("{}:{}:{scope}", self.repo.id, self.base)
+        format!("{}:{}:{scope}", self.owner, self.base)
     }
 
     async fn attempt(
@@ -324,7 +326,7 @@ impl Upstream<'_> {
             }
         }
         let auth = if basic {
-            self.creds.as_ref().map(Credentials::auth)
+            self.creds.as_ref().map(|creds| creds.auth())
         } else {
             None
         };
@@ -338,7 +340,7 @@ impl Upstream<'_> {
 
     /// Send a request for `path` (`/v2/…`), answering the upstream's
     /// authentication challenge once.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: Method,
         path: &str,
@@ -474,9 +476,9 @@ impl Registry {
             .map_err(|e| OciError::internal("proxy credentials", e))?;
         Ok(Upstream {
             reg: self,
-            repo,
+            owner: repo.id.to_string(),
             base: upstream_base(remote),
-            creds,
+            creds: creds.map(Arc::new),
         })
     }
 
@@ -1060,7 +1062,7 @@ impl Registry {
     }
 }
 
-fn content_type(response: &reqwest::Response) -> Option<String> {
+pub(crate) fn content_type(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)

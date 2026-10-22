@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE nexus_import SET locked_until = $3\n        WHERE id = $1 AND run_id = $2 AND state = 'running'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0321fa382dc868e2b659aaee5b9a5522d6d31cc44898a3d69f2b4c7fdb816382"
+}

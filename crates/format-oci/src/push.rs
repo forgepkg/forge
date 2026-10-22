@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use forge_core::auth::Principal;
 use forge_core::authz::Action;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{RepoKind, Repository};
@@ -34,6 +35,15 @@ use crate::service::{location, Decision, Registry, RequestCtx, Target};
 
 /// Config blobs larger than this are not read for the platform summary.
 const MAX_CONFIG_SUMMARY_BYTES: i64 = 1024 * 1024;
+
+/// A manifest [`Registry::commit_manifest`] stored.
+pub(crate) struct CommittedManifest {
+    pub id: i64,
+    /// Whether the image did not hold the manifest before.
+    pub created: bool,
+    /// What became of each tag.
+    pub tags: Vec<(String, TagWrite)>,
+}
 
 /// Refuse to commit a link whose blob turned out to be gone or being
 /// deleted: dropping the transaction rolls the link row back, so no link
@@ -148,7 +158,7 @@ impl Registry {
 
     /// The largest blob a push to `repo` may carry: its own upload limit,
     /// else the registry's default.
-    fn blob_limit(&self, repo: &Repository) -> u64 {
+    pub(crate) fn blob_limit(&self, repo: &Repository) -> u64 {
         repo.max_upload_bytes()
             .unwrap_or(self.inner.config.default_max_upload_bytes)
     }
@@ -600,6 +610,45 @@ impl Registry {
             Reference::Tag(_) => Digest::sha256_of(&body),
         };
 
+        self.commit_manifest(t, &ctx.caller.principal, &digest, &body, &parsed, &tags)
+            .await?;
+        let subject = parsed.subject.as_ref().map(|s| s.digest.to_string());
+
+        let mut response = StatusCode::CREATED.into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            header::LOCATION,
+            header_value(&location(&ctx.target.name, &format!("manifests/{digest}"))),
+        );
+        headers.insert("docker-content-digest", header_value(digest.as_str()));
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(0));
+        if let Some(subject) = subject {
+            headers.insert("oci-subject", header_value(&subject));
+        }
+        // A push by digest with `?tag=` parameters names every tag it set.
+        if matches!(reference, Reference::Digest(_)) {
+            for tag in &tags {
+                headers.append("oci-tag", header_value(tag));
+            }
+        }
+        Ok(response)
+    }
+
+    /// Store a manifest whose bytes match `digest` and point `tags` at it,
+    /// as a push does: every blob it names (but non-distributable layers)
+    /// must be linked into the image and, for an index, every child
+    /// manifest must exist; tags follow the repository's immutability; the
+    /// change runs past the publish policy of `principal`. A manifest the
+    /// image already holds is left as it is (its tags are still set).
+    pub(crate) async fn commit_manifest(
+        &self,
+        t: &Target,
+        principal: &Principal,
+        digest: &Digest,
+        body: &Bytes,
+        parsed: &ParsedManifest,
+        tags: &[String],
+    ) -> OciResult<CommittedManifest> {
         // What must exist before the manifest may: its blobs (except layers
         // that live elsewhere by definition) and, for an index, its children.
         let required_blobs: Vec<String> = parsed
@@ -616,7 +665,7 @@ impl Registry {
             .into_iter()
             .map(|d| d.digest.to_string())
             .collect();
-        let summary = self.manifest_summary(t, &parsed).await;
+        let summary = self.manifest_summary(t, parsed).await;
 
         let staged = self
             .inner
@@ -660,7 +709,7 @@ impl Registry {
             .map(|d| d.digest.to_string())
             .collect();
         let subject = parsed.subject.as_ref().map(|s| s.digest.to_string());
-        let (manifest_id, _) = oci_dao::insert_manifest(
+        let (manifest_id, created) = oci_dao::insert_manifest(
             &mut tx,
             NewManifest {
                 repository_id: t.repo.id,
@@ -679,7 +728,8 @@ impl Registry {
         )
         .await?;
         let immutable = t.repo.immutable_tags();
-        for tag in &tags {
+        let mut written = Vec::with_capacity(tags.len());
+        for tag in tags {
             let may_move = !immutable || (tag == "latest" && t.repo.latest_mutable());
             match oci_dao::set_tag(&mut tx, t.repo.id, &t.image, tag, manifest_id, may_move).await?
             {
@@ -689,32 +739,20 @@ impl Registry {
                     ))
                     .with_detail(serde_json::json!({ "tag": tag })));
                 }
-                TagWrite::Created | TagWrite::Moved { .. } | TagWrite::Unchanged => {}
+                write @ (TagWrite::Created | TagWrite::Moved { .. } | TagWrite::Unchanged) => {
+                    written.push((tag.clone(), write));
+                }
             }
         }
         let version = tags.first().cloned().unwrap_or_else(|| digest.to_string());
-        self.record_mutation(ctx, t, PackageMutation::Publish, version, &mut tx)
+        self.record_mutation(principal, t, PackageMutation::Publish, version, &mut tx)
             .await?;
         tx.commit().await?;
-
-        let mut response = StatusCode::CREATED.into_response();
-        let headers = response.headers_mut();
-        headers.insert(
-            header::LOCATION,
-            header_value(&location(&ctx.target.name, &format!("manifests/{digest}"))),
-        );
-        headers.insert("docker-content-digest", header_value(digest.as_str()));
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(0));
-        if let Some(subject) = subject {
-            headers.insert("oci-subject", header_value(&subject));
-        }
-        // A push by digest with `?tag=` parameters names every tag it set.
-        if matches!(reference, Reference::Digest(_)) {
-            for tag in &tags {
-                headers.append("oci-tag", header_value(tag));
-            }
-        }
-        Ok(response)
+        Ok(CommittedManifest {
+            id: manifest_id,
+            created,
+            tags: written,
+        })
     }
 
     /// Make sure the OCI empty JSON blob (`{}`) is linked into the image:
@@ -845,8 +883,14 @@ impl Registry {
             return Err(OciError::manifest_unknown(reference.as_str()));
         }
         let version = reference.as_str().to_string();
-        self.record_mutation(ctx, t, PackageMutation::Delete, version, &mut tx)
-            .await?;
+        self.record_mutation(
+            &ctx.caller.principal,
+            t,
+            PackageMutation::Delete,
+            version,
+            &mut tx,
+        )
+        .await?;
         tx.commit().await?;
         Ok(StatusCode::ACCEPTED.into_response())
     }
@@ -875,8 +919,14 @@ impl Registry {
             return Err(OciError::blob_unknown(digest.as_str()));
         }
         let version = digest.to_string();
-        self.record_mutation(ctx, t, PackageMutation::Delete, version, &mut tx)
-            .await?;
+        self.record_mutation(
+            &ctx.caller.principal,
+            t,
+            PackageMutation::Delete,
+            version,
+            &mut tx,
+        )
+        .await?;
         tx.commit().await?;
         Ok(StatusCode::ACCEPTED.into_response())
     }
@@ -887,7 +937,7 @@ impl Registry {
     /// since the request was authenticated.
     async fn record_mutation(
         &self,
-        ctx: &RequestCtx,
+        principal: &Principal,
         t: &Target,
         action: PackageMutation,
         version: String,
@@ -897,7 +947,7 @@ impl Registry {
             return Ok(());
         };
         let context = PublishAuthorizationContext {
-            principal: ctx.caller.principal,
+            principal: *principal,
             action,
             package_id: t.image.clone(),
             package_version: version,

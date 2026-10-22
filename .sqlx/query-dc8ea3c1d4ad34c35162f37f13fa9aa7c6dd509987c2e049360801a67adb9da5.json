@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE asset SET last_downloaded_at = greatest(last_downloaded_at, $3)\n            WHERE component_id = $1 AND path = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dc8ea3c1d4ad34c35162f37f13fa9aa7c6dd509987c2e049360801a67adb9da5"
+}
