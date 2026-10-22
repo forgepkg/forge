@@ -72,7 +72,7 @@ pub use realms::{
 pub use redirect::sanitize_redirect_to;
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
 pub use wif::WorkloadIdentitySource;
-pub(crate) use wif::{realm_current_now, workload_identity_config_sha256, MAX_CLOCK_SKEW_SECONDS};
+pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to
 /// clone (the metadata client + session service are `Arc`/pool-backed).

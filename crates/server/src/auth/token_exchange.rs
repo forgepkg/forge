@@ -34,7 +34,7 @@ use axum::Router;
 use chrono::{DateTime, Utc};
 use forge_core::auth::{generate_workload_key, is_workload_key, workload_key_sha256, Principal};
 use forge_db::trusted_publish_audit_dao;
-use forge_db::workload_api_key_dao::{self, NewWorkloadApiKey};
+use forge_db::workload_api_key_dao::{self, NewWorkloadApiKey, Redemption};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -271,6 +271,7 @@ async fn redeem(
             jti_sha256: &jti_sha256,
             token_issued_at,
             token_expires_at,
+            token_leeway_seconds: workload.clock_skew_seconds,
             ttl_seconds: i64::try_from(workload.api_key_ttl_seconds).unwrap_or(i64::MAX),
         },
     )
@@ -292,6 +293,17 @@ async fn redeem(
             refuse(
                 StatusCode::UNAUTHORIZED,
                 "this token was already exchanged; request a new one from the CI job",
+            )
+        }
+        Ok(Stored::TokenExpired) => {
+            tracing::warn!(
+                realm_id,
+                role_id,
+                "workload token expired by the database clock at the token exchange"
+            );
+            refuse(
+                StatusCode::UNAUTHORIZED,
+                "the token has expired; request a new one from the CI job",
             )
         }
         Ok(Stored::RealmChanged) => {
@@ -318,6 +330,8 @@ enum Stored {
     Issued(DateTime<Utc>),
     /// The token was exchanged before.
     Replayed,
+    /// The token has expired by the database's clock.
+    TokenExpired,
     /// The realm was disabled, deleted or edited (or the role deleted)
     /// since the token was verified against it.
     RealmChanged,
@@ -342,8 +356,10 @@ async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<St
     if issuer != *new.issuer_sha256 || config.as_ref() != Some(new.config_sha256) {
         return Ok(Stored::RealmChanged);
     }
-    let Some(expires) = workload_api_key_dao::insert(&mut tx, new).await? else {
-        return Ok(Stored::Replayed);
+    let expires = match workload_api_key_dao::insert(&mut tx, new).await? {
+        Redemption::Issued(expires) => expires,
+        Redemption::Replayed => return Ok(Stored::Replayed),
+        Redemption::TokenExpired => return Ok(Stored::TokenExpired),
     };
     tx.commit().await?;
     Ok(Stored::Issued(expires))

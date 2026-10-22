@@ -124,8 +124,11 @@ Content-Type: application/json
   key without rights. A registry token `docker login -u oidc`
   got with a key stops working within 10 seconds of the same changes. Forge
   stores only SHA-256 digests of the key, subject and `jti` (table
-  `workload_api_key`), and the auth reaper deletes a row once both the key and
-  the token have expired.
+  `workload_api_key`), and the auth reaper deletes a row once the key has
+  expired and the token has been expired for 15 minutes (the most clock skew
+  a realm accepts, plus a margin). Whether a token has expired is decided on
+  the database's clock, so an instance whose clock runs behind it cannot
+  redeem a token twice.
 - A key starts with `forge_wif.`, which no user API token can (user tokens
   are URL-safe base64, without a dot). Secret scanners can match
   `forge_wif\.[A-Za-z0-9_-]{43}`.
