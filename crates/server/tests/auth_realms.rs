@@ -521,6 +521,213 @@ async fn admin_realm_crud_with_write_only_secrets() {
     assert_eq!(resp.status(), 204);
 }
 
+/// An `oidc` realm with `client_authentication = "federated_credential"`
+/// needs no client secret: forge publishes itself as the OIDC issuer of its
+/// client assertions (created with the realm), and the realm shows what the
+/// IdP's federated credential must name.
+#[tokio::test]
+async fn a_federated_credential_realm_needs_no_secret_and_publishes_the_issuer() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let discovery_url = format!("{}/.well-known/openid-configuration", srv.base_url);
+
+    // Forge has signed nothing yet: no issuer.
+    let resp = client.get(&discovery_url).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let issuer = "https://login.microsoftonline.com/tenant-id/v2.0";
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "oidc",
+            "name": format!("entra{}", common::unique()),
+            "enabled": false,
+            "config": {
+                "issuer": issuer,
+                "client_id": "app-id",
+                "client_authentication": "federated_credential",
+                // Not kept: nothing would send it.
+                "client_secret": "unused",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let created: Value = resp.json().await.unwrap();
+    let realm_id = created["id"].as_i64().unwrap();
+    assert_eq!(created["config"]["client_secret_set"], json!(false));
+    assert_eq!(
+        created["config"]["client_authentication"],
+        json!("federated_credential")
+    );
+    assert_eq!(
+        created["federated_credential"],
+        json!({
+            "issuer": "http://test.local",
+            "subject": format!("app-id@{issuer}"),
+            "audience": "api://AzureADTokenExchange",
+        })
+    );
+
+    // Saving the realm published the issuer, unauthenticated.
+    let resp = client.get(&discovery_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("public")));
+    let discovery: Value = resp.json().await.unwrap();
+    assert_eq!(discovery["issuer"], json!("http://test.local"));
+    assert_eq!(
+        discovery["jwks_uri"],
+        json!("http://test.local/.well-known/jwks.json")
+    );
+    assert_eq!(
+        discovery["id_token_signing_alg_values_supported"],
+        json!(["RS256"])
+    );
+    let jwks: Value = client
+        .get(format!("{}/.well-known/jwks.json", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let keys = jwks["keys"].as_array().expect("keys");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kty"], json!("RSA"));
+    assert_eq!(keys[0]["use"], json!("sig"));
+    assert_eq!(keys[0]["alg"], json!("RS256"));
+    assert!(keys[0].get("d").is_none(), "public parts only");
+
+    // A sovereign cloud's audience.
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "config": {
+                "issuer": issuer,
+                "client_id": "app-id",
+                "client_authentication": "federated_credential",
+                "assertion_audience": " api://AzureADTokenExchangeUSGov ",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(
+        updated["federated_credential"]["audience"],
+        json!("api://AzureADTokenExchangeUSGov")
+    );
+
+    // Back to a client secret: one must be supplied.
+    let secret_config = json!({ "issuer": issuer, "client_id": "app-id" });
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "config": secret_config }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let mut with_secret = secret_config.clone();
+    with_secret["client_secret"] = json!("s3cret");
+    let resp = client
+        .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "config": with_secret }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(updated["config"]["client_secret_set"], json!(true));
+    assert!(updated.get("federated_credential").is_none(), "{updated}");
+    assert!(updated["config"].get("client_authentication").is_none());
+
+    let resp = client
+        .delete(format!("{}/admin/realms/{realm_id}", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+/// Instances share the issuer keys: the first creates them, the others pick
+/// them up, and a due rotation is done once (compare-and-swap) and then
+/// published by every instance before the new key signs.
+#[tokio::test]
+async fn instances_share_and_rotate_the_issuer_keys() {
+    use forge_core::oidc::assertion::{IssuerKeySet, KEY_ACTIVATION, KEY_ROTATION};
+    use forge_server::auth::{AssertionIssuer, ISSUER_KEYS_SETTING};
+
+    let pool = common::fresh_pool().await;
+    let a = AssertionIssuer::new(pool.clone(), None, "https://forge.test/".into());
+    let b = AssertionIssuer::new(pool.clone(), None, "https://forge.test".into());
+    assert_eq!(a.issuer(), "https://forge.test");
+    let kids = |keys: &IssuerKeySet| {
+        keys.keys()
+            .iter()
+            .map(|k| k.kid().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(a.published().await.unwrap().is_none());
+    let created = a.ensure().await.unwrap();
+    // `b` asked recently and found nothing: it asks again after a moment.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let seen = b.published().await.unwrap().expect("b sees a's keys");
+    assert_eq!(kids(&created), kids(&seen));
+    assert_eq!(kids(&b.ensure().await.unwrap()), kids(&created));
+
+    // Age the stored keys past a rotation.
+    let stored = forge_db::authz_dao::get_setting(&pool, ISSUER_KEYS_SETTING)
+        .await
+        .unwrap()
+        .expect("stored keys");
+    let old = IssuerKeySet::generate(chrono::Utc::now() - KEY_ROTATION).unwrap();
+    forge_db::secret_dao::store_secret_setting(
+        &pool,
+        None,
+        ISSUER_KEYS_SETTING,
+        &forge_crypto::PlaintextSecret::from(old.to_stored()),
+        Some(&stored),
+    )
+    .await
+    .unwrap()
+    .expect("replaced");
+
+    a.refresh().await.unwrap();
+    let rotated = a.published().await.unwrap().unwrap();
+    assert_eq!(
+        rotated.keys().len(),
+        2,
+        "a fresh key in front of the old one"
+    );
+    assert_eq!(rotated.keys()[1].kid(), old.keys()[0].kid());
+    // The new key is published, but the old one signs until it is old enough.
+    let now = chrono::Utc::now();
+    assert_eq!(rotated.signing_key(now).kid(), old.keys()[0].kid());
+    assert_eq!(
+        rotated.signing_key(now + KEY_ACTIVATION).kid(),
+        rotated.keys()[0].kid()
+    );
+
+    // `b` rotates nothing more: it picks up `a`'s rotation.
+    b.refresh().await.unwrap();
+    assert_eq!(kids(&b.published().await.unwrap().unwrap()), kids(&rotated));
+    a.refresh().await.unwrap();
+    assert_eq!(kids(&a.published().await.unwrap().unwrap()), kids(&rotated));
+}
+
 /// #71: an API token Forge issued is never tried as a password, even when it
 /// cannot be used (its owner is deactivated, it expired or was revoked): a
 /// credential-forwarding realm would send the live secret upstream on every
@@ -689,10 +896,13 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
         Arc::new(tokio::sync::Semaphore::new(0)),
         std::time::Duration::from_millis(10),
     ));
+    let issuer =
+        forge_server::auth::AssertionIssuer::new(pool.clone(), None, config.public_base_url());
     let realms = forge_server::auth::RealmAuth::new(
         pool.clone(),
         forge_cache::Cache::l1_only(100),
         Arc::new(config),
+        issuer,
     )
     .with_password_limiter(no_slot);
     let snapshot = realms.snapshot().await.expect("snapshot");
