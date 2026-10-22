@@ -88,10 +88,89 @@ variables:
   DOCKER_HOST: "tcp://docker:2375"
   DOCKER_TLS_CERTDIR: ""
 
+# ── What a change touches (#353) ─────────────────────────────────────────────
+# A merge request pipeline, a merge train's included, runs a job only when the
+# merge request changes one of the job's groups of paths below (`rules:
+# changes` compares it with the target branch). Branch pipelines, the default
+# branch and tags run every job. A merge request that touches no group gets no
+# pipeline. The groups are those of
+# .github/scripts/ci-changes.sh (keep them in step), each with this file in
+# place of ci.yml. In a merge train, the merge requests ahead count through
+# their own pipelines: a failed one leaves the train, and the pipelines
+# behind it restart without it.
+.paths:
+  # The workspace, what its build and tests read from outside the crates, and
+  # the scripts the Rust jobs run.
+  rust: &rust-paths
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - .cargo/**/*
+    - crates/**/*
+    - plugins/**/*
+    - xtask/**/*
+    - migrations/**/*
+    - .sqlx/**/*
+    - fixtures/**/*
+    - web/index.html
+    - docker/forge.docker.toml
+    - web/package.json
+    - deploy/kubernetes/base/kustomization.yaml
+    - deploy/helm/forge/Chart.yaml
+    - .github/scripts/**/*
+    - .gitlab-ci.yml
+  changelog: &changelog-paths
+    - docs/changes/**/*
+    - .gitlab-ci.yml
+  audit: &audit-paths
+    - Cargo.lock
+    - .cargo/audit.toml
+    - .gitlab-ci.yml
+  web: &web-paths
+    - web/**/*
+    - .gitlab-ci.yml
+  # What the image is built from beyond the sources clippy, test and web check.
+  image-inputs: &image-paths
+    - Dockerfile
+    - .dockerignore
+    - docker/**/*
+    - LICENSE
+    - "**/Cargo.toml"
+    - Cargo.lock
+    - rust-toolchain.toml
+    - .cargo/**/*
+    - web/package.json
+    - web/pnpm-lock.yaml
+    - web/pnpm-workspace.yaml
+    - web/.npmrc
+    - .gitlab-ci.yml
+  # The kubernetes job: the manifests, and what its digest-pin check reads
+  # besides them (Dockerfiles, the workflows, this file).
+  kubernetes: &kubernetes-paths
+    - deploy/**/*
+    - "**/Dockerfile"
+    - "**/*.Dockerfile"
+    - "**/Containerfile"
+    - .github/workflows/**/*
+    - .github/scripts/image-pin-check.sh
+    - .github/scripts/kustomize-check.sh
+    - .github/scripts/helm-check.sh
+    - .gitlab-ci.yml
+
 # ── Formatting, and the changelog fragments ────────────────────────────────
-# As on GitHub, the fragment check builds only xtask.
+# As on GitHub, the fragment check builds only xtask. No job waits for this
+# one: every job has `needs: []` and starts with the pipeline instead of after
+# its stage, as on GitHub (#337).
 fmt:
   stage: fmt
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *rust-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *changelog-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   script:
     - rustup component add rustfmt
     - cargo fmt --all --check
@@ -103,7 +182,13 @@ fmt:
 # like GitHub's, so the job waits for Postgres before using it.
 clippy:
   stage: clippy
-  needs: ["fmt"]
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *rust-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   services:
     - name: mirror.gcr.io/library/postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
       alias: postgres
@@ -134,6 +219,12 @@ clippy:
 audit:
   stage: test
   needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *audit-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   script:
     - cargo install cargo-audit --version 0.22.2 --locked
     - cargo audit
@@ -144,7 +235,13 @@ audit:
 # component for wasm32-wasip2. The tests that load a component run in `test`.
 plugins:
   stage: test
-  needs: ["fmt"]
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *rust-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   cache:
     <<: *cargo-cache
   script:
@@ -162,7 +259,13 @@ plugins:
 # would rebuild most of it.
 test:
   stage: test
-  needs: ["fmt"]
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *rust-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   services:
     - *dind-service
   variables:
@@ -187,11 +290,21 @@ test:
     - find target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete || true
 
 # ── Container image (build only; releases push from release.yml) ─────────
-# Builds the production Dockerfile on every change so a broken image is
-# caught before a release tag, not by it.
+# Builds the production Dockerfile so a broken image is caught before a
+# release tag, not by it, whenever a merge request (or a merge train) touches
+# what the image is built from (the image group, as on GitHub, #338 and
+# #353), and in branch pipelines and on the default branch. clippy, test and
+# web compile the Rust code and the SPA of every other change; one that
+# breaks only the image fails on the default branch.
 docker:
   stage: build
-  needs: ["fmt"]
+  needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *image-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   image: mirror.gcr.io/library/docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
   services:
     - *dind-service
@@ -206,13 +319,19 @@ docker:
 # Checks that every image reference (Dockerfile, deploy/, the workflows) is
 # pinned by digest, builds every overlay, and the base with each component,
 # and validates the output against the Kubernetes schemas. Both tools are
-# pinned by checksum.
-# Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
+# pinned by checksum. In merge requests, only when they touch any of these
+# (the kubernetes group). Not mirrored yet: ci.yml's kubernetes job also lints and renders the Helm
 # chart (.github/scripts/helm-check.sh, Helm built with `go install`), which
 # needs a pinned Go image here.
 kubernetes:
   stage: test
   needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *kubernetes-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   variables:
     KUSTOMIZE_VERSION: "5.7.1"
     KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
@@ -234,10 +353,16 @@ kubernetes:
 # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
 # output (web/dist/) is what the Rust server serves via ServeDir; building here
 # guards against TS/Vite breakage. Runs on the node image, independent of the
-# Rust jobs (only `needs: []` so it starts immediately).
+# Rust jobs (`needs: []` so it starts immediately).
 web:
   stage: web
   needs: []
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *web-paths
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - when: on_success
   image: mirror.gcr.io/library/node:22-bookworm@sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8
   variables:
     PNPM_HOME: "$CI_PROJECT_DIR/.pnpm-store"
@@ -273,14 +398,15 @@ web:
 # process's mock OIDC issuer at the job's address on the route to the dind
 # service.
 # Gated behind the `forge-e2e` feature; left out of MR pipelines to keep them
-# fast, but runs in merge trains (so a change that breaks it never lands) and
-# on the default branch. The optional dotnet smoke test is skipped here (no SDK
+# fast, but runs in merge trains that touch Rust (so a change that breaks it
+# never lands) and on the default branch. The optional dotnet smoke test is skipped here (no SDK
 # on the rust image); add a dotnet SDK to the image to exercise it.
 e2e:
   stage: e2e
   needs: []
   rules:
     - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+      changes: *rust-paths
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
     - *dind-service
@@ -299,9 +425,10 @@ e2e:
     - docker pull mirror.gcr.io/versity/versitygw:v1.9.0
     - docker pull mirror.gcr.io/library/redis:5.0
   script:
-    - rustup target add wasm32-wasip2
-    # Per-test timings, as in the test job.
-    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test --workspace --features forge-e2e
+    # The forge-e2e crate alone (as `cargo xtask e2e`): the test job of the
+    # same pipeline runs the rest of the workspace (#341). Per-test timings,
+    # as in the test job.
+    - CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CI_PROJECT_DIR/.github/scripts/test-timings-runner.sh" cargo test -p forge-e2e --features forge-e2e
   after_script:
     - .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS" || true
     # Keep the test binaries out of the cache (archived after after_script):
@@ -312,8 +439,8 @@ e2e:
 # Boots Postgres + versitygw via docker compose on the dind daemon, builds the
 # SPA + server, and runs the browser specs. The compose-published ports live on
 # the `docker` (dind) host, so the harness is pointed there via
-# FORGE_E2E_DOCKER_HOST. Like e2e, only in merge trains and on the default
-# branch (slow). Uses the official Playwright image (Ubuntu with Node, the
+# FORGE_E2E_DOCKER_HOST. Like e2e, only in merge trains (that touch Rust or
+# web/) and on the default branch (slow). Uses the official Playwright image (Ubuntu with Node, the
 # browsers and their system deps) at the version of @playwright/test in
 # web/package.json; the Rust toolchain is installed on top via rustup.
 web-e2e:
@@ -322,6 +449,9 @@ web-e2e:
   image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
   rules:
     - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+      changes: *rust-paths
+    - if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+      changes: *web-paths
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   services:
     - *dind-service
