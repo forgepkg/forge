@@ -30,6 +30,13 @@
 //! and client id), and stripped from the plaintext `config` (see
 //! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
+//! Secrets kept in `forge_setting` ([`SECRET_SETTINGS`]: the generated
+//! registry-token key) are text values, `sealed:<base64 envelope>` with the
+//! envelope service and `plain:<secret>` without it, AAD-bound to
+//! `('forge_setting', 'value', 0)` plus the setting's key. They take part in
+//! the backfill, the re-encrypt sweep and the DEK reference scan like the
+//! secret columns ([`store_secret_setting`], [`open_secret_setting`]).
+//!
 //! ## DEK revocation vs. concurrent writers
 //!
 //! A retiring DEK is revoked only when no stored ciphertext references it **at
@@ -123,6 +130,14 @@ pub enum SecretDbError {
     /// (or the decrypted document is malformed): fail closed.
     #[error("auth realm {0} secrets unavailable: {1}")]
     RealmSecrets(i64, &'static str),
+    /// A secret setting's value is neither `plain:` nor a readable `sealed:`
+    /// envelope: it can never be opened.
+    #[error("setting {0} is malformed")]
+    MalformedSetting(String),
+    /// A secret setting is sealed but no envelope service is configured:
+    /// fail closed (and never overwrite it with a plaintext value).
+    #[error("setting {0} is sealed but secret encryption is not configured")]
+    SettingSealedWithoutEnvelope(String),
 }
 
 /// Store (or clear) a repository's upstream password, **encrypted** under the
@@ -597,7 +612,8 @@ pub async fn reseal_upstream_passwords_batch(
 
 /// Every DEK version still referenced by stored ciphertext, across all
 /// encrypted columns (`repository.upstream_password_enc`,
-/// `auth_realm.secrets_enc`; future secret columns add their scan here). Used
+/// `auth_realm.secrets_enc`, the sealed [`SECRET_SETTINGS`]; future secret
+/// columns add their scan here). Used
 /// by the sweep to decide which `retiring` DEKs are safe to revoke.
 pub async fn referenced_dek_versions(
     pool: &PgPool,
@@ -659,6 +675,18 @@ async fn scan_referenced_dek_versions(
             }
         }
     }
+    for (key, value) in sealed_settings(&mut *conn).await? {
+        match sealed_setting_blob(&key, &value)
+            .and_then(|blob| Ok(EnvelopeService::blob_dek_version(&blob)?))
+        {
+            Ok(version) => {
+                versions.insert(version);
+            }
+            Err(e) => {
+                tracing::warn!(setting = %key, error = %e, "unreadable sealed setting; skipped");
+            }
+        }
+    }
     Ok(versions)
 }
 
@@ -679,8 +707,9 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
     Ok(row.pending)
 }
 
-/// Whether any secret is stored sealed (an upstream password or realm
-/// secrets): such a database needs the envelope service to be usable.
+/// Whether any secret is stored sealed (an upstream password, realm secrets
+/// or a [`SECRET_SETTINGS`] value): such a database needs the envelope
+/// service to be usable.
 pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError> {
     let row = sqlx::query!(
         r#"
@@ -693,7 +722,11 @@ pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError
     )
     .fetch_one(pool)
     .await?;
-    Ok(row.present)
+    if row.present {
+        return Ok(true);
+    }
+    let mut conn = pool.acquire().await?;
+    Ok(!sealed_settings(&mut conn).await?.is_empty())
 }
 
 /// Whether any auth realm still carries one of its secret keys
@@ -1099,6 +1132,235 @@ pub async fn reseal_realm_secrets(
         .execute(pool)
         .await?;
         resealed += usize::try_from(res.rows_affected()).unwrap_or(0);
+    }
+    Ok(resealed)
+}
+
+// ── secrets in `forge_setting` ───────────────────────────────────────────────
+
+/// `forge_setting` key of the generated registry-token signing key.
+pub const REGISTRY_TOKEN_KEY_SETTING: &str = "docker_token_key";
+
+/// The `forge_setting` keys whose values are secrets (module docs).
+pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING];
+
+/// Prefix of a sealed secret setting: `sealed:<base64 envelope>`.
+const SEALED_SETTING: &str = "sealed:";
+/// Prefix of a plaintext secret setting: `plain:<secret>`.
+const PLAIN_SETTING: &str = "plain:";
+
+/// The AAD binding of the secret setting `key`.
+fn setting_binding(key: &str) -> AeadBinding<'_> {
+    AeadBinding {
+        table: "forge_setting",
+        column: "value",
+        row_pk: 0,
+        destination: Some(key),
+    }
+}
+
+/// The envelope of a `sealed:` setting value.
+fn sealed_setting_blob(key: &str, value: &str) -> Result<Vec<u8>, SecretDbError> {
+    use base64::Engine;
+    value
+        .strip_prefix(SEALED_SETTING)
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .ok_or_else(|| SecretDbError::MalformedSetting(key.to_string()))
+}
+
+/// The [`SECRET_SETTINGS`] stored sealed: `(key, value)`.
+async fn sealed_settings(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<(String, String)>, SecretDbError> {
+    Ok(sqlx::query_as(
+        "SELECT key, value FROM forge_setting WHERE key = ANY($1) AND value LIKE 'sealed:%'",
+    )
+    .bind(SECRET_SETTINGS)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// Open the stored `value` of the secret setting `key`. A `sealed:` value
+/// needs `envelope`.
+pub async fn open_secret_setting(
+    envelope: Option<&EnvelopeService>,
+    key: &str,
+    value: &str,
+) -> Result<PlaintextSecret, SecretDbError> {
+    if let Some(plain) = value.strip_prefix(PLAIN_SETTING) {
+        return Ok(PlaintextSecret::from(plain.to_string()));
+    }
+    let blob = sealed_setting_blob(key, value)?;
+    let envelope =
+        envelope.ok_or_else(|| SecretDbError::SettingSealedWithoutEnvelope(key.to_string()))?;
+    Ok(envelope.open(&blob, setting_binding(key)).await?)
+}
+
+/// Whether `e`, from [`open_secret_setting`], says the stored value can
+/// never be opened (malformed, or sealed under a data key that does not open
+/// it), as opposed to the database, the key store or the configuration
+/// failing, which a retry or a fix can cure.
+pub fn is_unreadable_setting(e: &SecretDbError) -> bool {
+    match e {
+        SecretDbError::MalformedSetting(_) => true,
+        SecretDbError::Crypto(e) => is_blob_error(e),
+        _ => false,
+    }
+}
+
+/// Store `secret` as the secret setting `key`: sealed with `envelope`, else
+/// `plain:`. With `expected`, only while the stored value is still that
+/// (compare-and-swap); without, only while the key is unset. Returns the
+/// stored value, or `None` when another writer got there first.
+///
+/// A sealed write holds `FOR SHARE` on its DEK (module docs). A plaintext
+/// value never replaces a sealed one.
+pub async fn store_secret_setting(
+    pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
+    key: &str,
+    secret: &PlaintextSecret,
+    expected: Option<&str>,
+) -> Result<Option<String>, SecretDbError> {
+    match envelope {
+        Some(envelope) => {
+            let blob = envelope.seal(secret, setting_binding(key)).await?;
+            write_sealed_setting(pool, envelope, key, &blob, expected).await
+        }
+        None if expected.is_some_and(|v| v.starts_with(SEALED_SETTING)) => {
+            Err(SecretDbError::SettingSealedWithoutEnvelope(key.to_string()))
+        }
+        None => {
+            let value = format!("{PLAIN_SETTING}{}", secret.expose_secret());
+            let mut tx = pool.begin().await?;
+            let written = write_setting(&mut tx, key, &value, expected).await?;
+            tx.commit().await?;
+            Ok(written.then_some(value))
+        }
+    }
+}
+
+/// [`store_secret_setting`] of an envelope `blob` sealed for `key`, holding
+/// `FOR SHARE` on its DEK.
+async fn write_sealed_setting(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+    key: &str,
+    blob: &[u8],
+    expected: Option<&str>,
+) -> Result<Option<String>, SecretDbError> {
+    use base64::Engine;
+    let value = format!(
+        "{SEALED_SETTING}{}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    );
+    let mut tx = pool.begin().await?;
+    lock_sealing_dek(&mut tx, envelope, blob).await?;
+    let written = write_setting(&mut tx, key, &value, expected).await?;
+    tx.commit().await?;
+    Ok(written.then_some(value))
+}
+
+/// Write a setting: replace it while it is still `expected`, or insert it
+/// while it is unset. Returns whether it was written.
+async fn write_setting(
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+    value: &str,
+    expected: Option<&str>,
+) -> Result<bool, SecretDbError> {
+    Ok(match expected {
+        Some(expected) => {
+            crate::authz_dao::replace_setting(&mut *conn, key, expected, value).await?
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO forge_setting (key, value) VALUES ($1, $2) \
+                 ON CONFLICT (key) DO NOTHING",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected()
+                > 0
+        }
+    })
+}
+
+/// Seal every [`SECRET_SETTINGS`] value still stored `plain:` (written
+/// before `[crypto]` was enabled). Returns how many were sealed.
+pub async fn backfill_secret_settings(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<usize, SecretDbError> {
+    let mut sealed = 0;
+    for key in SECRET_SETTINGS {
+        let Some(value) = crate::authz_dao::get_setting(pool, key).await? else {
+            continue;
+        };
+        let Some(plain) = value.strip_prefix(PLAIN_SETTING) else {
+            continue;
+        };
+        let secret = PlaintextSecret::from(plain.to_string());
+        if store_secret_setting(pool, Some(envelope), key, &secret, Some(&value))
+            .await?
+            .is_some()
+        {
+            sealed += 1;
+        }
+    }
+    Ok(sealed)
+}
+
+/// Whether any [`SECRET_SETTINGS`] value is still stored `plain:` (the
+/// settings' half of the operator's "plaintext backfill pending" signal).
+pub async fn plaintext_settings_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM forge_setting \
+         WHERE key = ANY($1) AND value LIKE 'plain:%')",
+    )
+    .bind(SECRET_SETTINGS)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The DEK re-encrypt sweep over the sealed [`SECRET_SETTINGS`]: re-seal a
+/// value under the active DEK when its own is not. Returns how many were
+/// re-sealed. A value that does not open is left as it is (logged).
+pub async fn reseal_secret_settings(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<usize, SecretDbError> {
+    let mut conn = pool.acquire().await?;
+    let sealed = sealed_settings(&mut conn).await?;
+    drop(conn);
+    let mut resealed = 0;
+    for (key, value) in sealed {
+        let blob = match sealed_setting_blob(&key, &value) {
+            Ok(blob) => blob,
+            Err(error) => {
+                tracing::warn!(setting = %key, %error, "sealed setting is unreadable; left as is");
+                continue;
+            }
+        };
+        let Some(new_blob) = reseal_if_due(envelope, &blob, setting_binding(&key)).await? else {
+            continue;
+        };
+        // Guarded on the old value, so a racing replacement (or a racing
+        // sweep on another instance) is never overwritten.
+        match write_sealed_setting(pool, envelope, &key, &new_blob, Some(&value)).await {
+            Ok(Some(_)) => resealed += 1,
+            Ok(None) => {}
+            // The active DEK was retired and revoked meanwhile: the next
+            // pass re-seals under its successor.
+            Err(SecretDbError::Crypto(CryptoError::KeyRevoked { .. })) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(resealed)
 }

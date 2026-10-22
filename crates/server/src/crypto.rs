@@ -257,6 +257,12 @@ pub async fn bootstrap(
     if realms > 0 {
         tracing::info!(realms, "encrypted plaintext auth-realm secrets at rest");
     }
+    let settings = secret_dao::backfill_secret_settings(pool, envelope)
+        .await
+        .context("backfill plaintext secret settings")?;
+    if settings > 0 {
+        tracing::info!(settings, "encrypted plaintext secret settings at rest");
+    }
 
     // Secrets sealed by earlier builds are bound to their row only: re-seal
     // them for the destination they are sent to (the rotation worker repeats
@@ -273,8 +279,8 @@ pub async fn bootstrap(
     Ok(())
 }
 
-/// Run both re-encrypt sweeps to the end; returns how many rows were
-/// re-sealed.
+/// Run the re-encrypt sweeps (upstream passwords, realm secrets, secret
+/// settings) to the end; returns how many rows were re-sealed.
 async fn reseal_all(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -292,6 +298,7 @@ async fn reseal_all(
         }
     }
     resealed += secret_dao::reseal_realm_secrets(pool, envelope).await?;
+    resealed += secret_dao::reseal_secret_settings(pool, envelope).await?;
     Ok(resealed)
 }
 
@@ -392,6 +399,9 @@ async fn rotation_pass(
     secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
         .await
         .context("realm secrets backfill")?;
+    secret_dao::backfill_secret_settings(pool, envelope)
+        .await
+        .context("secret settings backfill")?;
 
     // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns),
     //    which also moves row-only bindings to destination bindings.

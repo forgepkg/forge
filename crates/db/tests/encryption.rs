@@ -17,6 +17,7 @@ use forge_crypto::service::{EnvelopeService, EnvelopeServiceConfig};
 use forge_crypto::store::{KeyLayer, KeyState, KeyStore, NewKeyRecord};
 use forge_crypto::{ExposeSecret, KeyBytes, PlaintextSecret};
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
+use forge_db::authz_dao;
 use forge_db::encryption_key_dao::PgKeyStore;
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::secret_dao;
@@ -1349,6 +1350,124 @@ async fn a_malformed_sealed_secret_does_not_stop_the_sweeps() {
     auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
     sqlx::query("DELETE FROM repository WHERE id = $1")
         .bind(repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// The generated registry-token key in `forge_setting` is a secret like the
+/// secret columns (#196): the DEK it is sealed under is not revoked while it
+/// is, DEK rotation re-seals it, the backfill seals one stored in plaintext,
+/// and only a value that can never be opened counts as unreadable.
+#[tokio::test]
+async fn secret_settings_follow_dek_rotation() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("settings-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    // DEK versions no other test's ciphertext uses, so that the reference
+    // scan alone decides whether this one's DEKs are revoked.
+    for _ in 0..6 {
+        envelope.rotate_dek().await.unwrap();
+    }
+    let key = secret_dao::REGISTRY_TOKEN_KEY_SETTING;
+    sqlx::query("DELETE FROM forge_setting WHERE key = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let open = |value: String| {
+        let envelope = &envelope;
+        async move { secret_dao::open_secret_setting(Some(envelope), key, &value).await }
+    };
+
+    let stored = secret_dao::store_secret_setting(&pool, Some(&envelope), key, &secret("k1"), None)
+        .await
+        .unwrap()
+        .expect("stored");
+    assert!(stored.starts_with("sealed:") && !stored.contains("k1"));
+    assert!(secret_dao::sealed_secrets_present(&pool).await.unwrap());
+    assert!(
+        secret_dao::store_secret_setting(&pool, Some(&envelope), key, &secret("k9"), None)
+            .await
+            .unwrap()
+            .is_none(),
+        "stored only while unset"
+    );
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+
+    // Its DEK stays while the key is sealed under it.
+    envelope.rotate_dek().await.unwrap();
+    secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+        .await
+        .unwrap();
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+
+    // The sweep re-seals it under the active DEK; then the old one goes.
+    assert_eq!(
+        secret_dao::reseal_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        1
+    );
+    let resealed = authz_dao::get_setting(&pool, key).await.unwrap().unwrap();
+    assert_ne!(resealed, stored);
+    assert_eq!(
+        secret_dao::reseal_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        0,
+        "converged"
+    );
+    assert!(
+        secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(open(resealed.clone()).await.unwrap().expose_secret(), "k1");
+    let err = open(stored).await.unwrap_err();
+    assert!(secret_dao::is_unreadable_setting(&err), "{err}");
+    for malformed in ["sealed:***", "sealed:AAAA", "bogus"] {
+        let err = open(malformed.to_string()).await.unwrap_err();
+        assert!(
+            secret_dao::is_unreadable_setting(&err),
+            "{malformed}: {err}"
+        );
+    }
+
+    // Without the envelope a sealed value fails closed, and that is no
+    // reason to replace it: a plaintext value never overwrites it.
+    let err = secret_dao::open_secret_setting(None, key, &resealed)
+        .await
+        .unwrap_err();
+    assert!(!secret_dao::is_unreadable_setting(&err), "{err}");
+    assert!(matches!(
+        secret_dao::store_secret_setting(&pool, None, key, &secret("k3"), Some(&resealed)).await,
+        Err(secret_dao::SecretDbError::SettingSealedWithoutEnvelope(_))
+    ));
+
+    // A key stored before `[crypto]` was enabled is sealed by the backfill.
+    sqlx::query("UPDATE forge_setting SET value = 'plain:k2' WHERE key = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(open("plain:k2".into()).await.unwrap().expose_secret(), "k2");
+    assert!(secret_dao::plaintext_settings_pending(&pool).await.unwrap());
+    assert_eq!(
+        secret_dao::backfill_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!secret_dao::plaintext_settings_pending(&pool).await.unwrap());
+    let backfilled = authz_dao::get_setting(&pool, key).await.unwrap().unwrap();
+    assert!(backfilled.starts_with("sealed:"));
+    assert_eq!(open(backfilled).await.unwrap().expose_secret(), "k2");
+
+    sqlx::query("DELETE FROM forge_setting WHERE key = $1")
+        .bind(key)
         .execute(&pool)
         .await
         .unwrap();

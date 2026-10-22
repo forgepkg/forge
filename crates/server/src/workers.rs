@@ -79,6 +79,9 @@ pub struct WorkerHandles {
     /// Docker registry sweeper: abandoned upload sessions and blob links no
     /// manifest references any more.
     pub registry_sweeper: JoinHandle<()>,
+    /// Re-reads the shared registry token key, so a key another instance
+    /// had to replace is picked up. Not run with `docker.token_secret`.
+    pub registry_key_refresh: JoinHandle<()>,
     /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
     /// when `[crypto]` is enabled and its rotation worker is not turned off.
     /// Cluster-coordinated via a Postgres advisory lock (see
@@ -102,6 +105,7 @@ impl WorkerHandles {
         }
         self.cred_reaper.abort();
         self.registry_sweeper.abort();
+        self.registry_key_refresh.abort();
         if let Some(h) = &self.crypto_rotation {
             h.abort();
         }
@@ -214,6 +218,16 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
+    // The shared registry token key: only the generated one can change.
+    let registry_key_refresh = if state.config.docker.token_secret.is_none() {
+        let state = state.clone();
+        supervise("registry-key-refresh", move || {
+            crate::registry::spawn_token_key_refresh(state.clone())
+        })
+    } else {
+        tokio::spawn(async {})
+    };
+
     // Crypto rotation/backfill worker (slice 12.5): only when secret
     // encryption is enabled. One instance at a time performs a pass (advisory
     // lock); every step is idempotent/resumable so crashes are harmless.
@@ -254,6 +268,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         auth_reaper,
         cred_reaper,
         registry_sweeper,
+        registry_key_refresh,
         crypto_rotation,
         blob_cache,
     }

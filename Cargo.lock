@@ -1898,6 +1898,7 @@ name = "forge-db"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "forge-crypto",
  "serde",

@@ -10,7 +10,7 @@
 //! Tokens are honored only by the `/v2` handler, never by the rest of the
 //! API, so a registry token cannot be replayed against `/admin`.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use forge_core::auth::{AuthMethod, Principal};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -20,17 +20,23 @@ use serde::{Deserialize, Serialize};
 /// any workload-identity issuer (those are `https://` URLs).
 const ISSUER_PREFIX: &str = "forge-registry:";
 
-/// Signing keys: the current one signs, every one verifies (a key replaced
-/// by another instance is still accepted while its tokens live).
+/// Signing keys: the current one signs, every one verifies. A key another
+/// instance replaced is picked up with [`TokenKeys::rotate_to`], and the
+/// keys before it keep verifying, so tokens they signed stay valid for their
+/// lifetime. Clones share the keys.
 #[derive(Clone)]
 pub struct TokenKeys {
-    keys: Arc<Vec<Vec<u8>>>,
+    keys: Arc<RwLock<Arc<Vec<Vec<u8>>>>>,
 }
+
+/// How many keys [`TokenKeys`] keeps verifying: the signing key and the two
+/// before it.
+const MAX_KEYS: usize = 3;
 
 impl std::fmt::Debug for TokenKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenKeys")
-            .field("keys", &self.keys.len())
+            .field("keys", &self.current().len())
             .finish()
     }
 }
@@ -40,12 +46,30 @@ impl TokenKeys {
     pub fn new(keys: Vec<Vec<u8>>) -> Self {
         assert!(!keys.is_empty(), "at least one registry token key");
         TokenKeys {
-            keys: Arc::new(keys),
+            keys: Arc::new(RwLock::new(Arc::new(keys))),
         }
     }
 
-    fn signing(&self) -> &[u8] {
-        &self.keys[0]
+    /// Sign with `key` from now on, and keep verifying with the keys before
+    /// it (at most [`MAX_KEYS`] in all). Returns whether `key` is new.
+    pub fn rotate_to(&self, key: Vec<u8>) -> bool {
+        let mut keys = self.keys.write().unwrap_or_else(PoisonError::into_inner);
+        if keys[0] == key {
+            return false;
+        }
+        let earlier = keys.iter().filter(|k| **k != key).take(MAX_KEYS - 1);
+        let rotated = std::iter::once(key.clone())
+            .chain(earlier.cloned())
+            .collect();
+        *keys = Arc::new(rotated);
+        true
+    }
+
+    fn current(&self) -> Arc<Vec<Vec<u8>>> {
+        self.keys
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -204,7 +228,7 @@ pub fn issue(keys: &TokenKeys, claims: &Claims) -> Result<String, jsonwebtoken::
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         claims,
-        &EncodingKey::from_secret(keys.signing()),
+        &EncodingKey::from_secret(&keys.current()[0]),
     )
 }
 
@@ -216,7 +240,7 @@ pub fn verify(keys: &TokenKeys, token: &str, issuer: &str, audience: &str) -> Op
     validation.set_required_spec_claims(&["exp", "iss", "aud", "nbf"]);
     validation.validate_nbf = true;
     validation.leeway = 30;
-    keys.keys.iter().find_map(|key| {
+    keys.current().iter().find_map(|key| {
         jsonwebtoken::decode::<Claims>(token, &DecodingKey::from_secret(key), &validation)
             .ok()
             .map(|data| data.claims)
@@ -325,6 +349,36 @@ mod tests {
             b"0123456789abcdef0123456789abcdef".to_vec(),
         ]);
         assert!(verify(&rotated, &jwt, &c.iss, &c.aud).is_some());
+    }
+
+    #[test]
+    fn a_picked_up_key_signs_and_earlier_tokens_still_verify() {
+        let first = b"0123456789abcdef0123456789abcdef".to_vec();
+        let keys = TokenKeys::new(vec![first.clone()]);
+        let shared = keys.clone();
+        let c = claims(Vec::new());
+        let old = issue(&keys, &c).unwrap();
+
+        let second = b"another-key-another-key-another!!".to_vec();
+        assert!(keys.rotate_to(second.clone()));
+        assert!(!keys.rotate_to(second.clone()), "the same key is no change");
+        let new = issue(&shared, &c).unwrap();
+        let only_second = TokenKeys::new(vec![second]);
+        assert!(
+            verify(&only_second, &new, &c.iss, &c.aud).is_some(),
+            "signed with the new key"
+        );
+        assert!(
+            verify(&shared, &old, &c.iss, &c.aud).is_some(),
+            "the old key still verifies"
+        );
+
+        // Only the last few keys keep verifying.
+        for n in 0..MAX_KEYS as u8 {
+            keys.rotate_to(vec![n; 32]);
+        }
+        assert!(verify(&keys, &old, &c.iss, &c.aud).is_none());
+        assert_eq!(keys.current().len(), MAX_KEYS);
     }
 
     #[test]

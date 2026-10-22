@@ -86,8 +86,12 @@ are accepted under `/v2` only.
 
 Registry tokens are signed with `docker.token_secret` when set, otherwise
 with a key Forge generates once and keeps in the database (sealed with the
-`[crypto]` envelope key when secret encryption is enabled), so every
-instance accepts every instance's tokens.
+`[crypto]` envelope key when secret encryption is enabled, and re-sealed by
+DEK rotation like the other secrets), so every instance accepts every
+instance's tokens. An instance replaces the stored key only when it can
+never be opened (a database or key-store error fails startup instead); the
+running instances pick the new key up within 30 seconds and keep accepting
+tokens of the previous one.
 
 ## Hosted repositories
 
