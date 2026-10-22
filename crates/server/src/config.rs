@@ -2224,8 +2224,17 @@ impl Config {
         if let Some(ba) = &self.auth.bootstrap_admin {
             // A local password account: its name must be one a password
             // login accepts (no `:`) and not a reserved protocol name.
-            forge_core::auth::canonical_account_username(&ba.username, true)
-                .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
+            forge_core::auth::canonical_account_username(&ba.username, true).map_err(|e| {
+                ConfigError::Invalid(match e {
+                    forge_core::auth::InvalidUsername::Reserved => format!(
+                        "auth.bootstrap_admin.username: {:?} is reserved for workload identity \
+                         since 1.1.0; rename the account and this setting (see the 1.1.0 \
+                         upgrade notes)",
+                        ba.username.trim()
+                    ),
+                    e => format!("auth.bootstrap_admin.username: {e}"),
+                })
+            })?;
         }
         match self.auth.login_mode.as_str() {
             "identifier_first" | "combined" => {}
@@ -4274,6 +4283,24 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("auth.bootstrap_admin.username: username must not contain ':'"),
+            "{err}"
+        );
+    }
+
+    /// A 1.0.0 bootstrap admin named `oidc` (reserved since, #199): the error
+    /// says why and where to look.
+    #[test]
+    fn bootstrap_admin_with_a_reserved_name_refused() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \" OIDC \"\npassword = \"s3cret-Pw!\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"oidc\" is reserved for workload identity since 1.1.0")
+                && err.contains("upgrade notes"),
             "{err}"
         );
     }

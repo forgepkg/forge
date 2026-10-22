@@ -85,6 +85,17 @@ otherwise.
   can publish. Existing realms keep the value they were saved with; to
   use the new default, clear the field in the realm form (or drop the key
   from the config) and save.
+- The username `oidc` is reserved for workload identity (trusted
+  publishing), and 1.0.0 allowed it. An account named `oidc` can no longer
+  sign in with its password, in the browser or over Basic, and its API
+  tokens work only as `X-NuGet-ApiKey`, no longer as the Basic password;
+  startup logs a warning that names it. A config with
+  `auth.bootstrap_admin.username = "oidc"` refuses to start. Rename the
+  account before upgrading; there is no API for it, so use SQL:
+  `UPDATE app_user SET username = 'oidc-admin' WHERE username = 'oidc';`
+  (the account keeps its id, password, roles and tokens). Then set
+  `auth.bootstrap_admin.username` to the new name if it was `oidc`.
+  ([#199](https://github.com/schmitch/forge/issues/199))
 - Migration 0034 adds the `workload_api_key` table for the trusted-publishing
   token exchange; it changes no existing data. `/api/v2/token` is a new
   route, so a reverse proxy that only forwards known prefixes needs `/api`.
