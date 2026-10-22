@@ -121,14 +121,14 @@ Content-Type: application/json
   realm again or reverting the edit does not bring them back. A key issued
   under the new configuration works on every instance at once, also on
   those that have not reloaded the realm yet. Deleting the role leaves the
-  key without rights. A registry token `docker login -u oidc`
-  got with a key stops working within 10 seconds of the same changes. Forge
-  stores only SHA-256 digests of the key, subject and `jti` (table
-  `workload_api_key`), and the auth reaper deletes a row once the key has
-  expired and the token has been expired for 15 minutes (the most clock skew
-  a realm accepts, plus a margin). Whether a token has expired is decided on
-  the database's clock, so an instance whose clock runs behind it cannot
-  redeem a token twice.
+  key without rights. A registry token `docker login -u oidc` got with a
+  key stops working within 10 seconds of the same changes, and expires no
+  later than the key. Forge stores only SHA-256 digests of the key, subject
+  and `jti` (table `workload_api_key`), and the auth reaper deletes a row
+  once the key has expired and the token has been expired for 15 minutes
+  (the most clock skew a realm accepts, plus a margin). Whether a token has
+  expired is decided on the database's clock, so an instance whose clock
+  runs behind it cannot redeem a token twice.
 - A key starts with `forge_wif.`, which no user API token can (user tokens
   are URL-safe base64, without a dot). Secret scanners can match
   `forge_wif\.[A-Za-z0-9_-]{43}`.

@@ -247,13 +247,15 @@ async fn redeem(
         subject_sha256,
         jti_sha256: Some(jti_sha256),
         issued_at,
+        key_id: None,
+        expires_at,
     } = workload.principal
     else {
         return refuse(StatusCode::UNAUTHORIZED, "invalid credentials");
     };
     let (Some(token_issued_at), Some(token_expires_at)) = (
         DateTime::<Utc>::from_timestamp(issued_at, 0),
-        DateTime::<Utc>::from_timestamp(workload.expires_at, 0),
+        DateTime::<Utc>::from_timestamp(expires_at, 0),
     ) else {
         return refuse(StatusCode::UNAUTHORIZED, "invalid credentials");
     };

@@ -106,6 +106,13 @@ pub enum TokenPrincipal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         jti: Option<String>,
         iat: i64,
+        /// The exchanged workload key the token was minted with; `None` when
+        /// the CI token itself was presented.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<i64>,
+        /// When that credential ends (Unix seconds); the token's `exp` is
+        /// capped at it.
+        ends: i64,
     },
 }
 
@@ -132,6 +139,8 @@ impl TokenPrincipal {
                 subject_sha256,
                 jti_sha256,
                 issued_at,
+                key_id,
+                expires_at,
             } => TokenPrincipal::Workload {
                 realm: realm_id,
                 role: role_id,
@@ -140,6 +149,8 @@ impl TokenPrincipal {
                 sub: hex::encode(subject_sha256),
                 jti: jti_sha256.map(hex::encode),
                 iat: issued_at,
+                key: key_id,
+                ends: expires_at,
             },
             _ => TokenPrincipal::Anonymous,
         }
@@ -174,6 +185,8 @@ impl TokenPrincipal {
                 sub,
                 jti,
                 iat,
+                key,
+                ends,
             } => Principal::Workload {
                 realm_id: *realm,
                 role_id: *role,
@@ -185,8 +198,19 @@ impl TokenPrincipal {
                     None => None,
                 },
                 issued_at: *iat,
+                key_id: *key,
+                expires_at: *ends,
             },
         })
+    }
+
+    /// When the credential behind this principal ends, if it ends on its own
+    /// (a workload's key or CI token).
+    pub fn credential_ends(&self) -> Option<i64> {
+        match self {
+            TokenPrincipal::Workload { ends, .. } => Some(*ends),
+            _ => None,
+        }
     }
 }
 
@@ -479,9 +503,26 @@ mod tests {
             subject_sha256: [3; 32],
             jti_sha256: Some([4; 32]),
             issued_at: 5,
+            key_id: Some(6),
+            expires_at: 7,
         };
         let tp = TokenPrincipal::of(&p);
+        assert_eq!(tp.credential_ends(), Some(7));
         assert_eq!(tp.to_principal(Principal::Unauthenticated), Some(p));
+        let direct = Principal::Workload {
+            realm_id: 1,
+            role_id: 2,
+            issuer_sha256: [1; 32],
+            config_sha256: [2; 32],
+            subject_sha256: [3; 32],
+            jti_sha256: Some([4; 32]),
+            issued_at: 5,
+            key_id: None,
+            expires_at: 7,
+        };
+        let tp = TokenPrincipal::of(&direct);
+        assert!(!serde_json::to_string(&tp).unwrap().contains("\"key\""));
+        assert_eq!(tp.to_principal(Principal::Unauthenticated), Some(direct));
 
         let session = Principal::User {
             user_id: 1,

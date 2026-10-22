@@ -198,6 +198,7 @@ impl PublishPolicy for SelectorPublishPolicy {
             subject_sha256,
             jti_sha256,
             issued_at,
+            ..
         } = context.principal
         else {
             // This ledger is specifically the federated trusted-publishing
@@ -331,6 +332,8 @@ mod tests {
             subject_sha256: [2; 32],
             jti_sha256: None,
             issued_at: 1,
+            key_id: None,
+            expires_at: 2,
         }));
         assert!(!principal_allows_protocol_mutations(&Principal::User {
             user_id: 1,

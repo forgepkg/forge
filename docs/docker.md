@@ -82,8 +82,10 @@ request naming more is refused with `400 UNSUPPORTED`. Every
 request is authorized again against the current permissions, and the user
 and API token behind a registry token must still be active; a workload's
 realm must still be enabled with the configuration it was verified under,
-and the workload key it came from must not have ended (checked at least
-every 10 seconds). Registry tokens
+and a token got with a workload key stands only while that key does
+(checked at least every 10 seconds). A token got with a CI token directly
+does not depend on any key that CI token was exchanged for. Either kind
+expires no later than the key or CI token it was got with. Registry tokens
 are accepted under `/v2` only.
 
 Registry tokens are signed with `docker.token_secret` when set, otherwise

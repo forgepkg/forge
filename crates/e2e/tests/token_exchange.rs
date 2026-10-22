@@ -439,6 +439,123 @@ async fn a_registry_token_dies_with_its_workload_key() {
 }
 
 #[tokio::test]
+async fn a_registry_token_rests_on_the_credential_it_was_minted_with() {
+    let idp = MockOidc::start_workload_only("unused-wif-client").await;
+    let srv = start_stack().await;
+    setup(&srv, &idp, json!({})).await;
+    let created = srv
+        .create_repo(json!({"name": "ci-images", "kind": "hosted", "format": "docker"}))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let role: i64 = sqlx::query_scalar("SELECT id FROM role WHERE name = 'ci-pub'")
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        srv.add_grant(role, Some("ci-images"), "read", None)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    // `docker login -u oidc -p <secret>`: the registry token and its lifetime.
+    let login = |secret: String| {
+        let srv = &srv;
+        async move {
+            let response = srv
+                .client()
+                .get(format!(
+                    "{}/v2/token?scope=repository:ci-images/app:pull",
+                    srv.base_url
+                ))
+                .basic_auth("oidc", Some(&secret))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.json::<Value>().await.unwrap();
+            (
+                body["token"].as_str().unwrap().to_string(),
+                body["expires_in"].as_i64().unwrap(),
+            )
+        }
+    };
+    // A pull of an image not pushed yet: 404 while the token stands.
+    let pull = |token: String| {
+        let srv = &srv;
+        async move {
+            srv.client()
+                .get(format!("{}/v2/ci-images/app/tags/list", srv.base_url))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let end_key = |key: String| {
+        let srv = &srv;
+        async move {
+            sqlx::query(
+                "UPDATE workload_api_key SET created_at = now() - interval '2 hours', \
+                 expires_at = now() - interval '1 hour' WHERE key_sha256 = $1",
+            )
+            .bind(sha256(&key))
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Minted with a key that the reaper deleted once it ended (with its CI
+    // token long expired): the registry token ended with the key. (Not used
+    // before: what a token rests on is cached for 10 seconds.)
+    let key = exchange_ok(&srv, &idp.sign_token(job_claims(&idp)).await).await;
+    let (token, _) = login(key.clone()).await;
+    end_key(key.clone()).await;
+    sqlx::query(
+        "UPDATE workload_api_key SET token_expires_at = now() - interval '1 day' \
+         WHERE key_sha256 = $1",
+    )
+    .bind(sha256(&key))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    assert!(
+        forge_db::workload_api_key_dao::reap_expired(&srv.pool)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        pull(token).await,
+        StatusCode::UNAUTHORIZED,
+        "a reaped key stays ended"
+    );
+
+    // Minted with a CI token directly, after the key that token was
+    // exchanged for ended: the token is a credential of its own.
+    let ci_token = idp.sign_token(job_claims(&idp)).await;
+    let key = exchange_ok(&srv, &ci_token).await;
+    end_key(key).await;
+    let (token, _) = login(ci_token).await;
+    assert_eq!(pull(token).await, StatusCode::NOT_FOUND);
+
+    // A registry token never outlives its credential.
+    let key = exchange_ok(&srv, &idp.sign_token(job_claims(&idp)).await).await;
+    sqlx::query("UPDATE workload_api_key SET expires_at = now() + interval '90 seconds' WHERE key_sha256 = $1")
+        .bind(sha256(&key))
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    let (_, expires_in) = login(key).await;
+    assert!((1..=90).contains(&expires_in), "{expires_in}");
+    let mut claims = job_claims(&idp);
+    claims["exp"] = json!(chrono::Utc::now().timestamp() + 90);
+    let (_, expires_in) = login(idp.sign_token(claims).await).await;
+    assert!((1..=90).contains(&expires_in), "{expires_in}");
+}
+
+#[tokio::test]
 async fn an_unreachable_issuer_answers_503_so_the_job_retries() {
     // The issuer goes away before any instance fetched its discovery
     // document or keys (a restart, a new replica): the token cannot be
