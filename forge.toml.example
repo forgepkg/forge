@@ -29,7 +29,8 @@ allow_insecure_defaults = true  # (default: false)
 # max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
 # staging_dir = "/var/tmp/forge"  # (default: <system temp dir>/forge-staging)
 # max_staging_bytes = 4294967296  # (default: 4 x the largest of the default upload limits, proxy.max_package_bytes, docker.max_blob_bytes; 0 = no limit)
-# It also caps the upload limit a repository may be given.
+# It also caps the upload limit a repository may be given. Set below 1 GiB, it
+# lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
 # anonymous_mode = "allowlist": a request naming any other host is not served
@@ -178,7 +179,7 @@ max_nuspec_compression_ratio = 200          # (default: 200)
 
 [docker]
 # The Docker / OCI registry under /v2 (see docs/docker.md).
-max_blob_bytes                = 1073741824  # (default: 1 GiB) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
+# max_blob_bytes              = 1073741824  # (default: 1 GiB, or what an explicit server.max_staging_bytes holds) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
 token_ttl_seconds             = 300         # (default: 300) registry token lifetime, 60-3600
 # Signs registry tokens (at least 32 characters). Unset: a key generated once
 # and kept in the database, sealed when [crypto] is enabled.

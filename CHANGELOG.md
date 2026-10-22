@@ -60,6 +60,14 @@ otherwise.
   `server.max_staging_bytes` (four times the largest item) grows with it to
   4 GiB; size the staging volume for it.
   ([#40](https://github.com/schmitch/forge/issues/40))
+- An explicit `server.max_staging_bytes` keeps working as it is. When it is
+  below the new 1 GiB docker defaults, they shrink to fit it (less
+  `nuget.max_nuspec_bytes`): docker repositories without an upload limit of
+  their own accept layers up to that size, and so do docker proxy
+  downloads unless `docker.max_blob_bytes` is set; startup logs a warning.
+  Raise the budget for larger layers. A budget too small for the package
+  limits is refused as before, with an error that names the setting that
+  decides the minimum. ([#198](https://github.com/schmitch/forge/issues/198))
 - The container image's baked `forge.toml` no longer holds the placeholder
   `minioadmin` S3 keys. An image started without `FORGE_S3__ACCESS_KEY` /
   `FORGE_S3__SECRET_KEY` (and without short-lived credentials) still

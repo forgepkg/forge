@@ -117,7 +117,8 @@ pub struct ServerConfig {
     /// default: a push under the default upload limits, or a proxy download
     /// (`proxy.max_package_bytes`, `docker.max_blob_bytes`), so 4 GiB. `0`
     /// removes the limit. Size the staging volume above it. A repository's
-    /// upload limit may not exceed it (less `nuget.max_nuspec_bytes`).
+    /// upload limit may not exceed it (less `nuget.max_nuspec_bytes`), and
+    /// an explicit budget lowers the docker defaults to fit it.
     #[serde(default)]
     pub max_staging_bytes: Option<u64>,
     /// Permit starting with **known-insecure placeholder credentials** (the
@@ -1359,9 +1360,10 @@ pub struct DockerConfig {
     /// Largest blob (image layer) a docker proxy downloads from its
     /// upstream. Staged on disk while it arrives, so it counts towards
     /// `server.max_staging_bytes`. Pushes follow the repository's upload
-    /// limit instead. Default 1 GiB.
-    #[serde(default = "default_docker_max_blob_bytes")]
-    pub max_blob_bytes: u64,
+    /// limit instead. Default 1 GiB, or less with an explicit staging budget
+    /// that is smaller ([`Config::docker_max_blob_bytes`]).
+    #[serde(default)]
+    pub max_blob_bytes: Option<u64>,
     /// Lifetime of a registry Bearer token from `/v2/token` (60–3600 s).
     /// Default 300.
     #[serde(default = "default_docker_token_ttl_seconds")]
@@ -1389,7 +1391,7 @@ pub struct DockerConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         DockerConfig {
-            max_blob_bytes: default_docker_max_blob_bytes(),
+            max_blob_bytes: None,
             token_ttl_seconds: default_docker_token_ttl_seconds(),
             token_secret: None,
             upload_ttl_seconds: default_docker_upload_ttl_seconds(),
@@ -1401,7 +1403,7 @@ impl Default for DockerConfig {
 
 impl DockerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.max_blob_bytes == 0 {
+        if self.max_blob_bytes == Some(0) {
             return Err(ConfigError::Invalid(
                 "docker.max_blob_bytes must be greater than 0".into(),
             ));
@@ -1448,9 +1450,9 @@ impl DockerConfig {
     }
 }
 
-fn default_docker_max_blob_bytes() -> u64 {
-    1024 * 1024 * 1024
-}
+/// The largest blob a docker proxy downloads unless `docker.max_blob_bytes`
+/// says otherwise: 1 GiB.
+pub const DEFAULT_DOCKER_MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 fn default_docker_token_ttl_seconds() -> u64 {
     300
 }
@@ -2258,11 +2260,12 @@ impl Config {
         if let Some(budget) = self.staging_budget() {
             let needed = self.largest_staged_set();
             if budget < needed {
+                let (item, setting) = self.largest_staged_item_and_setting();
                 return Err(ConfigError::Invalid(format!(
-                    "server.max_staging_bytes ({budget}) must be at least the largest of \
-                     the default upload limits, proxy.max_package_bytes and \
-                     docker.max_blob_bytes plus nuget.max_nuspec_bytes ({needed}), \
-                     or 0 for no limit"
+                    "server.max_staging_bytes ({budget}) must be at least {setting} ({item}) \
+                     plus nuget.max_nuspec_bytes ({}), {needed} in all: raise it, lower \
+                     {setting}, or set it to 0 for no limit",
+                    self.nuget.max_nuspec_bytes
                 )));
             }
         }
@@ -2274,19 +2277,75 @@ impl Config {
     /// package or an image blob. (A repository's own upload limit may be
     /// larger, up to [`Self::max_repository_upload_bytes`].)
     fn largest_staged_item(&self) -> u64 {
-        self.default_upload_limit(forge_db::model::NUGET_FORMAT)
-            .max(DEFAULT_DOCKER_MAX_UPLOAD_BYTES)
-            .max(self.proxy.max_package_bytes)
-            .max(self.docker.max_blob_bytes)
+        self.largest_staged_item_and_setting().0
+    }
+
+    /// [`Self::largest_staged_item`], and the setting that decides it. The
+    /// docker defaults fit an explicit staging budget by construction
+    /// ([`Self::docker_default`]), so only settings an operator can change
+    /// decide it then.
+    fn largest_staged_item_and_setting(&self) -> (u64, &'static str) {
+        let package = self.default_upload_limit(forge_db::model::NUGET_FORMAT);
+        [
+            (
+                package,
+                if self.server.max_upload_bytes.is_some() {
+                    "server.max_upload_bytes"
+                } else {
+                    "the default upload limit of package repositories"
+                },
+            ),
+            (self.proxy.max_package_bytes, "proxy.max_package_bytes"),
+            (
+                self.default_upload_limit(forge_db::model::DOCKER_FORMAT),
+                "the default upload limit of docker repositories",
+            ),
+            (self.docker_max_blob_bytes(), "docker.max_blob_bytes"),
+        ]
+        .into_iter()
+        .fold(
+            (0, ""),
+            |largest, item| {
+                if item.0 > largest.0 {
+                    item
+                } else {
+                    largest
+                }
+            },
+        )
+    }
+
+    /// A docker default (`default` bytes): with an explicit staging budget
+    /// smaller than it, what fits the budget (less `nuget.max_nuspec_bytes`,
+    /// like a repository's own limit). The docker defaults came with 1.1.0,
+    /// and a staging budget sized for a 1.0.0 install must not refuse to
+    /// start for them.
+    fn docker_default(&self, default: u64) -> u64 {
+        match self.server.max_staging_bytes {
+            Some(budget) if budget > 0 => {
+                default.min(budget.saturating_sub(self.nuget.max_nuspec_bytes))
+            }
+            _ => default,
+        }
+    }
+
+    /// The largest blob a docker proxy downloads: `docker.max_blob_bytes`,
+    /// else [`DEFAULT_DOCKER_MAX_BLOB_BYTES`] as far as an explicit staging
+    /// budget allows ([`Self::docker_default`]).
+    pub fn docker_max_blob_bytes(&self) -> u64 {
+        self.docker
+            .max_blob_bytes
+            .unwrap_or_else(|| self.docker_default(DEFAULT_DOCKER_MAX_BLOB_BYTES))
     }
 
     /// The upload limit of a hosted repository of `format` without one of
-    /// its own: for docker [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob, for
-    /// a package format the deprecated `server.max_upload_bytes` when set,
-    /// else [`DEFAULT_MAX_UPLOAD_BYTES`].
+    /// its own: for docker [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob (as
+    /// far as an explicit staging budget allows, [`Self::docker_default`]),
+    /// for a package format the deprecated `server.max_upload_bytes` when
+    /// set, else [`DEFAULT_MAX_UPLOAD_BYTES`].
     pub fn default_upload_limit(&self, format: &str) -> u64 {
         if format == forge_db::model::DOCKER_FORMAT {
-            return DEFAULT_DOCKER_MAX_UPLOAD_BYTES;
+            return self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES);
         }
         self.server
             .max_upload_bytes
@@ -2478,6 +2537,20 @@ impl Config {
                  temporary S3 keys STS returns cross the network in clear text; use https"
                     .to_string(),
             );
+        }
+        let docker_push = self.default_upload_limit(forge_db::model::DOCKER_FORMAT);
+        if docker_push < DEFAULT_DOCKER_MAX_UPLOAD_BYTES
+            || (self.docker.max_blob_bytes.is_none()
+                && self.docker_max_blob_bytes() < DEFAULT_DOCKER_MAX_BLOB_BYTES)
+        {
+            warnings.push(format!(
+                "server.max_staging_bytes ({}) leaves no room for the 1 GiB docker defaults: \
+                 docker repositories without an upload limit of their own accept layers up \
+                 to {docker_push} bytes, and docker proxies download blobs up to {} bytes; \
+                 raise server.max_staging_bytes for larger layers",
+                self.server.max_staging_bytes.unwrap_or_default(),
+                self.docker_max_blob_bytes()
+            ));
         }
         warnings
     }
@@ -3946,6 +4019,71 @@ mod tests {
             &format!("[server]\nmax_staging_bytes = {largest}"),
         );
         assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
+    }
+
+    /// A staging budget sized for a 1.0.0 install keeps starting after the
+    /// upgrade (#198): the 1 GiB docker defaults shrink to fit it, with a
+    /// warning, and only settings the operator can change decide the minimum,
+    /// which the error names.
+    #[test]
+    fn an_explicit_staging_budget_bounds_the_docker_defaults() {
+        const MIB: u64 = 1024 * 1024;
+        let v1 = MINIMAL.replace(
+            "[server]",
+            "[server]\nmax_upload_bytes = 268435456\nmax_staging_bytes = 805306368",
+        ) + "\n[proxy]\nmax_package_bytes = 268435456\n";
+        let cfg = Config::from_figment(fig_from_toml(&v1)).expect("a valid 1.0.0 config starts");
+        let fits = 768 * MIB - cfg.nuget.max_nuspec_bytes;
+        assert_eq!(cfg.default_upload_limit("docker"), fits);
+        assert_eq!(cfg.docker_max_blob_bytes(), fits);
+        assert_eq!(cfg.max_repository_upload_bytes(), Some(fits));
+        let warnings = cfg.deployment_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("1 GiB docker defaults")),
+            "{warnings:?}"
+        );
+
+        // An explicit docker.max_blob_bytes is the operator's and must fit;
+        // the error names it.
+        let explicit = format!("{v1}\n[docker]\nmax_blob_bytes = 1073741824\n");
+        let err = Config::from_figment(fig_from_toml(&explicit)).unwrap_err();
+        assert!(
+            err.to_string().contains("lower docker.max_blob_bytes"),
+            "{err}"
+        );
+        // Too small for the package default: the error names that, not
+        // settings that cannot help.
+        let small = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 314572800")
+            + "\n[proxy]\nmax_package_bytes = 268435456\n";
+        let err = Config::from_figment(fig_from_toml(&small))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the default upload limit of package repositories (536870912)"),
+            "{err}"
+        );
+        assert!(!err.contains("docker"), "{err}");
+
+        // Without an explicit budget, or with one that holds them, the
+        // docker defaults stay 1 GiB and nothing is logged.
+        for toml in [
+            MINIMAL.to_string(),
+            MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 2147483648"),
+            MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 0"),
+        ] {
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+            assert_eq!(
+                cfg.default_upload_limit("docker"),
+                DEFAULT_DOCKER_MAX_UPLOAD_BYTES
+            );
+            assert_eq!(cfg.docker_max_blob_bytes(), DEFAULT_DOCKER_MAX_BLOB_BYTES);
+            assert!(
+                !cfg.deployment_warnings()
+                    .iter()
+                    .any(|w| w.contains("docker defaults")),
+                "{toml}"
+            );
+        }
     }
 
     #[test]

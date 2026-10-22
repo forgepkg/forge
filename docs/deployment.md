@@ -529,7 +529,11 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   `0` removes the limit); past it, pushes and downloads are answered `503`
   with `Retry-After` until space frees up. A repository's upload limit may
   not exceed the budget (less `nuget.max_nuspec_bytes`), so raise the
-  budget before giving a repository a larger limit. Size the volume above that budget. Each process stages in a
+  budget before giving a repository a larger limit. An explicit budget below
+  the 1 GiB docker defaults lowers them to what it holds: docker
+  repositories without a limit of their own accept layers up to the budget
+  (less `nuget.max_nuspec_bytes`), and so do docker proxy downloads unless
+  `docker.max_blob_bytes` is set (startup warns). Size the volume above that budget. Each process stages in a
   locked subdirectory of its own, and the files a killed process left are
   removed at the next start however recent they are, so they do not add to
   the space a restarted instance needs. Give each instance a volume of its
