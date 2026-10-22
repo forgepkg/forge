@@ -1022,3 +1022,265 @@ async fn a_reorder_waits_for_a_realm_change_instead_of_deadlocking() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(realm_order(&srv).await, order);
 }
+
+/// A credential-forwarding realm that keeps password hashes
+/// (`capture_password_hash`, migration 0035): an accepted login keeps one,
+/// turning the option off deletes them, `captured_password_only` signs the
+/// accounts in with them while the upstream is never asked, and the accounts
+/// can then be switched to local ones that keep signing in with the same
+/// password.
+#[tokio::test]
+async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
+    use wiremock::matchers::{any, header};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let basic = |user: &str, password: &str| {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+        )
+    };
+    let alice = format!("alice{}", common::unique());
+    let bob = format!("bob{}", common::unique());
+    let upstream = MockServer::start().await;
+    let accepting = || async {
+        for (user, password) in [(&alice, "alice-pw"), (&bob, "bob-pw")] {
+            Mock::given(header("authorization", basic(user, password).as_str()))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&upstream)
+            .await;
+    };
+    accepting().await;
+
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let url = format!("{}/status", upstream.uri());
+    let login = |user: String, password: &'static str| {
+        let client = client.clone();
+        let url = format!("{}/auth/login", srv.base_url);
+        async move {
+            client
+                .post(url)
+                .json(&json!({ "username": user, "password": password }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let admin_call = |method: reqwest::Method, path: String, body: Option<Value>| {
+        let client = client.clone();
+        let url = format!("{}{path}", srv.base_url);
+        let (admin, password) = (admin.clone(), password.clone());
+        async move {
+            let mut req = client
+                .request(method, url)
+                .basic_auth(&admin, Some(&password));
+            if let Some(body) = body {
+                req = req.json(&body);
+            }
+            let resp = req.send().await.unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            (
+                status,
+                serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+            )
+        }
+    };
+    let config = |extra: Value| {
+        let mut config = json!({ "url": url, "key_pepper": "pepper" });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        config
+    };
+
+    // Stopping forwarding without keeping hashes is refused.
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        "/admin/realms".into(),
+        Some(json!({
+            "kind": "credential_forwarding",
+            "name": "nexus-only",
+            "config": config(json!({ "captured_password_only": true })),
+        })),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("capture_password_hash"), "{body}");
+
+    let (status, realm) = admin_call(
+        reqwest::Method::POST,
+        "/admin/realms".into(),
+        Some(json!({
+            "kind": "credential_forwarding",
+            "name": "nexus",
+            "config": config(json!({ "capture_password_hash": true })),
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "{realm}");
+    assert_eq!(realm["config"]["capture_password_hash"], json!(true));
+    let realm_id = realm["id"].as_i64().unwrap();
+    let realm_path = format!("/admin/realms/{realm_id}");
+    let counts = || {
+        admin_call(
+            reqwest::Method::GET,
+            format!("{realm_path}/captured-passwords"),
+            None,
+        )
+    };
+
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(bob.clone(), "wrong").await, 401);
+    assert_eq!(
+        counts().await,
+        (
+            reqwest::StatusCode::OK,
+            json!({ "accounts": 1, "captured": 1 })
+        )
+    );
+    let (_, users) = admin_call(reqwest::Method::GET, "/admin/users".into(), None).await;
+    let alice_view = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(alice))
+        .expect("alice provisioned")
+        .clone();
+    assert_eq!(alice_view["auth_source"], json!("upstream-basic"));
+    assert!(
+        alice_view["captured_password_at"].is_string(),
+        "{alice_view}"
+    );
+
+    // Turning the option off deletes the kept hashes...
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({})) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(counts().await.1, json!({ "accounts": 1, "captured": 0 }));
+    // ...and turning it on again keeps them from each account's next upstream
+    // check on. Alice's verdict from before is cached again (the config is
+    // the one it was cached under), so her login keeps nothing until a
+    // re-authentication makes it ask the upstream.
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({ "capture_password_hash": true })) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(bob.clone(), "bob-pw").await, 200);
+    assert_eq!(counts().await.1, json!({ "accounts": 2, "captured": 1 }));
+    let alice_id = alice_view["id"].as_i64().unwrap();
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{alice_id}/reauth"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204);
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(counts().await.1, json!({ "accounts": 2, "captured": 2 }));
+
+    // Stop forwarding: the upstream must not be asked any more.
+    let (status, body) = admin_call(
+        reqwest::Method::PATCH,
+        realm_path.clone(),
+        Some(json!({ "config": config(json!({
+            "capture_password_hash": true,
+            "captured_password_only": true,
+        })) })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    upstream.reset().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    assert_eq!(login(alice.clone(), "alice-pw").await, 200);
+    assert_eq!(login(alice.clone(), "wrong").await, 401);
+    assert_eq!(login(format!("carol{}", common::unique()), "x").await, 401);
+    // Basic auth on the wire works the same way.
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&bob, Some("bob-pw"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["user"]["username"],
+        json!(bob)
+    );
+
+    // Only a forwarded account with a kept password converts.
+    let admin_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(admin))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{admin_id}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 409);
+    let (status, _) = admin_call(
+        reqwest::Method::POST,
+        "/admin/users/0/convert-to-local".into(),
+        None,
+    )
+    .await;
+    assert_eq!(status, 404);
+
+    // One account, then the rest of the realm.
+    let (status, view) = admin_call(
+        reqwest::Method::POST,
+        format!("/admin/users/{alice_id}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["auth_source"], json!("local"));
+    assert_eq!(view["captured_password_at"], Value::Null);
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        format!("{realm_path}/convert-to-local"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "converted": 1, "remaining": 0 }));
+
+    // Local accounts now, signing in with the same passwords; the upstream is
+    // still never asked (the mock verifies on drop).
+    for (user, pw) in [(&alice, "alice-pw"), (&bob, "bob-pw")] {
+        assert_eq!(login(user.clone(), pw).await, 200, "{user}");
+        let account = forge_db::user_dao::find_user_by_username(&srv.pool, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.auth_source, "local");
+    }
+}

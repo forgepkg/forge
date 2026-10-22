@@ -134,8 +134,31 @@ impl PasswordHashLimiter {
 
     /// Burn one verification against the static dummy hash (timing
     /// equalization); never accepts.
-    async fn verify_dummy(&self, candidate: String) -> Result<bool, LimiterSaturated> {
+    pub async fn verify_dummy(&self, candidate: String) -> Result<bool, LimiterSaturated> {
         self.run(None, candidate).await
+    }
+
+    /// Hash `password` into a fresh argon2id PHC string (default parameters,
+    /// random salt) on a blocking thread, in a slot of its own: hashing costs
+    /// what a verification does. Unlike a verification it never queues: with
+    /// every slot busy it fails at once, so a caller that can do without the
+    /// hash (see `capture_password_hash`) never makes a request wait for a
+    /// slot. `Ok(None)` when hashing failed.
+    pub async fn try_hash(&self, password: String) -> Result<Option<String>, LimiterSaturated> {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| LimiterSaturated)?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Argon2::default()
+                .hash_password(password.as_bytes())
+                .map(|h| h.to_string())
+                .ok()
+        })
+        .await
+        .unwrap_or(None))
     }
 
     async fn run(
@@ -371,9 +394,31 @@ mod tests {
             limiter.verify_dummy("x".into()).await,
             Err(LimiterSaturated)
         );
+        assert_eq!(limiter.try_hash("x".into()).await, Err(LimiterSaturated));
         drop(held);
         assert_eq!(limiter.verify_dummy("x".into()).await, Ok(false));
         assert_eq!(permits.available_permits(), 1, "permit returned after use");
+    }
+
+    #[tokio::test]
+    async fn try_hash_makes_a_verifiable_argon2id_phc() {
+        let limiter = PasswordHashLimiter::new(1, DEFAULT_QUEUE_TIMEOUT);
+        let hashed = limiter.try_hash("right".into()).await.unwrap().unwrap();
+        let parsed = PasswordHash::new(&hashed).expect("valid PHC string");
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(
+            limiter.verify(hashed.clone(), "right".into()).await,
+            Ok(true)
+        );
+        assert_eq!(
+            limiter.verify(hashed.clone(), "wrong".into()).await,
+            Ok(false)
+        );
+        // A fresh salt each time.
+        assert_ne!(
+            limiter.try_hash("right".into()).await.unwrap().unwrap(),
+            hashed
+        );
     }
 
     #[test]
