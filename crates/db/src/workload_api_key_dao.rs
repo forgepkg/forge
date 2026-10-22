@@ -174,26 +174,19 @@ pub async fn find_live(
     .transpose()
 }
 
-/// Whether the CI token `(issuer_sha256, jti_sha256)` was exchanged for a
-/// key that has since ended (expired or revoked). `false` when it was never
-/// exchanged, or its key is live.
-pub async fn redemption_ended(
-    pool: &PgPool,
-    issuer_sha256: &[u8; 32],
-    jti_sha256: &[u8; 32],
-) -> sqlx::Result<bool> {
-    let ended: Option<bool> = sqlx::query_scalar(
+/// Whether the key `id` has not ended (expired or revoked). A key whose row
+/// is gone (reaped) has ended.
+pub async fn is_live(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
         r#"
-        SELECT expires_at <= now()
-        FROM workload_api_key
-        WHERE issuer_sha256 = $1 AND jti_sha256 = $2
+        SELECT EXISTS (
+            SELECT 1 FROM workload_api_key WHERE id = $1 AND expires_at > now()
+        )
         "#,
     )
-    .bind(issuer_sha256.as_slice())
-    .bind(jti_sha256.as_slice())
-    .fetch_optional(pool)
-    .await?;
-    Ok(ended.unwrap_or(false))
+    .bind(id)
+    .fetch_one(pool)
+    .await
 }
 
 /// Delete the rows whose key **and** CI token have both expired: until the

@@ -80,7 +80,12 @@ impl Registry {
         }
 
         let now = chrono::Utc::now();
-        let ttl = self.inner.config.token_ttl_seconds.max(60) as i64;
+        let max_ttl = self.inner.config.token_ttl_seconds.max(60) as i64;
+        // Never past the credential it was minted with: a workload's key or
+        // CI token ends on its own.
+        let ttl = token_principal
+            .credential_ends()
+            .map_or(max_ttl, |ends| max_ttl.min(ends - now.timestamp()).max(0));
         let claims = Claims {
             iss: site.issuer.clone(),
             aud: site.service.clone(),

@@ -87,6 +87,13 @@ pub enum Principal {
         /// Validated token `iat` (Unix seconds), recorded with publish audit
         /// events. WIF validation guarantees it is fresh and not in the future.
         issued_at: i64,
+        /// `workload_api_key.id` when the workload presented a key the token
+        /// exchange issued; `None` for the CI token itself.
+        key_id: Option<i64>,
+        /// When the presented credential ends (Unix seconds): the key's
+        /// expiry, or the CI token's `exp`. Nothing derived from it (a
+        /// registry token) may outlive it.
+        expires_at: i64,
     },
 }
 
@@ -175,6 +182,8 @@ mod tests {
             subject_sha256: [0; 32],
             jti_sha256: None,
             issued_at: 0,
+            key_id: None,
+            expires_at: 0,
         };
         assert_eq!(workload.audit_label(), "workload realm:3 role:7");
     }

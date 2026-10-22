@@ -526,10 +526,9 @@ pub struct WorkloadIdentitySource {
 /// A workload proven by a verified OIDC token: the principal it authorizes as,
 /// plus what the token exchange records about the token.
 pub(crate) struct VerifiedWorkload {
-    /// Always a [`Principal::Workload`].
+    /// Always a [`Principal::Workload`], whose `expires_at` is the token's
+    /// `exp`.
     pub principal: Principal,
-    /// The token's `exp` (Unix seconds).
-    pub expires_at: i64,
     /// The token's `jti`, when it has one.
     pub jti: Option<String>,
     /// The exchanged-key lifetime the token's realm grants.
@@ -668,8 +667,9 @@ impl WorkloadIdentitySource {
                         subject_sha256: workload_subject_hash(&verified.issuer, &verified.subject),
                         jti_sha256: verified.claims.jti.as_deref().map(sha256_bytes),
                         issued_at: verified.claims.iat.expect("workload verifier requires iat"),
+                        key_id: None,
+                        expires_at: verified.claims.exp.expect("workload verifier requires exp"),
                     },
-                    expires_at: verified.claims.exp.expect("workload verifier requires exp"),
                     jti: verified.claims.jti.clone(),
                     api_key_ttl_seconds: realm.config.api_key_ttl_seconds(),
                     clock_skew_seconds: realm.config.clock_skew_seconds,
@@ -749,6 +749,8 @@ impl WorkloadIdentitySource {
             subject_sha256: row.subject_sha256,
             jti_sha256: Some(row.jti_sha256),
             issued_at: row.token_issued_at.timestamp(),
+            key_id: Some(row.id),
+            expires_at: row.expires_at.timestamp(),
         })
     }
 

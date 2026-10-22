@@ -42,7 +42,8 @@ impl forge_oci::PublishRecorder for LedgerRecorder {
     }
 }
 
-/// Registry tokens of a workload stand only while their realm and key do.
+/// Registry tokens of a workload stand only while their realm, and the key
+/// they were minted with (if any), do.
 pub(crate) struct WorkloadLiveness {
     pub realms: Arc<crate::auth::RealmAuth>,
     pub pool: PgPool,
@@ -53,9 +54,8 @@ impl forge_oci::WorkloadCheck for WorkloadLiveness {
     async fn still_valid(&self, principal: &Principal) -> Result<bool, String> {
         let Principal::Workload {
             realm_id,
-            issuer_sha256,
             config_sha256,
-            jti_sha256,
+            key_id,
             ..
         } = *principal
         else {
@@ -69,12 +69,15 @@ impl forge_oci::WorkloadCheck for WorkloadLiveness {
         if !current {
             return Ok(false);
         }
-        let Some(jti_sha256) = jti_sha256 else {
+        // Minted with the CI token itself: the token's own expiry caps the
+        // registry token's, and the realm check above is all that is left.
+        let Some(key_id) = key_id else {
             return Ok(true);
         };
-        workload_api_key_dao::redemption_ended(&self.pool, &issuer_sha256, &jti_sha256)
+        // Minted with an exchanged key: it stands while that key does. A key
+        // the reaper deleted has ended too.
+        workload_api_key_dao::is_live(&self.pool, key_id)
             .await
-            .map(|ended| !ended)
             .map_err(|e| e.to_string())
     }
 }

@@ -50,8 +50,8 @@ pub trait PublishRecorder: Send + Sync {
 /// Whether the workload principal of a registry token still stands. The
 /// server answers it from its realms: like a workload key, a token stands
 /// only while its realm is enabled with the configuration it was verified
-/// under, and while the workload key its CI token was exchanged for (if it
-/// was) has not ended.
+/// under, and, when it was minted with a workload key, while that key has
+/// not ended.
 #[async_trait::async_trait]
 pub trait WorkloadCheck: Send + Sync {
     async fn still_valid(&self, principal: &Principal) -> Result<bool, String>;
@@ -342,7 +342,7 @@ impl Registry {
         if let Principal::Workload {
             realm_id,
             config_sha256,
-            jti_sha256,
+            key_id,
             ..
         } = principal
         {
@@ -352,7 +352,7 @@ impl Registry {
             let key = format!(
                 "{realm_id}:{}:{}",
                 hex::encode(config_sha256),
-                jti_sha256.map(hex::encode).unwrap_or_default()
+                key_id.map_or_else(|| "token".to_string(), |id| id.to_string())
             );
             let live: Result<bool, String> = self
                 .inner
