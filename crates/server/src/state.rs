@@ -324,7 +324,7 @@ impl AppState {
             envelope: self.envelope.clone(),
             config: forge_oci::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
-                max_blob_bytes: self.config.docker.max_blob_bytes,
+                max_blob_bytes: self.config.docker_max_blob_bytes(),
                 default_max_upload_bytes: self.config.default_upload_limit(DOCKER_FORMAT),
                 token_ttl_seconds: self.config.docker.token_ttl_seconds,
                 delete_grace: self.config.outbox.grace(),

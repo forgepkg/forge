@@ -118,7 +118,8 @@ with any `artifactType`; Docker schema 1 is refused.
   delete the manifest first.
 - Uploads are limited per blob by the repository's upload limit (*Maximum
   upload size* in the web UI, `max_upload_bytes` in the admin API; 1 GiB
-  when unset) and staged on disk like package pushes (see
+  when unset, or what an explicit `server.max_staging_bytes` below that
+  holds) and staged on disk like package pushes (see
   `server.max_staging_bytes`, which also caps the limit).
   Upload sessions are shared by all instances; an abandoned one expires
   after `docker.upload_ttl_seconds`.
@@ -248,7 +249,7 @@ A docker repository's retention policy (`PUT
 
 ```toml
 [docker]
-max_blob_bytes = 1073741824           # (default: 1 GiB) largest layer a proxy downloads
+max_blob_bytes = 1073741824           # (default: 1 GiB, or what an explicit server.max_staging_bytes holds) largest layer a proxy downloads
 token_ttl_seconds = 300               # (default: 300) registry token lifetime, 60-3600
 # token_secret = "…"                  # (default: a generated key kept in the database)
 upload_ttl_seconds = 86400            # (default: 24 h) abandoned upload sessions expire
