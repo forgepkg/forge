@@ -1721,3 +1721,70 @@ async fn stored_usernames_are_brought_into_canonical_form() {
         .unwrap();
     assert!(again.iter().all(|r| ![spaced, upper, twin].contains(&r.id)));
 }
+
+/// Migration 0035 stores a docker group's writable member by id: the name
+/// a group held becomes the id of the hosted docker repository so named,
+/// and a name no such repository has is dropped. The migration's statement
+/// only touches groups still holding a name, so it runs again here on
+/// groups seeded as before it.
+#[tokio::test]
+async fn migration_0035_stores_a_writable_member_by_id() {
+    let pool = pool().await;
+    let n = unique();
+    let insert = |name: String, kind: &'static str, config: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO repository (name, format, kind, config) \
+                 VALUES ($1, 'docker', $2, $3) RETURNING id",
+            )
+            .bind(name)
+            .bind(kind)
+            .bind(config)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let member = insert(format!("wm-hosted-{n}"), "hosted", serde_json::json!({})).await;
+    let named = insert(
+        format!("wm-group-{n}"),
+        "group",
+        serde_json::json!({"writable_member": format!("wm-hosted-{n}")}),
+    )
+    .await;
+    let dangling = insert(
+        format!("wm-dangling-{n}"),
+        "group",
+        serde_json::json!({"writable_member": format!("wm-gone-{n}"), "prefer_hosted": false}),
+    )
+    .await;
+
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0035_docker_writable_member_id.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let config = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT config FROM repository WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        config(named).await,
+        serde_json::json!({"writable_member_id": member})
+    );
+    assert_eq!(
+        config(dangling).await,
+        serde_json::json!({"prefer_hosted": false})
+    );
+}

@@ -1292,6 +1292,81 @@ async fn groups_resolve_by_priority_and_push_to_the_writable_member() {
     assert_eq!(resp.status(), 400);
 }
 
+/// A docker group names its writable member by id (#219): renaming the
+/// member keeps group pushes going to it, and a repository created later
+/// under its old name does not become the push target.
+#[tokio::test]
+async fn a_group_keeps_its_writable_member_through_a_rename() {
+    let srv = common::start().await;
+    let member = repo_name("dock");
+    let renamed = repo_name("dock");
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": member, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker", "writable_member": member}),
+    )
+    .await;
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{group}/members"),
+        json!({"member": member, "priority": 5}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{member}"),
+        json!({"name": renamed}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (u, p) = srv.admin_basic();
+    let shown: Value = srv
+        .client()
+        .get(format!("{}/admin/repositories/{group}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shown["writable_member"], renamed.as_str(), "{shown}");
+
+    // A new repository under the old name, in the group too.
+    create_repo(
+        &srv,
+        json!({"name": member, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{group}/members"),
+        json!({"member": member, "priority": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+
+    let oci = admin_oci(&srv).await;
+    let pushed = oci
+        .push_image(&format!("{group}/app"), "1", "amd64", b"pushed via group")
+        .await;
+    let resp = oci.get(&format!("{renamed}/app"), "manifests/1").await;
+    assert_eq!(resp.headers()["docker-content-digest"], pushed.as_str());
+    assert_eq!(
+        oci.get(&format!("{member}/app"), "manifests/1")
+            .await
+            .status(),
+        404
+    );
+}
+
 // ── Proxies ─────────────────────────────────────────────────────────────────
 
 /// A minimal upstream registry: Docker token auth, fixed content, and

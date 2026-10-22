@@ -214,8 +214,8 @@ pub const IMMUTABLE_TAGS_KEY: &str = "immutable_tags";
 /// `repository.config` key of [`Repository::latest_mutable`].
 pub const LATEST_MUTABLE_KEY: &str = "latest_mutable";
 
-/// `repository.config` key of [`Repository::writable_member`].
-pub const WRITABLE_MEMBER_KEY: &str = "writable_member";
+/// `repository.config` key of [`Repository::writable_member_id`].
+pub const WRITABLE_MEMBER_ID_KEY: &str = "writable_member_id";
 
 /// `repository.config` key of [`Repository::max_upload_bytes`].
 pub const MAX_UPLOAD_BYTES_KEY: &str = "max_upload_bytes";
@@ -268,16 +268,17 @@ impl Repository {
             .filter(|&bytes| bytes > 0)
     }
 
-    /// Docker group option (`config.writable_member`): the name of the hosted
-    /// member a push to the group goes to. `None`: pushes are refused.
-    pub fn writable_member(&self) -> Option<&str> {
+    /// Docker group option (`config.writable_member_id`): the id of the
+    /// hosted member a push to the group goes to, so renaming it keeps it
+    /// and a repository created later under its old name never becomes it.
+    /// `None`: pushes are refused.
+    pub fn writable_member_id(&self) -> Option<i64> {
         if self.kind() != RepoKind::Group {
             return None;
         }
         self.config
-            .get(WRITABLE_MEMBER_KEY)
-            .and_then(|v| v.as_str())
-            .filter(|m| !m.is_empty())
+            .get(WRITABLE_MEMBER_ID_KEY)
+            .and_then(|v| v.as_i64())
     }
 }
 
