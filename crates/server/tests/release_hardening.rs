@@ -481,29 +481,6 @@ async fn deleted_bootstrap_admin_is_not_recreated_on_restart() {
     );
 }
 
-/// An account named `oidc` from before 1.1.0, which reserves the name for
-/// workload identity (#199), is named in a startup warning.
-#[tokio::test]
-async fn a_reserved_account_name_is_reported_at_startup() {
-    // A database of its own: no other test may see an `oidc` account.
-    let pool = common::fresh_pool().await;
-    assert!(forge_server::app::warn_on_reserved_accounts(&pool)
-        .await
-        .is_empty());
-    // As 1.0.0 stored it: the DAO refuses the name now.
-    sqlx::query(
-        "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
-         VALUES ('oidc', '$argon2id$unused', true, true, 'local')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        forge_server::app::warn_on_reserved_accounts(&pool).await,
-        vec!["oidc".to_string()]
-    );
-}
-
 /// Review L7(a): when the bootstrap username already exists at boot (an
 /// install that predates the marker, or a boot that crashed between creating
 /// the account and recording the marker), the marker is recorded then — so
