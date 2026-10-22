@@ -12,9 +12,10 @@ The release workflow publishes the section whose heading matches the tag
 
 ### Upgrade notes
 
-- The Helm chart and the kustomize manifests run Valkey (9.1, the
-  BSD-licensed fork of Redis that speaks the same protocol) instead of Redis
-  as their optional in-cluster shared cache. Forge's own setting is
+- **Breaking for installs that run the in-cluster Redis:** the Helm chart
+  and the kustomize manifests run Valkey (9.1, the BSD-licensed fork of
+  Redis that speaks the same protocol) instead of Redis as their optional
+  in-cluster shared cache. Forge's own setting is
   unchanged (`FORGE_REDIS__URL`, a `redis://` URL), and an external Redis
   keeps working.
   - Helm: the `redis:` values are now `valkey:` (`valkey.enabled`,
