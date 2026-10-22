@@ -36,8 +36,9 @@ use std::time::{Duration, Instant};
 use forge_cache::Cache;
 use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
-    AuthProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper, ForwardLimits,
-    LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider, ValidatedCredentialCache,
+    AuthProvider, CapturedPasswordProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper,
+    ForwardLimits, LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider,
+    ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_core::oidc::{AssertionClaims, ClientAuth};
@@ -122,6 +123,19 @@ pub struct CredForwardRealmConfig {
     /// Auto-provision an `app_user` on first successful upstream login.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
+    /// Keep an argon2id hash of every password the upstream accepts on the
+    /// account (migration 0035), so an administrator can later switch the
+    /// realm's accounts to local ones and retire the upstream. Off by default;
+    /// turning it off deletes the kept hashes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_password_hash: bool,
+    /// Stop forwarding: sign the realm's accounts in with the password hashes
+    /// it kept instead of asking the upstream
+    /// ([`forge_core::auth::CapturedPasswordProvider`]); an account without
+    /// one can no longer sign in. Requires `capture_password_hash`, which
+    /// keeps the hashes from being deleted under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub captured_password_only: bool,
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
     pub positive_ttl_secs: u64,
@@ -369,6 +383,13 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             if !cfg.required_groups.is_empty() && cfg.groups_path.trim().is_empty() {
                 return Err("required_groups is set but groups_path is empty".into());
             }
+            if cfg.captured_password_only && !cfg.capture_password_hash {
+                return Err(
+                    "captured_password_only needs capture_password_hash (the kept hashes \
+                     are what the accounts then sign in with)"
+                        .into(),
+                );
+            }
             if !matches!(
                 cfg.method.to_ascii_uppercase().as_str(),
                 "GET" | "POST" | "HEAD" | "PUT"
@@ -607,8 +628,10 @@ pub struct RealmAuth {
     /// snapshot, so a snapshot rebuild never resets a bound while forwards
     /// started by the previous build are still in flight.
     forward_limits: Arc<ForwardLimits>,
-    /// Bounds concurrent argon2 verifications across every snapshot's local
-    /// provider (`auth.password_verify_concurrency`); outlives rebuilds.
+    /// Bounds concurrent argon2 work across every snapshot's providers
+    /// (`auth.password_verify_concurrency`): the local provider's
+    /// verifications and the hashes credential-forwarding realms keep.
+    /// Outlives rebuilds.
     password_limiter: Arc<PasswordHashLimiter>,
     /// Signs the client assertions of a `federated_credential` OIDC realm.
     assertion_issuer: AssertionIssuer,
@@ -855,7 +878,8 @@ impl RealmAuth {
         // in the clear to a non-loopback host unless the realm says so.
         ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
             .map_err(|e| anyhow::anyhow!("url: {e}"))?;
-        if cfg.auto_provision && cfg.identity_path.trim().is_empty() {
+        if cfg.auto_provision && !cfg.captured_password_only && cfg.identity_path.trim().is_empty()
+        {
             tracing::warn!(
                 realm = %realm.name,
                 "credential-forwarding realm provisions accounts without identity_path: \
@@ -892,6 +916,17 @@ impl RealmAuth {
         // The request's own timeout normally fires first (and is logged as
         // such); the cache's deadline is the backstop its lease is sized by.
         .with_forward_timeout(request_timeout + Duration::from_secs(1));
+        if cfg.captured_password_only {
+            // The upstream is no longer asked; the accounts' kept hashes
+            // decide, through the same (re-keyed) verdict cache.
+            return Ok(Box::new(CapturedPasswordProvider::new(
+                provider_id,
+                realm.id,
+                self.pool.clone(),
+                cred_cache,
+                self.password_limiter.clone(),
+            )));
+        }
         let core = forge_core::auth::UpstreamBasicConfig {
             url: cfg.url,
             method: cfg.method.to_ascii_uppercase(),
@@ -906,10 +941,12 @@ impl RealmAuth {
             provider_id,
             auto_provision: cfg.auto_provision,
             realm_id: Some(realm.id),
+            capture_password_hash: cfg.capture_password_hash,
         };
-        Ok(Box::new(UpstreamBasicProvider::new(
-            core, client, cred_cache,
-        )))
+        Ok(Box::new(
+            UpstreamBasicProvider::new(core, client, cred_cache)
+                .with_hash_limiter(self.password_limiter.clone()),
+        ))
     }
 
     /// Build the OIDC login runtime from a realm row.
@@ -1142,6 +1179,8 @@ pub async fn seed_auth_realms(
             allow_http: ub.allow_http,
             admin_group: ub.admin_group.clone(),
             auto_provision: ub.auto_provision,
+            capture_password_hash: false,
+            captured_password_only: false,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
             negative_ttl_secs: ub.cache.negative_ttl_secs,
             key_pepper: ub.cache.key_pepper.clone(),
@@ -1364,6 +1403,35 @@ mod tests {
             &json!({"url": "https://x/s", "key_pepper": "p", "required_groups": ["g"]}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn kept_password_options_validate() {
+        let base = json!({"url": "https://nexus.internal/status", "key_pepper": "p"});
+        let with = |extra: serde_json::Value| {
+            let mut config = base.clone();
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            validate_config(KIND_CRED_FORWARD, &config)
+        };
+        // Off by default, and then absent from the stored document.
+        let plain = with(json!({})).unwrap();
+        assert!(plain.get("capture_password_hash").is_none());
+        assert!(plain.get("captured_password_only").is_none());
+        // The key the database fences a kept hash on.
+        let keep = with(json!({"capture_password_hash": true})).unwrap();
+        assert_eq!(
+            keep[forge_db::user_dao::CAPTURE_PASSWORD_HASH_KEY],
+            json!(true)
+        );
+        // Stopping forwarding needs the hashes to be kept.
+        let err = with(json!({"captured_password_only": true})).unwrap_err();
+        assert!(err.contains("capture_password_hash"), "{err}");
+        let only =
+            with(json!({"capture_password_hash": true, "captured_password_only": true})).unwrap();
+        assert_eq!(only["captured_password_only"], json!(true));
     }
 
     #[test]

@@ -175,3 +175,37 @@ describe('OIDC federated credential', () => {
     )
   })
 })
+
+describe('kept password options', () => {
+  const stored = (config: RealmView['config']): RealmView => ({
+    id: 1,
+    kind: 'credential_forwarding',
+    name: 'nexus',
+    enabled: true,
+    priority: 1,
+    config,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  })
+  const base = { url: 'https://nexus.example.com/status', auto_provision: true }
+
+  it('round-trips both options and omits them when off', () => {
+    for (const config of [
+      base,
+      { ...base, capture_password_hash: true },
+      { ...base, capture_password_hash: true, captured_password_only: true },
+    ]) {
+      expect(toRealmConfig(seedRealmFormValues(stored(config)))).toEqual(config)
+    }
+  })
+
+  it('never stops forwarding without keeping hashes', () => {
+    const values = {
+      ...seedRealmFormValues(
+        stored({ ...base, capture_password_hash: true, captured_password_only: true }),
+      ),
+      capture_password_hash: false,
+    }
+    expect(toRealmConfig(values)).toEqual(base)
+  })
+})

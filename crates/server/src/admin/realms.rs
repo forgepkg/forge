@@ -21,14 +21,14 @@ use forge_crypto::CryptoError;
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm, ReorderOutcome};
 use forge_db::model::AuthRealm;
 use forge_db::secret_dao::{self, SecretDbError};
-use forge_db::workload_api_key_dao;
+use forge_db::{user_dao, workload_api_key_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::db_error;
 use crate::auth::{
     federated_credential, forget_seed, merge_secrets, redact_config, secret_keys, validate_config,
-    FederatedCredential, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+    FederatedCredential, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 use crate::state::AppState;
 
@@ -489,6 +489,84 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     }
 }
 
+/// How many accounts of a credential-forwarding realm keep a password hash
+/// (`capture_password_hash`) and so can be switched to local ones.
+#[derive(Debug, Serialize)]
+pub struct CapturedPasswordsView {
+    /// The realm's accounts (orphans of a deleted realm are not counted).
+    pub accounts: i64,
+    /// Those of them that keep a password hash.
+    pub captured: i64,
+}
+
+/// The outcome of `POST /admin/realms/{id}/convert-to-local`.
+#[derive(Debug, Serialize)]
+pub struct ConvertToLocalView {
+    /// Accounts switched to local ones.
+    pub converted: usize,
+    /// The realm's accounts left as they were: they keep no password hash
+    /// (no login the upstream accepted since the realm started keeping them).
+    pub remaining: i64,
+}
+
+/// The credential-forwarding realm `id`, or the response refusing it.
+async fn cred_forward_realm(state: &AppState, id: i64) -> Result<AuthRealm, Response> {
+    match auth_realm_dao::find_realm_by_id(&state.pool, id).await {
+        Ok(Some(r)) if r.kind == KIND_CRED_FORWARD => Ok(r),
+        Ok(Some(_)) => Err(bad_request(
+            "only a credential-forwarding realm keeps password hashes",
+        )),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "realm not found").into_response()),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// `GET /admin/realms/{id}/captured-passwords` — how many of a
+/// credential-forwarding realm's accounts keep a password hash.
+pub async fn captured_passwords(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    if let Err(resp) = cred_forward_realm(&state, id).await {
+        return resp;
+    }
+    match user_dao::captured_password_counts(&state.pool, id).await {
+        Ok(c) => Json(CapturedPasswordsView {
+            accounts: c.accounts,
+            captured: c.captured,
+        })
+        .into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+/// `POST /admin/realms/{id}/convert-to-local` — switch every account of a
+/// credential-forwarding realm that keeps a password hash to a local account
+/// with that password (see `POST /admin/users/{id}/convert-to-local`): the
+/// step that lets the upstream be retired without asking these users for new
+/// passwords. Accounts without a kept hash are left as they are and counted
+/// in `remaining`. The realm itself is not changed; disable or delete it once
+/// the accounts that still need it are dealt with.
+pub async fn convert_to_local(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let realm = match cred_forward_realm(&state, id).await {
+        Ok(realm) => realm,
+        Err(resp) => return resp,
+    };
+    let converted = match user_dao::convert_realm_users_to_local(&state.pool, id).await {
+        Ok(converted) => converted,
+        Err(e) => return db_error(e),
+    };
+    if let Err(resp) = super::users::purge_converted(&state, &converted).await {
+        return resp;
+    }
+    tracing::info!(realm = %realm.name, converted = converted.len(), "realm accounts switched to local passwords");
+    match user_dao::captured_password_counts(&state.pool, id).await {
+        Ok(c) => Json(ConvertToLocalView {
+            converted: converted.len(),
+            remaining: c.accounts,
+        })
+        .into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
 /// 409 body when a PATCH lost a race with another change of the realm.
 const REALM_CHANGED: &str =
     "the realm was changed by another request since it was read; reload it and try again";
@@ -541,11 +619,19 @@ async fn guard_last_interactive_realm(
 /// Write a PATCH as a compare-and-set against `existing` (the row the
 /// handler read and merged over): `Ok(None)` when it changed or is gone in
 /// between. Disabling the last enabled interactive realm is refused.
+///
+/// A credential-forwarding realm that does not (or no longer) keep password
+/// hashes loses the ones its accounts carry, in the same transaction: the
+/// realm row stays locked until it commits, so a login storing a hash under
+/// the old setting either lands before and is deleted here, or finds the
+/// option off ([`user_dao::store_captured_password_hash`]).
 async fn write_realm_update(
     state: &AppState,
     existing: &AuthRealm,
     upd: AuthRealmUpdate,
 ) -> Result<Option<AuthRealm>, RealmWriteError> {
+    let drops_captured_passwords = existing.kind == KIND_CRED_FORWARD
+        && upd.config.get(user_dao::CAPTURE_PASSWORD_HASH_KEY) != Some(&JsonValue::Bool(true));
     let mut tx = state.pool.begin().await?;
     if !upd.enabled {
         guard_last_interactive_realm(&mut tx, existing).await?;
@@ -571,6 +657,12 @@ async fn write_realm_update(
         // reverting it included.
         if existing.kind == KIND_WORKLOAD_IDENTITY {
             workload_api_key_dao::revoke_realm(&mut tx, existing.id).await?;
+        }
+        if drops_captured_passwords {
+            let cleared = user_dao::clear_captured_password_hashes(&mut *tx, existing.id).await?;
+            if cleared > 0 {
+                tracing::info!(realm = %existing.name, cleared, "kept password hashes deleted");
+            }
         }
         tx.commit().await?;
     }

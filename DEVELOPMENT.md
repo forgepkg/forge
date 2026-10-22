@@ -363,6 +363,41 @@ at most 1 MiB of a success body for `groups_path` / `identity_path`. With the
 account is never forwarded: a wrong password, or any password for a
 deactivated local account, is refused locally.
 
+### Retiring the upstream: kept password hashes
+
+A `credential_forwarding` realm stores no password by default: its verdict
+cache keeps only a peppered HMAC that expires with the TTL. To be able to
+switch the upstream off later without asking every user for a new password,
+check **Keep a password hash of successful logins** on the realm
+(`"capture_password_hash": true`). Every login the upstream accepts then keeps
+an argon2id hash of that password on the user's account (migration 0035). It
+is refreshed whenever a login actually asks the upstream (once per
+`positive_ttl_secs` per credential), never on a cache hit and never for a
+rejected password, so it is the last password the upstream accepted. The hash
+is not a local password while the realm forwards: the upstream stays in
+charge, so a password changed or revoked upstream keeps or loses access as
+before. Unchecking the option deletes the realm's kept hashes; deleting the
+realm keeps them on its (then orphaned) accounts.
+
+Two ways to stop depending on the upstream once the hashes are in place
+(the realm page shows how many of its accounts keep one):
+
+- **Stop forwarding: sign in with kept passwords only**
+  (`"captured_password_only": true`, which requires `capture_password_hash`).
+  The realm no longer contacts the upstream; it checks the password against
+  the account's kept hash, through the same verdict cache. The accounts stay
+  the realm's (same roles, tokens and admin flags). An account without a kept
+  hash can no longer sign in through the realm.
+- **Switch accounts to local passwords**: `POST
+  /admin/realms/{id}/convert-to-local` (every account of the realm with a
+  kept hash) or `POST /admin/users/{id}/convert-to-local` (one account, an
+  orphan of a deleted realm too). The kept hash becomes the account's Forge
+  password and the account becomes a `local` one with the same id, roles and
+  tokens; the upstream is never asked about it again. The `local` realm must
+  be enabled, and come before every realm that still forwards, for these
+  users to sign in. `GET /admin/realms/{id}/captured-passwords` counts the
+  realm's accounts and those that keep a hash.
+
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
 recorded in `forge_setting`); afterwards the database is the authority.

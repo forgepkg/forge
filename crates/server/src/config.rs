@@ -771,6 +771,8 @@ impl UpstreamBasicAuthConfig {
             provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
             auto_provision: self.auto_provision,
             realm_id: None,
+            // Kept hashes are bound to a realm row; the legacy block has none.
+            capture_password_hash: false,
         }
     }
 }

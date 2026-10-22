@@ -356,7 +356,16 @@ impl Registry {
         if staged.size == 0 {
             return Ok(upload.clone());
         }
-        let stored = self.inner.cas.commit(staged).await?;
+        // The first chunk may be the whole blob (a monolithic upload, or a
+        // layer streamed in one PATCH, as docker, podman and containerd
+        // send it), so it joins the local blob cache like any pushed blob.
+        // Later chunks are only read back once, to assemble the blob:
+        // caching them would evict content that is downloaded.
+        let stored = if upload.size == 0 {
+            self.inner.cas.commit(staged).await?
+        } else {
+            self.inner.cas.commit_uncached(staged).await?
+        };
         let mut tx = self.inner.pool.begin().await?;
         let Some(locked) =
             oci_dao::lock_upload(&mut tx, upload.id, upload.repository_id, &upload.image).await?
@@ -482,6 +491,12 @@ impl Registry {
                     .cas
                     .stage(StreamReader::new(Box::pin(chunks)), max)
                     .await?;
+                // The first chunk joined the local blob cache in case it was
+                // the whole blob (`append_chunk`). It is not, and nothing
+                // reads it as it is again.
+                if let (Some(cache), Some(first)) = (self.inner.store.cache(), parts.first()) {
+                    cache.evict(&first.blob_sha256).await;
+                }
                 if staged.size as i64 != upload.size
                     || !digest.matches(&staged.sha256, &staged.sha512_base64)
                 {
