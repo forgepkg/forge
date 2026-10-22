@@ -724,7 +724,24 @@ impl Cas {
     /// an ingest lease both lock the same blob row, so a deletion can neither
     /// start after this method observes the old object nor run before the
     /// caller consumes `ingest_token` in its reference transaction.
+    ///
+    /// The staged file is written through to the local blob cache.
     pub async fn commit(&self, staged: StagedBlob) -> Result<StoredBlob, CasError> {
+        self.promote(staged, true).await
+    }
+
+    /// [`Self::commit`] without the write-through to the local blob cache,
+    /// for bytes nobody downloads as they are: the chunks of a docker
+    /// upload, which are read back once to assemble the blob.
+    pub async fn commit_uncached(&self, staged: StagedBlob) -> Result<StoredBlob, CasError> {
+        self.promote(staged, false).await
+    }
+
+    async fn promote(
+        &self,
+        staged: StagedBlob,
+        write_through: bool,
+    ) -> Result<StoredBlob, CasError> {
         let size_i64 =
             i64::try_from(staged.size).map_err(|_| CasError::SizeOverflow { size: staged.size })?;
         let candidate_s3_key = format!(
@@ -789,7 +806,7 @@ impl Cas {
 
         // Write-through: S3 has the object now, so the staged copy may join
         // the local blob cache instead of only being deleted.
-        if let Some(cache) = self.store.cache() {
+        if let Some(cache) = self.store.cache().filter(|_| write_through) {
             cache
                 .insert_staged(&staged.sha256, staged.size, &staged.temp_path)
                 .await;

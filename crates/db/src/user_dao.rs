@@ -360,6 +360,247 @@ pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx:
     Ok(())
 }
 
+/// The `credential_forwarding` realm config key that opts the realm in to
+/// keeping a password hash of the logins its upstream accepts (migration 0035).
+pub const CAPTURE_PASSWORD_HASH_KEY: &str = "capture_password_hash";
+
+/// Keep `hash` — the argon2id PHC string of a password the upstream of realm
+/// `realm_id` just accepted for `user_id` — as the account's captured password
+/// (migration 0035). Returns whether it was stored.
+///
+/// Stored only while the realm opts in (`capture_password_hash`) and the
+/// account is still that realm's upstream account, and the realm row is
+/// share-locked for the write: a concurrent edit that turns the option off
+/// (and clears the hashes, [`clear_captured_password_hashes`]) either waits
+/// for this write and then clears it, or commits first and this writes
+/// nothing. A login that read the realm before the edit cannot leave a hash
+/// behind.
+pub async fn store_captured_password_hash(
+    pool: &PgPool,
+    user_id: i64,
+    realm_id: i64,
+    hash: &str,
+) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        r#"
+        WITH realm AS (
+            SELECT id FROM auth_realm
+            WHERE id = $2
+              AND kind = 'credential_forwarding'
+              AND config @> jsonb_build_object($4::text, true)
+            FOR SHARE
+        )
+        UPDATE app_user u
+        SET captured_password_hash = $3,
+            captured_password_at   = now()
+        FROM realm
+        WHERE u.id = $1
+          AND u.realm_id = realm.id
+          AND u.auth_source = 'upstream-basic'
+          AND u.password_hash IS NULL
+          AND NOT u.realm_orphaned
+        "#,
+    )
+    .bind(user_id)
+    .bind(realm_id)
+    .bind(hash)
+    .bind(CAPTURE_PASSWORD_HASH_KEY)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// The captured password of the upstream account `username` of `realm_id`
+/// (not an orphan of a deleted realm), for a realm that signs its accounts in
+/// with their captured passwords instead of asking the upstream
+/// (`captured_password_only`). `None` when there is no such account or it
+/// keeps no password.
+pub async fn find_captured_password_hash(
+    pool: &PgPool,
+    username: &str,
+    realm_id: i64,
+) -> sqlx::Result<Option<String>> {
+    let Some(username) = lookup_key(username) else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT captured_password_hash
+        FROM app_user
+        WHERE username = $1
+          AND auth_source = 'upstream-basic'
+          AND NOT realm_orphaned
+          AND realm_id = $2
+        "#,
+    )
+    .bind(username)
+    .bind(realm_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+/// Delete the captured passwords of every account of `realm_id`: the realm no
+/// longer opts in. Returns how many were deleted.
+pub async fn clear_captured_password_hashes<'e, E>(executor: E, realm_id: i64) -> sqlx::Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let res = sqlx::query(
+        r#"
+        UPDATE app_user
+        SET captured_password_hash = NULL,
+            captured_password_at   = NULL
+        WHERE realm_id = $1
+          AND captured_password_hash IS NOT NULL
+        "#,
+    )
+    .bind(realm_id)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// When each account that carries a captured password last had it refreshed
+/// (`(user id, captured_password_at)`), for the admin user listing.
+pub async fn captured_password_times(
+    pool: &PgPool,
+) -> sqlx::Result<Vec<(i64, chrono::DateTime<chrono::Utc>)>> {
+    sqlx::query_as(
+        r#"
+        SELECT id, captured_password_at
+        FROM app_user
+        WHERE captured_password_at IS NOT NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// When the captured password of `user_id` was last refreshed; `None` when
+/// the account carries none.
+pub async fn captured_password_at(
+    pool: &PgPool,
+    user_id: i64,
+) -> sqlx::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT captured_password_at
+        FROM app_user
+        WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+/// How many accounts of a credential-forwarding realm there are, and how many
+/// of them carry a captured password (see [`convert_realm_users_to_local`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedPasswordCounts {
+    pub accounts: i64,
+    pub captured: i64,
+}
+
+/// [`CapturedPasswordCounts`] of the (non-orphaned) upstream accounts of
+/// `realm_id`.
+pub async fn captured_password_counts(
+    pool: &PgPool,
+    realm_id: i64,
+) -> sqlx::Result<CapturedPasswordCounts> {
+    let (accounts, captured): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT count(*), count(captured_password_hash)
+        FROM app_user
+        WHERE realm_id = $1
+          AND auth_source = 'upstream-basic'
+          AND NOT realm_orphaned
+        "#,
+    )
+    .bind(realm_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(CapturedPasswordCounts { accounts, captured })
+}
+
+/// An account [`convert_to_local`] or [`convert_realm_users_to_local`]
+/// switched to a local password.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConvertedUser {
+    pub id: i64,
+    pub username: String,
+}
+
+/// Switch the upstream account `user_id` to a local one whose password is its
+/// captured password: `password_hash` takes the captured hash, the account
+/// leaves its realm (`auth_source = 'local'`, no realm, not orphaned) and
+/// keeps its id, roles, tokens and admin and active flags. From then on the
+/// local-password realm owns the name, so the password is never forwarded
+/// upstream again. `None` when there is no such upstream account or it has no
+/// captured password; an orphan of a deleted realm is converted all the same.
+pub async fn convert_to_local<'e, E>(
+    executor: E,
+    user_id: i64,
+) -> sqlx::Result<Option<ConvertedUser>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        r#"
+        UPDATE app_user
+        SET password_hash          = captured_password_hash,
+            captured_password_hash = NULL,
+            captured_password_at   = NULL,
+            auth_source            = 'local',
+            external_subject       = NULL,
+            realm_id               = NULL,
+            realm_orphaned         = false,
+            updated_at             = now()
+        WHERE id = $1
+          AND auth_source = 'upstream-basic'
+          AND captured_password_hash IS NOT NULL
+        RETURNING id, username
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// [`convert_to_local`] for every account of `realm_id` that carries a
+/// captured password; the others are left as they are.
+pub async fn convert_realm_users_to_local<'e, E>(
+    executor: E,
+    realm_id: i64,
+) -> sqlx::Result<Vec<ConvertedUser>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        r#"
+        UPDATE app_user
+        SET password_hash          = captured_password_hash,
+            captured_password_hash = NULL,
+            captured_password_at   = NULL,
+            auth_source            = 'local',
+            external_subject       = NULL,
+            realm_id               = NULL,
+            realm_orphaned         = false,
+            updated_at             = now()
+        WHERE realm_id = $1
+          AND auth_source = 'upstream-basic'
+          AND NOT realm_orphaned
+          AND captured_password_hash IS NOT NULL
+        RETURNING id, username
+        "#,
+    )
+    .bind(realm_id)
+    .fetch_all(executor)
+    .await
+}
+
 /// `forge_setting` key prefix of the bootstrap admin's "created once" markers
 /// (the server's `BOOTSTRAP_ADMIN_CREATED_KEY`, followed by `:` and the
 /// username).

@@ -41,6 +41,7 @@ function user(over: Partial<UserView>): UserView {
     is_admin: false,
     active: true,
     auth_source: 'local',
+    captured_password_at: null,
     ...over,
   }
 }
@@ -74,6 +75,7 @@ interface ApiHandlers {
   onDeleteUser?: (id: number) => Response
   onCreateToken?: (userId: number, body: unknown) => Response
   onRevokeToken?: (id: number) => Response
+  onConvertUser?: (id: number) => Response
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -121,6 +123,15 @@ function mockApi(h: ApiHandlers) {
         const body = init?.body ? JSON.parse(init.body as string) : {}
         return Promise.resolve(
           h.onCreateUser ? h.onCreateUser(body) : json(user(body), 201),
+        )
+      }
+
+      // Switch to a local account.
+      const convertMatch = path.match(/\/admin\/users\/(\d+)\/convert-to-local$/)
+      if (convertMatch && method === 'POST') {
+        const id = Number(convertMatch[1])
+        return Promise.resolve(
+          h.onConvertUser ? h.onConvertUser(id) : json(user({ id, auth_source: 'local' })),
         )
       }
 
@@ -330,6 +341,57 @@ describe('admin tokens', () => {
     // The plaintext is shown exactly once via ShowOnceSecret.
     expect(await screen.findByText('super-secret-plaintext')).toBeInTheDocument()
     expect(screen.getByText('Token created')).toBeInTheDocument()
+  })
+
+  it('switches a forwarded account with a kept password to a local one', async () => {
+    let converted: number | null = null
+    let users = [
+      user({
+        id: 2,
+        username: 'alice',
+        auth_source: 'upstream-basic',
+        captured_password_at: '2026-10-01T12:00:00Z',
+      }),
+    ]
+    mockApi({
+      get users() {
+        return users
+      },
+      tokens: [],
+      onConvertUser: (id) => {
+        converted = id
+        users = [user({ id, username: 'alice', auth_source: 'local' })]
+        return json(users[0])
+      },
+    })
+
+    const u = userEvent.setup()
+    const router = await renderAt('/manage/users')
+    await screen.findByText('alice')
+    await router.navigate({ to: '/manage/users/$userId', params: { userId: '2' } })
+    await waitFor(() => expect(router.state.status).toBe('idle'))
+
+    expect(await screen.findByText(/^Password kept/)).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: 'Switch to a local account…' }))
+    expect(converted).toBeNull()
+    await u.click(screen.getByRole('button', { name: 'Switch to a local account' }))
+
+    await waitFor(() => expect(converted).toBe(2))
+    expect(await screen.findByText(/^Sign-in:/)).toHaveTextContent('Sign-in: Password')
+    expect(screen.queryByText(/^Password kept/)).not.toBeInTheDocument()
+  })
+
+  it('offers no switch for an account without a kept password', async () => {
+    mockApi({
+      users: [user({ id: 2, username: 'alice', auth_source: 'upstream-basic' })],
+      tokens: [],
+    })
+    const router = await renderAt('/manage/users')
+    await screen.findByText('alice')
+    await router.navigate({ to: '/manage/users/$userId', params: { userId: '2' } })
+    await waitFor(() => expect(router.state.status).toBe('idle'))
+    expect(await screen.findByText(/^Sign-in:/)).toHaveTextContent('Credential forwarding')
+    expect(screen.queryByRole('button', { name: /local account/ })).not.toBeInTheDocument()
   })
 
   it('revokes a token after confirmation', async () => {

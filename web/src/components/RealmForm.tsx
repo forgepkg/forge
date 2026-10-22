@@ -100,6 +100,10 @@ export interface RealmFormValues {
   identity_path: string
   /** Credential forwarding: accept a plain-http, non-loopback URL. */
   allow_http: boolean
+  /** Credential forwarding: keep a hash of every password the upstream accepts. */
+  capture_password_hash: boolean
+  /** Credential forwarding: stop forwarding, sign in with the kept hashes. */
+  captured_password_only: boolean
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -247,6 +251,8 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     groups_path: fwd.groups_path ?? '',
     identity_path: fwd.identity_path ?? '',
     allow_http: fwd.allow_http ?? false,
+    capture_password_hash: fwd.capture_password_hash ?? false,
+    captured_password_only: fwd.captured_password_only ?? false,
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
@@ -948,6 +954,36 @@ export function RealmForm({
                 checked.
               </Description>
             </CheckboxField>
+            <CheckboxField>
+              <Checkbox
+                checked={values.capture_password_hash}
+                onChange={(c) => {
+                  set('capture_password_hash', c)
+                  // Without kept hashes there is nothing to sign in with.
+                  if (!c) set('captured_password_only', false)
+                }}
+              />
+              <Label>Keep a password hash of successful logins</Label>
+              <Description>
+                Stores an argon2id hash of each password the upstream accepts
+                on the user&apos;s account, so the users can keep signing in
+                once the upstream is retired. The upstream stays in charge
+                while it is asked. Unchecking deletes the kept hashes.
+              </Description>
+            </CheckboxField>
+            <CheckboxField>
+              <Checkbox
+                checked={values.captured_password_only}
+                disabled={!values.capture_password_hash}
+                onChange={(c) => set('captured_password_only', c)}
+              />
+              <Label>Stop forwarding: sign in with kept passwords only</Label>
+              <Description>
+                The upstream is no longer asked; users sign in with the last
+                password it accepted for them. Users without a kept hash can
+                no longer sign in through this realm.
+              </Description>
+            </CheckboxField>
           </FieldGroup>
         </Fieldset>
       )}
@@ -1528,6 +1564,10 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
     if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
     if (values.allow_http) config.allow_http = true
+    if (values.capture_password_hash) {
+      config.capture_password_hash = true
+      if (values.captured_password_only) config.captured_password_only = true
+    }
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive

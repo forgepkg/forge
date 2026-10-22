@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { CreatedToken, TokenView } from '~/api/tokens'
-import { authSourceLabel } from '~/api/users'
-import { useUsers } from '~/queries/useUsers'
+import { authSourceLabel, type UserView } from '~/api/users'
+import { useConvertUserToLocal, useUsers } from '~/queries/useUsers'
 import {
   useCreateToken,
   useRevokeToken,
@@ -38,7 +38,9 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
  * tokens (the plaintext is shown **once** via `ShowOnceSecret`), and revokes
  * existing ones. The plaintext is held in transient component state and never
  * written into a query cache. The header says how the user signs in, so a
- * token is not issued to a look-alike account by mistake.
+ * token is not issued to a look-alike account by mistake. A
+ * credential-forwarding account whose realm kept its password hash can be
+ * switched to a local account with that password from here.
  */
 function UserTokens() {
   const { userId } = Route.useParams()
@@ -99,6 +101,8 @@ function UserTokens() {
           shown only at creation time.
         </Text>
       </div>
+
+      {user?.captured_password_at && <KeptPassword user={user} />}
 
       {created && (
         <ShowOnceSecret
@@ -173,6 +177,48 @@ function UserTokens() {
         </Table>
       )}
     </section>
+  )
+}
+
+/**
+ * A credential-forwarding account's kept password hash, and the switch of the
+ * account to a local one with that password (asks for a confirmation first).
+ */
+function KeptPassword({ user }: { user: UserView }) {
+  const convert = useConvertUserToLocal()
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <div className="space-y-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10">
+      <Text>
+        Password kept {formatTs(user.captured_password_at)}: the last password
+        the upstream accepted for this user. Switching to a local account makes
+        it the user&apos;s Forge password; the upstream is never asked about
+        this user again.
+      </Text>
+      {convert.isError && (
+        <InlineError>{convert.error.body || convert.error.message}</InlineError>
+      )}
+      {confirming ? (
+        <div className="flex items-center gap-3">
+          <Button
+            color="red"
+            disabled={convert.isPending}
+            onClick={() =>
+              convert.mutate(user.id, { onSettled: () => setConfirming(false) })
+            }
+          >
+            {convert.isPending ? 'Switching…' : 'Switch to a local account'}
+          </Button>
+          <Button plain onClick={() => setConfirming(false)}>
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <Button outline onClick={() => setConfirming(true)}>
+          Switch to a local account…
+        </Button>
+      )}
+    </div>
   )
 }
 
