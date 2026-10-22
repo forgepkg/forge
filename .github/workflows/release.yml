@@ -66,7 +66,10 @@ jobs:
   # one CI run (ci.yml, a push or a manual run on the default branch) of the
   # tagged commit has succeeded with every job in REQUIRED_JOBS; waits up to an
   # hour for runs still queued or in progress (a tag pushed right after the
-  # merge), and fails when every run has finished without passing.
+  # merge), and fails when every run has finished without passing. A push run
+  # runs only the jobs of what the push changed (#361), every job for a release
+  # commit (it sets the workspace version); `cargo xtask release` starts a
+  # manual run, which runs every job, when it tags another commit.
   ci:
     name: CI passed for the tagged commit
     runs-on: ubuntu-latest
@@ -127,7 +130,7 @@ jobs:
               exit 1
             fi
             if [ -n "$runs" ] && [ "$pending" -eq 0 ]; then
-              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH passed with every job in: $REQUIRED_JOBS. Re-run CI for the commit, then this workflow."
+              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH passed with every job in: $REQUIRED_JOBS. A push run skips the jobs whose files the push did not change; while the commit is the head of $DEFAULT_BRANCH, start a full run (gh workflow run ci.yml --ref $DEFAULT_BRANCH), then re-run this workflow."
               exit 1
             fi
             if [ "$elapsed" -ge 3600 ]; then
