@@ -266,11 +266,47 @@ pub async fn map_identity_to_principal(
 ///   demotion from taking effect.
 /// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → never provisioned here;
 ///   delegate to [`map_identity_to_principal`].
+/// * **Kept password** (upstream-basic users only): an identity carrying a
+///   [`ProvenIdentity::captured_password_hash`] stores it on the account it
+///   signed in, while the vouching realm still opts in
+///   ([`forge_db::user_dao::store_captured_password_hash`]). Best effort: a
+///   failed write is logged and the login stands.
 ///
 /// Returns `Ok(None)` when no usable principal results (unknown/inactive and not
 /// auto-provisioned, or a name owned by another account kind), `Err` only on a
 /// DB failure (caller must fail closed).
 pub async fn provision_and_map(
+    pool: &PgPool,
+    identity: &ProvenIdentity,
+) -> sqlx::Result<Option<UserPrincipal>> {
+    let principal = resolve_upstream_or_map(pool, identity).await?;
+    if let Some(principal) = &principal {
+        keep_captured_password(pool, identity, principal.user_id).await;
+    }
+    Ok(principal)
+}
+
+/// Store the password hash an upstream realm captured for this login on the
+/// account it signed in (see [`provision_and_map`]). The next login the
+/// upstream accepts writes it again, so a failure only delays it.
+async fn keep_captured_password(pool: &PgPool, identity: &ProvenIdentity, user_id: i64) {
+    let (AuthSource::UpstreamBasic, Some(hash), Some(realm_id)) = (
+        identity.source,
+        &identity.captured_password_hash,
+        identity.realm_id,
+    ) else {
+        return;
+    };
+    if let Err(e) =
+        forge_db::user_dao::store_captured_password_hash(pool, user_id, realm_id, hash.as_str())
+            .await
+    {
+        tracing::warn!(error = %e, user_id, "captured password hash not stored");
+    }
+}
+
+/// [`provision_and_map`] without keeping the captured password.
+async fn resolve_upstream_or_map(
     pool: &PgPool,
     identity: &ProvenIdentity,
 ) -> sqlx::Result<Option<UserPrincipal>> {
@@ -460,6 +496,7 @@ mod tests {
             admin_authoritative: false,
             auto_provision: false,
             realm_id: None,
+            captured_password_hash: None,
         })
     }
 
