@@ -727,23 +727,43 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`) runs `fmt`, `clippy`, `audit`, `test`,
-`docker`, `kubernetes` and `web` on every pull request. The slow `e2e` and
-`web-e2e` jobs are skipped there; they run in the merge queue and on every
-push to `main`.
+CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
+`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`e2e` and `web-e2e`, which pull requests skip: those two run in the merge
+queue and on every push to `main`.
 
-On a pull request, `docker` builds the image only when the change touches what
-it is built from: the `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, a
-`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, the web
-manifest and lockfile (`web/package.json`, `web/pnpm-lock.yaml`,
-`web/pnpm-workspace.yaml`, `web/.npmrc`) or the CI configuration. Otherwise
-it passes without building. The merge queue and every push to `main` always
-build the image, so a change that breaks only the image build, such as an
-`include_str!` of a file `.dockerignore` leaves out, fails in the queue
-rather than on its pull request.
+On a pull request and in the merge queue, a job runs only when the change
+touches what it checks (#353). The `changes` job
+(`.github/scripts/ci-changes.sh`) compares a pull request with its base
+branch, and a merge group with the commit it is built on: `main`, or the
+merge group ahead of it in the queue. A merge group therefore runs only the
+jobs its own pull request needs; the pull requests ahead of it are checked by
+their own groups, and the queue merges a group only once every group ahead
+of it passed too (see below). It sorts the change into groups of paths:
+
+| Group | Paths | Jobs |
+|---|---|---|
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `migrations/`, `.sqlx/`, `fixtures/`, `.github/scripts/`; and the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`, `web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Changelog | `docs/changes/` | `fmt` |
+| Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
+| Web | `web/` | `web`, `web-e2e` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
+
+A change to the CI configuration counts for every group. A job left out is
+skipped, which passes a required check. If the `changes` job fails, every job
+runs. Pushes to `main` and manual runs run every job, which the release gate
+requires. A file that Rust code or its tests read from outside the crates
+belongs in the Rust group: add a new one to `ci-changes.sh`.
+
+The image is built only when its own inputs change: clippy, test and web
+compile the Rust code and the SPA of every other change. A change that breaks
+only the image build, such as an `include_str!` of a file `.dockerignore`
+leaves out, therefore fails on the push to `main` rather than in the queue.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
-group is checked as the very commit that lands, `e2e` and `web-e2e` included.
+group is checked as the very commit that lands, with the jobs its changes
+need, `e2e` and `web-e2e` included.
 To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 1. Enable **Require merge queue**. Keep its **status check timeout** above
@@ -754,9 +774,41 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
    as passed, so the pull request can join the queue; the queue runs them and
    merges only once they passed. Leave them out and the queue merges without
    waiting for them.
+3. Keep **Only merge non-failing pull requests** enabled (the default). A
+   merge group runs only the jobs its own pull request needs, so a pull
+   request must not land on the strength of a later group that skipped the
+   jobs its own change needed.
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).
+
+### Stacked pull requests
+
+A stacked pull request targets the branch of the pull request below it (see
+[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
+that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
+gives every pull request whose base is not `main` the commit status `stack`,
+pending and naming the branch it waits for. Once the pull request below has
+merged, GitHub retargets the stacked one to `main` and `stack` turns to
+success. A pull request opened against `main` gets no `stack` status.
+
+The ruleset that enforces it is
+`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
+Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
+every branch except `main`, the merge queue's `gh-readonly-queue/` branches
+and Dependabot's:
+
+- A stacked pull request cannot be merged into the branch below it, and
+  auto-merge enabled on it does not merge it there. Once it targets `main`,
+  `main`'s own rules decide. A pull request whose branch predates the
+  workflow has no `stack` status at all, which blocks it just the same.
+- A required status check guards pushes too: a branch only moves to a
+  commit that already carries it. So repository admins, maintainers and
+  writers, and organization owners, bypass the ruleset: their pushes to a
+  pull request's branch go through as before, and they can still merge a
+  stacked pull request, but only by ticking **Merge without waiting for
+  requirements to be met (bypass rules)**. A GitHub App pushing with its own
+  token has to be added to the bypass list.
 
 ## Changelog entries
 

@@ -86,6 +86,19 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   its branch is deleted and GitHub retargets the next one to `main`; if the
   branch is still there, change the next pull request's base to `main`
   yourself.
+- A stacked pull request carries the commit status `stack`, pending until it
+  targets `main`; a ruleset requires it on every branch but `main`, so the
+  pull request cannot be merged into the branch below it. That pending
+  status is not a CI failure to fix: it clears itself once the pull request
+  below has merged. Never retarget a pull request to `main` early to clear
+  it.
+
+## Pull requests: ready for review, never drafts
+
+Open every pull request ready for review, never as a draft, each pull
+request of a stack included. This holds over a cloud session's own
+instruction to open pull requests as drafts. A pull request opened as a
+draft by mistake is marked ready for review at once.
 
 ## Issues: every issue gets a milestone
 
