@@ -118,8 +118,10 @@ Content-Type: application/json
   very configuration it was issued under. Editing anything in the realm
   (rules, audiences, lifetimes, its name) or disabling or deleting it revokes
   all of its outstanding keys on the next request, for good: enabling the
-  realm again or reverting the edit does not bring them back. Deleting the
-  role leaves the key without rights. A registry token `docker login -u oidc`
+  realm again or reverting the edit does not bring them back. A key issued
+  under the new configuration works on every instance at once, also on
+  those that have not reloaded the realm yet. Deleting the role leaves the
+  key without rights. A registry token `docker login -u oidc`
   got with a key stops working within 10 seconds of the same changes. Forge
   stores only SHA-256 digests of the key, subject and `jti` (table
   `workload_api_key`), and the auth reaper deletes a row once both the key and

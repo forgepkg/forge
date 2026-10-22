@@ -490,6 +490,70 @@ async fn an_unreachable_issuer_answers_503_so_the_job_retries() {
 }
 
 #[tokio::test]
+async fn a_realm_edit_on_one_instance_is_honoured_at_once_on_another() {
+    // A realm edit drops the snapshot of the instance that took it only.
+    // Its peer, still holding the old configuration, must neither refuse a
+    // key the editing instance issues under the new one, nor refuse an
+    // exchange because its own snapshot is behind the database.
+    let idp = MockOidc::start_workload_only("unused-wif-client").await;
+    let srv = start_stack().await;
+    let realm_id = setup(&srv, &idp, json!({})).await;
+    let peer = srv.spawn_peer().await;
+    let with_key = |key: String| move |r: reqwest::RequestBuilder| r.basic_auth("oidc", Some(&key));
+    let (u, p) = srv.admin_basic();
+    let edit = |clock_skew_seconds: u64| {
+        srv.client()
+            .patch(format!("{}/admin/realms/{realm_id}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"config": {
+                "issuer": idp.issuer(),
+                "allow_http_issuer": true,
+                "allowed_audiences": [AUD],
+                "clock_skew_seconds": clock_skew_seconds,
+                "rules": [{
+                    "role": "ci-pub",
+                    "conditions": [
+                        {"claim": "job_project_id", "any_of": ["1001"]},
+                        {"claim": "ref_protected", "any_of": ["true"]}
+                    ],
+                }],
+            }}))
+            .send()
+    };
+
+    // The peer builds its snapshot under the original configuration.
+    let warm = exchange_ok(&peer, &idp.sign_token(job_claims(&idp)).await).await;
+    assert_eq!(
+        read_index(&peer, "ci-hosted", with_key(warm.clone())).await,
+        StatusCode::OK
+    );
+
+    // Edited on the primary: an exchange on the peer is verified against
+    // the stale snapshot first, which the database refuses.
+    assert_eq!(edit(30).await.unwrap().status(), StatusCode::OK);
+    let exchanged = exchange_ok(&peer, &idp.sign_token(job_claims(&idp)).await).await;
+    assert_eq!(
+        read_index(&peer, "ci-hosted", with_key(exchanged)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        read_index(&peer, "ci-hosted", with_key(warm)).await,
+        StatusCode::UNAUTHORIZED,
+        "the key of the old configuration stays revoked"
+    );
+
+    // Edited again: a key the primary issues under the new configuration
+    // works on the peer at once. (Past the one-second bound on rebuilds.)
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(edit(60).await.unwrap().status(), StatusCode::OK);
+    let issued = exchange_ok(&srv, &idp.sign_token(job_claims(&idp)).await).await;
+    assert_eq!(
+        read_index(&peer, "ci-hosted", with_key(issued)).await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn a_key_dies_with_its_expiry_and_any_realm_change() {
     let idp = MockOidc::start_workload_only("unused-wif-client").await;
     let srv = start_stack().await;
