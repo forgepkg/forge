@@ -113,7 +113,7 @@ password_verify_concurrency = 0     # (default: 0)
 # a button per enabled OIDC realm).
 login_mode = "identifier_first" # (default: "identifier_first")
 # Browser-session lifetimes (apply to local-password AND OIDC logins). When
-# unset, falls back to the legacy oidc.session_* keys, then 8h / 7d.
+# unset, falls back to the deprecated oidc.session_* keys, then 8h / 7d.
 # session_idle_ttl_seconds     = 28800
 # session_absolute_ttl_seconds = 604800
 # How long an instance trusts its cached snapshot of the auth_realm table.
@@ -249,6 +249,6 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")
 # # IdPs that serve tokens and keys on other hosts than the issuer's (Google):
 # endpoint_hosts = ["oauth2.googleapis.com", "www.googleapis.com"]   # (default: [] = issuer host only)
-# # session lifecycle
+# # session lifecycle: deprecated (startup warns), set auth.session_* instead
 # session_idle_ttl_seconds     = 28800       # (default: 8h) idle timeout
 # session_absolute_ttl_seconds = 604800      # (default: 7d) absolute lifetime
