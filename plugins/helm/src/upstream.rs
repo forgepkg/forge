@@ -683,4 +683,27 @@ mod tests {
         assert!(parse_index(b"apiVersion: v1\n").unwrap().is_empty());
         assert!(parse_index(b"<html>portal</html>").is_err());
     }
+
+    #[test]
+    fn an_index_leaves_out_versions_longer_than_an_oci_tag() {
+        let longest = format!(
+            "1.0.0-{}",
+            "a".repeat(crate::semver::MAX_VERSION_LENGTH - 6)
+        );
+        let mut body = String::from("apiVersion: v1\nentries:\n  demo:\n");
+        for version in [
+            "1.0.0".to_string(),
+            longest.clone(),
+            format!("{longest}a"),
+            format!("2.0.0-{}", "x".repeat(4096)),
+        ] {
+            body.push_str(&format!("    - name: demo\n      version: {version}\n"));
+        }
+        let index = parse_index(body.as_bytes()).unwrap();
+        let versions: Vec<String> = index["demo"]
+            .iter()
+            .map(|e| e.version.to_string())
+            .collect();
+        assert_eq!(versions, [longest, "1.0.0".to_string()]);
+    }
 }
