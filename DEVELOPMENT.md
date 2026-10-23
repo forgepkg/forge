@@ -645,6 +645,22 @@ cargo build -p forge-server
 .github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
 ```
 
+The container image has a smoke test, which CI's `docker` job runs on the
+image it built (#239). It starts the image the way the Kubernetes manifests
+and the Helm chart run it: read-only root filesystem, `/tmp` a tmpfs, user
+10001, every capability dropped, the baked `forge.toml` configured through
+`FORGE_*` only, and a blob cache in a volume prepared like a new persistent
+volume under `fsGroup`. PostgreSQL and versitygw run in containers of their
+own. The test waits for `/readyz`, checks `/version` and the web UI, pushes
+a NuGet package with an API token and downloads it. Then it restarts the
+container and checks that the package still downloads, from the cache. It
+needs docker, curl and jq:
+
+```bash
+docker build -t forge:dev .
+.github/scripts/image-smoke.sh forge:dev
+```
+
 **SMTP with OAuth against Stalwart** (#321) is a manual check: Stalwart 0.16
 is set up through its web UI's first-run wizard, which no test can drive.
 `crates/server/tests/email_oauth.rs` covers the protocol with a mock
@@ -851,7 +867,7 @@ It sorts the change into groups of paths:
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
-| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc`; and what the smoke test reads: `image-smoke.sh`, `fixtures/nuget/sample.lib.1.0.0.nupkg` | `docker` |
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
@@ -889,7 +905,10 @@ The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
 only the image build, such as an `include_str!` of a file `.dockerignore`
 leaves out, therefore fails in the next run that builds the image, the
-release's at the latest, rather than in the queue.
+release's at the latest, rather than in the queue. The same holds for the
+image's smoke test, which the `docker` job runs after the build (see
+[Tests](#tests)): a change that breaks only the image at run time, such as a
+file written outside `/tmp`, fails it in the next run that builds the image.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, with the jobs its changes
