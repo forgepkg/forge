@@ -6,6 +6,7 @@ import type { FormatView, RepoView } from '~/api/repositories'
 import {
   DOCKER_FORMAT,
   NUGET_FORMAT,
+  RAW_FORMAT,
   RepositoryForm,
   bytesToMib,
   mibToBytes,
@@ -941,5 +942,119 @@ describe('repository upload limit', () => {
       />,
     )
     expect(screen.queryByLabelText('Maximum upload size (MiB)')).toBeNull()
+  })
+})
+
+describe('raw repositories', () => {
+  function renderRawCreate() {
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    return onSubmit
+  }
+
+  it('hosted: a deployment policy instead of allow_redeploy, and inline display', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    expect(screen.queryByLabelText(/Allow redeploy \(re-push/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'binaries')
+    await user.selectOptions(screen.getByLabelText('Deployment policy'), 'allow_redeploy')
+    await user.click(screen.getByLabelText(/Display files in the browser/))
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toEqual({
+      name: 'binaries',
+      kind: 'hosted',
+      format: 'raw',
+      anonymous_read: false,
+      online: true,
+      deployment_policy: 'allow_redeploy',
+      content_disposition: 'inline',
+    })
+  })
+
+  it('proxy: a maximum age instead of the package delay and metadata TTL', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    expect(screen.queryByLabelText('Package delay (seconds)')).toBeNull()
+    expect(screen.queryByLabelText('Metadata TTL (seconds)')).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'pdfium')
+    await user.type(
+      screen.getByLabelText('Remote URL'),
+      'https://github.com/bblanchon/pdfium-binaries/releases/download/',
+    )
+    await user.type(screen.getByLabelText('Maximum age (seconds)'), '0')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      kind: 'proxy',
+      format: 'raw',
+      remote_url: 'https://github.com/bblanchon/pdfium-binaries/releases/download/',
+      max_age_seconds: 0,
+    })
+    expect(body).not.toHaveProperty('package_delay_seconds')
+    expect(body).not.toHaveProperty('metadata_ttl_seconds')
+    expect(body).not.toHaveProperty('content_disposition')
+  })
+
+  it('group: no dependency-confusion options', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.queryByLabelText(/Prefer hosted/)).toBeNull()
+    expect(screen.queryByLabelText('Reserved prefixes')).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'all-files')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).not.toHaveProperty('prefer_hosted')
+    expect(body).not.toHaveProperty('reserved_prefixes')
+  })
+
+  it('on edit, diffs the raw options and clears an emptied maximum age', () => {
+    const storedRaw: RepoView = {
+      ...storedProxy,
+      name: 'pdfium',
+      format: 'raw',
+      metadata_ttl_seconds: null,
+      max_age_seconds: 600,
+      content_disposition: 'attachment',
+    }
+    const untouched = lastValuesOf(storedRaw)
+    expect(untouched.max_age_seconds).toBe('600')
+    expect(toUpdateBody(untouched, storedRaw)).toEqual({})
+    expect(
+      toUpdateBody(
+        { ...untouched, max_age_seconds: '', inline_content: true, package_delay_seconds: '9' },
+        storedRaw,
+      ),
+    ).toEqual({ max_age_seconds: null, content_disposition: 'inline' })
+
+    const hosted: RepoView = {
+      ...storedRaw,
+      kind: 'hosted',
+      remote_url: null,
+      max_age_seconds: null,
+      deployment_policy: 'disable_redeploy',
+    }
+    const values = lastValuesOf(hosted)
+    expect(
+      toUpdateBody({ ...values, deployment_policy: 'read_only', allow_redeploy: true }, hosted),
+    ).toEqual({ deployment_policy: 'read_only' })
   })
 })

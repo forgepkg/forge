@@ -122,7 +122,7 @@ pub struct CredForwardRealmConfig {
     pub allow_http: bool,
     /// Gone in 1.2: a credential-forwarding realm creates no accounts (an
     /// administrator creates each one, `POST /admin/users` with the realm).
-    /// Accepted only as `false`, and never stored (migration 0040 removed it
+    /// Accepted only as `false`, and never stored (migration 0041 removed it
     /// from stored rows).
     #[serde(default, skip_serializing)]
     pub auto_provision: Option<bool>,

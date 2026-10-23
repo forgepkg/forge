@@ -1,6 +1,6 @@
 # Developing & running Forge locally
 
-Forge is a NuGet, Docker / OCI and Helm registry written in Rust.
+Forge is a NuGet, Docker / OCI, Helm and raw file registry written in Rust.
 Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 (metadata) and an **S3-compatible** object store (blobs) — both provided by
 `docker-compose.yml` (versitygw stands in for S3).
@@ -118,8 +118,8 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
-origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
+The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/raw`, `/auth`
+to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
 `web-dev` binds Vite to IPv4 all-interfaces and prints local/network portal
@@ -239,6 +239,12 @@ The same three types exist for container images with `"format":"docker"`
 password: `docker login localhost:8421 -u admin@example.com`, then
 `docker push localhost:8421/docker-hosted/team/app:1`. See
 [docs/docker.md](docs/docker.md).
+
+Raw repositories (`"format":"raw"`) hold files under arbitrary paths, served
+under `/raw/`: `curl -u admin@example.com:<token> --upload-file x.tgz
+localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
+(`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
+groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
@@ -606,6 +612,18 @@ cargo build -p forge-server
 .github/scripts/oci-e2e.sh target/debug/forge-server target/oci-e2e
 ```
 
+Raw repositories have one too, CI's `raw-e2e` job: curl against a live
+server (uploads, ranges and resumed downloads, checksum sidecars with
+`sha256sum -c`, path traversal sent with `--path-as-is`, a proxy of a mock
+upstream that redirects to a second host, a group, and the pdfium example
+against GitHub, skipped with `FORGE_E2E_SKIP_GITHUB=1`). It needs curl, jq
+and python3, a Postgres and an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
+```
+
 **Without Docker**, point the db / storage / core / server suites at running
 services instead (use a fresh database per crate run — suites share it):
 
@@ -810,6 +828,20 @@ gate requires (see [Releasing](#releasing)). A file that Rust code or its
 tests read from outside the crates belongs in the Rust group, one only
 xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
 A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
+
+The `audit` job runs `cargo audit` only for a change to `Cargo.lock` or
+`.cargo/audit.toml`: every change to a `Cargo.toml` that adds or updates a
+dependency changes the lockfile, and the lockfile is all the job reads. A
+RustSec advisory published for a dependency no change touches is caught by
+the `Audit` workflow (`.github/workflows/audit.yml`) instead, so it does not
+fail an unrelated pull request: it audits `main` every day at 9:00 Berlin
+time, and on demand (**Actions → Audit → Run workflow**). GitHub notifies the
+user who created the workflow, or who last changed its `cron` line, of a
+failed scheduled run, on github.com and by email as their notification
+settings for Actions say; to receive them yourself, disable and re-enable the
+workflow (**Actions → Audit → ⋯**). Fix a failure as in CI: update the crate
+(`cargo update -p <crate>`), or accept the advisory in `.cargo/audit.toml`
+with a one-line rationale.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks

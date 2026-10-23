@@ -18,8 +18,10 @@ import { httpClient } from '~/lib/httpClient'
  *  - Docker repositories (`format: "docker"`, served at `/v2/`) carry their
  *    own options — `host`, `immutable_tags`, `latest_mutable`,
  *    `writable_member` — which the server refuses on a NuGet repository (and
- *    `package_delay_seconds` / `allow_redeploy` on a docker one). Both bodies
- *    reject unknown fields.
+ *    `package_delay_seconds` / `allow_redeploy` on a docker one). Raw
+ *    repositories (`format: "raw"`, served at `/raw/`) likewise —
+ *    `deployment_policy`, `content_disposition`, `max_age_seconds`. Both
+ *    bodies reject unknown fields.
  *  - `MemberView` / `AddMember` / `UpdateMember`
  *    (`crates/server/src/admin/members.rs`) drive the group editor; `priority`
  *    is unique within a group (a duplicate → 409). A member may itself be a
@@ -82,7 +84,19 @@ export interface RepoView {
    * `null` for its format's default (`FormatView.default_max_upload_bytes`).
    */
   max_upload_bytes: number | null
+  /** Hosted raw: what an upload to an existing path does. `null` otherwise. */
+  deployment_policy?: DeploymentPolicy | null
+  /** Raw: files download (`attachment`) or display (`inline`). */
+  content_disposition?: 'attachment' | 'inline' | null
+  /**
+   * Raw proxy: seconds a cached file is served before the upstream is asked
+   * whether it changed (`0`: never). `null` otherwise.
+   */
+  max_age_seconds?: number | null
 }
+
+/** A hosted raw repository's deployment policy, as Nexus'. */
+export type DeploymentPolicy = 'allow_redeploy' | 'disable_redeploy' | 'read_only'
 
 /** `POST /admin/repositories` request body (`CreateRepo`). */
 export interface CreateRepo {
@@ -115,6 +129,13 @@ export interface CreateRepo {
   writable_member?: string
   /** Hosted only: the largest push it accepts, in bytes. Absent: the default. */
   max_upload_bytes?: number
+  // Raw fields (refused for other formats):
+  /** Hosted raw only. Absent: `disable_redeploy`. */
+  deployment_policy?: DeploymentPolicy
+  /** Raw only. Absent: `attachment`. */
+  content_disposition?: 'attachment' | 'inline'
+  /** Raw proxy only. Absent: a day. */
+  max_age_seconds?: number
 }
 
 /**
@@ -152,6 +173,12 @@ export interface UpdateRepo {
   writable_member?: string | null
   /** Hosted only; `null` clears it (the format's default applies). */
   max_upload_bytes?: number | null
+  /** Hosted raw only. */
+  deployment_policy?: DeploymentPolicy
+  /** Raw only. */
+  content_disposition?: 'attachment' | 'inline'
+  /** Raw proxy only; `null` clears it (a day). */
+  max_age_seconds?: number | null
 }
 
 /**
@@ -196,6 +223,8 @@ export interface ProxyCacheInvalidated {
   not_found_cleared: number
   /** Cached tags due for re-validation against the upstream (docker). */
   tags_expired: number
+  /** Cached files due for re-validation against the upstream (raw). */
+  files_expired?: number
 }
 
 /** A group member view (`MemberView`). */
