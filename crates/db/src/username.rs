@@ -19,9 +19,7 @@
 //! Every account is named by a UPN, `local-part@domain` ([`is_upn`],
 //! [`canonical_account_username`]): the name says which organization the
 //! account belongs to, two organizations' `alice` cannot collide, and it is
-//! the name Entra and Active Directory sign the person in with. Accounts named
-//! otherwise before 2.0 (`alice`, `admin`) are renamed `alice@example.com`
-//! when the server starts ([`crate::user_dao::rename_legacy_usernames`]). A
+//! the name Entra and Active Directory sign the person in with. A
 //! credential-forwarding realm forwards only the local part of the name to its
 //! upstream ([`upn_local_part`]).
 //!
