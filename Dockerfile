@@ -154,8 +154,8 @@ LABEL org.opencontainers.image.title="forge" \
       org.opencontainers.image.version="${FORGE_VERSION}" \
       org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 
-# The license (AGPL-3.0-only; see README.md for the alternative envisia
-# license) and the third-party notices of what the image redistributes.
+# The license (MIT) and the third-party notices of what the image
+# redistributes.
 COPY LICENSE /usr/share/doc/forge/LICENSE
 COPY --from=builder /licenses/THIRD-PARTY-RUST.txt /usr/share/doc/forge/
 COPY --from=web /licenses/THIRD-PARTY-WEB.txt /usr/share/doc/forge/
