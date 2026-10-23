@@ -340,7 +340,7 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 /// handled the same way.
 ///
 /// The name is a UPN (config validation): `admin@example.com` by default,
-/// which an install's `admin` from before 1.2 was renamed to, together with
+/// which an install's `admin` from before 2.0 was renamed to, together with
 /// its marker ([`forge_db::user_dao::rename_legacy_usernames`]).
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should

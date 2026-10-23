@@ -736,7 +736,7 @@ pub struct UpstreamBasicAuthConfig {
     /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
-    /// Ignored since 1.2: credential forwarding creates no accounts (an
+    /// Ignored since 2.0: credential forwarding creates no accounts (an
     /// administrator creates each one). Still accepted so an existing block
     /// keeps loading.
     #[serde(default)]
@@ -863,7 +863,7 @@ fn default_negative_ttl() -> u64 {
 pub struct BootstrapAdmin {
     /// Admin username to create on first run if absent: a UPN, like every
     /// account's. Default `admin@example.com`, which the `admin` of an install
-    /// from before 1.2 is renamed to.
+    /// from before 2.0 is renamed to.
     #[serde(default = "default_bootstrap_username")]
     pub username: String,
     /// Plaintext password (hashed with argon2id on creation). Required for the
@@ -2254,7 +2254,7 @@ impl Config {
                         ba.username.trim()
                     ),
                     forge_core::auth::InvalidUsername::NotUpn => format!(
-                        "auth.bootstrap_admin.username: {:?} is not a UPN: since 1.2 every \
+                        "auth.bootstrap_admin.username: {:?} is not a UPN: since 2.0 every \
                          account is named by one, such as admin@example.com (an account named \
                          {:?} before was renamed {:?})",
                         ba.username.trim(),
@@ -4184,7 +4184,7 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert_eq!(ub.auto_provision, None, "ignored since 1.2");
+        assert_eq!(ub.auto_provision, None, "ignored since 2.0");
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
         // to_core mirrors the block.

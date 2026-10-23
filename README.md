@@ -110,7 +110,7 @@ cargo xtask dev --db none    # assume the DB is already up; don't start one
 
 Every release publishes the signed image to GitHub Packages as
 [`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)
-(from 1.2.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
+(from 2.0.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
 [docs/deployment.md](docs/deployment.md#image)). To build it from a
 checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
 server into one image (no Node in prod):

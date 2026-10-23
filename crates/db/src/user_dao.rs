@@ -670,7 +670,7 @@ pub const LEGACY_UPN_DOMAIN: &str = "example.com";
 
 /// Rename every account whose name is not a UPN (`alice`, `admin`, the
 /// `bob@entra` of an earlier OIDC namespace) to one: `alice@example.com`,
-/// `bob+entra@example.com` ([`legacy_upn`]). From 1.2 every account is named
+/// `bob+entra@example.com` ([`legacy_upn`]). From 2.0 every account is named
 /// by a UPN ([`crate::username::is_upn`]). Runs after the migrations and
 /// [`canonicalize_stored_usernames`] ([`crate::migrate`]); a read-only scan
 /// when nothing needs renaming.
@@ -689,7 +689,7 @@ pub const LEGACY_UPN_DOMAIN: &str = "example.com";
 /// login asks the upstream again), and its upstream logins stay counted
 /// under the new name (`auth_success`).
 ///
-/// To be removed in 1.3.0 (#389), when every install has passed through a 1.2
+/// To be removed in 2.1.0 (#389), when every install has passed through a 2.0
 /// release.
 pub async fn rename_legacy_usernames(pool: &PgPool) -> sqlx::Result<Vec<UsernameRepair>> {
     if !needs_upn_renames(pool).await? {
@@ -799,7 +799,7 @@ async fn needs_upn_renames(pool: &PgPool) -> sqlx::Result<bool> {
         .any(|k| k.strip_prefix(BOOTSTRAP_MARKER_PREFIX).is_some_and(legacy)))
 }
 
-/// The UPN a pre-1.2 name becomes: its characters a local part cannot hold
+/// The UPN a pre-2.0 name becomes: its characters a local part cannot hold
 /// replaced (`@` by `+`, whitespace by `_`), then `suffix`, `@` and
 /// [`LEGACY_UPN_DOMAIN`]; the local part is cut short (at a character
 /// boundary) to keep the name within [`MAX_USERNAME_BYTES`].

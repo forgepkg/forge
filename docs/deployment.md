@@ -276,9 +276,9 @@ The image bakes no bootstrap admin; it comes only from the environment, and
 only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for
 the first start, and `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
 [UPN](#usernames) of your organization if `admin@example.com` will not do: the
-account is created **once**. Startup refuses a name that is no UPN. Before 1.2
+account is created **once**. Startup refuses a name that is no UPN. Before 2.0
 the name defaulted to `admin`; the upgrade renames that account
-`admin@example.com` ([below](#accounts-from-before-12)), so a configuration
+`admin@example.com` ([below](#accounts-from-before-20)), so a configuration
 that sets no name keeps finding it, and one that names a non-UPN must name the
 account's new name instead. Sign in to the web UI,
 create personal admin accounts (or connect OIDC), then delete the bootstrap
@@ -322,9 +322,9 @@ The rule applies wherever an account is created:
   `alice@example.com` signs in as the upstream's `alice`. A login the
   upstream accepts but that names no account of the realm is refused.
 
-#### Accounts from before 1.2
+#### Accounts from before 2.0
 
-The first start of 1.2 renames every account whose name is no UPN, and logs
+The first start of 2.0 renames every account whose name is no UPN, and logs
 each rename as a warning:
 
 - `alice` becomes `alice@example.com`, the bootstrap admin `admin` becomes
@@ -351,7 +351,7 @@ the accounts of new users under **Admin → Users**. A realm config that still
 sets `auto_provision: true` is refused by the admin API; the legacy
 `[auth.upstream_basic]` block's `auto_provision` is ignored.
 
-The rename goes away in 1.3.0; upgrade to 1.3 from a 1.2 release.
+The rename goes away in 2.1.0; upgrade to 2.1 from a 2.0 release.
 
 ### Access and sign-in settings
 

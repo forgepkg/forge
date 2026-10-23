@@ -25,8 +25,8 @@ pub async fn connect_with(
 /// migration cannot do in SQL: usernames are brought into the canonical form
 /// the server looks them up by
 /// ([`crate::user_dao::canonicalize_stored_usernames`]), and accounts named
-/// before 1.2 by something other than a UPN are renamed to one
-/// ([`crate::user_dao::rename_legacy_usernames`]; to be removed in 1.3.0,
+/// before 2.0 by something other than a UPN are renamed to one
+/// ([`crate::user_dao::rename_legacy_usernames`]; to be removed in 2.1.0,
 /// #389).
 ///
 /// Migrations live in the workspace-level `migrations/` directory and are
@@ -52,7 +52,7 @@ pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
             id = r.id,
             from = %r.from,
             to = %r.to,
-            "username is not a UPN, which every account is named by since 1.2; renamed \
+            "username is not a UPN, which every account is named by since 2.0; renamed \
              (the user signs in with the new name)"
         );
     }

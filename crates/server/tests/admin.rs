@@ -275,7 +275,7 @@ async fn usernames_with_a_colon_are_refused() {
 }
 
 /// #317: every account is named by a UPN (`POST /admin/users` answers 400
-/// otherwise). An account from before 1.2 is renamed `<name>@example.com` at
+/// otherwise). An account from before 2.0 is renamed `<name>@example.com` at
 /// startup and signs in under that name, with its password and its tokens.
 #[tokio::test]
 async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
@@ -310,7 +310,7 @@ async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
             .is_none());
     }
 
-    // An account from before 1.2, in a database of its own (the rename
+    // An account from before 2.0, in a database of its own (the rename
     // touches every account), written around the DAO, which no longer
     // creates one.
     let pool = common::fresh_pool().await;
