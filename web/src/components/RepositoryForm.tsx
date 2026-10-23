@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 
 import type {
   CreateRepo,
@@ -8,23 +8,18 @@ import type {
   RepoView,
   UpdateRepo,
 } from '~/api/repositories'
-import { Button } from '~/components/catalyst/button'
 import {
-  Checkbox,
-  CheckboxField,
-  CheckboxGroup,
-} from '~/components/catalyst/checkbox'
-import {
-  Description,
-  ErrorMessage,
-  Field,
-  FieldGroup,
-  Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
+  Button,
+  Code,
+  FormActions,
+  Icon,
+  Notice,
+  Panel,
+  SelectField,
+  Switch,
+  TextField,
+  type IconName,
+} from '~/components/ui'
 
 /**
  * Shared repository create/edit form. Kind-conditional fields:
@@ -292,6 +287,60 @@ export function mibToBytes(raw: string): number | null {
   return Number.isFinite(mib) ? Math.round(mib * MIB) : null
 }
 
+/**
+ * A validation error for a field's `error`, announced as it appears: the
+ * field's note under the control is not a live region of its own.
+ */
+function announced(message: string | undefined): ReactNode {
+  return message ? <span role="alert">{message}</span> : undefined
+}
+
+/**
+ * A warning that appears while the admin types, announced politely
+ * (`role="status"`); the kit's warn `Notice` is an alert, too loud for it.
+ */
+function WarnStatus({ children }: { children: ReactNode }) {
+  return (
+    <div className="fg-notice fg-notice--warn" role="status">
+      <Icon name="Alert" size={16} />
+      <div className="fg-notice-text">
+        <div className="fg-notice-body">{children}</div>
+      </div>
+    </div>
+  )
+}
+
+/** What a format is, for the Format field on create. */
+function formatHelp(format: FormatView): string {
+  if (format.description) return format.description
+  if (format.id === NUGET_FORMAT.id) return 'NuGet packages, served as a NuGet V3 feed.'
+  if (format.id === DOCKER_FORMAT.id) {
+    return 'Container images and other OCI artifacts, served by the registry under /v2.'
+  }
+  if (format.id === RAW_FORMAT.id) {
+    return 'Files under arbitrary paths (binaries, installers, fixtures), served under /raw.'
+  }
+  return 'A format plugin.'
+}
+
+/** What a kind does, for the Kind field on create. */
+function kindHelp(kind: RepoKind, things: string): string {
+  switch (kind) {
+    case 'hosted':
+      return `You push ${things} here; Forge stores them.`
+    case 'proxy':
+      return `Caches ${things} from an upstream on demand.`
+    case 'group':
+      return 'One URL over several repositories, asked in order of priority.'
+  }
+}
+
+/**
+ * The form, as panels: General (name, format, kind, the switches every
+ * repository has), then the options of its format and kind (Registry host,
+ * Hosted options, Proxy upstream, Group options), then the buttons. Its fields
+ * stay within the design system's form width.
+ */
 export function RepositoryForm({
   mode,
   existing,
@@ -415,223 +464,191 @@ export function RepositoryForm({
     originOf(values.remote_url) !== originOf(existing?.remote_url)
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Field>
-        <Label>Name</Label>
-        <Input
-          type="text"
-          value={values.name}
-          onChange={(e) => set('name', e.target.value)}
-          autoFocus={mode === 'create'}
-          invalid={!!errors.name}
-        />
-        {isDocker ? (
-          <Description>
-            Starts every image name (<span className="font-mono">&lt;registry&gt;/&lt;name&gt;/&lt;image&gt;</span>):
-            lowercase letters and digits, separated by ".", "_", "__" or "-",
-            up to 64 characters.
-          </Description>
-        ) : (
-          <Description>
-            Part of the feed URL (
-            <span className="font-mono">{feedPath(format, '<name>')}</span>):
-            letters, digits, ".", "_" and "-", up to 64 characters.
-          </Description>
-        )}
-        {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
-      </Field>
-
-      <Field>
-        <Label>Format</Label>
-        {mode === 'create' ? (
-          <Select
-            value={values.format}
-            onChange={(e) => setFormat(e.target.value)}
-          >
-            {available.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.builtin ? f.name : `${f.name} (plugin ${f.id})`}
-              </option>
-            ))}
-          </Select>
-        ) : (
-          <Input
+    <form onSubmit={handleSubmit} className="flex min-w-0 flex-col gap-6">
+      <Panel title="General">
+        <div className="fg-form">
+          <TextField
+            label="Name"
             type="text"
-            value={format.builtin ? format.name : format.id}
-            readOnly
-            aria-readonly="true"
+            mono
+            value={values.name}
+            onChange={(e) => set('name', e.target.value)}
+            autoFocus={mode === 'create'}
+            error={announced(errors.name)}
+            description={
+              isDocker ? (
+                <>
+                  Starts every image name (<Code>&lt;registry&gt;/&lt;name&gt;/&lt;image&gt;</Code>):
+                  lowercase letters and digits, separated by ".", "_", "__" or "-",
+                  up to 64 characters.
+                </>
+              ) : (
+                <>
+                  Part of the feed URL (<Code>{feedPath(format, '<name>')}</Code>): letters,
+                  digits, ".", "_" and "-", up to 64 characters.
+                </>
+              )
+            }
           />
-        )}
-        <Description>
-          {mode === 'edit'
-            ? 'The format cannot be changed after creation.'
-            : format.description ??
-              (format.id === NUGET_FORMAT.id
-                ? 'NuGet packages, served as a NuGet V3 feed.'
-                : format.id === DOCKER_FORMAT.id
-                  ? 'Container images and other OCI artifacts, served by the registry under /v2.'
-                  : format.id === RAW_FORMAT.id
-                    ? 'Files under arbitrary paths (binaries, installers, fixtures), served under /raw.'
-                    : 'A format plugin.')}
-        </Description>
-      </Field>
 
-      <Field>
-        <Label>Kind</Label>
-        {mode === 'create' ? (
-          <Select
-            value={values.kind}
-            onChange={(e) => set('kind', e.target.value as RepoKind)}
-          >
-            {(['hosted', 'proxy', 'group'] as const)
-              .filter((kind) => format.kinds.includes(kind))
-              .map((kind) => (
-                <option key={kind} value={kind}>
-                  {kind}
-                </option>
-              ))}
-          </Select>
-        ) : (
-          <Input
-            type="text"
-            value={values.kind}
-            readOnly
-            aria-readonly="true"
-          />
-        )}
-        {mode === 'edit' && (
-          <Description>The kind cannot be changed after creation.</Description>
-        )}
-      </Field>
+          <div className="fg-fieldrow">
+            {mode === 'create' ? (
+              <SelectField
+                label="Format"
+                value={values.format}
+                onChange={(e) => setFormat(e.target.value)}
+                description={formatHelp(format)}
+              >
+                {available.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.builtin ? f.name : `${f.name} (plugin ${f.id})`}
+                  </option>
+                ))}
+              </SelectField>
+            ) : (
+              <TextField
+                label="Format"
+                type="text"
+                value={format.builtin ? format.name : format.id}
+                readOnly
+                aria-readonly="true"
+                description="The format cannot be changed after creation."
+              />
+            )}
 
-      <CheckboxGroup>
-        <CheckboxField>
-          <Checkbox
+            {mode === 'create' ? (
+              <SelectField
+                label="Kind"
+                value={values.kind}
+                onChange={(e) => set('kind', e.target.value as RepoKind)}
+                description={kindHelp(values.kind, things)}
+              >
+                {(['hosted', 'proxy', 'group'] as const)
+                  .filter((kind) => format.kinds.includes(kind))
+                  .map((kind) => (
+                    <option key={kind} value={kind}>
+                      {kind}
+                    </option>
+                  ))}
+              </SelectField>
+            ) : (
+              <TextField
+                label="Kind"
+                type="text"
+                value={values.kind}
+                readOnly
+                aria-readonly="true"
+                description="The kind cannot be changed after creation."
+              />
+            )}
+          </div>
+
+          <Switch
+            label="Online"
             checked={values.online}
             onChange={(c) => set('online', c)}
+            description={
+              isProxy
+                ? `Offline, the proxy serves only ${things} it has already cached and never contacts the upstream.`
+                : `Offline, the repository answers every ${isDocker ? 'registry' : 'feed'} request with 503 (a maintenance window); in a group it counts as a failing member.`
+            }
           />
-          <Label>Online</Label>
-          <Description>
-            {isProxy
-              ? `Offline, the proxy serves only ${things} it has already cached and never contacts the upstream.`
-              : `Offline, the repository answers every ${isDocker ? 'registry' : 'feed'} request with 503 (a maintenance window); in a group it counts as a failing member.`}
-          </Description>
-        </CheckboxField>
-        <CheckboxField>
-          <Checkbox
+          <Switch
+            label="Allow anonymous read"
             checked={values.anonymous_read}
             onChange={(c) => set('anonymous_read', c)}
+            description="Callers who do not sign in may read it, as far as the server-wide anonymous access lets them in."
           />
-          <Label>Allow anonymous read</Label>
-        </CheckboxField>
-        {isRaw && (
-          <CheckboxField>
-            <Checkbox
+          {isRaw && (
+            <Switch
+              label="Display files in the browser"
               checked={values.inline_content}
               onChange={(c) => set('inline_content', c)}
+              description={
+                <>
+                  Files are served for display (<Code>Content-Disposition: inline</Code>)
+                  rather than as downloads. They stay sandboxed: an HTML or SVG file
+                  cannot run script on this server&apos;s origin.
+                </>
+              }
             />
-            <Label>Display files in the browser</Label>
-            <Description>
-              Files are served for display (<span className="font-mono">Content-Disposition: inline</span>)
-              rather than as downloads. They stay sandboxed: an HTML or SVG file
-              cannot run script on this server&apos;s origin.
-            </Description>
-          </CheckboxField>
-        )}
-      </CheckboxGroup>
+          )}
+        </div>
+      </Panel>
 
       {isDocker && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Registry host</Legend>
-          <FieldGroup>
-            <Field>
-              <Label>Host</Label>
-              <Input
-                type="text"
-                autoComplete="off"
-                value={values.host}
-                onChange={(e) => set('host', e.target.value)}
-                placeholder="docker.example.com"
-                invalid={!!errors.host}
-              />
-              <Description>
-                Optional. A DNS name pointed at this server that serves this
-                repository at its root (<span className="font-mono">&lt;host&gt;/&lt;image&gt;</span>),
-                in addition to{' '}
-                <span className="font-mono">
-                  &lt;server&gt;/{values.name.trim() || '<name>'}/&lt;image&gt;
-                </span>
-                .
-              </Description>
-              {errors.host && <ErrorMessage role="alert">{errors.host}</ErrorMessage>}
-            </Field>
-          </FieldGroup>
-        </Fieldset>
+        <Panel title="Registry host">
+          <div className="fg-form">
+            <TextField
+              label="Host"
+              type="text"
+              mono
+              autoComplete="off"
+              value={values.host}
+              onChange={(e) => set('host', e.target.value)}
+              placeholder="docker.example.com"
+              error={announced(errors.host)}
+              description={
+                <>
+                  Optional. A DNS name pointed at this server that serves this
+                  repository at its root (<Code>&lt;host&gt;/&lt;image&gt;</Code>), in
+                  addition to{' '}
+                  <Code>&lt;server&gt;/{values.name.trim() || '<name>'}/&lt;image&gt;</Code>.
+                </>
+              }
+            />
+          </div>
+        </Panel>
       )}
 
       {isHosted && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Hosted options</Legend>
-          {isDocker ? (
-            <CheckboxGroup>
-              <CheckboxField>
-                <Checkbox
+        <Panel title="Hosted options">
+          <div className="fg-form">
+            {isDocker ? (
+              <>
+                <Switch
+                  label="Immutable tags"
                   checked={values.immutable_tags}
                   onChange={(c) => setImmutableTags(c)}
+                  description="A pushed tag can never be moved to another manifest; pushing an existing tag again with different content is refused."
                 />
-                <Label>Immutable tags</Label>
-                <Description>
-                  A pushed tag can never be moved to another manifest; pushing
-                  an existing tag again with different content is refused.
-                </Description>
-              </CheckboxField>
-              <CheckboxField disabled={!values.immutable_tags}>
-                <Checkbox
+                <Switch
+                  label="Allow moving latest"
                   checked={values.latest_mutable}
+                  disabled={!values.immutable_tags}
                   onChange={(c) => set('latest_mutable', c)}
+                  description={
+                    <>
+                      With immutable tags, <Code>latest</Code> may still be re-pointed to
+                      a newer image.
+                    </>
+                  }
                 />
-                <Label>Allow moving latest</Label>
-                <Description>
-                  With immutable tags, <span className="font-mono">latest</span>{' '}
-                  may still be re-pointed to a newer image.
-                </Description>
-              </CheckboxField>
-            </CheckboxGroup>
-          ) : isRaw ? (
-            <Field>
-              <Label>Deployment policy</Label>
-              <Select
+              </>
+            ) : isRaw ? (
+              <SelectField
+                label="Deployment policy"
                 value={values.deployment_policy}
                 onChange={(e) =>
                   set('deployment_policy', e.target.value as DeploymentPolicy)
                 }
+                description="What an upload to a path that holds a file does: refused (uploading the same content again is accepted), replaces it (which needs the delete permission too), or every upload and delete is refused."
               >
                 <option value="disable_redeploy">Disable redeploy</option>
                 <option value="allow_redeploy">Allow redeploy</option>
                 <option value="read_only">Read-only</option>
-              </Select>
-              <Description>
-                What an upload to a path that holds a file does: refused
-                (uploading the same content again is accepted), replaces it
-                (which needs the delete permission too), or every upload and
-                delete is refused.
-              </Description>
-            </Field>
-          ) : (
-            <CheckboxGroup>
-              <CheckboxField>
-                <Checkbox
-                  checked={values.allow_redeploy}
-                  onChange={(c) => set('allow_redeploy', c)}
-                />
-                <Label>Allow redeploy (re-push an existing version)</Label>
-              </CheckboxField>
-            </CheckboxGroup>
-          )}
-          <Field className="mt-6">
-            <Label>Maximum upload size (MiB)</Label>
-            <Input
+              </SelectField>
+            ) : (
+              <Switch
+                label="Allow redeploy (re-push an existing version)"
+                checked={values.allow_redeploy}
+                onChange={(c) => set('allow_redeploy', c)}
+              />
+            )}
+            <TextField
+              label="Maximum upload size (MiB)"
               type="number"
+              mono
               min={0}
               step="any"
               value={values.max_upload_mib}
@@ -641,212 +658,183 @@ export function RepositoryForm({
                   ? `Default: ${bytesToMib(format.default_max_upload_bytes)}`
                   : 'Server default'
               }
-              invalid={!!errors.max_upload_mib}
+              error={announced(errors.max_upload_mib)}
+              description={
+                <>
+                  {isDocker
+                    ? 'The largest layer (blob) a push to this repository may carry.'
+                    : isRaw
+                      ? 'The largest file an upload to this repository may carry.'
+                      : 'The largest package a push to this repository may carry.'}{' '}
+                  Empty: the server default
+                  {format.default_max_upload_bytes != null
+                    ? ` (${bytesToMib(format.default_max_upload_bytes)} MiB)`
+                    : ''}
+                  .
+                  {format.max_upload_bytes_limit != null &&
+                    ` At most ${bytesToMib(format.max_upload_bytes_limit)} MiB.`}{' '}
+                  The reverse proxy in front of Forge must allow request bodies
+                  this large.
+                </>
+              }
             />
-            <Description>
-              {isDocker
-                ? 'The largest layer (blob) a push to this repository may carry.'
-                : isRaw
-                  ? 'The largest file an upload to this repository may carry.'
-                  : 'The largest package a push to this repository may carry.'}{' '}
-              Empty: the server default
-              {format.default_max_upload_bytes != null
-                ? ` (${bytesToMib(format.default_max_upload_bytes)} MiB)`
-                : ''}
-              .
-              {format.max_upload_bytes_limit != null &&
-                ` At most ${bytesToMib(format.max_upload_bytes_limit)} MiB.`}{' '}
-              The reverse proxy in front of Forge must allow request bodies
-              this large.
-            </Description>
-            {errors.max_upload_mib && (
-              <ErrorMessage role="alert">{errors.max_upload_mib}</ErrorMessage>
-            )}
-          </Field>
-        </Fieldset>
+          </div>
+        </Panel>
       )}
 
       {isProxy && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Proxy upstream</Legend>
-          <FieldGroup>
-            <Field>
-              <Label>Remote URL</Label>
-              <Input
-                type="url"
-                value={values.remote_url}
-                onChange={(e) => set('remote_url', e.target.value)}
-                placeholder={
-                  isDocker
-                    ? 'https://registry-1.docker.io'
-                    : isRaw
-                      ? 'https://github.com/bblanchon/pdfium-binaries/releases/download/'
-                      : values.format === NUGET_FORMAT.id
-                        ? 'https://api.nuget.org/v3/index.json'
-                        : 'https://charts.example.com/stable'
-                }
-                invalid={!!errors.remote_url}
-              />
-              {isDocker && (
-                <Description>
-                  The upstream registry&apos;s base URL, e.g.{' '}
-                  <span className="font-mono">https://registry-1.docker.io</span>{' '}
-                  (Docker Hub) or{' '}
-                  <span className="font-mono">https://ghcr.io</span>.
-                </Description>
-              )}
-              {isRaw && (
-                <Description>
-                  The base URL files are under: a request for{' '}
-                  <span className="font-mono">&lt;path&gt;</span> fetches{' '}
-                  <span className="font-mono">&lt;remote URL&gt;/&lt;path&gt;</span>,
-                  following redirects. Credentials below are sent to this
-                  URL&apos;s host only.
-                </Description>
-              )}
-              {errors.remote_url && (
-                <ErrorMessage role="alert">{errors.remote_url}</ErrorMessage>
-              )}
-            </Field>
+        <Panel
+          title="Proxy upstream"
+          description={`Where the ${things} come from, and how long Forge trusts what the upstream said.`}
+        >
+          <div className="fg-form">
+            <TextField
+              label="Remote URL"
+              type="url"
+              mono
+              value={values.remote_url}
+              onChange={(e) => set('remote_url', e.target.value)}
+              placeholder={
+                isDocker
+                  ? 'https://registry-1.docker.io'
+                  : isRaw
+                    ? 'https://github.com/bblanchon/pdfium-binaries/releases/download/'
+                    : values.format === NUGET_FORMAT.id
+                      ? 'https://api.nuget.org/v3/index.json'
+                      : 'https://charts.example.com/stable'
+              }
+              error={announced(errors.remote_url)}
+              description={
+                isDocker ? (
+                  <>
+                    The upstream registry&apos;s base URL, e.g.{' '}
+                    <Code>https://registry-1.docker.io</Code> (Docker Hub) or{' '}
+                    <Code>https://ghcr.io</Code>.
+                  </>
+                ) : isRaw ? (
+                  <>
+                    The base URL files are under: a request for <Code>&lt;path&gt;</Code>{' '}
+                    fetches <Code>&lt;remote URL&gt;/&lt;path&gt;</Code>, following
+                    redirects. Credentials below are sent to this URL&apos;s host only.
+                  </>
+                ) : undefined
+              }
+            />
 
             {isRaw && (
-              <Field>
-                <Label>Maximum age (seconds)</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={values.max_age_seconds}
-                  onChange={(e) => set('max_age_seconds', e.target.value)}
-                  placeholder={`Default: ${DEFAULT_RAW_MAX_AGE_SECONDS} (a day)`}
-                  invalid={!!errors.max_age_seconds}
-                />
-                <Description>
-                  How long a cached file is served before the upstream is asked
-                  whether it changed. 0: never (the upstream&apos;s files do not
-                  change, as release assets).
-                </Description>
-                {errors.max_age_seconds && (
-                  <ErrorMessage role="alert">{errors.max_age_seconds}</ErrorMessage>
-                )}
-              </Field>
+              <TextField
+                label="Maximum age (seconds)"
+                type="number"
+                mono
+                min={0}
+                value={values.max_age_seconds}
+                onChange={(e) => set('max_age_seconds', e.target.value)}
+                placeholder={`Default: ${DEFAULT_RAW_MAX_AGE_SECONDS} (a day)`}
+                error={announced(errors.max_age_seconds)}
+                description="How long a cached file is served before the upstream is asked whether it changed. 0: never (the upstream's files do not change, as release assets)."
+              />
             )}
 
             {!isDocker && !isRaw && (
-              <Field>
-                <Label>Package delay (seconds)</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={values.package_delay_seconds}
-                  onChange={(e) => set('package_delay_seconds', e.target.value)}
-                  invalid={!!errors.package_delay_seconds}
-                />
-                <Description>
-                  New upstream releases stay hidden for this long after the
-                  upstream published them (or, when the upstream does not say
-                  when, after this proxy first saw them). Older versions are
-                  served at once.
-                </Description>
-                {errors.package_delay_seconds && (
-                  <ErrorMessage role="alert">
-                    {errors.package_delay_seconds}
-                  </ErrorMessage>
-                )}
-              </Field>
+              <TextField
+                label="Package delay (seconds)"
+                type="number"
+                mono
+                min={0}
+                value={values.package_delay_seconds}
+                onChange={(e) => set('package_delay_seconds', e.target.value)}
+                error={announced(errors.package_delay_seconds)}
+                description="New upstream releases stay hidden for this long after the upstream published them (or, when the upstream does not say when, after this proxy first saw them). Older versions are served at once."
+              />
             )}
 
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="fg-fieldrow">
               {!isRaw && (
-                <Field>
-                  <Label>Metadata TTL (seconds)</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    value={values.metadata_ttl_seconds}
-                    onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
-                    placeholder="server default"
-                  />
-                </Field>
-              )}
-              <Field>
-                <Label>Not-found TTL (seconds)</Label>
-                <Input
+                <TextField
+                  label="Metadata TTL (seconds)"
                   type="number"
+                  mono
                   min={0}
-                  value={values.not_found_ttl_seconds}
-                  onChange={(e) => set('not_found_ttl_seconds', e.target.value)}
+                  value={values.metadata_ttl_seconds}
+                  onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
                   placeholder="server default"
                 />
-              </Field>
+              )}
+              <TextField
+                label="Not-found TTL (seconds)"
+                type="number"
+                mono
+                min={0}
+                value={values.not_found_ttl_seconds}
+                onChange={(e) => set('not_found_ttl_seconds', e.target.value)}
+                placeholder="server default"
+              />
             </div>
 
             {credentialsWillDrop && (
-              <p
-                role="status"
-                className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
-              >
+              <WarnStatus>
                 The remote URL now points to a different host. The stored
                 upstream credentials will be dropped when you save, unless you
                 enter a new password for the new host.
-              </p>
+              </WarnStatus>
             )}
 
-            <Field disabled={values.clear_credentials}>
-              <Label>Upstream username</Label>
-              <Input
+            <div className="fg-fieldrow">
+              <TextField
+                label="Upstream username"
                 type="text"
                 autoComplete="off"
                 value={values.upstream_username}
+                disabled={values.clear_credentials}
                 onChange={(e) => set('upstream_username', e.target.value)}
               />
-            </Field>
-
-            <Field disabled={values.clear_credentials}>
-              <Label>Upstream password</Label>
-              <Input
+              <TextField
+                label="Upstream password"
                 type="password"
                 autoComplete="new-password"
                 value={values.upstream_password}
+                disabled={values.clear_credentials}
                 onChange={(e) => set('upstream_password', e.target.value)}
                 placeholder={
                   mode === 'edit' && existing?.has_upstream_password
                     ? '•••••••• (set to replace)'
                     : 'Optional'
                 }
+                description={
+                  mode === 'edit' && existing?.has_upstream_password
+                    ? 'A password is stored. Leave blank to keep it; type a new one to replace it.'
+                    : 'Write-only. The stored secret is never shown after saving.'
+                }
               />
-              <Description>
-                {mode === 'edit' && existing?.has_upstream_password
-                  ? 'A password is stored. Leave blank to keep it; type a new one to replace it.'
-                  : 'Write-only. The stored secret is never shown after saving.'}
-              </Description>
-            </Field>
+            </div>
 
             {hasStoredCredentials &&
               (values.clear_credentials ? (
-                <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm/6 text-zinc-600 dark:text-zinc-400">
-                  <span role="status">
-                    The stored upstream username and password will be removed
-                    when you save.
-                  </span>
-                  <Button
-                    plain
-                    type="button"
-                    onClick={() =>
-                      setValues((v) => ({
-                        ...v,
-                        clear_credentials: false,
-                        upstream_username: existing?.upstream_username ?? '',
-                      }))
-                    }
-                  >
-                    Keep them
-                  </Button>
-                </p>
+                <Notice
+                  tone="info"
+                  action={
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        setValues((v) => ({
+                          ...v,
+                          clear_credentials: false,
+                          upstream_username: existing?.upstream_username ?? '',
+                        }))
+                      }
+                    >
+                      Keep them
+                    </Button>
+                  }
+                >
+                  The stored upstream username and password will be removed
+                  when you save.
+                </Notice>
               ) : (
                 <div>
                   <Button
-                    outline
-                    type="button"
+                    icon="Trash"
                     onClick={() =>
                       setValues((v) => ({
                         ...v,
@@ -860,117 +848,185 @@ export function RepositoryForm({
                   </Button>
                 </div>
               ))}
-          </FieldGroup>
-        </Fieldset>
+          </div>
+        </Panel>
       )}
 
-      {isGroup && isRaw && (
-        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
-          A path is served by the first member, by priority, that has it.
-        </p>
-      )}
-
-      {isGroup && !isRaw && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Group options</Legend>
-          <CheckboxGroup>
-            <CheckboxField>
-              <Checkbox
+      {isGroup && (
+        <Panel
+          title="Group options"
+          description={
+            mode === 'edit'
+              ? 'Group members and their priorities are managed on the Members screen.'
+              : 'Create the group first, then add members from its Members screen.'
+          }
+        >
+          {isRaw ? (
+            <p className="fg-text">
+              A path is served by the first member, by priority, that has it.
+            </p>
+          ) : (
+            <div className="fg-form">
+              <Switch
+                label={`Prefer hosted ${isDocker ? 'images' : 'packages'}`}
                 checked={values.prefer_hosted}
                 onChange={(c) => set('prefer_hosted', c)}
+                description={
+                  isDocker
+                    ? 'When an image exists in a hosted member, its tags from proxy members are hidden. Protects internal image names against dependency confusion from public registries.'
+                    : 'When a package exists in a hosted member, versions of it from proxy members are hidden. Protects internal package names against dependency confusion from public feeds.'
+                }
               />
-              <Label>Prefer hosted {isDocker ? 'images' : 'packages'}</Label>
-              {isDocker ? (
-                <Description>
-                  When an image exists in a hosted member, its tags from proxy
-                  members are hidden. Protects internal image names against
-                  dependency confusion from public registries.
-                </Description>
-              ) : (
-                <Description>
-                  When a package exists in a hosted member, versions of it from
-                  proxy members are hidden. Protects internal package names
-                  against dependency confusion from public feeds.
-                </Description>
+              <TextField
+                label="Reserved prefixes"
+                name="reserved_prefixes"
+                mono
+                value={values.reserved_prefixes}
+                onChange={(e) => set('reserved_prefixes', e.target.value)}
+                placeholder={isDocker ? 'acme/, team/' : 'Acme., Contoso.Internal.'}
+                description={
+                  isDocker ? (
+                    <>
+                      Image names starting with one of these — namespaces such as{' '}
+                      <Code>acme/</Code> — are never served from proxy members, also
+                      before the first internal image is pushed. Comma separated.
+                    </>
+                  ) : (
+                    <>
+                      Package ids starting with one of these (e.g. <Code>Acme.</Code>) are
+                      never served from proxy members — also before the first internal
+                      version is published. Comma separated.
+                    </>
+                  )
+                }
+              />
+              {isDocker && (
+                <TextField
+                  label="Writable member"
+                  name="writable_member"
+                  mono
+                  autoComplete="off"
+                  value={values.writable_member}
+                  onChange={(e) => set('writable_member', e.target.value)}
+                  placeholder="docker-hosted"
+                  description={
+                    <>
+                      Optional. The hosted docker repository that <Code>docker push</Code>{' '}
+                      to this group stores images in (make it a member too). Leave empty
+                      to refuse pushes to the group.
+                    </>
+                  }
+                />
               )}
-            </CheckboxField>
-          </CheckboxGroup>
-          <Field className="mt-6">
-            <Label>Reserved prefixes</Label>
-            {isDocker ? (
-              <Description>
-                Image names starting with one of these — namespaces such as{' '}
-                <code>acme/</code> — are never served from proxy members,
-                also before the first internal image is pushed. Comma
-                separated.
-              </Description>
-            ) : (
-              <Description>
-                Package ids starting with one of these (e.g.{' '}
-                <code>Acme.</code>) are never served from proxy members — also
-                before the first internal version is published. Comma separated.
-              </Description>
-            )}
-            <Input
-              name="reserved_prefixes"
-              value={values.reserved_prefixes}
-              onChange={(e) => set('reserved_prefixes', e.target.value)}
-              placeholder={isDocker ? 'acme/, team/' : 'Acme., Contoso.Internal.'}
-            />
-          </Field>
-          {isDocker && (
-            <Field className="mt-6">
-              <Label>Writable member</Label>
-              <Description>
-                Optional. The hosted docker repository that{' '}
-                <span className="font-mono">docker push</span> to this group
-                stores images in (make it a member too). Leave empty to refuse
-                pushes to the group.
-              </Description>
-              <Input
-                name="writable_member"
-                autoComplete="off"
-                value={values.writable_member}
-                onChange={(e) => set('writable_member', e.target.value)}
-                placeholder="docker-hosted"
-              />
-            </Field>
+            </div>
           )}
-        </Fieldset>
-      )}
-
-      {isGroup && mode === 'edit' && (
-        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
-          Group members and their priorities are managed on the{' '}
-          <span className="font-medium">Members</span> screen.
-        </p>
-      )}
-      {isGroup && mode === 'create' && (
-        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
-          Create the group first, then add members from its Members screen.
-        </p>
+        </Panel>
       )}
 
       {serverError && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
+        <Notice
+          tone="danger"
+          title={
+            mode === 'create'
+              ? 'Could not create the repository'
+              : 'Could not save the repository'
+          }
+        >
           {serverError}
-        </p>
+        </Notice>
       )}
 
-      <div className="flex items-center gap-3">
-        <Button type="submit" disabled={submitting}>
+      <FormActions>
+        <Button variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          type="submit"
+          variant="primary"
+          icon={mode === 'create' ? 'Plus' : undefined}
+          disabled={submitting}
+        >
           {submitting
             ? 'Saving…'
             : mode === 'create'
               ? 'Create repository'
               : 'Save changes'}
         </Button>
-        <Button type="button" outline onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
+      </FormActions>
     </form>
   )
+}
+
+/** The icon of a repository kind, for page headers. */
+export function kindIcon(kind: string): IconName {
+  return kind === 'proxy' ? 'Globe' : kind === 'group' ? 'Layers' : 'Repository'
+}
+
+/** `host` of a URL (the URL itself when it does not parse). */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+/** A duration in seconds the short way: `48 h`, `30 min`, `90 s`. */
+function shortDuration(seconds: number): string {
+  if (seconds % 3600 === 0) return `${seconds / 3600} h`
+  if (seconds % 60 === 0) return `${seconds / 60} min`
+  return `${seconds} s`
+}
+
+const DEPLOYMENT_POLICY_FACTS: Record<DeploymentPolicy, string | null> = {
+  disable_redeploy: null,
+  allow_redeploy: 'redeploy allowed',
+  read_only: 'read-only',
+}
+
+/**
+ * A repository's notable settings as short facts, lowercase ("caches
+ * api.nuget.org", "48 h package delay", "immutable tags"): the list's
+ * sub-line under a name and the edit screen's header. Only what differs from
+ * the defaults, and only the options of its format and kind.
+ */
+export function repositoryFacts(repo: RepoView): string[] {
+  const docker = repo.format === DOCKER_FORMAT.id
+  const raw = repo.format === RAW_FORMAT.id
+  const facts: string[] = []
+  if (repo.kind === 'proxy' && repo.remote_url) {
+    facts.push(`caches ${hostOf(repo.remote_url)}`)
+    if (!docker && !raw && repo.package_delay_seconds > 0) {
+      facts.push(`${shortDuration(repo.package_delay_seconds)} package delay`)
+    }
+  }
+  if (repo.kind === 'hosted') {
+    if (docker && repo.immutable_tags) {
+      facts.push('immutable tags')
+      if (repo.latest_mutable) facts.push('latest may move')
+    } else if (raw) {
+      const policy = DEPLOYMENT_POLICY_FACTS[repo.deployment_policy ?? 'disable_redeploy']
+      if (policy) facts.push(policy)
+    } else if (!docker && repo.allow_redeploy) {
+      facts.push('redeploy allowed')
+    }
+    if (repo.max_upload_bytes != null) {
+      facts.push(`${bytesToMib(repo.max_upload_bytes)} MiB max. upload`)
+    }
+  }
+  if (repo.kind === 'group' && !raw) {
+    if (repo.prefer_hosted) facts.push(`prefers hosted ${docker ? 'images' : 'packages'}`)
+    const n = repo.reserved_prefixes.length
+    if (n > 0) facts.push(`${n} reserved ${n === 1 ? 'prefix' : 'prefixes'}`)
+    if (docker && repo.writable_member) facts.push(`pushes go to ${repo.writable_member}`)
+  }
+  if (docker && repo.host) facts.push(`also at ${repo.host}`)
+  return facts
+}
+
+/** The first letter in upper case: a fact that starts a line. */
+export function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1)
 }
 
 /**
