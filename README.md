@@ -227,6 +227,6 @@ either of:
 The SPDX expression for the project is `AGPL-3.0-only OR LicenseRef-envisia`.
 
 Contributions are accepted under the [Contributor License Agreement](./CLA.md),
-which lets Forge offer them under both licenses and change the project's
-license later, for example to the MIT License. See
-[CONTRIBUTING.md](./CONTRIBUTING.md) for how to sign it.
+which lets the forgepkg organization relicense them, for example to move the
+project to the MIT License. See [CONTRIBUTING.md](./CONTRIBUTING.md) for how
+to sign it.
