@@ -512,6 +512,16 @@ impl ProxyRepo {
                     );
                     return Ok((api::UpstreamAnswer::Failed(reason), origins));
                 }
+                api::UpstreamStep::Done(api::UpstreamAnswer::File(Some(url)))
+                    if !origins.permits(&url) =>
+                {
+                    tracing::warn!(format = %self.format.id(), repo = %repo.name, %url, "the format answered a file URL on an origin neither the remote_url nor a document fetched from the upstream names; not downloaded");
+                    let reason = format!(
+                        "upstream file {url}: not downloaded, its origin is neither the \
+                             remote_url's nor named by a document fetched from the upstream"
+                    );
+                    return Ok((api::UpstreamAnswer::Failed(reason), origins));
+                }
                 api::UpstreamStep::Done(answer) => return Ok((answer, origins)),
                 api::UpstreamStep::Fetch(wanted) => wanted,
             };
@@ -616,6 +626,27 @@ impl ProxyRepo {
             }
             Ok(CachedFetch::NotFound) | Err(None) => (api::Fetched::NotFound, Vec::new()),
             Err(Some(e)) => (api::Fetched::Failed(e), Vec::new()),
+        }
+    }
+
+    /// The upstream URL of the file at `path` of proxy `repo`
+    /// ([`api::UpstreamOp::File`], a files format), on an origin the
+    /// upstream points at; `None` when the upstream cannot have it. The
+    /// file store downloads and re-validates it.
+    pub async fn file_url(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<Option<String>, RepoError> {
+        match self
+            .converse_resolved(repo, api::UpstreamOp::File(path.to_string()))
+            .await?
+        {
+            api::UpstreamAnswer::File(url) => Ok(url),
+            api::UpstreamAnswer::Failed(reason) => Err(RepoError::Storage(reason)),
+            _ => Err(RepoError::Storage(
+                "upstream protocol answered file with something else".into(),
+            )),
         }
     }
 

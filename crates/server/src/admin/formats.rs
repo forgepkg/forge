@@ -1,9 +1,9 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the format plugins (NuGet), Docker and raw files.
+//! repositories of: the format plugins (NuGet, raw files) and Docker.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
-use forge_db::model::{DOCKER_FORMAT, RAW_FORMAT};
+use forge_db::model::DOCKER_FORMAT;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -17,6 +17,9 @@ pub struct FormatView {
     pub name: String,
     /// The repository kinds it supports.
     pub kinds: Vec<&'static str>,
+    /// What its repositories hold: `packages` (versions of packages),
+    /// `files` (files under paths: raw) or `images` (Docker).
+    pub storage: &'static str,
     /// Where its repositories are served: `{mount}/{repository}` (for
     /// Docker, `/v2/{repository}/{image}`, or a repository's own host).
     pub mount: String,
@@ -35,7 +38,7 @@ pub struct FormatView {
 }
 
 /// `GET /admin/formats`: NuGet first, then Docker, then the other formats
-/// (the other plugins and raw files) by id.
+/// (the other plugins, raw files among them) by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
@@ -45,6 +48,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
             id: plugin.id().to_string(),
             name: manifest.name.clone(),
             kinds: kinds(plugin.id()),
+            storage: manifest.storage.as_str(),
             mount: manifest.mount.clone(),
             version: Some(manifest.version.clone()),
             description: manifest.description.clone(),
@@ -60,6 +64,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
         id: DOCKER_FORMAT.to_string(),
         name: "Docker / OCI".into(),
         kinds: kinds(DOCKER_FORMAT),
+        storage: "images",
         mount: "/v2".into(),
         version: None,
         description: None,
@@ -67,16 +72,6 @@ pub async fn list(State(state): State<AppState>) -> Response {
         max_upload_bytes_limit: ceiling,
     });
     let mut others: Vec<FormatView> = others.into_iter().map(|p| view(p)).collect();
-    others.push(FormatView {
-        id: RAW_FORMAT.to_string(),
-        name: "Raw files".into(),
-        kinds: kinds(RAW_FORMAT),
-        mount: crate::raw::MOUNT.into(),
-        version: None,
-        description: Some("Arbitrary files under arbitrary paths".into()),
-        default_max_upload_bytes: state.config.default_upload_limit(RAW_FORMAT),
-        max_upload_bytes_limit: ceiling,
-    });
     others.sort_by(|a, b| a.id.cmp(&b.id));
     formats.extend(others);
     Json(formats).into_response()

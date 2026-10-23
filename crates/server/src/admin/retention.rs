@@ -131,7 +131,7 @@ pub async fn put(
     };
 
     // Parsed with its repository's model and stored in its canonical form.
-    let normalized = if repo.is_raw() {
+    let normalized = if state.formats.stores_files(&repo.format) {
         let policy: FileRetentionPolicy = match serde_json::from_value(body.policy) {
             Ok(p) => p,
             Err(e) => return unprocessable(e),
@@ -255,7 +255,7 @@ pub async fn preview(
                 decisions: Vec::new(),
                 proxy_decisions: Vec::new(),
                 image_decisions: repo.is_docker().then(ImageDecisions::default),
-                file_decisions: repo.is_raw().then(Vec::new),
+                file_decisions: state.formats.stores_files(&repo.format).then(Vec::new),
                 counts: PreviewCounts::default(),
             })
             .into_response()
@@ -265,7 +265,7 @@ pub async fn preview(
     if repo.is_docker() {
         return preview_images(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
     }
-    if repo.is_raw() {
+    if state.formats.stores_files(&repo.format) {
         return preview_files(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
     }
     let policy: RetentionPolicy = match serde_json::from_value(policy_json) {

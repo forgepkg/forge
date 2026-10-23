@@ -53,10 +53,10 @@ A Cargo workspace of small crates plus the web SPA:
 | `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, raw file repositories (`/raw`), `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, raw files at `/raw`), the file store of files formats, the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
-| `plugins/` | `forge-format-*` | Format plugins, built into the server: `nuget`. |
+| `plugins/` | `forge-format-*` | Format plugins, built into the server: `nuget`, `raw`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed

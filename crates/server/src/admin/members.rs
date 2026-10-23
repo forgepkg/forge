@@ -66,14 +66,14 @@ pub struct UpdateMember {
 /// Refuse to flag a proxy as an owner: it would never own anything, and a
 /// group whose only flagged member is a proxy would serve its reserved ids
 /// from nowhere.
-fn owner_kind_error(member: &forge_db::model::Repository) -> Option<Response> {
-    if member.is_raw() {
-        // Owners guard package ids; a raw group serves a path from its first
-        // member that has it.
+fn owner_kind_error(state: &AppState, member: &forge_db::model::Repository) -> Option<Response> {
+    if state.formats.stores_files(&member.format) {
+        // Owners guard package ids; a group of files (raw) serves a path
+        // from its first member that has it.
         return Some(
             (
                 StatusCode::BAD_REQUEST,
-                "raw groups have no owner members: a path is served by the first member that has it",
+                "groups of files (raw) have no owner members: a path is served by the first member that has it",
             )
                 .into_response(),
         );
@@ -161,7 +161,7 @@ pub async fn add(
             .into_response();
     }
     if body.owner {
-        if let Some(resp) = owner_kind_error(&member) {
+        if let Some(resp) = owner_kind_error(&state, &member) {
             return resp;
         }
     }
@@ -215,7 +215,7 @@ pub async fn update(
         Err(e) => return db_error(e),
     };
     if body.owner {
-        if let Some(resp) = owner_kind_error(&member) {
+        if let Some(resp) = owner_kind_error(&state, &member) {
             return resp;
         }
     }

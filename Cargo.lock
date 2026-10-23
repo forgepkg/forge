@@ -1806,6 +1806,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-format-raw"
+version = "1.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "forge-plugin-api",
+ "httpdate",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "forge-oci"
 version = "1.1.0"
 dependencies = [
@@ -1873,6 +1886,7 @@ dependencies = [
  "forge-crypto",
  "forge-db",
  "forge-format-nuget",
+ "forge-format-raw",
  "forge-oci",
  "forge-plugin",
  "forge-storage",

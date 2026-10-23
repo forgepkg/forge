@@ -23,7 +23,7 @@ use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
     DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
-    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RAW_FORMAT, RESERVED_PREFIXES_KEY,
+    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
     WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
@@ -70,19 +70,24 @@ pub struct RepoView {
     /// Hosted: the largest push it accepts (for docker, the largest blob),
     /// `None` for the default of its format (`GET /admin/formats`).
     pub max_upload_bytes: Option<u64>,
-    /// Hosted raw: `allow_redeploy` | `disable_redeploy` | `read_only`.
+    /// Hosted, of a files format (raw): `allow_redeploy` |
+    /// `disable_redeploy` | `read_only`.
     pub deployment_policy: Option<&'static str>,
-    /// Raw: `attachment` (files download) | `inline` (files display).
+    /// A files format (raw): `attachment` (files download) | `inline`
+    /// (files display).
     pub content_disposition: Option<&'static str>,
-    /// Raw proxy: seconds a cached file is served before the upstream is
-    /// asked whether it changed (`0`: never).
+    /// Proxy of a files format (raw): seconds a cached file is served
+    /// before the upstream is asked whether it changed (`0`: never).
     pub max_age_seconds: Option<u64>,
+    /// What the repository holds: `packages`, `files` (a files format: raw)
+    /// or `images` (Docker).
+    pub storage: &'static str,
 }
 
 impl RepoView {
     /// The view of `r`, naming its writable member as `names` (repository
-    /// names by id) does.
-    fn new(r: &Repository, names: &HashMap<i64, String>) -> Self {
+    /// names by id) does; `stores_files` when its format holds files.
+    fn new(r: &Repository, names: &HashMap<i64, String>, stores_files: bool) -> Self {
         RepoView {
             id: r.id,
             name: r.name.clone(),
@@ -107,30 +112,41 @@ impl RepoView {
                 .writable_member_id()
                 .and_then(|id| names.get(&id).cloned()),
             max_upload_bytes: r.max_upload_bytes(),
-            deployment_policy: (r.is_raw() && r.kind() == RepoKind::Hosted)
+            deployment_policy: (stores_files && r.kind() == RepoKind::Hosted)
                 .then(|| r.deployment_policy().as_str()),
-            content_disposition: r.is_raw().then(|| {
+            content_disposition: stores_files.then(|| {
                 if r.inline_content() {
                     "inline"
                 } else {
                     "attachment"
                 }
             }),
-            max_age_seconds: (r.is_raw() && r.kind() == RepoKind::Proxy)
+            max_age_seconds: (stores_files && r.kind() == RepoKind::Proxy)
                 .then(|| r.max_age_seconds()),
+            storage: if r.is_docker() {
+                "images"
+            } else if stores_files {
+                "files"
+            } else {
+                "packages"
+            },
         }
     }
 }
 
 /// The view of `r`, its writable member's current name looked up.
-async fn view(pool: &sqlx::PgPool, r: &Repository) -> sqlx::Result<RepoView> {
+async fn view(state: &AppState, r: &Repository) -> sqlx::Result<RepoView> {
     let mut names = HashMap::new();
     if let Some(id) = r.writable_member_id() {
-        if let Some(member) = repository_dao::find_repository_by_id(pool, id).await? {
+        if let Some(member) = repository_dao::find_repository_by_id(&state.pool, id).await? {
             names.insert(id, member.name);
         }
     }
-    Ok(RepoView::new(r, &names))
+    Ok(RepoView::new(
+        r,
+        &names,
+        state.formats.stores_files(&r.format),
+    ))
 }
 
 /// Create-repository request body. Unknown fields are rejected: a misspelled
@@ -521,7 +537,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
         Ok(repos) => {
             let names: HashMap<i64, String> =
                 repos.iter().map(|r| (r.id, r.name.clone())).collect();
-            let views: Vec<RepoView> = repos.iter().map(|r| RepoView::new(r, &names)).collect();
+            let views: Vec<RepoView> = repos
+                .iter()
+                .map(|r| RepoView::new(r, &names, state.formats.stores_files(&r.format)))
+                .collect();
             Json(views).into_response()
         }
         Err(e) => db_error(e),
@@ -531,7 +550,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// `GET /admin/repositories/{name}`
 pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match repository_dao::find_repository_by_name(&state.pool, &name).await {
-        Ok(Some(r)) => match view(&state.pool, &r).await {
+        Ok(Some(r)) => match view(&state, &r).await {
             Ok(view) => Json(view).into_response(),
             Err(e) => db_error(e),
         },
@@ -595,9 +614,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
     }
-    let raw = body.format == RAW_FORMAT;
-    if raw {
-        if let Err(resp) = refuse_for_raw(
+    let files = state.formats.stores_files(&body.format);
+    if files {
+        if let Err(resp) = refuse_for_files(
             Some(body.package_delay_seconds),
             Some(body.allow_redeploy),
             Some(body.metadata_ttl_seconds),
@@ -606,10 +625,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             return resp;
         }
     }
-    let docker_config = match raw_options(
-        raw,
+    let docker_config = match file_options(
+        files,
         parsed_kind,
-        RawOptions {
+        FileOptions {
             deployment_policy: body.deployment_policy.clone(),
             content_disposition: body.content_disposition.clone(),
             max_age_seconds: body.max_age_seconds.map(Some),
@@ -628,8 +647,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         if let Err(resp) = validate_remote_url(url) {
             return resp;
         }
-        if raw {
-            if let Err(resp) = validate_raw_remote_url(url) {
+        if files {
+            if let Err(resp) = validate_files_remote_url(url) {
                 return resp;
             }
         }
@@ -740,7 +759,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     } else {
         repo
     };
-    match view(&state.pool, &repo).await {
+    match view(&state, &repo).await {
         Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
         Err(e) => db_error(e),
     }
@@ -833,15 +852,15 @@ async fn docker_options(
     Ok(config)
 }
 
-/// The raw options of a create or update request (`None`: not sent; for
-/// `max_age_seconds`, `Some(None)`: cleared).
-struct RawOptions {
+/// The options of a files format (raw) in a create or update request
+/// (`None`: not sent; for `max_age_seconds`, `Some(None)`: cleared).
+struct FileOptions {
     deployment_policy: Option<String>,
     content_disposition: Option<String>,
     max_age_seconds: Option<Option<u64>>,
 }
 
-impl RawOptions {
+impl FileOptions {
     fn any(&self) -> bool {
         self.deployment_policy.is_some()
             || self.content_disposition.is_some()
@@ -850,21 +869,21 @@ impl RawOptions {
 }
 
 /// Longest accepted `max_age_seconds`: ten years.
-const MAX_RAW_MAX_AGE_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
+const MAX_FILE_MAX_AGE_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
 
-/// Validate the raw options against the repository's format and kind and
+/// Validate the files options against the repository's format and kind and
 /// merge them into `config` (the config object to store).
 #[allow(clippy::result_large_err)]
-fn raw_options(
-    raw: bool,
+fn file_options(
+    files: bool,
     kind: RepoKind,
-    options: RawOptions,
+    options: FileOptions,
     mut config: serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
-    if !raw {
+    if !files {
         if options.any() {
             return Err(bad_request(
-                "deployment_policy, content_disposition and max_age_seconds are only valid for raw repositories",
+                "deployment_policy, content_disposition and max_age_seconds are only valid for repositories of files (raw)",
             ));
         }
         return Ok(config);
@@ -897,9 +916,9 @@ fn raw_options(
             ));
         }
         match max_age {
-            Some(seconds) if seconds > MAX_RAW_MAX_AGE_SECONDS => {
+            Some(seconds) if seconds > MAX_FILE_MAX_AGE_SECONDS => {
                 return Err(bad_request(format!(
-                    "max_age_seconds must be at most {MAX_RAW_MAX_AGE_SECONDS} (0: never re-validate)"
+                    "max_age_seconds must be at most {MAX_FILE_MAX_AGE_SECONDS} (0: never re-validate)"
                 )));
             }
             Some(seconds) => {
@@ -913,9 +932,9 @@ fn raw_options(
     Ok(config)
 }
 
-/// The options of other formats a raw repository refuses.
+/// The options of other formats a repository of files (raw) refuses.
 #[allow(clippy::result_large_err)]
-fn refuse_for_raw(
+fn refuse_for_files(
     package_delay_seconds: Option<i32>,
     allow_redeploy: Option<bool>,
     metadata_ttl_seconds: Option<Option<i32>>,
@@ -923,34 +942,34 @@ fn refuse_for_raw(
 ) -> Result<(), Response> {
     if package_delay_seconds.is_some_and(|d| d != 0) {
         return Err(bad_request(
-            "package_delay_seconds is not supported for raw repositories",
+            "package_delay_seconds is not supported for repositories of files (raw)",
         ));
     }
     if allow_redeploy == Some(true) {
         return Err(bad_request(
-            "allow_redeploy is a NuGet option; raw repositories have deployment_policy",
+            "allow_redeploy is a NuGet option; repositories of files (raw) have deployment_policy",
         ));
     }
     if matches!(metadata_ttl_seconds, Some(Some(_))) {
         return Err(bad_request(
-            "metadata_ttl_seconds is not used by raw proxies; set max_age_seconds",
+            "metadata_ttl_seconds is not used by proxies of files (raw); set max_age_seconds",
         ));
     }
     if group_guard {
         return Err(bad_request(
-            "a raw group serves a path from its first member that has it; prefer_hosted and reserved_prefixes do not apply",
+            "a group of files (raw) serves a path from its first member that has it; prefer_hosted and reserved_prefixes do not apply",
         ));
     }
     Ok(())
 }
 
-/// A raw proxy's `remote_url` is the base its paths are appended to: no
+/// A files proxy's `remote_url` is the base its paths are appended to: no
 /// query or fragment.
 #[allow(clippy::result_large_err)]
-fn validate_raw_remote_url(url: &str) -> Result<(), Response> {
+fn validate_files_remote_url(url: &str) -> Result<(), Response> {
     match url::Url::parse(url) {
         Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => Err(bad_request(
-            "a raw proxy's remote_url is the base URL files are under: no query or fragment",
+            "a proxy of files' remote_url is the base URL the files are under: no query or fragment",
         )),
         _ => Ok(()),
     }
@@ -1016,16 +1035,16 @@ pub async fn update(
                 if let Err(resp) = validate_remote_url(url) {
                     return resp;
                 }
-                if existing.is_raw() {
-                    if let Err(resp) = validate_raw_remote_url(url) {
+                if state.formats.stores_files(&existing.format) {
+                    if let Err(resp) = validate_files_remote_url(url) {
                         return resp;
                     }
                 }
             }
         }
     }
-    if existing.is_raw() {
-        if let Err(resp) = refuse_for_raw(
+    if state.formats.stores_files(&existing.format) {
+        if let Err(resp) = refuse_for_files(
             body.package_delay_seconds,
             body.allow_redeploy,
             body.metadata_ttl_seconds,
@@ -1064,10 +1083,10 @@ pub async fn update(
         Ok(config) => config,
         Err(resp) => return resp,
     };
-    let mut config = match raw_options(
-        existing.is_raw(),
+    let mut config = match file_options(
+        state.formats.stores_files(&existing.format),
         existing.kind(),
-        RawOptions {
+        FileOptions {
             deployment_policy: body.deployment_policy.clone(),
             content_disposition: body.content_disposition.clone(),
             max_age_seconds: body.max_age_seconds,
@@ -1225,8 +1244,8 @@ pub async fn update(
                 return db_error(e);
             }
         }
-        // A raw proxy's files are the previous upstream's: likewise.
-        if existing.is_raw() {
+        // A files proxy's files are the previous upstream's: likewise.
+        if state.formats.stores_files(&existing.format) {
             match repository_dao::lock_repository(&mut *tx, updated.id).await {
                 Ok(_) => {}
                 Err(e) => return db_error(e),
@@ -1293,7 +1312,7 @@ pub async fn update(
     } else {
         updated
     };
-    match view(&state.pool, &updated).await {
+    match view(&state, &updated).await {
         Ok(repo) => Json(UpdatedRepoView {
             repo,
             upstream_credentials_dropped: credentials_dropped,
@@ -1347,7 +1366,7 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
             "repository still has images; delete their manifests first",
         )
             .into_response(),
-        Ok(RepoDelete::HasPackages) if existing.is_raw() => (
+        Ok(RepoDelete::HasPackages) if state.formats.stores_files(&existing.format) => (
             StatusCode::CONFLICT,
             "repository still has files; delete them first (DELETE /admin/repositories/<name>/files?path=)",
         )
@@ -1485,7 +1504,7 @@ pub async fn hard_delete_package(
         )
             .into_response();
     }
-    if repo.is_raw() {
+    if state.formats.stores_files(&repo.format) {
         return (
             StatusCode::BAD_REQUEST,
             "delete files through DELETE /admin/repositories/<name>/files?path=<path>",

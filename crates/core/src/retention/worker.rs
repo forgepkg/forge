@@ -226,7 +226,12 @@ impl RetentionWorker {
         if repo.format == forge_db::model::DOCKER_FORMAT {
             return self.process_images(repo, kind, run_id).await;
         }
-        if repo.format == forge_db::model::RAW_FORMAT {
+        // A files format's repositories (raw) hold files under paths.
+        if self
+            .formats
+            .resolve(&repo.format)
+            .is_some_and(|format| format.stores_files())
+        {
             return self.process_files(repo, kind, run_id).await;
         }
 

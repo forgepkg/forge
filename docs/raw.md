@@ -6,9 +6,12 @@ have no package manager of their own (the
 [pdfium binaries](https://github.com/bblanchon/pdfium-binaries), for
 example), installers, firmware images, test fixtures, tool downloads.
 
-Files live in repositories of `format: "raw"`, a format built into Forge
-like Docker (`GET /admin/formats` lists it), served at
-`https://<host>/raw/<repository>/<path>`. They come in the usual three kinds:
+Files live in repositories of `format: "raw"`, a format plugin built into
+Forge like NuGet ([`plugins/raw`](../plugins/raw); `GET /admin/formats`
+lists it), served at `https://<host>/raw/<repository>/<path>`. The plugin
+speaks the protocol below; the host's file store keeps the files
+([format-plugins.md](format-plugins.md#files-formats)). They come in the
+usual three kinds:
 
 - **hosted**: upload, download and delete your own files;
 - **proxy**: a cache of files under an HTTP(S) base URL, such as a GitHub

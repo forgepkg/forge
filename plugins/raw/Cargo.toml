@@ -1,0 +1,24 @@
+[package]
+name = "forge-format-raw"
+# The plugin's own version: keep it equal to `version` in plugin.toml.
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Raw file repositories for Forge, as a format plugin"
+
+[dependencies]
+forge-plugin-api = { path = "../../crates/plugin-api" }
+# The JSON listing.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Last-Modified and If-Modified-Since of the checksum sidecars.
+httpdate = "1"
+# Upstream URLs of a proxy's files, listing queries and links.
+url = { workspace = true }
+percent-encoding = "2.3"
+base64 = { workspace = true }
+
+[dev-dependencies]
+forge-plugin-api = { path = "../../crates/plugin-api", features = ["testing"] }

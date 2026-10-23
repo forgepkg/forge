@@ -46,6 +46,13 @@ pub trait Format: Send + Sync {
     /// the `repository.format` column.
     fn id(&self) -> &'static str;
 
+    /// Whether the format's repositories hold files under paths (raw) rather
+    /// than package versions: their contents are the file store's
+    /// (`raw_file`), and none of the package seams below apply to them.
+    fn stores_files(&self) -> bool {
+        false
+    }
+
     /// Parse an uploaded package into format-neutral [`ParsedUpload`] data.
     fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError>;
 

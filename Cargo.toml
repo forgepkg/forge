@@ -12,6 +12,7 @@ members = [
     "crates/server",
     "crates/e2e",
     "plugins/nuget",
+    "plugins/raw",
     "xtask",
 ]
 
