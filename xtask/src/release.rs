@@ -2,14 +2,17 @@
 //!
 //! Sets the version everywhere the release workflow checks it (the workspace
 //! `Cargo.toml` and `Cargo.lock`, `web/package.json`, the image tag of the
-//! Kubernetes base, and the Helm chart's `version` and `appVersion`), turns
-//! the changelog's `[Unreleased]` section into the version's section, and
-//! commits on a `release-<version>` branch off the default branch. Then,
-//! through the GitHub CLI (`gh`), it opens a pull request, waits for its CI
-//! run, merges it (with a merge queue: queues it and waits for it to land),
-//! waits for the merge commit's CI run on the default branch (e2e and web-e2e
-//! never run on the pull request), and creates and pushes the annotated
-//! `v<version>` tag on the merge commit, which starts release.yml.
+//! Kubernetes base, and the Helm chart's `version` and `appVersion`), folds
+//! the changelog fragments of the version's milestone
+//! (`docs/changes/<version>/`, see [`crate::changelog`]) into the changelog's
+//! `[Unreleased]` section and deletes them, turns that section into the
+//! version's section, and commits on a `release-<version>` branch off the
+//! default branch. Then, through the GitHub CLI (`gh`), it opens a pull
+//! request, waits for its CI run, merges it (with a merge queue: queues it
+//! and waits for it to land), waits for the merge commit's CI run on the
+//! default branch (e2e and web-e2e never run on the pull request), and
+//! creates and pushes the annotated `v<version>` tag on the merge commit,
+//! which starts release.yml.
 //! `--no-tag` only commits, on the current branch, and pushes nothing.
 //! Every edit is computed before the first file is written, so a failed
 //! precondition leaves the tree untouched.
@@ -19,12 +22,15 @@
 //! committed: the run waits for the CI run of the default branch's head and
 //! tags that commit.
 //!
-//! Two changelog guards keep the release notes (the version's section alone)
+//! Three changelog guards keep the release notes (the version's section alone)
 //! whole. A release is refused while the changelog has a version section
 //! whose tag was never created: a section drafted for a release that then got
 //! another number would be left behind. It is also refused when the
-//! version's section already exists and `[Unreleased]` still has entries.
+//! version's section already exists and `[Unreleased]` or the milestone's
+//! fragments still have entries, and while another milestone has fragments:
+//! their changes are on the default branch and ship in this release too.
 
+use crate::changelog;
 use crate::proc::Cmd;
 use std::fs;
 use std::thread;
@@ -34,7 +40,7 @@ const CARGO_TOML: &str = "Cargo.toml";
 const PACKAGE_JSON: &str = "web/package.json";
 const KUSTOMIZATION: &str = "deploy/kubernetes/base/kustomization.yaml";
 const CHART: &str = "deploy/helm/forge/Chart.yaml";
-const CHANGELOG: &str = "CHANGELOG.md";
+pub const CHANGELOG: &str = "CHANGELOG.md";
 
 /// The workflow whose runs gate the merge and the tag (release.yml requires
 /// the tagged commit's run of it).
@@ -113,17 +119,27 @@ pub fn release(args: &[String]) -> Result<(), String> {
     {
         return Err(format!("release: tag {tag_name} already exists"));
     }
-    let changelog = read(CHANGELOG)?;
+    let notes = read(CHANGELOG)?;
     let tags = git(&["tag", "--list", "v*"])?;
-    check_sections_are_tagged(&changelog, &tags.lines().collect::<Vec<_>>(), &version)
+    check_sections_are_tagged(&notes, &tags.lines().collect::<Vec<_>>(), &version)
         .map_err(|e| format!("release: {CHANGELOG}: {e}"))?;
+    let fragments = changelog::read_all().map_err(|e| format!("release: {e}"))?;
+    changelog::check_only_milestone(&fragments, &version).map_err(|e| format!("release: {e}"))?;
+    let fragments_dir = (!fragments.is_empty()).then(|| format!("{}/{version}", changelog::DIR));
+    if let Some(dir) = &fragments_dir {
+        if notes.lines().any(|l| section_version(l) == Some(&version)) {
+            return Err(format!(
+                "release: {CHANGELOG} has a `## [{version}]` section already, and {dir} \
+                 still has fragments: write their entries into the section and delete them"
+            ));
+        }
+    }
 
-    let edits: [(&str, Edit); 5] = [
+    let edits: [(&str, Edit); 4] = [
         (CARGO_TOML, set_workspace_version),
         (PACKAGE_JSON, set_package_version),
         (KUSTOMIZATION, set_image_tag),
         (CHART, set_chart_version),
-        (CHANGELOG, release_changelog),
     ];
     // Only the files the release changes.
     let mut contents = Vec::new();
@@ -134,9 +150,18 @@ pub fn release(args: &[String]) -> Result<(), String> {
             contents.push((path, new));
         }
     }
+    let released = if fragments.is_empty() {
+        release_changelog(&notes, &version)
+    } else {
+        changelog::fold(&notes, &fragments).and_then(|notes| release_changelog(&notes, &version))
+    }
+    .map_err(|e| format!("release: {CHANGELOG}: {e}"))?;
+    if released != notes {
+        contents.push((CHANGELOG, released));
+    }
 
     let Some(base) = base else {
-        commit(&contents, &tag_name)?;
+        commit(&contents, fragments_dir.as_deref(), &tag_name)?;
         let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
         println!();
         println!(
@@ -161,7 +186,7 @@ pub fn release(args: &[String]) -> Result<(), String> {
             ));
         }
         Cmd::new("git").args(["switch", "-c", &branch]).run()?;
-        commit(&contents, &tag_name)?;
+        commit(&contents, fragments_dir.as_deref(), &tag_name)?;
         let resume = format!(
             "once the pull request is merged, run `cargo xtask release {version}` again on an \
              up-to-date `{base}` to tag the merge commit"
@@ -192,11 +217,22 @@ pub fn release(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes `contents`, updates Cargo.lock and commits `release: <tag_name>`;
-/// nothing to commit when the tree already carries the version.
-fn commit(contents: &[(&str, String)], tag_name: &str) -> Result<(), String> {
+/// Writes `contents`, deletes the folded `fragments_dir`, updates Cargo.lock
+/// and commits `release: <tag_name>`; nothing to commit when the tree already
+/// carries the version.
+fn commit(
+    contents: &[(&str, String)],
+    fragments_dir: Option<&str>,
+    tag_name: &str,
+) -> Result<(), String> {
     for (path, content) in contents {
         fs::write(path, content).map_err(|e| format!("release: write {path}: {e}"))?;
+    }
+    // Their entries are in the changelog now.
+    if let Some(dir) = fragments_dir {
+        Cmd::new("git")
+            .args(["rm", "-r", "--quiet", "--", dir])
+            .run()?;
     }
     // Cargo.lock records every workspace crate's version; nothing else moves.
     Cmd::new("cargo").args(["update", "--workspace"]).run()?;
@@ -354,7 +390,7 @@ fn read(path: &str) -> Result<String, String> {
 
 /// `MAJOR.MINOR.PATCH` with an optional `-PRERELEASE`, as release.yml's
 /// `v*.*.*` tags carry it.
-fn is_release_version(v: &str) -> bool {
+pub fn is_release_version(v: &str) -> bool {
     let (core, pre) = match v.split_once('-') {
         Some((core, pre)) => (core, Some(pre)),
         None => (v, None),
@@ -454,7 +490,7 @@ fn section_version(line: &str) -> Option<&str> {
 /// Whether `line` ends a section: the next `## [` heading, or the first link
 /// reference definition (`[label]: <url>`) at the bottom, as release.yml
 /// reads the notes.
-fn ends_section(line: &str) -> bool {
+pub fn ends_section(line: &str) -> bool {
     line.starts_with("## [")
         || line
             .strip_prefix('[')
@@ -493,7 +529,7 @@ fn check_sections_are_tagged(changelog: &str, tags: &[&str], version: &str) -> R
 /// kept as it is, but only while `[Unreleased]` is empty: the release notes
 /// are that one section, so entries left under `[Unreleased]` would be
 /// missing from them.
-fn release_changelog(changelog: &str, version: &str) -> Result<String, String> {
+pub fn release_changelog(changelog: &str, version: &str) -> Result<String, String> {
     let heading = format!("## [{version}]");
     let lines: Vec<&str> = changelog.lines().collect();
     let start = lines.iter().position(|l| *l == "## [Unreleased]");
@@ -598,10 +634,10 @@ mod tests {
 
     #[test]
     fn image_tag_keeps_indentation() {
-        let k = "images:\n  - name: ghcr.io/schmitch/forge\n    newTag: 0.1.0\n";
+        let k = "images:\n  - name: ghcr.io/forgepkg/forge\n    newTag: 0.1.0\n";
         assert_eq!(
             set_image_tag(k, "0.2.0").unwrap(),
-            "images:\n  - name: ghcr.io/schmitch/forge\n    newTag: 0.2.0\n"
+            "images:\n  - name: ghcr.io/forgepkg/forge\n    newTag: 0.2.0\n"
         );
         let two = format!("{k}  - name: other\n    newTag: 1.0.0\n");
         assert!(set_image_tag(&two, "0.2.0").is_err());
