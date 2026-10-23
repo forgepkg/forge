@@ -14,6 +14,8 @@
 //! `/repositories/{name}`), so they are validated on create and rename (see
 //! [`validate_repo_name`]).
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -21,7 +23,7 @@ use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     RepoKind, Repository, DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
     MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
-    WRITABLE_MEMBER_KEY,
+    WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao};
@@ -61,15 +63,18 @@ pub struct RepoView {
     pub immutable_tags: bool,
     /// Hosted docker with immutable tags: `latest` may still be moved.
     pub latest_mutable: bool,
-    /// Docker group: the hosted member pushes to the group go to.
+    /// Docker group: the hosted member pushes to the group go to, by its
+    /// current name (it is stored by id).
     pub writable_member: Option<String>,
     /// Hosted: the largest push it accepts (for docker, the largest blob),
     /// `None` for the default of its format (`GET /admin/formats`).
     pub max_upload_bytes: Option<u64>,
 }
 
-impl From<&Repository> for RepoView {
-    fn from(r: &Repository) -> Self {
+impl RepoView {
+    /// The view of `r`, naming its writable member as `names` (repository
+    /// names by id) does.
+    fn new(r: &Repository, names: &HashMap<i64, String>) -> Self {
         RepoView {
             id: r.id,
             name: r.name.clone(),
@@ -90,10 +95,23 @@ impl From<&Repository> for RepoView {
             host: r.docker_host().map(str::to_string),
             immutable_tags: r.immutable_tags(),
             latest_mutable: r.immutable_tags() && r.latest_mutable(),
-            writable_member: r.writable_member().map(str::to_string),
+            writable_member: r
+                .writable_member_id()
+                .and_then(|id| names.get(&id).cloned()),
             max_upload_bytes: r.max_upload_bytes(),
         }
     }
+}
+
+/// The view of `r`, its writable member's current name looked up.
+async fn view(pool: &sqlx::PgPool, r: &Repository) -> sqlx::Result<RepoView> {
+    let mut names = HashMap::new();
+    if let Some(id) = r.writable_member_id() {
+        if let Some(member) = repository_dao::find_repository_by_id(pool, id).await? {
+            names.insert(id, member.name);
+        }
+    }
+    Ok(RepoView::new(r, &names))
 }
 
 /// Create-repository request body. Unknown fields are rejected: a misspelled
@@ -387,10 +405,11 @@ fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, Str
     Ok(host)
 }
 
-/// A docker group's `writable_member`: an existing hosted docker repository.
-async fn validate_writable_member(state: &AppState, name: &str) -> Result<String, Response> {
+/// A docker group's `writable_member`: an existing hosted docker
+/// repository, whose id is stored.
+async fn validate_writable_member(state: &AppState, name: &str) -> Result<i64, Response> {
     match repository_dao::find_repository_by_name(&state.pool, name).await {
-        Ok(Some(r)) if r.is_docker() && r.kind() == RepoKind::Hosted => Ok(r.name),
+        Ok(Some(r)) if r.is_docker() && r.kind() == RepoKind::Hosted => Ok(r.id),
         Ok(_) => Err(bad_request(format!(
             "writable_member {name:?} must be a hosted docker repository (and a member of the group)"
         ))),
@@ -460,7 +479,9 @@ fn validate_timings(
 pub async fn list(State(state): State<AppState>) -> Response {
     match repository_dao::list_repositories(&state.pool).await {
         Ok(repos) => {
-            let views: Vec<RepoView> = repos.iter().map(RepoView::from).collect();
+            let names: HashMap<i64, String> =
+                repos.iter().map(|r| (r.id, r.name.clone())).collect();
+            let views: Vec<RepoView> = repos.iter().map(|r| RepoView::new(r, &names)).collect();
             Json(views).into_response()
         }
         Err(e) => db_error(e),
@@ -470,7 +491,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// `GET /admin/repositories/{name}`
 pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match repository_dao::find_repository_by_name(&state.pool, &name).await {
-        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(Some(r)) => match view(&state.pool, &r).await {
+            Ok(view) => Json(view).into_response(),
+            Err(e) => db_error(e),
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => db_error(e),
     }
@@ -637,13 +661,18 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
-    if !sealed {
-        return (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response();
-    }
-    // Re-fetch so the view reflects the sealed secret.
-    match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
-        Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
-        Ok(None) => db_error(sqlx::Error::RowNotFound),
+    // Re-fetched so the view reflects the sealed secret.
+    let repo = if sealed {
+        match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return db_error(sqlx::Error::RowNotFound),
+            Err(e) => return db_error(e),
+        }
+    } else {
+        repo
+    };
+    match view(&state.pool, &repo).await {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -725,10 +754,10 @@ async fn docker_options(
     match options.writable_member {
         Some(Some(member)) => {
             let member = validate_writable_member(state, &member).await?;
-            config.insert(WRITABLE_MEMBER_KEY.into(), json!(member));
+            config.insert(WRITABLE_MEMBER_ID_KEY.into(), json!(member));
         }
         Some(None) => {
-            config.remove(WRITABLE_MEMBER_KEY);
+            config.remove(WRITABLE_MEMBER_ID_KEY);
         }
         None => {}
     }
@@ -1022,19 +1051,22 @@ pub async fn update(
         );
     }
 
-    let respond = |r: &Repository| {
-        Json(UpdatedRepoView {
-            repo: RepoView::from(r),
+    // Re-fetched so the view reflects the sealed secret.
+    let updated = if sealed {
+        match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return db_error(sqlx::Error::RowNotFound),
+            Err(e) => return db_error(e),
+        }
+    } else {
+        updated
+    };
+    match view(&state.pool, &updated).await {
+        Ok(repo) => Json(UpdatedRepoView {
+            repo,
             upstream_credentials_dropped: credentials_dropped,
         })
-        .into_response()
-    };
-    if !sealed {
-        return respond(&updated);
-    }
-    match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
-        Ok(Some(r)) => respond(&r),
-        Ok(None) => db_error(sqlx::Error::RowNotFound),
+        .into_response(),
         Err(e) => db_error(e),
     }
 }

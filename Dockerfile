@@ -61,12 +61,12 @@ RUN pnpm run build
 
 
 # ── Stage 2a: cargo-chef base ─────────────────────────────────────────────────
-# Pin the Rust toolchain to match rust-toolchain.toml (1.95.0). cargo-chef lets
+# Pin the Rust toolchain to match rust-toolchain.toml (1.99.1). cargo-chef lets
 # us cache the dependency compile separately from the workspace sources.
-FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS chef
-# Use the image's preinstalled 1.95.0 as-is; the copied rust-toolchain.toml
+FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS chef
+# Use the image's preinstalled 1.99.1 as-is; the copied rust-toolchain.toml
 # would otherwise make rustup download its dev components (rustfmt, clippy).
-ENV RUSTUP_TOOLCHAIN=1.95.0
+ENV RUSTUP_TOOLCHAIN=1.99.1
 # aws-lc-sys (transitive via aws-sdk-s3 / rustls) compiles C + asm, so the build
 # needs cmake, clang and perl in addition to the default gcc toolchain.
 RUN apt-get update \

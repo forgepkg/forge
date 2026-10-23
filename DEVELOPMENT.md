@@ -684,7 +684,7 @@ and the static SPA on a single port (no Node in prod):
 
 1. **web** — Node 22 + pnpm (corepack): `pnpm install --frozen-lockfile` +
    `pnpm run build` → `web/dist`.
-2. **builder** — `rust:1.95` with cargo-chef for dependency-layer caching;
+2. **builder** — `rust:1.99` with cargo-chef for dependency-layer caching;
    `cargo build --release -p forge-server` with `SQLX_OFFLINE=true` against the
    committed `.sqlx/` cache (no DB needed at build time).
 3. **runtime** — `debian:bookworm-slim` (+ `ca-certificates`) running as an

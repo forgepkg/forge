@@ -559,14 +559,14 @@ impl Registry {
         &self,
         group: &Repository,
     ) -> OciResult<Option<Repository>> {
-        let Some(name) = group.writable_member() else {
+        let Some(id) = group.writable_member_id() else {
             return Ok(None);
         };
         let members = repository_dao::group_members(&self.inner.pool, group.id).await?;
         Ok(members
             .into_iter()
             .map(|(member, _)| member)
-            .find(|m| m.name == name && m.is_docker() && m.kind() == RepoKind::Hosted))
+            .find(|m| m.id == id && m.is_docker() && m.kind() == RepoKind::Hosted))
     }
 
     /// The refusal of `action` on `name`: a challenge (401) when credentials
