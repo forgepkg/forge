@@ -11,6 +11,11 @@
 //!   the calling admin's address (their UPN); a failure answers **502** with
 //!   the server's error text.
 //!
+//! A Microsoft Graph app that authenticates with a federated credential
+//! (#320) is shown with the issuer, subject and audience to register on the
+//! app (`federated_credential`), and saving it creates Forge's issuer keys
+//! first: the credential can be set up before the first send.
+//!
 //! The settings exist here only: there is no `forge.toml` section and no
 //! `FORGE_*` variable for them.
 
@@ -25,7 +30,9 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
 use super::db_error;
-use crate::email::{self, settings, EmailConfig, SendError, StoredEmail, TransportConfig};
+use crate::email::{
+    self, settings, EmailConfig, GraphClientAuth, SendError, StoredEmail, TransportConfig,
+};
 use crate::state::AppState;
 
 /// `PUT /admin/settings/email` body: [`EmailConfig`] and whether email is on.
@@ -62,11 +69,18 @@ pub struct TestEmail {
     pub to: Option<String>,
 }
 
-/// The API view of the stored settings: secrets as `<key>_set` markers.
-fn view(stored: &StoredEmail) -> JsonValue {
+/// The API view of the stored settings: secrets as `<key>_set` markers, and
+/// a federated Graph app's credential as forge (the issuer `forge_issuer`)
+/// presents it.
+fn view(stored: &StoredEmail, forge_issuer: &str) -> JsonValue {
     let mut doc = stored.config.redacted();
     if let JsonValue::Object(map) = &mut doc {
         map.insert("configured".into(), json!(true));
+        if let TransportConfig::MicrosoftGraph(graph) = &stored.config.transport {
+            if let Some(credential) = graph.federated_credential(forge_issuer) {
+                map.insert("federated_credential".into(), json!(credential));
+            }
+        }
         map.insert("enabled".into(), json!(stored.row.enabled));
         map.insert(
             "secrets_unreadable".into(),
@@ -97,7 +111,7 @@ async fn load(state: &AppState) -> Result<Option<StoredEmail>, Response> {
 /// `GET /admin/settings/email`
 pub async fn get(State(state): State<AppState>) -> Response {
     match load(&state).await {
-        Ok(Some(stored)) => Json(view(&stored)).into_response(),
+        Ok(Some(stored)) => Json(view(&stored, state.mailer.forge_issuer())).into_response(),
         Ok(None) => Json(json!({"configured": false})).into_response(),
         Err(resp) => resp,
     }
@@ -126,6 +140,21 @@ pub async fn put(State(state): State<AppState>, Json(body): Json<PutEmailSetting
         Ok(config) => config,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // A federated Graph app trusts forge's issuer keys: they must be
+    // published before its federated credential can be set up.
+    if let TransportConfig::MicrosoftGraph(graph) = &config.transport {
+        if graph.client_authentication == GraphClientAuth::FederatedCredential {
+            if let Err(error) = state.assertion_issuer.ensure().await {
+                tracing::error!(error = %format!("{error:#}"), "cannot create the issuer keys");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the issuer keys a federated credential needs could not be created; \
+                     try again",
+                )
+                    .into_response();
+            }
+        }
+    }
     let doc = match serde_json::to_value(&config) {
         Ok(doc) => doc,
         Err(e) => {
@@ -158,11 +187,14 @@ pub async fn put(State(state): State<AppState>, Json(body): Json<PutEmailSetting
         enabled = row.enabled,
         "email settings changed"
     );
-    Json(view(&StoredEmail {
-        row,
-        config,
-        secrets_unreadable: false,
-    }))
+    Json(view(
+        &StoredEmail {
+            row,
+            config,
+            secrets_unreadable: false,
+        },
+        state.mailer.forge_issuer(),
+    ))
     .into_response()
 }
 

@@ -1727,3 +1727,73 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
         .await
         .unwrap();
 }
+
+/// #320: a Microsoft Graph app's client secret is sealed like the SMTP
+/// password, bound to the tenant and the client id: a row repointed to
+/// another tenant or app outside the API no longer decrypts.
+#[tokio::test]
+async fn the_graph_client_secret_is_sealed_and_bound_to_the_app() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("graph-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let logical = json!({
+        "from_address": "forge@contoso.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "microsoft_graph",
+            "tenant_id": "contoso.onmicrosoft.com",
+            "client_id": "00000000-1111-2222-3333-444444444444",
+            "client_authentication": "client_secret",
+            "client_secret": "graph-secret-1",
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    assert!(row.config["transport"].get("client_secret").is_none());
+    let blob = row.secrets_enc.clone().expect("sealed");
+    assert!(!String::from_utf8_lossy(&blob).contains("graph-secret-1"));
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &row)
+            .await
+            .unwrap(),
+        logical
+    );
+
+    for (field, value) in [
+        ("tenant_id", "fabrikam.onmicrosoft.com"),
+        ("client_id", "55555555-1111-2222-3333-444444444444"),
+    ] {
+        sqlx::query("UPDATE email_settings SET config = jsonb_set(config, $1, $2)")
+            .bind(vec!["transport", field])
+            .bind(json!(value))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+        assert!(
+            secret_dao::email_config(Some(&envelope), &moved)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        sqlx::query("UPDATE email_settings SET config = $1")
+            .bind(&row.config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+}

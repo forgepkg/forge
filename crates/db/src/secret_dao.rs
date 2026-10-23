@@ -28,11 +28,13 @@
 //! the backfill, the re-encrypt sweep and the DEK reference scan like the
 //! secret columns ([`store_secret_setting`], [`open_secret_setting`]).
 //!
-//! The email service's transport secrets (the SMTP password) are sealed as
-//! one JSON object into `email_settings.secrets_enc`, AAD-bound to
+//! The email service's transport secrets (the SMTP password, the Graph
+//! client secret) are sealed as one JSON object into
+//! `email_settings.secrets_enc`, AAD-bound to
 //! `('email_settings', 'secrets_enc', 1)` plus the transport kind and the
 //! fields the secret belongs to ([`email_secret_binding_keys`]: the SMTP host
-//! and username), and stripped from the plaintext `config`
+//! and username, the Graph tenant and client id), and stripped from the
+//! plaintext `config`
 //! ([`store_email_settings`], [`email_config`]).
 //!
 //! An import from Nexus keeps the Nexus password in
@@ -1096,6 +1098,7 @@ pub const EMAIL_SECRETS_COLUMN: &str = "secrets_enc";
 pub fn email_secret_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         "smtp" => &["password"],
+        "microsoft_graph" => &["client_secret"],
         _ => &[],
     }
 }
@@ -1108,6 +1111,8 @@ pub fn email_secret_binding_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         // The SMTP password is the server's credential for this account.
         "smtp" => &["host", "username"],
+        // A client secret belongs to one app registration of one tenant.
+        "microsoft_graph" => &["tenant_id", "client_id"],
         _ => &[],
     }
 }

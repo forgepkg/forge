@@ -357,12 +357,13 @@ impl AppState {
                 key
             }]),
             instance: Arc::new(Instance::current()),
-            assertion_issuer,
             mailer: Arc::new(crate::email::Mailer::new(
                 pool_for_mailer,
                 None,
+                assertion_issuer.clone(),
                 &config_for_mailer,
             )),
+            assertion_issuer,
         }
     }
 
@@ -431,6 +432,7 @@ impl AppState {
         self.mailer = Arc::new(crate::email::Mailer::new(
             self.pool.clone(),
             envelope.clone(),
+            self.assertion_issuer.clone(),
             &self.config,
         ));
         self.envelope = envelope;

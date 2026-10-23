@@ -3,7 +3,8 @@
 //! validation, and the write-only handling of the transport's secrets.
 //!
 //! The stored document is [`EmailConfig`] as JSON. Its transport secrets
-//! (the SMTP password) are sealed by [`forge_db::secret_dao`] while secret
+//! (the SMTP password, the Graph client secret) are sealed by
+//! [`forge_db::secret_dao`] while secret
 //! encryption is on; the API never returns them ([`EmailConfig::redacted`])
 //! and an update that omits one keeps the stored one, unless a field the
 //! secret belongs to changed ([`merge_secrets`]).
@@ -52,6 +53,8 @@ fn default_invitation_ttl_hours() -> u32 {
 pub enum TransportConfig {
     /// SMTP submission, with or without a username and password.
     Smtp(SmtpConfig),
+    /// Microsoft Graph `sendMail`, as an Entra app registration (#320).
+    MicrosoftGraph(GraphConfig),
 }
 
 impl TransportConfig {
@@ -59,7 +62,142 @@ impl TransportConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             TransportConfig::Smtp(_) => "smtp",
+            TransportConfig::MicrosoftGraph(_) => "microsoft_graph",
         }
+    }
+}
+
+/// Microsoft Graph settings: Forge signs in as an Entra app registration
+/// with the client credentials grant and sends with `sendMail` as the sender
+/// mailbox. No mailbox password is involved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphConfig {
+    /// The Entra tenant: its id (a GUID) or a verified domain such as
+    /// `contoso.onmicrosoft.com`.
+    pub tenant_id: String,
+    /// The app registration's application (client) id.
+    pub client_id: String,
+    /// The mailbox to send as, its UPN or object id; the `From` address when
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// How Forge authenticates at the token endpoint.
+    #[serde(default)]
+    pub client_authentication: GraphClientAuth,
+    /// The app's client secret (`client_secret` authentication). Write-only:
+    /// never returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+}
+
+/// How Forge authenticates as the Graph app registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphClientAuth {
+    /// A client secret of the app registration.
+    #[default]
+    ClientSecret,
+    /// A client assertion Forge signs with its own issuer keys, which the
+    /// app's federated identity credential trusts ([`GraphConfig::federated_credential`]).
+    FederatedCredential,
+}
+
+/// Entra's sign-in host.
+pub const MICROSOFT_LOGIN_HOST: &str = "https://login.microsoftonline.com";
+
+/// What the app registration's federated identity credential must name for
+/// Forge's client assertions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FederatedCredential {
+    /// Forge's issuer URL (`server.public_base_url`).
+    pub issuer: String,
+    /// `{client_id}@https://login.microsoftonline.com/{tenant_id}/v2.0`:
+    /// what a federated `oidc` realm of the same app and tenant asserts too,
+    /// so one credential serves both.
+    pub subject: String,
+    /// `api://AzureADTokenExchange`.
+    pub audience: String,
+}
+
+impl GraphConfig {
+    /// The mailbox Graph sends as: [`Self::sender`], else `from_address`.
+    pub fn sender_mailbox<'a>(&'a self, from_address: &'a str) -> &'a str {
+        self.sender.as_deref().unwrap_or(from_address)
+    }
+
+    /// The federated credential Forge (the issuer `forge_issuer`) presents
+    /// with `federated_credential` authentication.
+    pub fn federated_credential(&self, forge_issuer: &str) -> Option<FederatedCredential> {
+        (self.client_authentication == GraphClientAuth::FederatedCredential).then(|| {
+            FederatedCredential {
+                issuer: forge_issuer.trim_end_matches('/').to_string(),
+                subject: forge_core::oidc::assertion::federated_subject(
+                    &format!("{MICROSOFT_LOGIN_HOST}/{}/v2.0", self.tenant_id),
+                    &self.client_id,
+                ),
+                audience: forge_core::oidc::assertion::DEFAULT_ASSERTION_AUDIENCE.to_string(),
+            }
+        })
+    }
+
+    fn validate(&mut self, require_secrets: bool) -> Result<(), InvalidSettings> {
+        self.tenant_id = self.tenant_id.trim().to_string();
+        let tenant_ok = !self.tenant_id.is_empty()
+            && self.tenant_id.len() <= 253
+            && self
+                .tenant_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if !tenant_ok {
+            return Err(invalid(
+                "transport.tenant_id must be the tenant's id or one of its domains, such as \
+                 contoso.onmicrosoft.com",
+            ));
+        }
+        self.client_id = self.client_id.trim().to_string();
+        if self.client_id.is_empty()
+            || self.client_id.len() > 64
+            || !self
+                .client_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(invalid(
+                "transport.client_id must be the app registration's application (client) id",
+            ));
+        }
+        self.sender = blank_to_none(self.sender.take());
+        if let Some(sender) = &self.sender {
+            let object_id =
+                sender.len() == 36 && sender.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+            if !object_id {
+                parse_address("transport.sender", sender)?;
+            }
+        }
+        match self.client_authentication {
+            GraphClientAuth::ClientSecret => {
+                if self.client_secret.as_deref() == Some("") {
+                    self.client_secret = None;
+                }
+                if let Some(secret) = &self.client_secret {
+                    if secret.len() > MAX_SECRET_BYTES {
+                        return Err(invalid(format!(
+                            "transport.client_secret must be at most {MAX_SECRET_BYTES} bytes"
+                        )));
+                    }
+                }
+                if require_secrets && self.client_secret.is_none() {
+                    return Err(invalid(
+                        "transport.client_secret is required with client_secret authentication",
+                    ));
+                }
+            }
+            // Nothing sends a secret: it is not kept (switching back takes a
+            // new one).
+            GraphClientAuth::FederatedCredential => self.client_secret = None,
+        }
+        Ok(())
     }
 }
 
@@ -150,6 +288,7 @@ impl EmailConfig {
         }
         match &mut self.transport {
             TransportConfig::Smtp(smtp) => smtp.validate(require_secrets)?,
+            TransportConfig::MicrosoftGraph(graph) => graph.validate(require_secrets)?,
         }
         Ok(self)
     }
@@ -244,8 +383,9 @@ impl SmtpConfig {
 /// Fill the secrets an update left out (absent or blank) from the `stored`
 /// document, as long as the transport kind and every field the secret
 /// belongs to ([`forge_db::secret_dao::email_secret_binding_keys`]: the SMTP
-/// host and username) are unchanged. Otherwise the secret must be entered
-/// again, which validation then reports.
+/// host and username, the Graph tenant and client id) are unchanged.
+/// Otherwise the secret must be entered again, which validation then
+/// reports.
 pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) -> EmailConfig {
     let Some(stored) = stored else {
         return incoming;
@@ -258,6 +398,20 @@ pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) ->
                 new.password = old.password.clone();
             }
         }
+        (TransportConfig::MicrosoftGraph(old), TransportConfig::MicrosoftGraph(new)) => {
+            let same_app = old
+                .tenant_id
+                .trim()
+                .eq_ignore_ascii_case(new.tenant_id.trim())
+                && old
+                    .client_id
+                    .trim()
+                    .eq_ignore_ascii_case(new.client_id.trim());
+            if new.client_secret.as_deref().is_none_or(str::is_empty) && same_app {
+                new.client_secret = old.client_secret.clone();
+            }
+        }
+        _ => {}
     }
     incoming
 }
@@ -326,7 +480,9 @@ mod tests {
     fn a_minimal_relay_validates_with_defaults() {
         let config = smtp(json!({})).validated(true).unwrap();
         assert_eq!(config.invitation_ttl_hours, DEFAULT_INVITATION_TTL_HOURS);
-        let TransportConfig::Smtp(smtp) = &config.transport;
+        let TransportConfig::Smtp(smtp) = &config.transport else {
+            panic!("an SMTP transport");
+        };
         assert_eq!(smtp.port(), 587);
         assert_eq!(smtp.username, None);
     }
@@ -422,6 +578,120 @@ mod tests {
         assert_eq!(view["transport"]["password_set"], json!(false));
     }
 
+    fn smtp_of(config: &EmailConfig) -> &SmtpConfig {
+        match &config.transport {
+            TransportConfig::Smtp(smtp) => smtp,
+            other => panic!("not SMTP: {other:?}"),
+        }
+    }
+
+    fn graph(extra: JsonValue) -> EmailConfig {
+        let mut transport = json!({
+            "kind": "microsoft_graph",
+            "tenant_id": "contoso.onmicrosoft.com",
+            "client_id": "00000000-1111-2222-3333-444444444444",
+        });
+        transport
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(json!({
+            "from_address": "forge@contoso.com",
+            "transport": transport,
+        }))
+        .unwrap()
+    }
+
+    fn graph_of(config: &EmailConfig) -> &GraphConfig {
+        match &config.transport {
+            TransportConfig::MicrosoftGraph(graph) => graph,
+            other => panic!("not Graph: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_needs_a_secret_unless_it_is_federated() {
+        let err = graph(json!({})).validated(true).unwrap_err();
+        assert!(
+            err.0.contains("transport.client_secret is required"),
+            "{err}"
+        );
+        let config = graph(json!({"client_secret": "s3cret"}))
+            .validated(true)
+            .unwrap();
+        assert_eq!(
+            graph_of(&config).sender_mailbox("forge@contoso.com"),
+            "forge@contoso.com"
+        );
+
+        let federated = graph(json!({
+            "client_authentication": "federated_credential",
+            "client_secret": "typed before switching",
+            "sender": " 9a8b7c6d-0000-1111-2222-333344445555 ",
+        }))
+        .validated(true)
+        .unwrap();
+        let g = graph_of(&federated);
+        assert_eq!(g.client_secret, None, "a federated app keeps no secret");
+        assert_eq!(
+            g.sender.as_deref(),
+            Some("9a8b7c6d-0000-1111-2222-333344445555")
+        );
+        assert_eq!(
+            g.federated_credential("https://forge.example.com/"),
+            Some(FederatedCredential {
+                issuer: "https://forge.example.com".into(),
+                subject: "00000000-1111-2222-3333-444444444444@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0".into(),
+                audience: "api://AzureADTokenExchange".into(),
+            })
+        );
+        assert_eq!(
+            graph_of(
+                &graph(json!({"client_secret": "x"}))
+                    .validated(true)
+                    .unwrap()
+            )
+            .federated_credential("https://forge.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn graph_ids_and_the_sender_are_checked() {
+        for (extra, field) in [
+            (json!({"tenant_id": "contoso/../x"}), "transport.tenant_id"),
+            (json!({"tenant_id": " "}), "transport.tenant_id"),
+            (json!({"client_id": "not an id"}), "transport.client_id"),
+            (json!({"sender": "not a mailbox"}), "transport.sender"),
+        ] {
+            let mut extra = extra;
+            extra["client_secret"] = json!("s");
+            let err = graph(extra).validated(true).unwrap_err();
+            assert!(err.0.contains(field), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_graph_secret_is_redacted_and_kept_for_the_same_app() {
+        let stored = graph(json!({"client_secret": "old"}));
+        let doc = stored.redacted();
+        assert_eq!(doc["transport"]["client_secret_set"], json!(true));
+        assert!(doc["transport"].get("client_secret").is_none());
+
+        let kept = merge_secrets(Some(&stored), graph(json!({"sender": "ops@contoso.com"})));
+        assert_eq!(graph_of(&kept).client_secret.as_deref(), Some("old"));
+        for changed in [
+            json!({"tenant_id": "fabrikam.onmicrosoft.com"}),
+            json!({"client_id": "55555555-1111-2222-3333-444444444444"}),
+        ] {
+            let merged = merge_secrets(Some(&stored), graph(changed.clone()));
+            assert_eq!(graph_of(&merged).client_secret, None, "{changed}");
+        }
+        // Another transport keeps nothing of the old one.
+        let switched = merge_secrets(Some(&stored), smtp(json!({"username": "forge"})));
+        assert_eq!(smtp_of(&switched).password, None);
+    }
+
     #[test]
     fn an_omitted_password_is_kept_for_the_same_host_and_username() {
         let stored = smtp(json!({"username": "forge", "password": "old"}));
@@ -429,14 +699,14 @@ mod tests {
             Some(&stored),
             smtp(json!({"username": "forge", "port": 2525})),
         );
-        let TransportConfig::Smtp(s) = &kept.transport;
+        let s = smtp_of(&kept);
         assert_eq!(s.password.as_deref(), Some("old"));
 
         let replaced = merge_secrets(
             Some(&stored),
             smtp(json!({"username": "forge", "password": "new"})),
         );
-        let TransportConfig::Smtp(s) = &replaced.transport;
+        let s = smtp_of(&replaced);
         assert_eq!(s.password.as_deref(), Some("new"));
 
         for changed in [
@@ -444,7 +714,7 @@ mod tests {
             json!({"username": "forge", "host": "mail.example.org"}),
         ] {
             let merged = merge_secrets(Some(&stored), smtp(changed.clone()));
-            let TransportConfig::Smtp(s) = &merged.transport;
+            let s = smtp_of(&merged);
             assert_eq!(s.password, None, "{changed}");
             assert!(merged.validated(true).is_err(), "{changed}");
         }
