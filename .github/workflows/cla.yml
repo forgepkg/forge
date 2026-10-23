@@ -45,7 +45,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          path-to-document: https://github.com/schmitch/forge/blob/main/CLA.md
+          path-to-document: https://github.com/forgepkg/forge/blob/main/CLA.md
           # Bump the directory (version2, ...) when CLA.md changes materially,
           # so everyone signs the new text.
           path-to-signatures: signatures/version1/cla.json

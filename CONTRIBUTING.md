@@ -1,4 +1,4 @@
-# Contributing to envisia-forge
+# Contributing to Forge
 
 Thank you for helping. This page covers what you need before a pull request
 can be merged. To set up a development environment, run the stack and run the
@@ -7,12 +7,13 @@ tests, see [DEVELOPMENT.md](./DEVELOPMENT.md). To report a vulnerability, see
 
 ## Contributor License Agreement
 
-envisia-forge is dual-licensed: under the GNU AGPL v3, and under the envisia
-license, a separate commercial agreement (see the README, section
-*License*). For envisia to offer your code under both, every contributor
-signs the [Contributor License Agreement](./CLA.md) (CLA) once.
+Every contributor signs the [Contributor License Agreement](./CLA.md) (CLA)
+once. Forge is dual-licensed today, under the GNU AGPL v3 and the envisia
+license (see the README, section *License*), and its license may change
+later, for example to the MIT License. The CLA lets Forge make that change
+without asking every contributor again.
 
-The agreement grants envisia a broad, non-exclusive license to your
+The agreement grants Forge a broad, non-exclusive license to your
 contributions, including the right to license them under other terms. You
 keep the copyright, and you can still use your own code however you like.
 Read [CLA.md](./CLA.md) for the full text.
@@ -59,5 +60,5 @@ only at the person who opened it:
 
 If your employer has rights to the code you write, make sure you are allowed
 to contribute it under the CLA before you sign (see CLA.md, section 5). If
-your employer wants a separate agreement with envisia, ask in an issue
+your employer wants a separate agreement with Forge, ask in an issue
 before you open the pull request.

@@ -919,8 +919,9 @@ success. A pull request opened against `main` gets no `stack` status.
 The ruleset that enforces it is
 `.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
 Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
-every branch except `main`, the merge queue's `gh-readonly-queue/` branches
-and Dependabot's:
+every branch except `main`, the merge queue's `gh-readonly-queue/` branches,
+Dependabot's, and `cla-signatures`, where the `CLA` workflow
+(`.github/workflows/cla.yml`) commits the contributors' signatures:
 
 - A stacked pull request cannot be merged into the branch below it, and
   auto-merge enabled on it does not merge it there. Once it targets `main`,
