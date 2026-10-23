@@ -596,11 +596,10 @@ async fn scan_referenced_dek_versions(
             }
         }
     }
-    let email_blob: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT secrets_enc FROM email_settings WHERE secrets_enc IS NOT NULL",
-    )
-    .fetch_optional(&mut *conn)
-    .await?;
+    let email_blob: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT secrets_enc FROM email_settings WHERE secrets_enc IS NOT NULL")
+            .fetch_optional(&mut *conn)
+            .await?;
     if let Some(blob) = email_blob {
         match EnvelopeService::blob_dek_version(&blob) {
             Ok(version) => {

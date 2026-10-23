@@ -68,7 +68,10 @@ fn view(stored: &StoredEmail) -> JsonValue {
     if let JsonValue::Object(map) = &mut doc {
         map.insert("configured".into(), json!(true));
         map.insert("enabled".into(), json!(stored.row.enabled));
-        map.insert("secrets_unreadable".into(), json!(stored.secrets_unreadable));
+        map.insert(
+            "secrets_unreadable".into(),
+            json!(stored.secrets_unreadable),
+        );
         map.insert(
             "last_failure".into(),
             match &stored.row.last_failure {
@@ -194,7 +197,11 @@ pub async fn test(
         )
             .into_response();
     }
-    let to = match body.to.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+    let to = match body
+        .to
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
         Some(to) => to,
         None => match caller_address(&state, &principal).await {
             Ok(Some(to)) => to,
@@ -215,11 +222,7 @@ pub async fn test(
         Err(e) => return (StatusCode::CONFLICT, e.to_string()).into_response(),
     };
     let content = email::templates::test_message(state.mailer.public_base_url());
-    match state
-        .mailer
-        .send_with(&config, "test", &to, content)
-        .await
-    {
+    match state.mailer.send_with(&config, "test", &to, content).await {
         Ok(()) => Json(json!({"sent": true, "to": to})).into_response(),
         Err(SendError::BadRecipient(_)) => (
             StatusCode::BAD_REQUEST,
@@ -235,7 +238,10 @@ pub async fn test(
 }
 
 /// The calling admin's address: their username when it is a UPN.
-async fn caller_address(state: &AppState, principal: &Principal) -> Result<Option<String>, Response> {
+async fn caller_address(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Option<String>, Response> {
     let Principal::User { user_id, .. } = principal else {
         return Ok(None);
     };

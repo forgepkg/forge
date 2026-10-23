@@ -1595,8 +1595,12 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
     let blob = row.secrets_enc.clone().expect("sealed");
     assert!(!String::from_utf8_lossy(&blob).contains("smtp-secret-1"));
     assert!(secret_dao::sealed_secrets_present(&pool).await.unwrap());
-    assert!(!secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
-    let opened = secret_dao::email_config(Some(&envelope), &row).await.unwrap();
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
+    let opened = secret_dao::email_config(Some(&envelope), &row)
+        .await
+        .unwrap();
     assert_eq!(opened, logical);
 
     // Bound to the host (and username): a row repointed outside the API no
@@ -1608,7 +1612,9 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
     .await
     .unwrap();
     let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
-    assert!(secret_dao::email_config(Some(&envelope), &moved).await.is_err());
+    assert!(secret_dao::email_config(Some(&envelope), &moved)
+        .await
+        .is_err());
     sqlx::query("UPDATE email_settings SET config = $1")
         .bind(&row.config)
         .execute(&pool)
@@ -1629,15 +1635,21 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
         .unwrap();
     let current = email_settings_dao::get(&pool).await.unwrap().unwrap();
     assert_eq!(
-        secret_dao::email_config(Some(&envelope), &current).await.unwrap(),
+        secret_dao::email_config(Some(&envelope), &current)
+            .await
+            .unwrap(),
         logical
     );
     assert_eq!(
-        secret_dao::reseal_email_secrets(&pool, &envelope).await.unwrap(),
+        secret_dao::reseal_email_secrets(&pool, &envelope)
+            .await
+            .unwrap(),
         1
     );
     assert_eq!(
-        secret_dao::reseal_email_secrets(&pool, &envelope).await.unwrap(),
+        secret_dao::reseal_email_secrets(&pool, &envelope)
+            .await
+            .unwrap(),
         0,
         "converged"
     );
@@ -1650,7 +1662,9 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
             >= 1
     );
     assert_eq!(
-        secret_dao::email_config(Some(&envelope), &resealed).await.unwrap(),
+        secret_dao::email_config(Some(&envelope), &resealed)
+            .await
+            .unwrap(),
         logical
     );
 
@@ -1660,14 +1674,18 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
         .unwrap();
     assert_eq!(plain.config, logical);
     assert!(plain.secrets_enc.is_none());
-    assert!(secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
+    assert!(secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
     // ... but never over a concurrent edit.
     let edited = json!({
         "from_address": "noreply@example.com",
         "invitation_ttl_hours": 24,
         "transport": {"kind": "smtp", "host": "localhost", "tls": "none"},
     });
-    email_settings_dao::put(&pool, true, &edited, None).await.unwrap();
+    email_settings_dao::put(&pool, true, &edited, None)
+        .await
+        .unwrap();
     assert!(
         email_settings_dao::put_if_unchanged(&pool, &plain, &edited, None)
             .await
@@ -1678,16 +1696,24 @@ async fn email_settings_secrets_are_sealed_bound_and_rotated() {
     secret_dao::store_email_settings(&pool, None, true, &logical)
         .await
         .unwrap();
-    assert!(secret_dao::backfill_email_secrets(&pool, &envelope).await.unwrap());
-    assert!(!secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
+    assert!(secret_dao::backfill_email_secrets(&pool, &envelope)
+        .await
+        .unwrap());
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
     let backfilled = email_settings_dao::get(&pool).await.unwrap().unwrap();
     assert!(backfilled.config["transport"].get("password").is_none());
     assert!(backfilled.secrets_enc.is_some());
     assert_eq!(
-        secret_dao::email_config(Some(&envelope), &backfilled).await.unwrap(),
+        secret_dao::email_config(Some(&envelope), &backfilled)
+            .await
+            .unwrap(),
         logical
     );
-    assert!(!secret_dao::backfill_email_secrets(&pool, &envelope).await.unwrap());
+    assert!(!secret_dao::backfill_email_secrets(&pool, &envelope)
+        .await
+        .unwrap());
 
     // A transport without a secret seals nothing.
     let relay = secret_dao::store_email_settings(&pool, Some(&envelope), true, &edited)

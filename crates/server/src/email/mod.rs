@@ -185,7 +185,12 @@ impl Mailer {
 
     /// Send `content` to `to` with the settings in use. `purpose` names the
     /// message in the log (`test`, `invitation`, …).
-    pub async fn send(&self, purpose: &'static str, to: &str, content: Content) -> Result<(), SendError> {
+    pub async fn send(
+        &self,
+        purpose: &'static str,
+        to: &str,
+        content: Content,
+    ) -> Result<(), SendError> {
         let Some(config) = self.active().await? else {
             return Err(SendError::NotConfigured);
         };
@@ -208,14 +213,15 @@ impl Mailer {
             .map_err(|_| SendError::BadRecipient(to.to_string()))?;
         let domain = recipient.domain().to_string();
         let result = match build_message(config, Mailbox::new(None, recipient), content) {
-            Ok(message) => match tokio::time::timeout(SEND_TIMEOUT, transmit(config, message)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "the send did not finish within {} seconds",
-                    SEND_TIMEOUT.as_secs()
-                )),
-            },
+            Ok(message) => {
+                match tokio::time::timeout(SEND_TIMEOUT, transmit(config, message)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "the send did not finish within {} seconds",
+                        SEND_TIMEOUT.as_secs()
+                    )),
+                }
+            }
             Err(e) => Err(e),
         };
         match result {
@@ -261,7 +267,10 @@ fn build_message(config: &EmailConfig, to: Mailbox, content: Content) -> Result<
         builder = builder.reply_to(reply_to);
     }
     builder
-        .multipart(MultiPart::alternative_plain_html(content.text, content.html))
+        .multipart(MultiPart::alternative_plain_html(
+            content.text,
+            content.html,
+        ))
         .map_err(|e| format!("the message could not be built: {e}"))
 }
 

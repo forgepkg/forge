@@ -264,8 +264,11 @@ pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) ->
 
 /// Parse an email address for the setting `field`.
 fn parse_address(field: &str, raw: &str) -> Result<Address, InvalidSettings> {
-    raw.parse::<Address>()
-        .map_err(|_| invalid(format!("{field} must be an email address such as forge@example.com")))
+    raw.parse::<Address>().map_err(|_| {
+        invalid(format!(
+            "{field} must be an email address such as forge@example.com"
+        ))
+    })
 }
 
 fn blank_to_none(value: Option<String>) -> Option<String> {
@@ -332,7 +335,9 @@ mod tests {
     fn plain_smtp_only_to_a_loopback_relay() {
         for host in ["localhost", "127.0.0.1", "::1", "LOCALHOST"] {
             assert!(
-                smtp(json!({"host": host, "tls": "none"})).validated(true).is_ok(),
+                smtp(json!({"host": host, "tls": "none"}))
+                    .validated(true)
+                    .is_ok(),
                 "{host}"
             );
         }
@@ -346,7 +351,9 @@ mod tests {
 
     #[test]
     fn a_username_needs_a_password_and_the_reverse() {
-        let err = smtp(json!({"username": "forge"})).validated(true).unwrap_err();
+        let err = smtp(json!({"username": "forge"}))
+            .validated(true)
+            .unwrap_err();
         assert!(err.0.contains("transport.password is required"), "{err}");
         // Before the stored secret is merged in, it may be missing.
         assert!(smtp(json!({"username": "forge"})).validated(false).is_ok());
@@ -384,7 +391,13 @@ mod tests {
         let mut c = base();
         c["invitation_ttl_hours"] = json!(721);
         assert!(bad(c).contains("invitation_ttl_hours"));
-        for host in ["smtp://example.com", "example.com:25", "", "a b", "-x.example"] {
+        for host in [
+            "smtp://example.com",
+            "example.com:25",
+            "",
+            "a b",
+            "-x.example",
+        ] {
             let mut c = base();
             c["transport"]["host"] = json!(host);
             assert!(bad(c).contains("transport.host"), "{host}");
@@ -412,7 +425,10 @@ mod tests {
     #[test]
     fn an_omitted_password_is_kept_for_the_same_host_and_username() {
         let stored = smtp(json!({"username": "forge", "password": "old"}));
-        let kept = merge_secrets(Some(&stored), smtp(json!({"username": "forge", "port": 2525})));
+        let kept = merge_secrets(
+            Some(&stored),
+            smtp(json!({"username": "forge", "port": 2525})),
+        );
         let TransportConfig::Smtp(s) = &kept.transport;
         assert_eq!(s.password.as_deref(), Some("old"));
 

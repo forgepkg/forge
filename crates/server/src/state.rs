@@ -358,7 +358,11 @@ impl AppState {
             }]),
             instance: Arc::new(Instance::current()),
             assertion_issuer,
-            mailer: Arc::new(crate::email::Mailer::new(pool_for_mailer, None, &config_for_mailer)),
+            mailer: Arc::new(crate::email::Mailer::new(
+                pool_for_mailer,
+                None,
+                &config_for_mailer,
+            )),
         }
     }
 

@@ -47,9 +47,10 @@ fn test_tls() -> &'static TestTls {
         let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
         let key = KeyPair::generate().unwrap();
         let mut params =
-            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-                .unwrap();
-        params.distinguished_name.push(DnType::CommonName, "localhost");
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
         let cert = params.signed_by(&key, &ca).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let ca_file = dir.path().join("ca.pem");
@@ -214,8 +215,19 @@ async fn sends_over_starttls_and_implicit_tls_with_and_without_auth() {
     ] {
         let mailpit = Mailpit::start(server_tls, auth).await;
         let settings = smtp_settings(mailpit.smtp_port, tls, auth.then_some(SMTP_PASSWORD));
-        let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(settings)).await;
-        assert_eq!(resp.status(), 200, "{tls}/{auth}: {}", resp.text().await.unwrap());
+        let resp = admin(
+            &srv,
+            reqwest::Method::PUT,
+            "/admin/settings/email",
+            Some(settings),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "{tls}/{auth}: {}",
+            resp.text().await.unwrap()
+        );
         let view: Value = resp.json().await.unwrap();
         assert_eq!(view["transport"]["password_set"], json!(auth));
 
@@ -243,7 +255,10 @@ async fn sends_over_starttls_and_implicit_tls_with_and_without_auth() {
             .eq_ignore_ascii_case("someone@example.com"));
         assert_eq!(summary["ReplyTo"][0]["Address"], "help@example.com");
         let message = mailpit.message(summary["ID"].as_str().unwrap()).await;
-        assert!(message["Text"].as_str().unwrap().contains("http://test.local"));
+        assert!(message["Text"]
+            .as_str()
+            .unwrap()
+            .contains("http://test.local"));
         assert!(message["HTML"]
             .as_str()
             .unwrap()
@@ -280,11 +295,20 @@ async fn sends_to_a_plain_relay_on_loopback_only() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(relay.messages(1).await[0]["To"][0]["Address"], "relay@example.com");
+    assert_eq!(
+        relay.messages(1).await[0]["To"][0]["Address"],
+        "relay@example.com"
+    );
 
     let mut remote = smtp_settings(relay.smtp_port, "none", None);
     remote["transport"]["host"] = json!("smtp.example.com");
-    let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(remote)).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        "/admin/settings/email",
+        Some(remote),
+    )
+    .await;
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("loopback"));
 }
@@ -318,8 +342,14 @@ async fn a_failed_send_reports_the_server_error() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["sent"], json!(false));
     let error = body["error"].as_str().unwrap().to_string();
-    assert!(error.contains("535") || error.to_lowercase().contains("auth"), "{error}");
-    assert!(!error.contains("wrong"), "the password is never echoed: {error}");
+    assert!(
+        error.contains("535") || error.to_lowercase().contains("auth"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("wrong"),
+        "the password is never echoed: {error}"
+    );
     let view: Value = admin(&srv, reqwest::Method::GET, "/admin/settings/email", None)
         .await
         .json()
@@ -341,7 +371,11 @@ async fn a_failed_send_reports_the_server_error() {
     assert_eq!(resp.status(), 502);
     let error: Value = resp.json().await.unwrap();
     assert!(
-        error["error"].as_str().unwrap().to_lowercase().contains("tls"),
+        error["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("tls"),
         "{error}"
     );
     admin(
@@ -353,10 +387,7 @@ async fn a_failed_send_reports_the_server_error() {
     .await;
     assert_eq!(test_send().await.status(), 502);
     assert!(
-        plain
-            .messages(0)
-            .await
-            .is_empty(),
+        plain.messages(0).await.is_empty(),
         "nothing went out unencrypted"
     );
 }
@@ -375,15 +406,26 @@ async fn settings_keep_their_secret_write_only() {
             .unwrap()
     };
     assert_eq!(get().await, json!({"configured": false}));
-    let resp = admin(&srv, reqwest::Method::POST, "/admin/settings/email/test", None).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/settings/email/test",
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 409, "nothing to test yet");
 
     let mailpit = Mailpit::start(ServerTls::Starttls, true).await;
     let settings = smtp_settings(mailpit.smtp_port, "starttls", Some(SMTP_PASSWORD));
     assert_eq!(
-        admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(settings.clone()))
-            .await
-            .status(),
+        admin(
+            &srv,
+            reqwest::Method::PUT,
+            "/admin/settings/email",
+            Some(settings.clone())
+        )
+        .await
+        .status(),
         200
     );
     let view = get().await;
@@ -404,13 +446,28 @@ async fn settings_keep_their_secret_write_only() {
 
     // An update without the password keeps it...
     let mut update = settings.clone();
-    update["transport"].as_object_mut().unwrap().remove("password");
+    update["transport"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
     update["from_name"] = json!("Forge registry");
     update["invitation_ttl_hours"] = json!(24);
-    let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(update.clone())).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        "/admin/settings/email",
+        Some(update.clone()),
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     // ... and the test send goes to the calling admin's address, their UPN.
-    let resp = admin(&srv, reqwest::Method::POST, "/admin/settings/email/test", None).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/settings/email/test",
+        None,
+    )
+    .await;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(status, 200, "{body}");
@@ -421,17 +478,32 @@ async fn settings_keep_their_secret_write_only() {
     // A new host or username needs the password again.
     let mut moved = update.clone();
     moved["transport"]["username"] = json!("someone-else");
-    let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(moved)).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        "/admin/settings/email",
+        Some(moved),
+    )
+    .await;
     assert_eq!(resp.status(), 400);
-    assert!(resp.text().await.unwrap().contains("transport.password is required"));
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("transport.password is required"));
 
     // Turned off: kept, not used by the mailer.
     let mut off = update.clone();
     off["enabled"] = json!(false);
     assert_eq!(
-        admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(off))
-            .await
-            .status(),
+        admin(
+            &srv,
+            reqwest::Method::PUT,
+            "/admin/settings/email",
+            Some(off)
+        )
+        .await
+        .status(),
         200
     );
     assert_eq!(get().await["enabled"], json!(false));
@@ -444,13 +516,25 @@ async fn settings_keep_their_secret_write_only() {
     ] {
         let mut bad = update.clone();
         bad[field] = value;
-        let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(bad)).await;
+        let resp = admin(
+            &srv,
+            reqwest::Method::PUT,
+            "/admin/settings/email",
+            Some(bad),
+        )
+        .await;
         assert_eq!(resp.status(), 400);
         assert!(resp.text().await.unwrap().contains(needle));
     }
     let mut unknown = update.clone();
     unknown["smtp_password"] = json!("x");
-    let resp = admin(&srv, reqwest::Method::PUT, "/admin/settings/email", Some(unknown)).await;
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        "/admin/settings/email",
+        Some(unknown),
+    )
+    .await;
     assert!(resp.status().is_client_error());
 
     assert_eq!(
@@ -490,7 +574,11 @@ async fn the_password_is_sealed_at_rest_with_crypto() {
         &srv,
         reqwest::Method::PUT,
         "/admin/settings/email",
-        Some(smtp_settings(mailpit.smtp_port, "implicit", Some(SMTP_PASSWORD))),
+        Some(smtp_settings(
+            mailpit.smtp_port,
+            "implicit",
+            Some(SMTP_PASSWORD),
+        )),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -511,7 +599,10 @@ async fn the_password_is_sealed_at_rest_with_crypto() {
     )
     .await;
     assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
-    assert_eq!(mailpit.messages(1).await[0]["To"][0]["Address"], "sealed@example.com");
+    assert_eq!(
+        mailpit.messages(1).await[0]["To"][0]["Address"],
+        "sealed@example.com"
+    );
     // The mailer opens it too.
     assert!(srv.state.mailer.is_configured().await);
 }
@@ -545,7 +636,10 @@ async fn other_instances_pick_a_change_up_within_the_cache_ttl() {
     let ttl = srv.state.config.auth.realm_cache_ttl_seconds.max(1);
     let deadline = std::time::Instant::now() + Duration::from_secs(ttl + 5);
     while !peer.state.mailer.is_configured().await {
-        assert!(std::time::Instant::now() < deadline, "the peer never converged");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer never converged"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
