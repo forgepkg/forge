@@ -785,14 +785,22 @@ It sorts the change into groups of paths:
 | Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
-A change to the CI configuration counts for every group. A job left out is
-skipped, which passes a required check. If the `changes` job fails, every job
-runs. A manual run without a `base` (`gh workflow run ci.yml --ref main`)
-and the push of a release commit, which sets a new workspace version, run
-every job, which the release gate requires (see [Releasing](#releasing)). A
-file that Rust code or its tests read from outside the crates belongs in the
-Rust group, one only xtask's tests read in the Release group: add a new one
-to `ci-changes.sh`.
+A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
+counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
+`clippy`, `plugins`, `test`, `oci-e2e` and `e2e` in Rust; `audit` in Audit;
+`web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
+Kubernetes. A change outside the jobs (the triggers, the settings, the
+`changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
+counts for every group; blank and comment lines count for none. The
+Kubernetes group's digest-pin check reads every workflow, so any change to
+one runs `kubernetes`. A job left out is skipped, which passes a required
+check. If the `changes` job fails, every job runs. A manual run without a
+`base` (`gh workflow run ci.yml --ref main`) and the push of a release
+commit, which sets a new workspace version, run every job, which the release
+gate requires (see [Releasing](#releasing)). A file that Rust code or its
+tests read from outside the crates belongs in the Rust group, one only
+xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
+A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
