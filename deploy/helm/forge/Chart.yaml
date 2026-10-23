@@ -10,9 +10,9 @@ type: application
 version: 1.1.0
 appVersion: "1.1.0"
 kubeVersion: ">=1.30.0-0"
-home: https://github.com/schmitch/forge
+home: https://github.com/forgepkg/forge
 sources:
-  - https://github.com/schmitch/forge
+  - https://github.com/forgepkg/forge
 keywords:
   - nuget
   - docker
@@ -24,7 +24,7 @@ annotations:
   artifacthub.io/license: AGPL-3.0-only OR LicenseRef-envisia
   # The digest of the appVersion image. Empty here; the release workflow sets
   # it to the digest it signed before it publishes the chart
-  # (oci://ghcr.io/schmitch/charts/forge), so the published chart always pulls
+  # (oci://ghcr.io/forgepkg/charts/forge), so the published chart always pulls
   # exactly that image (unless image.tag or image.digest is set).
   forge.envisia.de/image-digest: ""
 

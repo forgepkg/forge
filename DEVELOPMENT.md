@@ -609,9 +609,9 @@ cargo test -p forge-server
 ```
 
 **Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
-tests in their job summary (GitLab: at the end of the job log). Every result
-line in the log carries its test's duration (`test foo ... ok <1.234s>`).
-Locally, run any `cargo test` through the same runner, then summarize:
+tests in their job summary. Every result line in the log carries its test's
+duration (`test foo ... ok <1.234s>`). Locally, run any `cargo test` through
+the same runner, then summarize:
 
 ```bash
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
@@ -619,6 +619,27 @@ export FORGE_TEST_TIMINGS=$(mktemp -d)
 cargo test --workspace
 .github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS"
 ```
+
+**Test binaries in parallel.** `cargo test` runs one test binary at a time,
+and every integration-test binary starts its own containers, so CI's `test`
+job runs them side by side with `.github/scripts/test-parallel.sh`, which
+takes `cargo test`'s arguments:
+
+```bash
+.github/scripts/test-parallel.sh --workspace    # FORGE_TEST_JOBS=<n> binaries at a time, default: CPUs
+```
+
+It builds and runs the doc tests through `cargo test`, with itself as the
+target runner recording how cargo would run each test binary (working
+directory, environment, arguments). Then it runs the recorded binaries, each
+through the runner set in `CARGO_TARGET_<triple>_RUNNER` if there is one (as
+above, for the timings), prints each binary's output in one piece when it is
+done and lists the failed binaries at the end. On CI's 4-CPU runner the test
+binaries take about 150 s this way instead of about 260 s, and the CPUs are
+then busy all the time; more binaries at a time than CPUs gains little. Running side by side loads the machine more, so
+a test with a tight timing bound, or one whose test threads disturb each
+other, fails more often than under plain `cargo test` (#345, #347): give it
+slack rather than running fewer binaries at a time.
 
 The test build leaves the workspace crates unoptimized but optimizes the
 dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
@@ -650,6 +671,9 @@ Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
 
 Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
+
+Changelog: `changelog <milestone>` (fold a milestone's fragments into
+`CHANGELOG.md`) · `changelog --check` (see [Changelog entries](#changelog-entries)).
 
 Release: `release <version> [--no-tag]` (see [Releasing](#releasing)).
 
@@ -724,13 +748,47 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 
 ## CI and the merge queue
 
-CI (`.github/workflows/ci.yml`, mirrored for GitLab in `.gitlab-ci.yml`) runs
-`fmt`, `clippy`, `audit`, `test`, `docker`, `kubernetes` and `web` on every
-pull request. The slow `e2e` and `web-e2e` jobs are skipped there; they run in
-the merge queue and on every push to `main`.
+CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
+`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`e2e` and `web-e2e`, which pull requests skip: those two run in the merge
+queue and on every push to `main`. It runs on pull requests that target
+`main` only; a stacked one waits (see [Stacked pull
+requests](#stacked-pull-requests)).
+
+On a pull request and in the merge queue, a job runs only when the change
+touches what it checks (#353). The `changes` job
+(`.github/scripts/ci-changes.sh`) compares a pull request with its base
+branch, and a merge group with the commit it is built on: `main`, or the
+merge group ahead of it in the queue. A merge group therefore runs only the
+jobs its own pull request needs; the pull requests ahead of it are checked by
+their own groups, and the queue merges a group only once every group ahead
+of it passed too (see below). It sorts the change into groups of paths:
+
+| Group | Paths | Jobs |
+|---|---|---|
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `migrations/`, `.sqlx/`, `fixtures/`, `.github/scripts/`; and the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`, `web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Changelog | `docs/changes/` | `fmt` |
+| Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
+| Web | `web/` | `web`, `web-e2e` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
+
+A change to the CI configuration counts for every group. A job left out is
+skipped, which passes a required check. If the `changes` job fails, every job
+runs. Pushes to `main` run every job, which the release gate requires, and
+so does a manual run, unless it names a `base` branch: then it compares the
+branch with the commit it forked off that one. A file that Rust code or its
+tests read from outside the crates belongs in the Rust group: add a new one
+to `ci-changes.sh`.
+
+The image is built only when its own inputs change: clippy, test and web
+compile the Rust code and the SPA of every other change. A change that breaks
+only the image build, such as an `include_str!` of a file `.dockerignore`
+leaves out, therefore fails on the push to `main` rather than in the queue.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
-group is checked as the very commit that lands, `e2e` and `web-e2e` included.
+group is checked as the very commit that lands, with the jobs its changes
+need, `e2e` and `web-e2e` included.
 To turn it on, edit the ruleset (or branch protection rule) of `main`:
 
 1. Enable **Require merge queue**. Keep its **status check timeout** above
@@ -741,27 +799,89 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
    as passed, so the pull request can join the queue; the queue runs them and
    merges only once they passed. Leave them out and the queue merges without
    waiting for them.
+3. Keep **Only merge non-failing pull requests** enabled (the default). A
+   merge group runs only the jobs its own pull request needs, so a pull
+   request must not land on the strength of a later group that skipped the
+   jobs its own change needed.
 
 The push to `main` still runs CI once more, and the release workflow tags
 only commits whose push run passed (see [Releasing](#releasing)).
 
-On GitLab, a merge train is the merge queue: enable **merged results
-pipelines** and **merge trains** under *Settings → Merge requests*. Merge
-train pipelines run `e2e` and `web-e2e` as well.
+### Stacked pull requests
+
+A stacked pull request targets the branch of the pull request below it (see
+[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
+that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
+gives every pull request whose base is not `main` the commit status `stack`,
+pending and naming the branch it waits for. Once the pull request below has
+merged, GitHub retargets the stacked one to `main` and `stack` turns to
+success. A pull request opened against `main` gets no `stack` status.
+
+The ruleset that enforces it is
+`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
+Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
+every branch except `main`, the merge queue's `gh-readonly-queue/` branches
+and Dependabot's:
+
+- A stacked pull request cannot be merged into the branch below it, and
+  auto-merge enabled on it does not merge it there. Once it targets `main`,
+  `main`'s own rules decide. A pull request whose branch predates the
+  workflow has no `stack` status at all, which blocks it just the same.
+- A required status check guards pushes too: a branch only moves to a
+  commit that already carries it. So repository admins, maintainers and
+  writers, and organization owners, bypass the ruleset: their pushes to a
+  pull request's branch go through as before, and they can still merge a
+  stacked pull request, but only by ticking **Merge without waiting for
+  requirements to be met (bypass rules)**. A GitHub App pushing with its own
+  token has to be added to the bypass list.
+
+CI runs only on pull requests that target `main`, so a stacked pull request
+runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
+on every pull request above it. When a pull request is retargeted to `main`,
+the `Stack` workflow starts CI on its branch, with `main` as its `base`, so
+it runs the jobs the pull request's change needs, as a pull request run
+does. That run checks the branch as it is, not its merge with `main`; the
+next push, and the merge queue, check the merge. To check a stacked branch
+earlier, run CI on it by hand: **Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`.
+A pull request from a fork gets no such run: a push to it starts CI.
+
+## Changelog entries
+
+A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its
+own, `docs/changes/<milestone>/<issue>.<kind>.md`, for example
+`docs/changes/1.2.0/205.fixed.md`. Here `<milestone>` is the issue's GitHub
+milestone and `<kind>` the section (`upgrade`, `feature`, `fixed`,
+`security`, `docs`, `limitation`). The file holds the entry's text; the
+release adds the `- ` and the issue's link. Pull requests merged side by side
+therefore never conflict over the changelog, and an entry never lands under a
+release it is not part of. [docs/changes/README.md](docs/changes/README.md)
+describes the format.
+
+`cargo xtask release <version>` folds `docs/changes/<version>/` into the
+changelog (see [Releasing](#releasing)). To edit the notes before that, for
+example to write the release's introduction, `cargo xtask changelog
+<milestone>` folds the milestone's fragments into `[Unreleased]` and deletes
+them; commit that in a pull request of its own. CI's `fmt` job runs `cargo
+xtask changelog --check`. It refuses a file under `docs/changes` that is not a
+fragment, and a fragment whose milestone is released already. When a pull
+request written before a release merges after it, move its fragment to the
+next milestone.
 
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
 workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/schmitch/forge:<version>`, packages the Helm chart pinned to that
-image's digest, pushes and signs it as `oci://ghcr.io/schmitch/charts/forge`
+`ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned to that
+image's digest, pushes and signs it as `oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
 Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
 `version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
-unless the `[Unreleased]` section of `CHANGELOG.md` is empty (entries left
-there would be missing from the release notes).
+unless the `[Unreleased]` section of `CHANGELOG.md` is empty and
+`docs/changes/` holds no changelog fragments (entries left there would be
+missing from the release notes).
 
 `main` only accepts commits whose required checks passed, so the release
 commit goes through a pull request and the tag goes on the merge commit; a
@@ -806,14 +926,18 @@ git push origin v1.0.1
 ```
 
 The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
---workspace`), `web/package.json`, the Kubernetes base and the Helm chart,
-renames `## [Unreleased]` in `CHANGELOG.md` to `## [1.0.1]` under a new, empty
-`[Unreleased]`, updates the links at its bottom, and commits
-`release: v1.0.1`. A `## [1.0.1]` section drafted ahead of time is kept as it
-is, but only while `[Unreleased]` is empty; with entries in both, the release
-is refused. It also refuses a changelog with a version section whose tag does
-not exist (a section drafted for a release that then got another number):
-fold its entries into `[Unreleased]` first.
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart. It
+folds the changelog fragments of `docs/changes/1.0.1/` into `## [Unreleased]`
+in `CHANGELOG.md` and deletes them (see [Changelog entries](#changelog-entries)).
+It renames that section to `## [1.0.1]` under a new, empty `[Unreleased]`,
+updates the links at its bottom, and commits `release: v1.0.1`. A `## [1.0.1]`
+section drafted ahead of time is kept as it is, but only while `[Unreleased]`
+and the fragments are empty; with entries in both, the release is refused. It
+also refuses a changelog with a version section whose tag does not exist (a
+section drafted for a release that then got another number): fold its
+entries into `[Unreleased]` first. Fragments under another milestone are
+refused too, because their changes are on `main` and ship in this release:
+move them to `docs/changes/1.0.1/`.
 
 **A failed release run** can simply be re-run. It never builds a version
 twice: a new build would have another digest, and pushing it would move the
@@ -838,15 +962,18 @@ files:
    **Restrict deletions** and an empty bypass list, so nobody moves or
    deletes a release tag.
 
-**First release only.** GHCR creates a package of a user account as
-**private**, whatever the repository's visibility, and there is no REST API
-to change it. After the first release run, open each package's settings
-(profile → **Packages** → the package → **Package settings**) for
-`ghcr.io/schmitch/forge` (the image) and `ghcr.io/schmitch/charts/forge` (the
-chart):
+**First release under forgepkg only.** The repository moved from
+`schmitch/forge` to `forgepkg/forge`, and the release publishes to the
+packages of the repository's owner: from 1.2.0 on `ghcr.io/forgepkg/forge`
+(the image) and `ghcr.io/forgepkg/charts/forge` (the chart), while the
+releases up to 1.1.0 stay at `ghcr.io/schmitch/forge` and
+`ghcr.io/schmitch/charts/forge`. GHCR creates a new package as **private**,
+whatever the repository's visibility, and there is no REST API to change it.
+After the first release run, open each package's settings (the
+organization's **Packages** tab → the package → **Package settings**):
 
 1. Under **Danger Zone → Change visibility**, make both **Public**.
-2. On the chart, under **Manage Actions access**, give the `schmitch/forge`
+2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
    repository the **Write** role if it is not listed. Without it the next
    release's `helm push` fails after the image tags have already moved.
 
@@ -859,5 +986,5 @@ the first `sources` entry of `Chart.yaml` into that annotation.
 
 ```bash
 docker logout ghcr.io; helm registry logout ghcr.io
-docker pull ghcr.io/schmitch/forge:<version> && helm pull oci://ghcr.io/schmitch/charts/forge --version <version>
+docker pull ghcr.io/forgepkg/forge:<version> && helm pull oci://ghcr.io/forgepkg/charts/forge --version <version>
 ```
