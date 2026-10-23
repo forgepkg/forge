@@ -123,9 +123,9 @@ function puts(): Record<string, unknown>[] {
     .map(([, init]) => JSON.parse((init as RequestInit).body as string))
 }
 
+/** A section's form panel, named by its heading. */
 function section(name: string): HTMLElement {
-  const legend = screen.getByText(name, { selector: '[data-slot=legend]' })
-  return legend.closest('form') as HTMLElement
+  return screen.getByRole('form', { name })
 }
 
 describe('admin settings', () => {
@@ -152,7 +152,8 @@ describe('admin settings', () => {
 
     const anonymous = await waitFor(() => section('Anonymous access'))
     expect(within(anonymous).getByRole('combobox', { name: 'Mode' })).toHaveValue('off')
-    const listed = await within(anonymous).findByRole('region', {
+    // The side column lists the repositories allowing anonymous reads.
+    const listed = await screen.findByRole('region', {
       name: 'Repositories allowing anonymous reads',
     })
     expect(within(listed).getByRole('link', { name: 'public-feed' })).toBeInTheDocument()

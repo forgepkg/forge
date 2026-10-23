@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useState, type FormEvent, type ReactNode } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type {
@@ -10,68 +10,65 @@ import type {
 import { useRealms } from '~/queries/useRealms'
 import { useRepositories } from '~/queries/useRepositories'
 import { useAuthSettings, useUpdateAuthSettings } from '~/queries/useSettings'
-import { Button } from '~/components/catalyst/button'
-import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
 import {
-  Description,
-  ErrorMessage,
-  Field,
-  FieldGroup,
+  Button,
+  Checkbox,
+  Code,
+  Columns,
   Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
-import { Code, Text } from '~/components/catalyst/text'
-import { Textarea } from '~/components/catalyst/textarea'
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+  TextareaField,
+  TextField,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 
 export const Route = createFileRoute('/_app/manage/settings')({
   component: SettingsScreen,
 })
 
+const DESCRIPTION =
+  'Who may read without signing in, and how people sign in. Changes apply to every instance within seconds, without a restart.'
+
 /**
  * Settings screen (`/admin/settings/auth`): the sign-in and anonymous-access
  * policy, which every instance applies without a restart.
  *
- *  - **Anonymous access**: the mode and its IP allowlist, and the
- *    repositories that allow anonymous reads (the other half of the switch).
+ *  - **Anonymous access**: the mode and its IP allowlist; the side column
+ *    lists the repositories that allow anonymous reads (the other half of
+ *    the switch).
  *  - **Sign-in**: the login screen's mode, password Basic on the feeds, the
  *    session lifetimes and the password lockout.
  *
- * Each section saves its own fields (`PUT` changes only what it names), so
- * saving one never undoes a change another administrator made to the other.
+ * Each section is a form panel that saves its own fields (`PUT` changes only
+ * what it names), so saving one never undoes a change another administrator
+ * made to the other.
  */
 function SettingsScreen() {
   const settings = useAuthSettings()
 
-  if (settings.isError) {
-    return (
-      <ErrorState
-        title="Could not load the settings"
-        message={settings.error?.message}
-        onRetry={() => void settings.refetch()}
-      />
-    )
-  }
-  if (settings.isLoading || !settings.data) {
-    return <Text>Loading settings…</Text>
-  }
-
   return (
-    <section className="space-y-10">
-      <div>
-        <Heading>Settings</Heading>
-        <Text className="mt-1">
-          Who may read without signing in, and how people sign in. Changes
-          apply to every instance within seconds, without a restart.
-        </Text>
-      </div>
-      <AnonymousAccessForm settings={settings.data} />
-      <SignInForm settings={settings.data} />
-    </section>
+    <Page>
+      <PageHeader title="Settings" description={DESCRIPTION} />
+      {settings.isError ? (
+        <ErrorState
+          title="Could not load the settings"
+          message={settings.error?.message}
+          onRetry={() => void settings.refetch()}
+        />
+      ) : settings.isLoading || !settings.data ? (
+        <Skeleton lines={6} label="Loading settings…" />
+      ) : (
+        <Columns aside={<AnonymousRepositories />} asideLabel="Anonymous reads">
+          <AnonymousAccessForm settings={settings.data} />
+          <SignInForm settings={settings.data} />
+        </Columns>
+      )}
+    </Page>
   )
 }
 
@@ -99,7 +96,12 @@ function parseCount(raw: string, min: number): number | null {
   return Number.isSafeInteger(n) && n >= min ? n : null
 }
 
-/** The outcome line of a section's save. */
+/** A field's error, announced when it appears. */
+function fieldError(error: string | null | undefined): ReactNode {
+  return error ? <span role="alert">{error}</span> : undefined
+}
+
+/** The outcome of a section's save, at the end of its panel. */
 function SaveOutcome({
   saved,
   error,
@@ -107,27 +109,18 @@ function SaveOutcome({
   saved: boolean
   error: string | null
 }) {
-  if (error) {
-    return (
-      <p
-        role="alert"
-        className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-      >
-        {error}
-      </p>
-    )
-  }
-  if (saved) {
-    return (
-      <p
-        role="status"
-        className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-      >
-        Saved.
-      </p>
-    )
-  }
+  if (error) return <Notice tone="danger">{error}</Notice>
+  if (saved) return <Notice tone="ok">Saved.</Notice>
   return null
+}
+
+/** A section's submit button, in its panel's footer. */
+function SaveButton({ pending, children }: { pending: boolean; children: string }) {
+  return (
+    <Button type="submit" variant="primary" disabled={pending}>
+      {pending ? 'Saving…' : children}
+    </Button>
+  )
 }
 
 const MODE_HINTS: Record<AnonymousMode, string> = {
@@ -137,6 +130,7 @@ const MODE_HINTS: Record<AnonymousMode, string> = {
   all: 'Everyone reads without credentials; signed-in users also read what anonymous callers may.',
 }
 
+/** The anonymous-access mode and its IP allowlist. */
 function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
   const update = useUpdateAuthSettings()
   const [mode, setMode] = useState<AnonymousMode>(settings.anonymous_mode)
@@ -159,44 +153,48 @@ function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
 
   const serverError = update.isError ? update.error.body || update.error.message : null
   return (
-    <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Fieldset>
-        <Legend>Anonymous access</Legend>
-        <Text>
+    <Panel
+      as="form"
+      onSubmit={handleSubmit}
+      title="Anonymous access"
+      description={
+        <>
           A repository is read without credentials only when both this mode
           and the repository allow it: the repository&apos;s{' '}
           <strong>Allow anonymous read</strong>, or a grant of the{' '}
           <Code>anonymous</Code> role. Writing always needs a grant.
-        </Text>
-        <FieldGroup>
-          <Field>
-            <Label>Mode</Label>
-            <Select
-              value={mode}
-              onChange={(e) => {
-                setMode(e.target.value as AnonymousMode)
-                setError(null)
-              }}
-            >
-              <option value="off">Off</option>
-              <option value="allowlist">IP allowlist</option>
-              <option value="all">Everyone</option>
-            </Select>
-            <Description>{MODE_HINTS[mode]}</Description>
-          </Field>
-          <Field disabled={mode !== 'allowlist'}>
-            <Label>IP allowlist</Label>
-            <Textarea
-              rows={4}
-              value={allowlist}
-              onChange={(e) => {
-                setAllowlist(e.target.value)
-                setError(null)
-              }}
-              placeholder={'loopback\nprivate\n10.20.0.0/16'}
-              invalid={!!error}
-            />
-            <Description>
+        </>
+      }
+      footer={<SaveButton pending={update.isPending}>Save anonymous access</SaveButton>}
+    >
+      <div className="fg-form">
+        <SelectField
+          label="Mode"
+          value={mode}
+          onChange={(e) => {
+            setMode(e.target.value as AnonymousMode)
+            setError(null)
+          }}
+          description={MODE_HINTS[mode]}
+        >
+          <option value="off">Off</option>
+          <option value="allowlist">IP allowlist</option>
+          <option value="all">Everyone</option>
+        </SelectField>
+        <TextareaField
+          label="IP allowlist"
+          mono
+          rows={4}
+          disabled={mode !== 'allowlist'}
+          value={allowlist}
+          onChange={(e) => {
+            setAllowlist(e.target.value)
+            setError(null)
+          }}
+          placeholder={'loopback\nprivate\n10.20.0.0/16'}
+          error={fieldError(error)}
+          description={
+            <>
               One entry per line: <Code>loopback</Code>, <Code>private</Code>{' '}
               (RFC 1918, link-local and ULA networks), <Code>local</Code> (both),
               a network (<Code>10.20.0.0/16</Code>) or an address. Behind a
@@ -206,47 +204,41 @@ function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
               <Code>server.public_base_url</Code> or{' '}
               <Code>server.allowed_hosts</Code>); both stay in the
               configuration file.
-            </Description>
-            {error && <ErrorMessage role="alert">{error}</ErrorMessage>}
-          </Field>
-        </FieldGroup>
-      </Fieldset>
-
-      <AnonymousRepositories />
-
+            </>
+          }
+        />
+      </div>
       <SaveOutcome saved={update.isSuccess} error={serverError} />
-      <Button type="submit" disabled={update.isPending}>
-        {update.isPending ? 'Saving…' : 'Save anonymous access'}
-      </Button>
-    </form>
+    </Panel>
   )
 }
 
-/** The repositories that allow anonymous reads, each linking to its page. */
+/**
+ * The side column: the repositories that allow anonymous reads, each linking
+ * to its settings.
+ */
 function AnonymousRepositories() {
   const repos = useRepositories()
-  if (repos.isError) {
-    return <Text>Could not load the repositories.</Text>
-  }
-  if (!repos.data) {
-    return <Text>Loading repositories…</Text>
-  }
-  const open = repos.data.filter((r) => r.anonymous_read)
+  const open = repos.data?.filter((r) => r.anonymous_read)
   return (
-    <div role="region" aria-label="Repositories allowing anonymous reads">
-      <Text>
-        {open.length === 0
-          ? 'No repository allows anonymous reads.'
-          : `${open.length === 1 ? 'One repository allows' : `${open.length} repositories allow`} anonymous reads:`}
-      </Text>
-      {open.length > 0 && (
-        <ul className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-sm/6">
+    <Panel
+      title="Repositories allowing anonymous reads"
+      description="Read without credentials when the anonymous access mode also allows the client."
+    >
+      {repos.isError ? (
+        <Notice tone="danger">Could not load the repositories.</Notice>
+      ) : !open ? (
+        <Skeleton lines={2} label="Loading repositories…" />
+      ) : open.length === 0 ? (
+        <p className="fg-text">No repository allows anonymous reads.</p>
+      ) : (
+        <ul className="m-0 grid list-none gap-1 p-0">
           {open.map((r) => (
             <li key={r.name}>
               <Link
                 to="/manage/repositories/$repo"
                 params={{ repo: r.name }}
-                className="font-mono text-sky-600 hover:underline dark:text-sky-400"
+                className="fg-link fg-mono"
               >
                 {r.name}
               </Link>
@@ -254,7 +246,7 @@ function AnonymousRepositories() {
           ))}
         </ul>
       )}
-    </div>
+    </Panel>
   )
 }
 
@@ -303,6 +295,7 @@ function durationHint(raw: string): string | null {
   return n === null ? null : `= ${formatDuration(n)}`
 }
 
+/** The login screen, password Basic, session lifetimes and the lockout. */
 function SignInForm({ settings }: { settings: AuthSettings }) {
   const update = useUpdateAuthSettings()
   const realms = useRealms()
@@ -337,41 +330,42 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
   const serverError = update.isError ? update.error.body || update.error.message : null
 
   return (
-    <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Fieldset>
-        <Legend>Sign-in</Legend>
-        <FieldGroup>
-          <Field>
-            <Label>Login screen</Label>
-            <Select
-              value={draft.login_mode}
-              onChange={(e) => set('login_mode', e.target.value as LoginMode)}
-            >
-              <option value="identifier_first">Username first</option>
-              <option value="combined">Username and password</option>
-            </Select>
-            <Description>
+    <Panel
+      as="form"
+      onSubmit={handleSubmit}
+      title="Sign-in"
+      footer={<SaveButton pending={update.isPending}>Save sign-in</SaveButton>}
+    >
+      <div className="fg-form">
+        <SelectField
+          label="Login screen"
+          value={draft.login_mode}
+          onChange={(e) => set('login_mode', e.target.value as LoginMode)}
+          description={
+            <>
               {draft.login_mode === 'identifier_first'
                 ? 'Asks for the username, then for the password, or sends the user to the identity provider whose login domains match it.'
                 : 'Asks for username and password at once, with a button for the OIDC realm.'}{' '}
               The realms it offers are set under{' '}
-              <Link
-                to="/manage/realms"
-                className="text-sky-600 hover:underline dark:text-sky-400"
-              >
+              <Link to="/manage/realms" className="fg-link">
                 Authentication
               </Link>
               .
-            </Description>
-          </Field>
+            </>
+          }
+        >
+          <option value="identifier_first">Username first</option>
+          <option value="combined">Username and password</option>
+        </SelectField>
 
-          <CheckboxField>
-            <Checkbox
-              checked={draft.allow_password_basic}
-              onChange={(checked) => set('allow_password_basic', checked)}
-            />
-            <Label>Accept passwords over HTTP Basic on the feeds</Label>
-            <Description>
+        <Checkbox
+          label="Accept passwords over HTTP Basic on the feeds"
+          // The label wraps the description too: name the box by its label alone.
+          aria-label="Accept passwords over HTTP Basic on the feeds"
+          checked={draft.allow_password_basic}
+          onChange={(checked) => set('allow_password_basic', checked)}
+          description={
+            <>
               Lets a NuGet client or script send a user&apos;s password instead of
               an API token, which always works. The admin API never accepts a
               password over Basic.
@@ -379,10 +373,15 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
                 ` The enabled credential-forwarding realm${forwarding.length === 1 ? '' : 's'} ${forwarding
                   .map((r) => r.name)
                   .join(', ')} accept${forwarding.length === 1 ? 's' : ''} passwords there whatever this says.`}
-            </Description>
-          </CheckboxField>
+            </>
+          }
+        />
 
-          <div className="grid gap-4 sm:grid-cols-2">
+        <Fieldset
+          legend="Sessions"
+          description="New lifetimes apply to sessions signed in afterwards; an open session keeps its lifetime, and its idle timeout changes on its next use."
+        >
+          <div className="fg-fieldrow items-start">
             <SecondsField
               label="Session idle timeout (seconds)"
               value={draft.session_idle_ttl_seconds}
@@ -398,30 +397,28 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
               hint="A browser session ends this long after sign-in, used or not."
             />
           </div>
-          <Text>
-            New lifetimes apply to sessions signed in afterwards; an open
-            session keeps its lifetime, and its idle timeout changes on its
-            next use.
-          </Text>
+        </Fieldset>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field>
-              <Label>Failed passwords before lockout</Label>
-              <Input
-                type="text"
-                inputMode="numeric"
-                value={draft.login_max_failures}
-                onChange={(e) => set('login_max_failures', e.target.value)}
-                invalid={!!errors.login_max_failures}
-              />
-              <Description>
-                Per client network and username; <Code>0</Code> turns the
-                lockout off.
-              </Description>
-              {errors.login_max_failures && (
-                <ErrorMessage role="alert">{errors.login_max_failures}</ErrorMessage>
-              )}
-            </Field>
+        <Fieldset
+          legend="Password lockout"
+          description="Each instance counts failures on its own, so behind a load balancer a client can try up to this many times per instance."
+        >
+          <div className="fg-fieldrow items-start">
+            <TextField
+              label="Failed passwords before lockout"
+              mono
+              type="text"
+              inputMode="numeric"
+              value={draft.login_max_failures}
+              onChange={(e) => set('login_max_failures', e.target.value)}
+              error={fieldError(errors.login_max_failures)}
+              description={
+                <>
+                  Per client network and username; <Code>0</Code> turns the
+                  lockout off.
+                </>
+              }
+            />
             <SecondsField
               label="Lockout window (seconds)"
               value={draft.login_failure_window_seconds}
@@ -430,21 +427,14 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
               hint="Failures count within it, and a lockout lasts as long. At most a day."
             />
           </div>
-          <Text>
-            Each instance counts failures on its own, so behind a load
-            balancer a client can try up to this many times per instance.
-          </Text>
-        </FieldGroup>
-      </Fieldset>
-
+        </Fieldset>
+      </div>
       <SaveOutcome saved={update.isSuccess} error={serverError} />
-      <Button type="submit" disabled={update.isPending}>
-        {update.isPending ? 'Saving…' : 'Save sign-in'}
-      </Button>
-    </form>
+    </Panel>
   )
 }
 
+/** A number of seconds, with its value in words after the hint. */
 function SecondsField({
   label,
   value,
@@ -460,20 +450,20 @@ function SecondsField({
 }) {
   const inWords = durationHint(value)
   return (
-    <Field>
-      <Label>{label}</Label>
-      <Input
-        type="text"
-        inputMode="numeric"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        invalid={!!error}
-      />
-      <Description>
-        {hint}
-        {inWords && ` (${inWords})`}
-      </Description>
-      {error && <ErrorMessage role="alert">{error}</ErrorMessage>}
-    </Field>
+    <TextField
+      label={label}
+      mono
+      type="text"
+      inputMode="numeric"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      error={fieldError(error)}
+      description={
+        <>
+          {hint}
+          {inWords && ` (${inWords})`}
+        </>
+      }
+    />
   )
 }
