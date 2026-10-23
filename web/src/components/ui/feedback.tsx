@@ -26,26 +26,29 @@ const TONE_ICON: Record<NoticeTone, IconName> = {
 
 /**
  * An inline message where the problem is: info, warn, danger or ok. warn and
- * danger are announced to screen readers (`role="alert"`). `action` is a
- * button or link at the end.
+ * danger are announced to screen readers (`role="alert"`), the others are a
+ * `status`; `role` overrides that (a degraded state that needs no action).
+ * `action` is a button or link at the end.
  */
 export function Notice({
   tone = 'info',
   title,
   children,
   action,
+  role,
   className,
 }: {
   tone?: NoticeTone
   title?: ReactNode
   children?: ReactNode
   action?: ReactNode
+  role?: 'alert' | 'status'
   className?: string
 }) {
   return (
     <div
       className={clsx('fg-notice', `fg-notice--${tone}`, className)}
-      role={tone === 'danger' || tone === 'warn' ? 'alert' : 'status'}
+      role={role ?? (tone === 'danger' || tone === 'warn' ? 'alert' : 'status')}
     >
       <Icon name={TONE_ICON[tone]} size={16} />
       <div className="fg-notice-text">

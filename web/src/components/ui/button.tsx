@@ -52,6 +52,10 @@ export type ButtonProps = ButtonOwnProps &
 /**
  * The action control: a `<button type="button">` (pass `type="submit"` in a
  * form), or a link when `href` is set. Label it with a verb in sentence case.
+ *
+ * A link to a path inside the SPA navigates with the router; one with
+ * `download` or `target` (a file the server serves, such as `/raw/…`), or to
+ * another origin, is a plain `<a>`.
  */
 export const Button = forwardRef<HTMLButtonElement | HTMLAnchorElement, ButtonProps>(
   function Button(props, ref) {
@@ -92,7 +96,7 @@ export const Button = forwardRef<HTMLButtonElement | HTMLAnchorElement, ButtonPr
     )
     if (rest.href !== undefined) {
       const { href, ...anchor } = rest
-      if (isAppPath(href)) {
+      if (isAppPath(href) && anchor.download === undefined && anchor.target === undefined) {
         return (
           <RouterAnchor
             {...anchor}

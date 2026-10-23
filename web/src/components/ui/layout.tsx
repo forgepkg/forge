@@ -115,9 +115,15 @@ export function Panel({
         <div className="fg-panel-head">
           <div className="fg-panel-heading">
             {title && (
-              <h2 id={headingId} className="fg-panel-title">
-                {title}
-                {count !== undefined && <span className="fg-panel-count">{count}</span>}
+              <h2 className="fg-panel-title">
+                {/* The region is named by the title alone, not its count. */}
+                <span id={headingId}>{title}</span>
+                {count !== undefined && (
+                  <>
+                    {' '}
+                    <span className="fg-panel-count">{count}</span>
+                  </>
+                )}
               </h2>
             )}
             {description && <div className="fg-panel-desc">{description}</div>}

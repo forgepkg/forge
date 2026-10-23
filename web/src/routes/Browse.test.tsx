@@ -13,6 +13,7 @@ import type { Me } from '~/api/me'
 import type { BrowseRepo, BrowseResult } from '~/api/packages'
 import type { ImagesResult } from '~/api/images'
 import { routeTree } from '~/routeTree.gen'
+import { textContent } from '~/test/text'
 
 /**
  * Folder-view browse: the root lists the readable repositories (with kind and
@@ -94,6 +95,16 @@ function imagePage(total: number, images: string[]): ImagesResult {
     registry: 'forge.example.com',
     pull_prefix: 'forge.example.com/docker-hosted',
   }
+}
+
+/** Queries scoped to the page (the rail lists the repositories too). */
+function main() {
+  return within(screen.getByRole('main'))
+}
+
+/** The table row of an element (a repository's link). */
+function rowOf(element: HTMLElement): HTMLElement {
+  return element.closest('tr') as HTMLElement
 }
 
 /**
@@ -182,9 +193,9 @@ describe('Browse root (repository folders)', () => {
 
     await renderBrowse('/')
 
-    const nugetLink = await screen.findByRole('link', { name: /nuget/ })
+    const nugetLink = await waitFor(() => main().getByRole('link', { name: /nuget/ }))
     expect(nugetLink).toHaveAttribute('href', '/repos/nuget')
-    expect(screen.getByRole('link', { name: /internal/ })).toBeInTheDocument()
+    expect(main().getByRole('link', { name: /internal/ })).toBeInTheDocument()
   })
 
   it('badges an offline repository', async () => {
@@ -192,13 +203,13 @@ describe('Browse root (repository folders)', () => {
 
     await renderBrowse('/')
 
-    const releases = await screen.findByRole('link', { name: /releases/ })
-    expect(within(releases).getByText('offline')).toHaveAttribute(
+    const releases = await waitFor(() => main().getByRole('link', { name: /releases/ }))
+    expect(within(rowOf(releases)).getByText('offline')).toHaveAttribute(
       'title',
       'Offline for maintenance',
     )
     expect(
-      within(screen.getByRole('link', { name: /internal/ })).queryByText('offline'),
+      within(rowOf(main().getByRole('link', { name: /internal/ }))).queryByText('offline'),
     ).toBeNull()
   })
 
@@ -207,11 +218,11 @@ describe('Browse root (repository folders)', () => {
 
     await renderBrowse('/')
 
-    const docker = await screen.findByRole('link', { name: /docker-hosted/ })
+    const docker = await waitFor(() => main().getByRole('link', { name: /docker-hosted/ }))
     expect(docker).toHaveAttribute('href', '/repos/docker-hosted')
-    expect(within(docker).getByText('Docker')).toBeInTheDocument()
-    expect(within(docker).getByText('hosted')).toBeInTheDocument()
-    const nuget = screen.getByRole('link', { name: /^nuget/ })
+    expect(within(rowOf(docker)).getByText('Docker')).toBeInTheDocument()
+    expect(within(rowOf(docker)).getByText('hosted')).toBeInTheDocument()
+    const nuget = rowOf(main().getByRole('link', { name: /^nuget/ }))
     expect(within(nuget).getByText('NuGet')).toBeInTheDocument()
     expect(within(nuget).getByText('proxy')).toBeInTheDocument()
   })
@@ -222,24 +233,28 @@ describe('Browse root (repository folders)', () => {
     const user = userEvent.setup()
     const router = await renderBrowse('/')
 
-    const select = await screen.findByLabelText('Format')
+    const filter = await screen.findByRole('radiogroup', { name: 'Filter by format' })
     expect(
-      within(select).getAllByRole('option').map((o) => o.textContent),
-    ).toEqual(['All formats', 'Docker', 'Helm', 'NuGet'])
+      within(filter)
+        .getAllByRole('radio')
+        .map((o) => o.textContent?.replace(/ \d+$/, '')),
+    ).toEqual(['All', 'Docker', 'Helm', 'NuGet'])
+    expect(within(filter).getByRole('radio', { name: /^All/ })).toBeChecked()
 
-    await user.selectOptions(select, 'helm')
+    await user.click(within(filter).getByRole('radio', { name: /^Helm/ }))
 
     await waitFor(() =>
       expect(router.state.location.search).toEqual({ format: 'helm' }),
     )
-    expect(await screen.findByRole('link', { name: /charts/ })).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /internal/ })).toBeNull()
-    expect(screen.queryByRole('link', { name: /docker-hosted/ })).toBeNull()
+    expect(await main().findByRole('link', { name: /charts/ })).toBeInTheDocument()
+    expect(main().queryByRole('link', { name: /internal/ })).toBeNull()
+    expect(main().queryByRole('link', { name: /docker-hosted/ })).toBeNull()
+    expect(within(filter).getByRole('radio', { name: /^Helm/ })).toBeChecked()
 
-    await user.selectOptions(select, '')
+    await user.click(within(filter).getByRole('radio', { name: /^All/ }))
 
     await waitFor(() => expect(router.state.location.search).toEqual({}))
-    expect(await screen.findByRole('link', { name: /internal/ })).toBeInTheDocument()
+    expect(await main().findByRole('link', { name: /internal/ })).toBeInTheDocument()
   })
 
   it('says when no readable repository has the filtered format', async () => {
@@ -248,7 +263,7 @@ describe('Browse root (repository folders)', () => {
     await renderBrowse('/?format=npm')
 
     expect(await screen.findByText('No npm repositories')).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /internal/ })).toBeNull()
+    expect(main().queryByRole('link', { name: /internal/ })).toBeNull()
   })
 
   it('navigates into a repository when its folder is clicked', async () => {
@@ -257,7 +272,7 @@ describe('Browse root (repository folders)', () => {
     const user = userEvent.setup()
     const router = await renderBrowse('/')
 
-    await user.click(await screen.findByRole('link', { name: /nuget/ }))
+    await user.click(await waitFor(() => main().getByRole('link', { name: /nuget/ })))
 
     await waitFor(() =>
       expect(router.state.location.pathname).toBe('/repos/nuget'),
@@ -285,7 +300,9 @@ describe('RepoBrowse (per-repo search)', () => {
 
     expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /Beta/ })).toBeInTheDocument()
-    expect(screen.getByText(/Page 1 of 1 · 2 total/)).toBeInTheDocument()
+    const pager = screen.getByRole('navigation', { name: 'Pagination' })
+    expect(pager).toHaveTextContent('Showing 1–2 of 2')
+    expect(pager).toHaveTextContent('Page 1 of 1')
 
     // Every package request carried the repo filter.
     const pkgCalls = fetchMock.mock.calls
@@ -312,7 +329,7 @@ describe('RepoBrowse (per-repo search)', () => {
 
     expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: 'Next' }))
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
 
     expect(await screen.findByRole('link', { name: /Omega/ })).toBeInTheDocument()
     expect(router.state.location.search).toMatchObject({ skip: 20 })
@@ -448,15 +465,15 @@ describe('RepoBrowse connect snippets of package repositories', () => {
     const connect = await screen.findByRole('region', { name: 'Connect' })
     expect(
       within(connect).getByText(
-        'dotnet nuget add source https://forge.example.com/v3/internal/index.json --name internal --username <username> --password <token> --store-password-in-clear-text',
+        textContent('dotnet nuget add source https://forge.example.com/v3/internal/index.json --name internal --username <username> --password <token> --store-password-in-clear-text'),
       ),
     ).toBeInTheDocument()
     expect(
       within(connect).getByText(
-        'dotnet nuget push <package>.nupkg --source internal --api-key <token>',
+        textContent('dotnet nuget push <package>.nupkg --source internal --api-key <token>'),
       ),
     ).toBeInTheDocument()
-    expect(within(connect).getByRole('link', { name: 'Tokens' })).toHaveAttribute(
+    expect(within(connect).getByRole('link', { name: 'Your tokens' })).toHaveAttribute(
       'href',
       '/tokens',
     )
@@ -482,15 +499,15 @@ describe('RepoBrowse connect snippets of package repositories', () => {
     const connect = await screen.findByRole('region', { name: 'Connect' })
     expect(
       within(connect).getByText(
-        'helm repo add charts https://forge.example.com/repository/charts --username <username> --password <token>',
+        textContent('helm repo add charts https://forge.example.com/repository/charts --username <username> --password <token>'),
       ),
     ).toBeInTheDocument()
     expect(
-      within(connect).getByText('helm install <release> charts/<chart>'),
+      within(connect).getByText(textContent('helm install <release> charts/<chart>')),
     ).toBeInTheDocument()
     expect(
       within(connect).getByText(
-        'curl -u <username>:<token> --data-binary @<chart>-<version>.tgz https://forge.example.com/repository/charts/api/charts',
+        textContent('curl -u <username>:<token> --data-binary @<chart>-<version>.tgz https://forge.example.com/repository/charts/api/charts'),
       ),
     ).toBeInTheDocument()
   })
@@ -518,12 +535,16 @@ describe('RepoBrowse of a docker repository (images)', () => {
 
     const app = await screen.findByRole('link', { name: /team\/app/ })
     expect(app).toHaveAttribute('href', '/images/docker-hosted/team/app')
-    expect(within(app).getByText('3 tags · 1 manifest')).toBeInTheDocument()
+    const cells = within(rowOf(app)).getAllByRole('cell')
+    expect(cells[1]).toHaveTextContent('3')
+    expect(cells[2]).toHaveTextContent('1')
     expect(screen.getByRole('link', { name: /alpine/ })).toHaveAttribute(
       'href',
       '/images/docker-hosted/alpine',
     )
-    expect(screen.getByText(/Page 1 of 1 · 2 total/)).toBeInTheDocument()
+    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveTextContent(
+      'Showing 1–2 of 2',
+    )
     expect(screen.getByLabelText('Search images')).toBeInTheDocument()
     // NuGet-only controls are absent, and no package search was made.
     expect(screen.queryByLabelText('Search packages')).toBeNull()
@@ -568,19 +589,19 @@ describe('RepoBrowse of a docker repository (images)', () => {
     ).toBeInTheDocument()
     expect(
       within(connect).getByText(
-        'docker pull forge.example.com/docker-hosted/<image>:<tag>',
+        textContent('docker pull forge.example.com/docker-hosted/<image>:<tag>'),
       ),
     ).toBeInTheDocument()
     // A hosted repository can be pushed to.
     expect(
       within(connect).getByText(
-        'docker push forge.example.com/docker-hosted/<image>:<tag>',
+        textContent('docker push forge.example.com/docker-hosted/<image>:<tag>'),
       ),
     ).toBeInTheDocument()
     expect(
       within(connect).getByRole('button', { name: 'Copy login command' }),
     ).toBeInTheDocument()
-    expect(within(connect).getByRole('link', { name: 'Tokens' })).toHaveAttribute(
+    expect(within(connect).getByRole('link', { name: 'Your tokens' })).toHaveAttribute(
       'href',
       '/tokens',
     )

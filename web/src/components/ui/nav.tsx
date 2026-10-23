@@ -121,7 +121,12 @@ export function Tabs<T extends string>({
             onClick={() => onChange(it.id)}
           >
             {it.label}
-            {it.count !== undefined && <span className="fg-tab-count">{it.count}</span>}
+            {it.count !== undefined && (
+              <>
+                {' '}
+                <span className="fg-tab-count">{it.count}</span>
+              </>
+            )}
           </button>
         )
       })}
@@ -167,7 +172,12 @@ export function SegmentedControl<T extends string>({
           >
             {it.icon && <Icon name={it.icon} size={15} />}
             {it.label}
-            {it.count !== undefined && <span className="fg-seg-count">{it.count}</span>}
+            {it.count !== undefined && (
+              <>
+                {' '}
+                <span className="fg-seg-count">{it.count}</span>
+              </>
+            )}
           </button>
         )
       })}

@@ -156,13 +156,3 @@ function Browse() {
     </Page>
   )
 }
-
-/** A folder glyph for folder-view rows (raw directories). */
-export function FolderIcon() {
-  return <Icon name="Folder" size={16} className="text-ink-faint" />
-}
-
-/** A right-pointing chevron at the end of folder-view rows. */
-export function ChevronIcon() {
-  return <Icon name="ChevronRight" size={16} className="ml-auto text-ink-faint" />
-}

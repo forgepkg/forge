@@ -19,12 +19,7 @@ import { ApiError } from '~/lib/httpClient'
 import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import { safeReturnTo } from '~/lib/returnTo'
-import { AuthLayout } from '~/components/catalyst/auth-layout'
-import { Button } from '~/components/catalyst/button'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { Button, Code, Icon, Logo, Notice, Skeleton, TextField } from '~/components/ui'
 
 interface LoginSearch {
   /**
@@ -135,77 +130,73 @@ function Login() {
     options.data ?? (options.isError ? passwordFallbackOptions : undefined)
 
   return (
-    <AuthLayout>
-      <div className="w-full max-w-sm space-y-8">
-        <div className="space-y-2 text-center">
-          <span
-            aria-hidden="true"
-            className="mx-auto grid size-12 place-items-center rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-lg font-bold text-white shadow-lg shadow-sky-500/20"
-          >
-            ef
-          </span>
-          <Heading className="!text-2xl">Forge</Heading>
-          <Text>Sign in to the package registry</Text>
+    <div className="flex min-h-dvh flex-col items-center gap-7 bg-ground px-4 pt-16 pb-8 text-ink">
+      <Logo size={34} />
+      <main className="flex w-full max-w-[400px] flex-col gap-6 rounded-lg border border-line bg-surface p-8 shadow-lg max-sm:p-6">
+        <div className="flex flex-col gap-1">
+          <h1 className="m-0 text-2xl leading-8 font-semibold tracking-[-0.01em]">
+            Sign in to Forge
+          </h1>
+          <p className="fg-text">
+            {loginOptions?.mode === 'combined'
+              ? 'Use your username and password, or your organization’s sign-in.'
+              : 'Enter your username to continue.'}
+          </p>
         </div>
 
         {error && (
-          <div
-            role="alert"
-            className="space-y-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
+          <Notice
+            tone="danger"
+            action={
+              <Link to="/login" search={{ redirect }} className="fg-notice-action">
+                Try again
+              </Link>
+            }
           >
             <p>{loginErrorMessages[error]}</p>
             {error === 'username_not_upn' && claim && (
               <p>
-                The username came from the <code>{claim}</code> claim.
+                The username came from the <Code>{claim}</Code> claim.
               </p>
             )}
-            <Link
-              to="/login"
-              search={{ redirect }}
-              className="font-medium underline hover:no-underline"
-            >
-              Try again
-            </Link>
-          </div>
+          </Notice>
         )}
 
         {expired && (
-          <p
-            role="alert"
-            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
-          >
-            Your session expired. Sign in again to continue.
-          </p>
+          <Notice tone="warn">Your session expired. Sign in again to continue.</Notice>
         )}
 
         {logout_failed && (
-          <p
-            role="alert"
-            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
-          >
+          <Notice tone="danger">
             Sign-out could not be confirmed by the server, so your session may
             still be active. Sign in and sign out again, or close the browser.
-          </p>
+          </Notice>
         )}
 
         {options.isError && (
-          <p
-            role="status"
-            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
-          >
+          <Notice tone="warn" role="status">
             Sign-in options could not be loaded. Password sign-in is available.
-          </p>
+          </Notice>
         )}
 
         {!loginOptions ? (
-          <Text>Loading sign-in options…</Text>
+          <Skeleton lines={2} label="Loading sign-in options…" />
         ) : loginOptions.mode === 'combined' ? (
           <CombinedLogin options={loginOptions} redirect={redirect} />
         ) : (
           <IdentifierFirstLogin redirect={redirect} />
         )}
-      </div>
-    </AuthLayout>
+
+        {loginOptions?.mode !== 'combined' && (
+          <p className="fg-text fg-text--small border-t border-line pt-4">
+            Forge checks which sign-in your account uses. With your
+            organization’s single sign-on you continue at its sign-in page;
+            otherwise Forge asks for your password next.
+          </p>
+        )}
+      </main>
+      <p className="fg-text fg-text--small">{window.location.host}</p>
+    </div>
   )
 }
 
@@ -276,8 +267,9 @@ function usePasswordLogin(redirect?: string) {
 /** Inline form error, kept as `role="alert"` for tests + screen readers. */
 function FormError({ children }: { children: React.ReactNode }) {
   return (
-    <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-      {children}
+    <p role="alert" className="fg-field-error">
+      <Icon name="Alert" size={14} />
+      <span>{children}</span>
     </p>
   )
 }
@@ -330,19 +322,17 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 
   if (step === 'identify') {
     return (
-      <form onSubmit={onIdentify} className="space-y-6">
-        <Field>
-          <Label>Username</Label>
-          <Input
-            type="text"
-            autoComplete="username"
-            autoFocus
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </Field>
+      <form onSubmit={onIdentify} className="flex flex-col gap-4">
+        <TextField
+          label="Username"
+          type="text"
+          autoComplete="username"
+          autoFocus
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
         {error && <FormError>{error}</FormError>}
-        <Button type="submit" disabled={submitting} className="w-full">
+        <Button type="submit" variant="primary" block disabled={submitting}>
           {submitting ? 'Checking…' : 'Continue'}
         </Button>
       </form>
@@ -350,9 +340,9 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
   }
 
   return (
-    <form onSubmit={onPassword} className="space-y-6">
-      <Text>
-        Signing in as <span className="font-medium">{username.trim()}</span>{' '}
+    <form onSubmit={onPassword} className="flex flex-col gap-4">
+      <p className="fg-text">
+        Signing in as <span className="fg-strong">{username.trim()}</span>{' '}
         <button
           type="button"
           onClick={() => {
@@ -360,23 +350,21 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
             setPassword('')
             setError(null)
           }}
-          className="text-sky-600 hover:underline dark:text-sky-400"
+          className="fg-link cursor-pointer border-0 bg-transparent p-0"
         >
           Change
         </button>
-      </Text>
-      <Field>
-        <Label>Password</Label>
-        <Input
-          type="password"
-          autoComplete="current-password"
-          autoFocus
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-      </Field>
+      </p>
+      <TextField
+        label="Password"
+        type="password"
+        autoComplete="current-password"
+        autoFocus
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
       {error && <FormError>{error}</FormError>}
-      <Button type="submit" disabled={submitting} className="w-full">
+      <Button type="submit" variant="primary" block disabled={submitting}>
         {submitting ? 'Signing in…' : 'Sign in'}
       </Button>
     </form>
@@ -408,33 +396,37 @@ function CombinedLogin({
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-4">
       {options.password && (
-        <form onSubmit={onSubmit} className="space-y-6">
-          <Field>
-            <Label>Username</Label>
-            <Input
-              type="text"
-              autoComplete="username"
-              autoFocus
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-          </Field>
-          <Field>
-            <Label>Password</Label>
-            <Input
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </Field>
+        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <TextField
+            label="Username"
+            type="text"
+            autoComplete="username"
+            autoFocus
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+          <TextField
+            label="Password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
           {error && <FormError>{error}</FormError>}
-          <Button type="submit" disabled={submitting} className="w-full">
+          <Button type="submit" variant="primary" block disabled={submitting}>
             {submitting ? 'Signing in…' : 'Sign in'}
           </Button>
         </form>
+      )}
+
+      {options.password && options.oidc.length > 0 && (
+        <div className="flex items-center gap-3 text-xs text-ink-faint" aria-hidden="true">
+          <span className="h-px flex-1 bg-line" />
+          or
+          <span className="h-px flex-1 bg-line" />
+        </div>
       )}
 
       {options.oidc.map((idp) => (
@@ -453,8 +445,8 @@ function OidcButton({
 }) {
   return (
     <Button
-      outline
-      className="w-full"
+      block
+      icon="Shield"
       onClick={() => assignLocation(oidcUrl(idp.login_url, redirect))}
     >
       Login with {idp.label}

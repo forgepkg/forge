@@ -1,17 +1,27 @@
+import { useState } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
-import { isRepositoryOffline } from '~/api/packages'
+import { isRepositoryOffline, type DetailVersion } from '~/api/packages'
+import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import { usePackageDetail } from '~/queries/usePackageDetail'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
-import { Divider } from '~/components/catalyst/divider'
-import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { VersionTable } from '~/components/VersionTable'
 import { DependencyGroups } from '~/components/DependencyGroups'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
-import { Breadcrumbs } from '~/components/Breadcrumbs'
+import {
+  Code,
+  CodeBlock,
+  Columns,
+  CommandSnippet,
+  FactList,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+  formatIcon,
+} from '~/components/ui'
 
 export const Route = createFileRoute('/_app/packages/$repo/$id')({
   component: PackageDetailPage,
@@ -25,9 +35,23 @@ export const Route = createFileRoute('/_app/packages/$repo/$id')({
 function PackageDetailPage() {
   const { repo, id } = Route.useParams()
   const detail = usePackageDetail(repo, id)
+  // The repository's format, from the (cached) list the rail shows too.
+  const repos = useBrowseRepos()
+  const format = Array.isArray(repos.data)
+    ? repos.data.find((r) => r.name === repo)?.format
+    : undefined
+  const crumbs = [
+    { label: 'Repositories', to: '/' },
+    { label: repo, to: '/repos/$repo', params: { repo } },
+  ]
 
   if (detail.isLoading) {
-    return <Text>Loading package…</Text>
+    return (
+      <Page>
+        <PageHeader title={id} crumbs={[...crumbs, { label: id }]} />
+        <Skeleton variant="table" label="Loading package…" />
+      </Page>
+    )
   }
 
   if (detail.isError) {
@@ -35,84 +59,164 @@ function PackageDetailPage() {
     // it as a not-found empty state rather than a scary error panel.
     const notFound =
       detail.error instanceof ApiError && detail.error.status === 404
-    if (notFound) {
-      return (
-        <EmptyState title="Package not found">
-          No readable package <span className="font-mono">{id}</span> in
-          repository <span className="font-mono">{repo}</span>.
-        </EmptyState>
-      )
-    }
-    if (isRepositoryOffline(detail.error)) {
-      return <RepositoryOfflineState onRetry={() => void detail.refetch()} />
-    }
     return (
-      <ErrorState
-        title="Could not load package"
-        message={detail.error?.message}
-        onRetry={() => void detail.refetch()}
-      />
+      <Page>
+        <PageHeader title={id} crumbs={[...crumbs, { label: id }]} />
+        {notFound ? (
+          <EmptyState title="Package not found">
+            No readable package <Code>{id}</Code> in repository <Code>{repo}</Code>.
+          </EmptyState>
+        ) : isRepositoryOffline(detail.error) ? (
+          <RepositoryOfflineState onRetry={() => void detail.refetch()} />
+        ) : (
+          <ErrorState
+            title="Could not load package"
+            message={detail.error?.message}
+            onRetry={() => void detail.refetch()}
+          />
+        )}
+      </Page>
     )
   }
 
   const pkg = detail.data
   if (!pkg) return null
+  const hasDependencies = Object.keys(pkg.dependency_groups_by_version).length > 0
 
   return (
-    <section className="space-y-8">
-      <div className="space-y-2">
-        <Breadcrumbs
-          items={[
-            { label: 'Repositories', to: '/' },
-            { label: pkg.repo, to: '/repos/$repo', params: { repo: pkg.repo } },
-            { label: pkg.original_id },
-          ]}
-        />
-        <div className="flex flex-wrap items-center gap-3">
-          <Heading>{pkg.original_id}</Heading>
-          <span className="flex items-center gap-2 text-sm/6 text-zinc-500 dark:text-zinc-400">
-            {pkg.repo}
-            <RepoKindBadge kind={pkg.repo_kind} />
-          </span>
-        </div>
-      </div>
-
-      <div>
-        <Subheading>Versions</Subheading>
-        {pkg.versions.length === 0 ? (
-          <div className="mt-3">
-            <EmptyState title="No visible versions" />
-          </div>
-        ) : (
-          <div className="mt-3">
-            <VersionTable versions={pkg.versions} repoKind={pkg.repo_kind} />
-          </div>
-        )}
-      </div>
-
-      <Divider />
-
-      <div>
-        <Subheading>Dependencies</Subheading>
-        <div className="mt-3 space-y-6">
-          {Object.keys(pkg.dependency_groups_by_version).length === 0 ? (
-            <Text>No dependency information available.</Text>
+    <Page>
+      <PageHeader
+        title={pkg.original_id}
+        icon={formatIcon(format ?? 'nuget')}
+        crumbs={[
+          { label: 'Repositories', to: '/' },
+          { label: pkg.repo, to: '/repos/$repo', params: { repo: pkg.repo } },
+          { label: pkg.original_id },
+        ]}
+        kind={pkg.repo_kind}
+        format={format}
+        meta={[
+          pkg.versions.length === 1 ? '1 version' : `${pkg.versions.length} versions`,
+        ]}
+      />
+      <Columns
+        aside={
+          <>
+            {pkg.versions.length > 0 && format && (
+              <InstallPanel format={format} repo={pkg.repo} id={pkg.original_id} versions={pkg.versions} />
+            )}
+            <Panel title="Details">
+              <FactList
+                items={[
+                  { term: 'Package id', value: pkg.original_id, mono: true },
+                  { term: 'Repository', value: pkg.repo, mono: true },
+                  { term: 'Kind', value: pkg.repo_kind },
+                  { term: 'Versions', value: pkg.versions.length },
+                ]}
+              />
+            </Panel>
+          </>
+        }
+        asideLabel="Install and details"
+      >
+        <Panel
+          title="Versions"
+          count={pkg.versions.length}
+          flush
+          description="Unlisted versions stay restorable but are hidden from search and from floating version ranges."
+        >
+          {pkg.versions.length === 0 ? (
+            <EmptyState title="No visible versions" bordered={false} />
           ) : (
-            Object.entries(pkg.dependency_groups_by_version).map(
-              ([version, groups]) => (
-                <div key={version}>
-                  <h3 className="font-mono text-sm/6 font-medium text-zinc-700 dark:text-zinc-300">
-                    {version}
-                  </h3>
-                  <div className="mt-2">
-                    <DependencyGroups repo={pkg.repo} groups={groups} />
-                  </div>
-                </div>
-              ),
-            )
+            <VersionTable
+              versions={pkg.versions}
+              repoKind={pkg.repo_kind}
+              caption={`Versions of ${pkg.original_id}`}
+            />
           )}
-        </div>
-      </div>
-    </section>
+        </Panel>
+
+        <Panel
+          title="Dependencies"
+          flush
+          description="Per version and target framework, as declared in the package."
+        >
+          {hasDependencies ? (
+            <DependencyGroups
+              repo={pkg.repo}
+              byVersion={pkg.dependency_groups_by_version}
+              caption={`Dependencies of ${pkg.original_id}`}
+            />
+          ) : (
+            <EmptyState title="No dependency information" icon="Layers" bordered={false}>
+              No dependency information available.
+            </EmptyState>
+          )}
+        </Panel>
+      </Columns>
+    </Page>
+  )
+}
+
+/** The newest listed version that can be downloaded, else the newest. */
+function defaultVersion(versions: DetailVersion[]): string {
+  const ready = versions.filter((v) => v.listed && v.delay_status !== 'delayed_until')
+  return (ready.at(-1) ?? versions.at(-1))?.version_original ?? ''
+}
+
+/**
+ * The install commands of one version, for the formats Forge knows a client
+ * command of (NuGet, Helm). The source or repository is added once per
+ * machine with the repository's Connect commands.
+ */
+function InstallPanel({
+  format,
+  repo,
+  id,
+  versions,
+}: {
+  format: string
+  repo: string
+  id: string
+  versions: DetailVersion[]
+}) {
+  const [version, setVersion] = useState(() => defaultVersion(versions))
+  if (format !== 'nuget' && format !== 'helm') return null
+  return (
+    <Panel
+      title="Install"
+      description={`Add the ${repo} source once per machine; see Connect on the repository.`}
+    >
+      {versions.length > 1 && (
+        <SelectField label="Version" value={version} onChange={(e) => setVersion(e.target.value)}>
+          {versions.map((v) => (
+            <option key={v.version} value={v.version_original}>
+              {v.version_original}
+            </option>
+          ))}
+        </SelectField>
+      )}
+      {format === 'nuget' ? (
+        <>
+          <CommandSnippet
+            label="dotnet CLI"
+            command={`dotnet add package ${id} --version ${version}`}
+            copyLabel="Copy add-package command"
+          />
+          <CodeBlock
+            title="PackageReference"
+            copyLabel="Copy PackageReference"
+            code={`<PackageReference Include="${id}" Version="${version}" />`}
+            placeholders={[]}
+          />
+        </>
+      ) : (
+        <CommandSnippet
+          label="Helm"
+          command={`helm install <release> ${repo}/${id} --version ${version}`}
+          copyLabel="Copy install command"
+        />
+      )}
+    </Panel>
   )
 }
