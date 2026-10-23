@@ -14,6 +14,8 @@
 //!   from the body (checked like `PUT`, never stored).
 //! * `POST   …/retention/run`     — schedule a run promptly (`next_run_at=now()`);
 //!   the background worker claims it on its next poll (does **not** run inline).
+//!   Refused (409) while retention runs are switched off for every repository
+//!   (`/admin/settings/retention`).
 //! * `GET    …/retention/audit`   — recent audit rows (newest first), optionally
 //!   filtered by `run_id` and paged with `before`/`limit`.
 //!
@@ -71,6 +73,17 @@ pub struct RetentionView {
     pub policy: Option<JsonValue>,
     /// The `retention_run` ledger row, or `null` if the repo was never armed.
     pub last_run: Option<retention_dao::RunState>,
+    /// Whether retention runs at all (`/admin/settings/retention`): while it
+    /// is off, no policy runs.
+    pub runs_enabled: bool,
+}
+
+/// Whether retention runs for every repository (the stored settings).
+async fn runs_enabled(state: &AppState) -> Result<bool, Response> {
+    match retention_dao::read_settings(&state.pool).await {
+        Ok(settings) => Ok(settings.runs_enabled),
+        Err(e) => Err(db_error(e)),
+    }
 }
 
 /// `GET /admin/repositories/{name}/retention`
@@ -88,8 +101,17 @@ pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Res
         Ok(r) => r,
         Err(e) => return db_error(e),
     };
+    let runs_enabled = match runs_enabled(&state).await {
+        Ok(on) => on,
+        Err(resp) => return resp,
+    };
 
-    Json(RetentionView { policy, last_run }).into_response()
+    Json(RetentionView {
+        policy,
+        last_run,
+        runs_enabled,
+    })
+    .into_response()
 }
 
 /// PUT body: the policy to store. Unknown fields are rejected, here and inside
@@ -172,6 +194,7 @@ pub async fn put(
                 .await
                 .ok()
                 .flatten(),
+            runs_enabled: runs_enabled(&state).await.unwrap_or(false),
         })
         .into_response(),
         Ok(false) => not_found(),
@@ -547,12 +570,25 @@ pub struct RunScheduled {
 ///
 /// Sets `retention_run.next_run_at = now()` so the worker claims the repo on its
 /// next poll. Does **not** run inline. Requires an armed (non-null) policy:
-/// a repo without a policy returns 409.
+/// a repo without a policy returns 409, and so does any repo while retention
+/// runs are switched off (`/admin/settings/retention`).
 pub async fn run(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let repo = match resolve_repo(&state, &name).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    match runs_enabled(&state).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                "retention runs are switched off for every repository; switch them on in \
+                 Admin → Retention (/admin/settings/retention) to run",
+            )
+                .into_response()
+        }
+        Err(resp) => return resp,
+    }
 
     match retention_dao::schedule_now(&state.pool, repo.id).await {
         Ok(true) => (StatusCode::ACCEPTED, Json(RunScheduled { scheduled: true })).into_response(),
