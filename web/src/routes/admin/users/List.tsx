@@ -1,36 +1,14 @@
 import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
-import { ApiError } from '~/lib/httpClient'
 import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
-import { authSourceLabel, upnError, type UserView } from '~/api/users'
-import {
-  PartialCreate,
-  useCreateUser,
-  useDeleteUser,
-  useUsers,
-} from '~/queries/useUsers'
+import { authSourceLabel, type UserStatus, type UserView } from '~/api/users'
+import { useDeleteUser, useUsers } from '~/queries/useUsers'
 import { useRoles } from '~/queries/useRbac'
-import { useRealms } from '~/queries/useRealms'
 import { AccessBadge } from '~/components/AccessBadge'
 import { Badge } from '~/components/catalyst/badge'
 import { Button } from '~/components/catalyst/button'
-import {
-  Checkbox,
-  CheckboxField,
-  CheckboxGroup,
-} from '~/components/catalyst/checkbox'
-import {
-  Description,
-  ErrorMessage,
-  Field,
-  Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
+import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import {
   Table,
@@ -52,11 +30,10 @@ export const Route = createFileRoute('/_app/manage/users')({
  * identity provider, credential forwarding: look-alike usernames from
  * different sources are different accounts), their built-in access level
  * (admin, writer or reader, from their role assignments), the other roles
- * they hold and their active flag, offers an inline create form
- * (`CreateUser`, then the chosen roles), links each user to its
- * roles-and-tokens screen, and deletes with a confirm step. There is no
- * edit-in-place beyond create/delete + the per-user screen. Every account is
- * named by a UPN.
+ * they hold and their status (active, inactive, or invited: their user has
+ * not chosen a password yet), links to the create page
+ * (`/manage/users/new`) and each user's roles-and-tokens screen, and deletes
+ * with a confirm step. Every account is named by a UPN.
  */
 function UsersList() {
   const users = useUsers()
@@ -71,15 +48,16 @@ function UsersList() {
 
   return (
     <section className="space-y-6">
-      <div>
-        <Heading>Users</Heading>
-        <Text className="mt-1">
-          Create and remove users, assign their roles, and manage each
-          user&apos;s API tokens.
-        </Text>
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <Heading>Users</Heading>
+          <Text className="mt-1">
+            Invite and remove users, assign their roles, and manage each
+            user&apos;s API tokens.
+          </Text>
+        </div>
+        <Button href="/manage/users/new">New user</Button>
       </div>
-
-      <CreateUserForm />
 
       {del.isError && (
         <InlineError>{del.error.body || del.error.message}</InlineError>
@@ -95,7 +73,7 @@ function UsersList() {
         <Text>Loading users…</Text>
       ) : (users.data?.length ?? 0) === 0 ? (
         <EmptyState title="No users yet">
-          Create the first user with the form above.
+          Invite the first one with <strong>New user</strong>.
         </EmptyState>
       ) : (
         <Table striped>
@@ -127,6 +105,20 @@ function UsersList() {
       )}
     </section>
   )
+}
+
+const STATUS: Record<UserStatus, { color: 'emerald' | 'zinc' | 'sky' | 'amber'; label: string }> =
+  {
+    active: { color: 'emerald', label: 'active' },
+    inactive: { color: 'zinc', label: 'inactive' },
+    invited: { color: 'sky', label: 'invited' },
+    invitation_expired: { color: 'amber', label: 'invitation expired' },
+  }
+
+/** A user's status; an older server's view without one falls back to `active`. */
+export function StatusBadge({ status }: { status: UserStatus | undefined }) {
+  const { color, label } = STATUS[status ?? 'active'] ?? STATUS.active
+  return <Badge color={color}>{label}</Badge>
 }
 
 function InlineError({ children }: { children: React.ReactNode }) {
@@ -182,11 +174,7 @@ function UserRow({
         <RoleBadges user={user} roleIds={roleIds} />
       </TableCell>
       <TableCell>
-        {user.active ? (
-          <Badge color="emerald">active</Badge>
-        ) : (
-          <Badge color="zinc">inactive</Badge>
-        )}
+        <StatusBadge status={user.status} />
       </TableCell>
       <TableCell>
         <span className="flex items-center gap-3">
@@ -273,169 +261,5 @@ function RoleBadges({
         )
       })}
     </span>
-  )
-}
-
-/**
- * Inline create-user form. Controlled state (matching the codebase's Login /
- * RepositoryForm pattern); on success the fields reset so several users can be
- * added in a row. The username/password requirements mirror the server's 400s:
- * the username is a UPN (`upnError`), checked once the field was left. An
- * account signs in with a Forge password, or through a credential-forwarding
- * realm (`realm`, no password): such a realm signs in only the accounts
- * created for it here.
- */
-function CreateUserForm() {
-  const create = useCreateUser()
-  const roles = useRoles()
-  const realms = useRealms()
-  const forwarding = (realms.data ?? []).filter(
-    (r) => r.kind === 'credential_forwarding',
-  )
-  const [username, setUsername] = useState('')
-  const [usernameTouched, setUsernameTouched] = useState(false)
-  // '' = a Forge password; otherwise the credential-forwarding realm's name.
-  const [realm, setRealm] = useState('')
-  const [password, setPassword] = useState('')
-  const [chosen, setChosen] = useState<ReadonlySet<number>>(new Set())
-  const [active, setActive] = useState(true)
-  const usernameError = username.trim() ? upnError(username) : null
-  const showUsernameError = usernameTouched && usernameError !== null
-
-  function toggle(id: number, on: boolean) {
-    setChosen((prev) => {
-      const next = new Set(prev)
-      if (on) next.add(id)
-      else next.delete(id)
-      return next
-    })
-  }
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault()
-    if (!username.trim() || (!realm && !password)) return
-    if (usernameError) {
-      setUsernameTouched(true)
-      return
-    }
-    create.mutate(
-      {
-        body: realm
-          ? { username: username.trim(), realm, active }
-          : { username: username.trim(), password, active },
-        roles: (roles.data ?? []).filter((r) => chosen.has(r.id)),
-      },
-      {
-        onSettled: (created, error) => {
-          if (!created && !(error instanceof PartialCreate)) return
-          setUsername('')
-          setUsernameTouched(false)
-          setRealm('')
-          setPassword('')
-          setChosen(new Set())
-          setActive(true)
-        },
-      },
-    )
-  }
-
-  return (
-    <form
-      onSubmit={submit}
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-    >
-      <Subheading>New user</Subheading>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Username</Label>
-          <Input
-            type="text"
-            autoComplete="off"
-            placeholder="alice@example.com"
-            value={username}
-            invalid={showUsernameError}
-            onChange={(e) => setUsername(e.target.value)}
-            onBlur={() => setUsernameTouched(true)}
-          />
-          {showUsernameError && <ErrorMessage>{usernameError}</ErrorMessage>}
-        </Field>
-        {forwarding.length > 0 && (
-          <Field>
-            <Label>Sign-in</Label>
-            <Select value={realm} onChange={(e) => setRealm(e.target.value)}>
-              <option value="">Forge password</option>
-              {forwarding.map((r) => (
-                <option key={r.id} value={r.name}>
-                  Credential forwarding: {r.name}
-                </option>
-              ))}
-            </Select>
-            {realm && (
-              <Description>
-                Signs in with the upstream&apos;s password, which gets the part
-                of the username before the @.
-              </Description>
-            )}
-          </Field>
-        )}
-        {!realm && (
-          <Field>
-            <Label>Password</Label>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </Field>
-        )}
-      </div>
-      <Fieldset>
-        <Legend>Roles</Legend>
-        {roles.isError ? (
-          <Text>
-            Could not load the roles; assign them on the user&apos;s page once
-            it is created.
-          </Text>
-        ) : (
-          <CheckboxGroup className="grid gap-x-6 sm:grid-cols-2">
-            {(roles.data ?? []).map((role) => (
-              <CheckboxField key={role.id}>
-                <Checkbox
-                  checked={chosen.has(role.id)}
-                  onChange={(c) => toggle(role.id, c)}
-                />
-                <Label>{role.name}</Label>
-                {role.description && (
-                  <Description>{role.description}</Description>
-                )}
-              </CheckboxField>
-            ))}
-          </CheckboxGroup>
-        )}
-      </Fieldset>
-      <CheckboxField>
-        <Checkbox checked={active} onChange={(c) => setActive(c)} />
-        <Label>Active</Label>
-      </CheckboxField>
-      {create.isError && (
-        <InlineError>
-          {create.error instanceof ApiError
-            ? create.error.body || create.error.message
-            : create.error.message}
-        </InlineError>
-      )}
-      <Button
-        type="submit"
-        disabled={
-          create.isPending ||
-          !username.trim() ||
-          (!realm && !password) ||
-          !!usernameError
-        }
-      >
-        {create.isPending ? 'Creating…' : 'Create user'}
-      </Button>
-    </form>
   )
 }

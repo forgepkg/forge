@@ -218,6 +218,18 @@ impl Mailer {
         Ok(active)
     }
 
+    /// How long an invitation link stays valid, in hours: the stored
+    /// settings' lifetime, whether or not sending is on, else the default.
+    pub async fn invitation_ttl_hours(&self) -> u32 {
+        if let Ok(Some(config)) = self.active().await {
+            return config.invitation_ttl_hours;
+        }
+        match load_stored(&self.pool, self.envelope.as_deref()).await {
+            Ok(Some(stored)) => stored.config.invitation_ttl_hours,
+            _ => settings::DEFAULT_INVITATION_TTL_HOURS,
+        }
+    }
+
     /// Whether an email service is configured and turned on.
     pub async fn is_configured(&self) -> bool {
         matches!(self.active().await, Ok(Some(_)))

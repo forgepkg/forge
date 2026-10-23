@@ -10,6 +10,8 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *
  *   root.tsx
  *     /login            -> Login.tsx            (user+password or realm login)
+ *     /invite           -> Invite.tsx           (an invited user chooses a password;
+ *                                                the token is the URL fragment)
  *     layout 'app'      -> AppLayout.tsx        (login-gated nav shell)
  *       index           -> Browse.tsx           (folder view root: repositories)
  *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages or images + search;
@@ -29,6 +31,7 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  */
 export const routes = rootRoute('root.tsx', [
   route('/login', 'Login.tsx'),
+  route('/invite', 'Invite.tsx'),
   layout('app', 'AppLayout.tsx', [
     index('Browse.tsx'),
     route('/repos/$repo', 'RepoBrowse.tsx'),
@@ -46,6 +49,7 @@ export const routes = rootRoute('root.tsx', [
       ),
       route('/repositories/$repo/import', 'admin/repositories/Import.tsx'),
       route('/users', 'admin/users/List.tsx'),
+      route('/users/new', 'admin/users/Create.tsx'),
       route('/users/$userId', 'admin/users/Edit.tsx'),
       route('/roles', 'admin/roles/List.tsx'),
       route('/roles/$roleId', 'admin/roles/Edit.tsx'),

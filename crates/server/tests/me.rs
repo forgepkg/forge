@@ -44,23 +44,15 @@ async fn me_returns_admin_identity() {
 #[tokio::test]
 async fn me_reachable_by_non_admin() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let username = format!("plain{}@example.com", common::unique());
 
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    srv.create_user(&username, "pw123456-me12", "reader").await;
 
     // The non-admin is forbidden from the admin API but CAN read /admin/me.
     let resp = client
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap();
@@ -78,7 +70,7 @@ async fn me_reachable_by_non_admin() {
     // Sanity: the same user is still 403 on the admin API.
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap();
@@ -95,17 +87,7 @@ async fn me_reflects_the_admin_role() {
     let client = srv.client();
     let username = format!("rbacadmin{}@example.com", common::unique());
 
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = created["id"].as_i64().expect("user id");
+    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
     let resp = client
         .put(format!("{}/admin/users/{id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -117,7 +99,7 @@ async fn me_reflects_the_admin_role() {
 
     let body: Value = client
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap()
@@ -141,17 +123,7 @@ async fn me_shows_repo_write_to_a_writer() {
     let client = srv.client();
     let username = format!("writer{}@example.com", common::unique());
 
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = created["id"].as_i64().expect("user id");
+    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
     let resp = client
         .put(format!("{}/admin/users/{id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -163,7 +135,7 @@ async fn me_shows_repo_write_to_a_writer() {
 
     let body: Value = client
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap()

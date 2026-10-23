@@ -10,8 +10,13 @@ import {
   type AccessLevel,
 } from '~/api/rbac'
 import { ApiError } from '~/lib/httpClient'
-import { authSourceLabel, type UserView } from '~/api/users'
-import { useConvertUserToLocal, useUsers } from '~/queries/useUsers'
+import { authSourceLabel, type IssuedInvitation, type UserView } from '~/api/users'
+import {
+  useConvertUserToLocal,
+  useInviteUser,
+  useRevokeInvitation,
+  useUsers,
+} from '~/queries/useUsers'
 import {
   useCreateToken,
   useRevokeToken,
@@ -79,7 +84,9 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
  * re-scoped and revoked. The header says how the user signs in, so a role or
  * token does not go to a look-alike account by mistake. A
  * credential-forwarding account whose realm kept its password hash can be
- * switched to a local account with that password from here.
+ * switched to a local account with that password from here. An invited
+ * account (its user has not chosen a password yet) shows its invitation,
+ * which can be resent, copied as a link (shown once) or revoked.
  */
 function UserPage() {
   const { userId } = Route.useParams()
@@ -109,6 +116,9 @@ function UserPage() {
         )}
       </div>
 
+      {user && (user.status === 'invited' || user.status === 'invitation_expired') && (
+        <UserInvitation user={user} />
+      )}
       {user?.captured_password_at && <KeptPassword user={user} />}
 
       <UserAccess userId={id} />
@@ -620,6 +630,92 @@ function KeptPassword({ user }: { user: UserView }) {
         </Button>
       )}
     </div>
+  )
+}
+
+/**
+ * An invited account's invitation: where it went and until when, sending a
+ * new one (the old link stops working), making a link to copy instead (shown
+ * once, like a token), and revoking it.
+ */
+function UserInvitation({ user }: { user: UserView }) {
+  const invite = useInviteUser()
+  const revoke = useRevokeInvitation()
+  // The answer of the last resend or copy: its link is shown once, held
+  // here and never cached.
+  const [issued, setIssued] = useState<IssuedInvitation | null>(null)
+  const invitation = user.invitation
+  const live = user.status === 'invited'
+
+  function make(sendEmail: boolean) {
+    setIssued(null)
+    invite.mutate(
+      { id: user.id, send_email: sendEmail },
+      { onSuccess: (made) => setIssued(made) },
+    )
+  }
+
+  return (
+    <section className="space-y-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10">
+      <Subheading>Invitation</Subheading>
+      <Text>
+        {live && invitation
+          ? `${user.username} has not chosen a password yet. The invitation ${
+              invitation.sent_at ? `went to ${invitation.email}` : 'link was handed over'
+            } and works until ${formatTs(invitation.expires_at)}.`
+          : `${user.username} has not chosen a password yet, and no invitation link works: send a new one.`}
+      </Text>
+      {(invite.isError || revoke.isError) && (
+        <InlineError>
+          {invite.error?.body || invite.error?.message || revoke.error?.body || revoke.error?.message}
+        </InlineError>
+      )}
+      {issued?.email_sent && (
+        <p
+          role="status"
+          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
+        >
+          Sent a new invitation to {issued.email}; the previous link no longer works.
+        </p>
+      )}
+      {issued && !issued.email_sent && issued.link && (
+        <>
+          {issued.error && (
+            <Text>
+              {issued.error === 'no email service is configured'
+                ? 'No email service is configured,'
+                : `The invitation email was not sent (${issued.error}),`}{' '}
+              so give the user this link.
+            </Text>
+          )}
+          <ShowOnceSecret
+            secret={issued.link}
+            label="Invitation link"
+            onDismiss={() => setIssued(null)}
+          />
+        </>
+      )}
+      <div className="flex flex-wrap gap-3">
+        <Button disabled={invite.isPending} onClick={() => make(true)}>
+          Resend invitation
+        </Button>
+        <Button outline disabled={invite.isPending} onClick={() => make(false)}>
+          Copy invitation link
+        </Button>
+        {live && (
+          <Button
+            plain
+            disabled={revoke.isPending}
+            onClick={() => {
+              setIssued(null)
+              revoke.mutate(user.id)
+            }}
+          >
+            Revoke invitation
+          </Button>
+        )}
+      </div>
+    </section>
   )
 }
 

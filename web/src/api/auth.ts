@@ -144,3 +144,28 @@ export function logout(): Promise<void> {
     skipUnauthorizedHandler: true,
   })
 }
+
+/**
+ * The one answer for an invitation link that does not work (unknown, used,
+ * expired, replaced or revoked), as the server words it.
+ */
+export const INVALID_INVITATION =
+  'This invitation is invalid or has expired; ask your administrator for a new one.'
+
+/** The fewest characters a password chosen from an invitation has. */
+export const MIN_INVITATION_PASSWORD_CHARS = 12
+
+/**
+ * `POST /auth/invitations/lookup` — whose account the invitation `token`
+ * (the link's fragment) is for. A 400 is the generic answer.
+ */
+export function lookupInvitation(
+  token: string,
+): Promise<{ username: string; expires_at: string }> {
+  return httpClient.post('/auth/invitations/lookup', { token })
+}
+
+/** `POST /auth/invitations/accept` — choose the invited account's password. */
+export function acceptInvitation(token: string, password: string): Promise<{ username: string }> {
+  return httpClient.post('/auth/invitations/accept', { token, password })
+}

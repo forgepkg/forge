@@ -546,6 +546,44 @@ impl TestServer {
         )
     }
 
+    /// Create a local account the way an administrator and its user do
+    /// (#322): the admin invites it as a `role` (`reader`, `writer` or
+    /// `admin`) and, with no email service configured, gets the invitation
+    /// link; the user then chooses `password` (at least 12 characters) from
+    /// it. Returns the account's id.
+    pub async fn create_user(&self, username: &str, password: &str, role: &str) -> i64 {
+        let (u, p) = self.admin_basic();
+        let resp = self
+            .client()
+            .post(format!("{}/admin/users", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"username": username, "role": role}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 201, "{body}");
+        let link = body["invitation"]["link"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no invitation link: {body}"));
+        let token = link.split_once('#').expect("a fragment").1;
+        let resp = self.accept_invitation(token, password).await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        body["id"].as_i64().unwrap()
+    }
+
+    /// Choose `password` with the invitation `token`
+    /// (`POST /auth/invitations/accept`).
+    pub async fn accept_invitation(&self, token: &str, password: &str) -> reqwest::Response {
+        self.client()
+            .post(format!("{}/auth/invitations/accept", self.base_url))
+            .json(&serde_json::json!({"token": token, "password": password}))
+            .send()
+            .await
+            .unwrap()
+    }
+
     /// The bootstrap admin's username and real password.
     pub fn admin_password_basic(&self) -> (String, String) {
         (

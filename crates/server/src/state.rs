@@ -69,6 +69,9 @@ pub struct AppState {
     /// Password-failure lockout per `(client IP, username)`, shared by
     /// `POST /auth/login` and the wire Basic password path.
     pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Failed invitation lookups and acceptances per client network (#322),
+    /// with the login lockout's budget and window.
+    pub invitation_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
@@ -328,6 +331,10 @@ impl AppState {
                 forge_core::auth::PgKnownNetworks::new(pool.clone()),
             )),
         );
+        let invitation_throttle = Arc::new(forge_core::auth::LoginThrottle::new(
+            config.auth.login_max_failures,
+            std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
+        ));
         let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),
@@ -347,6 +354,7 @@ impl AppState {
             sessions,
             cookie_secure,
             login_throttle,
+            invitation_throttle,
             oidc_login_starts,
             envelope: None,
             upstream,

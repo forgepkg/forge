@@ -752,6 +752,42 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     );
 }
 
+/// #322: an invited local account (no password yet: its user is to choose
+/// one from the invitation) is never linked by username, so an IdP account
+/// claiming its name cannot take it over with its role.
+#[tokio::test]
+async fn resolve_user_never_links_an_invited_account() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let name = format!("invited-{n}@example.com");
+    let invited = forge_db::invitation_dao::insert_invited_user(&pool, &name, &name)
+        .await
+        .expect("invited user");
+    let validated = run_login(&pool, &idp, &format!("sub-i-{n}"), &name, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(
+        &pool,
+        &validated,
+        &mapped,
+        &ResolvePolicy {
+            auto_provision: true,
+            link_existing_by_username: true,
+        },
+    )
+    .await
+    .expect("provisioned separately");
+    assert_ne!(
+        user.id, invited.id,
+        "an invited account is never linked by name"
+    );
+    assert!(
+        !forge_db::external_identity_dao::user_has_identity(&pool, invited.id)
+            .await
+            .unwrap()
+    );
+}
+
 /// Linking by username never takes over an account another credential owns:
 /// a credential-forwarding account, or an account already linked to an IdP
 /// identity (of another person, possibly at another issuer).

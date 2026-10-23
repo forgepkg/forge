@@ -44,6 +44,10 @@ interface LoginSearch {
    * only when it looks like a claim name (the URL is anyone's to craft).
    */
   claim?: string
+  /** A username to start with: an invited user who just chose a password. */
+  username?: string
+  /** Set when the user just chose their password from an invitation. */
+  invited?: boolean
 }
 
 /**
@@ -98,6 +102,11 @@ export const Route = createFileRoute('/login')({
       search.logout_failed === true || search.logout_failed === 'true',
     error: parseLoginError(search.error),
     claim: parseClaim(search.claim),
+    username:
+      typeof search.username === 'string' && search.username.length <= 256
+        ? search.username
+        : undefined,
+    invited: search.invited === true || search.invited === 'true',
   }),
 })
 
@@ -121,7 +130,7 @@ export const Route = createFileRoute('/login')({
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired, logout_failed, error, claim } = useSearch({
+  const { redirect, expired, logout_failed, error, claim, username, invited } = useSearch({
     from: '/login',
   })
   const options = useQuery<LoginOptions, ApiError>({
@@ -169,6 +178,15 @@ function Login() {
           </div>
         )}
 
+        {invited && (
+          <p
+            role="status"
+            className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm/6 text-emerald-700 dark:text-emerald-400"
+          >
+            Your password is set. Sign in with it.
+          </p>
+        )}
+
         {expired && (
           <p
             role="alert"
@@ -200,9 +218,9 @@ function Login() {
         {!loginOptions ? (
           <Text>Loading sign-in options…</Text>
         ) : loginOptions.mode === 'combined' ? (
-          <CombinedLogin options={loginOptions} redirect={redirect} />
+          <CombinedLogin options={loginOptions} redirect={redirect} initialUsername={username} />
         ) : (
-          <IdentifierFirstLogin redirect={redirect} />
+          <IdentifierFirstLogin redirect={redirect} initialUsername={username} />
         )}
       </div>
     </AuthLayout>
@@ -287,9 +305,15 @@ function FormError({ children }: { children: React.ReactNode }) {
  * realm decision either reveals the password field (step 2, username shown
  * with a back link) or navigates the browser to the IdP.
  */
-function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
+function IdentifierFirstLogin({
+  redirect,
+  initialUsername,
+}: {
+  redirect?: string
+  initialUsername?: string
+}) {
   const [step, setStep] = useState<'identify' | 'password'>('identify')
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting, setSubmitting } =
     usePasswordLogin(redirect)
@@ -390,11 +414,13 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 function CombinedLogin({
   options,
   redirect,
+  initialUsername,
 }: {
   options: LoginOptions
   redirect?: string
+  initialUsername?: string
 }) {
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting } = usePasswordLogin(redirect)
 

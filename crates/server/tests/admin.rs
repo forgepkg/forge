@@ -45,25 +45,17 @@ async fn bootstrap_admin_and_gating() {
 #[tokio::test]
 async fn non_admin_forbidden() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let suffix = common::unique();
     let username = format!("plain{suffix}@example.com");
 
-    // Admin creates a non-admin user.
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    // Admin creates a non-admin user, who chooses a password.
+    srv.create_user(&username, "pw123456-plain", "reader").await;
 
     // That user authenticates (password basic) but is forbidden from admin.
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-plain"))
         .send()
         .await
         .unwrap();
@@ -192,18 +184,23 @@ async fn usernames_are_canonical() {
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": typed, "password": "pw123456", "is_admin": false}))
+        .json(&json!({"username": typed}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     let created: Value = resp.json().await.unwrap();
     assert_eq!(created["username"], json!(lower), "stored canonical");
+    let link = created["invitation"]["link"].as_str().unwrap();
+    let resp = srv
+        .accept_invitation(link.split_once('#').unwrap().1, "pw123456-carol")
+        .await;
+    assert_eq!(resp.status(), 200);
 
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": lower, "password": "other-pw", "is_admin": false}))
+        .json(&json!({"username": lower}))
         .send()
         .await
         .unwrap();
@@ -214,9 +211,7 @@ async fn usernames_are_canonical() {
             .post(format!("{}/admin/users", srv.base_url))
             .basic_auth(&au, Some(&ap))
             .header("content-type", "application/json")
-            .body(format!(
-                r#"{{"username": "{bad}", "password": "pw123456"}}"#
-            ))
+            .body(format!(r#"{{"username": "{bad}"}}"#))
             .send()
             .await
             .unwrap();
@@ -226,7 +221,7 @@ async fn usernames_are_canonical() {
     for spelling in [lower.to_uppercase(), format!(" {lower}")] {
         let resp = client
             .post(format!("{}/auth/login", srv.base_url))
-            .json(&json!({"username": spelling, "password": "pw123456"}))
+            .json(&json!({"username": spelling, "password": "pw123456-carol"}))
             .send()
             .await
             .unwrap();
@@ -258,7 +253,7 @@ async fn usernames_with_a_colon_are_refused() {
         let resp = client
             .post(format!("{}/admin/users", srv.base_url))
             .basic_auth(&au, Some(&ap))
-            .json(&json!({"username": bad, "password": "pw123456"}))
+            .json(&json!({"username": bad}))
             .send()
             .await
             .unwrap();
@@ -295,7 +290,7 @@ async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
         let resp = client
             .post(format!("{}/admin/users", srv.base_url))
             .basic_auth(&au, Some(&ap))
-            .json(&json!({"username": bad, "password": "pw123456"}))
+            .json(&json!({"username": bad}))
             .send()
             .await
             .unwrap();
@@ -386,17 +381,9 @@ async fn reauth_endpoint_admin_only_and_idempotent() {
     let username = format!("reauth{suffix}@example.com");
 
     // Admin creates a non-admin user and discovers its id.
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let user_id = created["id"].as_i64().expect("user id");
+    let user_id = srv
+        .create_user(&username, "pw123456-reauth", "reader")
+        .await;
 
     // Admin reauth → 204 (no cached verdicts, but still succeeds idempotently).
     let resp = client
@@ -419,7 +406,7 @@ async fn reauth_endpoint_admin_only_and_idempotent() {
     // Non-admin caller → 403 (gated by require_admin).
     let resp = client
         .post(format!("{}/admin/users/{user_id}/reauth", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-reauth"))
         .send()
         .await
         .unwrap();
@@ -651,8 +638,7 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
             .header("X-NuGet-ApiKey", &token)
             .json(&json!({
                 "username": format!("evil{}@example.com", common::unique()),
-                "password": "pw123456",
-                "is_admin": true
+                "role": "admin"
             }))
             .send()
             .await
@@ -730,9 +716,7 @@ async fn admin_scoped_token_can_use_admin_api() {
         .post(format!("{}/admin/users", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
         .json(&json!({
-            "username": format!("automated{}@example.com", common::unique()),
-            "password": "pw123456",
-            "is_admin": false
+            "username": format!("automated{}@example.com", common::unique())
         }))
         .send()
         .await
@@ -1707,19 +1691,8 @@ async fn create_and_login(
     username: &str,
     password: &str,
 ) -> (i64, String, String) {
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": password, "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let user_id = created["id"].as_i64().expect("user id");
+    let user_id = srv.create_user(username, password, "reader").await;
     let resp = client
         .post(format!("{}/auth/login", srv.base_url))
         .json(&json!({"username": username, "password": password}))
@@ -1753,7 +1726,7 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let username = format!("deact{}@example.com", common::unique());
-    let password = "pw123456";
+    let password = "pw123456-login";
     let (user_id, cookie, csrf) = create_and_login(&srv, &username, password).await;
 
     // The user mints a token from its session.
@@ -1891,17 +1864,7 @@ async fn admin_state(pool: &sqlx::PgPool, id: i64) -> (bool, bool) {
 
 /// Create an active admin through the API, returning its id.
 async fn create_admin(srv: &common::TestServer, username: &str, password: &str) -> i64 {
-    let (u, p) = srv.admin_basic();
-    let resp = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"username": username, "password": password, "is_admin": true}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap()
+    srv.create_user(username, password, "admin").await
 }
 
 /// L4: nothing takes admin away from the last active administrator, not
@@ -1944,7 +1907,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
     };
 
     // The bootstrap admin removes itself.
-    let dormant = create_admin(&srv, "dormant@example.com", "pw-dormant").await;
+    let dormant = create_admin(&srv, "dormant@example.com", "pw-dormant-admin").await;
     forge_db::user_dao::set_active(&srv.pool, dormant, false)
         .await
         .unwrap();
@@ -1960,7 +1923,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
 
     // With a second admin, the bootstrap admin may step down, and the second
     // one is then the last.
-    let second = create_admin(&srv, "second@example.com", "pw-second").await;
+    let second = create_admin(&srv, "second@example.com", "pw-second-admin").await;
     let resp = req(
         reqwest::Method::DELETE,
         &format!("/admin/users/{boot}/roles/{admin_role}"),
@@ -1972,7 +1935,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
     .unwrap();
     assert_eq!(resp.status(), 204, "another active admin remains");
 
-    let session = srv.login("second@example.com", "pw-second").await;
+    let session = srv.login("second@example.com", "pw-second-admin").await;
     for (method, path, body) in removals(second) {
         let resp = session
             .apply(req(method, &path, &body))
@@ -2003,7 +1966,7 @@ async fn concurrent_admin_deactivations_leave_one_admin() {
     let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
     let (u, p) = srv.admin_basic();
     let boot = admin_id(&srv).await;
-    let second = create_admin(&srv, "second@example.com", "pw-second").await;
+    let second = create_admin(&srv, "second@example.com", "pw-second-admin").await;
 
     // Hold the role row so both requests park inside the guard.
     let mut holder = srv.pool.begin().await.unwrap();
@@ -2052,7 +2015,7 @@ async fn concurrent_admin_deactivations_leave_one_admin() {
 async fn auth_tokens_refuses_a_scope_it_would_drop() {
     let srv = common::start().await;
     let username = format!("scoped{}@example.com", common::unique());
-    let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456-login").await;
     let resp = srv
         .client()
         .post(format!("{}/auth/tokens", srv.base_url))
@@ -2075,7 +2038,7 @@ async fn auth_tokens_refuse_inactive_user_with_live_session() {
     let srv = common::start().await;
     let client = srv.client();
     let username = format!("inact{}@example.com", common::unique());
-    let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456-login").await;
 
     let resp = client
         .post(format!("{}/auth/tokens", srv.base_url))
@@ -2143,7 +2106,7 @@ async fn reauth_revokes_sessions() {
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let username = format!("reauthsess{}@example.com", common::unique());
-    let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456-login").await;
 
     let me = || {
         client

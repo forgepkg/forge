@@ -339,18 +339,9 @@ async fn a_writer_uploads_charts_but_deletes_none() {
     let repo = helm_repo(&srv, false).await;
     let (au, ap) = srv.admin_basic();
     let username = format!("charts-writer{}@example.com", unique());
-    let created: Value = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({ "username": username, "password": "pw12345678" }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let user_id = created["id"].as_i64().unwrap();
+    let user_id = srv
+        .create_user(&username, "pw12345678-charts", "reader")
+        .await;
     let resp = srv
         .client()
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))

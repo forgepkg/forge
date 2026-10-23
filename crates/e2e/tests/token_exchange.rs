@@ -891,7 +891,7 @@ async fn basic_oidc_only_ever_carries_a_workload_credential() {
             .client()
             .post(format!("{}/admin/users", srv.base_url))
             .basic_auth(&u, Some(&p))
-            .json(&json!({"username": name, "password": "irrelevant-password"}))
+            .json(&json!({"username": name}))
             .send()
             .await
             .unwrap();

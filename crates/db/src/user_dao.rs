@@ -18,7 +18,8 @@ fn lookup_key(username: &str) -> Option<String> {
 /// `password_hash` is `None` for users with no local password (upstream-basic /
 /// oidc). `auth_source` defaults conceptually to `'local'`; callers provisioning
 /// a non-local user set it explicitly along with `external_subject`. The DB
-/// CHECK enforces that a `'local'` user has a non-null `password_hash`.
+/// CHECK enforces that a `'local'` user has a non-null `password_hash`, except
+/// an invited one ([`crate::invitation_dao::insert_invited_user`]).
 #[derive(Debug, Clone)]
 pub struct NewUser {
     pub username: String,

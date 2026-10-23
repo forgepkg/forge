@@ -1,4 +1,5 @@
 import { httpClient } from '~/lib/httpClient'
+import type { AccessLevel } from '~/api/rbac'
 
 /**
  * Admin user CRUD API.
@@ -9,15 +10,17 @@ import { httpClient } from '~/lib/httpClient'
  *    response shape — the argon2id hash is never returned.
  *  - `GET /admin/users` returns a **bare array** of `UserView` (no
  *    `{ total, items }` envelope — the admin list is unpaginated).
- *  - `CreateUser` is the `POST /admin/users` body. `is_admin` defaults to
- *    `false` and `active` to `true` server-side; we always send them explicitly.
- *    `is_admin` also gives the new user the built-in `admin` role; other
- *    roles are assigned after the create (`assignRole` in `rbac.ts`).
+ *  - `CreateUser` is the `POST /admin/users` body (#322): no password. A
+ *    local account is invited: its user chooses the password from a link,
+ *    sent by email, or (no email service, or a failed send) handed to the
+ *    admin once in the answer's `invitation.link`. `role` gives the built-in
+ *    access level; other roles are assigned on the user page.
  *  - The UI does not edit users: its only per-user writes beyond create are
- *    `DELETE /admin/users/{id}`, switching a credential-forwarding account to
- *    a local one (`POST /admin/users/{id}/convert-to-local`), token
- *    management (see `tokens.ts`) and role assignment (see `rbac.ts`). The
- *    server's `PATCH /admin/users/{id}` (activate / deactivate) and
+ *    `DELETE /admin/users/{id}`, invitations (`POST`/`DELETE
+ *    /admin/users/{id}/invitation`), switching a credential-forwarding
+ *    account to a local one (`POST /admin/users/{id}/convert-to-local`),
+ *    token management (see `tokens.ts`) and role assignment (see `rbac.ts`).
+ *    The server's `PATCH /admin/users/{id}` (activate / deactivate) and
  *    `POST /admin/users/{id}/reauth` are not used here.
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
@@ -46,6 +49,38 @@ export interface UserView {
    * follows from these (with `is_admin`), not from `is_admin` alone.
    */
   roles: string[]
+  /** Where invitations go. */
+  email: string | null
+  status: UserStatus
+  /** The account's invitation while it is invited. */
+  invitation?: InvitationView
+}
+
+/**
+ * `invited`: a live invitation waits for the user to choose a password;
+ * `invitation_expired`: invited, but its link no longer works (expired or
+ * revoked): make a new one.
+ */
+export type UserStatus = 'active' | 'inactive' | 'invited' | 'invitation_expired'
+
+/** An invitation, without its token. */
+export interface InvitationView {
+  email: string
+  expires_at: string
+  created_at: string
+  /** When the email service took it; `null` for a link handed over. */
+  sent_at: string | null
+}
+
+/** An invitation just made (`POST /admin/users`, `…/invitation`). */
+export interface IssuedInvitation {
+  email: string
+  expires_at: string
+  email_sent: boolean
+  /** Why no email went out, when one should have. */
+  error: string | null
+  /** The link when no email carries it: shown once, never again. */
+  link: string | null
 }
 
 const AUTH_SOURCE_LABELS: Record<string, string> = {
@@ -111,16 +146,22 @@ export function upnError(raw: string): string | null {
 }
 
 /**
- * `POST /admin/users` request body (`CreateUser`): a local account with a
- * `password`, or an account of the credential-forwarding realm named `realm`
- * (no password: it signs in with the upstream's).
+ * `POST /admin/users` request body (`CreateUser`): an invited local
+ * account, or an account of the credential-forwarding realm named `realm`
+ * (it signs in with the upstream's password).
  */
 export interface CreateUser {
   username: string
-  password?: string
+  /** Where the invitation goes; the username when absent. */
+  email?: string
+  /** The built-in access level; `reader` when absent. */
+  role?: AccessLevel
   realm?: string
-  is_admin: boolean
-  active: boolean
+}
+
+/** `POST /admin/users` answer: the user and, for a local account, its invitation. */
+export type CreatedUser = Omit<UserView, 'invitation'> & {
+  invitation: IssuedInvitation | null
 }
 
 /**
@@ -139,8 +180,24 @@ export function fetchUsers(signal?: AbortSignal): Promise<UserView[]> {
 }
 
 /** `POST /admin/users` — create a user (201 → the created view). */
-export function createUser(body: CreateUser): Promise<UserView> {
-  return httpClient.post<UserView>('/admin/users', body)
+export function createUser(body: CreateUser): Promise<CreatedUser> {
+  return httpClient.post<CreatedUser>('/admin/users', body)
+}
+
+/**
+ * `POST /admin/users/{id}/invitation` — a new invitation, replacing the
+ * previous one: sent by email (`send_email`), or as a link to copy.
+ */
+export function inviteUser(
+  id: number,
+  body: { send_email: boolean; email?: string },
+): Promise<IssuedInvitation> {
+  return httpClient.post<IssuedInvitation>(`/admin/users/${id}/invitation`, body)
+}
+
+/** `DELETE /admin/users/{id}/invitation` — revoke the invitation (204). */
+export function revokeInvitation(id: number): Promise<void> {
+  return httpClient.delete<void>(`/admin/users/${id}/invitation`)
 }
 
 /**

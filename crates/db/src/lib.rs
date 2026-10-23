@@ -19,6 +19,7 @@ pub mod encryption_key_dao;
 pub mod external_identity_dao;
 pub mod ids;
 pub mod import_dao;
+pub mod invitation_dao;
 pub mod login_network_dao;
 pub mod model;
 pub mod oci_dao;
