@@ -120,7 +120,7 @@ pub struct CredForwardRealmConfig {
     /// sends a password there, so it must be https.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_http: bool,
-    /// Gone in 1.2: a credential-forwarding realm creates no accounts (an
+    /// Gone in 2.0: a credential-forwarding realm creates no accounts (an
     /// administrator creates each one, `POST /admin/users` with the realm).
     /// Accepted only as `false`, and never stored (migration 0041 removed it
     /// from stored rows).

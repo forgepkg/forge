@@ -727,7 +727,7 @@ pub struct UpstreamBasicAuthConfig {
     /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
-    /// Ignored since 1.2: credential forwarding creates no accounts (an
+    /// Ignored since 2.0: credential forwarding creates no accounts (an
     /// administrator creates each one). Still accepted so an existing block
     /// keeps loading.
     #[serde(default)]
@@ -4283,7 +4283,7 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert_eq!(ub.auto_provision, None, "ignored since 1.2");
+        assert_eq!(ub.auto_provision, None, "ignored since 2.0");
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
         // to_core mirrors the block.
