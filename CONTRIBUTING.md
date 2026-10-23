@@ -8,9 +8,10 @@ tests, see [DEVELOPMENT.md](./DEVELOPMENT.md). To report a vulnerability, see
 ## Contributor License Agreement
 
 Every contributor signs the [Contributor License Agreement](./CLA.md) (CLA)
-once. Forge belongs to the forgepkg organization, and the CLA lets forgepkg
-relicense contributions, for example to move the project to the MIT License,
-without asking every contributor again.
+once, unless you are a member of the forgepkg organization. Forge belongs to
+forgepkg and is licensed under the MIT License; the CLA lets forgepkg
+distribute contributions under it or under other terms later, without asking
+every contributor again.
 
 The agreement grants forgepkg a broad, non-exclusive license to your
 contributions, including the right to license them under other terms. You

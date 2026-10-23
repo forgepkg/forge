@@ -3,11 +3,12 @@
 Version 1
 
 Thank you for your interest in contributing to Forge. The Forge project
-belongs to the forgepkg organization, which may change the project's
-license, for example from the GNU Affero General Public License to the MIT
-License. Without an agreement, every contribution stays under the license it
-was submitted under, and such a change would need the consent of every
-contributor. This agreement gives forgepkg the rights to make it.
+belongs to the forgepkg organization and is licensed under the MIT License.
+This agreement makes sure forgepkg holds the rights it needs: to distribute
+your contributions under the MIT License or under any other terms, including
+a different license for the whole project, without asking you again. It also
+includes a patent license, and it confirms that you are entitled to
+contribute what you submit.
 
 You keep the copyright in your contributions and remain free to use them in
 any way you like.
@@ -64,12 +65,10 @@ forgepkg may grant sublicenses of these rights to third parties.
 forgepkg may license Your Contributions, alone or as part of the Project,
 under any terms it chooses. This includes:
 
-- the GNU Affero General Public License;
-- permissive open source licenses, such as the MIT License;
+- the MIT License and any other open source license;
 - commercial or proprietary licenses.
 
-forgepkg may also change the license of the Project, for example from the
-GNU Affero General Public License to the MIT License, without asking You
+forgepkg may also change the license of the Project without asking You
 again.
 
 ## 4. Patent license

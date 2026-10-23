@@ -22,14 +22,17 @@ jobs:
   cla:
     name: cla
     runs-on: ubuntu-latest
-    # Pull requests opened by the owner (including the commits Claude Code
-    # authors for them) or by Dependabot need no signature. On anyone else's
-    # pull request a commit authored by `claude` blocks the check: AI-agent
-    # commits must be re-authored by the contributor (CONTRIBUTING.md).
-    # Comments only trigger a run when they sign or ask for a recheck.
+    # Pull requests opened by members of the forgepkg organization (including
+    # the commits Claude Code authors for them) or by Dependabot need no
+    # signature. On anyone else's pull request a commit authored by `claude`
+    # blocks the check: AI-agent commits must be re-authored by the
+    # contributor (CONTRIBUTING.md). A member whose own commits land in such
+    # a pull request signs once, like everyone else. Comments only trigger a
+    # run when they sign or ask for a recheck.
     if: >-
-      !contains(fromJSON('["schmitch", "dependabot[bot]"]'),
-                github.event.pull_request.user.login || github.event.issue.user.login) &&
+      !contains(fromJSON('["OWNER", "MEMBER"]'),
+                github.event.pull_request.author_association || github.event.issue.author_association) &&
+      (github.event.pull_request.user.login || github.event.issue.user.login) != 'dependabot[bot]' &&
       (github.event_name == 'pull_request_target' ||
        (github.event.issue.pull_request &&
         (github.event.comment.body == 'recheck' ||
@@ -50,5 +53,3 @@ jobs:
           # so everyone signs the new text.
           path-to-signatures: signatures/version1/cla.json
           branch: cla-signatures
-          # The owner's own commits pushed to a contributor's pull request.
-          allowlist: schmitch
