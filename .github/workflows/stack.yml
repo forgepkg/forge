@@ -1,7 +1,7 @@
 name: Stack
 
 # A stacked pull request targets the branch of the pull request below it
-# (AGENTS.md, "Pull requests: one per issue, stacked"). Merged there, its fix
+# (DEVELOPMENT.md, "Stacked pull requests"). Merged there, its fix
 # would land in that other pull request; it has to wait until the one below
 # has merged and GitHub has retargeted it to the default branch.
 #

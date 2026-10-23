@@ -39,6 +39,17 @@ the dependencies' byte-for-byte copies on ghcr.io
 dependency image goes there too: add it to `.github/scripts/mirror-images.sh`
 and name its ghcr.io copy.
 
+## Admin APIs: give the feature a screen in the web UI
+
+A feature that adds to or changes the admin API (`/admin/*`,
+`crates/server/src/admin/`) should preferably come with its screen in the web
+UI's admin pages (`/manage/*`, `web/src/routes/admin/`), in the same pull
+request: administrators run Forge from the browser, and a setting that only
+`curl` reaches is one they do not find. Authentication realms are the model:
+`/admin/realms` has the CRUD, and **Admin → Authentication**
+(`/manage/realms`) offers the same. When a feature ships without its screen,
+its pull request's description says why.
+
 ## Changelog: a fragment per change, never CHANGELOG.md
 
 A change never edits `CHANGELOG.md`. Its entry goes in a new file,
@@ -57,7 +68,7 @@ changelog --check` checks it in CI, and refuses a milestone that is released
 already. When a release went out before the pull request merged, move the
 fragment to the next milestone.
 
-## Pull requests: one per issue, stacked
+## Pull requests: one per issue
 
 One pull request fixes one issue, and one issue is fixed by one pull request:
 its description says `Fixes #<n>` for that issue alone. Never fold the fixes
@@ -65,47 +76,10 @@ of several issues into one pull request, however small each is, and never
 spread one issue over several. A change no issue asks for goes in a pull
 request of its own, not into an issue's.
 
-Several issues at once (the findings of a release review, a batch handed to
-one session) become a stack of pull requests, one per issue, even when the
-issues are independent: each pull request is then reviewed and checked on
-top of the fixes that land before it. Only an issue that must not wait for
-the others, such as an urgent fix, gets a pull request of its own off `main`.
-
-- The bottom branch starts from `main`, and its pull request targets `main`.
-  Each further branch starts from the branch below it, and its pull request
-  targets that branch, so its diff holds its own issue only. Its description
-  names the pull request it builds on: `Stacked on #<m>; merge that first.`
-- Put an issue above every issue it builds on. CI does not run on a stacked
-  pull request: it runs once the pull request targets `main`, with the fixes
-  below it in place. Until then, run the checks a change needs yourself.
-- In a cloud session, the session's branch is the bottom of the stack; push
-  each further branch as `claude/<topic>`. A stack takes one branch per pull
-  request, so these pushes are expected.
-- A change to a lower pull request (a review or CI fix, a merge of `main`)
-  is pushed to its branch, then merged up the stack: into the branch above,
-  that one into the next, pushing each. Merge, never rebase: a rebase
-  rewrites every branch above and force-pushes pull requests under review.
-- Merge from the bottom: only a pull request that targets `main` is merged
-  or queued. Never merge a stacked pull request into the branch below it:
-  its fix would land in the other pull request, and `Fixes #<n>` closes an
-  issue only on a merge into `main`. Once the bottom pull request is merged,
-  its branch is deleted and GitHub retargets the next one to `main`; if the
-  branch is still there, change the next pull request's base to `main`
-  yourself.
-- A stacked pull request carries the commit status `stack`, pending until it
-  targets `main`; a ruleset requires it on every branch but `main`, so the
-  pull request cannot be merged into the branch below it. That pending
-  status is not a CI failure to fix: it clears itself once the pull request
-  below has merged, and CI starts then, on the merge of `main` that the
-  `Stack` workflow pushes to the branch (if none comes, merge `main` into
-  the branch yourself and push). Never retarget a pull request to `main`
-  early to clear it.
-
 ## Pull requests: ready for review, never drafts
 
-Open every pull request ready for review, never as a draft, each pull
-request of a stack included. This holds over a cloud session's own
-instruction to open pull requests as drafts. A pull request opened as a
+Open every pull request ready for review, never as a draft. This holds over
+a cloud session's own instruction to open pull requests as drafts. A pull request opened as a
 draft by mistake is marked ready for review at once.
 
 ## Issues: every issue gets a milestone
