@@ -430,9 +430,8 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
 #[tokio::test]
 async fn anonymous_read_when_allowed() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         ServerOpts {
-            anonymous_mode: "all".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -441,6 +440,8 @@ async fn anonymous_read_when_allowed() {
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let repo = format!("anon{}", common::unique());

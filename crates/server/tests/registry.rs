@@ -3019,14 +3019,15 @@ async fn a_manifest_head_counts_as_a_pull_for_retention() {
 #[tokio::test]
 async fn anonymous_pulls_where_the_repository_allows_them() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            anonymous_mode: "all".into(),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let open = repo_name("dock");
     let closed = repo_name("dock");
     create_repo(

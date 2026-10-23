@@ -31,8 +31,8 @@ allow_insecure_defaults = true  # (default: false)
 # lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
-# anonymous_mode = "allowlist": a request naming any other host is not served
-# anonymously by IP (DNS-rebinding guard).
+# the anonymous mode "allowlist" (Admin → Settings): a request naming any
+# other host is not served anonymously by IP (DNS-rebinding guard).
 allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
@@ -92,31 +92,24 @@ conditional_writes = "auto"     # (default: "auto")
 # duration_seconds = 3600         # 900..43200 (default: the STS default)
 
 [auth]
-anonymous_mode = "off"          # (default: "off") off | allowlist | all
-# Tokens (loopback/private/local) or CIDRs; used only when anonymous_mode = "allowlist".
-# With "allowlist", keep shared HTTP caches from storing /v3 responses
-# (docs/deployment.md, "Reverse proxy").
-anonymous_ip_allowlist = ["loopback"]   # (default: [])
-# CIDRs of reverse proxies whose X-Forwarded-For is trusted.
+# Anonymous access (mode and IP allowlist), the login screen, passwords over
+# HTTP Basic, the session lifetimes and the login lockout are not configured
+# here: they are auth settings, set in the web UI (Admin → Settings) or through
+# /admin/settings/auth, and every instance applies them without a restart.
+# Startup refuses the keys that used to set them (anonymous_mode,
+# anonymous_ip_allowlist, login_mode, allow_password_basic,
+# session_idle_ttl_seconds, session_absolute_ttl_seconds, login_max_failures,
+# login_failure_window_seconds). See docs/deployment.md, "Access and sign-in
+# settings".
+# CIDRs of reverse proxies whose X-Forwarded-For is trusted (the client address
+# behind them decides the anonymous allowlist and the login lockout).
 trusted_proxy_cidrs = []        # (default: [])
-allow_password_basic = false    # (default: false)
-# Password-failure lockout per (client IP, username) for /auth/login and Basic
-# password auth; 0 disables.
-login_max_failures = 10             # (default: 10)
-login_failure_window_seconds = 300  # (default: 300)
 # Most argon2 password verifications running at once (~19 MiB and a core each);
 # more queue for a few seconds, then fail as unavailable (not counted as a
 # failed password). 0 = the number of available CPUs.
 password_verify_concurrency = 0     # (default: 0)
-# Login screen: "identifier_first" (ask username, then route to a password
-# prompt or an OIDC redirect) or "combined" (always show username+password +
-# a button per enabled OIDC realm).
-login_mode = "identifier_first" # (default: "identifier_first")
-# Browser-session lifetimes (apply to local-password AND OIDC logins). When
-# unset, falls back to the deprecated oidc.session_* keys, then 8h / 7d.
-# session_idle_ttl_seconds     = 28800
-# session_absolute_ttl_seconds = 604800
-# How long an instance trusts its cached snapshot of the auth_realm table.
+# How long an instance trusts its cached copy of the auth_realm table and of
+# the auth settings: other instances follow an admin's change within it.
 realm_cache_ttl_seconds = 10    # (default: 10)
 # Concurrent upstream credential forwards (verdict-cache misses) allowed per
 # credential-forwarding realm, per instance; excess logins fail closed (401).
@@ -251,6 +244,4 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")
 # # IdPs that serve tokens and keys on other hosts than the issuer's (Google):
 # endpoint_hosts = ["oauth2.googleapis.com", "www.googleapis.com"]   # (default: [] = issuer host only)
-# # session lifecycle: deprecated (startup warns), set auth.session_* instead
-# session_idle_ttl_seconds     = 28800       # (default: 8h) idle timeout
-# session_absolute_ttl_seconds = 604800      # (default: 7d) absolute lifetime
+# # The session lifetimes are auth settings (Admin → Settings), not set here.

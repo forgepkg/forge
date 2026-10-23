@@ -34,12 +34,18 @@ const SECTIONS = [
     title: 'Authentication',
     description: 'Login realms: local passwords, OIDC, credential forwarding.',
   },
+  {
+    to: '/manage/settings',
+    title: 'Settings',
+    description:
+      'Anonymous access, the login screen, password Basic, session lifetimes and the lockout.',
+  },
 ] as const
 
 /**
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. Links to the repositories, users (incl. per-user tokens and
- * roles), roles, content selectors and authentication-realm management
+ * roles), roles, content selectors, authentication-realm and settings
  * screens, and names what only the `/admin` API manages (CHANGELOG "Known
  * limitations").
  */
@@ -50,7 +56,8 @@ function AdminHome() {
         <Heading>Administration</Heading>
         <Text className="mt-1">
           Manage repositories, users and their API tokens, roles and their
-          grants, content selectors, and authentication realms. Retention,
+          grants, content selectors, authentication realms, and the sign-in
+          and anonymous-access settings. Retention,
           user deactivation and key rotation have no screen yet; use the{' '}
           <Code>/admin</Code> API.
         </Text>

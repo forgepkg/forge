@@ -37,9 +37,6 @@ async fn main() -> anyhow::Result<()> {
     for warning in config.deployment_warnings() {
         tracing::warn!("{warning}");
     }
-    for deprecation in config.deprecations() {
-        tracing::warn!("{deprecation}");
-    }
 
     // Database.
     let pool = forge_db::connect_with(

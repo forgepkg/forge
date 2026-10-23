@@ -34,8 +34,8 @@ repository in the image name:
   (`"host": "docker.example.com"`) also answers at the root of that host, so
   its images keep short names: `docker.example.com/team/app:1.2`. Point the
   host name at Forge, include it in the TLS certificate, keep `Host` intact
-  in the reverse proxy, and add it to `server.allowed_hosts` if you use
-  `anonymous_mode = "allowlist"`.
+  in the reverse proxy, and add it to `server.allowed_hosts` if you use the
+  anonymous mode `allowlist` (Admin → Settings).
 
 A docker repository's name is part of every image name, so it follows the
 spec's name grammar: lowercase letters and digits, separated by `.`, `_`,
@@ -61,8 +61,9 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 - **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
   the password to use. A token's repository scope applies.
-- **Passwords** work where Basic passwords are allowed at all:
-  `auth.allow_password_basic`, or an enabled credential-forwarding realm (so
+- **Passwords** work where Basic passwords are allowed at all: the
+  `allow_password_basic` setting (Admin → Settings), or an enabled
+  credential-forwarding realm (so
   users of an existing Nexus or LDAP sign in with their upstream password).
   The password goes to the token endpoint only; the registry itself sees the
   short-lived token.
@@ -71,7 +72,8 @@ docker push forge.example.com/docker-hosted/team/app:1.3
   `oidc` ([trusted publishing](trusted-publishing.md)); their pushes and
   deletes are recorded in the trusted-publishing ledger.
 - **Anonymous pulls** work for repositories that allow anonymous read (with
-  `auth.anonymous_mode`): clients get an anonymous token without logging in.
+  the anonymous mode on, Admin → Settings): clients get an anonymous token
+  without logging in.
 - A browser session never pushes, even an administrator's.
 
 A registry token grants only what the caller may do when it is issued:
