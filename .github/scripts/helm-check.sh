@@ -3,8 +3,9 @@
 # (used by ci.yml): `helm lint --strict` and `helm template` with the default
 # values and with each file in the chart's ci/ directory, kubeconform against
 # the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), every
-# rendered forge.toml parsed as TOML, and the pod annotations that roll the
-# pods on a secret change salted.
+# rendered forge.toml parsed as TOML, a Recreate strategy rendered without
+# rollingUpdate, and the pod annotations that roll the pods on a secret change
+# salted.
 #
 # Usage: helm-check.sh <kubernetes version, e.g. 1.33.0>
 # Needs helm, kubeconform and python3 (3.11+) on PATH.
@@ -91,6 +92,34 @@ for path in sys.argv[1:]:
 sys.exit(1 if failed else 0)
 EOF
 echo "forge.toml: every rendering parses" >&2
+
+# The API server refuses a Deployment whose Recreate strategy carries
+# rollingUpdate, a rule kubeconform does not check. A values file's
+# `strategy.type: Recreate` is merged into the default's rollingUpdate, which
+# the chart must leave out (ci/persistent-cache-values.yaml).
+python3 - "$work"/*.yaml <<'EOF'
+import re
+import sys
+
+failed = False
+recreate = False
+for path in sys.argv[1:]:
+    for document in open(path, encoding="utf-8").read().split("\n---\n"):
+        if not re.search(r"^kind: Deployment$", document, re.M):
+            continue
+        strategy = re.search(r"^  strategy:\n((?:    .*\n)*)", document, re.M)
+        if not strategy or not re.search(r"^    type: Recreate$", strategy.group(1), re.M):
+            continue
+        recreate = True
+        if re.search(r"^    rollingUpdate:", strategy.group(1), re.M):
+            print(f"{path}: a Recreate strategy with rollingUpdate:\n{strategy.group(1)}")
+            failed = True
+if not recreate:
+    print("no rendering has a Recreate strategy")
+    failed = True
+sys.exit(1 if failed else 0)
+EOF
+echo "strategy: Recreate renders without rollingUpdate" >&2
 
 # A secretEnv or Valkey password change rolls the pods through a pod
 # annotation (checksum/secret-env, Valkey's checksum/auth) that anyone who can

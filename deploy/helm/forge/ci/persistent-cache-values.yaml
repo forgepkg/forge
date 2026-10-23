@@ -1,0 +1,16 @@
+# CI: the blob cache on a ReadWriteOnce PersistentVolumeClaim, one replica
+# replaced with `strategy.type: Recreate` (docs/deployment.md, "Local blob
+# cache"); the rendered strategy must not keep the default's rollingUpdate.
+# Like the local-cache-persistent kustomize component.
+config:
+  blob_cache:
+    path: /var/cache/forge/blobs
+strategy:
+  type: Recreate
+extraVolumes:
+  - name: blob-cache
+    persistentVolumeClaim:
+      claimName: forge-blob-cache
+extraVolumeMounts:
+  - name: blob-cache
+    mountPath: /var/cache/forge
