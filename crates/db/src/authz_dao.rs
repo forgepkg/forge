@@ -28,6 +28,10 @@ pub const ANONYMOUS_ROLE: &str = "anonymous";
 /// The fixed slug of the built-in `authenticated` role (read and write on
 /// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
+/// The fixed slug of the built-in `writer` role (migration 0042): read and
+/// publish packages on every repository, without deleting them or any right
+/// to administer the instance.
+pub const WRITER_ROLE: &str = "writer";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
 /// The two `sqlx::query!` calls generate distinct anonymous structs with the
@@ -514,7 +518,8 @@ pub struct Role {
     pub name: String,
     /// Human description.
     pub description: String,
-    /// `true` for the seeded built-in roles (`admin`/`authenticated`/`anonymous`);
+    /// `true` for the seeded built-in roles
+    /// (`admin`/`writer`/`authenticated`/`anonymous`);
     /// they cannot be deleted and their grants are protected by the admin API.
     pub builtin: bool,
 }

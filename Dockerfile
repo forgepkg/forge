@@ -179,8 +179,9 @@ USER 10001:10001
 
 # ── Runtime configuration (FORGE_* override the baked forge.toml) ─────────────
 # Baked defaults (see docker/forge.docker.toml): bind 0.0.0.0:8421, SPA at
-# /app/web/dist, anonymous_mode=off, allow_password_basic=false, no bootstrap
-# admin (set FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD for the first start).
+# /app/web/dist, no bootstrap admin (set FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
+# for the first start). Anonymous access and password Basic start off; they
+# are set in the web UI (Admin → Settings).
 ENV FORGE_CONFIG=/app/forge.toml \
     FORGE_WEB__ASSETS_DIR=/app/web/dist \
     RUST_LOG=info

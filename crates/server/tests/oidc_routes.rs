@@ -265,7 +265,6 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -365,7 +364,6 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     let srv = start_with(
         pool.clone(),
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -452,7 +450,6 @@ async fn callback_refuses_a_new_account_without_a_upn_and_names_the_claim() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -525,7 +522,6 @@ async fn federated_credential_login_presents_a_forge_signed_client_assertion() {
     let srv = start_with(
         common::fresh_pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -963,7 +959,6 @@ async fn auth_me_returns_identity_and_csrf_token() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -1008,7 +1003,6 @@ async fn session_can_mint_and_revoke_repository_token() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -1118,7 +1112,6 @@ async fn required_claims_gate_the_callback() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -1205,7 +1198,6 @@ async fn idp_demotion_ends_sessions_opened_as_admin() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),

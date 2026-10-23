@@ -288,6 +288,36 @@ that account, or removing its `admin` role, is refused with `409 Conflict`.
 So the replacement admin has to exist first; an OIDC or credential-forwarding
 admin counts once they have signed in.
 
+### Built-in roles
+
+What a user may do follows from the roles they hold (**Admin → Roles**,
+`/admin/roles`). Every install has four built-in roles, which cannot be
+deleted or renamed:
+
+| Role | Grants | For |
+| --- | --- | --- |
+| `admin` | Everything: every repository, and administering the instance (repositories, users, roles, authentication, settings). | Administrators. |
+| `writer` | `read` and `write` on every repository, ones created later included. No `delete`, no `admin`. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `authenticated` | `read` and `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
+| `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). | Anonymous access. |
+
+A user who holds neither `admin` nor `writer` is a **reader**: they read what
+their other roles and anonymous access allow. **Admin → Users** shows each
+user's level (admin, writer or reader), and the user's page switches it.
+
+A writer cannot unlist or delete package versions, delete image tags, or
+delete or replace raw files:
+deleting stays with administrators and custom roles that grant `delete`, so a
+leaked CI token cannot remove published versions. Nor can a writer reach the
+admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
+`repo.write` capability). A writer mints their own API tokens on the
+**Tokens** page; a token never carries more than its owner's rights.
+
+Migration 0042 adds `writer`. An install that already had a custom role named
+`writer` keeps it as `writer#<id>`, with its grants and members, and a
+workload-identity rule that named it names `writer#<id>` too; the migration
+logs a warning for each.
+
 ### Usernames
 
 Every account is named by a UPN, `local-part@domain` (`alice@example.com`):
@@ -321,17 +351,43 @@ The rule applies wherever an account is created:
   realm config that sets `auto_provision: true` is refused by the admin API,
   and the `[auth.upstream_basic]` block's `auto_provision` is ignored.
 
-### Password Basic auth
+### Access and sign-in settings
 
-The image defaults to `allow_password_basic = false`: the web UI signs in
-through its login form (not affected by this setting), and NuGet clients and
-scripts authenticate with API tokens (a token in the Basic password field is
-always accepted). An enabled credential-forwarding realm turns the Basic
-password path on by itself, because its users have no tokens until they first
-sign in — and that path runs the whole password chain, so **local** users'
-passwords are then accepted over Basic too, whatever this setting says. Set
-`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must send a local
-user's password over Basic without such a realm.
+Who may read without signing in, and how people sign in, is not deployment
+configuration: an administrator sets it in the web UI (**Admin → Settings**,
+`/manage/settings`) or through `GET`/`PUT /admin/settings/auth`. The values
+are kept in the database, so every instance applies the same ones: the
+instance that takes a change at once, the others within
+`auth.realm_cache_ttl_seconds` (10 s), without a restart. A `PUT` changes the
+fields its body names; a value out of range is refused with `400` and what is
+wrong.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `anonymous_mode` | `off` | `off`, `allowlist` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. |
+| `anonymous_ip_allowlist` | `[]` | Under `allowlist`: `loopback`, `private`, `local`, networks and addresses. It depends on `auth.trusted_proxy_cidrs` and `server.allowed_hosts`, which stay in the configuration file. |
+| `login_mode` | `identifier_first` | The login screen: the username first (then a password prompt or the identity provider whose login domains match), or `combined` (username and password, plus the OIDC button). |
+| `allow_password_basic` | `false` | Accept a user's password over HTTP Basic on the feeds (see below). |
+| `session_idle_ttl_seconds` | `28800` (8 h) | A browser session ends this long after its last use. |
+| `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
+| `login_max_failures` | `10` | Failed passwords per client network and username before the lockout; `0` turns it off. Each instance counts its own. |
+| `login_failure_window_seconds` | `300` | The failure window, and how long a lockout lasts (at most a day). |
+
+A configuration that still sets one of these (`auth.anonymous_mode`,
+`FORGE_AUTH__ALLOW_PASSWORD_BASIC`, …, or the `oidc.session_*` lifetimes)
+is refused at startup, with a message naming the keys to remove.
+
+#### Password Basic auth
+
+`allow_password_basic` is off by default: the web UI signs in through its
+login form (not affected by this setting), and NuGet clients and scripts
+authenticate with API tokens (a token in the Basic password field is always
+accepted). An enabled credential-forwarding realm turns the Basic password
+path on by itself, because its users have no tokens until they first sign in
+— and that path runs the whole password chain, so **local** users' passwords
+are then accepted over Basic too, whatever this setting says. Turn it on only
+if a client must send a local user's password over Basic without such a
+realm.
 
 A password sent over Basic is a **feed** credential only: the admin API
 (`/admin/*`) and token minting refuse it with 403, even for an administrator,
@@ -455,7 +511,7 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Vary: Authorization, Cookie, X-NuGet-ApiKey` and registry responses
   `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
-- With `anonymous_mode = "allowlist"`, do not let a shared cache store `/v3`
+- With the anonymous mode `allowlist`, do not let a shared cache store `/v3`
   (or `/raw`) responses at all. Anonymous feed responses carry no `Cache-Control`, and
   whether Forge serves one depends on the client's address, which the cache
   does not key on: a cache that stores responses without caching headers
@@ -544,9 +600,11 @@ largest package download.
 Instances coordinate through PostgreSQL (row locks and leases), so any number
 can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
-password-failure lockout is kept in memory on each instance; the networks a
-username signed in from, which that username's backoff exempts, are shared
-through the database.
+[access and sign-in settings](#access-and-sign-in-settings) are read from the
+database: the other instances follow a change within
+`auth.realm_cache_ttl_seconds`. The password-failure lockout is kept in memory
+on each instance; the networks a username signed in from, which that
+username's backoff exempts, are shared through the database.
 
 Redis is optional at runtime: an instance starts while Redis is unreachable
 (after waiting a few seconds for it) and works from its own memory until

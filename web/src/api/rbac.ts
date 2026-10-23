@@ -7,8 +7,8 @@ import { httpClient } from '~/lib/httpClient'
  * Types mirror the Rust DTOs in `crates/server/src/admin/`:
  *
  *  - `RoleView` (`roles.rs`) counts the role's grants and users. The built-in
- *    roles (`admin`, `authenticated`, `anonymous`) cannot be deleted; only a
- *    role's description can change.
+ *    roles (`admin`, `writer`, `authenticated`, `anonymous`) cannot be
+ *    deleted; only a role's description can change.
  *  - `GrantView` (`grants.rs`) is `(repository or every repository, action,
  *    selector?)`: `repository_id: null` means every repository. `admin` is
  *    accepted only on every repository (400 otherwise).
@@ -29,7 +29,33 @@ export type Action = (typeof ACTIONS)[number]
 
 /** The built-in role names. */
 export const ADMIN_ROLE = 'admin'
+export const WRITER_ROLE = 'writer'
 export const ANONYMOUS_ROLE = 'anonymous'
+
+/**
+ * A user's built-in access level: `admin` (the `admin` role), `writer` (the
+ * `writer` role: read and publish packages on every repository, no
+ * administration) or `reader` (neither; what they may read follows from
+ * their other roles and the anonymous reach). The levels are the built-in
+ * roles an admin switches between on the user page.
+ */
+export type AccessLevel = 'reader' | 'writer' | 'admin'
+
+/** The built-in role behind each access level above `reader`. */
+export const ACCESS_ROLES: Record<Exclude<AccessLevel, 'reader'>, string> = {
+  admin: ADMIN_ROLE,
+  writer: WRITER_ROLE,
+}
+
+/**
+ * The access level of a user holding `roles` (role names). An administrator
+ * by the legacy `is_admin` flag counts as `admin`.
+ */
+export function accessLevel(roles: readonly string[], isAdmin = false): AccessLevel {
+  if (isAdmin || roles.includes(ADMIN_ROLE)) return 'admin'
+  if (roles.includes(WRITER_ROLE)) return 'writer'
+  return 'reader'
+}
 
 /** A role (`RoleView`). */
 export interface RoleView {

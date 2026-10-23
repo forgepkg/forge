@@ -50,6 +50,9 @@
 //! is a fast in-memory set test over the (warm-cache) effective set; selector
 //! filtering happens separately via [`Authz::package_filter`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use forge_cache::Cache;
 use forge_db::authz_dao;
 use forge_db::model::Repository;
@@ -70,8 +73,9 @@ pub struct Authz {
     cache: Cache,
     /// Whether authenticated principals also hold the public read reach (see
     /// [`Self::can_read`]). Off unless the server reads anonymously for
-    /// everyone (`anonymous_mode = "all"`).
-    public_read_for_signed_in: bool,
+    /// everyone (anonymous mode `all`). Shared by every clone, so
+    /// [`Self::set_public_read_for_signed_in`] reaches them all.
+    public_read_for_signed_in: Arc<AtomicBool>,
 }
 
 impl Authz {
@@ -82,20 +86,28 @@ impl Authz {
         Authz {
             pool,
             cache,
-            public_read_for_signed_in: false,
+            public_read_for_signed_in: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Give authenticated principals the public read reach as well. The server
-    /// enables this only for `anonymous_mode = "all"`, where anyone may read
+    /// enables this only for anonymous mode `all`, where anyone may read
     /// those repositories anyway. Under `off` the reach is inert for everyone,
     /// and under `allowlist` it depends on the caller's address and `Host`,
     /// which authorization does not see — granting it there would let a
     /// signed-in user (or their token, or a workload) read from anywhere what
     /// only allowlisted networks may read anonymously.
-    pub fn with_public_read_for_signed_in(mut self, enabled: bool) -> Self {
-        self.public_read_for_signed_in = enabled;
+    pub fn with_public_read_for_signed_in(self, enabled: bool) -> Self {
+        self.set_public_read_for_signed_in(enabled);
         self
+    }
+
+    /// [`Self::with_public_read_for_signed_in`] at runtime, for this service
+    /// and every clone of it: the server follows the anonymous mode an
+    /// administrator sets.
+    pub fn set_public_read_for_signed_in(&self, enabled: bool) {
+        self.public_read_for_signed_in
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// May `principal` read (download / list / search) `repo`?
@@ -106,7 +118,7 @@ impl Authz {
     /// is therefore anonymously readable even on a fresh, default-deny RBAC
     /// install. RBAC grants are still consulted for everything else.
     ///
-    /// With [`Self::with_public_read_for_signed_in`] (`anonymous_mode = "all"`),
+    /// With [`Self::with_public_read_for_signed_in`] (anonymous mode `all`),
     /// authenticated principals (users, tokens, workloads) hold the same public
     /// reach — the flag and the `anonymous` role's `read` grants — on top of
     /// their own grants, so a signed-in user without grants is not denied a repo
@@ -158,6 +170,18 @@ impl Authz {
     pub async fn is_global_admin(&self, principal: &Principal) -> bool {
         match self.effective(principal).await {
             Ok(eff) => eff.is_admin(),
+            Err(()) => false,
+        }
+    }
+
+    /// May `principal` write (publish) to **every** repository, ones created
+    /// later included, with no package scope? True for the `admin` role and
+    /// for an unscoped `write` grant on ANY repository, such as the built-in
+    /// `writer` role's; a token scope narrows it like every other check.
+    /// Fail-closed.
+    pub async fn can_write_every_repository(&self, principal: &Principal) -> bool {
+        match self.effective(principal).await {
+            Ok(eff) => eff.allows_every_repo(Action::Write),
             Err(()) => false,
         }
     }
@@ -272,7 +296,9 @@ impl Authz {
                 let mut owner = authz_cache::load_user_effective(&self.pool, &self.cache, *user_id)
                     .await
                     .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
-                if let Some(flag) = public_read.filter(|_| self.public_read_for_signed_in) {
+                if let Some(flag) =
+                    public_read.filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
+                {
                     owner = self.add_public_read(owner, flag).await;
                 }
 
@@ -292,7 +318,9 @@ impl Authz {
                         |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
                     )?;
                 Ok(
-                    match public_read.filter(|_| self.public_read_for_signed_in) {
+                    match public_read
+                        .filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
+                    {
                         Some(flag) => self.add_public_read(role, flag).await,
                         None => role,
                     },

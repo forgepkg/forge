@@ -331,13 +331,86 @@ async fn a_helm_repository_round_trip() {
     assert_eq!(detail["versions"].as_array().unwrap().len(), 1);
 }
 
+/// #318: a holder of the built-in `writer` role uploads a new chart to a
+/// hosted Helm repository and reads it back, but cannot delete a version.
+#[tokio::test]
+async fn a_writer_uploads_charts_but_deletes_none() {
+    let srv = start_helm(ServerOpts::default()).await;
+    let repo = helm_repo(&srv, false).await;
+    let (au, ap) = srv.admin_basic();
+    let username = format!("charts-writer{}@example.com", unique());
+    let created: Value = srv
+        .client()
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({ "username": username, "password": "pw12345678" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_id = created["id"].as_i64().unwrap();
+    let resp = srv
+        .client()
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({ "role": "writer" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let token: Value = srv
+        .client()
+        .post(format!("{}/admin/users/{user_id}/tokens", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({ "name": "ci" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let creds = (username, token["token"].as_str().unwrap().to_string());
+
+    let resp = push(&srv, &repo, &creds, chart("Fresh", "0.1.0")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let index: Value = get_index(&srv, &repo, Some(&creds))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(index["entries"]["Fresh"].as_array().unwrap().len(), 1);
+    let resp = srv
+        .client()
+        .delete(format!(
+            "{}/repository/{repo}/api/charts/fresh/0.1.0",
+            srv.base_url
+        ))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn plugin_repositories_are_authorized_like_feeds() {
-    let srv = start_helm(ServerOpts {
-        anonymous_mode: "all".into(),
-        ..Default::default()
-    })
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            ..Default::default()
+        },
+    )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let private = helm_repo(&srv, false).await;
     let public = helm_repo(&srv, true).await;
     let creds = credentials(&srv).await;

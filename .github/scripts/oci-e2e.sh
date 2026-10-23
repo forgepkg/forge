@@ -63,8 +63,6 @@ bucket = "forge-e2e"
 access_key = "forge-e2e-key"
 secret_key = "forge-e2e-secret"
 force_path_style = true
-[auth]
-anonymous_mode = "off"
 [auth.bootstrap_admin]
 username = "$admin_user"
 password = "$admin_password"

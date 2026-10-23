@@ -2793,17 +2793,18 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
 #[tokio::test]
 async fn anonymous_read_off_deletes_the_synthesized_grant() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            anonymous_mode: "all".into(),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")

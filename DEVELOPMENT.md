@@ -70,7 +70,8 @@ With the server running, in a second terminal:
 cargo xtask seed
 ```
 
-This creates an anonymous-readable hosted repo `nuget`, mints a push token, and
+This turns anonymous reads and password Basic on (**Admin → Settings**),
+creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
 `http://localhost:8421/v3/nuget/index.json`.
@@ -266,19 +267,15 @@ installed directory and the `id` in its `plugin.toml`).
 
 ## Configuration
 
-Everything is in [`forge.toml`](./forge.toml) (loaded by default; override the
-path with `FORGE_CONFIG`, or override individual keys with `FORGE_*` env vars
-using **double-underscore** nesting, e.g. `FORGE_AUTH__ANONYMOUS_MODE=off`).
-Key knobs:
+Deployment configuration is in [`forge.toml`](./forge.toml) (loaded by
+default; override the path with `FORGE_CONFIG`, or override individual keys
+with `FORGE_*` env vars using **double-underscore** nesting, e.g.
+`FORGE_SERVER__BIND=0.0.0.0:8080`). Key knobs:
 
 | Setting | Meaning |
 | --- | --- |
-| `auth.anonymous_mode` | `off` / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
-| repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
-| `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
 | `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
-| `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
 | repo `max_upload_bytes` | Largest accepted push to a hosted repository (docker: per blob), set in the web UI or admin API; streamed to disk, 413 above it. Unset: 512 MiB (docker 1 GiB). |
@@ -296,10 +293,32 @@ and `"object_store":"degraded"`. The server handles
 SIGTERM (as sent by `docker stop` / Kubernetes): it stops accepting
 connections, drains in-flight requests, then stops the background workers.
 
-> **Anonymous reads need both** `anonymous_mode` *and* the repo's `anonymous_read=true`
-> (authz = authenticated user **or** anonymous-and-repo-allows). For zero-auth
-> local browsing, keep `anonymous_mode = "all"` and create repos with
-> `"anonymous_read": true`.
+### Access and sign-in settings
+
+Anonymous access, the login screen, passwords over HTTP Basic, the session
+lifetimes and the login lockout are **not** in `forge.toml`: they are auth
+settings kept in the database, set under **Admin → Settings**
+(`/manage/settings`) or through `GET`/`PUT /admin/settings/auth`, and every
+instance applies a change without a restart (the others within
+`auth.realm_cache_ttl_seconds`). Startup refuses the `[auth]` keys that used
+to set them. See
+[docs/deployment.md](./docs/deployment.md#access-and-sign-in-settings).
+
+| Setting | Meaning |
+| --- | --- |
+| `anonymous_mode` | `off` (default) / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
+| `anonymous_ip_allowlist` | Under `allowlist`: `loopback`, `private`, `local`, networks, addresses. |
+| repo `anonymous_read` | **Also required** for anonymous reads — set it per repository. |
+| `login_mode` | `identifier_first` (default) or `combined`. |
+| `allow_password_basic` | Accept a user's password over HTTP Basic on the feeds (default off; the admin API never takes one). |
+| `session_idle_ttl_seconds` / `session_absolute_ttl_seconds` | Browser-session lifetimes (default 8 h / 7 d). |
+| `login_max_failures` / `login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
+
+> **Anonymous reads need both** the anonymous mode *and* the repo's
+> `anonymous_read=true` (authz = authenticated user **or**
+> anonymous-and-repo-allows). For zero-auth local browsing, `cargo xtask seed`
+> sets the anonymous mode to `all` (and turns password Basic on) and creates
+> an `anonymous_read` repository.
 
 ## Authentication realms
 
@@ -413,8 +432,8 @@ recorded in `forge_setting`); afterwards the database is the authority.
 
 The login screen is **identifier-first** by default (username → password
 prompt, or a 302 to the IdP when the identifier's email domain matches an OIDC
-realm's `login_domains`); set `auth.login_mode = "combined"` for a classic
-combined form with per-realm OIDC buttons.
+realm's `login_domains`); set the `login_mode` setting to `combined` (Admin →
+Settings) for a classic combined form with per-realm OIDC buttons.
 
 ### Endpoints
 
@@ -749,14 +768,14 @@ cargo xtask docker-run         # run the image against the compose db + s3 on :8
 http://localhost:8421.
 
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
-anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
-`allow_password_basic=false`, no bootstrap admin — that comes only from
-`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env), and no S3 keys. Placeholder
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, no bootstrap admin — that
+comes only from `FORGE_AUTH__BOOTSTRAP_ADMIN__*` env), and no S3 keys.
+Anonymous access and password Basic start off and are set under **Admin →
+Settings** (`cargo xtask seed` turns both on for a dev stack). Placeholder
 credentials (`minioadmin` S3 keys, a `changeme` password) are **refused at
 startup**; only the dev compose stack sets
-`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin@example.com/changeme and
-`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin@example.com/changeme).
+Override anything via `FORGE_*`
 env vars (double-underscore nesting). Required at runtime (no safe default):
 
 | Env var | Example |
@@ -1096,7 +1115,7 @@ files:
 
 **First release under forgepkg only.** The repository moved from
 `schmitch/forge` to `forgepkg/forge`, and the release publishes to the
-packages of the repository's owner: from 1.2.0 on `ghcr.io/forgepkg/forge`
+packages of the repository's owner: from 2.0.0 on `ghcr.io/forgepkg/forge`
 (the image) and `ghcr.io/forgepkg/charts/forge` (the chart), while the
 releases up to 1.1.0 stay at `ghcr.io/schmitch/forge` and
 `ghcr.io/schmitch/charts/forge`. GHCR creates a new package as **private**,
