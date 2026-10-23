@@ -15,15 +15,20 @@ import { Route as BrowseRouteImport } from './routes/Browse'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as TokensRouteImport } from './routes/Tokens'
 import { Route as adminAdminHomeRouteImport } from './routes/admin/AdminHome'
+import { Route as adminSelectorsListRouteImport } from './routes/admin/selectors/List'
 import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
+import { Route as adminRolesListRouteImport } from './routes/admin/roles/List'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as RepoBrowseRouteImport } from './routes/RepoBrowse'
 import { Route as ImageDetailRouteImport } from './routes/ImageDetail'
+import { Route as adminSelectorsEditRouteImport } from './routes/admin/selectors/Edit'
+import { Route as adminSelectorsCreateRouteImport } from './routes/admin/selectors/Create'
 import { Route as adminRealmsEditRouteImport } from './routes/admin/realms/Edit'
 import { Route as adminRealmsCreateRouteImport } from './routes/admin/realms/Create'
 import { Route as adminRepositoriesEditRouteImport } from './routes/admin/repositories/Edit'
 import { Route as adminRepositoriesCreateRouteImport } from './routes/admin/repositories/Create'
+import { Route as adminRolesEditRouteImport } from './routes/admin/roles/Edit'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
 import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
 import { Route as adminRepositoriesImportRouteImport } from './routes/admin/repositories/Import'
@@ -58,6 +63,11 @@ const adminAdminHomeRoute = adminAdminHomeRouteImport.update({
   path: '/',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminSelectorsListRoute = adminSelectorsListRouteImport.update({
+  id: '/content-selectors',
+  path: '/content-selectors',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
 const adminRealmsListRoute = adminRealmsListRouteImport.update({
   id: '/realms',
   path: '/realms',
@@ -66,6 +76,11 @@ const adminRealmsListRoute = adminRealmsListRouteImport.update({
 const adminRepositoriesListRoute = adminRepositoriesListRouteImport.update({
   id: '/repositories',
   path: '/repositories',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
+const adminRolesListRoute = adminRolesListRouteImport.update({
+  id: '/roles',
+  path: '/roles',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
 const adminUsersListRoute = adminUsersListRouteImport.update({
@@ -82,6 +97,16 @@ const ImageDetailRoute = ImageDetailRouteImport.update({
   id: '/images/$repo/$',
   path: '/images/$repo/$',
   getParentRoute: () => AppLayoutRoute,
+} as any)
+const adminSelectorsEditRoute = adminSelectorsEditRouteImport.update({
+  id: '/content-selectors/$selectorId',
+  path: '/content-selectors/$selectorId',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
+const adminSelectorsCreateRoute = adminSelectorsCreateRouteImport.update({
+  id: '/content-selectors/new',
+  path: '/content-selectors/new',
+  getParentRoute: () => AdminLayoutRoute,
 } as any)
 const adminRealmsEditRoute = adminRealmsEditRouteImport.update({
   id: '/realms/$realmId',
@@ -101,6 +126,11 @@ const adminRepositoriesEditRoute = adminRepositoriesEditRouteImport.update({
 const adminRepositoriesCreateRoute = adminRepositoriesCreateRouteImport.update({
   id: '/repositories/new',
   path: '/repositories/new',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
+const adminRolesEditRoute = adminRolesEditRouteImport.update({
+  id: '/roles/$roleId',
+  path: '/roles/$roleId',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
 const adminUsersEditRoute = adminUsersEditRouteImport.update({
@@ -131,15 +161,20 @@ export interface FileRoutesByFullPath {
   '/manage': typeof AdminLayoutRouteWithChildren
   '/tokens': typeof TokensRoute
   '/manage/': typeof adminAdminHomeRoute
+  '/manage/content-selectors': typeof adminSelectorsListRoute
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
+  '/manage/roles': typeof adminRolesListRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
+  '/manage/content-selectors/$selectorId': typeof adminSelectorsEditRoute
+  '/manage/content-selectors/new': typeof adminSelectorsCreateRoute
   '/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/manage/realms/new': typeof adminRealmsCreateRoute
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
+  '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
@@ -150,15 +185,20 @@ export interface FileRoutesByTo {
   '/': typeof BrowseRoute
   '/tokens': typeof TokensRoute
   '/manage': typeof adminAdminHomeRoute
+  '/manage/content-selectors': typeof adminSelectorsListRoute
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
+  '/manage/roles': typeof adminRolesListRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
+  '/manage/content-selectors/$selectorId': typeof adminSelectorsEditRoute
+  '/manage/content-selectors/new': typeof adminSelectorsCreateRoute
   '/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/manage/realms/new': typeof adminRealmsCreateRoute
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
+  '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
@@ -172,15 +212,20 @@ export interface FileRoutesById {
   '/_app/manage': typeof AdminLayoutRouteWithChildren
   '/_app/tokens': typeof TokensRoute
   '/_app/manage/': typeof adminAdminHomeRoute
+  '/_app/manage/content-selectors': typeof adminSelectorsListRoute
   '/_app/manage/realms': typeof adminRealmsListRoute
   '/_app/manage/repositories': typeof adminRepositoriesListRoute
+  '/_app/manage/roles': typeof adminRolesListRoute
   '/_app/manage/users': typeof adminUsersListRoute
   '/_app/repos/$repo': typeof RepoBrowseRoute
   '/_app/images/$repo/$': typeof ImageDetailRoute
+  '/_app/manage/content-selectors/$selectorId': typeof adminSelectorsEditRoute
+  '/_app/manage/content-selectors/new': typeof adminSelectorsCreateRoute
   '/_app/manage/realms/$realmId': typeof adminRealmsEditRoute
   '/_app/manage/realms/new': typeof adminRealmsCreateRoute
   '/_app/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/_app/manage/repositories/new': typeof adminRepositoriesCreateRoute
+  '/_app/manage/roles/$roleId': typeof adminRolesEditRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
   '/_app/packages/$repo/$id': typeof PackageDetailRoute
   '/_app/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
@@ -194,15 +239,20 @@ export interface FileRouteTypes {
     | '/manage'
     | '/tokens'
     | '/manage/'
+    | '/manage/content-selectors'
     | '/manage/realms'
     | '/manage/repositories'
+    | '/manage/roles'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
+    | '/manage/content-selectors/$selectorId'
+    | '/manage/content-selectors/new'
     | '/manage/realms/$realmId'
     | '/manage/realms/new'
     | '/manage/repositories/$repo'
     | '/manage/repositories/new'
+    | '/manage/roles/$roleId'
     | '/manage/users/$userId'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
@@ -213,15 +263,20 @@ export interface FileRouteTypes {
     | '/'
     | '/tokens'
     | '/manage'
+    | '/manage/content-selectors'
     | '/manage/realms'
     | '/manage/repositories'
+    | '/manage/roles'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
+    | '/manage/content-selectors/$selectorId'
+    | '/manage/content-selectors/new'
     | '/manage/realms/$realmId'
     | '/manage/realms/new'
     | '/manage/repositories/$repo'
     | '/manage/repositories/new'
+    | '/manage/roles/$roleId'
     | '/manage/users/$userId'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
@@ -234,15 +289,20 @@ export interface FileRouteTypes {
     | '/_app/manage'
     | '/_app/tokens'
     | '/_app/manage/'
+    | '/_app/manage/content-selectors'
     | '/_app/manage/realms'
     | '/_app/manage/repositories'
+    | '/_app/manage/roles'
     | '/_app/manage/users'
     | '/_app/repos/$repo'
     | '/_app/images/$repo/$'
+    | '/_app/manage/content-selectors/$selectorId'
+    | '/_app/manage/content-selectors/new'
     | '/_app/manage/realms/$realmId'
     | '/_app/manage/realms/new'
     | '/_app/manage/repositories/$repo'
     | '/_app/manage/repositories/new'
+    | '/_app/manage/roles/$roleId'
     | '/_app/manage/users/$userId'
     | '/_app/packages/$repo/$id'
     | '/_app/manage/repositories/$repo/import'
@@ -298,6 +358,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminAdminHomeRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/content-selectors': {
+      id: '/_app/manage/content-selectors'
+      path: '/content-selectors'
+      fullPath: '/manage/content-selectors'
+      preLoaderRoute: typeof adminSelectorsListRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/realms': {
       id: '/_app/manage/realms'
       path: '/realms'
@@ -310,6 +377,13 @@ declare module '@tanstack/react-router' {
       path: '/repositories'
       fullPath: '/manage/repositories'
       preLoaderRoute: typeof adminRepositoriesListRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/roles': {
+      id: '/_app/manage/roles'
+      path: '/roles'
+      fullPath: '/manage/roles'
+      preLoaderRoute: typeof adminRolesListRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
     '/_app/manage/users': {
@@ -332,6 +406,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/images/$repo/$'
       preLoaderRoute: typeof ImageDetailRouteImport
       parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/manage/content-selectors/$selectorId': {
+      id: '/_app/manage/content-selectors/$selectorId'
+      path: '/content-selectors/$selectorId'
+      fullPath: '/manage/content-selectors/$selectorId'
+      preLoaderRoute: typeof adminSelectorsEditRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/content-selectors/new': {
+      id: '/_app/manage/content-selectors/new'
+      path: '/content-selectors/new'
+      fullPath: '/manage/content-selectors/new'
+      preLoaderRoute: typeof adminSelectorsCreateRouteImport
+      parentRoute: typeof AdminLayoutRoute
     }
     '/_app/manage/realms/$realmId': {
       id: '/_app/manage/realms/$realmId'
@@ -359,6 +447,13 @@ declare module '@tanstack/react-router' {
       path: '/repositories/new'
       fullPath: '/manage/repositories/new'
       preLoaderRoute: typeof adminRepositoriesCreateRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/roles/$roleId': {
+      id: '/_app/manage/roles/$roleId'
+      path: '/roles/$roleId'
+      fullPath: '/manage/roles/$roleId'
+      preLoaderRoute: typeof adminRolesEditRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
     '/_app/manage/users/$userId': {
@@ -394,13 +489,18 @@ declare module '@tanstack/react-router' {
 
 interface AdminLayoutRouteChildren {
   adminAdminHomeRoute: typeof adminAdminHomeRoute
+  adminSelectorsListRoute: typeof adminSelectorsListRoute
   adminRealmsListRoute: typeof adminRealmsListRoute
   adminRepositoriesListRoute: typeof adminRepositoriesListRoute
+  adminRolesListRoute: typeof adminRolesListRoute
   adminUsersListRoute: typeof adminUsersListRoute
+  adminSelectorsEditRoute: typeof adminSelectorsEditRoute
+  adminSelectorsCreateRoute: typeof adminSelectorsCreateRoute
   adminRealmsEditRoute: typeof adminRealmsEditRoute
   adminRealmsCreateRoute: typeof adminRealmsCreateRoute
   adminRepositoriesEditRoute: typeof adminRepositoriesEditRoute
   adminRepositoriesCreateRoute: typeof adminRepositoriesCreateRoute
+  adminRolesEditRoute: typeof adminRolesEditRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
   adminRepositoriesImportRoute: typeof adminRepositoriesImportRoute
   adminRepositoriesGroupMembersRoute: typeof adminRepositoriesGroupMembersRoute
@@ -408,13 +508,18 @@ interface AdminLayoutRouteChildren {
 
 const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminAdminHomeRoute: adminAdminHomeRoute,
+  adminSelectorsListRoute: adminSelectorsListRoute,
   adminRealmsListRoute: adminRealmsListRoute,
   adminRepositoriesListRoute: adminRepositoriesListRoute,
+  adminRolesListRoute: adminRolesListRoute,
   adminUsersListRoute: adminUsersListRoute,
+  adminSelectorsEditRoute: adminSelectorsEditRoute,
+  adminSelectorsCreateRoute: adminSelectorsCreateRoute,
   adminRealmsEditRoute: adminRealmsEditRoute,
   adminRealmsCreateRoute: adminRealmsCreateRoute,
   adminRepositoriesEditRoute: adminRepositoriesEditRoute,
   adminRepositoriesCreateRoute: adminRepositoriesCreateRoute,
+  adminRolesEditRoute: adminRolesEditRoute,
   adminUsersEditRoute: adminUsersEditRoute,
   adminRepositoriesImportRoute: adminRepositoriesImportRoute,
   adminRepositoriesGroupMembersRoute: adminRepositoriesGroupMembersRoute,

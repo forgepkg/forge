@@ -237,6 +237,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             "/roles/{id}",
             get(roles::get).patch(roles::update).delete(roles::delete),
         )
+        .route("/roles/{id}/users", get(roles::users))
         .route("/roles/{id}/grants", get(grants::list).put(grants::add))
         .route(
             "/roles/{id}/grants/{grant_id}",
@@ -255,10 +256,18 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(content_selectors::list).post(content_selectors::create),
         )
         .route(
+            "/content-selectors/match",
+            axum::routing::post(content_selectors::test_match),
+        )
+        .route(
             "/content-selectors/{id}",
             get(content_selectors::get)
                 .patch(content_selectors::update)
                 .delete(content_selectors::delete),
+        )
+        .route(
+            "/content-selectors/{id}/grants",
+            get(content_selectors::grants),
         )
         // --- 12.7: auth realm management -------------------------------------
         .route("/realms", get(realms::list).post(realms::create))
