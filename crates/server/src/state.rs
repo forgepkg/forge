@@ -54,8 +54,8 @@ pub struct AppState {
     /// Authorization decision service: every read/write/admin gate routes
     /// through this.
     pub authz: Authz,
-    /// Package-format registry, keyed by `Format::id()`: the built-in format
-    /// plugin (NuGet) and any loaded WebAssembly plugins.
+    /// Package-format registry, keyed by `Format::id()`: the format plugins
+    /// (NuGet).
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -139,10 +139,8 @@ impl Instance {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`] and its plugin. The built-in format plugin
-/// ([`crate::plugins::builtin`]: NuGet), Docker and raw are always
-/// there; WebAssembly plugins are added at startup
-/// ([`FormatRegistry::with_plugin`]).
+/// [`Format`] and its plugin: the built-in format plugin
+/// ([`crate::plugins::builtin`]: NuGet), Docker and raw.
 ///
 /// Docker ([`DOCKER_FORMAT`]) and raw ([`RAW_FORMAT`]) are installed but have
 /// no [`Format`]: their repositories hold images (manifests and blobs) or
@@ -152,8 +150,7 @@ impl Instance {
 /// them.
 pub struct FormatRegistry {
     formats: BTreeMap<String, Arc<dyn Format>>,
-    /// Every format's plugin (built in or WebAssembly), by format id: its
-    /// client protocol.
+    /// Every format's plugin, by format id: its client protocol.
     plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
 }
 
@@ -179,8 +176,7 @@ impl FormatRegistry {
     pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
         let id = format.id().to_string();
         if self.is_installed(&id) {
-            let built_in =
-                Self::is_native(&id) || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
+            let built_in = Self::is_native(&id) || self.plugins.contains_key(&id);
             return Err(if built_in {
                 format!("format {id:?} is built into this server")
             } else {
@@ -192,7 +188,7 @@ impl FormatRegistry {
     }
 
     /// Add a format plugin: its [`Format`] and its client protocol. Its id
-    /// must be free: a WebAssembly plugin never replaces a built-in format.
+    /// must be free: a plugin never replaces another format.
     pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
         let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
         self = self.with_format(format)?;
@@ -210,7 +206,7 @@ impl FormatRegistry {
         self.plugins.get(id).cloned()
     }
 
-    /// The plugin formats (built in and WebAssembly), by format id.
+    /// The plugin formats, by format id.
     pub fn plugins(&self) -> impl Iterator<Item = &Arc<forge_plugin::Plugin>> {
         self.plugins.values()
     }
@@ -456,9 +452,9 @@ impl AppState {
         self
     }
 
-    /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
-    /// next to the built-in formats. A plugin whose format id is taken
-    /// (a built-in plugin, or another plugin) is an error.
+    /// Install further format plugins next to the built-in formats (the
+    /// tests' own). A plugin whose format id is taken (a built-in plugin, or
+    /// another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
         let mut registry = FormatRegistry::new(self.config.nuget.limits());
         for plugin in plugins {

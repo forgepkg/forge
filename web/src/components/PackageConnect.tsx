@@ -13,7 +13,7 @@ interface Snippet {
  * The client commands for a repository of `format` at `url` (its
  * `/browse/repos` address), named `repo` in the client's configuration.
  * Push commands are left out unless `canPush`. A format without commands of
- * its own (a WebAssembly plugin's) gets the repository URL.
+ * its own gets the repository URL.
  */
 export function connectSnippets(
   format: string,

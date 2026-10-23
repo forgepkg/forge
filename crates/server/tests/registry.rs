@@ -817,7 +817,7 @@ async fn chunked_uploads_cache_the_blob_not_its_chunks() {
         common::pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            plugins_block: Some(format!(
+            extra_toml: Some(format!(
                 "[blob_cache]\npath = {:?}\nmax_bytes = 1048576\nmin_free_bytes = 0\n",
                 dir.path().join("cache").display().to_string()
             )),
@@ -2560,7 +2560,7 @@ async fn admin_validates_docker_repositories() {
         .iter()
         .find(|f| f["id"] == "docker")
         .expect("docker is listed");
-    assert_eq!(docker["builtin"], true);
+    assert!(docker.get("builtin").is_none(), "{docker}");
     assert_eq!(docker["kinds"], json!(["hosted", "proxy", "group"]));
     assert_eq!(docker["mount"], "/v2");
 
@@ -2600,7 +2600,7 @@ async fn confirming_a_blob_records_the_use_of_its_link() {
         common::pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            plugins_block: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
+            extra_toml: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
             ..Default::default()
         },
     )

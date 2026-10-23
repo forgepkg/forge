@@ -1,6 +1,4 @@
 /target
-# Format plugins build in their own workspaces (`cargo xtask plugins`).
-/plugins/*/target
 **/*.rs.bk
 Cargo.lock.orig
 .env

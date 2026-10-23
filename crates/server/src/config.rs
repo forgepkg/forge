@@ -63,11 +63,11 @@ pub struct Config {
     /// proxied packages.
     #[serde(default)]
     pub nuget: NugetConfig,
-    /// WebAssembly format plugins: further package formats loaded at startup
-    /// (see `docs/format-plugins.md`). None are loaded by default; the
-    /// built-in plugin (NuGet) needs no configuration here.
-    #[serde(default)]
-    pub plugins: PluginsConfig,
+    /// The removed `[plugins]` section (WebAssembly format plugins). The top
+    /// level accepts unknown keys, so without this a leftover section would
+    /// be ignored and the repositories of its formats would answer 503.
+    #[serde(default, rename = "plugins")]
+    removed_plugins: Option<serde::de::IgnoredAny>,
     /// Docker / OCI registry (`/v2`): size limits, registry tokens, upload
     /// and blob-link expiry.
     #[serde(default)]
@@ -1503,63 +1503,6 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
     forge_format_nuget::NupkgLimits::default().max_nuspec_compression_ratio
 }
 
-/// `plugins.*` — WebAssembly format plugins.
-///
-/// The format plugin built into the server (NuGet) is always installed.
-/// Further ones are WebAssembly components, each listed explicitly with the
-/// SHA-256 of its component: a directory under `dir` that is not listed is
-/// never loaded, and a listed one whose component does not match its pin, or
-/// whose id is taken by a built-in format, fails startup. Every instance must
-/// therefore load the same plugins (the same configuration and files), since
-/// a repository of a format an instance lacks is unavailable there.
-///
-/// ```toml
-/// [plugins]
-/// dir = "/etc/forge/plugins"     # holds <id>/plugin.toml + its component
-///
-/// [plugins.formats]
-/// example = "sha256:3f1c…"       # format id → pinned component digest
-/// ```
-///
-/// As environment variables: `FORGE_PLUGINS__DIR`,
-/// `FORGE_PLUGINS__FORMATS__EXAMPLE`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginsConfig {
-    /// Directory with one subdirectory per plugin, named by its format id.
-    #[serde(default)]
-    pub dir: Option<std::path::PathBuf>,
-    /// The plugins to load: format id → SHA-256 of its component (lowercase
-    /// hex, optionally prefixed `sha256:`).
-    #[serde(default)]
-    pub formats: std::collections::BTreeMap<String, String>,
-}
-
-impl PluginsConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        if self.formats.is_empty() {
-            return Ok(());
-        }
-        if self.dir.is_none() {
-            return Err(ConfigError::Invalid(
-                "plugins.formats lists plugins but plugins.dir is not set".into(),
-            ));
-        }
-        for (id, sha256) in &self.formats {
-            forge_plugin::manifest::validate_id(id)
-                .map_err(|e| ConfigError::Invalid(format!("plugins.formats.{id}: {e}")))?;
-            let hex = sha256.trim();
-            let hex = hex.strip_prefix("sha256:").unwrap_or(hex);
-            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ConfigError::Invalid(format!(
-                    "plugins.formats.{id} must be the component's SHA-256 (64 hex digits)"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
 /// `web.*` — static SPA serving.
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
@@ -2265,10 +2208,16 @@ impl Config {
         self.validate_crypto()?;
         self.proxy.validate()?;
         self.nuget.validate()?;
-        self.plugins.validate()?;
         self.docker.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
+        if self.removed_plugins.is_some() {
+            return Err(ConfigError::Invalid(
+                "plugins was removed: Forge loads no WebAssembly format plugins, only its \
+                 built-in formats. Remove the [plugins] section (FORGE_PLUGINS__*)"
+                    .into(),
+            ));
+        }
         if self.server.removed_max_upload_bytes.is_some() {
             return Err(ConfigError::Invalid(
                 "server.max_upload_bytes was removed: set each repository's upload limit \
@@ -4163,9 +4112,17 @@ mod tests {
             );
         }
 
-        // `[plugins.max_upload_bytes]` is gone: limits are per repository.
-        let per_format = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nnuget = 4096\n");
-        assert!(Config::from_figment(fig_from_toml(&per_format)).is_err());
+        // `[plugins]` is gone with WebAssembly plugins.
+        for plugins in [
+            "[plugins.max_upload_bytes]\nnuget = 4096\n",
+            "[plugins]\ndir = \"/etc/forge/plugins\"\n",
+            "[plugins.formats]\nexample = \"sha256:00\"\n",
+        ] {
+            let err = Config::from_figment(fig_from_toml(&format!("{MINIMAL}\n{plugins}")))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("plugins was removed"), "{err}");
+        }
     }
 
     #[test]

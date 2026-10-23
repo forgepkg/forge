@@ -34,9 +34,9 @@ without stored API keys through Forge's **direct-token OIDC trusted-publishing**
 flow for GitHub Actions, GitLab CI, and compatible workload issuers; its bearer
 token, cache, and audit limitations are documented below.
 A **retention** engine reaps cold versions and garbage-collects dereferenced
-blobs. **Format plugins** (preview) add further package formats that reuse all
-of the above, either built into the server or loaded as sandboxed WebAssembly
-components ([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
+blobs. **Format plugins** (preview), crates built into the server, add
+further package formats that reuse all of the above
+([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
 a **TanStack Router SPA** served by the same Rust process on a single origin —
 there is no Node server in production.
 
@@ -51,12 +51,12 @@ A Cargo workspace of small crates plus the web SPA:
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
-| `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait, its WIT twin and the component glue. |
-| `plugin` | `forge-plugin` | The host side of format plugins: built-in and WebAssembly plugins (Wasmtime) behind one trait. |
+| `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
+| `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
 | `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, raw file repositories (`/raw`), `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
-| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), and `helm`, the example plugin the plugin tests run (not built in). |
+| `plugins/` | `forge-format-*` | Format plugins, built into the server: `nuget`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
@@ -206,8 +206,7 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/raw/binaries/tools/1.0/t
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
   and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).
 - **[Format plugins](./docs/format-plugins.md)** — further package formats,
-  built in or as sandboxed WebAssembly components: design, operation, and
-  writing one.
+  built into the server: design, operation, and writing one.
 - **[Importing from Nexus](./docs/nexus-import.md)** — copy a Nexus hosted
   repository (NuGet, Docker) into Forge, with its publish dates:
   dry run, conflicts, resuming, and the cutover.

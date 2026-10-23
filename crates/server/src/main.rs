@@ -121,7 +121,6 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let plugins = forge_server::plugins::load(&config.plugins).context("load format plugins")?;
     // Registry (`/v2`) tokens are signed with one key shared by every
     // instance: docker.token_secret, or the install's generated key.
     let registry_keys =
@@ -130,10 +129,7 @@ async fn main() -> anyhow::Result<()> {
             .context("load the registry token key")?;
     let state = AppState::new(pool, blob_store, cache, config)
         .with_envelope(envelope)
-        .with_registry_keys(registry_keys)
-        .with_plugins(plugins)
-        .map_err(anyhow::Error::msg)
-        .context("install format plugins")?;
+        .with_registry_keys(registry_keys);
     let layer = principal_layer(&state)?;
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 

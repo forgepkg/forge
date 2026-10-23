@@ -1,16 +1,13 @@
 //! `plugin.toml`: what a plugin declares about itself, next to its crate's
-//! `Cargo.toml` (`plugins/<id>/plugin.toml`) and in an installed plugin
-//! directory.
+//! `Cargo.toml` (`plugins/<id>/plugin.toml`).
 //!
 //! ```toml
 //! [plugin]
-//! id = "helm"               # the format id repositories are created with
-//! name = "Helm charts"
-//! version = "0.1.0"         # the plugin's own version (informational)
+//! id = "nuget"              # the format id repositories are created with
+//! name = "NuGet"
+//! version = "1.0.0"         # the plugin's own version (informational)
 //! api = "0.3.0"             # the forge:format contract it is built against
-//! component = "helm.wasm"   # built as a component: its file, relative to
-//!                           # the directory (unused when built in)
-//! mount = "/repository"     # optional: served at {mount}/{repository}/…
+//! mount = "/v3"             # optional: served at {mount}/{repository}/…
 //! kinds = ["hosted", "group"] # optional: the repository kinds it supports
 //!                           # ("proxy" too, when it implements `upstream`)
 //!
@@ -19,14 +16,7 @@
 //! package_type = "application/octet-stream"
 //! manifest = "manifest"
 //! manifest_type = "application/octet-stream"
-//!
-//! [limits]                  # as a component; each capped by the host's maximum
-//! memory_mib = 64
-//! fuel = 2000000000
-//! timeout_ms = 2000
 //! ```
-
-use std::path::{Component, Path, PathBuf};
 
 use forge_plugin_api::RepositoryKind;
 use serde::Deserialize;
@@ -92,9 +82,6 @@ pub struct Manifest {
     pub api: String,
     /// Optional one-line description.
     pub description: Option<String>,
-    /// Path of the component, relative to the plugin directory (WebAssembly
-    /// plugins).
-    pub component: Option<PathBuf>,
     /// Where repositories of the format are served: `{mount}/{repository}/…`.
     pub mount: String,
     /// The repository kinds the format supports. `proxy` means the plugin
@@ -102,8 +89,6 @@ pub struct Manifest {
     pub kinds: Vec<RepositoryKind>,
     /// How a version's files are stored.
     pub assets: Assets,
-    /// Requested limits as a component (`None` → the host default).
-    pub limits: RequestedLimits,
 }
 
 /// The `[assets]` table: the names (within a version) and content types of
@@ -128,27 +113,12 @@ impl Default for Assets {
     }
 }
 
-/// The `[limits]` table.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestedLimits {
-    /// Memory ceiling per instance, in MiB: its linear memories and tables
-    /// together, and the most one call returns to the host.
-    pub memory_mib: Option<u64>,
-    /// Fuel (roughly, WebAssembly instructions) per call.
-    pub fuel: Option<u64>,
-    /// Wall-clock budget per call, in milliseconds.
-    pub timeout_ms: Option<u64>,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawManifest {
     plugin: RawPlugin,
     #[serde(default)]
     assets: Assets,
-    #[serde(default)]
-    limits: RequestedLimits,
 }
 
 #[derive(Deserialize)]
@@ -158,7 +128,6 @@ struct RawPlugin {
     name: String,
     version: String,
     api: String,
-    component: Option<String>,
     description: Option<String>,
     mount: Option<String>,
     kinds: Option<Vec<String>>,
@@ -177,18 +146,6 @@ impl Manifest {
                 p.api
             )));
         }
-        // The component is a file inside the plugin directory: a plain
-        // relative path, never `..`, absolute, or a drive/root prefix.
-        let component = p.component.map(|raw| {
-            let path = PathBuf::from(&raw);
-            if raw.is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_))) {
-                return Err(PluginError::Manifest(format!(
-                    "component {raw:?} must be a relative path inside the plugin directory"
-                )));
-            }
-            Ok(path)
-        });
-        let component = component.transpose()?;
         if p.name.trim().is_empty() {
             return Err(PluginError::Manifest("name must not be empty".into()));
         }
@@ -205,20 +162,10 @@ impl Manifest {
             version: p.version,
             api: p.api,
             description: p.description,
-            component,
             mount,
             kinds,
             assets: raw.assets,
-            limits: raw.limits,
         })
-    }
-
-    /// Read and parse `<dir>/plugin.toml`.
-    pub fn load(dir: &Path) -> Result<Self, PluginError> {
-        let path = dir.join("plugin.toml");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| PluginError::Io(format!("read {}: {e}", path.display())))?;
-        Self::parse(&text)
     }
 }
 
@@ -341,19 +288,14 @@ mod tests {
         name = "Helm charts"
         version = "0.1.0"
         api = "0.3.0"
-        component = "helm.wasm"
-
-        [limits]
-        memory_mib = 32
     "#;
 
     #[test]
     fn parses_a_manifest() {
         let m = Manifest::parse(GOOD).unwrap();
         assert_eq!(m.id, "helm");
-        assert_eq!(m.component, Some(PathBuf::from("helm.wasm")));
-        assert_eq!(m.limits.memory_mib, Some(32));
-        assert_eq!(m.limits.fuel, None);
+        assert_eq!(m.name, "Helm charts");
+        assert_eq!(m.description, None);
     }
 
     #[test]
@@ -377,19 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn refuses_components_outside_the_directory() {
-        for path in ["../helm.wasm", "/etc/passwd", "a/../../b.wasm", ""] {
-            let text = GOOD.replace("\"helm.wasm\"", &format!("{path:?}"));
-            assert!(Manifest::parse(&text).is_err(), "{path:?} accepted");
-        }
-        let text = GOOD.replace("\"helm.wasm\"", "\"lib/helm.wasm\"");
-        assert!(Manifest::parse(&text).is_ok());
-        // A built-in plugin needs none.
-        let text = GOOD.replace("component = \"helm.wasm\"", "");
-        assert_eq!(Manifest::parse(&text).unwrap().component, None);
-    }
-
-    #[test]
     fn mounts_kinds_and_assets_default_and_validate() {
         let m = Manifest::parse(GOOD).unwrap();
         assert_eq!(m.mount, DEFAULT_MOUNT);
@@ -398,8 +327,8 @@ mod tests {
 
         let with = |plugin_keys: &str, tables: &str| {
             let text = GOOD.replace(
-                "component = \"helm.wasm\"",
-                &format!("component = \"helm.wasm\"\n{plugin_keys}"),
+                "api = \"0.3.0\"",
+                &format!("api = \"0.3.0\"\n{plugin_keys}"),
             );
             Manifest::parse(&format!("{text}\n{tables}"))
         };
@@ -476,6 +405,8 @@ mod tests {
         // 0.1.0 was a preview that no release shipped.
         assert!(Manifest::parse(&GOOD.replace("api = \"0.3.0\"", "api = \"0.2.0\"")).is_err());
         assert!(Manifest::parse(&format!("{GOOD}\nunknown = 1\n")).is_err());
-        assert!(Manifest::parse(&GOOD.replace("memory_mib", "memory_gib")).is_err());
+        // What a WebAssembly component named is gone with it.
+        assert!(Manifest::parse(&format!("{GOOD}component = \"helm.wasm\"\n")).is_err());
+        assert!(Manifest::parse(&format!("{GOOD}\n[limits]\nmemory_mib = 32\n")).is_err());
     }
 }

@@ -82,10 +82,7 @@ lettre = { workspace = true }
 figment = { version = "0.10", features = ["toml", "env"] }
 
 [dev-dependencies]
-forge-plugin = { path = "../plugin", features = ["testing"] }
-# The example format plugin the format-plugin tests serve repositories with
-# (plugins/helm, not built in), and the chart archives they push to it.
-forge-format-helm = { path = "../../plugins/helm" }
+# Builds Helm chart archives for the registry tests.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }
 testcontainers = "0.27"
