@@ -147,7 +147,7 @@ curl -u admin:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories -d '{
     "name": "docker-hub", "kind": "proxy", "format": "docker",
     "remote_url": "https://registry-1.docker.io",
-    "upstream_username": "envisia", "upstream_password": "<docker hub token>"
+    "upstream_username": "<docker hub user>", "upstream_password": "<docker hub token>"
   }'
 docker pull forge.example.com/docker-hub/nginx:1.27
 ```
@@ -192,7 +192,7 @@ docker pull forge.example.com/docker-hub/nginx:1.27
 ```bash
 curl … /admin/repositories -d '{"name":"docker","kind":"group","format":"docker",
                                  "writable_member":"docker-hosted",
-                                 "reserved_prefixes":["envisia/"]}'
+                                 "reserved_prefixes":["acme/"]}'
 curl … /admin/repositories/docker/members -d '{"member":"docker-hosted","priority":10}'
 curl … /admin/repositories/docker/members -d '{"member":"docker-hub","priority":5}'
 docker pull forge.example.com/docker/nginx:1.27
@@ -209,7 +209,7 @@ docker pull forge.example.com/docker/nginx:1.27
   when it is renamed; once it is deleted, the group has no writable member
   until one is set again.
 - **Dependency-confusion guard**: an image under one of the group's
-  `reserved_prefixes` (namespaces such as `envisia/`) is never served by a
+  `reserved_prefixes` (namespaces such as `acme/`) is never served by a
   proxy member, and with `prefer_hosted` (on by default) neither is an image
   a hosted member already has. Flag trusted members as `owner` when hosted
   members have different writers, as for NuGet groups.

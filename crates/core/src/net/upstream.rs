@@ -356,7 +356,7 @@ impl UpstreamHttp {
             })
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
-            .user_agent(concat!("envisia-forge/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("forge/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(UpstreamHttp {
             client,

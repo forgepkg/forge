@@ -29,7 +29,7 @@ SAMPLE_LIB_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
   <metadata>
     <id>Sample.Lib</id>
     <version>1.02.3</version>
-    <authors>envisia</authors>
+    <authors>forge</authors>
     <description>A sample library fixture.</description>
     <dependencies>
       <group targetFramework="net8.0">
@@ -54,7 +54,7 @@ SAMPLE_LIB_WINNER_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
   <metadata>
     <id>Sample.Lib</id>
     <version>1.02.3</version>
-    <authors>envisia</authors>
+    <authors>forge</authors>
     <description>Group winner variant of Sample.Lib (distinct dependency).</description>
     <dependencies>
       <group targetFramework="net8.0">
@@ -72,7 +72,7 @@ OTHER_PKG_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
   <metadata>
     <id>Other.Package</id>
     <version>2.0.0-Beta.1</version>
-    <authors>envisia</authors>
+    <authors>forge</authors>
     <description>A second fixture with a different namespace.</description>
     <dependencies>
       <dependency id="Microsoft.Extensions.Logging" version="8.0.0" />

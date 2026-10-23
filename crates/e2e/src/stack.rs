@@ -155,57 +155,6 @@ async fn connect_migrated(db_url: &str) -> PgPool {
     pool
 }
 
-/// A [`Migrator`] over the workspace `migrations/` dir, optionally truncated to
-/// migrations with `version <= target`.
-async fn migrator_up_to(target: Option<i64>) -> sqlx::migrate::Migrator {
-    let mut m = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations"
-    )))
-    .await
-    .expect("load migrations");
-    if let Some(t) = target {
-        let subset: Vec<_> = m.iter().filter(|mig| mig.version <= t).cloned().collect();
-        m.migrations = std::borrow::Cow::Owned(subset);
-    }
-    m
-}
-
-/// `0007_rbac_migrate.sql` (the behavior-preserving data migration) carries
-/// version 7; bringing a DB up to 6 leaves the RBAC schema present but inert,
-/// exactly the state an upgrading slice-1 deployment is in before 0007 runs.
-const RBAC_MIGRATE_VERSION: i64 = 7;
-
-/// Bring a fresh DB up to the pre-RBAC-data schema (migrations `0001..0006`),
-/// run `seed` to inject slice-1-shaped rows (users with `is_admin`, repos with
-/// `anonymous_read`), then run the remaining migrations (`0007`). Because
-/// `app_user` is **non-empty** when `0007` runs, the data migration detects an
-/// UPGRADE and preserves slice-1 open-access behavior — faithfully reproducing
-/// what an upgrading deployment experiences, end-to-end through a real server.
-async fn connect_migrated_upgrade<F, Fut>(db_url: &str, seed: F) -> PgPool
-where
-    F: FnOnce(PgPool) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(db_url)
-        .await
-        .expect("connect fresh db");
-    migrator_up_to(Some(RBAC_MIGRATE_VERSION - 1))
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
-    seed(pool.clone()).await;
-    migrator_up_to(None)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0007 (upgrade)");
-    pool
-}
-
 async fn blob_store() -> BlobStore {
     let endpoint = s3_endpoint().await.to_string();
     let store = BlobStore::new(S3Config {
@@ -502,26 +451,6 @@ impl StackBuilder {
     pub async fn start(self) -> TestServer {
         let db_url = fresh_database().await;
         let pool = connect_migrated(&db_url).await;
-        self.serve(db_url, pool, true).await
-    }
-
-    /// Boot a stack over a DB that was migrated as an **upgrade** from a slice-1
-    /// deployment: migrations `0001..0006` run, then `seed` injects slice-1-shaped
-    /// rows (users with `is_admin`, repos with `anonymous_read`) while RBAC is
-    /// still inert, then `0007` runs and — seeing a non-empty `app_user` — detects
-    /// an upgrade and preserves slice-1 open access. Used by the
-    /// UPGRADE-PRESERVES-BEHAVIOR e2e scenario.
-    ///
-    /// `seed` receives a pool over the upgrading DB. The bootstrap admin is still
-    /// created normally afterwards (and additionally inherits the `admin` role via
-    /// the now-applied migration).
-    pub async fn start_upgrade_seeded<F, Fut>(self, seed: F) -> TestServer
-    where
-        F: FnOnce(PgPool) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        let db_url = fresh_database().await;
-        let pool = connect_migrated_upgrade(&db_url, seed).await;
         self.serve(db_url, pool, true).await
     }
 

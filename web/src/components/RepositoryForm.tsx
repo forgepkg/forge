@@ -774,7 +774,7 @@ export function RepositoryForm({
             {isDocker ? (
               <Description>
                 Image names starting with one of these — namespaces such as{' '}
-                <code>envisia/</code> — are never served from proxy members,
+                <code>acme/</code> — are never served from proxy members,
                 also before the first internal image is pushed. Comma
                 separated.
               </Description>
@@ -789,7 +789,7 @@ export function RepositoryForm({
               name="reserved_prefixes"
               value={values.reserved_prefixes}
               onChange={(e) => set('reserved_prefixes', e.target.value)}
-              placeholder={isDocker ? 'envisia/, team/' : 'Acme., Contoso.Internal.'}
+              placeholder={isDocker ? 'acme/, team/' : 'Acme., Contoso.Internal.'}
             />
           </Field>
           {isDocker && (

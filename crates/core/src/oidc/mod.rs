@@ -188,28 +188,16 @@ pub async fn resolve_user(
 
     // 3. Auto-provision a fresh, password-less user, then link.
     if policy.auto_provision {
-        let user = match provision_oidc_user(pool, login, mapped, policy).await? {
+        return match provision_oidc_user(pool, login, mapped, policy).await? {
             Provisioned::New(user) => {
-                finalize(pool, user, login, &identity_claims, mapped, true).await?
+                finalize(pool, user, login, &identity_claims, mapped, true).await
             }
             // A concurrent first login provisioned and linked the identity
             // while this one was still looking for a free username.
             Provisioned::AlreadyLinked(user) => {
-                finalize(pool, user, login, &identity_claims, mapped, false).await?
+                finalize(pool, user, login, &identity_claims, mapped, false).await
             }
         };
-        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
-        // freshly auto-provisioned OIDC user must inherit the `authenticated` role
-        // immediately so it has the slice-1 "read/write everywhere" reach —
-        // `ensure_legacy_rbac` runs only once per install. The
-        // assignment is idempotent and gated on the install-wide flag, so a fresh
-        // (fail-closed) install leaves the user with no automatic grants. (When
-        // a concurrent login won the link, this is the winner's account, for
-        // which the assignment is equally due — and idempotent.)
-        authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
-            .await
-            .map_err(|e| ResolveError::Db(e.to_string()))?;
-        return Ok(user);
     }
 
     // 4. No link, no match, no provisioning → reject.

@@ -1,4 +1,4 @@
-//! envisia-forge task runner — the single entry point for local dev + CI-adjacent
+//! Forge task runner — the single entry point for local dev + CI-adjacent
 //! chores. Replaces the former Makefile + Justfile.
 //!
 //! Run `cargo xtask help` (or `cargo xtask` with no args) for the command list.
@@ -105,7 +105,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     print!(
-        r#"envisia-forge task runner (cargo xtask <command>)
+        r#"Forge task runner (cargo xtask <command>)
 
 One-command dev:
   dev [--db local|docker|none]  Bring up infra, run forge-server + Vite HMR.
@@ -876,14 +876,7 @@ fn plugins_check() -> Result<(), String> {
 /// not need a live DB.
 fn docker_build() -> Result<(), String> {
     Cmd::new("docker")
-        .args([
-            "build",
-            "-t",
-            "envisia-forge:latest",
-            "-f",
-            "Dockerfile",
-            ".",
-        ])
+        .args(["build", "-t", "forge:latest", "-f", "Dockerfile", "."])
         .run()
 }
 

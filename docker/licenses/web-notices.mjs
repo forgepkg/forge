@@ -60,7 +60,7 @@ const out = [
   "",
   "The web UI (/app/web/dist) is built from the third-party npm packages listed",
   "below, the production dependencies of web/package.json, each under the",
-  "license given with it. The license of envisia-forge itself is in LICENSE,",
+  "license given with it. The license of Forge itself is in LICENSE,",
   "next to this file.",
   "",
   "Generated from `pnpm licenses list --prod` and the packages' license files",

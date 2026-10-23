@@ -149,28 +149,12 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(e) => return db_error(e),
     };
 
-    // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a brand
-    // new authenticated user must inherit the `authenticated` role *now* —
-    // `ensure_legacy_rbac` runs only once per install, so otherwise a freshly
-    // created user would silently lose the slice-1 "read/write everywhere"
-    // behavior. Fail-closed installs leave the flag false and skip
-    // this. Idempotent.
     // An admin created here holds the built-in `admin` role as well as the
     // legacy flag, so the role-assignment API sees (and can revoke) it.
     if u.is_admin {
         if let Err(e) = authz_dao::sync_admin_role(&state.pool, u.id, true).await {
             return db_error(e);
         }
-    }
-
-    match authz_dao::assign_authenticated_if_legacy_open(&state.pool, u.id).await {
-        Ok(true) => {
-            // No cached effective set should exist for a just-created id, but
-            // invalidate defensively in case the id was reused within a TTL window.
-            forge_core::authz::cache::invalidate_user(&state.cache, u.id).await;
-        }
-        Ok(false) => {}
-        Err(e) => return db_error(e),
     }
 
     (StatusCode::CREATED, Json(UserView::from(&u))).into_response()

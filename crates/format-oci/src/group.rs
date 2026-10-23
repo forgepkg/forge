@@ -4,7 +4,7 @@
 //! group grants nothing on its members), and an offline hosted member is
 //! skipped. The dependency-confusion guard of NuGet groups applies to image
 //! names: an image under one of the group's `reserved_prefixes` (e.g.
-//! `envisia/`), or — with `prefer_hosted`, the default — an image an owning
+//! `acme/`), or — with `prefer_hosted`, the default — an image an owning
 //! member already has, is never served by a proxy member. Owners are the
 //! members flagged `owner`, or every hosted member when none is, decided
 //! over the whole group whatever the caller may read: a caller without read

@@ -1,6 +1,6 @@
-# Developing & running envisia-forge locally
+# Developing & running Forge locally
 
-envisia-forge is a NuGet, Docker / OCI and Helm registry written in Rust.
+Forge is a NuGet, Docker / OCI and Helm registry written in Rust.
 Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 (metadata) and an **S3-compatible** object store (blobs) — both provided by
 `docker-compose.yml` (versitygw stands in for S3).
@@ -209,7 +209,8 @@ password supplied to NuGet should be a **token**.
   points at on a different host — and must not be embedded in `remote_url`.
   NuGet V2-only feeds cannot be proxied. Version listings are refreshed at
   most once per `metadata_ttl_seconds`; a failing upstream degrades to what
-  is already cached.
+  is already cached, and for a minute after a listing failed, ids with
+  cached versions are answered from the cache without asking it again.
 - **group** — `{"name":"all","kind":"group"}`, then
   `POST /admin/repositories/all/members` with `{"member":"nuget","priority":100}`
   (higher priority wins ties). A member that errors (e.g. an unreachable
@@ -718,7 +719,7 @@ the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
 are bumped by hand (tag and digest, from the registry's index of the tag).
 
 ```bash
-cargo xtask docker-build       # docker build -t envisia-forge:latest .
+cargo xtask docker-build       # docker build -t forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
 ```
 
@@ -856,18 +857,83 @@ and Dependabot's:
   pull request's branch go through as before, and they can still merge a
   stacked pull request, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
-  token has to be added to the bypass list.
+  token, such as the stack App below, has to be added to the bypass list.
 
 CI runs only on pull requests that target `main`, so a stacked pull request
 runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
 on every pull request above it. When a pull request is retargeted to `main`,
-the `Stack` workflow starts CI on its branch, with `main` as its `base`, so
-it runs the jobs the pull request's change needs, as a pull request run
-does. That run checks the branch as it is, not its merge with `main`; the
-next push, and the merge queue, check the merge. To check a stacked branch
-earlier, run CI on it by hand: **Actions → CI → Run workflow**, or
-`gh workflow run ci.yml --ref <branch> -f base=main`.
-A pull request from a fork gets no such run: a push to it starts CI.
+the `Stack` workflow merges `main` into its branch, as the pull request's
+**Update branch** button does, and that push runs CI on the pull request.
+A retarget alone starts no CI run, and a manual run's checks would not
+count: GitHub shows a pull request only the checks of `pull_request`,
+`push` and a few other runs, and only those satisfy its required checks.
+The workflow pushes the merge with a GitHub App's token, since a push with
+a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
+workflow warns, and the **Update branch** button starts CI instead. When
+`main` does not merge cleanly, the `stack-status` check fails: merge `main`
+by hand and push.
+
+To set up the stack App:
+
+1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
+   GitHub App**), without a webhook, with the repository permissions
+   **Contents**, **Pull requests** and **Workflows**, each **Read and
+   write**. Install it on this repository only.
+2. Generate a private key for it. Save the App's client ID as the repository
+   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
+   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
+3. If the stacked pull requests ruleset is active, add the App to its bypass
+   list, or it refuses the merge on the pull request's branch.
+
+The App's merge, like the button's, dismisses the pull request's approvals
+under a rule that dismisses stale ones.
+
+To check a stacked branch before its retarget, run CI on it by hand:
+**Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
+branch with the commit it forked off `main`, so it runs the jobs the pull
+request's change needs; its results show under **Actions**, not on the pull
+request. A pull request from a fork gets no merge: a push to it starts CI.
+
+## Code scanning (CodeQL)
+
+CodeQL code scanning runs as an advanced setup, the `CodeQL` workflow
+(`.github/workflows/codeql.yml`) with its configuration
+`.github/codeql/codeql-config.yml`. GitHub's default setup has to stay off
+(**CodeQL analysis** under code scanning in the repository's security
+settings): while it is on, GitHub refuses the workflow's uploads.
+
+The workflow analyzes three languages, each without a build, and a language
+only when a change touches its code:
+
+| Language | Paths |
+|---|---|
+| `rust` | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
+| `javascript-typescript` | `web/`, and every `.js`, `.cjs`, `.mjs`, `.ts` and `.tsx` file |
+| `actions` | `.github/workflows/`, and every `action.yml` and `action.yaml` |
+
+A pull request that targets `main` is compared with its base branch, and a
+push to `main` with `main`'s previous commit. A change to the workflow or to
+`.github/codeql/` analyzes every language, and so do the weekly run and a
+manual run (**Actions → CodeQL → Run workflow**), so that a newer CodeQL's
+queries also look at code no change touched. A language a push to `main`
+leaves out keeps the alerts of its last analysis there, which the Security
+tab shows. The Rust analysis is by far the slowest, so a change to the web UI
+or the docs no longer waits for it. CodeQL is not among `main`'s required
+checks (see above), and the merge queue does not run it.
+
+Tests are not analyzed. Their fixed passwords and keys and their plain-http
+URLs to local test servers are on purpose, and an alert for each would only
+be dismissed by hand. The configuration's `paths-ignore` leaves out the test
+directories (`**/tests`, `crates/e2e`, `web/e2e`), the web UI's
+`*.test.ts(x)` and test runner configuration, the `testing` helpers of
+`crates/plugin` and `crates/plugin-api`, and `fixtures/`. The unit tests
+inside the Rust source files (`#[cfg(test)] mod tests`) cannot be left out by
+path; the Rust extractor compiles the code with `cfg(test)` off instead
+(`CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test`), as a release build
+does. Add a new test directory or test helper outside these to `paths-ignore`.
+The repository's one Python file, `fixtures/nuget/make_fixtures.py`, makes
+test packages, so Python is not analyzed at all.
 
 ## Changelog entries
 

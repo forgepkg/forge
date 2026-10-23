@@ -1,4 +1,4 @@
-//! `forge-e2e` — end-to-end test harness for envisia-forge.
+//! `forge-e2e` — end-to-end test harness for Forge.
 //!
 //! The whole crate is gated behind the `forge-e2e` feature so a plain
 //! `cargo build/test --workspace` never compiles testcontainers or touches

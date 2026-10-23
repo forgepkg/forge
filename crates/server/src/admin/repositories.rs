@@ -340,7 +340,7 @@ const MAX_RESERVED_PREFIXES: usize = 100;
 /// Validate and normalize a group's reserved id prefixes: each is a NuGet id
 /// prefix (`A-Z a-z 0-9 . _ -`, at most 100 bytes, an optional trailing `*`
 /// dropped), stored lowercase, deduplicated. A docker group's prefixes are
-/// image-name prefixes and may contain `/` (a namespace such as `envisia/`).
+/// image-name prefixes and may contain `/` (a namespace such as `acme/`).
 fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, String> {
     if raw.len() > MAX_RESERVED_PREFIXES {
         return Err(format!(

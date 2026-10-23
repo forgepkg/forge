@@ -124,7 +124,7 @@ function Login() {
           >
             ef
           </span>
-          <Heading className="!text-2xl">envisia&nbsp;forge</Heading>
+          <Heading className="!text-2xl">Forge</Heading>
           <Text>Sign in to the package registry</Text>
         </div>
 

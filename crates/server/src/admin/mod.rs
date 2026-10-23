@@ -17,7 +17,6 @@
 //! * [`members`] — group membership management.
 //! * [`crypto`] — secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
-//! * [`settings`] — install-wide switches (`legacy_open_access`).
 //! * [`blob_cache`] — the local blob cache's statistics.
 //! * [`proxy_cache`] — invalidating what a proxy repository cached from its
 //!   upstream (its "not found" answers, listings and documents).
@@ -50,7 +49,6 @@ pub mod realms;
 pub mod repositories;
 pub mod retention;
 pub mod roles;
-pub mod settings;
 pub mod token_scope;
 pub mod tokens;
 pub mod user_roles;
@@ -279,10 +277,6 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::post(realms::convert_to_local),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
-        .route(
-            "/settings/legacy-open-access",
-            get(settings::get_legacy_open_access).put(settings::put_legacy_open_access),
-        )
         .route("/users/{id}/effective", get(effective::for_user))
         .route("/anonymous/effective", get(effective::for_anonymous))
         // --- secret encryption at rest -------------------------------------

@@ -1,4 +1,4 @@
-# envisia-forge configuration (TOML form).
+# Forge configuration (TOML form).
 #
 # Copy this to `forge.toml` (loaded automatically if present in the working
 # directory) or point $FORGE_CONFIG at it (the file must then exist: a missing

@@ -822,112 +822,14 @@ async fn cross_instance_cache_invalidation_on_grant_change() {
     );
 }
 
-// ── upgrade preserves behavior / fresh defaults closed ──────────────────────
-
-/// UPGRADE-PRESERVES-BEHAVIOR: a DB seeded slice-1-style (a pre-existing user,
-/// repos with `anonymous_read`) upgraded through the data migration keeps the
-/// pre-existing user reading/writing everywhere (the `authenticated` role) and
-/// keeps anonymous reading the `anonymous_read` repos — end-to-end over HTTP.
-#[tokio::test]
-async fn upgrade_preserves_slice1_behavior_over_http() {
-    // The pre-existing user's plaintext password is irrelevant to the RBAC test
-    // (we mint a token for it through the admin API after boot), so the seeded
-    // password_hash can be a placeholder.
-    let srv = StackBuilder::default()
-        .anon(AnonMode::All)
-        .start_upgrade_seeded(|pool| async move {
-            // A slice-1 deployment: one normal user + a public (anonymous_read)
-            // repo + a private one — seeded while RBAC is inert (pre-0007).
-            sqlx::query(
-                "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('legacy-user', 'x', false)",
-            )
-            .execute(&pool)
-            .await
-            .expect("seed legacy user");
-            sqlx::query(
-                "INSERT INTO repository (name, kind, anonymous_read) VALUES ('up-pub', 'hosted', true)",
-            )
-            .execute(&pool)
-            .await
-            .expect("seed public repo");
-            sqlx::query(
-                "INSERT INTO repository (name, kind, anonymous_read) VALUES ('up-priv', 'hosted', false)",
-            )
-            .execute(&pool)
-            .await
-            .expect("seed private repo");
-        })
-        .await;
-
-    // The upgrade must have recorded open access.
-    assert!(
-        forge_db::authz_dao::legacy_open_access(&srv.pool)
-            .await
-            .expect("flag"),
-        "upgrade must record legacy_open_access = true"
-    );
-
-    // The pre-existing user keeps read+write everywhere via `authenticated`. Mint
-    // a token for it through the admin API (it now holds the authenticated role).
-    let legacy_id = forge_db::user_dao::find_user_by_username(&srv.pool, "legacy-user")
-        .await
-        .expect("lookup")
-        .expect("legacy user present")
-        .id;
-    let token = srv.issue_token(legacy_id, None).await;
-
-    assert_eq!(
-        srv.read_index_with_token("up-priv", &token).await,
-        StatusCode::OK,
-        "an upgraded existing user keeps reading every repo (slice-1 open access)"
-    );
-    assert_eq!(
-        srv.push_nupkg_with_token("up-pub", &token, make_nupkg("Up.Pkg", "1.0.0"))
-            .await
-            .status(),
-        201,
-        "an upgraded existing user keeps writing every repo"
-    );
-
-    // Anonymous keeps reading the anonymous_read repo (the migration converted the
-    // flag into an anonymous-role grant) but not the private one.
-    let resp = srv
-        .client()
-        .get(format!("{}/v3/up-pub/index.json", srv.base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "anonymous keeps reading the previously-anonymous_read repo"
-    );
-    let resp = srv
-        .client()
-        .get(format!("{}/v3/up-priv/index.json", srv.base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        401,
-        "anonymous is still denied the private repo"
-    );
-}
+// ── fresh defaults closed ───────────────────────────────────────────────────
 
 /// FRESH-DEFAULTS-CLOSED: a fresh install denies a newly-created roleless user
 /// (deny-by-default). The bootstrap admin still works (admin role). This is the
 /// security-by-default counterpart to the upgrade scenario.
 #[tokio::test]
 async fn fresh_install_defaults_closed_over_http() {
-    let srv = start_stack().await; // fresh install ⇒ legacy_open_access = false
-
-    assert!(
-        !forge_db::authz_dao::legacy_open_access(&srv.pool)
-            .await
-            .expect("flag"),
-        "fresh install must record legacy_open_access = false"
-    );
+    let srv = start_stack().await;
 
     assert_eq!(
         srv.create_repo(serde_json::json!({"name": "fresh-repo", "kind": "hosted"}))
@@ -1129,92 +1031,5 @@ async fn signed_in_user_gets_no_public_reach_when_anonymous_access_is_off() {
     assert_eq!(
         srv.read_index_with_token("l6-off", &token).await,
         StatusCode::FORBIDDEN
-    );
-}
-
-// ── upgraded installs: switching the legacy behavior off (M20) ─────────────
-
-/// On an upgraded install: turning a repository's `anonymous_read` off really
-/// ends anonymous access (the synthesized anonymous grant is deleted too), and
-/// switching `legacy_open_access` off stops new users from inheriting the
-/// `authenticated` role while existing users keep it.
-#[tokio::test]
-async fn upgrade_legacy_access_can_be_switched_off_over_http() {
-    let srv = StackBuilder::default()
-        .anon(AnonMode::All)
-        .start_upgrade_seeded(|pool| async move {
-            sqlx::query(
-                "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('legacy-user', 'x', false)",
-            )
-            .execute(&pool)
-            .await
-            .expect("seed legacy user");
-            sqlx::query(
-                "INSERT INTO repository (name, kind, anonymous_read) VALUES ('up-pub', 'hosted', true)",
-            )
-            .execute(&pool)
-            .await
-            .expect("seed public repo");
-        })
-        .await;
-    let (u, p) = srv.admin_basic();
-    let client = srv.client();
-    let index = format!("{}/v3/up-pub/index.json", srv.base_url);
-    assert_eq!(client.get(&index).send().await.unwrap().status(), 200);
-
-    // anonymous_read off ⇒ anonymous is denied (flag *and* grant are gone).
-    let resp = client
-        .put(format!("{}/admin/repositories/up-pub", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .json(&serde_json::json!({"anonymous_read": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        client.get(&index).send().await.unwrap().status(),
-        401,
-        "turning anonymous_read off ends anonymous access on an upgraded install"
-    );
-
-    // While legacy open access is on, a new user reads everything.
-    let settings = format!("{}/admin/settings/legacy-open-access", srv.base_url);
-    let state: Value = client
-        .get(&settings)
-        .basic_auth(&u, Some(&p))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(state, serde_json::json!({"enabled": true}));
-    let before = srv.create_user("before-switch", "pw").await;
-    let before_token = srv.issue_token(before, None).await;
-    assert_eq!(
-        srv.read_index_with_token("up-pub", &before_token).await,
-        StatusCode::OK
-    );
-
-    // Switch it off: the next new user is deny-by-default.
-    let resp = client
-        .put(&settings)
-        .basic_auth(&u, Some(&p))
-        .json(&serde_json::json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let after = srv.create_user("after-switch", "pw").await;
-    let after_token = srv.issue_token(after, None).await;
-    assert_eq!(
-        srv.read_index_with_token("up-pub", &after_token).await,
-        StatusCode::FORBIDDEN,
-        "new users no longer inherit `authenticated`"
-    );
-    assert_eq!(
-        srv.read_index_with_token("up-pub", &before_token).await,
-        StatusCode::OK,
-        "existing assignments are left to the operator"
     );
 }
