@@ -169,7 +169,11 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   `not_found_ttl_seconds` (default 60).
 - Multi-arch indexes are cached as they are; each platform's manifest and
   layers are fetched when a client asks for them. Tag lists and referrers
-  come from the upstream, or from the cache while it is unreachable.
+  come from the upstream, or from the cache while it is unreachable. A tag
+  list follows the upstream's own pages (`Link: rel="next"`, up to 10
+  requests) to fill the client's page, and links to the next page when the
+  upstream has more; an upstream that refuses a large `n` is asked without
+  one.
 - An offline proxy (`"online": false`) serves only what it cached. Pointing a
   proxy at another `remote_url` empties its cache.
 - To ask the upstream again before those TTLs run out (a tag moved, an image

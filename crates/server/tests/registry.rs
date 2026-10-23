@@ -1312,6 +1312,13 @@ struct MockRegistry {
     blob_gets: AtomicUsize,
     token_requests: AtomicUsize,
     base: Mutex<String>,
+    /// Tag lists: at most this many tags per page, with a `Link` to the
+    /// next one.
+    tag_page: Mutex<Option<usize>>,
+    /// Tag lists: answer an `n` above this with 400.
+    max_tags_n: Mutex<Option<usize>>,
+    /// The query of every tag list request.
+    tag_queries: Mutex<Vec<String>>,
 }
 
 impl MockRegistry {
@@ -1436,6 +1443,22 @@ impl MockRegistry {
                 body.into_response()
             }
             Some(forge_oci::path::Endpoint::TagsList { name }) => {
+                let query = req.uri().query().unwrap_or_default().to_string();
+                self.tag_queries.lock().unwrap().push(query.clone());
+                let mut n: Option<usize> = None;
+                let mut last: Option<String> = None;
+                for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                    match key.as_ref() {
+                        "n" => n = value.parse().ok(),
+                        "last" => last = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if n.zip(*self.max_tags_n.lock().unwrap())
+                    .is_some_and(|(n, max)| n > max)
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
                 let mut tags: Vec<String> = self
                     .manifests
                     .lock()
@@ -1443,13 +1466,166 @@ impl MockRegistry {
                     .keys()
                     .filter_map(|k| k.strip_prefix(&format!("{name}:")).map(str::to_string))
                     .filter(|t| !t.starts_with("sha256:"))
+                    .filter(|t| last.as_ref().is_none_or(|l| t > l))
                     .collect();
                 tags.sort();
-                axum::Json(json!({"name": name, "tags": tags})).into_response()
+                let page = match (n, *self.tag_page.lock().unwrap()) {
+                    (Some(n), Some(cap)) => Some(n.min(cap)),
+                    (n, cap) => n.or(cap),
+                };
+                let mut resp_headers = HeaderMap::new();
+                if let Some(page) = page.filter(|&page| tags.len() > page) {
+                    tags.truncate(page);
+                    let next = format!(
+                        "</v2/{name}/tags/list?n={page}&last={}>; rel=\"next\"",
+                        tags.last().unwrap()
+                    );
+                    resp_headers.insert(header::LINK, next.parse().unwrap());
+                }
+                (
+                    resp_headers,
+                    axum::Json(json!({"name": name, "tags": tags})),
+                )
+                    .into_response()
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
+}
+
+/// A proxy's tag list follows the upstream's own pages (`Link:
+/// rel="next"`) to fill the client's page, and passes on that there are
+/// more; an upstream that refuses a large `n` is asked without one (#216).
+#[tokio::test]
+async fn proxy_tag_lists_follow_the_upstream_pages() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let manifest = image(&config("amd64"), &[b"paged layer"]);
+    for i in 0..7 {
+        mock.put("team/paged", &format!("t{i}"), OCI_MANIFEST, &manifest);
+    }
+    *mock.tag_page.lock().unwrap() = Some(3);
+    *mock.max_tags_n.lock().unwrap() = Some(1000);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/team/paged");
+
+    let resp = oci.get(&name, "tags/list?n=5").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{name}/tags/list?n=5&last=t4>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t0", "t1", "t2", "t3", "t4"]));
+    let resp = oci.get(&name, "tags/list?n=5&last=t4").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t5", "t6"]));
+
+    // Without `n`: Forge's default page is more than this upstream allows.
+    mock.tag_queries.lock().unwrap().clear();
+    let resp = oci.get(&name, "tags/list").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["tags"],
+        json!(["t0", "t1", "t2", "t3", "t4", "t5", "t6"])
+    );
+    assert_eq!(
+        *mock.tag_queries.lock().unwrap(),
+        ["n=10001", "", "n=3&last=t2", "n=3&last=t5"]
+    );
+}
+
+/// An upstream that pages in steps too small to fill a page within the
+/// pages a proxy follows: the proxy passes on that there are more, and a
+/// group holding it ends its page at the proxy's last tag, so the next
+/// page lists what the proxy left out before any later tag of another
+/// member (#216).
+#[tokio::test]
+async fn group_tag_lists_end_where_a_member_left_tags_out() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let manifest = image(&config("amd64"), &[b"many layer"]);
+    for i in 0..12 {
+        mock.put("team/many", &format!("t{i:02}"), OCI_MANIFEST, &manifest);
+    }
+    *mock.tag_page.lock().unwrap() = Some(1);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let hosted = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    // Served from both members (with `prefer_hosted`, the hosted image
+    // would hide the proxy's).
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker", "prefer_hosted": false}),
+    )
+    .await;
+    for (member, priority) in [(&hosted, 2), (&proxy, 1)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    }
+    let oci = admin_oci(&srv).await;
+    oci.push_image(
+        &format!("{hosted}/team/many"),
+        "zz",
+        "amd64",
+        b"hosted many",
+    )
+    .await;
+
+    let first_ten: Vec<String> = (0..10).map(|i| format!("t{i:02}")).collect();
+    let resp = oci.get(&format!("{proxy}/team/many"), "tags/list").await;
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{proxy}/team/many/tags/list?n=10000&last=t09>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(first_ten));
+
+    let name = format!("{group}/team/many");
+    let resp = oci.get(&name, "tags/list").await;
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{name}/tags/list?n=10000&last=t09>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["tags"],
+        json!(first_ten),
+        "zz waits for the proxy's rest"
+    );
+    let resp = oci.get(&name, "tags/list?n=10000&last=t09").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t10", "t11", "zz"]));
 }
 
 #[tokio::test]
