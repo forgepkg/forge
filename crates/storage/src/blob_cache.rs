@@ -195,8 +195,8 @@ fn parse_key(sha256: &str) -> Option<Key> {
         _ => None,
     };
     let mut key = [0u8; 32];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
-        key[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    for (i, &[hi, lo]) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        key[i] = (nibble(hi)? << 4) | nibble(lo)?;
     }
     Some(key)
 }
