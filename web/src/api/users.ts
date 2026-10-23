@@ -111,18 +111,14 @@ export function upnError(raw: string): string | null {
 }
 
 /**
- * Whether the stored `username` is a UPN. Accounts created before Forge 1.2
- * may be named otherwise (`alice`, `admin`): they keep signing in, and the
- * users list marks them "legacy name".
+ * `POST /admin/users` request body (`CreateUser`): a local account with a
+ * `password`, or an account of the credential-forwarding realm named `realm`
+ * (no password: it signs in with the upstream's).
  */
-export function isUpn(username: string): boolean {
-  return upnError(username) === null
-}
-
-/** `POST /admin/users` request body (`CreateUser`). */
 export interface CreateUser {
   username: string
-  password: string
+  password?: string
+  realm?: string
   is_admin: boolean
   active: boolean
 }

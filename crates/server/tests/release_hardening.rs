@@ -602,42 +602,22 @@ fn bootstrap_config(block: &str) -> forge_server::config::Config {
     .expect("valid config")
 }
 
-/// #317: a new bootstrap admin is named by a UPN. While the account still has
-/// to be created, startup refuses a missing or non-UPN name with a message
-/// that asks for one, and creates nothing.
+/// #317: the bootstrap admin is named by a UPN, `admin@example.com` unless
+/// the config names another (a name that is no UPN is refused by config
+/// validation).
 #[tokio::test]
-async fn a_new_bootstrap_admin_needs_a_upn() {
+async fn the_bootstrap_admin_is_named_by_a_upn() {
     let pool = common::fresh_pool().await;
-
-    let err = forge_server::app::ensure_bootstrap_admin(
-        &bootstrap_config("password = \"bootpw\""),
-        &pool,
-    )
-    .await
-    .expect_err("no name");
-    assert!(
-        err.to_string().contains(
-            "auth.bootstrap_admin.username is not set: name the first administrator by a UPN \
-             such as admin@example.com"
-        ),
-        "{err}"
-    );
-
-    let name = format!("root{}", common::unique());
-    let err = forge_server::app::ensure_bootstrap_admin(
-        &bootstrap_config(&format!("username = \"{name}\"\npassword = \"bootpw\"")),
-        &pool,
-    )
-    .await
-    .expect_err("not a UPN");
-    assert!(err.to_string().contains("is not a UPN"), "{err}");
-    assert!(err.to_string().contains("admin@example.com"), "{err}");
-    for username in [name.as_str(), "admin"] {
-        assert!(forge_db::user_dao::find_user_by_username(&pool, username)
-            .await
-            .unwrap()
-            .is_none());
-    }
+    forge_server::app::ensure_bootstrap_admin(&bootstrap_config("password = \"bootpw\""), &pool)
+        .await
+        .expect("the default name");
+    let admin = forge_db::user_dao::find_user_by_username(&pool, "admin@example.com")
+        .await
+        .unwrap()
+        .expect("created");
+    assert!(forge_db::authz_dao::user_has_role(&pool, admin.id, "admin")
+        .await
+        .unwrap());
 
     let upn = format!("Root{}@Example.com", common::unique());
     forge_server::app::ensure_bootstrap_admin(
@@ -651,70 +631,60 @@ async fn a_new_bootstrap_admin_needs_a_upn() {
         .unwrap()
         .expect("created");
     assert_eq!(user.username, upn.to_lowercase());
-    assert!(forge_db::authz_dao::user_has_role(&pool, user.id, "admin")
-        .await
-        .unwrap());
 }
 
-/// #317: an install whose bootstrap admin exists already is unaffected. A
-/// config without a name stands for the old default `admin`, and a non-UPN
-/// name for the account it names, whether that account exists or was
-/// created and deleted since (its marker).
+/// #317: the bootstrap admin of an install from before 1.2 is renamed with
+/// its "created once" marker (`admin` becomes `admin@example.com`, the new
+/// default), so it is found under its new name, and one deleted since is
+/// not created again under it.
 #[tokio::test]
-async fn an_existing_bootstrap_admin_keeps_its_legacy_name() {
+async fn a_pre_upn_bootstrap_admin_is_renamed_with_its_marker() {
     let pool = common::fresh_pool().await;
-    let legacy = |name: &str| {
-        let pool = pool.clone();
-        let name = name.to_string();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "INSERT INTO app_user (username, password_hash, active, auth_source) \
-                 VALUES ($1, '$argon2id$unused', true, 'local') RETURNING id",
-            )
-            .bind(name)
-            .fetch_one(&pool)
+    let marker = |name: &str| format!("{}:{name}", forge_server::app::BOOTSTRAP_ADMIN_CREATED_KEY);
+    // As a release before 1.2 left them: the default `admin`, and a `root`
+    // an earlier config named, created and deleted since.
+    let admin_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, active, auth_source) \
+         VALUES ('admin', '$argon2id$unused', true, 'local') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for (name, id) in [("admin", admin_id), ("root", 999_999)] {
+        forge_db::authz_dao::set_setting(&pool, &marker(name), &id.to_string())
             .await
-            .unwrap()
-        }
-    };
+            .unwrap();
+    }
 
-    // The pre-1.2 default: no name configured, the `admin` account exists.
-    let admin_id = legacy("admin").await;
+    // The upgrade's start renames both.
+    forge_db::migrate(&pool).await.expect("migrate");
     forge_server::app::ensure_bootstrap_admin(&bootstrap_config("password = \"bootpw\""), &pool)
         .await
-        .expect("an existing `admin` needs no name");
-    let marker = |name: &str| format!("{}:{name}", forge_server::app::BOOTSTRAP_ADMIN_CREATED_KEY);
+        .expect("the renamed admin is found");
+    let admin = forge_db::user_dao::find_user_by_username(&pool, "admin@example.com")
+        .await
+        .unwrap()
+        .expect("renamed");
+    assert_eq!(admin.id, admin_id, "the same account, not a new one");
     assert_eq!(
-        forge_db::authz_dao::get_setting(&pool, &marker("admin"))
+        forge_db::authz_dao::get_setting(&pool, &marker("admin@example.com"))
             .await
             .unwrap(),
         Some(admin_id.to_string())
     );
-    // Deleted since: its marker keeps startup going, and nothing comes back.
-    forge_db::user_dao::delete_user(&pool, admin_id)
-        .await
-        .unwrap();
-    forge_server::app::ensure_bootstrap_admin(&bootstrap_config("password = \"bootpw\""), &pool)
-        .await
-        .expect("a deleted `admin` needs no name either");
-    assert!(forge_db::user_dao::find_user_by_username(&pool, "admin")
-        .await
-        .unwrap()
-        .is_none());
 
-    // A configured non-UPN name that names an existing account.
-    let root_id = legacy("root").await;
     forge_server::app::ensure_bootstrap_admin(
-        &bootstrap_config("username = \"Root\"\npassword = \"bootpw\""),
+        &bootstrap_config("username = \"root@example.com\"\npassword = \"bootpw\""),
         &pool,
     )
     .await
-    .expect("an existing non-UPN bootstrap admin is kept");
-    assert_eq!(
-        forge_db::authz_dao::get_setting(&pool, &marker("root"))
+    .expect("a deleted bootstrap admin needs nothing");
+    assert!(
+        forge_db::user_dao::find_user_by_username(&pool, "root@example.com")
             .await
-            .unwrap(),
-        Some(root_id.to_string())
+            .unwrap()
+            .is_none(),
+        "a deleted bootstrap admin is not created again under its new name"
     );
 }
 

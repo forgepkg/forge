@@ -149,8 +149,7 @@ a token of an enabled `workload_identity` realm or a workload API key. Anything
 else, including a user's API token, is refused with 401, and it never reaches
 the password realms, so it is never forwarded to a credential-forwarding
 upstream. No account can be created, bootstrapped or provisioned under the name
-(an OIDC login whose username claim is `oidc` is provisioned as `oidc-2`), and
-the browser login refuses it.
+(it is no UPN either), and the browser login refuses it.
 
 1.0.0 reserved no names: an account named `oidc` from 1.0.0 needs renaming,
 as the 1.1.0 upgrade notes in `CHANGELOG.md` describe.

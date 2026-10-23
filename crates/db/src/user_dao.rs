@@ -5,9 +5,7 @@ use std::collections::HashSet;
 use sqlx::PgPool;
 
 use crate::model::AppUser;
-use crate::username::{
-    canonical_account_username, canonical_forwarded_username, canonical_username,
-};
+use crate::username::{canonical_account_username, canonical_username, is_upn, MAX_USERNAME_BYTES};
 
 /// The canonical form of a username used as a lookup key, or `None` when it
 /// can never name an account (empty, control characters, oversized).
@@ -46,15 +44,12 @@ impl NewUser {
 /// Insert a user, returning the persisted row.
 ///
 /// The username is stored in its canonical form
-/// ([`crate::username::canonical_username`]); an invalid or
+/// ([`crate::username::canonical_username`]) and must be a UPN
+/// ([`crate::username::canonical_account_username`]); an invalid, non-UPN or
 /// [reserved](crate::username::RESERVED_USERNAMES) one is refused with
 /// [`sqlx::Error::InvalidArgument`] (callers validate first to answer 400).
 /// An account with a local password must also have a name a password login
 /// accepts ([`crate::username::canonical_password_username`]: no `:`).
-/// Every account but a credential-forwarding one (`upstream-basic`) must be
-/// named by a UPN ([`crate::username::canonical_account_username`]); that one
-/// keeps the name its upstream accepted
-/// ([`crate::username::canonical_forwarded_username`]).
 ///
 /// An administrator is a member of the built-in `admin` role: assign it
 /// separately ([`crate::authz_dao::assign_role`]), in the same transaction
@@ -63,12 +58,9 @@ pub async fn insert_user<'e, E>(executor: E, new: NewUser) -> sqlx::Result<AppUs
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let username = if new.auth_source == "upstream-basic" {
-        canonical_forwarded_username(&new.username)
-    } else {
-        canonical_account_username(&new.username, new.password_hash.is_some())
-    }
-    .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    let with_password = new.password_hash.is_some() || new.auth_source == "upstream-basic";
+    let username = canonical_account_username(&new.username, with_password)
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
     sqlx::query_as!(
         AppUser,
         r#"
@@ -89,62 +81,44 @@ where
     .await
 }
 
-/// Provision (or refresh) a user authenticated by the `upstream-basic` provider.
+/// Create an account of the credential-forwarding realm `realm_id`: no local
+/// password (`auth_source = 'upstream-basic'`), signed in by forwarding its
+/// password, with the local part of `username` as the name sent upstream
+/// (`external_subject`, [`crate::username::upn_local_part`]).
 ///
-/// Called by the auth chain after the upstream **definitively accepts** a
-/// credential. Idempotent and **never touches a non-upstream account**:
-///
-/// * **New username** → insert a fresh user with `auth_source = 'upstream-basic'`,
-///   `password_hash = NULL` (no local password — the DB CHECK only requires one
-///   for `'local'` users), `external_subject = username`, `active = true`, and
-///   `realm_id` = the vouching realm.
-/// * **Existing `'upstream-basic'` username of the same realm** (or, for the
-///   realm-less static wiring, of no realm) → stamp `last_auth_source_at =
-///   now()`.
-/// * **Existing username owned by anything else** (a `'local'` or `'oidc'`
-///   account, an upstream user of a different realm, or an **orphan** whose
-///   realm was deleted — `realm_orphaned`, migration 0023) → **no row** is
-///   returned: an upstream login must never be mapped onto (or take over) an
-///   account it did not create. A missing realm is never a wildcard. The
-///   caller denies.
-///
-/// The upstream's admin verdict is the caller's to apply, as membership in the
-/// built-in `admin` role. The unique constraint on `username` makes the
-/// `ON CONFLICT` path race-safe across instances. The username is
-/// canonicalized first; an invalid one, a
-/// [reserved](crate::username::RESERVED_USERNAMES) one, or one containing `:`
-/// (the upstream verified the part before the colon, see
-/// [`crate::username::canonical_password_username`]), provisions nothing
-/// (`None` ⇒ deny). It need not be a UPN: the account keeps the name the
-/// upstream accepted ([`crate::username::canonical_forwarded_username`]).
-pub async fn provision_upstream_user(
-    pool: &PgPool,
+/// Credential-forwarding realms create no accounts on their own: an
+/// administrator creates each one. The username is a UPN, refused like
+/// [`insert_user`]'s otherwise.
+pub async fn insert_forwarded_user<'e, E>(
+    executor: E,
     username: &str,
-    realm_id: Option<i64>,
-) -> sqlx::Result<Option<AppUser>> {
-    let Ok(username) = canonical_forwarded_username(username) else {
-        return Ok(None);
-    };
+    realm_id: i64,
+    active: bool,
+) -> sqlx::Result<AppUser>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let username = canonical_account_username(username, true)
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    let subject = crate::username::upn_local_part(&username)
+        .unwrap_or(&username)
+        .to_string();
     sqlx::query_as!(
         AppUser,
         r#"
         INSERT INTO app_user
-            (username, password_hash, active, auth_source,
-             external_subject, last_auth_source_at, realm_id)
-        VALUES ($1, NULL, true, 'upstream-basic', $1, now(), $2)
-        ON CONFLICT (username) DO UPDATE SET
-            last_auth_source_at = now()
-        WHERE app_user.auth_source = 'upstream-basic'
-          AND NOT app_user.realm_orphaned
-          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id
+            (username, password_hash, active, auth_source, external_subject, realm_id)
+        VALUES ($1, NULL, $2, 'upstream-basic', $3, $4)
         RETURNING
             id, username, password_hash, active,
             auth_source, external_subject, created_at, updated_at
         "#,
         username,
+        active,
+        subject,
         realm_id,
     )
-    .fetch_optional(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -239,9 +213,9 @@ pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
 ///
 /// The admin deactivate/activate path. `active = false` is honored by every
 /// authentication path (tokens, passwords, sessions, OIDC and upstream
-/// logins), and no provisioning path ever flips it back: the upstream-basic
-/// upsert ([`provision_upstream_user`]) and OIDC resolution leave an existing
-/// row's `active` alone.
+/// logins), and no login ever flips it back: credential forwarding signs in
+/// existing accounts only ([`find_upstream_user`]) and OIDC resolution leaves
+/// an existing row's `active` alone.
 pub async fn set_active<'e, E>(executor: E, id: i64, active: bool) -> sqlx::Result<Option<AppUser>>
 where
     E: sqlx::PgExecutor<'e>,
@@ -277,7 +251,7 @@ where
 
 /// Record which auth realm vouches for this user. For credential-forwarding
 /// accounts this is an authorization input: only that realm may sign the
-/// account in (see [`provision_upstream_user`]). A no-op write when the value
+/// account in (see [`find_upstream_user`]). A no-op write when the value
 /// is unchanged.
 pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx::Result<()> {
     sqlx::query!(
@@ -690,6 +664,196 @@ fn plan_username_repairs(rows: Vec<(i64, String)>) -> Vec<UsernameRepair> {
     repairs
 }
 
+/// The domain [`rename_legacy_usernames`] gives a name that is not a UPN
+/// (RFC 2606's reserved `example.com`).
+pub const LEGACY_UPN_DOMAIN: &str = "example.com";
+
+/// Rename every account whose name is not a UPN (`alice`, `admin`, the
+/// `bob@entra` of an earlier OIDC namespace) to one: `alice@example.com`,
+/// `bob+entra@example.com` ([`legacy_upn`]). From 1.2 every account is named
+/// by a UPN ([`crate::username::is_upn`]). Runs after the migrations and
+/// [`canonicalize_stored_usernames`] ([`crate::migrate`]); a read-only scan
+/// when nothing needs renaming.
+///
+/// An account keeps its id, roles, tokens, sessions and identity links; only
+/// the name changes. A credential-forwarding account keeps the name its
+/// upstream knows in `external_subject`. Where the new name is taken, the
+/// account becomes `<local>#<id>@example.com` (with a further `#<n>` if even
+/// that is taken), as [`canonicalize_stored_usernames`] does. Names without a
+/// canonical form are left alone: they cannot sign in either way.
+///
+/// The bootstrap admin's "created once" markers follow their account, and a
+/// marker of a deleted account the name it would have had, so a deleted
+/// bootstrap admin is not created again under its new name. Cached
+/// credential-forwarding verdicts of a renamed account are dropped (the next
+/// login asks the upstream again), and its upstream logins stay counted
+/// under the new name (`auth_success`).
+///
+/// To be removed in 1.3.0 (#389), when every install has passed through a 1.2
+/// release.
+pub async fn rename_legacy_usernames(pool: &PgPool) -> sqlx::Result<Vec<UsernameRepair>> {
+    if !needs_upn_renames(pool).await? {
+        return Ok(Vec::new());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query!("LOCK TABLE app_user IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query!("SELECT id, username FROM app_user ORDER BY id")
+        .fetch_all(&mut *tx)
+        .await?;
+    let repairs = plan_upn_renames(rows.into_iter().map(|r| (r.id, r.username)).collect());
+    for r in &repairs {
+        sqlx::query!(
+            "UPDATE app_user SET username = '~upn-renaming~' || id WHERE id = $1",
+            r.id
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    for r in &repairs {
+        sqlx::query!(
+            "UPDATE app_user SET username = $2, updated_at = now() WHERE id = $1",
+            r.id,
+            r.to
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM validated_credential WHERE username = $1")
+            .bind(&r.from)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM validated_credential_tag WHERE username = $1")
+            .bind(&r.from)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE auth_success old SET username = $2
+             WHERE old.username = $1
+               AND NOT EXISTS (SELECT 1 FROM auth_success new
+                               WHERE new.username = $2 AND new.auth_method = old.auth_method)",
+        )
+        .bind(&r.from)
+        .bind(&r.to)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM auth_success WHERE username = $1")
+            .bind(&r.from)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let markers = sqlx::query_scalar!(
+        "SELECT key FROM forge_setting WHERE starts_with(key, $1)",
+        BOOTSTRAP_MARKER_PREFIX
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for key in markers {
+        let Some(name) = key.strip_prefix(BOOTSTRAP_MARKER_PREFIX) else {
+            continue;
+        };
+        if is_upn(name) || canonical_username(name).is_err() {
+            continue;
+        }
+        let to = repairs
+            .iter()
+            .find(|r| r.from == name)
+            .map(|r| r.to.clone())
+            .unwrap_or_else(|| legacy_upn(name, ""));
+        sqlx::query!(
+            "INSERT INTO forge_setting (key, value)
+             SELECT $2, value FROM forge_setting WHERE key = $1
+             ON CONFLICT (key) DO NOTHING",
+            key,
+            format!("{BOOTSTRAP_MARKER_PREFIX}{to}")
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!("DELETE FROM forge_setting WHERE key = $1", key)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(repairs)
+}
+
+/// Whether any account, or any bootstrap marker, names a non-UPN that has a
+/// canonical form.
+async fn needs_upn_renames(pool: &PgPool) -> sqlx::Result<bool> {
+    let legacy = |name: &str| !is_upn(name) && canonical_username(name).is_ok();
+    let usernames = sqlx::query_scalar!("SELECT username FROM app_user")
+        .fetch_all(pool)
+        .await?;
+    if usernames.iter().any(|u| legacy(u)) {
+        return Ok(true);
+    }
+    let markers = sqlx::query_scalar!(
+        "SELECT key FROM forge_setting WHERE starts_with(key, $1)",
+        BOOTSTRAP_MARKER_PREFIX
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(markers
+        .iter()
+        .any(|k| k.strip_prefix(BOOTSTRAP_MARKER_PREFIX).is_some_and(legacy)))
+}
+
+/// The UPN a pre-1.2 name becomes: its characters a local part cannot hold
+/// replaced (`@` by `+`, whitespace by `_`), then `suffix`, `@` and
+/// [`LEGACY_UPN_DOMAIN`]; the local part is cut short (at a character
+/// boundary) to keep the name within [`MAX_USERNAME_BYTES`].
+pub fn legacy_upn(name: &str, suffix: &str) -> String {
+    let local: String = name
+        .chars()
+        .map(|c| match c {
+            '@' => '+',
+            c if c.is_whitespace() => '_',
+            c => c,
+        })
+        .collect();
+    let room = MAX_USERNAME_BYTES - suffix.len() - 1 - LEGACY_UPN_DOMAIN.len();
+    let mut end = local.len().min(room);
+    while !local.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}@{LEGACY_UPN_DOMAIN}", &local[..end])
+}
+
+/// The renames [`rename_legacy_usernames`] applies to `rows` (`(id,
+/// username)`, in id order).
+fn plan_upn_renames(rows: Vec<(i64, String)>) -> Vec<UsernameRepair> {
+    let legacy = |name: &str| !is_upn(name) && canonical_username(name).is_ok();
+    let mut taken: HashSet<String> = rows
+        .iter()
+        .filter(|(_, u)| !legacy(u))
+        .map(|(_, u)| u.clone())
+        .collect();
+    let mut repairs = Vec::new();
+    for (id, username) in rows {
+        if !legacy(&username) {
+            continue;
+        }
+        let mut to = legacy_upn(&username, "");
+        let mut n = 1u32;
+        while taken.contains(&to) {
+            to = if n == 1 {
+                legacy_upn(&username, &format!("#{id}"))
+            } else {
+                legacy_upn(&username, &format!("#{id}#{n}"))
+            };
+            n += 1;
+        }
+        taken.insert(to.clone());
+        repairs.push(UsernameRepair {
+            id,
+            from: username,
+            to,
+        });
+    }
+    repairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +898,70 @@ mod tests {
     #[test]
     fn names_without_a_canonical_form_are_left_alone() {
         assert!(plan(&[(1, "bad\nname"), (2, "ok")]).is_empty());
+    }
+
+    fn upn_plan(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+        plan_upn_renames(rows.iter().map(|(id, u)| (*id, u.to_string())).collect())
+            .into_iter()
+            .map(|r| (r.id, r.to))
+            .collect()
+    }
+
+    #[test]
+    fn pre_upn_names_become_example_com_upns() {
+        assert_eq!(
+            upn_plan(&[
+                (1, "admin"),
+                (2, "alice@corp.example"),
+                (3, "bob@entra"),
+                (4, "jane doe"),
+                (5, "corp\\mallory"),
+                (6, "bad\nname"),
+            ]),
+            vec![
+                (1, "admin@example.com".into()),
+                (3, "bob+entra@example.com".into()),
+                (4, "jane_doe@example.com".into()),
+                (5, "corp\\mallory@example.com".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_taken_upn_gets_the_account_id() {
+        assert_eq!(
+            upn_plan(&[
+                (1, "alice@example.com"),
+                (2, "alice"),
+                (3, "alice#2@example.com")
+            ]),
+            vec![(2, "alice#2#2@example.com".into())]
+        );
+        // Two legacy names mapping to one UPN: the older one takes it.
+        assert_eq!(
+            upn_plan(&[(4, "bob@x"), (5, "bob+x")]),
+            vec![
+                (4, "bob+x@example.com".into()),
+                (5, "bob+x#5@example.com".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn renamed_names_are_canonical_upns_within_the_limit() {
+        for name in [
+            "admin".to_string(),
+            "ü".repeat(MAX_USERNAME_BYTES / 2),
+            "a".repeat(MAX_USERNAME_BYTES),
+            "x y@z w".to_string(),
+        ] {
+            for suffix in ["", "#12345"] {
+                let upn = legacy_upn(&name, suffix);
+                assert!(upn.len() <= MAX_USERNAME_BYTES, "{upn}");
+                assert!(crate::username::is_upn(&upn), "{upn}");
+                assert_eq!(canonical_username(&upn).unwrap(), upn);
+                assert!(upn.ends_with(&format!("{suffix}@example.com")), "{upn}");
+            }
+        }
     }
 }

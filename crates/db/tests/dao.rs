@@ -1216,10 +1216,10 @@ async fn upstream_basic_user_has_no_local_password() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("nexus-{n}");
+    let username = format!("nexus-{n}@example.com");
 
-    // An upstream-basic user is provisioned with NO local password hash and
-    // carries provenance (source + external subject).
+    // An upstream-basic user has NO local password hash and carries
+    // provenance (source + external subject).
     let user = user_dao::insert_user(
         pool,
         NewUser {
@@ -1247,39 +1247,71 @@ async fn upstream_basic_user_has_no_local_password() {
     assert_eq!(reread.external_subject.as_deref(), Some(username.as_str()));
 }
 
+/// A credential-forwarding realm row for the account tests.
+async fn forwarding_realm(pool: &sqlx::PgPool) -> i64 {
+    forge_db::auth_realm_dao::insert_realm(
+        pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("fwd-{}", unique()),
+            enabled: false,
+            priority: 6_000_000 + (unique() % 1_000_000) as i32,
+            config: serde_json::json!({ "url": "https://nexus.test/status" }),
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// #317: a credential-forwarding realm creates no accounts; an administrator
+/// creates each one for it. It is named by a UPN, has no local password, and
+/// keeps the local part, the name sent upstream, as its external subject.
 #[tokio::test]
-async fn provision_upstream_user_inserts_then_refreshes() {
+async fn forwarded_accounts_are_created_for_a_realm() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("up-prov-{n}");
+    let realm = forwarding_realm(pool).await;
+    let other_realm = forwarding_realm(pool).await;
+    let username = format!("Up-Fwd-{n}@Example.com");
 
-    // First call inserts a passwordless upstream-basic user.
-    let u1 = user_dao::provision_upstream_user(pool, &username, None)
+    let user = user_dao::insert_forwarded_user(pool, &username, realm, true)
         .await
-        .expect("provision")
-        .expect("row");
-    assert_eq!(u1.auth_source, "upstream-basic");
-    assert!(u1.password_hash.is_none());
-    assert!(u1.active);
-    assert_eq!(u1.external_subject.as_deref(), Some(username.as_str()));
+        .expect("created");
+    assert_eq!(user.username, format!("up-fwd-{n}@example.com"));
+    assert_eq!(user.auth_source, "upstream-basic");
+    assert!(user.password_hash.is_none());
+    assert_eq!(user.external_subject, Some(format!("up-fwd-{n}")));
 
-    // A later login reuses the row.
-    let u2 = user_dao::provision_upstream_user(pool, &username, None)
+    let found = user_dao::find_upstream_user(pool, &username, Some(realm))
         .await
-        .expect("re-provision")
-        .expect("row");
-    assert_eq!(u2.id, u1.id, "same row");
+        .unwrap()
+        .expect("the realm's account");
+    assert_eq!(found.id, user.id);
+    // Only that realm's account.
+    assert!(
+        user_dao::find_upstream_user(pool, &username, Some(other_realm))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A UPN, like every account's.
+    let err = user_dao::insert_forwarded_user(pool, &format!("up-fwd-{n}"), realm, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, sqlx::Error::InvalidArgument(_)), "{err:?}");
 }
 
 #[tokio::test]
-async fn provision_upstream_user_does_not_clobber_local_user() {
+async fn a_local_account_is_never_a_forwarded_one() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
+    let realm = forwarding_realm(pool).await;
     let username = format!("up-prov-local-{n}@example.com");
 
-    // Pre-existing LOCAL user with a password.
     user_dao::insert_user(
         pool,
         NewUser::local(username.clone(), "$argon2id$dummy".to_string(), true),
@@ -1287,16 +1319,18 @@ async fn provision_upstream_user_does_not_clobber_local_user() {
     .await
     .expect("insert local");
 
-    // An upstream provision for the same username returns no row (deny) and
-    // must NOT null the password or flip auth_source.
-    let u = user_dao::provision_upstream_user(pool, &username, None)
-        .await
-        .expect("provision over local");
-    assert!(u.is_none(), "local user is never taken over");
-    assert!(user_dao::find_upstream_user(pool, &username, None)
+    assert!(user_dao::find_upstream_user(pool, &username, Some(realm))
         .await
         .unwrap()
         .is_none());
+    // Nor can the name be taken for the realm.
+    let err = user_dao::insert_forwarded_user(pool, &username, realm, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")),
+        "{err:?}"
+    );
     let local = user_dao::find_user_by_username(pool, &username)
         .await
         .unwrap()
@@ -1638,8 +1672,7 @@ async fn usernames_are_unique_in_canonical_form() {
     let invalid =
         user_dao::insert_user(&pool, NewUser::local("bad\nname".into(), "x".into(), true)).await;
     assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
-    // A new account is named by a UPN (#317); a stored legacy name is still
-    // found.
+    // Every account is named by a UPN (#317).
     let legacy =
         user_dao::insert_user(&pool, NewUser::local(format!("dora{n}"), "x".into(), true)).await;
     assert!(

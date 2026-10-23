@@ -256,7 +256,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__BUCKET` | e.g. `forge` |
 | `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` | Object-store credentials, or instead `FORGE_S3__CREDENTIALS` for [short-lived credentials](#short-lived-s3-credentials). |
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
-| `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` / `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin, named by a [UPN](#usernames) such as `admin@example.com` (there is no default name), and its password. Without the password no bootstrap admin is created. |
+| `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` / `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin, named by a [UPN](#usernames) (default `admin@example.com`), and its password. Without the password no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
 | `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (see [Reverse proxy](#reverse-proxy): on Kubernetes the Helm chart's `networkPolicy.from`, the kustomize `network-policy` component). |
 
@@ -273,13 +273,14 @@ meant only for the local compose stack.
 ### The bootstrap admin
 
 The image bakes no bootstrap admin; it comes only from the environment, and
-only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
-[UPN](#usernames) of your organization and `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD`
-for the first start: the account is created **once**. While it still has to
-be created, startup refuses a missing or non-UPN name. An install whose
-bootstrap admin exists already is unaffected: before 1.2 the name defaulted
-to `admin`, and a configuration that still sets no name, or a non-UPN one,
-keeps the account it created. Sign in to the web UI,
+only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for
+the first start, and `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
+[UPN](#usernames) of your organization if `admin@example.com` will not do: the
+account is created **once**. Startup refuses a name that is no UPN. Before 1.2
+the name defaulted to `admin`; the upgrade renames that account
+`admin@example.com` ([below](#accounts-from-before-12)), so a configuration
+that sets no name keeps finding it, and one that names a non-UPN must name the
+account's new name instead. Sign in to the web UI,
 create personal admin accounts (or connect OIDC), then delete the bootstrap
 account. It is not re-created on later restarts. Then remove the password from
 the environment: with no bootstrap password configured, Forge simply starts
@@ -314,23 +315,23 @@ admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 `repo.write` capability). A writer mints their own API tokens on the
 **Tokens** page; a token never carries more than its owner's rights.
 
-Migration 0040 adds `writer`. An install that already had a custom role named
+Migration 0041 adds `writer`. An install that already had a custom role named
 `writer` keeps it as `writer#<id>`, with its grants and members, and a
 workload-identity rule that named it names `writer#<id>` too; the migration
 logs a warning for each.
 
 ### Usernames
 
-Every new account is named by a UPN, `local-part@domain`
-(`alice@example.com`): the name says which organization the account belongs
-to, two organizations' `alice` cannot collide, and it is the name Entra and
-Active Directory sign the person in with. After canonicalization (trimmed,
-Unicode NFC, lowercased) a username must have exactly one `@`, a non-empty
-local part without whitespace, and a domain of at least two DNS labels
-without a trailing dot. Each label is 1 to 63 letters, digits or `-`, and
-does not start or end with `-`; the last one is not all digits. A Unicode
-domain is accepted as written (`jürgen@müller.example`), and so is its
-`xn--` form; the two are different names.
+Every account is named by a UPN, `local-part@domain` (`alice@example.com`):
+the name says which organization the account belongs to, two
+organizations' `alice` cannot collide, and it is the name Entra and Active
+Directory sign the person in with. After canonicalization (trimmed, Unicode
+NFC, lowercased) a username must have exactly one `@`, a non-empty local part
+without whitespace, and a domain of at least two DNS labels without a
+trailing dot. Each label is 1 to 63 letters, digits or `-`, and does not start
+or end with `-`; the last one is not all digits. A Unicode domain is accepted
+as written (`jürgen@müller.example`), and so is its `xn--` form; the two are
+different names.
 
 The rule applies wherever an account is created:
 
@@ -341,17 +342,45 @@ The rule applies wherever an account is created:
   email claim when `email_verified`, else `sub`) must yield a UPN for a new
   account, or the login is refused and the login page names the claim. With
   Entra, `preferred_username` is the UPN. Elsewhere, map a claim that holds
-  one, such as `email`. While a credential-forwarding realm is enabled, a new
-  OIDC account is named `<local-part>+<realm>@<domain>`, and a name that is
-  taken gets `-2`, `-3`, … on its local part.
-- **Credential-forwarding realms are exempt.** Their accounts keep the name
-  the upstream accepted (`alice`, or `alice@corp.example` when users sign in
-  with their UPN), since a rewritten name would be a second spelling of the
-  same directory account.
+  one, such as `email`. A name that is taken gets `-2`, `-3`, … on its local
+  part.
+- **Credential-forwarding realms create no accounts.** Create each one under
+  **Admin → Users** with the realm as its sign-in (`POST /admin/users` with
+  `"realm": "<name>"` and no password), named by a UPN whose local part is the
+  upstream's username: Forge forwards the local part, so
+  `alice@example.com` signs in as the upstream's `alice`. A login the
+  upstream accepts but that names no account of the realm is refused.
 
-Accounts created before 1.2 (`alice`, `admin`) keep their names, passwords,
-tokens and roles; nothing is renamed. **Admin → Users** marks them "legacy
-name".
+#### Accounts from before 1.2
+
+The first start of 1.2 renames every account whose name is no UPN, and logs
+each rename as a warning:
+
+- `alice` becomes `alice@example.com`, the bootstrap admin `admin` becomes
+  `admin@example.com`. In the local part, an `@` becomes `+` (the
+  `bob@entra` of an earlier OIDC namespace becomes `bob+entra@example.com`)
+  and whitespace `_`.
+- Where that name is taken, the account becomes `<name>#<id>@example.com`.
+- The account keeps its id, password, roles, tokens, sessions and identity
+  links. Users sign in with the new name; API tokens keep working whatever
+  name a client sends with them, but a password sent over Basic needs the new
+  name.
+- A credential-forwarding account keeps forwarding its old name (the new
+  name's local part). One whose old name held an `@` (`alice@corp`) would
+  forward `alice+corp`; delete it and create `alice@<your domain>` for the
+  realm instead. Its cached upstream verdicts are dropped, so its next login
+  asks the upstream again.
+- A bootstrap admin deleted before the upgrade stays deleted under its new
+  name.
+
+A credential-forwarding account that was named by a UPN already
+(`alice@corp.example`) is not renamed, but now forwards its local part,
+`alice`, too. Credential-forwarding realms no longer create accounts: create
+the accounts of new users under **Admin → Users**. A realm config that still
+sets `auto_provision: true` is refused by the admin API; the legacy
+`[auth.upstream_basic]` block's `auto_provision` is ignored.
+
+The rename goes away in 1.3.0; upgrade to 1.3 from a 1.2 release.
 
 ### Password Basic auth
 

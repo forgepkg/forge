@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { canonicalUsername, isUpn, upnError } from './users'
+import { canonicalUsername, upnError } from './users'
 
 /** The same cases as `crates/db/src/username.rs`, which stays authoritative. */
 describe('upnError', () => {
@@ -51,7 +51,5 @@ describe('upnError', () => {
   it('canonicalizes like the server', () => {
     expect(canonicalUsername('  Alice@Example.COM ')).toBe('alice@example.com')
     expect(canonicalUsername('José')).toBe('josé')
-    expect(isUpn('admin')).toBe(false)
-    expect(isUpn('admin@example.com')).toBe(true)
   })
 })

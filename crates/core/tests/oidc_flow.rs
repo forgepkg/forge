@@ -619,7 +619,6 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
         let policy = ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: link,
-            provision_namespace: None,
         };
         let user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
             .await
@@ -634,63 +633,10 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
     assert!(still_local.password_hash.is_some());
 }
 
-/// #123: while a credential-forwarding realm is enabled, the server sets
-/// `provision_namespace`, and a first OIDC login no longer takes the bare
-/// name a forwarded directory user signs in with later: the OIDC account is
-/// `{local-part}+{realm}@{domain}`, still a UPN (#317), and the forwarded
-/// user gets their own name.
-#[tokio::test]
-async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
-    use forge_core::auth::chain::provision_and_map;
-    use forge_core::auth::provider::{AuthSource, ProvenIdentity};
-
-    let pool = pool().await;
-    let idp = MockIdp::start().await;
-    let n = unique();
-    let username = format!("bob-{n}@example.com");
-
-    let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
-    let mapped = map_claims(&validated.claims, &admin_mapping());
-    let policy = ResolvePolicy {
-        provision_namespace: Some("entra".into()),
-        ..ResolvePolicy::default()
-    };
-    let oidc_user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
-        .await
-        .expect("provisioned");
-    assert_eq!(oidc_user.username, format!("bob-{n}+entra@example.com"));
-    assert_eq!(oidc_user.auth_source, "oidc");
-    // The next login resolves the same account through its identity link.
-    let again = oidc::resolve_user(&pool, &validated, &mapped, &policy)
-        .await
-        .expect("linked");
-    assert_eq!(again.id, oidc_user.id);
-
-    // The directory user of the bare name signs in later through a
-    // credential-forwarding realm, into an account of their own.
-    let forwarded = provision_and_map(
-        &pool,
-        &ProvenIdentity {
-            username: username.clone(),
-            source: AuthSource::UpstreamBasic,
-            external_subject: Some(username.clone()),
-            groups: Vec::new(),
-            suggested_is_admin: false,
-            admin_authoritative: false,
-            auto_provision: true,
-            realm_id: None,
-            captured_password_hash: None,
-        },
-    )
-    .await
-    .expect("db")
-    .expect("the forwarded user is not locked out");
-    assert_ne!(forwarded.user_id, oidc_user.id);
-}
-
-/// #317: a new account is named by a UPN. A username claim that is none
-/// refuses the login and names the claim; an identity linked before the rule
-/// keeps signing in to its (legacy-named) account.
+/// #317: every account is named by a UPN. A username claim that is none
+/// refuses the login and names the claim; an identity linked before 1.2
+/// keeps signing in to its account, renamed `<name>@example.com` at the
+/// upgrade, whatever its claim says.
 #[tokio::test]
 async fn provisioning_needs_a_upn_and_names_the_claim() {
     let pool = pool().await;
@@ -714,13 +660,13 @@ async fn provisioning_needs_a_upn_and_names_the_claim() {
         .unwrap()
         .is_none());
 
-    // The same identity, linked before the rule to an account of that name,
-    // still resolves to it.
+    // The same identity, linked before 1.2 to an account of that name, which
+    // the upgrade renamed, still resolves to it.
     let legacy_id: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, active, auth_source, external_subject) \
          VALUES ($1, NULL, true, 'oidc', $2) RETURNING id",
     )
-    .bind(&username)
+    .bind(forge_db::user_dao::legacy_upn(&username, ""))
     .bind(format!("sub-{n}"))
     .fetch_one(&pool)
     .await
@@ -796,7 +742,6 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
         &ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: true,
-            provision_namespace: None,
         },
     )
     .await
@@ -818,7 +763,6 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
     let link = ResolvePolicy {
         auto_provision: true,
         link_existing_by_username: true,
-        provision_namespace: None,
     };
 
     let upstream_name = format!("directory-{n}@example.com");
@@ -934,7 +878,6 @@ async fn resolve_user_rejects_when_no_provision_and_no_match() {
         &ResolvePolicy {
             auto_provision: false,
             link_existing_by_username: false,
-            provision_namespace: None,
         },
     )
     .await;

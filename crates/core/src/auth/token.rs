@@ -316,9 +316,9 @@ pub struct BasicAuthSource {
 
 impl BasicAuthSource {
     /// Build a source with an explicit, fixed password-auth chain. Pass `None`
-    /// to disable the password path entirely. Auto-provisioning of
-    /// upstream-vouched users is decided per identity (the vouching provider
-    /// stamps its realm's flag onto the [`crate::auth::ProvenIdentity`]).
+    /// to disable the password path entirely. An upstream-vouched login maps
+    /// only onto an existing account of its realm
+    /// ([`crate::auth::provision_and_map`]).
     pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>) -> Self {
         Self::with_source(pool, Arc::new(StaticChainSource(chain)))
     }
@@ -451,9 +451,9 @@ impl PrincipalSource for BasicAuthSource {
             };
             match chain.authenticate(&cred).await {
                 ChainOutcome::Authenticated { identity, .. } => {
-                    // Map the vouched-for username back to a concrete principal,
-                    // auto-provisioning an upstream-vouched user on first login
-                    // when its realm allows it.
+                    // Map the vouched-for username back to a concrete principal
+                    // (an upstream-vouched login only to an existing account of
+                    // its realm).
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             attempt.succeeded();

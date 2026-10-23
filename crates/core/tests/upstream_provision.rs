@@ -1,18 +1,17 @@
-//! Integration tests for auto-provisioning of upstream-basic users:
+//! Integration tests for mapping credential-forwarding logins onto accounts:
 //! [`forge_core::auth::provision_and_map`] over a real Postgres testcontainer.
 //!
 //! Covers:
-//!   * first upstream success provisions an `app_user` with
-//!     `auth_source = 'upstream-basic'`, NULL `password_hash`, active;
-//!   * a second login reuses the row (no duplicate, idempotent);
-//!   * an authoritative admin-group reading grants the `admin` role on
-//!     provision;
-//!   * a provisioned admin is not downgraded by a non-authoritative login, but
-//!     is when the realm's admin mapping authoritatively says so;
+//!   * a login maps onto the account an administrator created for the realm
+//!     (`auth_source = 'upstream-basic'`, NULL `password_hash`), every time;
+//!   * a login without such an account creates none and is denied;
+//!   * an authoritative admin-group reading grants and removes the `admin`
+//!     role (a demotion also ends the admin's sessions); a non-authoritative
+//!     one changes nothing;
 //!   * an existing LOCAL user is never clobbered NOR mapped (the upstream login
 //!     is denied) when an upstream login shares the username;
-//!   * `auto_provision = false` does not create a user (unknown → `None`),
-//!     but still applies an authoritative admin demotion;
+//!   * another realm's account, and an orphan of a deleted realm, are never
+//!     mapped;
 //!   * a deactivated user resolves to `None` (login denied).
 //!
 //! Requires Docker.
@@ -22,152 +21,140 @@ mod common;
 use forge_core::auth::provider::{AuthSource, ProvenIdentity};
 use forge_core::auth::provision_and_map;
 use forge_db::user_dao::{self, NewUser};
+use sqlx::PgPool;
 
 use common::{pool, unique};
 
+/// A fresh UPN: every account name is one.
 fn unique_user(prefix: &str) -> String {
-    format!("{prefix}-{}", unique())
+    format!("{prefix}-{}@example.com", unique())
 }
 
 /// Whether the user holds the built-in `admin` role.
-async fn is_admin(pool: &sqlx::PgPool, user_id: i64) -> bool {
+async fn is_admin(pool: &PgPool, user_id: i64) -> bool {
     forge_db::authz_dao::user_has_role(pool, user_id, "admin")
         .await
         .unwrap()
 }
 
-/// An upstream-vouched identity whose provider allows auto-provisioning
-/// (`auto_provision` rides on the identity — it is a per-realm setting).
-fn upstream_identity(username: &str, admin: bool, auto_provision: bool) -> ProvenIdentity {
+/// A disabled credential-forwarding realm row (only its id matters here).
+async fn realm(pool: &PgPool, prefix: &str) -> i64 {
+    forge_db::auth_realm_dao::insert_realm(
+        pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("{prefix}-{}", unique()),
+            enabled: false,
+            priority: 100_000 + (unique() % 100_000_000) as i32,
+            config: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// The identity realm `realm_id` vouches for after the upstream accepted
+/// `username`'s local part.
+fn upstream_identity(username: &str, realm_id: Option<i64>, admin: bool) -> ProvenIdentity {
     ProvenIdentity {
         username: username.to_string(),
         source: AuthSource::UpstreamBasic,
-        external_subject: Some(username.to_string()),
+        external_subject: forge_db::username::upn_local_part(username).map(str::to_string),
         groups: Vec::new(),
         suggested_is_admin: admin,
         admin_authoritative: false,
-        auto_provision,
-        realm_id: None,
+        realm_id,
         captured_password_hash: None,
     }
 }
 
+/// A realm with one active account created by an administrator.
+async fn realm_with_account(pool: &PgPool, prefix: &str) -> (i64, String, i64) {
+    let realm_id = realm(pool, prefix).await;
+    let username = unique_user(prefix);
+    let user = user_dao::insert_forwarded_user(pool, &username, realm_id, true)
+        .await
+        .unwrap();
+    (realm_id, username, user.id)
+}
+
 #[tokio::test]
-async fn first_success_provisions_passwordless_upstream_user() {
+async fn a_login_maps_onto_the_realms_account() {
     let pool = pool().await;
-    let username = unique_user("prov");
+    let (realm_id, username, user_id) = realm_with_account(&pool, "fwd").await;
 
-    // No such user yet.
-    assert!(user_dao::find_user_by_username(&pool, &username)
-        .await
-        .unwrap()
-        .is_none());
-
-    let principal = provision_and_map(&pool, &upstream_identity(&username, false, true))
-        .await
-        .unwrap()
-        .expect("provisioned principal");
-    assert!(!is_admin(&pool, principal.user_id).await);
-    assert!(principal.token_id.is_none());
+    for _ in 0..2 {
+        let principal =
+            provision_and_map(&pool, &upstream_identity(&username, Some(realm_id), false))
+                .await
+                .unwrap()
+                .expect("the account signs in");
+        assert_eq!(principal.user_id, user_id, "the same account, every time");
+        assert!(principal.token_id.is_none());
+        assert!(!is_admin(&pool, user_id).await);
+    }
 
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
-        .expect("user now exists");
+        .expect("the account");
     assert_eq!(user.auth_source, "upstream-basic");
     assert!(user.password_hash.is_none(), "no local password");
-    assert!(user.active);
-    assert_eq!(user.external_subject.as_deref(), Some(username.as_str()));
-}
-
-#[tokio::test]
-async fn second_login_reuses_user_no_duplicate() {
-    let pool = pool().await;
-    let username = unique_user("prov-reuse");
-
-    let p1 = provision_and_map(&pool, &upstream_identity(&username, false, true))
-        .await
-        .unwrap()
-        .unwrap();
-    let p2 = provision_and_map(&pool, &upstream_identity(&username, false, true))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(p1.user_id, p2.user_id, "same row reused");
-
-    let all = user_dao::list_users(&pool).await.unwrap();
     assert_eq!(
-        all.iter().filter(|u| u.username == username).count(),
-        1,
-        "no duplicate row"
+        user.external_subject.as_deref(),
+        forge_db::username::upn_local_part(&username),
+        "the upstream knows the account by its local part"
+    );
+    let all = user_dao::list_users(&pool).await.unwrap();
+    assert_eq!(all.iter().filter(|u| u.username == username).count(), 1);
+}
+
+/// Credential forwarding creates no accounts: a login the upstream accepts
+/// but no administrator created an account for is denied.
+#[tokio::test]
+async fn a_login_without_an_account_creates_none() {
+    let pool = pool().await;
+    let realm_id = realm(&pool, "fwd-none").await;
+    let username = unique_user("fwd-none");
+
+    let mut identity = upstream_identity(&username, Some(realm_id), true);
+    identity.admin_authoritative = true;
+    assert!(provision_and_map(&pool, &identity).await.unwrap().is_none());
+    assert!(
+        user_dao::find_user_by_username(&pool, &username)
+            .await
+            .unwrap()
+            .is_none(),
+        "no row created"
     );
 }
 
 #[tokio::test]
-async fn admin_group_grants_admin_on_provision() {
+async fn the_admin_group_grants_and_removes_admin() {
     let pool = pool().await;
-    let username = unique_user("prov-admin");
+    let (realm_id, username, user_id) = realm_with_account(&pool, "fwd-admin").await;
 
-    let mut grant = upstream_identity(&username, true, true);
-    grant.admin_authoritative = true;
-    let principal = provision_and_map(&pool, &grant).await.unwrap().unwrap();
-    assert!(
-        is_admin(&pool, principal.user_id).await,
-        "the admin group grants the admin role"
-    );
-
-    // A subsequent NON-authoritative login (cache hit / no mapping) must NOT
-    // touch the granted admin.
-    let principal2 = provision_and_map(&pool, &upstream_identity(&username, false, true))
+    // Without an authoritative reading the suggestion grants nothing.
+    provision_and_map(&pool, &upstream_identity(&username, Some(realm_id), true))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(principal2.user_id, principal.user_id);
-    assert!(
-        is_admin(&pool, principal.user_id).await,
-        "non-authoritative login leaves admin alone"
-    );
+    assert!(!is_admin(&pool, user_id).await);
 
-    // An authoritative login without the admin group demotes.
-    let mut demote = upstream_identity(&username, false, true);
-    demote.admin_authoritative = true;
-    let principal3 = provision_and_map(&pool, &demote).await.unwrap().unwrap();
-    assert!(
-        !is_admin(&pool, principal3.user_id).await,
-        "admin role removed on authoritative demotion"
-    );
-}
-
-/// Without an authoritative reading, provisioning grants nothing, whatever
-/// the suggestion says.
-#[tokio::test]
-async fn a_non_authoritative_suggestion_grants_no_admin() {
-    let pool = pool().await;
-    let username = unique_user("prov-suggest");
-    let principal = provision_and_map(&pool, &upstream_identity(&username, true, true))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!is_admin(&pool, principal.user_id).await);
-}
-
-/// A realm switched to `auto_provision = false` still applies the upstream's
-/// authoritative admin verdict to an existing account: the demotion removes
-/// the `admin` role and ends the sessions opened as an admin.
-#[tokio::test]
-async fn demotion_applies_without_auto_provision() {
-    let pool = pool().await;
-    let username = unique_user("prov-noauto");
-
-    let mut grant = upstream_identity(&username, true, true);
+    let mut grant = upstream_identity(&username, Some(realm_id), true);
     grant.admin_authoritative = true;
-    let admin = provision_and_map(&pool, &grant).await.unwrap().unwrap();
-    assert!(is_admin(&pool, admin.user_id).await);
+    provision_and_map(&pool, &grant).await.unwrap().unwrap();
+    assert!(
+        is_admin(&pool, user_id).await,
+        "the admin group grants admin"
+    );
+
     let now = chrono::Utc::now();
     let session = forge_db::session_dao::create(
         &pool,
         forge_db::session_dao::NewSession {
-            user_id: admin.user_id,
+            user_id,
             external_identity_id: None,
             token_hash: format!("hash-{username}"),
             csrf_secret: "csrf".to_string(),
@@ -179,16 +166,19 @@ async fn demotion_applies_without_auto_provision() {
     .await
     .unwrap();
 
-    // The operator turns auto-provisioning off; the directory then removes
-    // the user from the admin group.
-    let mut demote = upstream_identity(&username, false, false);
+    // A non-authoritative login (cache hit / no mapping) leaves admin alone.
+    provision_and_map(&pool, &upstream_identity(&username, Some(realm_id), false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(is_admin(&pool, user_id).await);
+
+    // An authoritative login without the admin group demotes and ends the
+    // sessions opened as an admin.
+    let mut demote = upstream_identity(&username, Some(realm_id), false);
     demote.admin_authoritative = true;
-    let demoted = provision_and_map(&pool, &demote).await.unwrap().unwrap();
-    assert_eq!(demoted.user_id, admin.user_id);
-    assert!(
-        !is_admin(&pool, admin.user_id).await,
-        "authoritative demotion removes the admin role"
-    );
+    provision_and_map(&pool, &demote).await.unwrap().unwrap();
+    assert!(!is_admin(&pool, user_id).await, "admin role removed");
     assert!(
         forge_db::session_dao::find_valid_by_hash(&pool, &session.token_hash)
             .await
@@ -196,25 +186,13 @@ async fn demotion_applies_without_auto_provision() {
             .is_none(),
         "the admin session was ended"
     );
-
-    // A non-authoritative login (no group reading) changes nothing, and an
-    // authoritative one re-grants.
-    provision_and_map(&pool, &upstream_identity(&username, true, false))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!is_admin(&pool, admin.user_id).await);
-    let mut regrant = upstream_identity(&username, true, false);
-    regrant.admin_authoritative = true;
-    provision_and_map(&pool, &regrant).await.unwrap().unwrap();
-    assert!(is_admin(&pool, admin.user_id).await);
 }
 
 #[tokio::test]
 async fn existing_local_user_is_not_clobbered_or_mapped() {
     let pool = pool().await;
-    // A local account is named by a UPN; a forwarded login may use one too.
-    let username = format!("{}@example.com", unique_user("prov-local"));
+    let username = unique_user("fwd-local");
+    let realm_id = realm(&pool, "fwd-local").await;
 
     // A pre-existing LOCAL admin (with a password hash).
     let local = user_dao::insert_user(
@@ -228,15 +206,13 @@ async fn existing_local_user_is_not_clobbered_or_mapped() {
         .unwrap();
 
     // An upstream login with the same username must be DENIED (never mapped
-    // onto the local account), with or without auto-provisioning, and must not
-    // drop its local password or flip auth_source to upstream-basic.
-    for auto_provision in [true, false] {
-        let resolved =
-            provision_and_map(&pool, &upstream_identity(&username, false, auto_provision))
-                .await
-                .unwrap();
+    // onto the local account), and must not drop its local password or flip
+    // auth_source to upstream-basic.
+    for realm_id in [Some(realm_id), None] {
+        let mut identity = upstream_identity(&username, realm_id, false);
+        identity.admin_authoritative = true;
         assert!(
-            resolved.is_none(),
+            provision_and_map(&pool, &identity).await.unwrap().is_none(),
             "upstream identity never maps to a local user"
         );
     }
@@ -256,44 +232,23 @@ async fn existing_local_user_is_not_clobbered_or_mapped() {
 #[tokio::test]
 async fn upstream_user_of_another_realm_is_not_mapped() {
     let pool = pool().await;
-    let username = unique_user("prov-realm");
-    let realm_a = forge_db::auth_realm_dao::insert_realm(
-        &pool,
-        forge_db::auth_realm_dao::NewAuthRealm {
-            kind: "credential_forwarding".into(),
-            name: format!("ra-{}", unique()),
-            enabled: false,
-            priority: 100_000 + (unique() % 1_000_000) as i32,
-            config: serde_json::json!({}),
-        },
-    )
-    .await
-    .unwrap();
-    let realm_b = forge_db::auth_realm_dao::insert_realm(
-        &pool,
-        forge_db::auth_realm_dao::NewAuthRealm {
-            kind: "credential_forwarding".into(),
-            name: format!("rb-{}", unique()),
-            enabled: false,
-            priority: 2_000_000 + (unique() % 1_000_000) as i32,
-            config: serde_json::json!({}),
-        },
-    )
-    .await
-    .unwrap();
+    let (_, username, user_id) = realm_with_account(&pool, "fwd-ra").await;
+    let realm_b = realm(&pool, "fwd-rb").await;
 
-    let mut from_a = upstream_identity(&username, false, true);
-    from_a.realm_id = Some(realm_a.id);
-    assert!(provision_and_map(&pool, &from_a).await.unwrap().is_some());
-
-    let mut from_b = upstream_identity(&username, false, true);
-    from_b.realm_id = Some(realm_b.id);
+    let mut from_b = upstream_identity(&username, Some(realm_b), true);
+    from_b.admin_authoritative = true;
     assert!(
         provision_and_map(&pool, &from_b).await.unwrap().is_none(),
         "realm B cannot claim realm A's user"
     );
-    from_b.auto_provision = false;
-    assert!(provision_and_map(&pool, &from_b).await.unwrap().is_none());
+    assert!(
+        provision_and_map(&pool, &upstream_identity(&username, None, false))
+            .await
+            .unwrap()
+            .is_none(),
+        "nor can the realm-less wiring"
+    );
+    assert!(!is_admin(&pool, user_id).await);
 }
 
 /// Deleting a realm orphans its users: a NULL realm is not a wildcard, so
@@ -302,114 +257,51 @@ async fn upstream_user_of_another_realm_is_not_mapped() {
 #[tokio::test]
 async fn users_of_a_deleted_realm_are_never_adopted_by_another_realm() {
     let pool = pool().await;
-    let username = unique_user("orphan");
-    let realm = |name: String, priority: i32| forge_db::auth_realm_dao::NewAuthRealm {
-        kind: "credential_forwarding".into(),
-        name,
-        enabled: false,
-        priority,
-        config: serde_json::json!({}),
-    };
-    let realm_a = forge_db::auth_realm_dao::insert_realm(
-        &pool,
-        realm(
-            format!("oa-{}", unique()),
-            3_000_000 + (unique() % 1_000_000) as i32,
-        ),
-    )
-    .await
-    .unwrap();
-    let realm_b = forge_db::auth_realm_dao::insert_realm(
-        &pool,
-        realm(
-            format!("ob-{}", unique()),
-            4_000_000 + (unique() % 1_000_000) as i32,
-        ),
-    )
-    .await
-    .unwrap();
+    let (realm_a, username, user_id) = realm_with_account(&pool, "orphan-a").await;
+    let realm_b = realm(&pool, "orphan-b").await;
 
-    let mut from_a = upstream_identity(&username, false, true);
-    from_a.realm_id = Some(realm_a.id);
-    let original = provision_and_map(&pool, &from_a)
-        .await
-        .unwrap()
-        .expect("realm A provisions the account");
-
-    assert!(forge_db::auth_realm_dao::delete_realm(&pool, realm_a.id)
+    assert!(forge_db::auth_realm_dao::delete_realm(&pool, realm_a)
         .await
         .unwrap());
     let orphaned: bool = sqlx::query_scalar("SELECT realm_orphaned FROM app_user WHERE id = $1")
-        .bind(original.user_id)
+        .bind(user_id)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert!(orphaned, "deleting the realm flags its users");
 
-    let mut from_b = upstream_identity(&username, true, true);
-    from_b.realm_id = Some(realm_b.id);
+    let mut from_b = upstream_identity(&username, Some(realm_b), true);
     from_b.admin_authoritative = true;
     assert!(
         provision_and_map(&pool, &from_b).await.unwrap().is_none(),
         "realm B must not adopt realm A's orphaned account"
     );
-    from_b.auto_provision = false;
-    assert!(provision_and_map(&pool, &from_b).await.unwrap().is_none());
     // Not even the realm-less static wiring may claim it.
     assert!(
-        provision_and_map(&pool, &upstream_identity(&username, false, true))
+        provision_and_map(&pool, &upstream_identity(&username, None, false))
             .await
             .unwrap()
             .is_none()
     );
-
     assert!(
-        !is_admin(&pool, original.user_id).await,
+        !is_admin(&pool, user_id).await,
         "the orphan was not touched"
-    );
-}
-
-#[tokio::test]
-async fn no_auto_provision_does_not_create_user() {
-    let pool = pool().await;
-    let username = unique_user("prov-off");
-
-    let resolved = provision_and_map(&pool, &upstream_identity(&username, false, false))
-        .await
-        .unwrap();
-    assert!(resolved.is_none(), "unknown user not provisioned");
-    assert!(
-        user_dao::find_user_by_username(&pool, &username)
-            .await
-            .unwrap()
-            .is_none(),
-        "no row created"
     );
 }
 
 #[tokio::test]
 async fn deactivated_user_resolves_to_none() {
     let pool = pool().await;
-    let username = unique_user("prov-inactive");
-
-    // Provision then deactivate via a fresh insert path: simulate by inserting a
-    // deactivated upstream user, then attempting a (no-auto-provision) resolve.
-    user_dao::insert_user(
-        &pool,
-        NewUser {
-            username: username.clone(),
-            password_hash: None,
-            active: false,
-            auth_source: "upstream-basic".to_string(),
-            external_subject: Some(username.clone()),
-        },
-    )
-    .await
-    .unwrap();
-
-    // With auto_provision = false, an inactive existing user is denied.
-    let resolved = provision_and_map(&pool, &upstream_identity(&username, false, false))
+    let realm_id = realm(&pool, "fwd-inactive").await;
+    let username = unique_user("fwd-inactive");
+    user_dao::insert_forwarded_user(&pool, &username, realm_id, false)
         .await
         .unwrap();
-    assert!(resolved.is_none(), "inactive user denied");
+
+    let mut identity = upstream_identity(&username, Some(realm_id), true);
+    identity.admin_authoritative = true;
+    assert!(
+        provision_and_map(&pool, &identity).await.unwrap().is_none(),
+        "inactive user denied"
+    );
 }
