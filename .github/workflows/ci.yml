@@ -32,7 +32,7 @@ on:
 # cancel-in-progress: false, so one group for the default branch would drop
 # the run of a commit merged while another was in progress, e2e jobs included,
 # and one for the merge queue would leave a queued group without its checks.
-# Per commit, every merge gets its own full run, and the release workflow can
+# Per commit, every merge gets its own run, and the release workflow can
 # require it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
@@ -58,8 +58,9 @@ permissions:
 #     dependencies' build output only, not the workspace crates or the test
 #     binaries, which every run rebuilds anyway (~19 GB of test binaries);
 #   - only pushes to the default branch save them (and the docker job's
-#     layer cache); pull requests and the merge queue restore those, and
-#     their own copies, which no other ref can read, would evict them.
+#     layer cache), in the jobs a push runs, that is when what they build
+#     from changed (#361); pull requests and the merge queue restore those,
+#     and their own copies, which no other ref can read, would evict them.
 
 env:
   CARGO_TERM_COLOR: always
@@ -75,16 +76,20 @@ env:
 
 jobs:
   # ── What the change touches ────────────────────────────────────────────────
-  # On a pull request and in the merge queue, a job runs only when the change
-  # touches what it checks (#353): ci-changes.sh compares the commit with its
-  # base (a merge group with the group ahead of it in the queue, or main) and
-  # sets one output per group of paths (rust, changelog, audit, web, image,
-  # kubernetes), and a job whose groups are all `false` is skipped,
-  # which passes a required check. Pushes to the default branch set every
-  # group, and so does a manual run without a `base` branch to compare with. The conditions run a job unless its output is
-  # `false`, so if this job fails, every job runs. Every job waits for this
-  # one, a second turn in the runner queue for a few seconds of work (see
-  # fmt); in exchange most changes leave most jobs out.
+  # A job runs only when the change touches what it checks (#353, #361):
+  # ci-changes.sh compares the commit with its base (a pull request with its
+  # base branch, a merge group with the group ahead of it in the queue or
+  # main, a push with the branch's previous commit, a manual run given a
+  # `base` branch with the commit it forked off that branch) and sets one
+  # output per group of paths (rust, changelog, audit, web, image,
+  # kubernetes), and a job whose groups are all `false` is skipped, which
+  # passes a required check. A push to main repeats its merge group's run on
+  # the same commit, so it runs only what that push changed; a push that sets
+  # a new workspace version (a release commit) and a manual run without a
+  # `base` set every group, which the release gate needs. The conditions run
+  # a job unless its output is `false`, so if this job fails, every job runs.
+  # Every job waits for this one, a second turn in the runner queue for a few
+  # seconds of work (see fmt); in exchange most changes leave most jobs out.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -99,13 +104,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A pull request's merge commit and its first parent, the base
-          # branch; the script fetches a merge group's base commit itself.
+          # branch; the script fetches a merge group's base commit, and a
+          # push's previous commit when it is not the parent, itself.
           fetch-depth: 2
       - name: Which jobs does the change need?
         id: changes
         env:
           EVENT: ${{ github.event_name }}
           MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
           DISPATCH_BASE: ${{ inputs.base }}
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-changes.sh
@@ -287,11 +294,11 @@ jobs:
   # ── Container image (build only; releases push from release.yml) ─────────
   # Builds the production Dockerfile so a broken image is caught before a
   # release tag, not by it, whenever a change touches what the image is built
-  # from (the image group, #338 and #353), on pushes to the default branch and
-  # on manual runs without a `base`. clippy, test and web compile the Rust code and the SPA of
-  # every other change; one that breaks only the image (a release-only cfg, a
-  # file .dockerignore leaves out) fails on the next push to the default
-  # branch.
+  # from (the image group, #338, #353 and #361), for a release commit and on
+  # manual runs without a `base`. clippy, test and web compile the Rust code
+  # and the SPA of every other change; one that breaks only the image (a
+  # release-only cfg, a file .dockerignore leaves out) fails in the next run
+  # that builds it, the release's at the latest.
   docker:
     name: docker
     runs-on: ubuntu-latest
@@ -500,8 +507,8 @@ jobs:
     name: e2e
     runs-on: ubuntu-latest
     # Skipped on pull requests to keep them fast (a skipped job passes a
-    # required check); runs in the merge queue when the group touches Rust,
-    # so a change that breaks it never lands, and on main/master. release.yml
+    # required check); runs in the merge queue and on main/master when the
+    # change touches Rust, so a change that breaks it never lands. release.yml
     # refuses a tag unless this and web-e2e passed on its commit.
     needs: changes
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && needs.changes.outputs.rust != 'false' }}
@@ -558,8 +565,8 @@ jobs:
 
   # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ────
   # Boots Postgres + versitygw via docker compose, builds the SPA + server, and
-  # runs the browser specs. Like e2e, only in the merge queue (when the group
-  # touches Rust or web/) and on the default branch (slow; needs Docker +
+  # runs the browser specs. Like e2e, only in the merge queue and on the
+  # default branch, when the change touches Rust or web/ (slow; needs Docker +
   # browsers).
   web-e2e:
     name: web-e2e
