@@ -146,40 +146,6 @@ impl RedisL2 {
             .await
     }
 
-    /// Promote a legacy (generation-less) invalidation into a tag bump, but
-    /// only when Redis has not already advanced past the caller's local
-    /// barrier: the first receiver of a legacy backplane message raises Redis
-    /// above every peer's barrier, so the remaining receivers adopt its
-    /// generation instead of bumping again (one bump per legacy event when
-    /// delivery is staggered, instead of one per node). Returns the resulting
-    /// generation and whether this caller performed the bump.
-    pub async fn promote_tag(
-        &self,
-        tag: &str,
-        local_generation: u64,
-    ) -> Result<(u64, bool), redis::RedisError> {
-        let script = redis::Script::new(
-            r#"
-            local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-            local barrier = tonumber(ARGV[1])
-            if current > barrier then
-                return {current, 0}
-            end
-            local next = math.max(current, barrier) + 1
-            redis.call('SET', KEYS[1], next, 'EX', ARGV[2])
-            return {next, 1}
-            "#,
-        );
-        let mut conn = self.conn.clone();
-        let (generation, bumped): (u64, i32) = script
-            .key(Self::redis_tag_key(tag))
-            .arg(local_generation)
-            .arg(TAG_TTL.as_secs())
-            .invoke_async(&mut conn)
-            .await?;
-        Ok((generation, bumped == 1))
-    }
-
     /// Store a tagged envelope only if every Redis tag generation still equals
     /// the generation captured before the factory ran. This is the distributed
     /// fencing token that prevents stale fills from repopulating shared L2.
