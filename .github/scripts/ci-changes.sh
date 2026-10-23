@@ -33,24 +33,31 @@ set -uo pipefail
 COMMON=(.github/workflows/ci.yml .github/scripts/ci-changes.sh)
 
 # Rust: the workspace, what its build and tests read from outside the crates
-# (web/index.html and docker/forge.docker.toml are compiled in; the release
-# tests read the version lines of web/package.json, the Kubernetes base and
-# the chart), and the scripts the Rust jobs run.
+# (web/index.html and docker/forge.docker.toml are compiled in), and the
+# scripts the Rust jobs run. Not .cargo/audit.toml, which only cargo-audit
+# reads.
 RUST=(
-    Cargo.toml Cargo.lock rust-toolchain.toml .cargo
+    Cargo.toml Cargo.lock rust-toolchain.toml .cargo ':(exclude).cargo/audit.toml'
     crates plugins xtask migrations .sqlx fixtures
     web/index.html docker/forge.docker.toml
-    web/package.json deploy/kubernetes/base/kustomization.yaml deploy/helm/forge/Chart.yaml
-    .github/scripts
+    .github/scripts/test-parallel.sh .github/scripts/test-timings-runner.sh
+    .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh
 )
 # fmt's second check: the changelog fragments.
 CHANGELOG=(docs/changes)
+# What xtask's tests, which fmt runs too (#363), read from outside xtask: the
+# version lines `cargo xtask release` sets, and the release workflow's channel
+# script.
+RELEASE=(
+    web/package.json deploy/kubernetes/base/kustomization.yaml deploy/helm/forge/Chart.yaml
+    .github/scripts/release-channels.sh
+)
 AUDIT=(Cargo.lock .cargo/audit.toml)
 WEB=(web)
 # What the image is built from beyond the sources clippy, test and web check.
 IMAGE=(
     Dockerfile .dockerignore docker LICENSE
-    ':(glob)**/Cargo.toml' Cargo.lock rust-toolchain.toml .cargo
+    ':(glob)**/Cargo.toml' Cargo.lock rust-toolchain.toml .cargo ':(exclude).cargo/audit.toml'
     web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc
 )
 # The kubernetes job: the manifests and the chart, and what its digest-pin
@@ -62,7 +69,7 @@ KUBERNETES=(
     .github/scripts/image-pin-check.sh .github/scripts/kustomize-check.sh
     .github/scripts/helm-check.sh
 )
-JOB_GROUPS=(rust changelog audit web image kubernetes)
+JOB_GROUPS=(rust changelog release audit web image kubernetes)
 
 out=${GITHUB_OUTPUT:-/dev/stdout}
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
