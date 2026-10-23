@@ -1312,6 +1312,15 @@ struct MockRegistry {
     blob_gets: AtomicUsize,
     token_requests: AtomicUsize,
     base: Mutex<String>,
+    /// Tag lists: at most this many tags per page, with a `Link` to the
+    /// next one.
+    tag_page: Mutex<Option<usize>>,
+    /// Tag lists: answer an `n` above this with 400.
+    max_tags_n: Mutex<Option<usize>>,
+    /// The query of every tag list request.
+    tag_queries: Mutex<Vec<String>>,
+    /// Hold every manifest `GET` this long before answering.
+    manifest_delay: Mutex<std::time::Duration>,
 }
 
 impl MockRegistry {
@@ -1393,6 +1402,8 @@ impl MockRegistry {
                 };
                 if !head {
                     self.manifest_gets.fetch_add(1, Ordering::SeqCst);
+                    let delay = *self.manifest_delay.lock().unwrap();
+                    tokio::time::sleep(delay).await;
                 }
                 let digest = sha(&body);
                 if self.corrupt.load(Ordering::SeqCst) {
@@ -1436,6 +1447,22 @@ impl MockRegistry {
                 body.into_response()
             }
             Some(forge_oci::path::Endpoint::TagsList { name }) => {
+                let query = req.uri().query().unwrap_or_default().to_string();
+                self.tag_queries.lock().unwrap().push(query.clone());
+                let mut n: Option<usize> = None;
+                let mut last: Option<String> = None;
+                for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                    match key.as_ref() {
+                        "n" => n = value.parse().ok(),
+                        "last" => last = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if n.zip(*self.max_tags_n.lock().unwrap())
+                    .is_some_and(|(n, max)| n > max)
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
                 let mut tags: Vec<String> = self
                     .manifests
                     .lock()
@@ -1443,13 +1470,227 @@ impl MockRegistry {
                     .keys()
                     .filter_map(|k| k.strip_prefix(&format!("{name}:")).map(str::to_string))
                     .filter(|t| !t.starts_with("sha256:"))
+                    .filter(|t| last.as_ref().is_none_or(|l| t > l))
                     .collect();
                 tags.sort();
-                axum::Json(json!({"name": name, "tags": tags})).into_response()
+                let page = match (n, *self.tag_page.lock().unwrap()) {
+                    (Some(n), Some(cap)) => Some(n.min(cap)),
+                    (n, cap) => n.or(cap),
+                };
+                let mut resp_headers = HeaderMap::new();
+                if let Some(page) = page.filter(|&page| tags.len() > page) {
+                    tags.truncate(page);
+                    let next = format!(
+                        "</v2/{name}/tags/list?n={page}&last={}>; rel=\"next\"",
+                        tags.last().unwrap()
+                    );
+                    resp_headers.insert(header::LINK, next.parse().unwrap());
+                }
+                (
+                    resp_headers,
+                    axum::Json(json!({"name": name, "tags": tags})),
+                )
+                    .into_response()
             }
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
+}
+
+/// A proxy's tag list follows the upstream's own pages (`Link:
+/// rel="next"`) to fill the client's page, and passes on that there are
+/// more; an upstream that refuses a large `n` is asked without one (#216).
+#[tokio::test]
+async fn proxy_tag_lists_follow_the_upstream_pages() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let manifest = image(&config("amd64"), &[b"paged layer"]);
+    for i in 0..7 {
+        mock.put("team/paged", &format!("t{i}"), OCI_MANIFEST, &manifest);
+    }
+    *mock.tag_page.lock().unwrap() = Some(3);
+    *mock.max_tags_n.lock().unwrap() = Some(1000);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/team/paged");
+
+    let resp = oci.get(&name, "tags/list?n=5").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{name}/tags/list?n=5&last=t4>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t0", "t1", "t2", "t3", "t4"]));
+    let resp = oci.get(&name, "tags/list?n=5&last=t4").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t5", "t6"]));
+
+    // Without `n`: Forge's default page is more than this upstream allows.
+    mock.tag_queries.lock().unwrap().clear();
+    let resp = oci.get(&name, "tags/list").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["tags"],
+        json!(["t0", "t1", "t2", "t3", "t4", "t5", "t6"])
+    );
+    assert_eq!(
+        *mock.tag_queries.lock().unwrap(),
+        ["n=10001", "", "n=3&last=t2", "n=3&last=t5"]
+    );
+}
+
+/// An upstream that pages in steps too small to fill a page within the
+/// pages a proxy follows: the proxy passes on that there are more, and a
+/// group holding it ends its page at the proxy's last tag, so the next
+/// page lists what the proxy left out before any later tag of another
+/// member (#216).
+#[tokio::test]
+async fn group_tag_lists_end_where_a_member_left_tags_out() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let manifest = image(&config("amd64"), &[b"many layer"]);
+    for i in 0..12 {
+        mock.put("team/many", &format!("t{i:02}"), OCI_MANIFEST, &manifest);
+    }
+    *mock.tag_page.lock().unwrap() = Some(1);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let hosted = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    // Served from both members (with `prefer_hosted`, the hosted image
+    // would hide the proxy's).
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker", "prefer_hosted": false}),
+    )
+    .await;
+    for (member, priority) in [(&hosted, 2), (&proxy, 1)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    }
+    let oci = admin_oci(&srv).await;
+    oci.push_image(
+        &format!("{hosted}/team/many"),
+        "zz",
+        "amd64",
+        b"hosted many",
+    )
+    .await;
+
+    let first_ten: Vec<String> = (0..10).map(|i| format!("t{i:02}")).collect();
+    let resp = oci.get(&format!("{proxy}/team/many"), "tags/list").await;
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{proxy}/team/many/tags/list?n=10000&last=t09>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(first_ten));
+
+    let name = format!("{group}/team/many");
+    let resp = oci.get(&name, "tags/list").await;
+    assert_eq!(
+        resp.headers()["link"],
+        format!("</v2/{name}/tags/list?n=10000&last=t09>; rel=\"next\"").as_str()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["tags"],
+        json!(first_ten),
+        "zz waits for the proxy's rest"
+    );
+    let resp = oci.get(&name, "tags/list?n=10000&last=t09").await;
+    assert!(resp.headers().get("link").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["t10", "t11", "zz"]));
+}
+
+/// A docker proxy repointed while it fetches from its previous upstream
+/// caches nothing of that fetch: the repoint purges the cache, and what the
+/// previous upstream served must not land in it after the purge (#217).
+#[tokio::test]
+async fn a_fetch_from_the_previous_upstream_is_not_cached_after_a_repoint() {
+    let srv = common::start().await;
+    let old = MockRegistry::start().await;
+    let new = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let manifest = image(&cfg, &[b"previous upstream layer"]);
+    old.put("library/base", "1.0", OCI_MANIFEST, &manifest);
+    *old.manifest_delay.lock().unwrap() = std::time::Duration::from_secs(2);
+    let proxy = repo_name("proxy");
+    let created = create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": old.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = Arc::new(admin_oci(&srv).await);
+    let name = format!("{proxy}/library/base");
+
+    let pull = tokio::spawn({
+        let oci = oci.clone();
+        let name = name.clone();
+        async move { oci.get(&name, "manifests/1.0").await.status() }
+    });
+    for _ in 0..200 {
+        if old.manifest_gets.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        old.manifest_gets.load(Ordering::SeqCst),
+        1,
+        "the fetch is under way"
+    );
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{proxy}"),
+        json!({"remote_url": new.base()}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    assert_eq!(pull.await.unwrap(), 503, "asked to retry");
+    let rows: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM oci_tag WHERE repository_id = $1), \
+                (SELECT count(*) FROM oci_manifest WHERE repository_id = $1)",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (0, 0), "no tag or manifest of the previous upstream");
 }
 
 #[tokio::test]
@@ -2214,6 +2455,276 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     .await
     .unwrap();
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
+}
+
+/// Claim `repo_id`'s retention run and evaluate its image policy as the
+/// worker does, stopping before the apply step so a test can change state
+/// in between.
+async fn claim_image_run(
+    srv: &TestServer,
+    repo: &str,
+    repo_id: i64,
+) -> (
+    forge_db::retention_dao::ClaimedRepo,
+    uuid::Uuid,
+    forge_core::retention::images::ImageRetentionPolicy,
+    forge_core::retention::images::ImageDecisions,
+    chrono::DateTime<chrono::Utc>,
+) {
+    let resp = admin_post(
+        srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    let mut tx = srv.pool.begin().await.unwrap();
+    let (claimed, run_id) = forge_db::retention_dao::claim_next_due_repo(
+        &mut tx,
+        chrono::Utc::now(),
+        chrono::Duration::seconds(300),
+        Some(repo_id),
+    )
+    .await
+    .unwrap()
+    .expect("due");
+    tx.commit().await.unwrap();
+    let policy: forge_core::retention::images::ImageRetentionPolicy =
+        serde_json::from_value(claimed.policy.clone()).unwrap();
+    let now = forge_db::db_now(&srv.pool).await.unwrap();
+    let (decisions, _) =
+        forge_core::retention::images::evaluate_repository(&srv.pool, repo_id, now, &policy)
+            .await
+            .unwrap();
+    (claimed, run_id, policy, decisions, now)
+}
+
+async fn apply_image_run(
+    srv: &TestServer,
+    claimed: &forge_db::retention_dao::ClaimedRepo,
+    run_id: uuid::Uuid,
+    policy: &forge_core::retention::images::ImageRetentionPolicy,
+    decisions: &forge_core::retention::images::ImageDecisions,
+    evaluated_at: chrono::DateTime<chrono::Utc>,
+) -> forge_db::retention_dao::RunSummary {
+    let fence = forge_core::retention::images::ImageRunFence {
+        stored_policy: &claimed.policy,
+        policy,
+        evaluated_at,
+    };
+    forge_core::retention::images::apply_images(
+        &srv.pool,
+        claimed.repository_id,
+        run_id,
+        decisions,
+        chrono::Duration::seconds(60),
+        false,
+        Some(&fence),
+    )
+    .await
+    .unwrap()
+}
+
+/// An image retention run stops applying once its policy changes (here: to
+/// dry run) or it loses its lease, as a package retention run does (#215).
+#[tokio::test]
+async fn image_retention_stops_when_its_policy_changes_or_its_lease_is_lost() {
+    let srv = common::start().await;
+    let oci = admin_oci(&srv).await;
+    let policy = json!({"version": 1, "rules": [{"id": "keep-1", "keep_last_n_tags": 1}]});
+    for lose_lease in [false, true] {
+        let repo = repo_name("dock");
+        let created = create_repo(
+            &srv,
+            json!({"name": repo, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+        let repo_id = created["id"].as_i64().unwrap();
+        let name = format!("{repo}/app");
+        for i in 0..4 {
+            oci.push_image(
+                &name,
+                &format!("v{i}"),
+                "amd64",
+                format!("layer {repo} {i}").as_bytes(),
+            )
+            .await;
+            sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND tag = $3")
+                .bind(10 - i)
+                .bind(repo_id)
+                .bind(format!("v{i}"))
+                .execute(&srv.pool)
+                .await
+                .unwrap();
+        }
+        let resp = admin_put(
+            &srv,
+            &format!("/admin/repositories/{repo}/retention"),
+            json!({"policy": policy}),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+        assert_eq!(decisions.tags.len(), 3);
+
+        if lose_lease {
+            sqlx::query("UPDATE retention_run SET current_run_id = gen_random_uuid() WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&srv.pool)
+                .await
+                .unwrap();
+        } else {
+            let mut dry_run = policy.clone();
+            dry_run["dry_run_only"] = json!(true);
+            forge_db::retention_dao::write_policy(&srv.pool, repo_id, Some(&dry_run))
+                .await
+                .unwrap();
+        }
+
+        let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+        assert_eq!(
+            (summary.deleted, summary.skipped),
+            (0, 3),
+            "lose_lease={lose_lease}"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                oci.get(&name, &format!("manifests/v{i}")).await.status(),
+                200,
+                "lose_lease={lose_lease}"
+            );
+        }
+    }
+}
+
+/// Image retention re-evaluates an image under its lock before applying
+/// what it decided for it (#215): a tag newer ones deleted since now keeps,
+/// a tag pulled since, and a referrer whose subject was tagged again are
+/// skipped; the rest is applied.
+#[tokio::test]
+async fn image_retention_re_evaluates_each_image_under_its_lock() {
+    let srv = common::start().await;
+    let oci = admin_oci(&srv).await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let pushed_days_ago = |image: &'static str, tag: String, days: i32| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND image = $3 AND tag = $4")
+                .bind(days)
+                .bind(repo_id)
+                .bind(image)
+                .bind(tag)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // `keep`: five tags, the two newest kept.
+    let keep = format!("{repo}/keep");
+    for i in 0..5 {
+        oci.push_image(
+            &keep,
+            &format!("k{i}"),
+            "amd64",
+            format!("keep {repo} {i}").as_bytes(),
+        )
+        .await;
+        pushed_days_ago("keep", format!("k{i}"), 10 - i).await;
+    }
+    // `pulled`: a tag pushed long ago and never pulled.
+    let pulled = format!("{repo}/pulled");
+    oci.push_image(&pulled, "p0", "amd64", format!("pulled {repo}").as_bytes())
+        .await;
+    pushed_days_ago("pulled", "p0".into(), 60).await;
+    // `signed`: an image and its signature, both untagged for a month.
+    let signed = format!("{repo}/signed");
+    let layer = format!("signed {repo}").into_bytes();
+    let subject = oci.push_image(&signed, "s", "amd64", &layer).await;
+    let subject_manifest = image(&config("amd64"), &[&layer]);
+    let empty_cfg = b"{}";
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(empty_cfg), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": subject, "size": subject_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    let resp = oci
+        .put_manifest(&signed, &sha(&sig), OCI_MANIFEST, &sig)
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    assert_eq!(oci.delete(&signed, "manifests/s").await.status(), 202);
+    sqlx::query("UPDATE oci_manifest SET untagged_since = now() - interval '30 days' WHERE repository_id = $1 AND image = 'signed'")
+        .bind(repo_id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+
+    let policy = json!({"version": 1, "rules": [
+        {"id": "keep-2", "image_prefix": "keep", "keep_last_n_tags": 2},
+        {"id": "unpulled", "image_prefix": "pulled", "tag_not_pulled_for_days": 30},
+        {"id": "untagged", "image_prefix": "signed", "delete_untagged_after_days": 7}
+    ]});
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut tags: Vec<&str> = decisions.tags.iter().map(|t| t.tag.as_str()).collect();
+    tags.sort_unstable();
+    assert_eq!(tags, ["k0", "k1", "k2", "p0"]);
+    let mut manifests: Vec<&str> = decisions
+        .manifests
+        .iter()
+        .map(|m| m.digest.as_str())
+        .collect();
+    manifests.sort_unstable();
+    let sig_digest = sha(&sig);
+    let mut doomed = vec![subject.as_str(), sig_digest.as_str()];
+    doomed.sort_unstable();
+    assert_eq!(manifests, doomed);
+
+    // Meanwhile: the newest `keep` tag is deleted, `p0` is pulled, and the
+    // signed image is tagged again.
+    assert_eq!(oci.delete(&keep, "manifests/k4").await.status(), 202);
+    assert_eq!(oci.get(&pulled, "manifests/p0").await.status(), 200);
+    let resp = oci
+        .put_manifest(&signed, "again", OCI_MANIFEST, &subject_manifest)
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (2, 4), "{summary:?}");
+    for (tag, status) in [("k0", 404), ("k1", 404), ("k2", 200), ("k3", 200)] {
+        assert_eq!(
+            oci.get(&keep, &format!("manifests/{tag}")).await.status(),
+            status,
+            "{tag}"
+        );
+    }
+    assert_eq!(oci.get(&pulled, "manifests/p0").await.status(), 200);
+    for digest in [&subject, &sig_digest] {
+        assert_eq!(
+            oci.get(&signed, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
 }
 
 /// A tag that clients only resolve with a HEAD, as containerd does while it

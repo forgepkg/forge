@@ -960,8 +960,16 @@ pub async fn update(
             return db_error(e);
         }
         // A docker proxy's tags name what the previous upstream served:
-        // the repointed proxy starts with an empty cache.
+        // the repointed proxy starts with an empty cache. Locked first, as
+        // the purge requires: a fetch from the previous upstream still
+        // inserting commits before the purge (which removes it), and one
+        // inserting later finds the new upstream and caches nothing
+        // (`oci_dao::lock_proxy_upstream`).
         if existing.is_docker() {
+            match repository_dao::lock_repository(&mut *tx, updated.id).await {
+                Ok(_) => {}
+                Err(e) => return db_error(e),
+            }
             if let Err(e) =
                 oci_dao::purge_repository(&mut tx, updated.id, state.config.outbox.grace()).await
             {

@@ -21,7 +21,7 @@ use forge_db::{oci_dao, repository_dao};
 
 use crate::digest::Digest;
 use crate::error::{OciError, OciResult};
-use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor};
+use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor, TagPage};
 use crate::reference::Reference;
 use crate::service::{Caller, Registry};
 
@@ -225,10 +225,14 @@ impl Registry {
         last: Option<&str>,
         limit: usize,
         depth: u32,
-    ) -> OciResult<Option<Vec<String>>> {
+    ) -> OciResult<Option<TagPage>> {
         let mut known = false;
         let mut failure: Option<OciError> = None;
         let mut tags: Vec<String> = Vec::new();
+        // The smallest last tag of a member page that left tags out: the
+        // merged page ends there, since the member's next page may hold
+        // tags before the other members' later ones.
+        let mut cut: Option<String> = None;
         for member in self.serving_members(caller, group, image, depth).await? {
             match self
                 .tags_from(caller, &member, image, last, limit, depth + 1)
@@ -236,7 +240,12 @@ impl Registry {
             {
                 Ok(Some(page)) => {
                     known = true;
-                    tags.extend(page);
+                    if let Some(end) = page.tags.last().filter(|_| page.more) {
+                        if cut.as_ref().is_none_or(|cut| end < cut) {
+                            cut = Some(end.clone());
+                        }
+                    }
+                    tags.extend(page.tags);
                 }
                 Ok(None) => {}
                 Err(e) => failure = Some(e),
@@ -247,8 +256,15 @@ impl Registry {
         }
         tags.sort_unstable();
         tags.dedup();
-        tags.truncate(limit);
-        Ok(Some(tags))
+        let mut more = cut.is_some();
+        if let Some(cut) = &cut {
+            tags.retain(|t| t <= cut);
+        }
+        if tags.len() > limit {
+            tags.truncate(limit);
+            more = true;
+        }
+        Ok(Some(TagPage { tags, more }))
     }
 
     pub(crate) async fn group_referrers(

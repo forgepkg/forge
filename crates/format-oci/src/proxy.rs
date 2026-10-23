@@ -19,7 +19,7 @@
 //! to the token realm that challenge names, and the token is cached until it
 //! expires.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -37,7 +37,7 @@ use reqwest::Method;
 use crate::digest::Digest;
 use crate::error::{Code, OciError, OciResult};
 use crate::manifest::{self, media, MAX_MANIFEST_BYTES};
-use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor};
+use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor, TagPage};
 use crate::push::require_linked;
 use crate::reference::{self, Reference};
 use crate::service::{Registry, Target};
@@ -64,6 +64,11 @@ const MAX_CONFIG_BYTES: i64 = 1024 * 1024;
 
 /// Largest upstream tag list or referrers document read.
 const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
+
+/// Pages of an upstream's tag list followed (`Link: rel="next"`) to fill
+/// one page of Forge's: an upstream that pages in small steps is listed
+/// further on the client's next request.
+const MAX_UPSTREAM_TAG_PAGES: usize = 10;
 
 /// Cached upstream registry tokens: key → (token, expiry). Bounded: the key
 /// names an image a client chose, and the token and its lifetime are the
@@ -132,6 +137,55 @@ fn cache_token(key: String, token: String, ttl: Duration) {
 pub(crate) fn upstream_base(remote_url: &str) -> String {
     let base = remote_url.trim_end_matches('/');
     base.strip_suffix("/v2").unwrap_or(base).to_string()
+}
+
+/// The `next` page a response's `Link` header names (RFC 8288), as a path
+/// under `base`, resolved against the response's URL: only a link back to
+/// the upstream itself is followed, never one to another host.
+fn next_link(response: &reqwest::Response, base: &str) -> Option<String> {
+    response
+        .headers()
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .find_map(|link| {
+            let mut parts = link.split(';');
+            let target = parts.next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
+            let next = parts.any(|param| {
+                let param = param.trim().replace(' ', "");
+                param.eq_ignore_ascii_case("rel=\"next\"") || param.eq_ignore_ascii_case("rel=next")
+            });
+            if !next {
+                return None;
+            }
+            let url = response.url().join(target).ok()?;
+            // Both as the URL parser writes them (lowercase host, no
+            // default port).
+            let base = url::Url::parse(base).ok()?;
+            url.as_str()
+                .strip_prefix(base.as_str().trim_end_matches('/'))
+                .filter(|path| path.starts_with("/v2/"))
+                .map(str::to_string)
+        })
+}
+
+/// Inside a transaction that caches what `repo`'s upstream served: lock the
+/// repository row and make sure the proxy still points at the upstream the
+/// content came from ([`oci_dao::lock_proxy_upstream`]). A proxy repointed
+/// meanwhile purged its cache, and content of the previous upstream must
+/// not land in it after that: the client is asked to retry.
+pub(crate) async fn still_upstream(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &Repository,
+) -> OciResult<()> {
+    if oci_dao::lock_proxy_upstream(tx, repo.id, repo.remote_url.as_deref()).await? {
+        Ok(())
+    } else {
+        Err(OciError::unavailable(
+            "the proxy was pointed at another upstream while this was fetched; retry",
+        ))
+    }
 }
 
 fn is_docker_hub(remote_url: &str) -> bool {
@@ -693,6 +747,7 @@ impl Registry {
                     .await?;
                 if head.status().is_success() {
                     let mut tx = pool.begin().await?;
+                    still_upstream(&mut tx, repo).await?;
                     match oci_dao::insert_link_existing(
                         &mut tx,
                         repo.id,
@@ -762,6 +817,7 @@ impl Registry {
         };
         let stored = self.inner.cas.commit(staged).await?;
         let mut tx = pool.begin().await?;
+        still_upstream(&mut tx, repo).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
             repo.id,
@@ -831,7 +887,7 @@ impl Registry {
         image: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<Vec<String>>> {
+    ) -> OciResult<Option<TagPage>> {
         let local = proxied_image(repo, image);
         if repo.online {
             match self.upstream_tags(repo, &local, last, limit).await {
@@ -846,56 +902,89 @@ impl Registry {
         self.local_tags(repo, &local, last, limit).await
     }
 
+    /// Up to `limit` of the upstream's tags of `local` after `last`. Asks
+    /// for one more than that, to know whether there are more, and follows
+    /// the upstream's own pages (`Link: rel="next"`, back to the upstream
+    /// only) for up to [`MAX_UPSTREAM_TAG_PAGES`] requests. An upstream that
+    /// refuses so large an `n` (400, as registries that cap it answer) is
+    /// asked again without one: its own page size and links take over.
     async fn upstream_tags(
         &self,
         repo: &Repository,
         local: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<Vec<String>>> {
+    ) -> OciResult<Option<TagPage>> {
         let upstream = self.upstream(repo).await?;
-        let query = {
+        let first = |n: Option<usize>| {
             let mut query = url::form_urlencoded::Serializer::new(String::new());
-            query.append_pair("n", &limit.to_string());
+            if let Some(n) = n {
+                query.append_pair("n", &n.to_string());
+            }
             if let Some(last) = last {
                 query.append_pair("last", last);
             }
-            query.finish()
+            let query = query.finish();
+            if query.is_empty() {
+                format!("/v2/{local}/tags/list")
+            } else {
+                format!("/v2/{local}/tags/list?{query}")
+            }
         };
-        let response = upstream
-            .send(
-                Method::GET,
-                &format!("/v2/{local}/tags/list?{query}"),
-                &format!("repository:{local}:pull"),
-                None,
-                RequestClass::Metadata,
-            )
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+        let scope = format!("repository:{local}:pull");
+        let mut tags: BTreeSet<String> = BTreeSet::new();
+        let mut path = Some(first(Some(limit.saturating_add(1))));
+        let mut sized = true;
+        let mut pages = 0;
+        let mut left_out = false;
+        while let Some(current) = path.take() {
+            let response = upstream
+                .send(Method::GET, &current, &scope, None, RequestClass::Metadata)
+                .await?;
+            if pages == 0 {
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                if response.status() == reqwest::StatusCode::BAD_REQUEST && sized {
+                    sized = false;
+                    path = Some(first(None));
+                    continue;
+                }
+            }
+            if !response.status().is_success() {
+                return Err(upstream_status(response.status()));
+            }
+            pages += 1;
+            let next = next_link(&response, &upstream.base);
+            #[derive(serde::Deserialize)]
+            struct TagList {
+                #[serde(default)]
+                tags: Option<Vec<String>>,
+            }
+            let body = read_limited(response, MAX_LISTING_BYTES).await?;
+            let list: TagList = serde_json::from_slice(&body)
+                .map_err(|_| OciError::unavailable("the upstream served an invalid tag list"))?;
+            tags.extend(
+                list.tags
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| reference::valid_tag(t))
+                    .filter(|t| last.is_none_or(|l| t.as_bytes() > l.as_bytes())),
+            );
+            if tags.len() > limit {
+                break;
+            }
+            match next {
+                Some(next) if pages < MAX_UPSTREAM_TAG_PAGES => path = Some(next),
+                Some(_) => left_out = true,
+                None => {}
+            }
         }
-        if !response.status().is_success() {
-            return Err(upstream_status(response.status()));
-        }
-        #[derive(serde::Deserialize)]
-        struct TagList {
-            #[serde(default)]
-            tags: Option<Vec<String>>,
-        }
-        let body = read_limited(response, MAX_LISTING_BYTES).await?;
-        let list: TagList = serde_json::from_slice(&body)
-            .map_err(|_| OciError::unavailable("the upstream served an invalid tag list"))?;
-        let mut tags: Vec<String> = list
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| reference::valid_tag(t))
-            .filter(|t| last.is_none_or(|l| t.as_bytes() > l.as_bytes()))
-            .collect();
-        tags.sort_unstable();
-        tags.dedup();
-        tags.truncate(limit);
-        Ok(Some(tags))
+        let more = left_out || tags.len() > limit;
+        Ok(Some(TagPage {
+            tags: tags.into_iter().take(limit).collect(),
+            more,
+        }))
     }
 
     pub(crate) async fn proxy_referrers(

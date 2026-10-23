@@ -169,9 +169,15 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   `not_found_ttl_seconds` (default 60).
 - Multi-arch indexes are cached as they are; each platform's manifest and
   layers are fetched when a client asks for them. Tag lists and referrers
-  come from the upstream, or from the cache while it is unreachable.
+  come from the upstream, or from the cache while it is unreachable. A tag
+  list follows the upstream's own pages (`Link: rel="next"`, up to 10
+  requests) to fill the client's page, and links to the next page when the
+  upstream has more; an upstream that refuses a large `n` is asked without
+  one.
 - An offline proxy (`"online": false`) serves only what it cached. Pointing a
-  proxy at another `remote_url` empties its cache.
+  proxy at another `remote_url` empties its cache; a fetch from the previous
+  upstream still running then caches nothing, and its client is asked to
+  retry (503).
 - To ask the upstream again before those TTLs run out (a tag moved, an image
   published after the proxy answered "not found"), invalidate the proxy's
   cache: *Invalidate cache* on its page in the web UI, or
@@ -259,6 +265,14 @@ A docker repository's retention policy (`PUT
   audit work as for NuGet repositories; audit rows carry the image as
   `package_name` and the tag or digest as `version`. Group repositories have
   no policy of their own.
+- A run applies its decisions image by image, in batches of up to 100. As
+  for NuGet repositories, a batch first checks that the policy is still the
+  one the run evaluated and that the run still holds its lease; otherwise
+  the run stops, so disabling the policy, switching it to dry run or
+  editing it takes effect at once. The batch then evaluates the image's
+  current tags and manifests again and skips what they no longer warrant:
+  a tag pulled or pushed since, a tag that newer tags deleted meanwhile now
+  keep, or a signature whose image was tagged again.
 
 ## Configuration
 

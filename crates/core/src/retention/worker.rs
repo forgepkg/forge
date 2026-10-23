@@ -401,6 +401,11 @@ impl RetentionWorker {
         if policy.enabled {
             let (decisions, evaluated) =
                 images::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
+            let fence = images::ImageRunFence {
+                stored_policy: &repo.policy,
+                policy: &policy,
+                evaluated_at: now,
+            };
             summary = images::apply_images(
                 &self.pool,
                 repo.repository_id,
@@ -408,6 +413,7 @@ impl RetentionWorker {
                 &decisions,
                 self.config.delete_grace,
                 policy.dry_run_only,
+                Some(&fence),
             )
             .await?;
             summary.evaluated = evaluated;

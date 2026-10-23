@@ -19,6 +19,17 @@ use crate::service::{location, Caller, Registry, RequestCtx};
 /// Tags returned by one `tags/list` page when the client sets no `n`.
 const DEFAULT_TAG_PAGE: usize = 10_000;
 
+/// One page of an image's tags: the tags after `last`, in byte order, at
+/// most as many as asked for.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TagPage {
+    pub tags: Vec<String>,
+    /// The source has tags after these that the page leaves out: the full
+    /// page did not hold them, or the source could not list them all at
+    /// once (a proxy's upstream that pages its tags).
+    pub more: bool,
+}
+
 /// A manifest found for a pull.
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestHit {
@@ -184,7 +195,7 @@ impl Registry {
         last: Option<&'a str>,
         limit: usize,
         depth: u32,
-    ) -> BoxFuture<'a, OciResult<Option<Vec<String>>>> {
+    ) -> BoxFuture<'a, OciResult<Option<TagPage>>> {
         Box::pin(async move {
             match repo.kind() {
                 RepoKind::Hosted => self.local_tags(repo, image, last, limit).await,
@@ -279,14 +290,17 @@ impl Registry {
         image: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<Vec<String>>> {
+    ) -> OciResult<Option<TagPage>> {
         let pool = &self.inner.pool;
-        let tags = oci_dao::list_tags(pool, repo.id, image, last, limit as i64).await?;
+        let asked = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut tags = oci_dao::list_tags(pool, repo.id, image, last, asked).await?;
         if tags.is_empty() && last.is_none() && !oci_dao::image_exists(pool, repo.id, image).await?
         {
             return Ok(None);
         }
-        Ok(Some(tags))
+        let more = tags.len() > limit;
+        tags.truncate(limit);
+        Ok(Some(TagPage { tags, more }))
     }
 
     pub(crate) async fn local_referrers(
@@ -475,17 +489,15 @@ impl Registry {
         }
         let page = n.unwrap_or(DEFAULT_TAG_PAGE).min(DEFAULT_TAG_PAGE);
         let t = &ctx.target;
-        let tags = if page == 0 {
-            Some(Vec::new())
+        let listed = if page == 0 {
+            Some(TagPage::default())
         } else {
-            self.tags_from(&ctx.caller, &t.repo, &t.image, last.as_deref(), page + 1, 0)
+            self.tags_from(&ctx.caller, &t.repo, &t.image, last.as_deref(), page, 0)
                 .await?
         };
-        let Some(mut tags) = tags else {
+        let Some(TagPage { tags, more }) = listed else {
             return Err(OciError::name_unknown(&t.name));
         };
-        let more = tags.len() > page;
-        tags.truncate(page);
         let body = serde_json::json!({ "name": t.name, "tags": tags });
         let mut response = (
             StatusCode::OK,

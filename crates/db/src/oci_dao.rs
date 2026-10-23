@@ -61,6 +61,34 @@ where
     .await
 }
 
+/// Inside a proxy's transaction that caches what its upstream served: take a
+/// `FOR SHARE` lock on the repository row while it still names `remote_url`
+/// as the upstream. `false`: the proxy was repointed (or deleted) since the
+/// content was fetched, which must then not be cached. The lock conflicts
+/// with the update that repoints a proxy and purges its cache in the same
+/// transaction ([`purge_repository`]): the update waits for this insert to
+/// commit and purges it, or this waits for the update and sees the new
+/// upstream.
+pub async fn lock_proxy_upstream(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    remote_url: Option<&str>,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT 1 AS "one!"
+        FROM repository
+        WHERE id = $1 AND remote_url IS NOT DISTINCT FROM $2
+        FOR SHARE
+        "#,
+        repository_id,
+        remote_url,
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Remove every image row of `repository_id` (uploads, tags, manifests,
 /// links), releasing one blob reference per removed row. Returns how many
 /// references were released. The caller must hold the repository row
@@ -1567,6 +1595,52 @@ pub async fn retention_manifests(
     )
     .fetch_all(pool)
     .await
+}
+
+/// Lock (`FOR UPDATE`) and load one image's manifests and tags, as
+/// [`retention_manifests`] and [`retention_tags`] load a repository's: for
+/// image retention to re-evaluate its decisions against the image's current
+/// state, which stays put until the caller's transaction ends. Manifests are
+/// locked before tags, in id and tag order.
+pub async fn lock_image_for_retention(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    image: &str,
+) -> sqlx::Result<(Vec<RetentionTag>, Vec<RetentionManifest>)> {
+    let manifests = sqlx::query_as!(
+        RetentionManifest,
+        r#"
+        SELECT m.id, m.image, m.digest, m.created_at, m.untagged_since, m.last_pulled_at,
+               m.subject_digest,
+               ARRAY(SELECT r.digest FROM oci_manifest_ref r
+                     WHERE r.manifest_id = m.id AND r.kind = 'manifest'
+                     ORDER BY r.digest) AS "children!"
+        FROM oci_manifest m
+        WHERE m.repository_id = $1 AND m.image = $2
+        ORDER BY m.id
+        FOR UPDATE OF m
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let tags = sqlx::query_as!(
+        RetentionTag,
+        r#"
+        SELECT t.image, t.tag, t.manifest_id, m.digest, t.updated_at, m.last_pulled_at
+        FROM oci_tag t
+        JOIN oci_manifest m ON m.id = t.manifest_id
+        WHERE t.repository_id = $1 AND t.image = $2
+        ORDER BY t.tag
+        FOR UPDATE OF t
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok((tags, manifests))
 }
 
 /// Delete `tag` only if it still points at `manifest_id` (retention decided
