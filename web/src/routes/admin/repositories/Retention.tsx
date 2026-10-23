@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 import { useQueryClient } from '@tanstack/react-query'
 
 import type { RepoView } from '~/api/repositories'
@@ -654,16 +654,29 @@ function RunPanel({
   const policy = view.policy
   const running = ledger?.state === 'running'
   const summary = ledger?.last_run_summary
+  const switchedOff = view.runs_enabled === false
 
   const nextRun = !policy
     ? 'not scheduled: no policy'
     : policy.enabled === false
       ? 'not scheduled: disabled'
-      : formatDateTime(ledger?.next_run_at)
+      : switchedOff
+        ? 'waiting: retention runs are off'
+        : formatDateTime(ledger?.next_run_at)
 
   return (
     <Panel title="Runs">
       <div className="grid gap-4">
+        {switchedOff && (
+          <Notice tone="warn" title="Retention runs are switched off">
+            No policy runs, on any repository, until they are switched on
+            again in{' '}
+            <Link to="/manage/settings/retention" className="fg-link">
+              Admin → Retention
+            </Link>
+            .
+          </Notice>
+        )}
         {ledger ? (
           <FactList
             items={[
@@ -712,7 +725,7 @@ function RunPanel({
         <div>
           <Button
             icon="Refresh"
-            disabled={!policy || running || runPending || run.isPending}
+            disabled={!policy || switchedOff || running || runPending || run.isPending}
             onClick={() => run.mutate(undefined, { onSuccess: onRun })}
           >
             Run now

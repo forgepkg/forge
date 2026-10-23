@@ -7,6 +7,11 @@
 //! lease (mirroring `blob_outbox`), so a repository is evaluated by **at most
 //! one instance at a time** and a crashed instance's lease expires and is
 //! reclaimed. There are **no Postgres advisory locks** here.
+//!
+//! The settings every instance shares ([`RetentionSettings`]: whether runs
+//! happen at all, how long the audit log is kept) are a `forge_setting`
+//! document, read where they apply: by the claim, the run fence and the
+//! audit prune.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value as JsonValue;
@@ -91,6 +96,73 @@ pub struct AuditRow {
     pub reason: JsonValue,
 }
 
+/// `forge_setting` key of the [`RetentionSettings`] document.
+pub const SETTINGS_KEY: &str = "retention_settings";
+
+/// How long audit rows are kept when the settings were never saved (90 days).
+pub const DEFAULT_AUDIT_RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
+
+/// Longest accepted audit retention (100 years): longer ones overflow the
+/// cutoff arithmetic.
+pub const MAX_AUDIT_RETENTION_SECONDS: u64 = 100 * 365 * 24 * 60 * 60;
+
+/// Retention settings for every instance (#429), set in the web UI (Admin →
+/// Retention) or through `/admin/settings/retention`, and kept in
+/// `forge_setting` under [`SETTINGS_KEY`]. An install that never saved them
+/// uses [`RetentionSettings::default`].
+///
+/// Read leniently: a key left out takes its default and one this version does
+/// not know is ignored. A document that does not parse at all is an error,
+/// so its readers fail closed: no run starts and nothing is pruned.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RetentionSettings {
+    /// Whether retention runs. Off, no instance claims a run (scheduled or
+    /// asked for) and a run in progress stops before its next batch
+    /// ([`lock_run_fence`]); policies and previews keep working.
+    pub runs_enabled: bool,
+    /// How long `retention_audit` rows are kept (seconds); `0` keeps them all.
+    pub audit_retention_seconds: u64,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        RetentionSettings {
+            runs_enabled: true,
+            audit_retention_seconds: DEFAULT_AUDIT_RETENTION_SECONDS,
+        }
+    }
+}
+
+impl RetentionSettings {
+    /// How long audit rows are kept, or `None` when they are kept forever.
+    pub fn audit_retention(&self) -> Option<Duration> {
+        match self.audit_retention_seconds {
+            0 => None,
+            secs => Some(Duration::seconds(
+                secs.min(MAX_AUDIT_RETENTION_SECONDS) as i64
+            )),
+        }
+    }
+}
+
+/// The stored [`RetentionSettings`], or the defaults when never saved.
+pub async fn read_settings<'e, E>(executor: E) -> sqlx::Result<RetentionSettings>
+where
+    E: PgExecutor<'e>,
+{
+    match crate::authz_dao::get_setting(executor, SETTINGS_KEY).await? {
+        None => Ok(RetentionSettings::default()),
+        Some(raw) => serde_json::from_str(&raw).map_err(|e| sqlx::Error::Decode(Box::new(e))),
+    }
+}
+
+/// Store the [`RetentionSettings`] for every instance.
+pub async fn write_settings(pool: &PgPool, settings: &RetentionSettings) -> sqlx::Result<()> {
+    let json = serde_json::to_string(settings).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    crate::authz_dao::set_setting(pool, SETTINGS_KEY, &json).await
+}
+
 /// A summary of a completed run, persisted on `retention_run.last_run_summary`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RunSummary {
@@ -143,6 +215,9 @@ where
 /// "run now" path and by tests that need to claim a specific repo without
 /// racing the global scan.
 ///
+/// While runs are switched off ([`RetentionSettings::runs_enabled`]) nothing
+/// is claimed; due repositories wait until they are switched on again.
+///
 /// `lease` is truncated to whole seconds (`make_interval`).
 pub async fn claim_next_due_repo(
     tx: &mut Transaction<'_, Postgres>,
@@ -150,6 +225,9 @@ pub async fn claim_next_due_repo(
     lease: Duration,
     only_repo: Option<i64>,
 ) -> sqlx::Result<Option<(ClaimedRepo, uuid::Uuid)>> {
+    if !read_settings(&mut **tx).await?.runs_enabled {
+        return Ok(None);
+    }
     let run_id = uuid::Uuid::new_v4();
     let lease_secs = lease.num_seconds() as f64;
 
@@ -627,8 +705,9 @@ pub async fn prune_audit(
 /// `FOR SHARE` lock on the repository row and its `retention_run` row while
 /// the run still owns a live lease (`current_run_id = run_id`,
 /// `locked_until` in the future) and the stored policy still equals the one
-/// the run evaluated. Returns `false` when any of that no longer holds; the
-/// run must then stop applying.
+/// the run evaluated, and runs are still switched on
+/// ([`RetentionSettings::runs_enabled`]). Returns `false` when any of that no
+/// longer holds; the run must then stop applying.
 ///
 /// The share lock makes a concurrent policy write (or a reclaim of the lease
 /// by another instance) wait until this step commits, and a write that
@@ -656,9 +735,13 @@ pub async fn lock_run_fence(
         run_id,
         policy,
     )
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    Ok(row.is_some())
+    if row.is_none() {
+        return Ok(false);
+    }
+    // Switched off since the run started: it stops before its next batch.
+    Ok(read_settings(&mut *conn).await?.runs_enabled)
 }
 
 /// Lock (`FOR UPDATE`, in id order) and load every component of one package

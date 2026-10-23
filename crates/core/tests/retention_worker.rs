@@ -336,7 +336,8 @@ async fn zero_run_intervals_do_not_rerun_back_to_back() {
     );
     assert_eq!(audit_total(&pool, repo.id).await, 1);
 
-    // A run that fails is rescheduled by the default interval alone.
+    // A run that fails is retried after its policy's interval, here 0, so
+    // after the floor.
     let broken =
         repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0b-{n}")))
             .await
@@ -1031,4 +1032,39 @@ async fn a_package_with_many_versions_is_applied_in_batches() {
     .await
     .unwrap();
     assert_eq!(audited, 229);
+}
+
+#[tokio::test]
+async fn a_failed_run_is_retried_after_its_policy_interval() {
+    // The worker's floor is a minute (the server sets no floor of its own,
+    // #429), but a broken policy must not be retried every minute: a failed
+    // run waits for its policy's interval, the default hour when it names
+    // none.
+    let pool = pool().await;
+    let n = unique();
+    let w = worker(
+        &pool,
+        RetentionConfig {
+            default_run_interval: Duration::seconds(MIN_RUN_INTERVAL_SECONDS),
+            ..config()
+        },
+    );
+    let broken =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rwr-{n}")))
+            .await
+            .unwrap();
+    arm(&pool, broken.id, &json!({ "version": 1, "rules": [] })).await;
+    let before = Utc::now();
+    w.tick_repo(broken.id)
+        .await
+        .expect_err("an invalid policy fails the run");
+    let run = retention_dao::get_run(&pool, broken.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        run.next_run_at >= before + Duration::seconds(3600 - 5),
+        "{:?}",
+        run.next_run_at
+    );
 }

@@ -35,9 +35,29 @@ export interface AuthSettings {
 /** `PUT /admin/settings/auth` body: the fields to change. */
 export type AuthSettingsUpdate = Partial<AuthSettings>
 
+/**
+ * Retention for every repository and instance
+ * (`/admin/settings/retention`), in the same way: `GET` answers both
+ * settings, `PUT` changes the fields it names.
+ */
+export interface RetentionSettings {
+  /**
+   * Off, no retention run starts (scheduled or asked for with Run now) and a
+   * run in progress stops before its next batch. Policies and previews keep
+   * working.
+   */
+  runs_enabled: boolean
+  /** How long audit rows are kept; `0` keeps them all. */
+  audit_retention_seconds: number
+}
+
+/** `PUT /admin/settings/retention` body: the fields to change. */
+export type RetentionSettingsUpdate = Partial<RetentionSettings>
+
 /** Query keys of the settings. */
 export const settingsKeys = {
   auth: () => ['settings', 'auth'] as const,
+  retention: () => ['settings', 'retention'] as const,
 }
 
 /** `GET /admin/settings/auth`. */
@@ -48,4 +68,16 @@ export function fetchAuthSettings(signal?: AbortSignal): Promise<AuthSettings> {
 /** `PUT /admin/settings/auth` — change the fields `body` names. */
 export function updateAuthSettings(body: AuthSettingsUpdate): Promise<AuthSettings> {
   return httpClient.put<AuthSettings>('/admin/settings/auth', body)
+}
+
+/** `GET /admin/settings/retention`. */
+export function fetchRetentionSettings(signal?: AbortSignal): Promise<RetentionSettings> {
+  return httpClient.get<RetentionSettings>('/admin/settings/retention', { signal })
+}
+
+/** `PUT /admin/settings/retention` — change the fields `body` names. */
+export function updateRetentionSettings(
+  body: RetentionSettingsUpdate,
+): Promise<RetentionSettings> {
+  return httpClient.put<RetentionSettings>('/admin/settings/retention', body)
 }

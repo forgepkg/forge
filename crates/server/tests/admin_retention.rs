@@ -762,3 +762,152 @@ async fn preview_evaluates_a_draft_without_storing_it() {
         .unwrap();
     assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
 }
+
+/// Whether retention runs and how long its audit log is kept are settings of
+/// every instance (`/admin/settings/retention`, #429), on a database of its
+/// own since they are install-wide. Switched off, no run is claimed, a run in
+/// progress fails its fence, and Run now answers 409; switched on again, the
+/// due run is claimed.
+#[tokio::test]
+async fn retention_settings_switch_runs_off_and_on() {
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let settings_url = format!("{}/admin/settings/retention", srv.base_url);
+    let put = |body: Value| {
+        client
+            .put(&settings_url)
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let name = format!("rets{}", common::unique());
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0", "2.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": keep_one_policy() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The defaults of an install that never saved them.
+    let resp = client
+        .get(&settings_url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": true, "audit_retention_seconds": 7_776_000 })
+    );
+
+    // Refused like the other admin bodies: out of range, unknown fields.
+    let resp = put(json!({ "audit_retention_seconds": 3_153_600_001_u64 }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = put(json!({ "enabled": false })).await.unwrap();
+    assert_eq!(resp.status(), 422);
+
+    // A run claimed while runs are on.
+    let mut tx = srv.pool.begin().await.unwrap();
+    let now = forge_db::db_now(&mut *tx).await.unwrap();
+    let (claimed, run_id) = retention_dao::claim_next_due_repo(
+        &mut tx,
+        now,
+        chrono::Duration::seconds(60),
+        Some(repo_id),
+    )
+    .await
+    .unwrap()
+    .expect("a due repository is claimed while runs are on");
+    tx.commit().await.unwrap();
+    let fence = || async {
+        let mut conn = srv.pool.acquire().await.unwrap();
+        retention_dao::lock_run_fence(&mut conn, repo_id, run_id, &claimed.policy)
+            .await
+            .unwrap()
+    };
+    assert!(fence().await, "the fence holds while runs are on");
+
+    // Switched off: the fence stops the run, Run now is refused, and the
+    // repository's view says so. The other field keeps its value.
+    let resp = put(json!({ "runs_enabled": false })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": false, "audit_retention_seconds": 7_776_000 })
+    );
+    assert!(!fence().await, "a running run stops at its next batch");
+    let resp = client
+        .post(format!("{url}/run"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.text().await.unwrap().contains("switched off"));
+    let view: Value = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["runs_enabled"], json!(false), "{view}");
+
+    // Nothing is claimed while off, even a repository that is due.
+    retention_dao::fail_run(&srv.pool, repo_id, Some(run_id), "test", now)
+        .await
+        .unwrap();
+    let mut tx = srv.pool.begin().await.unwrap();
+    let off = retention_dao::claim_next_due_repo(
+        &mut tx,
+        now + chrono::Duration::seconds(1),
+        chrono::Duration::seconds(60),
+        Some(repo_id),
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(off.is_none(), "no run is claimed while runs are off");
+
+    // Switched on again with another audit retention: Run now is accepted.
+    let resp = put(json!({ "runs_enabled": true, "audit_retention_seconds": 0 }))
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": true, "audit_retention_seconds": 0 })
+    );
+    let resp = client
+        .post(format!("{url}/run"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let settings = retention_dao::read_settings(&srv.pool).await.unwrap();
+    assert!(settings.runs_enabled);
+    assert!(settings.audit_retention().is_none(), "0 keeps every row");
+}
