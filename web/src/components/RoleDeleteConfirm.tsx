@@ -6,8 +6,7 @@ import {
   useRoleMembers,
   useSelectors,
 } from '~/queries/useRbac'
-import { Button } from '~/components/catalyst/button'
-import { Text } from '~/components/catalyst/text'
+import { Dialog } from '~/components/ui'
 import {
   byId,
   grantText,
@@ -16,9 +15,11 @@ import {
 } from '~/components/RbacLabels'
 
 /**
- * The confirmation before a role is deleted: deleting it unassigns its users
- * and removes its grants (both cascade on the server), so it names them first
- * and deletes only once both lists have loaded.
+ * The confirmation before a role is deleted, as a dialog open while it is
+ * mounted: deleting the role unassigns its users and removes its grants
+ * (both cascade on the server), so it names them first and deletes only once
+ * both lists have loaded. Cancel, Escape and the close button call
+ * `onCancel`.
  */
 export function RoleDeleteConfirm({
   role,
@@ -41,34 +42,38 @@ export function RoleDeleteConfirm({
   const loadError = members.error ?? grants.error
 
   return (
-    <div
-      role="region"
-      aria-label={`Delete role ${role.name}`}
-      className="space-y-3 rounded-xl border border-red-500/25 bg-red-500/5 p-4 dark:bg-red-500/10"
+    <Dialog
+      open
+      onClose={onCancel}
+      icon="Trash"
+      tone="danger"
+      title={`Delete ${role.name}?`}
+      description="Its users lose the role and its grants are removed. This cannot be undone."
+      confirmLabel={del.isPending ? 'Deleting…' : 'Delete role'}
+      confirmVariant="danger-solid"
+      confirmDisabled={loading || loadError != null || del.isPending}
+      onConfirm={() => del.mutate(role.id, { onSuccess: onDeleted })}
     >
-      <Text>
-        Delete the role{' '}
-        <span className="font-medium text-zinc-950 dark:text-white">
-          {role.name}
-        </span>
-        ?
-      </Text>
       {loadError ? (
         <InlineError>
           Could not load what the role holds: {loadError.body || loadError.message}
         </InlineError>
       ) : loading ? (
-        <Text>Loading the role&apos;s users and grants…</Text>
+        <p className="fg-text">Loading the role&apos;s users and grants…</p>
       ) : (
         <>
           {(members.data?.length ?? 0) === 0 ? (
-            <Text>No user holds it.</Text>
+            <p className="fg-text">No user holds it.</p>
           ) : (
-            <div>
-              <Text>
-                It is taken from {members.data!.length === 1 ? 'this user' : `these ${members.data!.length} users`}:
-              </Text>
-              <ul className="mt-1 list-inside list-disc text-sm/6 text-zinc-950 dark:text-white">
+            <div className="grid gap-1">
+              <p className="fg-text">
+                It is taken from{' '}
+                {members.data!.length === 1
+                  ? 'this user'
+                  : `these ${members.data!.length} users`}
+                :
+              </p>
+              <ul className="fg-list text-ink">
                 {members.data!.map((m) => (
                   <li key={m.id}>{m.username}</li>
                 ))}
@@ -76,14 +81,16 @@ export function RoleDeleteConfirm({
             </div>
           )}
           {(grants.data?.length ?? 0) === 0 ? (
-            <Text>It has no grants.</Text>
+            <p className="fg-text">It has no grants.</p>
           ) : (
-            <div>
-              <Text>
-                {grants.data!.length === 1 ? 'This grant is' : `These ${grants.data!.length} grants are`}{' '}
+            <div className="grid gap-1">
+              <p className="fg-text">
+                {grants.data!.length === 1
+                  ? 'This grant is'
+                  : `These ${grants.data!.length} grants are`}{' '}
                 removed:
-              </Text>
-              <ul className="mt-1 list-inside list-disc text-sm/6 text-zinc-950 dark:text-white">
+              </p>
+              <ul className="fg-list text-ink">
                 {grants.data!.map((g) => (
                   <li key={g.id}>{grantText(g, names, selectorMap)}</li>
                 ))}
@@ -93,18 +100,6 @@ export function RoleDeleteConfirm({
         </>
       )}
       {del.isError && <InlineError>{del.error.body || del.error.message}</InlineError>}
-      <div className="flex items-center gap-3">
-        <Button
-          color="red"
-          disabled={loading || loadError != null || del.isPending}
-          onClick={() => del.mutate(role.id, { onSuccess: onDeleted })}
-        >
-          {del.isPending ? 'Deleting…' : 'Delete role'}
-        </Button>
-        <Button plain onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-    </div>
+    </Dialog>
   )
 }
