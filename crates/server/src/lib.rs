@@ -21,6 +21,7 @@ pub mod browse_images;
 pub mod config;
 pub mod crypto;
 pub mod dispatch;
+pub mod email;
 pub mod feed;
 pub mod health;
 pub mod me;

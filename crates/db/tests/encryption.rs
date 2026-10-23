@@ -1556,3 +1556,148 @@ async fn oidc_client_secret_is_bound_to_the_issuer() {
     );
     auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
 }
+
+/// #319: the email settings' transport secret (the SMTP password) is sealed
+/// into `email_settings.secrets_enc` and stripped from `config`, bound to the
+/// transport's host and username, follows DEK rotation (the sweep re-seals
+/// it, the reference scan protects its DEK), fails closed without the
+/// envelope, and a password stored before `[crypto]` was enabled is sealed by
+/// the backfill, which never undoes a concurrent edit.
+#[tokio::test]
+async fn email_settings_secrets_are_sealed_bound_and_rotated() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("email-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    for _ in 0..6 {
+        envelope.rotate_dek().await.unwrap();
+    }
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let logical = json!({
+        "from_address": "forge@example.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "smtp", "host": "smtp.example.com", "tls": "starttls",
+            "username": "forge", "password": "smtp-secret-1",
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    assert!(row.config["transport"].get("password").is_none());
+    let blob = row.secrets_enc.clone().expect("sealed");
+    assert!(!String::from_utf8_lossy(&blob).contains("smtp-secret-1"));
+    assert!(secret_dao::sealed_secrets_present(&pool).await.unwrap());
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
+    let opened = secret_dao::email_config(Some(&envelope), &row).await.unwrap();
+    assert_eq!(opened, logical);
+
+    // Bound to the host (and username): a row repointed outside the API no
+    // longer decrypts, so the password never goes to the other server.
+    sqlx::query(
+        "UPDATE email_settings SET config = jsonb_set(config, '{transport,host}', '\"evil.example\"')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert!(secret_dao::email_config(Some(&envelope), &moved).await.is_err());
+    sqlx::query("UPDATE email_settings SET config = $1")
+        .bind(&row.config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Without the envelope the sealed secret fails closed.
+    assert!(matches!(
+        secret_dao::email_config(None, &row).await,
+        Err(secret_dao::SecretDbError::EmailSecrets(_))
+    ));
+
+    // Its DEK stays while the secret is sealed under it; the sweep re-seals
+    // it under the active DEK, and then the old one goes.
+    envelope.rotate_dek().await.unwrap();
+    secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+        .await
+        .unwrap();
+    let current = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &current).await.unwrap(),
+        logical
+    );
+    assert_eq!(
+        secret_dao::reseal_email_secrets(&pool, &envelope).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        secret_dao::reseal_email_secrets(&pool, &envelope).await.unwrap(),
+        0,
+        "converged"
+    );
+    let resealed = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert_ne!(resealed.secrets_enc, current.secrets_enc);
+    assert!(
+        secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &resealed).await.unwrap(),
+        logical
+    );
+
+    // A password stored without encryption is sealed by the backfill.
+    let plain = secret_dao::store_email_settings(&pool, None, true, &logical)
+        .await
+        .unwrap();
+    assert_eq!(plain.config, logical);
+    assert!(plain.secrets_enc.is_none());
+    assert!(secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
+    // ... but never over a concurrent edit.
+    let edited = json!({
+        "from_address": "noreply@example.com",
+        "invitation_ttl_hours": 24,
+        "transport": {"kind": "smtp", "host": "localhost", "tls": "none"},
+    });
+    email_settings_dao::put(&pool, true, &edited, None).await.unwrap();
+    assert!(
+        email_settings_dao::put_if_unchanged(&pool, &plain, &edited, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "the row changed since it was read"
+    );
+    secret_dao::store_email_settings(&pool, None, true, &logical)
+        .await
+        .unwrap();
+    assert!(secret_dao::backfill_email_secrets(&pool, &envelope).await.unwrap());
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool).await.unwrap());
+    let backfilled = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert!(backfilled.config["transport"].get("password").is_none());
+    assert!(backfilled.secrets_enc.is_some());
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &backfilled).await.unwrap(),
+        logical
+    );
+    assert!(!secret_dao::backfill_email_secrets(&pool, &envelope).await.unwrap());
+
+    // A transport without a secret seals nothing.
+    let relay = secret_dao::store_email_settings(&pool, Some(&envelope), true, &edited)
+        .await
+        .unwrap();
+    assert!(relay.secrets_enc.is_none());
+    assert_eq!(relay.config, edited);
+
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+}

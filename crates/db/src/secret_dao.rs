@@ -28,6 +28,13 @@
 //! the backfill, the re-encrypt sweep and the DEK reference scan like the
 //! secret columns ([`store_secret_setting`], [`open_secret_setting`]).
 //!
+//! The email service's transport secrets (the SMTP password) are sealed as
+//! one JSON object into `email_settings.secrets_enc`, AAD-bound to
+//! `('email_settings', 'secrets_enc', 1)` plus the transport kind and the
+//! fields the secret belongs to ([`email_secret_binding_keys`]: the SMTP host
+//! and username), and stripped from the plaintext `config`
+//! ([`store_email_settings`], [`email_config`]).
+//!
 //! An import from Nexus keeps the Nexus password in
 //! `nexus_import.password_enc` until it completes, AAD-bound to
 //! `('nexus_import', 'password_enc', <row id>)` plus the origins it is sent
@@ -56,6 +63,7 @@ use serde_json::{Map, Value as JsonValue};
 use sqlx::PgPool;
 
 use crate::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
+use crate::email_settings_dao::{self, EmailSettingsRow};
 use crate::model::AuthRealm;
 
 /// Owning table of the encrypted upstream password (AAD component).
@@ -109,6 +117,10 @@ pub enum SecretDbError {
     /// (or the decrypted document is malformed): fail closed.
     #[error("auth realm {0} secrets unavailable: {1}")]
     RealmSecrets(i64, &'static str),
+    /// The email settings' secrets are encrypted but no envelope service is
+    /// configured (or the decrypted document is malformed): fail closed.
+    #[error("email settings secrets unavailable: {0}")]
+    EmailSecrets(&'static str),
     /// A secret setting's value is neither `plain:` nor a readable `sealed:`
     /// envelope: it can never be opened.
     #[error("setting {0} is malformed")]
@@ -505,7 +517,8 @@ pub async fn reseal_upstream_passwords_batch(
 
 /// Every DEK version still referenced by stored ciphertext, across all
 /// encrypted columns (`repository.upstream_password_enc`,
-/// `auth_realm.secrets_enc`, `nexus_import.password_enc`, the sealed
+/// `auth_realm.secrets_enc`, `nexus_import.password_enc`,
+/// `email_settings.secrets_enc`, the sealed
 /// [`SECRET_SETTINGS`]; future secret columns add their scan here). Used
 /// by the sweep to decide which `retiring` DEKs are safe to revoke.
 pub async fn referenced_dek_versions(
@@ -583,6 +596,21 @@ async fn scan_referenced_dek_versions(
             }
         }
     }
+    let email_blob: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT secrets_enc FROM email_settings WHERE secrets_enc IS NOT NULL",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(blob) = email_blob {
+        match EnvelopeService::blob_dek_version(&blob) {
+            Ok(version) => {
+                versions.insert(version);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "unreadable email settings secrets envelope; skipped");
+            }
+        }
+    }
     for (key, value) in sealed_settings(&mut *conn).await? {
         match sealed_setting_blob(&key, &value)
             .and_then(|blob| Ok(EnvelopeService::blob_dek_version(&blob)?))
@@ -618,7 +646,8 @@ pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDb
 }
 
 /// Whether any secret is stored sealed (an upstream password, realm secrets,
-/// an import's Nexus password or a [`SECRET_SETTINGS`] value): such a
+/// an import's Nexus password, the email settings' secrets or a
+/// [`SECRET_SETTINGS`] value): such a
 /// database needs the envelope
 /// service to be usable.
 pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError> {
@@ -636,6 +665,14 @@ pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError
     .fetch_one(pool)
     .await?;
     if row.present {
+        return Ok(true);
+    }
+    let email: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM email_settings WHERE secrets_enc IS NOT NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if email {
         return Ok(true);
     }
     let mut conn = pool.acquire().await?;
@@ -1047,6 +1084,247 @@ pub async fn reseal_realm_secrets(
         resealed += usize::try_from(res.rows_affected()).unwrap_or(0);
     }
     Ok(resealed)
+}
+
+// ── email settings secrets (#319) ────────────────────────────────────────────
+
+/// Owning table of the encrypted email transport secrets (AAD component).
+pub const EMAIL_SECRETS_TABLE: &str = "email_settings";
+/// Owning column of the encrypted email transport secrets (AAD component).
+pub const EMAIL_SECRETS_COLUMN: &str = "secrets_enc";
+
+/// The secret keys of an email transport of `kind`, in `config.transport`.
+pub fn email_secret_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "smtp" => &["password"],
+        _ => &[],
+    }
+}
+
+/// The `config.transport` fields a transport's secrets belong to: the secret
+/// is the credential for them, so changing any of them makes the stored
+/// secret unusable (the admin API then requires a new one, and the
+/// ciphertext is bound to them).
+pub fn email_secret_binding_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        // The SMTP password is the server's credential for this account.
+        "smtp" => &["host", "username"],
+        _ => &[],
+    }
+}
+
+/// `config.transport.kind`, or `""` without one.
+fn email_transport_kind(config: &JsonValue) -> &str {
+    config
+        .pointer("/transport/kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+}
+
+/// The destination the email secrets are bound to: the transport kind and its
+/// [`email_secret_binding_keys`] values, as a JSON array.
+fn email_destination(config: &JsonValue) -> String {
+    let kind = email_transport_kind(config);
+    let transport = config.get("transport");
+    let mut values = vec![JsonValue::String(kind.to_string())];
+    values.extend(email_secret_binding_keys(kind).iter().map(|key| {
+        transport
+            .and_then(|t| t.get(*key))
+            .cloned()
+            .unwrap_or(JsonValue::Null)
+    }));
+    JsonValue::Array(values).to_string()
+}
+
+/// The AAD binding for `email_settings.secrets_enc` (the table's one row).
+fn email_binding(destination: &str) -> AeadBinding<'_> {
+    AeadBinding {
+        table: EMAIL_SECRETS_TABLE,
+        column: EMAIL_SECRETS_COLUMN,
+        row_pk: 1,
+        destination: Some(destination),
+    }
+}
+
+/// Split the transport's secret keys out of an email `config`: returns the
+/// config without them plus the non-blank secret values (blank or non-string
+/// values are dropped from both).
+pub fn split_email_secrets(config: &JsonValue) -> (JsonValue, Map<String, JsonValue>) {
+    let keys = email_secret_keys(email_transport_kind(config));
+    let mut stripped = config.clone();
+    let mut secrets = Map::new();
+    if let Some(JsonValue::Object(transport)) = stripped.get_mut("transport") {
+        for key in keys {
+            if let Some(JsonValue::String(v)) = transport.remove(*key) {
+                if !v.is_empty() {
+                    secrets.insert((*key).to_string(), JsonValue::String(v));
+                }
+            }
+        }
+    }
+    (stripped, secrets)
+}
+
+/// The **logical** email config: the stored `config` with the decrypted
+/// secrets merged into `transport`. A row without `secrets_enc` is returned
+/// as is (no secret, or secret encryption off). Encrypted secrets without an
+/// envelope service fail closed.
+pub async fn email_config(
+    envelope: Option<&EnvelopeService>,
+    row: &EmailSettingsRow,
+) -> Result<JsonValue, SecretDbError> {
+    let Some(blob) = row.secrets_enc.as_deref() else {
+        return Ok(row.config.clone());
+    };
+    let envelope = envelope.ok_or(SecretDbError::EmailSecrets(
+        "secrets are encrypted but secret encryption is not configured",
+    ))?;
+    let destination = email_destination(&row.config);
+    let plaintext = envelope.open(blob, email_binding(&destination)).await?;
+    let secrets: Map<String, JsonValue> = serde_json::from_str(plaintext.expose_secret())
+        .map_err(|_| SecretDbError::EmailSecrets("malformed secrets document"))?;
+    let mut config = row.config.clone();
+    match config.get_mut("transport") {
+        Some(JsonValue::Object(transport)) => transport.extend(secrets),
+        _ => return Err(SecretDbError::EmailSecrets("secrets without a transport")),
+    }
+    Ok(config)
+}
+
+/// Seal the email transport secrets for `config` (the stripped config they
+/// are bound to).
+async fn seal_email_secrets(
+    envelope: &EnvelopeService,
+    config: &JsonValue,
+    secrets: &Map<String, JsonValue>,
+) -> Result<Vec<u8>, SecretDbError> {
+    let doc = PlaintextSecret::from(JsonValue::Object(secrets.clone()).to_string());
+    let destination = email_destination(config);
+    Ok(envelope.seal(&doc, email_binding(&destination)).await?)
+}
+
+/// Store the email settings whose `config` is the full logical document
+/// (secrets included). With an envelope the transport secrets are sealed into
+/// `secrets_enc` and stripped from `config`; without one they are stored in
+/// `config` as they are.
+pub async fn store_email_settings(
+    pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
+    enabled: bool,
+    config: &JsonValue,
+) -> Result<EmailSettingsRow, SecretDbError> {
+    let Some(envelope) = envelope else {
+        return Ok(email_settings_dao::put(pool, enabled, config, None).await?);
+    };
+    let (stripped, secrets) = split_email_secrets(config);
+    if secrets.is_empty() {
+        return Ok(email_settings_dao::put(pool, enabled, &stripped, None).await?);
+    }
+    let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
+    // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
+    let mut tx = pool.begin().await?;
+    lock_sealing_dek(&mut tx, envelope, &blob).await?;
+    let row = email_settings_dao::put(&mut *tx, enabled, &stripped, Some(&blob)).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Whether the stored email `config` still carries a transport secret in
+/// plaintext (the email half of the operator's "plaintext backfill pending"
+/// signal).
+pub async fn plaintext_email_secrets_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
+    Ok(email_settings_dao::get(pool)
+        .await?
+        .is_some_and(|row| !split_email_secrets(&row.config).1.is_empty()))
+}
+
+/// Plaintext → encrypted **backfill** for the email settings: a stored config
+/// that still carries a transport secret is re-stored with it sealed, while
+/// the row is still the one read here (a concurrent admin edit is never
+/// undone; a changed row is left for the next pass). A `secrets_enc` that does
+/// not decrypt is logged and left as is. Returns whether the row was
+/// re-encrypted.
+pub async fn backfill_email_secrets(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<bool, SecretDbError> {
+    let Some(row) = email_settings_dao::get(pool).await? else {
+        return Ok(false);
+    };
+    if split_email_secrets(&row.config).1.is_empty() {
+        return Ok(false);
+    }
+    let config = match email_config(Some(envelope), &row).await {
+        Ok(config) => config,
+        Err(SecretDbError::Crypto(e)) if is_blob_error(&e) => {
+            tracing::warn!(
+                error = %e,
+                "stored email settings secrets are unreadable; left as is (enter them again on \
+                 the email settings page)"
+            );
+            return Ok(false);
+        }
+        Err(SecretDbError::EmailSecrets(why)) => {
+            tracing::warn!(
+                why,
+                "stored email settings secrets are unreadable; left as is (enter them again on \
+                 the email settings page)"
+            );
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let (stripped, secrets) = split_email_secrets(&config);
+    let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
+    let mut tx = pool.begin().await?;
+    lock_sealing_dek(&mut tx, envelope, &blob).await?;
+    let written = email_settings_dao::put_if_unchanged(&mut *tx, &row, &stripped, Some(&blob))
+        .await?
+        .is_some();
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// DEK-rotation re-encrypt sweep over `email_settings.secrets_enc`: re-seals a
+/// blob under a non-active DEK, guarded on the old blob, the config it is
+/// bound to and the sealing DEK like the realm sweep. Returns how many rows
+/// were resealed (0 or 1).
+pub async fn reseal_email_secrets(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+) -> Result<usize, SecretDbError> {
+    let Some(row) = email_settings_dao::get(pool).await? else {
+        return Ok(0);
+    };
+    let Some(old_blob) = row.secrets_enc.as_deref() else {
+        return Ok(0);
+    };
+    let destination = email_destination(&row.config);
+    let Some(new_blob) = reseal_if_due(envelope, old_blob, email_binding(&destination)).await?
+    else {
+        return Ok(0);
+    };
+    let res = sqlx::query(
+        r#"
+        WITH dek AS (
+            SELECT 1 FROM encryption_key
+            WHERE layer = 'dek' AND scope = $3 AND version = $4 AND state <> 'revoked'
+            FOR SHARE
+        )
+        UPDATE email_settings
+        SET secrets_enc = $1
+        WHERE id = 1 AND secrets_enc = $2 AND config = $5
+          AND EXISTS (SELECT 1 FROM dek)
+        "#,
+    )
+    .bind(&new_blob)
+    .bind(old_blob)
+    .bind(envelope.scope())
+    .bind(EnvelopeService::blob_dek_version(&new_blob)?)
+    .bind(&row.config)
+    .execute(pool)
+    .await?;
+    Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
 }
 
 // ── secrets in `forge_setting` ───────────────────────────────────────────────

@@ -13,6 +13,7 @@ pub mod authz_dao;
 pub mod blob_dao;
 pub mod component_dao;
 pub mod download_dao;
+pub mod email_settings_dao;
 pub mod encryption_key_dao;
 pub mod external_identity_dao;
 pub mod ids;

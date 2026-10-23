@@ -69,6 +69,8 @@ bytes = "1"
 uuid = { workspace = true }
 # Registry token signing key generation.
 rand = { workspace = true }
+# Outgoing email (invitations): SMTP submission.
+lettre = { workspace = true }
 
 # Config: TOML + FORGE_* env overrides.
 figment = { version = "0.10", features = ["toml", "env"] }
@@ -98,3 +100,6 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 sqlx = { workspace = true }
+# A throwaway CA and server certificate for the SMTP-over-TLS tests (mailpit),
+# made per run instead of a key kept in the repository.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

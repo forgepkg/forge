@@ -77,6 +77,18 @@ aws-credential-types = { version = "1.2" }
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form", "system-proxy"] }
 
+# Outgoing email (Admin → Settings → Email): SMTP submission over rustls,
+# verified against the system roots like reqwest (the platform verifier),
+# with the workspace's aws-lc-rs provider.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "hostname",
+    "tokio1-rustls",
+    "rustls-platform-verifier",
+    "aws-lc-rs",
+] }
+
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
 

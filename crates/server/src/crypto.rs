@@ -265,6 +265,12 @@ pub async fn bootstrap(
             "encrypted plaintext Nexus import passwords at rest"
         );
     }
+    if secret_dao::backfill_email_secrets(pool, envelope)
+        .await
+        .context("backfill plaintext email settings secrets")?
+    {
+        tracing::info!("encrypted the plaintext email settings secrets at rest");
+    }
 
     // Secrets sealed by earlier builds are bound to their row only: re-seal
     // them for the destination they are sent to (the rotation worker repeats
@@ -282,8 +288,8 @@ pub async fn bootstrap(
 }
 
 /// Run the re-encrypt sweeps (upstream passwords, realm secrets, secret
-/// settings, import passwords) to the end; returns how many rows were
-/// re-sealed.
+/// settings, import passwords, email settings secrets) to the end; returns
+/// how many rows were re-sealed.
 async fn reseal_all(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -303,6 +309,7 @@ async fn reseal_all(
     resealed += secret_dao::reseal_realm_secrets(pool, envelope).await?;
     resealed += secret_dao::reseal_secret_settings(pool, envelope).await?;
     resealed += secret_dao::reseal_import_passwords(pool, envelope).await?;
+    resealed += secret_dao::reseal_email_secrets(pool, envelope).await?;
     Ok(resealed)
 }
 
@@ -409,6 +416,9 @@ async fn rotation_pass(
     secret_dao::backfill_import_passwords(pool, envelope)
         .await
         .context("import passwords backfill")?;
+    secret_dao::backfill_email_secrets(pool, envelope)
+        .await
+        .context("email settings secrets backfill")?;
 
     // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     reseal_all(pool, envelope, batch)
