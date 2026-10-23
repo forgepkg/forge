@@ -301,7 +301,9 @@ FORGE_PLUGINS__FORMATS__EXAMPLE=sha256:c2053ffc…
   image derived from Forge's, or mount it from a volume (a ConfigMap's 1 MiB
   limit leaves little room for components).
 - **Limits.** A plugin's `plugin.toml` may ask for a memory ceiling per
-  instance (`memory_mib`, default 64, at most 512), fuel per call (`fuel`,
+  instance (`memory_mib`, default 64, at most 512; it covers the instance's
+  linear memories and tables together, and what one call returns to the
+  host), fuel per call (`fuel`,
   default 5·10⁹, at most 5·10¹⁰) and a wall-clock budget per call
   (`timeout_ms`, default 5,000, at most 30,000). Asking for more than the
   maximum fails startup. Built-in plugins ignore `[limits]`.
@@ -351,10 +353,17 @@ plugin is code from elsewhere, so it is also sandboxed:
   randomness. Its stdout and stderr go nowhere. It imports exactly one
   host interface, the reader for the package being parsed.
 - **Resource limits.** Each call runs with a fresh fuel budget and an epoch
-  deadline (10 ms ticks), in an instance with a memory ceiling. A trap (out
-  of fuel, past the deadline, out of memory, a guest panic) fails that call
-  with a 500 or 400 and discards the instance. The sandbox tests include a
-  gzip bomb.
+  deadline (10 ms ticks), in an instance with a memory ceiling. The ceiling
+  bounds the host memory an instance can take: all its linear memories and
+  tables count against it together (each table element as a pointer), the
+  strings and lists one call returns are copied into the host only up to
+  it (a string that several list elements point at is copied once per
+  element, and counted so), and so are the random bytes it asks WASI for. A
+  trap (out of fuel, past the deadline, out of memory, a guest panic, a
+  result past the ceiling) fails that call with a 500 or 400 and discards
+  the instance. The sandbox tests include a gzip bomb, an instance whose
+  memories together exceed the ceiling, a `table.grow` past it, and a
+  result whose list elements all point at one string.
 - **Isolation from the server's threads.** Guest code runs on dedicated
   threads, never on the async runtime's workers. The quick rule calls
   (`canonical-id`, `compare-versions`, …) and the slow calls (parsing a
