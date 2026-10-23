@@ -7,9 +7,9 @@
 //! discovery document and JWKS from the test process, which it reaches as
 //! [`HOST_ALIAS`], so the issuer must be started with
 //! [`MockOidc::start_workload_only_on_host`]. With a local Docker daemon the
-//! alias is the Docker host gateway; with a remote one (GitLab's
-//! Docker-in-Docker service, `DOCKER_HOST=tcp://docker:2375`) it is this
-//! machine's address on the route to the daemon.
+//! alias is the Docker host gateway; with a remote one (a Docker-in-Docker
+//! service, `DOCKER_HOST=tcp://docker:2375`) it is this machine's address on
+//! the route to the daemon.
 //!
 //! [`VersitygwSts::start`] registers the issuer as an OpenID Connect provider
 //! for [`CLIENT_ID`] and creates a role its tokens may assume, with full S3

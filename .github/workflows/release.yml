@@ -182,7 +182,8 @@ jobs:
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
       # The notes are the version's section alone, so entries still under
-      # [Unreleased] would be left out of them.
+      # [Unreleased], or fragments under docs/changes that were not folded
+      # in, would be left out of them.
       - name: Extract release notes from CHANGELOG.md
         run: |
           section() {
@@ -200,6 +201,10 @@ jobs:
           fi
           if section "## [Unreleased]" | grep -q '[^[:space:]]'; then
             echo "::error::CHANGELOG.md still has entries under [Unreleased], which the release notes would leave out; cut releases with 'cargo xtask release ${{ steps.version.outputs.version }}'"
+            exit 1
+          fi
+          if [ -n "$(find docs/changes -mindepth 2 -type f 2>/dev/null)" ]; then
+            echo "::error::docs/changes still has changelog fragments, which the release notes would leave out; cut releases with 'cargo xtask release ${{ steps.version.outputs.version }}'"
             exit 1
           fi
 
