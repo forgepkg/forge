@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
 import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
@@ -13,35 +13,31 @@ import {
 import { useRoles } from '~/queries/useRbac'
 import { useRealms } from '~/queries/useRealms'
 import { AccessBadge } from '~/components/AccessBadge'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
 import {
+  Avatar,
+  Button,
+  CellActions,
   Checkbox,
-  CheckboxField,
-  CheckboxGroup,
-} from '~/components/catalyst/checkbox'
-import {
-  Description,
-  ErrorMessage,
-  Field,
+  Dialog,
   Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
-import { Text } from '~/components/catalyst/text'
-import {
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+  StatusBadge,
+  Switch,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+  TextField,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import { InlineError } from '~/components/RbacLabels'
 
 export const Route = createFileRoute('/_app/manage/users')({
   component: UsersList,
@@ -54,9 +50,9 @@ export const Route = createFileRoute('/_app/manage/users')({
  * (admin, writer or reader, from their role assignments), the other roles
  * they hold and their active flag, offers an inline create form
  * (`CreateUser`, then the chosen roles), links each user to its
- * roles-and-tokens screen, and deletes with a confirm step. There is no
- * edit-in-place beyond create/delete + the per-user screen. Every account is
- * named by a UPN.
+ * roles-and-tokens screen, and deletes after a confirmation dialog. There is
+ * no edit-in-place beyond create/delete + the per-user screen. Every account
+ * is named by a UPN.
  */
 function UsersList() {
   const users = useUsers()
@@ -64,25 +60,38 @@ function UsersList() {
   const roleIds = new Map((roles.data ?? []).map((r) => [r.name, r.id]))
   const del = useDeleteUser()
   const [pendingDelete, setPendingDelete] = useState<number | null>(null)
+  const doomed = users.data?.find((u) => u.id === pendingDelete)
 
   function confirmDelete(id: number) {
     del.mutate(id, { onSettled: () => setPendingDelete(null) })
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Heading>Users</Heading>
-        <Text className="mt-1">
-          Create and remove users, assign their roles, and manage each
-          user&apos;s API tokens.
-        </Text>
-      </div>
+    <Page>
+      <PageHeader
+        title="Users"
+        description="Create and remove users, assign their roles, and manage each user's API tokens."
+      />
 
       <CreateUserForm />
 
       {del.isError && (
         <InlineError>{del.error.body || del.error.message}</InlineError>
+      )}
+
+      {doomed && (
+        <Dialog
+          open
+          onClose={() => setPendingDelete(null)}
+          icon="Trash"
+          tone="danger"
+          title={`Delete ${doomed.username}?`}
+          description="Their sessions, tokens and role assignments go with the account, and clients that use its tokens start failing. This cannot be undone."
+          confirmLabel={del.isPending ? 'Deleting…' : 'Delete user'}
+          confirmVariant="danger-solid"
+          confirmDisabled={del.isPending}
+          onConfirm={() => confirmDelete(doomed.id)}
+        />
       )}
 
       {users.isError ? (
@@ -92,87 +101,63 @@ function UsersList() {
           onRetry={() => void users.refetch()}
         />
       ) : users.isLoading ? (
-        <Text>Loading users…</Text>
+        <Skeleton variant="table" rows={4} columns={5} label="Loading users…" />
       ) : (users.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No users yet">
+        <EmptyState title="No users yet" icon="Users">
           Create the first user with the form above.
         </EmptyState>
       ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
+        <Panel title="All users" count={users.data!.length} flush>
+          <Table caption="Users">
+            <TableHead>
               <TableHeader>Username</TableHeader>
               <TableHeader>Sign-in</TableHeader>
-              <TableHeader>Access</TableHeader>
+              <TableHeader width="110px">Access</TableHeader>
               <TableHeader>Roles</TableHeader>
-              <TableHeader>Status</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {users.data!.map((user) => (
-              <UserRow
-                key={user.id}
-                user={user}
-                roleIds={roleIds}
-                isDeleting={del.isPending && pendingDelete === user.id}
-                pendingDelete={pendingDelete === user.id}
-                onRequestDelete={() => setPendingDelete(user.id)}
-                onCancelDelete={() => setPendingDelete(null)}
-                onConfirmDelete={() => confirmDelete(user.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
+              <TableHeader width="110px">Status</TableHeader>
+              <TableHeader align="right">
+                <span className="fg-sr">Actions</span>
+              </TableHeader>
+            </TableHead>
+            <TableBody>
+              {users.data!.map((user) => (
+                <UserRow
+                  key={user.id}
+                  user={user}
+                  roleIds={roleIds}
+                  onRequestDelete={() => setPendingDelete(user.id)}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        </Panel>
       )}
-    </section>
-  )
-}
-
-function InlineError({ children }: { children: React.ReactNode }) {
-  return (
-    <p
-      role="alert"
-      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-    >
-      {children}
-    </p>
+    </Page>
   )
 }
 
 function UserRow({
   user,
   roleIds,
-  isDeleting,
-  pendingDelete,
   onRequestDelete,
-  onCancelDelete,
-  onConfirmDelete,
 }: {
   user: UserView
   roleIds: ReadonlyMap<string, number>
-  isDeleting: boolean
-  pendingDelete: boolean
   onRequestDelete: () => void
-  onCancelDelete: () => void
-  onConfirmDelete: () => void
 }) {
-  const navigate = useNavigate()
   return (
     <TableRow>
-      <TableCell>
-        <button
-          type="button"
-          onClick={() =>
-            void navigate({
-              to: '/manage/users/$userId',
-              params: { userId: String(user.id) },
-            })
-          }
-          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
-        >
-          {user.username}
-        </button>
+      <TableCell lead>
+        <span className="fg-cell-user">
+          <Avatar name={user.username} decorative />
+          <Link
+            to="/manage/users/$userId"
+            params={{ userId: String(user.id) }}
+            className="fg-link-strong"
+          >
+            {user.username}
+          </Link>
+        </span>
       </TableCell>
       <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
       <TableCell>
@@ -183,48 +168,20 @@ function UserRow({
       </TableCell>
       <TableCell>
         {user.active ? (
-          <Badge color="emerald">active</Badge>
+          <StatusBadge tone="ok">active</StatusBadge>
         ) : (
-          <Badge color="zinc">inactive</Badge>
+          <StatusBadge tone="neutral">inactive</StatusBadge>
         )}
       </TableCell>
-      <TableCell>
-        <span className="flex items-center gap-3">
-          <Link
-            to="/manage/users/$userId"
-            params={{ userId: String(user.id) }}
-            className="text-sky-600 hover:underline dark:text-sky-400"
-          >
+      <TableCell align="right" nowrap>
+        <CellActions>
+          <Button size="sm" variant="ghost" href={`/manage/users/${user.id}`}>
             Roles &amp; tokens
-          </Link>
-          {pendingDelete ? (
-            <span className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={onConfirmDelete}
-                disabled={isDeleting}
-                className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
-              >
-                {isDeleting ? 'Deleting…' : 'Confirm'}
-              </button>
-              <button
-                type="button"
-                onClick={onCancelDelete}
-                className="text-zinc-500 hover:underline dark:text-zinc-400"
-              >
-                Cancel
-              </button>
-            </span>
-          ) : (
-            <button
-              type="button"
-              onClick={onRequestDelete}
-              className="font-medium text-red-600 hover:underline dark:text-red-400"
-            >
-              Delete
-            </button>
-          )}
-        </span>
+          </Button>
+          <Button size="sm" variant="ghost" icon="Trash" onClick={onRequestDelete}>
+            Delete
+          </Button>
+        </CellActions>
       </TableCell>
     </TableRow>
   )
@@ -248,27 +205,33 @@ function RoleBadges({
     (name) => name !== ADMIN_ROLE && name !== WRITER_ROLE,
   )
   if (others.length === 0 && !legacyAdmin) {
-    return <span className="text-zinc-500 dark:text-zinc-400">—</span>
+    return <span className="text-ink-faint">—</span>
   }
   return (
-    <span className="flex flex-wrap items-center gap-1">
+    <span className="fg-cell-badges">
       {legacyAdmin && (
-        <Badge color="red" title="The legacy is_admin flag, without the admin role">
+        <StatusBadge
+          tone="heat"
+          dot={false}
+          title="The legacy is_admin flag, without the admin role"
+        >
           admin (flag)
-        </Badge>
+        </StatusBadge>
       )}
       {others.map((name) => {
         const id = roleIds.get(name)
-        const badge = <Badge color="zinc">{name}</Badge>
         return id == null ? (
-          <span key={name}>{badge}</span>
+          <span key={name} className="fg-chip">
+            {name}
+          </span>
         ) : (
           <Link
             key={name}
             to="/manage/roles/$roleId"
             params={{ roleId: String(id) }}
+            className="fg-chip fg-link"
           >
-            {badge}
+            {name}
           </Link>
         )
       })}
@@ -277,13 +240,13 @@ function RoleBadges({
 }
 
 /**
- * Inline create-user form. Controlled state (matching the codebase's Login /
- * RepositoryForm pattern); on success the fields reset so several users can be
- * added in a row. The username/password requirements mirror the server's 400s:
- * the username is a UPN (`upnError`), checked once the field was left. An
- * account signs in with a Forge password, or through a credential-forwarding
- * realm (`realm`, no password): such a realm signs in only the accounts
- * created for it here.
+ * Inline create-user form, a "New user" panel. Controlled state (matching the
+ * codebase's Login / RepositoryForm pattern); on success the fields reset so
+ * several users can be added in a row. The username/password requirements
+ * mirror the server's 400s: the username is a UPN (`upnError`), checked once
+ * the field was left. An account signs in with a Forge password, or through
+ * a credential-forwarding realm (`realm`, no password): such a realm signs in
+ * only the accounts created for it here.
  */
 function CreateUserForm() {
   const create = useCreateUser()
@@ -340,84 +303,87 @@ function CreateUserForm() {
   }
 
   return (
-    <form
+    <Panel
+      as="form"
       onSubmit={submit}
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+      title="New user"
+      footer={
+        <Button
+          type="submit"
+          variant="primary"
+          icon="Plus"
+          disabled={
+            create.isPending ||
+            !username.trim() ||
+            (!realm && !password) ||
+            !!usernameError
+          }
+        >
+          {create.isPending ? 'Creating…' : 'Create user'}
+        </Button>
+      }
     >
-      <Subheading>New user</Subheading>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Username</Label>
-          <Input
-            type="text"
-            autoComplete="off"
-            placeholder="alice@example.com"
-            value={username}
-            invalid={showUsernameError}
-            onChange={(e) => setUsername(e.target.value)}
-            onBlur={() => setUsernameTouched(true)}
-          />
-          {showUsernameError && <ErrorMessage>{usernameError}</ErrorMessage>}
-        </Field>
+      <div className="fg-form">
+        <TextField
+          label="Username"
+          type="text"
+          autoComplete="off"
+          placeholder="alice@example.com"
+          value={username}
+          error={showUsernameError ? usernameError : undefined}
+          onChange={(e) => setUsername(e.target.value)}
+          onBlur={() => setUsernameTouched(true)}
+        />
         {forwarding.length > 0 && (
-          <Field>
-            <Label>Sign-in</Label>
-            <Select value={realm} onChange={(e) => setRealm(e.target.value)}>
-              <option value="">Forge password</option>
-              {forwarding.map((r) => (
-                <option key={r.id} value={r.name}>
-                  Credential forwarding: {r.name}
-                </option>
-              ))}
-            </Select>
-            {realm && (
-              <Description>
-                Signs in with the upstream&apos;s password, which gets the part
-                of the username before the @.
-              </Description>
-            )}
-          </Field>
+          <SelectField
+            label="Sign-in"
+            value={realm}
+            onChange={(e) => setRealm(e.target.value)}
+            description={
+              realm
+                ? "Signs in with the upstream's password, which gets the part of the username before the @."
+                : undefined
+            }
+          >
+            <option value="">Forge password</option>
+            {forwarding.map((r) => (
+              <option key={r.id} value={r.name}>
+                Credential forwarding: {r.name}
+              </option>
+            ))}
+          </SelectField>
         )}
         {!realm && (
-          <Field>
-            <Label>Password</Label>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </Field>
+          <TextField
+            label="Password"
+            type="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         )}
-      </div>
-      <Fieldset>
-        <Legend>Roles</Legend>
-        {roles.isError ? (
-          <Text>
-            Could not load the roles; assign them on the user&apos;s page once
-            it is created.
-          </Text>
-        ) : (
-          <CheckboxGroup className="grid gap-x-6 sm:grid-cols-2">
-            {(roles.data ?? []).map((role) => (
-              <CheckboxField key={role.id}>
+        <Fieldset legend="Roles">
+          {roles.isError ? (
+            <p className="fg-text">
+              Could not load the roles; assign them on the user&apos;s page once
+              it is created.
+            </p>
+          ) : (
+            <div className="fg-choice-list">
+              {(roles.data ?? []).map((role) => (
                 <Checkbox
+                  key={role.id}
+                  label={role.name}
+                  description={role.description || undefined}
                   checked={chosen.has(role.id)}
                   onChange={(c) => toggle(role.id, c)}
                 />
-                <Label>{role.name}</Label>
-                {role.description && (
-                  <Description>{role.description}</Description>
-                )}
-              </CheckboxField>
-            ))}
-          </CheckboxGroup>
-        )}
-      </Fieldset>
-      <CheckboxField>
-        <Checkbox checked={active} onChange={(c) => setActive(c)} />
-        <Label>Active</Label>
-      </CheckboxField>
+              ))}
+            </div>
+          )}
+        </Fieldset>
+        <Switch label="Active" checked={active} onChange={(c) => setActive(c)} />
+      </div>
       {create.isError && (
         <InlineError>
           {create.error instanceof ApiError
@@ -425,17 +391,6 @@ function CreateUserForm() {
             : create.error.message}
         </InlineError>
       )}
-      <Button
-        type="submit"
-        disabled={
-          create.isPending ||
-          !username.trim() ||
-          (!realm && !password) ||
-          !!usernameError
-        }
-      >
-        {create.isPending ? 'Creating…' : 'Create user'}
-      </Button>
-    </form>
+    </Panel>
   )
 }

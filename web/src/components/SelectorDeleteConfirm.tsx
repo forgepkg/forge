@@ -5,8 +5,7 @@ import {
   useRoles,
   useSelectorGrants,
 } from '~/queries/useRbac'
-import { Button } from '~/components/catalyst/button'
-import { Text } from '~/components/catalyst/text'
+import { Dialog } from '~/components/ui'
 import {
   byId,
   grantText,
@@ -15,9 +14,10 @@ import {
 } from '~/components/RbacLabels'
 
 /**
- * The confirmation before a content selector is deleted: the server deletes
- * the grants scoped by it along with it (rather than leaving them to cover
- * every package), so this names them, role by role, first.
+ * The confirmation before a content selector is deleted, as a dialog open
+ * while it is mounted: the server deletes the grants scoped by it along with
+ * it (rather than leaving them to cover every package), so this names them,
+ * role by role, first. Cancel, Escape and the close button call `onCancel`.
  */
 export function SelectorDeleteConfirm({
   selector,
@@ -38,36 +38,36 @@ export function SelectorDeleteConfirm({
   const selectors = new Map([[selector.id, selector]])
 
   return (
-    <div
-      role="region"
-      aria-label={`Delete selector ${selector.name}`}
-      className="space-y-3 rounded-xl border border-red-500/25 bg-red-500/5 p-4 dark:bg-red-500/10"
+    <Dialog
+      open
+      onClose={onCancel}
+      icon="Trash"
+      tone="danger"
+      title={`Delete ${selector.name}?`}
+      description="The grants it scopes are deleted with it, so they never cover every package. This cannot be undone."
+      confirmLabel={del.isPending ? 'Deleting…' : 'Delete selector'}
+      confirmVariant="danger-solid"
+      confirmDisabled={grants.isLoading || grants.isError || del.isPending}
+      onConfirm={() => del.mutate(selector.id, { onSuccess: onDeleted })}
     >
-      <Text>
-        Delete the content selector{' '}
-        <span className="font-medium text-zinc-950 dark:text-white">
-          {selector.name}
-        </span>
-        ?
-      </Text>
       {grants.isError ? (
         <InlineError>
           Could not load the grants it scopes:{' '}
           {grants.error.body || grants.error.message}
         </InlineError>
       ) : grants.isLoading ? (
-        <Text>Loading the grants it scopes…</Text>
+        <p className="fg-text">Loading the grants it scopes…</p>
       ) : (grants.data?.length ?? 0) === 0 ? (
-        <Text>No grant uses it.</Text>
+        <p className="fg-text">No grant uses it.</p>
       ) : (
-        <div>
-          <Text>
+        <div className="grid gap-1">
+          <p className="fg-text">
             {grants.data!.length === 1
               ? 'This grant is'
               : `These ${grants.data!.length} grants are`}{' '}
             deleted with it:
-          </Text>
-          <ul className="mt-1 list-inside list-disc text-sm/6 text-zinc-950 dark:text-white">
+          </p>
+          <ul className="fg-list text-ink">
             {grants.data!.map((g) => (
               <li key={g.id}>
                 {roleMap.get(g.role_id)?.name ?? `role #${g.role_id}`}:{' '}
@@ -80,18 +80,6 @@ export function SelectorDeleteConfirm({
       {del.isError && (
         <InlineError>{del.error.body || del.error.message}</InlineError>
       )}
-      <div className="flex items-center gap-3">
-        <Button
-          color="red"
-          disabled={grants.isLoading || grants.isError || del.isPending}
-          onClick={() => del.mutate(selector.id, { onSuccess: onDeleted })}
-        >
-          {del.isPending ? 'Deleting…' : 'Delete selector'}
-        </Button>
-        <Button plain onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-    </div>
+    </Dialog>
   )
 }
