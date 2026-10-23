@@ -28,7 +28,7 @@ use crate::me::me_router;
 use crate::me_tokens::me_tokens_router;
 use crate::middleware::{attach_principal, PrincipalLayer};
 use crate::state::AppState;
-use crate::web_ui::{legacy_admin_ui_redirect, spa_service};
+use crate::web_ui::spa_service;
 
 /// Build the principal middleware layer from the assembled [`AppState`].
 ///
@@ -171,12 +171,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
     // headless deployment (`web.enabled = false`). The admin UI lives under
-    // `/manage/*`; a browser navigation to one of its former `/admin/...`
-    // paths is 302-redirected there (API requests to `/admin/*` are untouched).
+    // `/manage/*`; `/admin/*` is the admin API's.
     if state.config.web.enabled {
-        app = app
-            .fallback_service(spa_service(&state.config.web))
-            .layer(axum::middleware::from_fn(legacy_admin_ui_redirect));
+        app = app.fallback_service(spa_service(&state.config.web));
     }
 
     let hsts = state.cookie_secure;

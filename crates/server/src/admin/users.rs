@@ -45,32 +45,41 @@ pub struct UserView {
     /// account can be switched to a local one
     /// (`POST /admin/users/{id}/convert-to-local`).
     pub captured_password_at: Option<DateTime<Utc>>,
+    /// The names of the RBAC roles the user holds, sorted. What the user may
+    /// do follows from these; `is_admin` only says whether `admin` is one.
+    pub roles: Vec<String>,
 }
 
 impl UserView {
-    fn new(u: &AppUser, is_admin: bool) -> Self {
+    /// The view of `u`, which holds `roles` (sorted role names): it is an
+    /// administrator when `admin` is among them.
+    fn new(u: &AppUser, roles: Vec<String>) -> Self {
         UserView {
             id: u.id,
             username: u.username.clone(),
-            is_admin,
+            is_admin: roles.iter().any(|r| r == authz_dao::ADMIN_ROLE),
             active: u.active,
             auth_source: u.auth_source.clone(),
             captured_password_at: None,
+            roles,
         }
     }
 
-    /// The view of `u`, reading its `admin` role membership and its
-    /// kept-password time from the database.
+    /// The view of `u`, with its roles and kept-password time read from the
+    /// database.
     async fn load(state: &AppState, u: &AppUser) -> Result<Self, Response> {
-        let is_admin = authz_dao::user_has_role(&state.pool, u.id, authz_dao::ADMIN_ROLE)
-            .await
-            .map_err(db_error)?;
         let captured_password_at = user_dao::captured_password_at(&state.pool, u.id)
             .await
             .map_err(db_error)?;
+        let roles = authz_dao::list_roles_for_user(&state.pool, u.id)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
         Ok(UserView {
             captured_password_at,
-            ..Self::new(u, is_admin)
+            ..Self::new(u, roles)
         })
     }
 }
@@ -109,20 +118,25 @@ pub async fn list(State(state): State<AppState>) -> Response {
         Ok(users) => users,
         Err(e) => return db_error(e),
     };
-    let admins = match authz_dao::user_ids_with_role(&state.pool, authz_dao::ADMIN_ROLE).await {
-        Ok(admins) => admins,
-        Err(e) => return db_error(e),
-    };
     let captured: std::collections::HashMap<i64, DateTime<Utc>> =
         match user_dao::captured_password_times(&state.pool).await {
             Ok(times) => times.into_iter().collect(),
             Err(e) => return db_error(e),
         };
+    let mut roles: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    match authz_dao::list_user_role_names(&state.pool).await {
+        Ok(assignments) => {
+            for (user_id, role) in assignments {
+                roles.entry(user_id).or_default().push(role);
+            }
+        }
+        Err(e) => return db_error(e),
+    }
     let views: Vec<UserView> = users
         .iter()
         .map(|u| UserView {
             captured_password_at: captured.get(&u.id).copied(),
-            ..UserView::new(u, admins.contains(&u.id))
+            ..UserView::new(u, roles.remove(&u.id).unwrap_or_default())
         })
         .collect();
     Json(views).into_response()
@@ -148,18 +162,22 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         Err(resp) => return resp,
     };
 
-    match insert_with_admin_role(
+    let u = match insert_with_admin_role(
         &state,
         NewUser::local(username, password_hash, body.active),
         body.is_admin,
     )
     .await
     {
-        Ok(u) => (StatusCode::CREATED, Json(UserView::new(&u, body.is_admin))).into_response(),
+        Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {
-            (StatusCode::CONFLICT, "username already exists").into_response()
+            return (StatusCode::CONFLICT, "username already exists").into_response();
         }
-        Err(e) => db_error(e),
+        Err(e) => return db_error(e),
+    };
+    match UserView::load(&state, &u).await {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(resp) => resp,
     }
 }
 

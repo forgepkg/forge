@@ -760,81 +760,15 @@ async fn upstream_password_end_to_end() {
     let legacy = repository_dao::insert_repository(&pool, legacy)
         .await
         .unwrap();
-    // A row a pre-release backfill left behind: envelope written, plaintext kept.
-    let mut leftover = NewRepository::proxy("crypt-leftover");
-    leftover.upstream_password = Some("leftover-pw".to_string());
-    let leftover = repository_dao::insert_repository(&pool, leftover)
-        .await
-        .unwrap();
-    let leftover_blob = envelope
-        .seal(
-            &secret("leftover-pw"),
-            forge_crypto::envelope::AeadBinding {
-                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
-                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
-                row_pk: leftover.id,
-                destination: None,
-            },
-        )
-        .await
-        .unwrap();
-    sqlx::query!(
-        r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
-        leftover.id,
-        &leftover_blob
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    // A row whose envelope is stale (the password was changed while
-    // encryption was off) and one whose envelope does not decrypt: in both
-    // the plaintext is the copy to keep, so it is sealed afresh.
-    let mut stale = NewRepository::proxy("crypt-stale");
-    stale.upstream_password = Some("new-pw".to_string());
-    let stale = repository_dao::insert_repository(&pool, stale)
-        .await
-        .unwrap();
-    let stale_blob = envelope
-        .seal(
-            &secret("old-pw"),
-            forge_crypto::envelope::AeadBinding {
-                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
-                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
-                row_pk: stale.id,
-                destination: None,
-            },
-        )
-        .await
-        .unwrap();
-    let mut broken = NewRepository::proxy("crypt-broken");
-    broken.upstream_password = Some("broken-pw".to_string());
-    let broken = repository_dao::insert_repository(&pool, broken)
-        .await
-        .unwrap();
-    for (id, blob) in [
-        (stale.id, stale_blob),
-        (broken.id, b"not an envelope".to_vec()),
-    ] {
-        sqlx::query!(
-            r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
-            id,
-            &blob
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
     assert!(secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
 
-    // One pass seals the plaintext-only row, clears the verified leftover
-    // copy and re-seals the stale and the undecryptable rows.
+    // One pass seals the plaintext row.
     let done = secret_dao::backfill_upstream_passwords(&pool, &envelope, 100)
         .await
         .expect("backfill");
-    assert_eq!(done, 4);
-    // Every plaintext copy is gone, not just the un-sealed ones.
+    assert_eq!(done, 1);
     assert!(!secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
@@ -855,28 +789,21 @@ async fn upstream_password_end_to_end() {
             .unwrap(),
         0
     );
-    // The original plaintexts survive the round trip, now only as envelopes.
-    for (id, expected) in [
-        (legacy.id, "legacy-pw"),
-        (leftover.id, "leftover-pw"),
-        (stale.id, "new-pw"),
-        (broken.id, "broken-pw"),
-    ] {
-        let got = secret_dao::get_upstream_password(&pool, &envelope, id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.expose_secret(), expected);
-        let row = sqlx::query!(
-            r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
-            id
-        )
-        .fetch_one(&pool)
+    // The original plaintext survives the round trip, now only as an envelope.
+    let got = secret_dao::get_upstream_password(&pool, &envelope, legacy.id)
         .await
+        .unwrap()
         .unwrap();
-        assert!(row.upstream_password.is_none(), "plaintext cleared");
-        assert!(row.upstream_password_enc.is_some());
-    }
+    assert_eq!(got.expose_secret(), "legacy-pw");
+    let row = sqlx::query!(
+        r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
+        legacy.id
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.upstream_password.is_none(), "plaintext cleared");
+    assert!(row.upstream_password_enc.is_some());
 
     // ── DEK rotation + lazy re-encrypt sweep ─────────────────────────────────
     let old_dek = EnvelopeService::blob_dek_version(&blob).unwrap();
@@ -894,10 +821,7 @@ async fn upstream_password_end_to_end() {
             None => break,
         }
     }
-    assert_eq!(
-        resealed, 5,
-        "repo1 + legacy + leftover + stale + broken re-encrypted under the new DEK"
-    );
+    assert_eq!(resealed, 2, "repo1 + legacy re-encrypted under the new DEK");
 
     // Everything still decrypts and now references the active DEK.
     for (id, expected) in [(repo1.id, "hunter2"), (legacy.id, "legacy-pw")] {
@@ -1213,10 +1137,10 @@ async fn realm_backfill_never_undoes_a_concurrent_edit() {
 
 /// A realm whose `secrets_enc` does not decrypt but whose `config` holds a
 /// plaintext secret (an OIDC realm "repaired" in SQL with a new issuer and
-/// client secret) does not fail the backfill: the plaintext copy is sealed
-/// for the new issuer and replaces the old ciphertext.
+/// client secret) does not fail the backfill, and is left as is: an
+/// administrator enters its secrets again through the admin API.
 #[tokio::test]
-async fn realm_backfill_reseals_an_undecryptable_realm_from_its_plaintext() {
+async fn realm_backfill_leaves_an_undecryptable_realm_alone() {
     let _serial = TABLE_WIDE.lock().await;
     let pool = pool().await;
     let envelope = envelope_with_scope(&pool, &format!("realm-fix-{}", uuid::Uuid::new_v4()));
@@ -1269,13 +1193,8 @@ async fn realm_backfill_reseals_an_undecryptable_realm_from_its_plaintext() {
         .await
         .unwrap()
         .unwrap();
-    assert!(now.config.get("client_secret").is_none(), "{}", now.config);
-    assert_ne!(now.secrets_enc, repaired.secrets_enc);
-    let config = secret_dao::realm_config(Some(&envelope), &now)
-        .await
-        .expect("sealed for the new issuer");
-    assert_eq!(config["client_secret"], "new-secret");
-    assert_eq!(config["issuer"], "https://login.example/new/v2.0");
+    assert_eq!(now.secrets_enc, repaired.secrets_enc);
+    assert_eq!(now.config, repaired.config);
     auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
 }
 
@@ -1477,9 +1396,8 @@ async fn secret_settings_follow_dek_rotation() {
 /// (review: "the ciphertext is not bound to where the secret is sent"). A
 /// row repointed at another host outside the API no longer decrypts, so the
 /// proxy can never send the password there; a path change on the same origin
-/// keeps it. A blob a pre-release build sealed under the row-only binding
-/// opens only with `crypto.accept_row_bound_secrets`, and is then moved to
-/// the origin binding by the re-encrypt sweep.
+/// keeps it. A blob sealed under the row-only binding (as pre-release builds
+/// did) does not decrypt either, and the sweep leaves it.
 #[tokio::test]
 async fn upstream_password_is_bound_to_the_remote_origin() {
     let pool = pool().await;
@@ -1547,8 +1465,8 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
     set_url("https://nexus.example/index.json").await;
     assert_eq!(read().await.unwrap().unwrap().secret.expose_secret(), "pw");
 
-    // A blob sealed by a pre-release build (row-only binding) is refused by
-    // default, and the sweep leaves it alone …
+    // A blob sealed under the row-only binding (as pre-release builds did)
+    // is refused, and the sweep leaves it alone.
     let legacy = envelope
         .seal(
             &secret("legacy-pw"),
@@ -1577,46 +1495,6 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
         .await
         .unwrap();
     assert_eq!(swept.resealed, 0);
-    // … but an instance started with `crypto.accept_row_bound_secrets` opens
-    // it, and its sweep re-seals it for the current origin, once.
-    let migrating = EnvelopeService::new(
-        Arc::new(PgKeyStore::new(pool.clone())),
-        Arc::new(StaticRootProvider::new(
-            "env",
-            Algorithm::Aes256Gcm,
-            KeyBytes::from_slice(root.expose()).unwrap(),
-            vec![],
-        )),
-        EnvelopeServiceConfig {
-            scope: scope.clone(),
-            accept_row_bound_secrets: true,
-            ..Default::default()
-        },
-    );
-    assert_eq!(
-        secret_dao::get_upstream_credential(&pool, &migrating, repo.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .secret
-            .expose_secret(),
-        "legacy-pw"
-    );
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(swept.resealed, 1);
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(swept.resealed, 0, "converged");
-    // The re-sealed blob opens without the switch.
-    assert_eq!(
-        read().await.unwrap().unwrap().secret.expose_secret(),
-        "legacy-pw"
-    );
-    set_url("https://attacker.example/index.json").await;
-    assert!(read().await.is_err(), "now bound to the origin");
 }
 
 /// An OIDC realm's client secret is bound to its issuer and client id: a

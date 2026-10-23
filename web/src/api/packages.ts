@@ -22,6 +22,8 @@ import { ApiError, httpClient } from '~/lib/httpClient'
 
 /** One readable repository (`GET /browse/repos` item) — a folder-view root. */
 export interface BrowseRepo {
+  /** Repository id, as a token's scope names repositories. */
+  id: number
   /** Repository name. */
   name: string
   /** Repository kind: `hosted` | `proxy` | `group`. */

@@ -143,8 +143,8 @@ impl OidcRuntime {
         let cookie_secure = public_base_url.trim().starts_with("https://");
         let sessions = SessionService::new(
             pool,
-            chrono::Duration::seconds(oidc.session_idle_ttl_seconds as i64),
-            chrono::Duration::seconds(oidc.session_absolute_ttl_seconds as i64),
+            chrono::Duration::from_std(oidc.session_idle_ttl())?,
+            chrono::Duration::from_std(oidc.session_absolute_ttl())?,
         );
 
         Ok(Self {

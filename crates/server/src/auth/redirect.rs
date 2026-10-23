@@ -81,8 +81,7 @@ mod tests {
             "/admin/repositories?tab=2"
         );
         // The admin UI's own paths (`/manage/*`) are ordinary same-origin
-        // targets; a legacy `/admin/...` UI target is passed through and then
-        // 302-redirected to `/manage/...` by `web_ui::legacy_admin_ui_redirect`.
+        // targets.
         assert_eq!(
             sanitize_redirect_to(Some("/manage/repositories/feed?tab=2")),
             "/manage/repositories/feed?tab=2"

@@ -763,11 +763,12 @@ impl Cache {
                                     // below simply replaces it.
                                 }
                                 Ok(_) | Err(_) => {
-                                    // Rolling upgrades can encounter the former raw-value
-                                    // format. Treat it as a miss; the next successful fill
-                                    // replaces it with a tagged envelope.
+                                    // Not a current-format envelope (another format
+                                    // version, or a value that is no envelope). Treat
+                                    // it as a miss; the next successful fill replaces it
+                                    // with a tagged envelope.
                                     if let Err(err) = l2.del(&key_for_l2).await {
-                                        tracing::warn!(error = %err, key = %key_for_l2, "legacy L2 entry cleanup failed");
+                                        tracing::warn!(error = %err, key = %key_for_l2, "unreadable L2 entry cleanup failed");
                                     }
                                 }
                             }

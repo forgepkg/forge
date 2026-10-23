@@ -7,10 +7,7 @@ import { adminBasic, createRepo, facts, signInSession } from '../helpers'
  *
  * The admin REST API owns `/admin/*`; the admin **UI** lives under `/manage/*`
  * so a hard navigation / refresh / bookmark of any admin screen is served by
- * the SPA (index.html) and resolved client-side. Links saved while the UI
- * still lived under `/admin/...` keep working: the server 302-redirects a
- * browser navigation there to the `/manage/...` equivalent, while API calls
- * to the same paths are answered by the API as before.
+ * the SPA (index.html) and resolved client-side.
  */
 test.describe('admin UI deep links', () => {
   test('hard-loading and refreshing /manage/repositories renders the list', async ({
@@ -81,25 +78,7 @@ test.describe('admin UI deep links', () => {
     ).toBeVisible()
   })
 
-  test('a bookmark of a former /admin/... UI path is redirected to /manage/...', async ({
-    page,
-  }) => {
-    await signInSession(page)
-    // A real browser navigation (Sec-Fetch-Dest: document, Accept: text/html).
-    await page.goto('/admin/repositories?from=bookmark')
-    await expect(page).toHaveURL(/\/manage\/repositories\?from=bookmark$/)
-    await expect(
-      page.getByRole('heading', { name: /^repositories$/i }),
-    ).toBeVisible()
-
-    await page.goto('/admin')
-    await expect(page).toHaveURL(/\/manage$/)
-    await expect(
-      page.getByRole('heading', { name: /^administration$/i }),
-    ).toBeVisible()
-  })
-
-  test('API clients of /admin/* are unaffected by the UI move', async ({
+  test('requests to /admin/* are answered by the API', async ({
     request,
   }) => {
     const f = facts()

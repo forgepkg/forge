@@ -12,6 +12,7 @@ import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { RealmView } from '~/api/realms'
+import type { RoleView } from '~/api/rbac'
 import { routeTree } from '~/routeTree.gen'
 
 /**
@@ -34,6 +35,18 @@ const adminMe: Me = {
   user: { id: 1, username: 'root', is_admin: true, active: true },
   is_admin: true,
   capabilities: ['repo.read', 'repo.admin'],
+}
+
+function role(over: Partial<RoleView>): RoleView {
+  return {
+    id: 1,
+    name: 'role',
+    description: '',
+    builtin: false,
+    grant_count: 0,
+    user_count: 0,
+    ...over,
+  }
 }
 
 function realm(over: Partial<RealmView>): RealmView {
@@ -90,6 +103,8 @@ interface ApiHandlers {
   onReorder?: (body: unknown) => Response
   capturedPasswords?: () => { accounts: number; captured: number }
   onConvert?: (id: number) => Response
+  /** `GET /admin/roles`; absent → 404 (the rule's role is typed instead). */
+  roles?: RoleView[]
 }
 
 /** Route the mock by method + pathname against the realms admin API. */
@@ -143,6 +158,10 @@ function mockApi(h: ApiHandlers) {
             h.onDelete ? h.onDelete(id) : new Response(null, { status: 204 }),
           )
         }
+      }
+
+      if (path.endsWith('/admin/roles') && method === 'GET' && h.roles) {
+        return Promise.resolve(json(h.roles))
       }
 
       if (path.endsWith('/admin/realms') && method === 'GET') {
@@ -545,6 +564,11 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     let posted: unknown = null
     mockApi({
       realms: [],
+      roles: [
+        role({ id: 1, name: 'admin', builtin: true }),
+        role({ id: 4, name: 'ci-deployer' }),
+        role({ id: 5, name: 'readers' }),
+      ],
       onCreate: (body) => {
         posted = body
         return json(realm({ id: 9, kind: 'workload_identity' }), 201)
@@ -572,7 +596,13 @@ describe('admin realms create', { timeout: 20_000 }, () => {
 
     // A newly added rule starts with one mandatory condition.
     await u.click(screen.getByRole('button', { name: 'Add rule' }))
-    await u.type(screen.getByLabelText('Role'), 'ci-deployer')
+    // The rule's role is picked from the roles; the global admin is not offered.
+    const rolePicker = screen.getByLabelText('Role')
+    await waitFor(() =>
+      expect(within(rolePicker).getByRole('option', { name: 'ci-deployer' })).toBeInTheDocument(),
+    )
+    expect(within(rolePicker).queryByRole('option', { name: 'admin' })).toBeNull()
+    await u.selectOptions(rolePicker, 'ci-deployer')
     await u.type(screen.getByLabelText('Claim'), 'repository_id')
     await u.type(screen.getByLabelText('Any of'), '987654321')
     await u.click(screen.getByRole('button', { name: 'Add condition' }))

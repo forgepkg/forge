@@ -1003,8 +1003,8 @@ impl RealmAuth {
             admin_claim: cfg.admin_claim.clone(),
             required_claims: cfg.required_claims.clone(),
             endpoint_hosts: cfg.endpoint_hosts.clone(),
-            session_idle_ttl_seconds: idle,
-            session_absolute_ttl_seconds: absolute,
+            session_idle_ttl_seconds: Some(idle),
+            session_absolute_ttl_seconds: Some(absolute),
         };
         let runtime = OidcRuntime::build(
             &oidc_config,
@@ -1076,12 +1076,6 @@ fn seed_fingerprint(kind: &str, config: &JsonValue) -> String {
         "{SEED_FINGERPRINT_V2}{}",
         forge_core::auth::token::hash_token(&doc.to_string())
     )
-}
-
-/// The marker pre-release builds stored: sha256 hex over the whole config,
-/// secrets included. Only ever compared once, then replaced or dropped.
-fn legacy_seed_fingerprint(config: &JsonValue) -> String {
-    forge_core::auth::token::hash_token(&config.to_string())
 }
 
 /// The `forge_setting` key holding the seed fingerprint for a realm kind.
@@ -1298,24 +1292,17 @@ async fn apply_seed(
             // drops the marker before it writes ([`forget_seed`]), so every
             // write below is a compare-and-set against it: a seed racing an
             // edit backs off instead of re-creating the marker over it.
-            let marker = if last_seed.starts_with(SEED_FINGERPRINT_V2) {
-                if last_seed != seed_fingerprint(kind, &existing_config) {
-                    return Ok(());
-                }
-                last_seed
-            } else if last_seed == legacy_seed_fingerprint(&existing_config) {
-                // A pre-release marker hashes the secret as well: replace it
-                // whatever happens below.
-                let current = seed_fingerprint(kind, &existing_config);
-                if !authz_dao::replace_setting(pool, &key, &last_seed, &current).await? {
-                    return Ok(());
-                }
-                current
-            } else {
-                // A pre-release marker of an edited row.
+            if !last_seed.starts_with(SEED_FINGERPRINT_V2) {
+                // A marker in another format (pre-release builds hashed the
+                // secrets too) counts as an edited row's: it is dropped, and
+                // the block no longer re-applies.
                 authz_dao::delete_setting(pool, &key).await?;
                 return Ok(());
-            };
+            }
+            if last_seed != seed_fingerprint(kind, &existing_config) {
+                return Ok(());
+            }
+            let marker = last_seed;
             if existing_config == config {
                 return Ok(());
             }

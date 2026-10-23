@@ -7,11 +7,9 @@ import {
   useMyTokens,
   useRevokeMyToken,
 } from '~/queries/useTokens'
-import { Button } from '~/components/catalyst/button'
+import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import { Code, Text } from '~/components/catalyst/text'
 import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Field, Label } from '~/components/catalyst/fieldset'
 import {
   Table,
   TableBody,
@@ -23,6 +21,7 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
+import { TokenCreateForm } from '~/components/TokenCreateForm'
 import { TokenScopeBadges, TokenStatusBadge } from '~/components/TokenBadges'
 
 export const Route = createFileRoute('/_app/tokens')({
@@ -34,32 +33,19 @@ export const Route = createFileRoute('/_app/tokens')({
  * revoke their **own** registry tokens here (`/admin/me/tokens` — not
  * admin-gated). Tokens authenticate NuGet clients against the feed and Docker
  * clients against the registry (`docker login`, the token as the password);
- * they cannot be used to sign in to this UI. The plaintext is shown **once**
- * via `ShowOnceSecret`, held in transient component state, and never written
- * into a query cache.
+ * they cannot be used to sign in to this UI. A token can be scoped to some
+ * actions and to some of the repositories the user can read. The plaintext is
+ * shown **once** via `ShowOnceSecret`, held in transient component state, and
+ * never written into a query cache.
  */
 function MyTokens() {
   const tokens = useMyTokens()
   const create = useCreateMyToken()
   const revoke = useRevokeMyToken()
+  const repos = useBrowseRepos()
 
-  const [name, setName] = useState('')
   const [created, setCreated] = useState<CreatedToken | null>(null)
   const [pendingRevoke, setPendingRevoke] = useState<number | null>(null)
-
-  function issue(e: React.FormEvent) {
-    e.preventDefault()
-    if (!name.trim()) return
-    create.mutate(
-      { name: name.trim() },
-      {
-        onSuccess: (token) => {
-          setCreated(token)
-          setName('')
-        },
-      },
-    )
-  }
 
   function confirmRevoke(tokenId: number) {
     revoke.mutate(tokenId, { onSettled: () => setPendingRevoke(null) })
@@ -86,23 +72,19 @@ function MyTokens() {
         />
       )}
 
-      <form
-        onSubmit={issue}
-        className="flex items-end gap-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-      >
-        <Field className="flex-1">
-          <Label>Token name</Label>
-          <Input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. my-laptop"
-          />
-        </Field>
-        <Button type="submit" disabled={create.isPending || !name.trim()}>
-          {create.isPending ? 'Creating…' : 'Create token'}
-        </Button>
-      </form>
+      <TokenCreateForm
+        repositories={repos.data ?? []}
+        submitting={create.isPending}
+        placeholder="e.g. my-laptop"
+        onSubmit={(body, reset) =>
+          create.mutate(body, {
+            onSuccess: (token) => {
+              setCreated(token)
+              reset()
+            },
+          })
+        }
+      />
 
       {create.isError && (
         <InlineError>{create.error.body || create.error.message}</InlineError>
