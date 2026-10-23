@@ -1,5 +1,5 @@
 import type { TokenView } from '~/api/tokens'
-import { Badge } from '~/components/catalyst/badge'
+import { StatusBadge } from '~/components/ui'
 
 /**
  * Status and scope cells shared by the self-service and the admin token
@@ -24,11 +24,11 @@ export function tokenStatus(token: TokenView, now = Date.now()): TokenStatus {
 export function TokenStatusBadge({ token }: { token: TokenView }) {
   switch (tokenStatus(token)) {
     case 'revoked':
-      return <Badge color="zinc">revoked</Badge>
+      return <StatusBadge tone="neutral">revoked</StatusBadge>
     case 'expired':
-      return <Badge color="amber">expired</Badge>
+      return <StatusBadge tone="warn">expired</StatusBadge>
     default:
-      return <Badge color="emerald">active</Badge>
+      return <StatusBadge tone="ok">active</StatusBadge>
   }
 }
 
@@ -68,9 +68,12 @@ export function TokenScopeBadges({ scope }: { scope: TokenView['scope'] }) {
   const parsed = parseTokenScope(scope)
   if (parsed === 'invalid') {
     return (
-      <Badge color="red" title="The stored scope does not parse; the token is denied">
+      <StatusBadge
+        tone="danger"
+        title="The stored scope does not parse; the token is denied"
+      >
         invalid scope
-      </Badge>
+      </StatusBadge>
     )
   }
   const actions = parsed?.actions
@@ -78,7 +81,7 @@ export function TokenScopeBadges({ scope }: { scope: TokenView['scope'] }) {
   if (actions === undefined && repositories === undefined) {
     return (
       <span
-        className="text-zinc-500 dark:text-zinc-400"
+        className="fg-muted"
         title="The owner's read, write and delete access; never admin"
       >
         unscoped
@@ -87,20 +90,24 @@ export function TokenScopeBadges({ scope }: { scope: TokenView['scope'] }) {
   }
   const other = (actions ?? []).filter((a) => a !== 'admin')
   return (
-    <span className="flex flex-wrap items-center gap-1">
-      {actions?.includes('admin') && <Badge color="red">admin</Badge>}
+    <span className="fg-cell-badges">
+      {actions?.includes('admin') && (
+        <StatusBadge tone="heat" dot={false}>
+          admin
+        </StatusBadge>
+      )}
       {actions !== undefined && other.length > 0 && (
-        <Badge color="zinc">{other.join(', ')}</Badge>
+        <StatusBadge dot={false}>{other.join(', ')}</StatusBadge>
       )}
       {actions !== undefined && actions.length === 0 && (
-        <Badge color="zinc">no actions</Badge>
+        <StatusBadge dot={false}>no actions</StatusBadge>
       )}
       {repositories !== undefined && (
-        <Badge color="sky">
+        <StatusBadge icon="Repository">
           {repositories.length === 1
             ? '1 repository'
             : `${repositories.length} repositories`}
-        </Badge>
+        </StatusBadge>
       )}
     </span>
   )
