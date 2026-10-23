@@ -30,7 +30,7 @@ mod tar;
 mod upstream;
 mod yaml;
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BTreeMap;
 
 use forge_plugin_api::{
@@ -68,6 +68,31 @@ const METADATA_KEYS: &[&str] = &[
     "annotations",
     "condition",
     "tags",
+];
+
+/// The most a chart version's manifest summary takes, as JSON. Every
+/// `index.yaml` request renders every version from its summary, so this
+/// bounds what a version adds to the index: 300 versions make under 5 MB,
+/// where a Chart.yaml of 1 MiB each made 300 MB. A typical chart's summary
+/// takes a few hundred bytes to a few KiB.
+const MAX_SUMMARY: usize = 16 * 1024;
+
+/// The longest description, in bytes, that a summary over [`MAX_SUMMARY`]
+/// keeps. Helm asks for a single sentence, and `helm search` shows its first
+/// 50 characters.
+const MAX_DESCRIPTION: usize = 1024;
+
+/// The Chart.yaml keys a summary over [`MAX_SUMMARY`] gives up last: what
+/// Helm needs to list, choose and install a version, each a short string or
+/// a boolean.
+const ESSENTIAL_KEYS: &[&str] = &[
+    "apiVersion",
+    "name",
+    "version",
+    "appVersion",
+    "kubeVersion",
+    "type",
+    "deprecated",
 ];
 
 /// The Helm chart format.
@@ -209,23 +234,96 @@ impl FormatPlugin for Helm {
 
 /// The manifest summary of a chart's metadata (its Chart.yaml, or an index
 /// entry): the chart metadata an index entry carries, and the description
-/// and dependency groups Forge's web UI shows.
+/// and dependency groups Forge's web UI shows, within [`MAX_SUMMARY`].
 fn summary(metadata: &Map<String, Value>) -> String {
-    let chart = helm_metadata(metadata);
     let deps: Vec<Value> = dependencies(metadata)
         .into_iter()
         .map(|d| json!({ "id": d.id, "range": d.range }))
         .collect();
-    json!({
-        "chart": chart,
-        "description": metadata.get("description").cloned().unwrap_or(Value::Null),
-        "dependency_groups": if deps.is_empty() {
+    let mut summary = Map::new();
+    summary.insert("chart".into(), Value::Object(helm_metadata(metadata)));
+    summary.insert(
+        "description".into(),
+        metadata.get("description").cloned().unwrap_or(Value::Null),
+    );
+    summary.insert(
+        "dependency_groups".into(),
+        if deps.is_empty() {
             json!([])
         } else {
             json!([{ "target_framework": null, "dependencies": deps }])
         },
-    })
-    .to_string()
+    );
+    bounded(&mut summary)
+}
+
+/// `summary` (a manifest summary's `chart`, with its `description` and
+/// `dependency_groups` when it has them) cut down to [`MAX_SUMMARY`], and
+/// its JSON.
+///
+/// A summary within the budget stays as it is. One over it has its
+/// description cut to [`MAX_DESCRIPTION`] bytes and an ellipsis, then loses
+/// whole fields, the largest first and the [`ESSENTIAL_KEYS`] last, until it
+/// fits. So what is left of a field is all of it, never part of a list or a
+/// map, and the same summary always comes out the same.
+fn bounded(summary: &mut Map<String, Value>) -> String {
+    let text = serde_json::to_string(summary).unwrap_or_default();
+    if text.len() <= MAX_SUMMARY {
+        return text;
+    }
+    // The description, in both of its places.
+    let mut description = None;
+    if let Some(Value::Object(chart)) = summary.get_mut("chart") {
+        if let Some(Value::String(long)) = chart.get_mut("description") {
+            let end = long.floor_char_boundary(MAX_DESCRIPTION);
+            if end < long.len() {
+                long.truncate(end);
+                long.push('…');
+            }
+        }
+        description = chart.get("description").cloned();
+    }
+    if summary.contains_key("description") {
+        summary.insert("description".into(), description.unwrap_or(Value::Null));
+    }
+    // Then whole fields, the chart's and the summary's own, ordered by
+    // (essential, largest first, the summary's before the chart's, key).
+    let mut fields: Vec<(bool, Reverse<usize>, bool, String)> = Vec::new();
+    for (key, value) in summary.iter() {
+        match value {
+            Value::Object(chart) if key == "chart" => {
+                fields.extend(chart.iter().map(|(key, value)| {
+                    let essential = ESSENTIAL_KEYS.contains(&key.as_str());
+                    (essential, Reverse(field_len(key, value)), true, key.clone())
+                }));
+            }
+            _ => fields.push((false, Reverse(field_len(key, value)), false, key.clone())),
+        }
+    }
+    fields.sort();
+    let mut size = serde_json::to_string(summary).map_or(0, |text| text.len());
+    for (_, Reverse(len), in_chart, key) in fields {
+        if size <= MAX_SUMMARY {
+            break;
+        }
+        let object = if in_chart {
+            match summary.get_mut("chart") {
+                Some(Value::Object(chart)) => chart,
+                _ => continue,
+            }
+        } else {
+            &mut *summary
+        };
+        // The field, and the comma between it and its neighbour.
+        size = size.saturating_sub(len + usize::from(object.len() > 1));
+        object.remove(&key);
+    }
+    serde_json::to_string(summary).unwrap_or_default()
+}
+
+/// The length of `"key":value` in JSON.
+fn field_len(key: &str, value: &Value) -> usize {
+    Value::from(key).to_string().len() + 1 + value.to_string().len()
 }
 
 /// The [`METADATA_KEYS`] of `metadata`, each as the type Helm's
@@ -512,15 +610,7 @@ fn render_index(segments: &[&str], entries: Map<String, Value>, latest: Option<&
 /// newest version carries the chart's metadata; the others, which the
 /// search does not describe, their name, version and URL.
 fn hit_entries(repo: &Repository, hit: &SearchHit) -> Vec<Value> {
-    let chart: Map<String, Value> = hit
-        .summary
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|s| match s.get("chart") {
-            Some(Value::Object(map)) => Some(helm_metadata(map)),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let chart = stored_chart(hit.summary.as_deref());
     let mut versions: Vec<_> = hit.versions.iter().collect();
     versions.sort_by(
         |a, b| match (Version::parse(&a.version), Version::parse(&b.version)) {
@@ -568,18 +658,35 @@ fn newest_first(versions: &mut [&PackageInfo]) {
     );
 }
 
-/// One chart version as the index and the ChartMuseum API list it.
-fn entry(repo: &Repository, p: &PackageInfo) -> Value {
-    // Typed for Helm again: a summary stored before may not be.
-    let mut chart = p
-        .summary
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+/// The chart metadata of a stored manifest summary, typed for Helm again (a
+/// summary stored before may not be). A summary this plugin makes fits in
+/// [`MAX_SUMMARY`]; one over it, stored before summaries were bounded, has
+/// its chart cut down the same way ([`bounded`]).
+fn stored_chart(summary: Option<&str>) -> Map<String, Value> {
+    let Some(text) = summary else {
+        return Map::new();
+    };
+    let chart = serde_json::from_str::<Value>(text)
+        .ok()
         .and_then(|s| match s.get("chart") {
             Some(Value::Object(map)) => Some(helm_metadata(map)),
             _ => None,
         })
         .unwrap_or_default();
+    if text.len() <= MAX_SUMMARY {
+        return chart;
+    }
+    let mut summary = Map::from_iter([("chart".to_string(), Value::Object(chart))]);
+    bounded(&mut summary);
+    match summary.remove("chart") {
+        Some(Value::Object(chart)) => chart,
+        _ => Map::new(),
+    }
+}
+
+/// One chart version as the index and the ChartMuseum API list it.
+fn entry(repo: &Repository, p: &PackageInfo) -> Value {
+    let mut chart = stored_chart(p.summary.as_deref());
     chart.insert("name".into(), json!(p.original_id));
     chart.insert("version".into(), json!(p.version_original));
     chart.insert(
@@ -620,6 +727,206 @@ mod tests {
                 "keywords": ["k", "3"],
             })
         );
+    }
+
+    fn summary_of(chart_yaml: &str) -> Value {
+        let chart = chart::parse_chart_yaml(chart_yaml.as_bytes().to_vec()).unwrap();
+        let text = summary(&chart.metadata);
+        assert!(text.len() <= MAX_SUMMARY, "{} bytes", text.len());
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn package_info(summary: &str) -> PackageInfo {
+        PackageInfo {
+            original_id: "demo".into(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+            published: None,
+            sha256: None,
+            sha512: None,
+            size: None,
+            summary: Some(summary.into()),
+        }
+    }
+
+    fn hosted() -> Repository {
+        forge_plugin_api::testing::repository(RepositoryKind::Hosted, "/repository")
+    }
+
+    #[test]
+    fn a_typical_charts_summary_is_all_of_its_metadata() {
+        let summary = summary_of(
+            "apiVersion: v2\nname: web\nversion: 1.2.0\nappVersion: \"1.27\"\n\
+             kubeVersion: \">=1.25.0-0\"\ndescription: A web server\ntype: application\n\
+             keywords: [web, http]\nhome: https://example.com/web\n\
+             sources: [https://github.com/example/web]\nicon: https://example.com/web.png\n\
+             maintainers:\n  - name: Ada\n    email: ada@example.com\n\
+             dependencies:\n  - name: redis\n    version: \">=17\"\n    \
+             repository: https://charts.example.com\n    condition: redis.enabled\n\
+             annotations:\n  artifacthub.io/license: Apache-2.0\n",
+        );
+        let chart = json!({
+            "apiVersion": "v2",
+            "name": "web",
+            "version": "1.2.0",
+            "appVersion": "1.27",
+            "kubeVersion": ">=1.25.0-0",
+            "description": "A web server",
+            "type": "application",
+            "keywords": ["web", "http"],
+            "home": "https://example.com/web",
+            "sources": ["https://github.com/example/web"],
+            "icon": "https://example.com/web.png",
+            "maintainers": [{"name": "Ada", "email": "ada@example.com"}],
+            "dependencies": [{
+                "name": "redis",
+                "version": ">=17",
+                "repository": "https://charts.example.com",
+                "condition": "redis.enabled",
+            }],
+            "annotations": {"artifacthub.io/license": "Apache-2.0"},
+        });
+        assert_eq!(
+            summary,
+            json!({
+                "chart": chart,
+                "description": "A web server",
+                "dependency_groups": [{
+                    "target_framework": null,
+                    "dependencies": [{"id": "redis", "range": ">=17"}],
+                }],
+            })
+        );
+        // The index entry carries all of it (and the stored version's name
+        // and version).
+        let entry = entry(&hosted(), &package_info(&summary.to_string()));
+        for (key, value) in chart.as_object().unwrap() {
+            if key != "name" && key != "version" {
+                assert_eq!(&entry[key], value, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_huge_description_is_cut_short() {
+        // 990 kB of a three-byte character: the cut falls inside one.
+        let description = "€".repeat(330_000);
+        let summary = summary_of(&format!(
+            "apiVersion: v2\nname: demo\nversion: 1.0.0\nappVersion: \"2.0\"\n\
+             keywords: [a, b]\ndescription: {description}\n"
+        ));
+        let cut = format!("{}…", "€".repeat(MAX_DESCRIPTION / 3));
+        assert_eq!(
+            summary,
+            json!({
+                "chart": {
+                    "apiVersion": "v2",
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "appVersion": "2.0",
+                    "keywords": ["a", "b"],
+                    "description": cut,
+                },
+                "description": cut,
+                "dependency_groups": [],
+            })
+        );
+        let entry = entry(&hosted(), &package_info(&summary.to_string()));
+        assert!(entry.to_string().len() <= MAX_SUMMARY);
+        assert_eq!(entry["description"], json!(cut));
+    }
+
+    #[test]
+    fn the_largest_fields_go_first_and_the_essential_ones_last() {
+        let big = "x".repeat(20_000);
+        // Long annotations go, and nothing else.
+        let summary = summary_of(&format!(
+            "apiVersion: v2\nname: demo\nversion: 1.0.0\ndescription: A demo\n\
+             keywords: [a]\nannotations:\n  changes: {big}\n  license: MIT\n"
+        ));
+        assert_eq!(
+            summary,
+            json!({
+                "chart": {
+                    "apiVersion": "v2",
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "description": "A demo",
+                    "keywords": ["a"],
+                },
+                "description": "A demo",
+                "dependency_groups": [],
+            })
+        );
+        // A long essential field goes only after every other one.
+        let summary = summary_of(&format!(
+            "apiVersion: v2\nname: demo\nversion: 1.0.0\nappVersion: {big}\n\
+             description: A demo\nkeywords: [a]\ntype: application\n"
+        ));
+        assert_eq!(
+            summary,
+            json!({
+                "chart": {
+                    "apiVersion": "v2",
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "type": "application",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn an_oversized_stored_summary_renders_a_bounded_entry() {
+        // As stored before summaries were bounded, and not typed for Helm.
+        let big = "x".repeat(1 << 20);
+        let stored = json!({
+            "chart": {
+                "apiVersion": "v2",
+                "name": "demo",
+                "version": "1.0.0",
+                "appVersion": 2,
+                "description": big,
+                "keywords": ["a"],
+                "annotations": {"changes": big},
+            },
+            "description": big,
+            "dependency_groups": [],
+        })
+        .to_string();
+        let expected = json!({
+            "apiVersion": "v2",
+            "name": "demo",
+            "version": "1.0.0",
+            "appVersion": "2",
+            "description": format!("{}…", &big[..MAX_DESCRIPTION]),
+            "keywords": ["a"],
+        });
+        let check = |mut entry: Value| {
+            assert!(entry.to_string().len() <= MAX_SUMMARY);
+            let entry = entry.as_object_mut().unwrap();
+            for key in ["urls", "created", "digest"] {
+                entry.remove(key);
+            }
+            assert_eq!(Value::Object(entry.clone()), expected);
+        };
+        check(entry(&hosted(), &package_info(&stored)));
+        let hit = SearchHit {
+            original_id: "demo".into(),
+            latest_version: "1.0.0".into(),
+            versions: vec![forge_plugin_api::VersionInfo {
+                original_id: "demo".into(),
+                version: "1.0.0".into(),
+                version_original: "1.0.0".into(),
+                listed: true,
+            }],
+            summary: Some(stored),
+            total_downloads: None,
+        };
+        let proxy = forge_plugin_api::testing::repository(RepositoryKind::Proxy, "/repository");
+        let entries = hit_entries(&proxy, &hit);
+        check(entries.into_iter().next().unwrap());
     }
 
     #[test]
