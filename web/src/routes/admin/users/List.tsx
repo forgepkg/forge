@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
-import { ADMIN_ROLE } from '~/api/rbac'
+import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
 import {
   authSourceLabel,
   isUpn,
@@ -16,6 +16,7 @@ import {
   useUsers,
 } from '~/queries/useUsers'
 import { useRoles } from '~/queries/useRbac'
+import { AccessBadge } from '~/components/AccessBadge'
 import { Badge } from '~/components/catalyst/badge'
 import { Button } from '~/components/catalyst/button'
 import {
@@ -52,8 +53,9 @@ export const Route = createFileRoute('/_app/manage/users')({
 /**
  * Admin users screen (plan §Phase 5). Lists every user with how they sign in
  * (password, identity provider, credential forwarding: look-alike usernames
- * from different sources are different accounts), the roles they hold and
- * their active flag, offers an inline create form (`CreateUser`, then the
+ * from different sources are different accounts), their built-in access
+ * level (admin, writer or reader, from their role assignments), the other
+ * roles they hold and their active flag, offers an inline create form (`CreateUser`, then the
  * chosen roles), links each user to its roles-and-tokens screen, and deletes
  * with a confirm step. There is no edit-in-place beyond create/delete + the
  * per-user screen. A new account is named by a UPN; one created before that
@@ -104,6 +106,7 @@ function UsersList() {
             <TableRow>
               <TableHeader>Username</TableHeader>
               <TableHeader>Sign-in</TableHeader>
+              <TableHeader>Access</TableHeader>
               <TableHeader>Roles</TableHeader>
               <TableHeader>Status</TableHeader>
               <TableHeader>Actions</TableHeader>
@@ -185,6 +188,9 @@ function UserRow({
       </TableCell>
       <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
       <TableCell>
+        <AccessBadge level={accessLevel(user.roles, user.is_admin)} />
+      </TableCell>
+      <TableCell>
         <RoleBadges user={user} roleIds={roleIds} />
       </TableCell>
       <TableCell>
@@ -237,9 +243,10 @@ function UserRow({
 }
 
 /**
- * The roles a user holds, each linked to its role page. A user with the
- * legacy `is_admin` flag but without the `admin` role is still an
- * administrator (the server reads both), so that shows too.
+ * The roles a user holds besides the access level's (`admin`, `writer`),
+ * each linked to its role page. A user with the legacy `is_admin` flag but
+ * without the `admin` role is still an administrator (the server reads
+ * both), so that shows too.
  */
 function RoleBadges({
   user,
@@ -249,8 +256,11 @@ function RoleBadges({
   roleIds: ReadonlyMap<string, number>
 }) {
   const legacyAdmin = user.is_admin && !user.roles.includes(ADMIN_ROLE)
-  if (user.roles.length === 0 && !legacyAdmin) {
-    return <span className="text-zinc-500 dark:text-zinc-400">no roles</span>
+  const others = user.roles.filter(
+    (name) => name !== ADMIN_ROLE && name !== WRITER_ROLE,
+  )
+  if (others.length === 0 && !legacyAdmin) {
+    return <span className="text-zinc-500 dark:text-zinc-400">—</span>
   }
   return (
     <span className="flex flex-wrap items-center gap-1">
@@ -259,11 +269,9 @@ function RoleBadges({
           admin (flag)
         </Badge>
       )}
-      {user.roles.map((name) => {
+      {others.map((name) => {
         const id = roleIds.get(name)
-        const badge = (
-          <Badge color={name === ADMIN_ROLE ? 'red' : 'zinc'}>{name}</Badge>
-        )
+        const badge = <Badge color="zinc">{name}</Badge>
         return id == null ? (
           <span key={name}>{badge}</span>
         ) : (

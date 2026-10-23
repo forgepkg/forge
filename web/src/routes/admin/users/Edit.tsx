@@ -2,7 +2,14 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { CreatedToken, TokenView } from '~/api/tokens'
-import { ADMIN_ROLE } from '~/api/rbac'
+import {
+  ACCESS_ROLES,
+  accessLevel,
+  ADMIN_ROLE,
+  WRITER_ROLE,
+  type AccessLevel,
+} from '~/api/rbac'
+import { ApiError } from '~/lib/httpClient'
 import { authSourceLabel, type UserView } from '~/api/users'
 import { useConvertUserToLocal, useUsers } from '~/queries/useUsers'
 import {
@@ -34,6 +41,8 @@ import {
   TableHeader,
   TableRow,
 } from '~/components/catalyst/table'
+import { AccessBadge } from '~/components/AccessBadge'
+import { AccessLevelFields } from '~/components/AccessLevelFields'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
@@ -59,8 +68,9 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
 })
 
 /**
- * One user (plan §Phase 5): the roles they hold, which admins assign and
- * remove here (taking `admin` from the last active administrator is refused
+ * One user (plan §Phase 5): their built-in access level (reader, writer or
+ * admin), which admins switch here; the roles they hold, which admins assign
+ * and remove here (taking `admin` from the last active administrator is refused
  * with the server's reason); their effective access, the union of those
  * roles' grants with repository and selector names; and their tokens. Tokens
  * are listed as metadata only (the secret is never returned), issued with an
@@ -101,10 +111,103 @@ function UserPage() {
 
       {user?.captured_password_at && <KeptPassword user={user} />}
 
+      <UserAccess userId={id} />
       <UserRoles userId={id} legacyAdmin={user?.is_admin ?? false} />
       <EffectiveAccess userId={id} />
       <UserTokens userId={id} />
     </section>
+  )
+}
+
+/**
+ * The user's built-in access level: reader (no built-in role), writer (the
+ * `writer` role) or admin (the `admin` role), switched through
+ * `/admin/users/{id}/roles`. A switch assigns the new level's role first and
+ * then takes the other one, so a refused step (the last active
+ * administrator keeps `admin`: 409, with the server's reason) never leaves
+ * the user with less access than before.
+ */
+function UserAccess({ userId }: { userId: number }) {
+  const held = useUserRoles(userId)
+  const roles = useRoles()
+  const assign = useAssignRole()
+  const unassign = useUnassignRole()
+  const current = accessLevel((held.data ?? []).map((r) => r.name))
+  const [choice, setChoice] = useState<AccessLevel | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const chosen = choice ?? current
+
+  async function save() {
+    if (chosen === current) return
+    setSaving(true)
+    setError(null)
+    try {
+      if (chosen !== 'reader') {
+        const name = ACCESS_ROLES[chosen]
+        const role = (roles.data ?? []).find((r) => r.name === name)
+        if (!role) throw new Error(`The built-in role ${name} is missing.`)
+        await assign.mutateAsync({ userId, roleId: role.id })
+      }
+      for (const role of held.data ?? []) {
+        const level = role.name === ADMIN_ROLE || role.name === WRITER_ROLE
+        if (level && (chosen === 'reader' || role.name !== ACCESS_ROLES[chosen])) {
+          await unassign.mutateAsync({ userId, roleId: role.id })
+        }
+      }
+      setChoice(null)
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.body || e.message : (e as Error).message,
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <Subheading>Access</Subheading>
+        <Text className="mt-1">
+          The user&apos;s built-in role. Their other roles below add to it.
+        </Text>
+      </div>
+      {held.isError || roles.isError ? (
+        <ErrorState
+          title="Could not load the user's access"
+          message={(held.error ?? roles.error)?.message}
+          onRetry={() => {
+            void held.refetch()
+            void roles.refetch()
+          }}
+        />
+      ) : held.isLoading || roles.isLoading ? (
+        <Text>Loading access…</Text>
+      ) : (
+        <form
+          aria-label="Change access"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void save()
+          }}
+          className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+        >
+          <Text>
+            Now: <AccessBadge level={current} />
+          </Text>
+          <AccessLevelFields
+            value={chosen}
+            onChange={setChoice}
+            disabled={saving}
+          />
+          {error && <InlineError>{error}</InlineError>}
+          <Button type="submit" disabled={saving || chosen === current}>
+            {saving ? 'Saving…' : 'Change access'}
+          </Button>
+        </form>
+      )}
+    </div>
   )
 }
 

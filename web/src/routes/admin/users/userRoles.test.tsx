@@ -9,11 +9,12 @@ import { renderApp } from '~/test/renderApp'
 /**
  * Roles, effective access and token scopes on the admin user screens,
  * against the real route tree and a stateful fake of the RBAC API:
- *  - the user list shows each user's roles, not `admin` / `reader` from
- *    `is_admin`, and the create form gives a new user its roles;
- *  - the user page assigns and removes roles, shows the 409 for the last
- *    administrator, and lists the effective access with repository and
- *    selector names;
+ *  - the user list shows each user's access level (admin, writer or reader)
+ *    from their role assignments and their other roles, and the create form
+ *    gives a new user its roles;
+ *  - the user page switches the access level, assigns and removes roles,
+ *    shows the 409 for the last administrator, and lists the effective
+ *    access with repository and selector names;
  *  - tokens are created with a scope, and an admin changes a token's scope.
  */
 
@@ -26,6 +27,7 @@ describe('admin user roles', () => {
         user({ id: 1, username: 'root', is_admin: true }),
         user({ id: 2, username: 'alice' }),
         user({ id: 3, username: 'legacy', is_admin: true }),
+        user({ id: 4, username: 'publisher' }),
       ],
       repos: [repo({ id: 10, name: 'internal' }), repo({ id: 11, name: 'public' })],
       selectors: [
@@ -33,7 +35,7 @@ describe('admin user roles', () => {
       ],
     })
     api.state.roles.push({ id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false })
-    api.state.assignments.push([1, 1], [2, 7])
+    api.state.assignments.push([1, 1], [2, 7], [4, 4])
     api.state.grants.push(
       { id: 30, role_id: 7, repository_id: 10, action: 'write', selector_id: null },
       { id: 31, role_id: 7, repository_id: null, action: 'read', selector_id: 20 },
@@ -46,26 +48,89 @@ describe('admin user roles', () => {
     clearSession()
   })
 
-  it("lists each user's roles instead of admin / reader", async () => {
+  it("lists each user's access level from their roles, and their other roles", async () => {
     await renderApp('/manage/users')
 
     const row = (name: string) =>
       screen.getByRole('button', { name }).closest('tr')!
+    const cells = (name: string) => within(row(name)).getAllByRole('cell')
     await screen.findByRole('button', { name: 'alice' })
+    expect(screen.getByRole('columnheader', { name: 'Access' })).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'Roles' })).toBeInTheDocument()
-    expect(screen.queryByText('reader')).toBeNull()
 
-    // A user who may push holds a role, not "reader".
-    const alice = within(row('alice')).getAllByRole('cell')[2]
+    await waitFor(() => expect(cells('publisher')[2]).toHaveTextContent('writer'))
+    expect(cells('root')[2]).toHaveTextContent('admin')
+    expect(cells('alice')[2]).toHaveTextContent('reader')
+    // The legacy flag without the role still makes an administrator.
+    expect(cells('legacy')[2]).toHaveTextContent('admin')
+    expect(within(row('legacy')).getByText('admin (flag)')).toBeInTheDocument()
+
+    // A custom role is listed with a link to it; the access level's role is
+    // not listed twice.
     await waitFor(() =>
-      expect(within(alice).getByRole('link', { name: 'ci-pushers' })).toHaveAttribute(
+      expect(within(cells('alice')[3]).getByRole('link', { name: 'ci-pushers' })).toHaveAttribute(
         'href',
         '/manage/roles/7',
       ),
     )
-    expect(within(row('root')).getByText('admin')).toBeInTheDocument()
-    // The legacy flag without the role still makes an administrator.
-    expect(within(row('legacy')).getByText('admin (flag)')).toBeInTheDocument()
+    expect(cells('root')[3]).toHaveTextContent('—')
+    expect(cells('publisher')[3]).toHaveTextContent('—')
+  })
+
+  it('switches a user between reader, writer and admin', async () => {
+    const u = userEvent.setup()
+    await renderApp('/manage/users/2')
+
+    const form = await screen.findByRole('form', { name: 'Change access' })
+    expect(within(form).getByRole('radio', { name: /^Reader/ })).toBeChecked()
+    expect(within(form).getByRole('button', { name: 'Change access' })).toBeDisabled()
+
+    await u.click(within(form).getByRole('radio', { name: /^Writer/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+    await waitFor(() =>
+      expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[0]?.body).toEqual({ role_id: 4 }),
+    )
+    await waitFor(() =>
+      expect(within(form).getByRole('radio', { name: /^Writer/ })).toBeChecked(),
+    )
+
+    // Writer → admin: the admin role first, then writer goes.
+    await u.click(within(form).getByRole('radio', { name: /^Admin/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+    await waitFor(() =>
+      expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/4$/)).toHaveLength(1),
+    )
+    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[1]?.body).toEqual({ role_id: 1 })
+    expect(api.state.assignments).toContainEqual([2, 1])
+    expect(api.state.assignments).not.toContainEqual([2, 4])
+    // The custom role stays.
+    expect(api.state.assignments).toContainEqual([2, 7])
+
+    // Back to reader takes the admin role.
+    await u.click(within(form).getByRole('radio', { name: /^Reader/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+    await waitFor(() =>
+      expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/1$/)).toHaveLength(1),
+    )
+    expect(api.state.assignments).toContainEqual([2, 7])
+  })
+
+  it('keeps the last administrator an admin, with the server’s reason', async () => {
+    const u = userEvent.setup()
+    await renderApp('/manage/users/1')
+
+    const form = await screen.findByRole('form', { name: 'Change access' })
+    await waitFor(() =>
+      expect(within(form).getByRole('radio', { name: /^Admin/ })).toBeChecked(),
+    )
+    await u.click(within(form).getByRole('radio', { name: /^Writer/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+
+    expect(await within(form).findByRole('alert')).toHaveTextContent(
+      'this would leave no active administrator',
+    )
+    // The writer role was given first, so the user lost nothing.
+    expect(api.state.assignments).toContainEqual([1, 1])
   })
 
   it('gives a new user the chosen roles', async () => {

@@ -864,6 +864,118 @@ async fn redeploy_needs_delete_as_well_as_write() {
     assert!(push().await.is_success(), "write + delete may redeploy");
 }
 
+/// #318: the built-in `writer` role reads and publishes on every repository,
+/// one created after the role was assigned too, and a package id the
+/// repository does not have yet. It unlists nothing (no `delete`) and
+/// administers nothing: every `/admin/*` route but `/admin/me` is closed. A
+/// token the writer mints for itself is limited the same way.
+#[tokio::test]
+async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothing() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let (user_id, username, password) = make_user(&srv).await;
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "writer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let repo = make_repo(&srv).await;
+
+    // The writer mints its own token from a browser session.
+    let session = srv.login(&username, &password).await;
+    let created: Value = session
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = created["token"].as_str().expect("token").to_string();
+
+    let id = format!("Writer.Pkg{}", common::unique());
+    assert_eq!(
+        publish_with_token(&srv, &repo, &token, &id, "1.0.0").await,
+        201,
+        "a new package id"
+    );
+    assert_eq!(
+        publish_with_token(&srv, &repo, &token, &id, "1.1.0").await,
+        201,
+        "a new version of it"
+    );
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{}/index.json",
+            srv.base_url,
+            id.to_lowercase()
+        ))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "and reads it back");
+    let resp = client
+        .delete(format!("{}/v3/{repo}/package/{id}/1.0.0", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "unlisting needs delete");
+
+    for credentials in [token.as_str(), password.as_str()] {
+        for path in [
+            "/admin/users",
+            "/admin/repositories",
+            "/admin/roles",
+            "/admin/realms",
+        ] {
+            let resp = client
+                .get(format!("{}{path}", srv.base_url))
+                .basic_auth(&username, Some(credentials))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}");
+        }
+        let resp = client
+            .get(format!("{}/admin/me", srv.base_url))
+            .basic_auth(&username, Some(credentials))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "/admin/me answers");
+    }
+    // Nor from the browser session: no repository, user, role or realm.
+    for (path, body) in [
+        (
+            "/admin/repositories",
+            json!({"name": format!("w{}", common::unique()), "kind": "hosted"}),
+        ),
+        (
+            "/admin/users",
+            json!({"username": format!("w{}@example.com", common::unique()), "password": "pw12345678"}),
+        ),
+        (
+            "/admin/roles",
+            json!({"name": format!("w{}", common::unique())}),
+        ),
+    ] {
+        let resp = session
+            .apply(client.post(format!("{}{path}", srv.base_url)))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path}");
+    }
+}
+
 /// A read-only scoped token cannot write even though its owner can.
 #[tokio::test]
 async fn token_scope_narrows_to_read_only() {

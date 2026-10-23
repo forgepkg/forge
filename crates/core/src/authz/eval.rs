@@ -312,6 +312,18 @@ impl EffectiveSet {
         self.grants.iter().any(|g| g.covers_repo(action, repo_id))
     }
 
+    /// Whether this principal may perform `action` on **every** repository,
+    /// including ones created later and every package in them: the `admin`
+    /// role, or an unscoped grant of `action` on ANY repository (what the
+    /// built-in `writer` role holds for `write`).
+    pub fn allows_every_repo(&self, action: Action) -> bool {
+        self.is_admin
+            || self
+                .grants
+                .iter()
+                .any(|g| g.action == action && g.repo.is_none() && g.selector.is_none())
+    }
+
     /// **Package-level filter** for `action` on `repo_id`.
     ///
     /// Returns the predicate to apply when listing/serving packages from the
@@ -681,6 +693,26 @@ mod tests {
             !s.allows_repo(Action::Read, 1),
             "write ANY does not grant read"
         );
+    }
+
+    #[test]
+    fn only_an_unscoped_any_repo_grant_covers_every_repo_ever() {
+        let writer = set(
+            false,
+            &[(Action::Read, None, None), (Action::Write, None, None)],
+        );
+        assert!(writer.allows_every_repo(Action::Write));
+        assert!(writer.allows_every_repo(Action::Read));
+        assert!(!writer.allows_every_repo(Action::Delete));
+        assert!(!writer.allows_every_repo(Action::Admin));
+        assert!(set(true, &[]).allows_every_repo(Action::Write), "admin");
+        // One repository, or a package scope, is not every repository.
+        assert!(!set(false, &[(Action::Write, Some(1), None)]).allows_every_repo(Action::Write));
+        assert!(
+            !set(false, &[(Action::Write, None, Some(sel(&["acme.*"], &[])))])
+                .allows_every_repo(Action::Write)
+        );
+        assert!(!EffectiveSet::empty().allows_every_repo(Action::Write));
     }
 
     #[test]
