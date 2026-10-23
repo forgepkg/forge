@@ -41,6 +41,7 @@ pub const SUPPORTED_APIS: &[&str] = &[forge_plugin_api::API];
 /// NuGet's, is taken by that plugin: see the server's registry.)
 const RESERVED_IDS: &[&str] = &[
     "docker",
+    "raw",
     "v2",
     "v3",
     "admin",
@@ -64,6 +65,7 @@ const RESERVED_MOUNTS: &[&str] = &[
     "login",
     "manage",
     "packages",
+    "raw",
     "readyz",
     "realms",
     "repos",

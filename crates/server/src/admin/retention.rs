@@ -27,6 +27,7 @@ use chrono::Utc;
 use forge_core::retention::evaluate::{
     evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate,
 };
+use forge_core::retention::files::{validate_file_policy, FileDecision, FileRetentionPolicy};
 use forge_core::retention::images::{validate_image_policy, ImageDecisions, ImageRetentionPolicy};
 use forge_core::retention::model::{validate_policy, RetentionPolicy};
 use forge_db::model::RepoKind;
@@ -130,7 +131,16 @@ pub async fn put(
     };
 
     // Parsed with its repository's model and stored in its canonical form.
-    let normalized = if repo.is_docker() {
+    let normalized = if repo.is_raw() {
+        let policy: FileRetentionPolicy = match serde_json::from_value(body.policy) {
+            Ok(p) => p,
+            Err(e) => return unprocessable(e),
+        };
+        if let Err(e) = validate_file_policy(&policy, repo.kind()) {
+            return bad_request(format!("invalid retention policy: {e}"));
+        }
+        serde_json::to_value(&policy)
+    } else if repo.is_docker() {
         let policy: ImageRetentionPolicy = match serde_json::from_value(body.policy) {
             Ok(p) => p,
             Err(e) => return unprocessable(e),
@@ -215,6 +225,9 @@ pub struct PreviewView {
     /// Docker repositories: the tags and manifests that would be deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_decisions: Option<ImageDecisions>,
+    /// Raw repositories: the files that would be deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_decisions: Option<Vec<FileDecision>>,
     pub counts: PreviewCounts,
 }
 
@@ -242,6 +255,7 @@ pub async fn preview(
                 decisions: Vec::new(),
                 proxy_decisions: Vec::new(),
                 image_decisions: repo.is_docker().then(ImageDecisions::default),
+                file_decisions: repo.is_raw().then(Vec::new),
                 counts: PreviewCounts::default(),
             })
             .into_response()
@@ -250,6 +264,9 @@ pub async fn preview(
     };
     if repo.is_docker() {
         return preview_images(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
+    }
+    if repo.is_raw() {
+        return preview_files(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
     }
     let policy: RetentionPolicy = match serde_json::from_value(policy_json) {
         Ok(p) => p,
@@ -263,6 +280,7 @@ pub async fn preview(
             decisions: Vec::new(),
             proxy_decisions: Vec::new(),
             image_decisions: None,
+            file_decisions: None,
             counts: PreviewCounts::default(),
         })
         .into_response();
@@ -354,6 +372,7 @@ pub async fn preview(
         decisions,
         proxy_decisions,
         image_decisions: None,
+        file_decisions: None,
         counts: PreviewCounts {
             evaluated,
             unlisted,
@@ -381,6 +400,7 @@ async fn preview_images(
         decisions: Vec::new(),
         proxy_decisions: Vec::new(),
         image_decisions: Some(ImageDecisions::default()),
+        file_decisions: None,
         counts: PreviewCounts {
             evaluated,
             ..PreviewCounts::default()
@@ -405,6 +425,7 @@ async fn preview_images(
                 decisions: Vec::new(),
                 proxy_decisions: Vec::new(),
                 image_decisions: Some(decisions),
+                file_decisions: None,
                 counts: PreviewCounts {
                     evaluated: evaluated as usize,
                     unlisted: 0,
@@ -413,6 +434,48 @@ async fn preview_images(
             })
             .into_response()
         }
+        Err(e) => db_error(e),
+    }
+}
+
+async fn preview_files(
+    state: &AppState,
+    repo: &forge_db::model::Repository,
+    policy_json: JsonValue,
+    at: Option<chrono::DateTime<Utc>>,
+) -> Response {
+    let policy: FileRetentionPolicy = match serde_json::from_value(policy_json) {
+        Ok(p) => p,
+        Err(e) => return bad_request(format!("stored policy is unparseable: {e}")),
+    };
+    if let Err(e) = validate_file_policy(&policy, repo.kind()) {
+        return bad_request(format!("stored policy is invalid: {e}"));
+    }
+    let view = |decisions: Vec<FileDecision>, evaluated: usize| PreviewView {
+        decisions: Vec::new(),
+        proxy_decisions: Vec::new(),
+        image_decisions: None,
+        counts: PreviewCounts {
+            evaluated,
+            unlisted: 0,
+            deleted: decisions.len(),
+        },
+        file_decisions: Some(decisions),
+    };
+    if !policy.enabled {
+        return Json(view(Vec::new(), 0)).into_response();
+    }
+    let now = match at {
+        Some(at) => at,
+        None => match forge_db::db_now(&state.pool).await {
+            Ok(now) => now,
+            Err(e) => return db_error(e),
+        },
+    };
+    match forge_core::retention::files::evaluate_repository(&state.pool, repo.id, now, &policy)
+        .await
+    {
+        Ok((decisions, evaluated)) => Json(view(decisions, evaluated as usize)).into_response(),
         Err(e) => db_error(e),
     }
 }

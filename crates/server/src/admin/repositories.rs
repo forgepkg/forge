@@ -21,12 +21,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
-    RepoKind, Repository, DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
-    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
+    DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
+    DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
+    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RAW_FORMAT, RESERVED_PREFIXES_KEY,
     WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
-use forge_db::{component_dao, oci_dao};
+use forge_db::{component_dao, oci_dao, raw_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -69,6 +70,13 @@ pub struct RepoView {
     /// Hosted: the largest push it accepts (for docker, the largest blob),
     /// `None` for the default of its format (`GET /admin/formats`).
     pub max_upload_bytes: Option<u64>,
+    /// Hosted raw: `allow_redeploy` | `disable_redeploy` | `read_only`.
+    pub deployment_policy: Option<&'static str>,
+    /// Raw: `attachment` (files download) | `inline` (files display).
+    pub content_disposition: Option<&'static str>,
+    /// Raw proxy: seconds a cached file is served before the upstream is
+    /// asked whether it changed (`0`: never).
+    pub max_age_seconds: Option<u64>,
 }
 
 impl RepoView {
@@ -99,6 +107,17 @@ impl RepoView {
                 .writable_member_id()
                 .and_then(|id| names.get(&id).cloned()),
             max_upload_bytes: r.max_upload_bytes(),
+            deployment_policy: (r.is_raw() && r.kind() == RepoKind::Hosted)
+                .then(|| r.deployment_policy().as_str()),
+            content_disposition: r.is_raw().then(|| {
+                if r.inline_content() {
+                    "inline"
+                } else {
+                    "attachment"
+                }
+            }),
+            max_age_seconds: (r.is_raw() && r.kind() == RepoKind::Proxy)
+                .then(|| r.max_age_seconds()),
         }
     }
 }
@@ -166,6 +185,17 @@ pub struct CreateRepo {
     /// largest blob). Absent: the default of its format.
     #[serde(default)]
     pub max_upload_bytes: Option<u64>,
+    /// Hosted raw only: `allow_redeploy`, `disable_redeploy` (default) or
+    /// `read_only`.
+    #[serde(default)]
+    pub deployment_policy: Option<String>,
+    /// Raw only: `attachment` (default) or `inline`.
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    /// Raw proxy only: seconds before a cached file is re-validated (`0`:
+    /// never). Absent: a day.
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -197,6 +227,9 @@ pub struct CreateRepo {
 ///   `null` clears) and are refused on NuGet repositories.
 /// * `max_upload_bytes` (hosted only): `null` clears it, back to the default
 ///   of the repository's format.
+/// * Raw options (`deployment_policy`, `content_disposition`,
+///   `max_age_seconds`) are refused on other formats; `max_age_seconds:
+///   null` goes back to the default.
 /// * Unknown fields are rejected (a misspelled field would otherwise keep the
 ///   stored value).
 #[derive(Debug, Deserialize)]
@@ -233,6 +266,13 @@ pub struct UpdateRepo {
     /// Hosted only; `null` clears it (the format's default applies).
     #[serde(default, deserialize_with = "double_option")]
     pub max_upload_bytes: Option<Option<u64>>,
+    /// Hosted raw only.
+    pub deployment_policy: Option<String>,
+    /// Raw only.
+    pub content_disposition: Option<String>,
+    /// Raw proxy only; `null` clears it (a day).
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_age_seconds: Option<Option<u64>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -555,6 +595,30 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
     }
+    let raw = body.format == RAW_FORMAT;
+    if raw {
+        if let Err(resp) = refuse_for_raw(
+            Some(body.package_delay_seconds),
+            Some(body.allow_redeploy),
+            Some(body.metadata_ttl_seconds),
+            body.prefer_hosted.is_some() || body.reserved_prefixes.is_some(),
+        ) {
+            return resp;
+        }
+    }
+    let docker_config = match raw_options(
+        raw,
+        parsed_kind,
+        RawOptions {
+            deployment_policy: body.deployment_policy.clone(),
+            content_disposition: body.content_disposition.clone(),
+            max_age_seconds: body.max_age_seconds.map(Some),
+        },
+        docker_config,
+    ) {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
 
     // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
     if parsed_kind == RepoKind::Proxy {
@@ -563,6 +627,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         };
         if let Err(resp) = validate_remote_url(url) {
             return resp;
+        }
+        if raw {
+            if let Err(resp) = validate_raw_remote_url(url) {
+                return resp;
+            }
         }
     } else if body.remote_url.is_some() {
         return bad_request("remote_url is only valid for proxy repositories");
@@ -764,6 +833,129 @@ async fn docker_options(
     Ok(config)
 }
 
+/// The raw options of a create or update request (`None`: not sent; for
+/// `max_age_seconds`, `Some(None)`: cleared).
+struct RawOptions {
+    deployment_policy: Option<String>,
+    content_disposition: Option<String>,
+    max_age_seconds: Option<Option<u64>>,
+}
+
+impl RawOptions {
+    fn any(&self) -> bool {
+        self.deployment_policy.is_some()
+            || self.content_disposition.is_some()
+            || self.max_age_seconds.is_some()
+    }
+}
+
+/// Longest accepted `max_age_seconds`: ten years.
+const MAX_RAW_MAX_AGE_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
+
+/// Validate the raw options against the repository's format and kind and
+/// merge them into `config` (the config object to store).
+#[allow(clippy::result_large_err)]
+fn raw_options(
+    raw: bool,
+    kind: RepoKind,
+    options: RawOptions,
+    mut config: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    if !raw {
+        if options.any() {
+            return Err(bad_request(
+                "deployment_policy, content_disposition and max_age_seconds are only valid for raw repositories",
+            ));
+        }
+        return Ok(config);
+    }
+    if let Some(policy) = options.deployment_policy {
+        if kind != RepoKind::Hosted {
+            return Err(bad_request(
+                "deployment_policy is only valid for hosted repositories",
+            ));
+        }
+        let Some(policy) = DeploymentPolicy::parse(&policy) else {
+            return Err(bad_request(
+                "deployment_policy must be allow_redeploy, disable_redeploy or read_only",
+            ));
+        };
+        config.insert(DEPLOYMENT_POLICY_KEY.into(), json!(policy.as_str()));
+    }
+    if let Some(disposition) = options.content_disposition {
+        if !matches!(disposition.as_str(), "attachment" | "inline") {
+            return Err(bad_request(
+                "content_disposition must be attachment or inline",
+            ));
+        }
+        config.insert(CONTENT_DISPOSITION_KEY.into(), json!(disposition));
+    }
+    if let Some(max_age) = options.max_age_seconds {
+        if kind != RepoKind::Proxy {
+            return Err(bad_request(
+                "max_age_seconds is only valid for proxy repositories",
+            ));
+        }
+        match max_age {
+            Some(seconds) if seconds > MAX_RAW_MAX_AGE_SECONDS => {
+                return Err(bad_request(format!(
+                    "max_age_seconds must be at most {MAX_RAW_MAX_AGE_SECONDS} (0: never re-validate)"
+                )));
+            }
+            Some(seconds) => {
+                config.insert(MAX_AGE_SECONDS_KEY.into(), json!(seconds));
+            }
+            None => {
+                config.remove(MAX_AGE_SECONDS_KEY);
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// The options of other formats a raw repository refuses.
+#[allow(clippy::result_large_err)]
+fn refuse_for_raw(
+    package_delay_seconds: Option<i32>,
+    allow_redeploy: Option<bool>,
+    metadata_ttl_seconds: Option<Option<i32>>,
+    group_guard: bool,
+) -> Result<(), Response> {
+    if package_delay_seconds.is_some_and(|d| d != 0) {
+        return Err(bad_request(
+            "package_delay_seconds is not supported for raw repositories",
+        ));
+    }
+    if allow_redeploy == Some(true) {
+        return Err(bad_request(
+            "allow_redeploy is a NuGet option; raw repositories have deployment_policy",
+        ));
+    }
+    if matches!(metadata_ttl_seconds, Some(Some(_))) {
+        return Err(bad_request(
+            "metadata_ttl_seconds is not used by raw proxies; set max_age_seconds",
+        ));
+    }
+    if group_guard {
+        return Err(bad_request(
+            "a raw group serves a path from its first member that has it; prefer_hosted and reserved_prefixes do not apply",
+        ));
+    }
+    Ok(())
+}
+
+/// A raw proxy's `remote_url` is the base its paths are appended to: no
+/// query or fragment.
+#[allow(clippy::result_large_err)]
+fn validate_raw_remote_url(url: &str) -> Result<(), Response> {
+    match url::Url::parse(url) {
+        Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => Err(bad_request(
+            "a raw proxy's remote_url is the base URL files are under: no query or fragment",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Seal `password` under the active DEK and store it on `repo_id`
 /// (`secret_dao::set_upstream_password`); map failures to a 500 response. The
 /// error string carries no key material or plaintext by construction.
@@ -824,7 +1016,22 @@ pub async fn update(
                 if let Err(resp) = validate_remote_url(url) {
                     return resp;
                 }
+                if existing.is_raw() {
+                    if let Err(resp) = validate_raw_remote_url(url) {
+                        return resp;
+                    }
+                }
             }
+        }
+    }
+    if existing.is_raw() {
+        if let Err(resp) = refuse_for_raw(
+            body.package_delay_seconds,
+            body.allow_redeploy,
+            body.metadata_ttl_seconds,
+            body.prefer_hosted.is_some() || body.reserved_prefixes.is_some(),
+        ) {
+            return resp;
         }
     }
 
@@ -839,7 +1046,7 @@ pub async fn update(
         );
     }
     let stored_config = existing.config.as_object().cloned().unwrap_or_default();
-    let mut config = match docker_options(
+    let config = match docker_options(
         &state,
         docker,
         existing.kind(),
@@ -854,6 +1061,19 @@ pub async fn update(
     )
     .await
     {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
+    let mut config = match raw_options(
+        existing.is_raw(),
+        existing.kind(),
+        RawOptions {
+            deployment_policy: body.deployment_policy.clone(),
+            content_disposition: body.content_disposition.clone(),
+            max_age_seconds: body.max_age_seconds,
+        },
+        config,
+    ) {
         Ok(config) => serde_json::Value::Object(config),
         Err(resp) => return resp,
     };
@@ -1005,6 +1225,18 @@ pub async fn update(
                 return db_error(e);
             }
         }
+        // A raw proxy's files are the previous upstream's: likewise.
+        if existing.is_raw() {
+            match repository_dao::lock_repository(&mut *tx, updated.id).await {
+                Ok(_) => {}
+                Err(e) => return db_error(e),
+            }
+            if let Err(e) =
+                raw_dao::purge_repository(&mut tx, updated.id, state.config.outbox.grace()).await
+            {
+                return db_error(e);
+            }
+        }
     }
 
     // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
@@ -1115,6 +1347,11 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
             "repository still has images; delete their manifests first",
         )
             .into_response(),
+        Ok(RepoDelete::HasPackages) if existing.is_raw() => (
+            StatusCode::CONFLICT,
+            "repository still has files; delete them first (DELETE /admin/repositories/<name>/files?path=)",
+        )
+            .into_response(),
         Ok(RepoDelete::HasPackages) => (
             StatusCode::CONFLICT,
             "repository still has packages; hard-delete them first",
@@ -1197,6 +1434,7 @@ async fn delete_repository_once(
         // admin action.
         if component_dao::repository_has_components(&mut *tx, repo_id).await?
             || oci_dao::repository_has_images(&mut *tx, repo_id).await?
+            || raw_dao::repository_has_files(&mut *tx, repo_id).await?
         {
             return Ok(RepoDelete::HasPackages);
         }
@@ -1207,8 +1445,10 @@ async fn delete_repository_once(
         component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
     // Image rows (a proxy's cache; a hosted repository's leftover blobs and
-    // upload sessions) release their blob references before the cascade.
+    // upload sessions) and a raw proxy's files release their blob references
+    // before the cascade.
     oci_dao::purge_repository(&mut tx, repo_id, grace).await?;
+    raw_dao::purge_repository(&mut tx, repo_id, grace).await?;
 
     let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;
@@ -1242,6 +1482,13 @@ pub async fn hard_delete_package(
         return (
             StatusCode::BAD_REQUEST,
             "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",
+        )
+            .into_response();
+    }
+    if repo.is_raw() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "delete files through DELETE /admin/repositories/<name>/files?path=<path>",
         )
             .into_response();
     }

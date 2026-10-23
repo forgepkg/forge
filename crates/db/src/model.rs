@@ -282,6 +282,95 @@ impl Repository {
     }
 }
 
+/// `repository.format` of raw (generic file) repositories.
+pub const RAW_FORMAT: &str = "raw";
+
+/// `repository.config` key of [`Repository::deployment_policy`].
+pub const DEPLOYMENT_POLICY_KEY: &str = "deployment_policy";
+
+/// `repository.config` key of [`Repository::inline_content`].
+pub const CONTENT_DISPOSITION_KEY: &str = "content_disposition";
+
+/// `repository.config` key of [`Repository::max_age_seconds`].
+pub const MAX_AGE_SECONDS_KEY: &str = "max_age_seconds";
+
+/// How long a raw proxy serves a cached file before it asks its upstream
+/// whether the file changed, when the repository sets no `max_age_seconds`:
+/// a day.
+pub const DEFAULT_RAW_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+
+/// What a hosted raw repository does with an upload to a path it has
+/// (`config.deployment_policy`), as Nexus' deployment policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeploymentPolicy {
+    /// Replace the file.
+    AllowRedeploy,
+    /// Refuse it (the same content again is accepted, as a no-op).
+    #[default]
+    DisableRedeploy,
+    /// Refuse every upload and delete.
+    ReadOnly,
+}
+
+impl DeploymentPolicy {
+    /// The stored and API spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeploymentPolicy::AllowRedeploy => "allow_redeploy",
+            DeploymentPolicy::DisableRedeploy => "disable_redeploy",
+            DeploymentPolicy::ReadOnly => "read_only",
+        }
+    }
+
+    /// Parse the stored and API spelling.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow_redeploy" => Some(DeploymentPolicy::AllowRedeploy),
+            "disable_redeploy" => Some(DeploymentPolicy::DisableRedeploy),
+            "read_only" => Some(DeploymentPolicy::ReadOnly),
+            _ => None,
+        }
+    }
+}
+
+impl Repository {
+    /// Whether this is a raw (generic file) repository.
+    pub fn is_raw(&self) -> bool {
+        self.format == RAW_FORMAT
+    }
+
+    /// Hosted raw option (`config.deployment_policy`, default
+    /// [`DeploymentPolicy::DisableRedeploy`]).
+    pub fn deployment_policy(&self) -> DeploymentPolicy {
+        self.config
+            .get(DEPLOYMENT_POLICY_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(DeploymentPolicy::parse)
+            .unwrap_or_default()
+    }
+
+    /// Raw option (`config.content_disposition = "inline"`, default
+    /// `"attachment"`): files are served for display in the browser rather
+    /// than as downloads.
+    pub fn inline_content(&self) -> bool {
+        self.config
+            .get(CONTENT_DISPOSITION_KEY)
+            .and_then(|v| v.as_str())
+            == Some("inline")
+    }
+
+    /// Raw proxy option (`config.max_age_seconds`): how long a cached file
+    /// is served before the upstream is asked whether it changed; `0` never
+    /// asks (the upstream's files are immutable). Default
+    /// [`DEFAULT_RAW_MAX_AGE_SECONDS`].
+    pub fn max_age_seconds(&self) -> u64 {
+        self.config
+            .get(MAX_AGE_SECONDS_KEY)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_RAW_MAX_AGE_SECONDS)
+    }
+}
+
 /// `repository.config` key of [`Repository::prefer_hosted`].
 pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
 

@@ -94,9 +94,10 @@ pub struct BrowseRepo {
     /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
     /// browsed through `/browse/images`.
     pub format: String,
-    /// The address clients use for the repository (`{public_base_url}{mount}/{name}`),
-    /// for the UI's client snippets. Absent for docker repositories, whose
-    /// registry `/browse/images` names, and for a format not installed here.
+    /// The address clients use for the repository (`{public_base_url}{mount}/{name}`,
+    /// for raw `{public_base_url}/raw/{name}`), for the UI's client
+    /// snippets. Absent for docker repositories, whose registry
+    /// `/browse/images` names, and for a format not installed here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -142,9 +143,17 @@ pub async fn list_repos(
                 kind: repo.kind.clone(),
                 online: repo.online,
                 format: repo.format.clone(),
-                url: state.formats.plugin(&repo.format).map(|plugin| {
-                    crate::plugins::repository_url(&state, &plugin.manifest().mount, &repo.name)
-                }),
+                url: if repo.is_raw() {
+                    Some(crate::plugins::repository_url(
+                        &state,
+                        crate::raw::MOUNT,
+                        &repo.name,
+                    ))
+                } else {
+                    state.formats.plugin(&repo.format).map(|plugin| {
+                        crate::plugins::repository_url(&state, &plugin.manifest().mount, &repo.name)
+                    })
+                },
             });
         }
     }
@@ -242,8 +251,9 @@ pub async fn search_packages(
                 continue;
             }
         }
-        // Package search covers NuGet; images are listed by /browse/images.
-        if repo.is_docker() {
+        // Package search covers the package formats; images are listed by
+        // /browse/images, raw files by their repository's listings.
+        if repo.is_docker() || repo.is_raw() {
             continue;
         }
         if state.authz.can_read(&principal, repo).await {
@@ -404,8 +414,9 @@ pub async fn package_detail(
     }
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        // A docker repository holds images (`/browse/images`), not packages.
-        Ok(Some(r)) if !r.is_docker() => r,
+        // A docker repository holds images (`/browse/images`) and a raw one
+        // files (its listings), not packages.
+        Ok(Some(r)) if !r.is_docker() && !r.is_raw() => r,
         // An unknown name answers like an unreadable repository (no name
         // enumeration), except to a global admin.
         Ok(_) if state.authz.is_global_admin(&principal).await => {
@@ -644,5 +655,10 @@ pub fn browse_router() -> Router<AppState> {
         .route(
             "/browse/images/{repo}/{*image}",
             get(crate::browse_images::image_detail),
+        )
+        .route(
+            "/browse/raw/{repo}/files",
+            axum::routing::post(crate::raw::web::browse_upload)
+                .delete(crate::raw::web::browse_delete),
         )
 }

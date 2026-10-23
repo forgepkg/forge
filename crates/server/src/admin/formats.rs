@@ -1,10 +1,10 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the built-in format plugins (NuGet, Helm), Docker, and
-//! every loaded WebAssembly plugin.
+//! repositories of: the built-in format plugins (NuGet, Helm), Docker, raw
+//! files, and every loaded WebAssembly plugin.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
-use forge_db::model::DOCKER_FORMAT;
+use forge_db::model::{DOCKER_FORMAT, RAW_FORMAT};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -16,8 +16,8 @@ pub struct FormatView {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Whether the format is built into the server (Docker and the built-in
-    /// plugins) rather than loaded as a WebAssembly plugin.
+    /// Whether the format is built into the server (Docker, raw and the
+    /// built-in plugins) rather than loaded as a WebAssembly plugin.
     pub builtin: bool,
     /// The repository kinds it supports.
     pub kinds: Vec<&'static str>,
@@ -41,8 +41,8 @@ pub struct FormatView {
     pub max_upload_bytes_limit: Option<u64>,
 }
 
-/// `GET /admin/formats`: NuGet first, then Docker, then the other formats
-/// by id.
+/// `GET /admin/formats`: NuGet first, then Docker and raw, then the other
+/// formats by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
@@ -75,6 +75,18 @@ pub async fn list(State(state): State<AppState>) -> Response {
         description: None,
         sha256: None,
         default_max_upload_bytes: state.config.default_upload_limit(DOCKER_FORMAT),
+        max_upload_bytes_limit: ceiling,
+    });
+    formats.push(FormatView {
+        id: RAW_FORMAT.to_string(),
+        name: "Raw files".into(),
+        builtin: true,
+        kinds: kinds(RAW_FORMAT),
+        mount: crate::raw::MOUNT.into(),
+        version: None,
+        description: Some("Arbitrary files under arbitrary paths".into()),
+        sha256: None,
+        default_max_upload_bytes: state.config.default_upload_limit(RAW_FORMAT),
         max_upload_bytes_limit: ceiling,
     });
     formats.extend(others.into_iter().map(|p| view(p)));
