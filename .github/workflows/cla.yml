@@ -1,0 +1,55 @@
+name: CLA
+
+# Contributor License Agreement check (CLA Assistant Lite; see CLA.md and
+# CONTRIBUTING.md). Every commit author on a pull request must have signed
+# CLA.md once by commenting the sign-off sentence. Signatures are committed
+# to signatures/version1/cla.json on the `cla-signatures` branch, which must
+# stay unprotected.
+#
+# `pull_request_target` runs this workflow as defined on the base branch,
+# with a write token, also for pull requests from forks. That is only safe
+# because nothing here checks out or runs code from the pull request: keep
+# it that way.
+on:
+  pull_request_target:
+    types: [opened, synchronize, closed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  cla:
+    name: cla
+    runs-on: ubuntu-latest
+    # Pull requests opened by members of the forgepkg organization (including
+    # the commits Claude Code authors for them) or by Dependabot need no
+    # signature. On anyone else's pull request a commit authored by `claude`
+    # blocks the check: AI-agent commits must be re-authored by the
+    # contributor (CONTRIBUTING.md). A member whose own commits land in such
+    # a pull request signs once, like everyone else. Comments only trigger a
+    # run when they sign or ask for a recheck.
+    if: >-
+      !contains(fromJSON('["OWNER", "MEMBER"]'),
+                github.event.pull_request.author_association || github.event.issue.author_association) &&
+      (github.event.pull_request.user.login || github.event.issue.user.login) != 'dependabot[bot]' &&
+      (github.event_name == 'pull_request_target' ||
+       (github.event.issue.pull_request &&
+        (github.event.comment.body == 'recheck' ||
+         contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA'))))
+    permissions:
+      actions: write # re-run the failed check once everyone has signed
+      contents: write # commit signatures to the cla-signatures branch
+      pull-requests: write # comment on the pull request, lock it after merge
+    steps:
+      # The upstream repository is archived; v2.6.1 is its final release.
+      # Pinned to the full commit SHA like every other third-party action.
+      - uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-document: https://github.com/forgepkg/forge/blob/main/CLA.md
+          # Bump the directory (version2, ...) when CLA.md changes materially,
+          # so everyone signs the new text.
+          path-to-signatures: signatures/version1/cla.json
+          branch: cla-signatures

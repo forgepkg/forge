@@ -33,11 +33,13 @@ import { Route as adminRepositoriesEditRouteImport } from './routes/admin/reposi
 import { Route as adminRepositoriesCreateRouteImport } from './routes/admin/repositories/Create'
 import { Route as adminRolesEditRouteImport } from './routes/admin/roles/Edit'
 import { Route as adminSettingsEmailRouteImport } from './routes/admin/settings/Email'
+import { Route as adminSettingsRetentionSettingsRouteImport } from './routes/admin/settings/RetentionSettings'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
 import { Route as adminUsersCreateRouteImport } from './routes/admin/users/Create'
 import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
 import { Route as adminRepositoriesImportRouteImport } from './routes/admin/repositories/Import'
 import { Route as adminRepositoriesGroupMembersRouteImport } from './routes/admin/repositories/GroupMembers'
+import { Route as adminRepositoriesRetentionRouteImport } from './routes/admin/repositories/Retention'
 
 const AppLayoutRoute = AppLayoutRouteImport.update({
   id: '/_app',
@@ -158,6 +160,12 @@ const adminSettingsEmailRoute = adminSettingsEmailRouteImport.update({
   path: '/settings/email',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminSettingsRetentionSettingsRoute =
+  adminSettingsRetentionSettingsRouteImport.update({
+    id: '/settings/retention',
+    path: '/settings/retention',
+    getParentRoute: () => AdminLayoutRoute,
+  } as any)
 const adminUsersEditRoute = adminUsersEditRouteImport.update({
   id: '/users/$userId',
   path: '/users/$userId',
@@ -182,6 +190,12 @@ const adminRepositoriesGroupMembersRoute =
   adminRepositoriesGroupMembersRouteImport.update({
     id: '/repositories/$repo/members',
     path: '/repositories/$repo/members',
+    getParentRoute: () => AdminLayoutRoute,
+  } as any)
+const adminRepositoriesRetentionRoute =
+  adminRepositoriesRetentionRouteImport.update({
+    id: '/repositories/$repo/retention',
+    path: '/repositories/$repo/retention',
     getParentRoute: () => AdminLayoutRoute,
   } as any)
 
@@ -209,11 +223,13 @@ export interface FileRoutesByFullPath {
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
+  '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
+  '/manage/repositories/$repo/retention': typeof adminRepositoriesRetentionRoute
 }
 export interface FileRoutesByTo {
   '/invite': typeof InviteRoute
@@ -238,11 +254,13 @@ export interface FileRoutesByTo {
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
+  '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
+  '/manage/repositories/$repo/retention': typeof adminRepositoriesRetentionRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -270,11 +288,13 @@ export interface FileRoutesById {
   '/_app/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/_app/manage/roles/$roleId': typeof adminRolesEditRoute
   '/_app/manage/settings/email': typeof adminSettingsEmailRoute
+  '/_app/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
   '/_app/manage/users/new': typeof adminUsersCreateRoute
   '/_app/packages/$repo/$id': typeof PackageDetailRoute
   '/_app/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/_app/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
+  '/_app/manage/repositories/$repo/retention': typeof adminRepositoriesRetentionRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -302,11 +322,13 @@ export interface FileRouteTypes {
     | '/manage/repositories/new'
     | '/manage/roles/$roleId'
     | '/manage/settings/email'
+    | '/manage/settings/retention'
     | '/manage/users/$userId'
     | '/manage/users/new'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
     | '/manage/repositories/$repo/members'
+    | '/manage/repositories/$repo/retention'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/invite'
@@ -331,11 +353,13 @@ export interface FileRouteTypes {
     | '/manage/repositories/new'
     | '/manage/roles/$roleId'
     | '/manage/settings/email'
+    | '/manage/settings/retention'
     | '/manage/users/$userId'
     | '/manage/users/new'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
     | '/manage/repositories/$repo/members'
+    | '/manage/repositories/$repo/retention'
   id:
     | '__root__'
     | '/_app'
@@ -362,11 +386,13 @@ export interface FileRouteTypes {
     | '/_app/manage/repositories/new'
     | '/_app/manage/roles/$roleId'
     | '/_app/manage/settings/email'
+    | '/_app/manage/settings/retention'
     | '/_app/manage/users/$userId'
     | '/_app/manage/users/new'
     | '/_app/packages/$repo/$id'
     | '/_app/manage/repositories/$repo/import'
     | '/_app/manage/repositories/$repo/members'
+    | '/_app/manage/repositories/$repo/retention'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -545,6 +571,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminSettingsEmailRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/settings/retention': {
+      id: '/_app/manage/settings/retention'
+      path: '/settings/retention'
+      fullPath: '/manage/settings/retention'
+      preLoaderRoute: typeof adminSettingsRetentionSettingsRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/users/$userId': {
       id: '/_app/manage/users/$userId'
       path: '/users/$userId'
@@ -580,6 +613,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminRepositoriesGroupMembersRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/repositories/$repo/retention': {
+      id: '/_app/manage/repositories/$repo/retention'
+      path: '/repositories/$repo/retention'
+      fullPath: '/manage/repositories/$repo/retention'
+      preLoaderRoute: typeof adminRepositoriesRetentionRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
   }
 }
 
@@ -600,10 +640,12 @@ interface AdminLayoutRouteChildren {
   adminRepositoriesCreateRoute: typeof adminRepositoriesCreateRoute
   adminRolesEditRoute: typeof adminRolesEditRoute
   adminSettingsEmailRoute: typeof adminSettingsEmailRoute
+  adminSettingsRetentionSettingsRoute: typeof adminSettingsRetentionSettingsRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
   adminUsersCreateRoute: typeof adminUsersCreateRoute
   adminRepositoriesImportRoute: typeof adminRepositoriesImportRoute
   adminRepositoriesGroupMembersRoute: typeof adminRepositoriesGroupMembersRoute
+  adminRepositoriesRetentionRoute: typeof adminRepositoriesRetentionRoute
 }
 
 const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
@@ -623,10 +665,12 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminRepositoriesCreateRoute: adminRepositoriesCreateRoute,
   adminRolesEditRoute: adminRolesEditRoute,
   adminSettingsEmailRoute: adminSettingsEmailRoute,
+  adminSettingsRetentionSettingsRoute: adminSettingsRetentionSettingsRoute,
   adminUsersEditRoute: adminUsersEditRoute,
   adminUsersCreateRoute: adminUsersCreateRoute,
   adminRepositoriesImportRoute: adminRepositoriesImportRoute,
   adminRepositoriesGroupMembersRoute: adminRepositoriesGroupMembersRoute,
+  adminRepositoriesRetentionRoute: adminRepositoriesRetentionRoute,
 }
 
 const AdminLayoutRouteWithChildren = AdminLayoutRoute._addFileChildren(

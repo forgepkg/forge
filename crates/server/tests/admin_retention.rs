@@ -667,3 +667,336 @@ async fn audit_lists_persisted_rows() {
     assert_eq!(items.len(), 1, "run_id filter narrows to one row");
     assert_eq!(items[0]["version"], json!("1.0.0"));
 }
+
+/// A draft `policy` in the preview body is evaluated in place of the stored
+/// one: validated like a `PUT` of it (422 for an unknown field, 400 for an
+/// invalid rule), evaluated even while disabled, and never stored. A
+/// misspelled `policy` is refused instead of previewing the stored policy.
+#[tokio::test]
+async fn preview_evaluates_a_draft_without_storing_it() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retd{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0", "1.1.0", "2.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let preview = |body: Value| {
+        client
+            .post(format!("{url}/preview"))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let stored = || async {
+        let resp = client
+            .get(&url)
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        resp.json::<Value>().await.unwrap()
+    };
+
+    // A disabled draft, with nothing stored: evaluated all the same.
+    let mut draft = keep_one_policy();
+    draft["enabled"] = json!(false);
+    let resp = preview(json!({ "policy": draft })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["counts"]["evaluated"], json!(3));
+    assert_eq!(body["counts"]["deleted"], json!(2), "{body}");
+    let view = stored().await;
+    assert!(view["policy"].is_null(), "a draft is not stored: {view}");
+    assert!(view["last_run"].is_null(), "a draft arms nothing: {view}");
+
+    // With a policy stored, the draft is evaluated in its place.
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": keep_one_policy() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut keep_two = keep_one_policy();
+    keep_two["rules"][0]["criteria"]["keep_last_n"] = json!(2);
+    let body: Value = preview(json!({ "policy": keep_two }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["counts"]["deleted"], json!(1), "{body}");
+    assert_eq!(body["decisions"][0]["version"], json!("1.0.0"));
+    let body: Value = preview(json!({})).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        body["counts"]["deleted"],
+        json!(2),
+        "the stored policy: {body}"
+    );
+    let view = stored().await;
+    assert_eq!(
+        view["policy"]["rules"][0]["criteria"]["keep_last_n"],
+        json!(1),
+        "the stored policy is unchanged: {view}"
+    );
+
+    // Refused like a PUT of it.
+    let mut misspelled = keep_one_policy();
+    misspelled["dry_run"] = json!(true);
+    let resp = preview(json!({ "policy": misspelled })).await.unwrap();
+    assert_eq!(resp.status(), 422);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `dry_run`"), "{msg}");
+    let mut empty = keep_one_policy();
+    empty["rules"] = json!([]);
+    let resp = preview(json!({ "policy": empty })).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.starts_with("invalid retention policy"), "{msg}");
+
+    // A misspelled `policy` is not silently read as "the stored policy".
+    let resp = preview(json!({ "polciy": keep_one_policy() }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
+}
+
+/// Whether retention runs and how long its audit log is kept are settings of
+/// every instance (`/admin/settings/retention`, #429), on a database of its
+/// own since they are install-wide. Switched off, no run is claimed, a run in
+/// progress fails its fence, and Run now answers 409; switched on again, the
+/// due run is claimed.
+#[tokio::test]
+async fn retention_settings_switch_runs_off_and_on() {
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let settings_url = format!("{}/admin/settings/retention", srv.base_url);
+    let put = |body: Value| {
+        client
+            .put(&settings_url)
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let name = format!("rets{}", common::unique());
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0", "2.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": keep_one_policy() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The defaults of an install that never saved them.
+    let resp = client
+        .get(&settings_url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": true, "audit_retention_seconds": 7_776_000 })
+    );
+
+    // Refused like the other admin bodies: out of range, unknown fields.
+    let resp = put(json!({ "audit_retention_seconds": 3_153_600_001_u64 }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let resp = put(json!({ "enabled": false })).await.unwrap();
+    assert_eq!(resp.status(), 422);
+
+    // A run claimed while runs are on.
+    let mut tx = srv.pool.begin().await.unwrap();
+    let now = forge_db::db_now(&mut *tx).await.unwrap();
+    let (claimed, run_id) = retention_dao::claim_next_due_repo(
+        &mut tx,
+        now,
+        chrono::Duration::seconds(60),
+        Some(repo_id),
+    )
+    .await
+    .unwrap()
+    .expect("a due repository is claimed while runs are on");
+    tx.commit().await.unwrap();
+    let fence = || async {
+        let mut conn = srv.pool.acquire().await.unwrap();
+        retention_dao::lock_run_fence(&mut conn, repo_id, run_id, &claimed.policy)
+            .await
+            .unwrap()
+    };
+    assert!(fence().await, "the fence holds while runs are on");
+
+    // Switched off: the fence stops the run, Run now is refused, and the
+    // repository's view says so. The other field keeps its value.
+    let resp = put(json!({ "runs_enabled": false })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": false, "audit_retention_seconds": 7_776_000 })
+    );
+    assert!(!fence().await, "a running run stops at its next batch");
+    let resp = client
+        .post(format!("{url}/run"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert!(resp.text().await.unwrap().contains("switched off"));
+    let view: Value = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["runs_enabled"], json!(false), "{view}");
+
+    // Nothing is claimed while off, even a repository that is due.
+    retention_dao::fail_run(&srv.pool, repo_id, Some(run_id), "test", now)
+        .await
+        .unwrap();
+    let mut tx = srv.pool.begin().await.unwrap();
+    let off = retention_dao::claim_next_due_repo(
+        &mut tx,
+        now + chrono::Duration::seconds(1),
+        chrono::Duration::seconds(60),
+        Some(repo_id),
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(off.is_none(), "no run is claimed while runs are off");
+
+    // Switched on again with another audit retention: Run now is accepted.
+    let resp = put(json!({ "runs_enabled": true, "audit_retention_seconds": 0 }))
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({ "runs_enabled": true, "audit_retention_seconds": 0 })
+    );
+    let resp = client
+        .post(format!("{url}/run"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let settings = retention_dao::read_settings(&srv.pool).await.unwrap();
+    assert!(settings.runs_enabled);
+    assert!(settings.audit_retention().is_none(), "0 keeps every row");
+}
+
+/// #59: a proxy rule takes `keep_last_n` and `keep_n_most_downloaded`, and the
+/// preview evicts none of the cached versions they keep.
+#[tokio::test]
+async fn proxy_rules_keep_the_newest_and_recently_pulled_cached_versions() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retk{s}");
+    let repo = repository_dao::insert_repository(&srv.pool, NewRepository::proxy(name.clone()))
+        .await
+        .unwrap();
+    // Four cold cached versions: 1.0.0 was pulled last, 4.0.0 is the newest.
+    for (version, pulled) in [("1.0.0", 40), ("2.0.0", 60), ("3.0.0", 70), ("4.0.0", 80)] {
+        forge_db::proxy_dao::upsert_cached_version(
+            &srv.pool,
+            forge_db::proxy_dao::NewProxyCachedVersion {
+                repository_id: repo.id,
+                name: "lib".into(),
+                version: version.into(),
+                listed: true,
+                downloaded: true,
+                not_found: false,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE proxy_cached_version \
+             SET first_seen_at = now() - interval '90 days', \
+                 last_downloaded_at = now() - make_interval(days => $3) \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(repo.id)
+        .bind(version)
+        .bind(pulled)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    }
+    let policy = json!({
+        "version": 1,
+        "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                    "criteria": { "not_pulled_for_days": 30,
+                                  "keep_last_n": 1, "keep_n_most_downloaded": 1 } }]
+    });
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let body: Value = client
+        .post(format!("{url}/preview"))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["counts"]["evaluated"], json!(4), "{body}");
+    let mut evicted: Vec<&str> = body["proxy_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["version"].as_str().unwrap())
+        .collect();
+    evicted.sort_unstable();
+    assert_eq!(evicted, ["2.0.0", "3.0.0"], "{body}");
+
+    // Zero protects nothing and is refused, as on hosted rules.
+    let mut zero = policy.clone();
+    zero["rules"][0]["criteria"]["keep_last_n"] = json!(0);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": zero }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}

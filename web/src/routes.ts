@@ -48,6 +48,10 @@ export const routes = rootRoute('root.tsx', [
         'admin/repositories/GroupMembers.tsx',
       ),
       route('/repositories/$repo/import', 'admin/repositories/Import.tsx'),
+      route(
+        '/repositories/$repo/retention',
+        'admin/repositories/Retention.tsx',
+      ),
       route('/users', 'admin/users/List.tsx'),
       route('/users/new', 'admin/users/Create.tsx'),
       route('/users/$userId', 'admin/users/Edit.tsx'),
@@ -61,6 +65,7 @@ export const routes = rootRoute('root.tsx', [
       route('/realms/$realmId', 'admin/realms/Edit.tsx'),
       route('/settings', 'admin/settings/Settings.tsx'),
       route('/settings/email', 'admin/settings/Email.tsx'),
+      route('/settings/retention', 'admin/settings/RetentionSettings.tsx'),
       route('/system', 'admin/system/System.tsx'),
     ]),
   ]),

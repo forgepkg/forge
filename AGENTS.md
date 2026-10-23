@@ -50,6 +50,18 @@ request: administrators run Forge from the browser, and a setting that only
 (`/manage/realms`) offers the same. When a feature ships without its screen,
 its pull request's description says why.
 
+## Formats: every format plugin lives under plugins/
+
+A package format is a crate in `plugins/<id>/`, the directory named after its
+format id, linked into the server like `plugins/nuget` (Forge loads no
+WebAssembly plugins). Never add a format as a crate under `crates/` (no
+`crates/format-<id>`) or as a module of the server: it implements
+`FormatPlugin` with the layout [plugins/README.md](plugins/README.md)
+describes. Docker / OCI (`crates/format-oci`) and raw
+(`crates/server/src/raw/`) are not there yet and are to move, to
+`plugins/docker` and `plugins/raw`, each in a pull request of its own; until
+then they are not the model for a new format.
+
 ## Changelog: a fragment per change, never CHANGELOG.md
 
 A change never edits `CHANGELOG.md`. Its entry goes in a new file,

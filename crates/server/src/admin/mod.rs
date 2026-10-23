@@ -27,7 +27,8 @@
 //! * [`email_oauth`] — registering and authorizing Forge for the email
 //!   service's SMTP with OAuth.
 //! * [`settings`] — the sign-in and anonymous-access policy (anonymous mode,
-//!   login mode, password Basic, session lifetimes, lockout).
+//!   login mode, password Basic, session lifetimes, lockout), and whether
+//!   retention runs and how long its audit log is kept.
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -303,6 +304,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/settings/auth",
             get(settings::get_auth).put(settings::put_auth),
+        )
+        .route(
+            "/settings/retention",
+            get(settings::get_retention).put(settings::put_retention),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route("/users/{id}/effective", get(effective::for_user))

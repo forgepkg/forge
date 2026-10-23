@@ -8,8 +8,8 @@
 
 # The licenses the crates may be used under, in order of preference (for a
 # crate offering a choice); cargo-about refuses a crate whose license
-# expression these do not satisfy. All are permissive and AGPL-compatible;
-# check that a new one is before adding it.
+# expression these do not satisfy. All are permissive; check that a new one
+# is before adding it.
 accepted = [
     "Apache-2.0",
     "MIT",

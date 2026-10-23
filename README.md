@@ -59,6 +59,11 @@ A Cargo workspace of small crates plus the web SPA:
 | `plugins/` | `forge-format-*` | Format plugins, built into the server: `nuget`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
+**Every format is a plugin in `plugins/`.** A package format is a crate in
+`plugins/<id>/` implementing `FormatPlugin`, linked into the server. Docker /
+OCI (`crates/format-oci`) and raw (in `forge-server`) are not there yet and
+are to move to `plugins/docker` and `plugins/raw`.
+
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
 (NuGet at `/v3`, others at `/repository`), the Docker / OCI registry (`/v2`),
 raw file repositories (`/raw`),
@@ -215,12 +220,9 @@ Run `cargo xtask help` for the complete command list.
 
 ## License
 
-Forge is dual-licensed. You may use, modify and distribute it under
-either of:
+Forge is licensed under the [MIT License](./LICENSE) (SPDX `MIT`).
 
-- the **GNU Affero General Public License, version 3** — see
-  [LICENSE](./LICENSE) (SPDX `AGPL-3.0-only`); or
-- the **envisia license**, a separate agreement with envisia for use on terms
-  other than the AGPL's.
-
-The SPDX expression for the project is `AGPL-3.0-only OR LicenseRef-envisia`.
+Contributions are accepted under the [Contributor License Agreement](./CLA.md),
+which grants the forgepkg organization the rights to distribute them under
+the MIT License or other terms. See [CONTRIBUTING.md](./CONTRIBUTING.md) for
+how to sign it.

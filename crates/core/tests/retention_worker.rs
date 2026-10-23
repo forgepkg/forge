@@ -336,7 +336,8 @@ async fn zero_run_intervals_do_not_rerun_back_to_back() {
     );
     assert_eq!(audit_total(&pool, repo.id).await, 1);
 
-    // A run that fails is rescheduled by the default interval alone.
+    // A run that fails is retried after its policy's interval, here 0, so
+    // after the floor.
     let broken =
         repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0b-{n}")))
             .await
@@ -1031,4 +1032,95 @@ async fn a_package_with_many_versions_is_applied_in_batches() {
     .await
     .unwrap();
     assert_eq!(audited, 229);
+}
+
+#[tokio::test]
+async fn a_failed_run_is_retried_after_its_policy_interval() {
+    // The worker's floor is a minute (the server sets no floor of its own,
+    // #429), but a broken policy must not be retried every minute: a failed
+    // run waits for its policy's interval, the default hour when it names
+    // none.
+    let pool = pool().await;
+    let n = unique();
+    let w = worker(
+        &pool,
+        RetentionConfig {
+            default_run_interval: Duration::seconds(MIN_RUN_INTERVAL_SECONDS),
+            ..config()
+        },
+    );
+    let broken =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rwr-{n}")))
+            .await
+            .unwrap();
+    arm(&pool, broken.id, &json!({ "version": 1, "rules": [] })).await;
+    let before = Utc::now();
+    w.tick_repo(broken.id)
+        .await
+        .expect_err("an invalid policy fails the run");
+    let run = retention_dao::get_run(&pool, broken.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        run.next_run_at >= before + Duration::seconds(3600 - 5),
+        "{:?}",
+        run.next_run_at
+    );
+}
+
+#[tokio::test]
+async fn proxy_eviction_keeps_the_newest_and_the_recently_pulled_versions() {
+    // #59: a proxy rule's protections keep a working set per package, so a
+    // quiet month no longer evicts every cached version of it.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("rwk-{n}")))
+        .await
+        .unwrap();
+    // Four cold cached versions; 1.0.0 was pulled last, 4.0.0 is the newest.
+    for (i, (version, pulled)) in [("1.0.0", 40), ("2.0.0", 60), ("3.0.0", 70), ("4.0.0", 80)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        seed_cached_version(&pool, repo.id, version, true, Some(pulled)).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                        "criteria": { "not_pulled_for_days": 30,
+                                      "keep_last_n": 1, "keep_n_most_downloaded": 1 } }]
+        }),
+    )
+    .await;
+
+    let w = worker(&pool, config());
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(summary.deleted, 2);
+    // The newest (4.0.0) and the one pulled last (1.0.0) stay cached.
+    for (version, kept) in [
+        ("1.0.0", true),
+        ("2.0.0", false),
+        ("3.0.0", false),
+        ("4.0.0", true),
+    ] {
+        assert_eq!(
+            component_exists(&pool, repo.id, "lib", version).await,
+            kept,
+            "{version}"
+        );
+        assert_eq!(
+            cached_row(&pool, repo.id, version)
+                .await
+                .unwrap()
+                .downloaded,
+            kept,
+            "{version}"
+        );
+    }
 }

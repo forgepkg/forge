@@ -11,6 +11,7 @@ import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import { usePackageSearch } from '~/queries/usePackageSearch'
 import { useImageSearch } from '~/queries/useImageSearch'
 import { formatDateTime } from '~/lib/oci'
+import { searchFlag, searchInt } from '~/lib/search'
 import { SearchBox } from '~/components/SearchBox'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
@@ -59,14 +60,20 @@ const PAGE_SIZE = 20
 
 export const Route = createFileRoute('/_app/repos/$repo')({
   validateSearch: (search: Record<string, unknown>): RepoBrowseSearch => {
-    const out: RepoBrowseSearch = {}
+    // Every key, undefined when absent or invalid: the router lays this over
+    // the URL's own values, so a key left out would keep the URL's text, such
+    // as the `prerelease=false&skip=0` the search box writes.
+    const out: RepoBrowseSearch = {
+      q: undefined,
+      prerelease: undefined,
+      skip: undefined,
+      path: undefined,
+      after: undefined,
+    }
     if (typeof search.q === 'string' && search.q.length > 0) out.q = search.q
-    if (search.prerelease === true || search.prerelease === 'true') {
-      out.prerelease = true
-    }
-    if (typeof search.skip === 'number' && search.skip > 0) {
-      out.skip = Math.floor(search.skip)
-    }
+    if (searchFlag(search.prerelease)) out.prerelease = true
+    const skip = searchInt(search.skip)
+    if (skip !== undefined && skip > 0) out.skip = skip
     // A directory: no leading `/`, ending in `/`.
     if (typeof search.path === 'string' && search.path.length > 0) {
       const path = search.path.replace(/^\/+/, '')

@@ -12,8 +12,9 @@
 //!    object first, then drops the row only if it is *still* stale, so two
 //!    instances racing are harmless. Each tick also prunes processed
 //!    `blob_outbox` rows past `outbox.processed_retention_seconds` and
-//!    `retention_audit` rows past `retention.audit_retention_seconds` (bounded
-//!    batched `DELETE`s, safe on every instance).
+//!    `retention_audit` rows past the stored retention settings' audit
+//!    retention, read on each tick (bounded batched `DELETE`s, safe on every
+//!    instance).
 //! 3. **Proxy metadata refresh** — periodically re-resolves each proxy
 //!    repository's upstream service index. The cross-instance singleflight is a
 //!    **row lock**: [`forge_core::repo::proxy::ProxyRepo::resolve_upstream_index`]
@@ -149,12 +150,9 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         let (pool, store) = (state.pool.clone(), state.blob_store.clone());
         // Reconcile less often than the outbox polls; it is only a safety net.
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
-        let prune = PruneAfter {
-            outbox: state.config.outbox.processed_retention(),
-            retention_audit: state.config.retention.audit_retention(),
-        };
+        let prune_outbox = state.config.outbox.processed_retention();
         supervise("reconciler", move || {
-            spawn_reconciler(pool.clone(), store.clone(), grace, prune, interval)
+            spawn_reconciler(pool.clone(), store.clone(), grace, prune_outbox, interval)
         })
     };
 
@@ -172,10 +170,10 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     // tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its policy, and
     // applies decisions through the same blob outbox the outbox worker above
     // drains — no parallel S3-delete path. Cross-instance exclusivity is the
-    // lease, not leader election. Disabling it
-    // (`FORGE_RETENTION__ENABLED=false`) leaves the admin REST surface intact;
-    // due repositories simply wait for an instance that runs the worker.
-    let retention = if state.config.retention.enabled {
+    // lease, not leader election. While retention runs are switched off
+    // (Admin → Retention) it claims nothing and a running run stops before
+    // its next batch; the admin REST surface stays intact.
+    let retention = {
         let state = state.clone();
         supervise("retention", move || {
             RetentionWorker::new(
@@ -184,7 +182,10 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
                 state.cache_invalidator(),
                 RetentionConfig {
                     poll_interval: state.config.retention.poll_interval(),
-                    default_run_interval: state.config.retention.default_run_interval(),
+                    // No floor of its own: each policy's interval decides.
+                    default_run_interval: chrono::Duration::seconds(
+                        forge_core::retention::worker::MIN_RUN_INTERVAL_SECONDS,
+                    ),
                     lease: state.config.retention.lease(),
                     // Reuse the outbox grace so a retention-dereferenced blob and a
                     // redeploy-dereferenced one share the same S3-delete deferral.
@@ -193,9 +194,6 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
             )
             .spawn_loop()
         })
-    } else {
-        tracing::info!("retention worker disabled (FORGE_RETENTION__ENABLED=false)");
-        tokio::spawn(async {})
     };
 
     // Auth reaper: always on — local-password logins create `session` rows and
@@ -460,22 +458,14 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
     })
 }
 
-/// How long the reconciler loop keeps history rows (`None` = keep them all).
-#[derive(Clone, Copy)]
-struct PruneAfter {
-    /// Processed `blob_outbox` rows.
-    outbox: Option<chrono::Duration>,
-    /// `retention_audit` rows.
-    retention_audit: Option<chrono::Duration>,
-}
-
-/// Spawn the orphan-reconciler loop. Each tick also prunes the history rows
-/// `prune` names.
+/// Spawn the orphan-reconciler loop. Each tick also prunes processed
+/// `blob_outbox` rows older than `prune_outbox` (`None` keeps them all) and
+/// `retention_audit` rows older than the stored retention settings say.
 fn spawn_reconciler(
     pool: PgPool,
     store: BlobStore,
     grace: chrono::Duration,
-    prune: PruneAfter,
+    prune_outbox: Option<chrono::Duration>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -487,19 +477,29 @@ fn spawn_reconciler(
                 Ok(n) => tracing::info!(reclaimed = n, "reconciler reclaimed orphan blobs"),
                 Err(e) => tracing::error!(error = %e, "reconciler pass failed"),
             }
-            if let Some(retention) = prune.outbox {
+            if let Some(retention) = prune_outbox {
                 match outbox_worker::prune_processed(&pool, retention).await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!(pruned = n, "pruned processed blob_outbox rows"),
                     Err(e) => tracing::error!(error = %e, "blob_outbox prune failed"),
                 }
             }
-            if let Some(keep) = prune.retention_audit {
-                match forge_core::retention::worker::prune_audit(&pool, keep).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::debug!(pruned = n, "pruned retention_audit rows"),
-                    Err(e) => tracing::error!(error = %e, "retention_audit prune failed"),
+            // Read on every tick, so a change in Admin → Retention applies
+            // within one; settings that cannot be read prune nothing.
+            match forge_db::retention_dao::read_settings(&pool).await {
+                Ok(settings) => {
+                    if let Some(keep) = settings.audit_retention() {
+                        match forge_core::retention::worker::prune_audit(&pool, keep).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::debug!(pruned = n, "pruned retention_audit rows"),
+                            Err(e) => tracing::error!(error = %e, "retention_audit prune failed"),
+                        }
+                    }
                 }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "cannot read the retention settings; retention_audit not pruned"
+                ),
             }
             // Proxy versions only ever requested, never listed or served
             // upstream, once their negative-cache window has lapsed.
