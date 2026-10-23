@@ -11,12 +11,14 @@ import { httpClient } from '~/lib/httpClient'
  *    `{ total, items }` envelope — the admin list is unpaginated).
  *  - `CreateUser` is the `POST /admin/users` body. `is_admin` defaults to
  *    `false` and `active` to `true` server-side; we always send them explicitly.
+ *    `is_admin` also gives the new user the built-in `admin` role; other
+ *    roles are assigned after the create (`assignRole` in `rbac.ts`).
  *  - The UI does not edit users: its only per-user writes beyond create are
  *    `DELETE /admin/users/{id}`, switching a credential-forwarding account to
- *    a local one (`POST /admin/users/{id}/convert-to-local`) and token
- *    management (see `tokens.ts`). The server's `PATCH /admin/users/{id}`
- *    (activate / deactivate) and `POST /admin/users/{id}/reauth` are not used
- *    here.
+ *    a local one (`POST /admin/users/{id}/convert-to-local`), token
+ *    management (see `tokens.ts`) and role assignment (see `rbac.ts`). The
+ *    server's `PATCH /admin/users/{id}` (activate / deactivate) and
+ *    `POST /admin/users/{id}/reauth` are not used here.
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.
@@ -39,6 +41,11 @@ export interface UserView {
    * account can be switched to a local one (`convertUserToLocal`).
    */
   captured_password_at: string | null
+  /**
+   * The names of the RBAC roles the user holds, sorted. What the user may do
+   * follows from these (with `is_admin`), not from `is_admin` alone.
+   */
+  roles: string[]
 }
 
 const AUTH_SOURCE_LABELS: Record<string, string> = {

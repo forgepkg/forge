@@ -44,6 +44,9 @@ pub struct UserView {
     /// account can be switched to a local one
     /// (`POST /admin/users/{id}/convert-to-local`).
     pub captured_password_at: Option<DateTime<Utc>>,
+    /// The names of the RBAC roles the user holds, sorted. What the user may
+    /// do follows from these (and `is_admin`), not from `is_admin` alone.
+    pub roles: Vec<String>,
 }
 
 impl From<&AppUser> for UserView {
@@ -55,18 +58,27 @@ impl From<&AppUser> for UserView {
             active: u.active,
             auth_source: u.auth_source.clone(),
             captured_password_at: None,
+            roles: Vec::new(),
         }
     }
 }
 
 impl UserView {
-    /// The view of `u`, with its kept-password time read from the database.
+    /// The view of `u`, with its kept-password time and roles read from the
+    /// database.
     async fn load(state: &AppState, u: &AppUser) -> Result<Self, Response> {
         let captured_password_at = user_dao::captured_password_at(&state.pool, u.id)
             .await
             .map_err(db_error)?;
+        let roles = authz_dao::list_roles_for_user(&state.pool, u.id)
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
         Ok(UserView {
             captured_password_at,
+            roles,
             ..UserView::from(u)
         })
     }
@@ -110,10 +122,20 @@ pub async fn list(State(state): State<AppState>) -> Response {
             Ok(times) => times.into_iter().collect(),
             Err(e) => return db_error(e),
         };
+    let mut roles: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    match authz_dao::list_user_role_names(&state.pool).await {
+        Ok(assignments) => {
+            for (user_id, role) in assignments {
+                roles.entry(user_id).or_default().push(role);
+            }
+        }
+        Err(e) => return db_error(e),
+    }
     let views: Vec<UserView> = users
         .iter()
         .map(|u| UserView {
             captured_password_at: captured.get(&u.id).copied(),
+            roles: roles.remove(&u.id).unwrap_or_default(),
             ..UserView::from(u)
         })
         .collect();
@@ -157,7 +179,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
         }
     }
 
-    (StatusCode::CREATED, Json(UserView::from(&u))).into_response()
+    match UserView::load(&state, &u).await {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 /// `PATCH /admin/users/{id}` — deactivate (`{"active": false}`) or reactivate
@@ -317,7 +342,10 @@ pub async fn convert_to_local(State(state): State<AppState>, Path(id): Path<i64>
         return resp;
     }
     match user_dao::find_user_by_id(&state.pool, id).await {
-        Ok(Some(user)) => Json(UserView::from(&user)).into_response(),
+        Ok(Some(user)) => match UserView::load(&state, &user).await {
+            Ok(view) => Json(view).into_response(),
+            Err(resp) => resp,
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => db_error(e),
     }

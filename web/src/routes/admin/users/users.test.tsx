@@ -19,7 +19,8 @@ import { routeTree } from '~/routeTree.gen'
  * Admin users + tokens screens, driven against the **real** route tree + query
  * hooks so the admin guard, routing, and mutations are all exercised:
  *  - the users list renders users with how each signs in, and create-user
- *    POSTs the right body + the list re-fetches (invalidation);
+ *    POSTs the right body + the list re-fetches (invalidation; roles are
+ *    covered by `userRoles.test.tsx`);
  *  - delete-user invalidates the list, and a refused delete (409 for the last
  *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
@@ -41,6 +42,7 @@ function user(over: Partial<UserView>): UserView {
     active: true,
     auth_source: 'local',
     captured_password_at: null,
+    roles: [],
     ...over,
   }
 }
@@ -238,14 +240,13 @@ describe('admin users', () => {
       'new-password',
     )
     await user_.type(screen.getByLabelText('Password'), 'hunter2')
-    await user_.click(screen.getByRole('checkbox', { name: 'Administrator' }))
     await user_.click(screen.getByRole('button', { name: 'Create user' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({
       username: 'carol',
       password: 'hunter2',
-      is_admin: true,
+      is_admin: false,
       active: true,
     })
     // List invalidation re-fetched and shows the new user.

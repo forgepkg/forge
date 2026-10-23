@@ -407,32 +407,46 @@ async fn tag_generation_keys_carry_a_ttl() {
     );
 }
 
+/// A re-sync message recovers an invalidation whose tag message was lost: the
+/// tag's generation was bumped in Redis, but no peer heard of it until the
+/// re-sync message makes them re-read it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
+async fn a_resync_message_recovers_a_lost_tag_invalidation() {
     let url = redis_url().await;
     let cache = connect(&url).await;
 
     let old: String = cache
-        .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+        .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
             Ok::<_, TestError>("OLD".to_string())
         })
         .await
         .unwrap();
     assert_eq!(old, "OLD");
 
-    // Simulate a pre-tag-version node. A new subscriber must turn this legacy
-    // namespace event into a durable Redis tag bump and apply it locally.
+    // A peer bumped the namespace's tag generation, but its tag publish was
+    // lost: the local barrier does not know yet.
     let client = redis::Client::open(url).unwrap();
     let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let _: u64 = publisher
+        .incr("forge:cache:tag:@ns:resync", 1u64)
+        .await
+        .unwrap();
+    let stale: String = cache
+        .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
+            Ok::<_, TestError>("FRESH".to_string())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, "OLD", "without a message the bump goes unnoticed");
     let _: () = publisher
-        .publish("forge:cache:invalidate", "424242|n|legacy")
+        .publish("forge:cache:invalidate", "424242|n|resync")
         .await
         .unwrap();
 
     let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let value = cache
-            .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+            .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
                 Ok::<_, TestError>("FRESH".to_string())
             })
             .await
@@ -441,7 +455,7 @@ async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("legacy invalidation was not promoted to a tag barrier");
+            panic!("the re-sync message did not advance the tag barrier");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

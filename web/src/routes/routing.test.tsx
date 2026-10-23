@@ -148,9 +148,20 @@ describe('app routing + admin gating', () => {
 
     expect(router.state.location.pathname).toBe('/manage')
     expect(await screen.findByText('Administration')).toBeInTheDocument()
-    // Only what the UI can manage; the rest is named as API-only.
+    // Only what the UI can manage; the rest is named as API-only, and RBAC
+    // is no longer part of that rest.
     expect(screen.queryByText(/admin flags|with retention/)).toBeNull()
-    expect(screen.getByText(/Retention, RBAC roles and grants/)).toBeInTheDocument()
+    expect(
+      screen.getByText(/Retention, user deactivation and key rotation have no screen/),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/RBAC/)).toBeNull()
+    expect(screen.getByRole('link', { name: /^Roles/ })).toHaveAttribute(
+      'href',
+      '/manage/roles',
+    )
+    expect(
+      screen.getByRole('link', { name: /^Content selectors/ }),
+    ).toHaveAttribute('href', '/manage/content-selectors')
   })
 
   it('refreshes the stored CSRF token from the live session on load', async () => {

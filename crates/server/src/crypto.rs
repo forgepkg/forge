@@ -192,15 +192,8 @@ pub fn build_envelope(
             scope: "default".to_string(),
             unwrapped_key_ttl: std::time::Duration::from_secs(crypto.cache.unwrapped_key_ttl_secs),
             unwrapped_key_max: crypto.cache.unwrapped_key_max,
-            accept_row_bound_secrets: crypto.accept_row_bound_secrets,
         },
     );
-    if crypto.accept_row_bound_secrets {
-        tracing::warn!(
-            "crypto.accept_row_bound_secrets is on: secrets sealed by pre-release builds are \
-             accepted without their destination binding; turn it off once startup has re-sealed them"
-        );
-    }
     tracing::info!(
         provider = %crypto.root.provider,
         algorithm = %algorithm,
@@ -417,8 +410,7 @@ async fn rotation_pass(
         .await
         .context("import passwords backfill")?;
 
-    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns),
-    //    which also moves row-only bindings to destination bindings.
+    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     reseal_all(pool, envelope, batch)
         .await
         .context("DEK re-encrypt sweep")?;

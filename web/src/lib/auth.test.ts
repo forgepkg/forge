@@ -43,17 +43,6 @@ describe('auth', () => {
     expect(authHeaders()).toEqual({})
   })
 
-  it('removes a leftover legacy slice-1 token from storage', () => {
-    localStorage.setItem('forge.token', 'stale-registry-token')
-
-    setSession('csrf-123')
-    expect(localStorage.getItem('forge.token')).toBeNull()
-
-    localStorage.setItem('forge.token', 'stale-registry-token')
-    clearSession()
-    expect(localStorage.getItem('forge.token')).toBeNull()
-  })
-
   it('notifies in-tab subscribers when the credential is set or cleared', () => {
     const listener = vi.fn()
     const unsubscribe = onAuthChange(listener)

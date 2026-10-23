@@ -28,6 +28,8 @@ import {
 import { Input } from '~/components/catalyst/input'
 import { Textarea } from '~/components/catalyst/textarea'
 import { Select } from '~/components/catalyst/select'
+import { ADMIN_ROLE } from '~/api/rbac'
+import { useRoles } from '~/queries/useRbac'
 
 /**
  * Shared auth-realm create/edit form. Kind-conditional fields:
@@ -1214,13 +1216,9 @@ export function RealmForm({
                   <div className="flex items-start justify-between gap-3">
                     <Field className="flex-1">
                       <Label>Role</Label>
-                      <Input
-                        type="text"
+                      <WifRolePicker
                         value={rule.role}
-                        onChange={(e) =>
-                          setRule(ri, (r) => ({ ...r, role: e.target.value }))
-                        }
-                        placeholder="ci-deployer"
+                        onChange={(role) => setRule(ri, (r) => ({ ...r, role }))}
                         invalid={!!errors[`wifRule.${ri}.role`]}
                       />
                       {errors[`wifRule.${ri}.role`] && (
@@ -1728,4 +1726,56 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
   }
   // local (and reserved kinds): no config.
   return {}
+}
+
+/**
+ * The role a workload-identity rule grants, picked from the roles that exist.
+ * The built-in `admin` role is not offered (the server refuses it). A rule
+ * naming a role that is not in the list (since deleted) keeps it, marked; if
+ * the roles cannot be loaded, the name is typed instead.
+ */
+function WifRolePicker({
+  value,
+  onChange,
+  invalid,
+}: {
+  value: string
+  onChange: (role: string) => void
+  invalid: boolean
+}) {
+  const roles = useRoles()
+  if (roles.isError) {
+    return (
+      <Input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="ci-deployer"
+        invalid={invalid}
+      />
+    )
+  }
+  const offered = (roles.data ?? []).filter((r) => r.name !== ADMIN_ROLE)
+  const missing =
+    roles.data != null && value !== '' && !offered.some((r) => r.name === value)
+  return (
+    <Select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={roles.isLoading}
+      invalid={invalid}
+    >
+      <option value="">{roles.isLoading ? 'Loading roles…' : 'Choose a role…'}</option>
+      {missing && (
+        <option value={value}>
+          {value === ADMIN_ROLE ? `${value} (not allowed)` : `${value} (no such role)`}
+        </option>
+      )}
+      {offered.map((r) => (
+        <option key={r.id} value={r.name}>
+          {r.name}
+        </option>
+      ))}
+    </Select>
+  )
 }

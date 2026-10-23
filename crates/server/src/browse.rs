@@ -81,6 +81,8 @@ fn require_user(principal: &Principal) -> Option<Response> {
 /// One repository on the browse root (`GET /browse/repos`).
 #[derive(Debug, Serialize)]
 pub struct BrowseRepo {
+    /// Repository id, as a token's scope names repositories.
+    pub id: i64,
     /// Repository name (the folder name).
     pub name: String,
     /// Repository kind (`hosted` | `proxy` | `group`).
@@ -135,6 +137,7 @@ pub async fn list_repos(
         }
         if state.authz.can_read(&principal, repo).await {
             out.push(BrowseRepo {
+                id: repo.id,
                 name: repo.name.clone(),
                 kind: repo.kind.clone(),
                 online: repo.online,

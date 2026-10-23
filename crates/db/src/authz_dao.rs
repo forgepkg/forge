@@ -816,6 +816,125 @@ pub async fn delete_content_selector(pool: &PgPool, id: i64) -> sqlx::Result<boo
     Ok(res.rows_affected() > 0)
 }
 
+/// How many grants and users a role holds, as the admin role views show it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoleCounts {
+    /// `role.id`.
+    pub role_id: i64,
+    /// The role's `repository_privilege` rows.
+    pub grants: i64,
+    /// The users assigned the role (`user_role` rows).
+    pub users: i64,
+}
+
+/// Count the grants and users of every role, or of the one role `role_id`.
+pub async fn role_counts(pool: &PgPool, role_id: Option<i64>) -> sqlx::Result<Vec<RoleCounts>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            r.id,
+            (SELECT count(*) FROM repository_privilege rp WHERE rp.role_id = r.id) AS "grants!",
+            (SELECT count(*) FROM user_role ur WHERE ur.role_id = r.id) AS "users!"
+        FROM role r
+        WHERE $1::bigint IS NULL OR r.id = $1
+        "#,
+        role_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RoleCounts {
+            role_id: r.id,
+            grants: r.grants,
+            users: r.users,
+        })
+        .collect())
+}
+
+/// A user holding a role, as the role's member list shows it.
+#[derive(Debug, Clone)]
+pub struct RoleMember {
+    /// `app_user.id`.
+    pub id: i64,
+    /// Canonical username.
+    pub username: String,
+    /// How the account signs in (`local`, `oidc`, `upstream-basic`).
+    pub auth_source: String,
+    /// `false` for a deactivated account.
+    pub active: bool,
+}
+
+/// List the users who hold a role, ordered by username.
+pub async fn list_users_for_role(pool: &PgPool, role_id: i64) -> sqlx::Result<Vec<RoleMember>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT u.id, u.username, u.auth_source, u.active
+        FROM user_role ur
+        JOIN app_user u ON u.id = ur.user_id
+        WHERE ur.role_id = $1
+        ORDER BY u.username
+        "#,
+        role_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RoleMember {
+            id: r.id,
+            username: r.username,
+            auth_source: r.auth_source,
+            active: r.active,
+        })
+        .collect())
+}
+
+/// Every `(user id, role name)` assignment, ordered by role name: the roles
+/// column of the admin user list, read in one query.
+pub async fn list_user_role_names(pool: &PgPool) -> sqlx::Result<Vec<(i64, String)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT ur.user_id, r.name
+        FROM user_role ur
+        JOIN role r ON r.id = ur.role_id
+        ORDER BY r.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.user_id, r.name)).collect())
+}
+
+/// List the grants scoped by a content selector (every role's), ordered for
+/// stable display: what deleting the selector removes.
+pub async fn list_grants_for_selector(
+    pool: &PgPool,
+    selector_id: i64,
+) -> sqlx::Result<Vec<GrantRow>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, role_id, repository_id, action, selector_id
+        FROM repository_privilege
+        WHERE selector_id = $1
+        ORDER BY role_id, id
+        "#,
+        selector_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GrantRow {
+            id: r.id,
+            role_id: r.role_id,
+            repository_id: r.repository_id,
+            action: r.action,
+            selector_id: r.selector_id,
+        })
+        .collect())
+}
+
 /// List the roles a user holds, ordered by name.
 pub async fn list_roles_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Vec<Role>> {
     let rows = sqlx::query!(

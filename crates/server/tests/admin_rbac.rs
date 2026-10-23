@@ -177,11 +177,17 @@ async fn non_admin_forbidden_on_rbac_endpoints() {
 
     for (method, path) in [
         ("GET", "/admin/roles"),
+        ("GET", "/admin/roles/1/users"),
         ("GET", "/admin/content-selectors"),
+        ("GET", "/admin/content-selectors/1/grants"),
+        ("POST", "/admin/content-selectors/match"),
         ("GET", "/admin/anonymous/effective"),
     ] {
         let req = match method {
             "GET" => client.get(format!("{}{}", srv.base_url, path)),
+            "POST" => client
+                .post(format!("{}{}", srv.base_url, path))
+                .json(&json!({"name": "x"})),
             _ => unreachable!(),
         };
         let resp = req
@@ -557,6 +563,238 @@ async fn content_selector_crud_and_invalid_glob() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
+}
+
+/// A role view counts the role's grants and users, `GET /admin/roles/{id}/users`
+/// lists its members, and the user list names each user's roles: what the
+/// role screens and the user list show.
+#[tokio::test]
+async fn role_counts_members_and_user_roles() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let repo = make_repo(&srv).await;
+    let (user_id, username, _) = make_user(&srv).await;
+    let role_name = format!("pushers-{}", common::unique());
+
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": role_name}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    assert_eq!(role["grant_count"], json!(0));
+    assert_eq!(role["user_count"], json!(0));
+
+    for action in ["read", "write"] {
+        let resp = client
+            .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"repository": repo, "action": action}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role_id": role_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Counted in the list and on the role itself.
+    let roles: Value = client
+        .get(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(role_id))
+        .expect("role listed");
+    assert_eq!(listed["grant_count"], json!(2));
+    assert_eq!(listed["user_count"], json!(1));
+    let one: Value = client
+        .get(format!("{}/admin/roles/{role_id}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["grant_count"], json!(2));
+    assert_eq!(one["user_count"], json!(1));
+
+    // The members.
+    let members: Value = client
+        .get(format!("{}/admin/roles/{role_id}/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        members,
+        json!([{"id": user_id, "username": username, "auth_source": "local", "active": true}])
+    );
+    let resp = client
+        .get(format!("{}/admin/roles/{}/users", srv.base_url, i64::MAX))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "an unknown role has no member list");
+
+    // The user list names the user's roles.
+    let users: Value = client
+        .get(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == json!(user_id))
+        .expect("user listed");
+    assert_eq!(listed["roles"], json!([role_name]));
+    let admin = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(au))
+        .expect("bootstrap admin listed");
+    assert!(
+        admin["roles"].as_array().unwrap().contains(&json!("admin")),
+        "the bootstrap admin holds the admin role: {admin}"
+    );
+}
+
+/// `GET /admin/content-selectors/{id}/grants` lists the grants a selector
+/// scopes, and `POST /admin/content-selectors/match` tests a package name with
+/// the evaluator's own globs.
+#[tokio::test]
+async fn content_selector_grants_and_match() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let repo = make_repo(&srv).await;
+
+    let sel: Value = client
+        .post(format!("{}/admin/content-selectors", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({
+            "name": format!("acme-{}", common::unique()),
+            "includes": ["acme.*"],
+            "excludes": ["acme.internal.*"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sel_id = sel["id"].as_i64().unwrap();
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": format!("acme-readers-{}", common::unique())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    let resp = client
+        .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"repository": repo, "action": "read", "selector_id": sel_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let grants: Value = client
+        .get(format!(
+            "{}/admin/content-selectors/{sel_id}/grants",
+            srv.base_url
+        ))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants = grants.as_array().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0]["role_id"], json!(role_id));
+    assert_eq!(grants[0]["action"], json!("read"));
+    assert_eq!(grants[0]["selector_id"], json!(sel_id));
+    let resp = client
+        .get(format!(
+            "{}/admin/content-selectors/{}/grants",
+            srv.base_url,
+            i64::MAX
+        ))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    for (includes, name, expected) in [
+        (json!(["acme.*"]), "Acme.Core", true),
+        (json!(["acme.*"]), "acme.internal.tools", false),
+        (json!(["acme.*"]), "other.lib", false),
+        (json!([]), "anything", true),
+        (json!([]), "acme.internal.tools", false),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/content-selectors/match", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"includes": includes, "excludes": ["acme.internal.*"], "name": name}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body, json!({"matches": expected}), "{includes} vs {name}");
+    }
+    let resp = client
+        .post(format!("{}/admin/content-selectors/match", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"includes": ["[unterminated"], "name": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an invalid glob is refused as on a write"
+    );
 }
 
 /// A redeploy replaces a version's bytes, so with `allow_redeploy` on it takes

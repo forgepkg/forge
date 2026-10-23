@@ -32,6 +32,7 @@ const readerMe: Me = {
 
 const repos: BrowseRepo[] = [
   {
+    id: 1,
     name: 'nuget',
     kind: 'proxy',
     online: true,
@@ -39,6 +40,7 @@ const repos: BrowseRepo[] = [
     url: 'https://forge.example.com/v3/nuget',
   },
   {
+    id: 2,
     name: 'internal',
     kind: 'hosted',
     online: true,
@@ -46,14 +48,16 @@ const repos: BrowseRepo[] = [
     url: 'https://forge.example.com/v3/internal',
   },
   {
+    id: 3,
     name: 'releases',
     kind: 'hosted',
     online: false,
     format: 'nuget',
     url: 'https://forge.example.com/v3/releases',
   },
-  { name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
+  { id: 4, name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
   {
+    id: 5,
     name: 'charts',
     kind: 'hosted',
     online: true,

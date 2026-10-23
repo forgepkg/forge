@@ -296,32 +296,6 @@ describe('Login', () => {
       )
     })
 
-    it('maps a legacy /admin return-to onto the /manage admin UI', async () => {
-      const user = userEvent.setup()
-      const adminMe: Me = {
-        user: { id: 1, username: 'root', is_admin: true, active: true },
-        is_admin: true,
-        capabilities: ['repo.admin'],
-      }
-      mockAuthApi({
-        options: combined,
-        onLogin: () =>
-          json({ user_id: 1, username: 'root', is_admin: true, csrf_token: 'c' }),
-        onMe: () => json(adminMe),
-      })
-
-      const router = await renderLogin('/login?redirect=%2Fadmin%2Frealms%3Fx%3D1')
-
-      await user.type(await screen.findByLabelText('Username'), 'root')
-      await user.type(screen.getByLabelText('Password'), 'pw')
-      await user.click(screen.getByRole('button', { name: 'Sign in' }))
-
-      await waitFor(() =>
-        expect(router.state.location.pathname).toBe('/manage/realms'),
-      )
-      expect(router.state.location.search).toMatchObject({ x: 1 })
-    })
-
     it('ignores an off-site return-to', async () => {
       const user = userEvent.setup()
       mockAuthApi({

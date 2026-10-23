@@ -142,9 +142,11 @@ async fn admin_edit_of_a_seeded_secret_survives_the_next_boot() {
 }
 
 /// A marker written by a pre-release build (sha256 over the whole config,
-/// secret included) is honoured once, then replaced; a stale one is dropped.
+/// secret included, without the `v2:` prefix) counts as an edited row's,
+/// even for a row unmodified since that seed: it is dropped, and the block
+/// is not applied.
 #[tokio::test]
-async fn a_legacy_marker_is_replaced_or_dropped() {
+async fn a_legacy_marker_is_dropped() {
     let pool = common::fresh_pool().await;
     seed(&pool, &config("pepper-one", 5000)).await;
     let (_, stored) = seeded_config(&pool).await;
@@ -153,21 +155,8 @@ async fn a_legacy_marker_is_replaced_or_dropped() {
         .await
         .unwrap();
 
-    // Unmodified since that seed: the changed block applies, and the marker
-    // is rewritten without the secret.
     seed(&pool, &config("pepper-one", 6000)).await;
     let (_, stored) = seeded_config(&pool).await;
-    assert_eq!(stored["request_timeout_ms"], 6000);
-    let current = marker(&pool).await.expect("marker");
-    assert!(current.starts_with("v2:"), "{current}");
-
-    // A legacy marker that no longer matches (the row was edited) is removed
-    // and the block is not applied.
-    forge_db::authz_dao::set_setting(&pool, MARKER_KEY, &"0".repeat(64))
-        .await
-        .unwrap();
-    seed(&pool, &config("pepper-one", 9000)).await;
-    let (_, stored) = seeded_config(&pool).await;
-    assert_eq!(stored["request_timeout_ms"], 6000);
+    assert_eq!(stored["request_timeout_ms"], 5000);
     assert_eq!(marker(&pool).await, None);
 }

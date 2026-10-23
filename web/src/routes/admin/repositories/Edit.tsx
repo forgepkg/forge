@@ -15,6 +15,7 @@ import { Heading } from '~/components/catalyst/heading'
 import { Text } from '~/components/catalyst/text'
 import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
+import { AnonymousAccessPanel } from '~/components/AnonymousAccessPanel'
 import { IMPORT_FORMATS } from '~/api/imports'
 
 export const Route = createFileRoute('/_app/manage/repositories/$repo')({
@@ -29,7 +30,9 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * a new one (an empty field leaves the stored secret unchanged); "Remove
  * stored credentials" clears it explicitly. Group repos get a link to the
  * Members editor; proxies, their cache invalidation; hosted NuGet, Helm and
- * Docker repositories, the import from Nexus.
+ * Docker repositories, the import from Nexus. Below the form, the
+ * repository's anonymous access: the flag together with the anonymous role's
+ * grants that cover it (read-only, linking to the role).
  */
 function EditRepository() {
   const { repo: name } = Route.useParams()
@@ -121,6 +124,8 @@ function EditRepository() {
         onSubmit={handleSubmit}
         onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
+
+      <AnonymousAccessPanel repo={current} />
 
       {current.kind === 'proxy' && (
         <ProxyCachePanel key={current.name} repo={current} />

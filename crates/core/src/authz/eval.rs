@@ -134,6 +134,13 @@ impl SelectorPatterns {
     pub fn compile_check(&self) -> Result<(), SelectorCompileError> {
         self.compile().map(|_| ())
     }
+
+    /// Compile the patterns and match `package_name` against them, exactly as
+    /// a grant scoped by this selector would. Used by the admin API's selector
+    /// test, so an admin checks a pattern against the evaluator's own globs.
+    pub fn matches(&self, package_name: &str) -> Result<bool, SelectorCompileError> {
+        self.compile().map(|c| c.matches(package_name))
+    }
 }
 
 /// Build a [`GlobSet`] from a list of patterns, lowercasing each (package names

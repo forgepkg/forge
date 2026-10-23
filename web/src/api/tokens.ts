@@ -11,7 +11,8 @@ import { httpClient } from '~/lib/httpClient'
  *    `token` is ever returned (flattened onto a `TokenView`). It is shown once
  *    via `ShowOnceSecret` and never re-fetched or cached.
  *  - Tokens belong to a user: `GET`/`POST` are under
- *    `/admin/users/{id}/tokens`; revoke is `DELETE /admin/tokens/{id}`.
+ *    `/admin/users/{id}/tokens`; revoke is `DELETE /admin/tokens/{id}`, and
+ *    an admin changes a token's scope with `PATCH /admin/tokens/{id}/scope`.
  *  - `GET /admin/users/{id}/tokens` returns a **bare array** of `TokenView`.
  *  - `revoke` is a soft-delete (sets `revoked_at`); the server replies 404 when
  *    the token is unknown or already revoked.
@@ -55,6 +56,8 @@ export interface CreateToken {
   name: string
   /** Optional RFC3339 expiry; absent → non-expiring. */
   expires_at?: string | null
+  /** Optional scope; absent → the owner's access without `admin`. */
+  scope?: TokenScope
 }
 
 /**
@@ -97,6 +100,18 @@ export function createToken(
 /** `DELETE /admin/tokens/{id}` — revoke a token (204). */
 export function revokeToken(id: number): Promise<void> {
   return httpClient.delete<void>(`/admin/tokens/${id}`)
+}
+
+/**
+ * `PATCH /admin/tokens/{id}/scope` — set a token's scope, or clear it with
+ * `null` (204; 404 for a revoked token). The next request with the token
+ * reads the new scope.
+ */
+export function setTokenScope(
+  id: number,
+  scope: TokenScope | null,
+): Promise<void> {
+  return httpClient.patch<void>(`/admin/tokens/${id}/scope`, { scope })
 }
 
 /*

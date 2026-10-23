@@ -330,6 +330,18 @@ async fn browse_repos_folder_root() {
         .expect("created repo listed in /browse/repos");
     assert_eq!(entry["kind"], json!("hosted"));
     assert_eq!(entry["online"], json!(true));
+    // The id, which a token's scope names repositories by.
+    let admin: Value = srv
+        .client()
+        .get(format!("{}/admin/repositories/{repo}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(entry["id"], admin["id"]);
 
     // Sorted by name.
     let names: Vec<&str> = repos.iter().map(|r| r["name"].as_str().unwrap()).collect();

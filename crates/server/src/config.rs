@@ -576,8 +576,8 @@ pub struct AuthConfig {
     pub login_mode: String,
     /// Idle timeout (seconds) for browser sessions: a session expires this long
     /// after its last use. Applies to ALL sessions (local-password logins and
-    /// OIDC). When unset, falls back to the legacy `oidc.session_idle_ttl_seconds`
-    /// if an `[oidc]` block is present, else 8h.
+    /// OIDC). When unset, falls back to the deprecated
+    /// `oidc.session_idle_ttl_seconds` if set, else 8h.
     #[serde(default)]
     pub session_idle_ttl_seconds: Option<u64>,
     /// Absolute lifetime (seconds) for browser sessions, regardless of
@@ -1692,13 +1692,18 @@ pub struct OidcConfig {
     pub endpoint_hosts: Vec<String>,
 
     // ---- session lifecycle ----
-    /// Idle timeout (seconds): a session expires this long after its last use.
-    #[serde(default = "default_session_idle_ttl")]
-    pub session_idle_ttl_seconds: u64,
-    /// Absolute lifetime (seconds): a session expires this long after creation
-    /// regardless of activity.
-    #[serde(default = "default_session_absolute_ttl")]
-    pub session_absolute_ttl_seconds: u64,
+    /// **Deprecated** in favour of `auth.session_idle_ttl_seconds`, which it
+    /// stands in for while that is unset ([`Config::session_ttls`]; startup
+    /// warns, [`Config::deprecations`]). Idle timeout (seconds): a session
+    /// expires this long after its last use. Default 8h.
+    #[serde(default)]
+    pub session_idle_ttl_seconds: Option<u64>,
+    /// **Deprecated** in favour of `auth.session_absolute_ttl_seconds`, like
+    /// [`Self::session_idle_ttl_seconds`]. Absolute lifetime (seconds): a
+    /// session expires this long after creation regardless of activity.
+    /// Default 7d.
+    #[serde(default)]
+    pub session_absolute_ttl_seconds: Option<u64>,
 }
 
 /// How an OIDC client authenticates at the IdP's token endpoint (an `oidc`
@@ -1756,11 +1761,17 @@ impl std::fmt::Debug for OidcConfig {
 impl OidcConfig {
     /// Idle timeout as a [`Duration`].
     pub fn session_idle_ttl(&self) -> Duration {
-        Duration::from_secs(self.session_idle_ttl_seconds)
+        Duration::from_secs(
+            self.session_idle_ttl_seconds
+                .unwrap_or_else(default_session_idle_ttl),
+        )
     }
     /// Absolute lifetime as a [`Duration`].
     pub fn session_absolute_ttl(&self) -> Duration {
-        Duration::from_secs(self.session_absolute_ttl_seconds)
+        Duration::from_secs(
+            self.session_absolute_ttl_seconds
+                .unwrap_or_else(default_session_absolute_ttl),
+        )
     }
     /// Clock-skew leeway as a [`Duration`].
     pub fn clock_skew(&self) -> Duration {
@@ -1828,13 +1839,6 @@ pub struct CryptoConfig {
     /// Rotation worker tuning.
     #[serde(default)]
     pub rotation: CryptoRotationConfig,
-    /// Also open secrets sealed by pre-release builds, which were bound to
-    /// their row but not to where they are sent, and re-seal them for their
-    /// destination at startup. Turn it on for one start after upgrading such
-    /// an installation, then off again: while on, someone who can write to
-    /// the database can replay such a blob into a repointed row.
-    #[serde(default)]
-    pub accept_row_bound_secrets: bool,
 }
 
 /// `crypto.root.*` — the root-key provider.
@@ -2411,7 +2415,35 @@ impl Config {
     /// Settings this configuration still uses but that are on their way
     /// out, each with what replaces it: logged as warnings at startup.
     pub fn deprecations(&self) -> Vec<String> {
-        Vec::new()
+        let mut out = Vec::new();
+        if let Some(oidc) = &self.oidc {
+            for (key, legacy, current) in [
+                (
+                    "session_idle_ttl_seconds",
+                    oidc.session_idle_ttl_seconds,
+                    self.auth.session_idle_ttl_seconds,
+                ),
+                (
+                    "session_absolute_ttl_seconds",
+                    oidc.session_absolute_ttl_seconds,
+                    self.auth.session_absolute_ttl_seconds,
+                ),
+            ] {
+                match (legacy, current) {
+                    (Some(_), None) => out.push(format!(
+                        "oidc.{key} is deprecated: it sets the lifetime of every browser \
+                         session while auth.{key} is unset. Move the value to auth.{key} \
+                         and remove oidc.{key}."
+                    )),
+                    (Some(_), Some(_)) => out.push(format!(
+                        "oidc.{key} is deprecated, and ignored since auth.{key} is set: \
+                         remove it."
+                    )),
+                    (None, _) => {}
+                }
+            }
+        }
+        out
     }
 
     /// What one push or download stages at once at most: the package, and
@@ -2963,19 +2995,18 @@ impl Config {
 
     /// Resolve the browser-session TTLs `(idle, absolute)` in seconds.
     ///
-    /// Precedence: explicit `auth.session_*` → legacy `oidc.session_*` (when an
-    /// `[oidc]` block is present — preserves pre-12.7 deployments that tuned
-    /// them there) → defaults (8h idle / 7d absolute).
+    /// Precedence: explicit `auth.session_*` → the deprecated `oidc.session_*`
+    /// (see [`Self::deprecations`]) → defaults (8h idle / 7d absolute).
     pub fn session_ttls(&self) -> (u64, u64) {
         let idle = self
             .auth
             .session_idle_ttl_seconds
-            .or_else(|| self.oidc.as_ref().map(|o| o.session_idle_ttl_seconds))
+            .or_else(|| self.oidc.as_ref()?.session_idle_ttl_seconds)
             .unwrap_or_else(default_session_idle_ttl);
         let absolute = self
             .auth
             .session_absolute_ttl_seconds
-            .or_else(|| self.oidc.as_ref().map(|o| o.session_absolute_ttl_seconds))
+            .or_else(|| self.oidc.as_ref()?.session_absolute_ttl_seconds)
             .unwrap_or_else(default_session_absolute_ttl);
         (idle, absolute)
     }
@@ -3266,8 +3297,8 @@ mod tests {
             assert!(!oidc.link_existing_by_username);
             assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
             assert_eq!(oidc.admin_claim, "groups");
-            assert_eq!(oidc.session_idle_ttl_seconds, 3600);
-            assert_eq!(oidc.session_absolute_ttl_seconds, 86400);
+            assert_eq!(oidc.session_idle_ttl_seconds, Some(3600));
+            assert_eq!(oidc.session_absolute_ttl_seconds, Some(86400));
             Ok(())
         });
     }
@@ -3712,6 +3743,35 @@ mod tests {
         assert!(cfg.oidc.is_none());
     }
 
+    /// `oidc.session_*` are deprecated in favour of `auth.session_*`: while
+    /// those are unset they still decide the session lifetimes, and either way
+    /// startup warns. An `[oidc]` block without them warns about nothing.
+    #[test]
+    fn oidc_session_ttls_are_deprecated() {
+        let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
+        assert!(cfg.deprecations().is_empty());
+        assert_eq!(cfg.session_ttls(), (8 * 60 * 60, 7 * 24 * 60 * 60));
+
+        let legacy = minimal_with_oidc("session_idle_ttl_seconds = 600\n");
+        let cfg = Config::from_figment(fig_from_toml(&legacy)).expect("valid");
+        assert_eq!(cfg.session_ttls(), (600, 7 * 24 * 60 * 60));
+        let deprecations = cfg.deprecations();
+        assert_eq!(deprecations.len(), 1, "{deprecations:?}");
+        assert!(
+            deprecations[0].contains("oidc.session_idle_ttl_seconds is deprecated")
+                && deprecations[0].contains("auth.session_idle_ttl_seconds"),
+            "{deprecations:?}"
+        );
+
+        let both = minimal_with_oidc("session_idle_ttl_seconds = 600\n")
+            .replace("[auth]", "[auth]\nsession_idle_ttl_seconds = 900");
+        let cfg = Config::from_figment(fig_from_toml(&both)).expect("valid");
+        assert_eq!(cfg.session_ttls(), (900, 7 * 24 * 60 * 60));
+        let deprecations = cfg.deprecations();
+        assert_eq!(deprecations.len(), 1, "{deprecations:?}");
+        assert!(deprecations[0].contains("ignored"), "{deprecations:?}");
+    }
+
     #[test]
     fn oidc_valid_block_parses_with_defaults() {
         let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
@@ -3732,8 +3792,11 @@ mod tests {
         );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
-        assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);
-        assert_eq!(oidc.session_absolute_ttl_seconds, 7 * 24 * 60 * 60);
+        assert_eq!(oidc.session_idle_ttl(), Duration::from_secs(8 * 60 * 60));
+        assert_eq!(
+            oidc.session_absolute_ttl(),
+            Duration::from_secs(7 * 24 * 60 * 60)
+        );
         // effective_scopes keeps openid; idempotent when already present.
         assert_eq!(oidc.effective_scopes(), vec!["openid", "profile", "email"]);
     }

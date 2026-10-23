@@ -17,9 +17,6 @@
 
 const CSRF_KEY = 'forge.session.csrf'
 
-/** Legacy slice-1 token storage key — cleared on sight, never read. */
-const LEGACY_TOKEN_KEY = 'forge.token'
-
 /**
  * In-tab subscribers notified whenever the stored credential changes
  * (`setSession`/`clearSession`). The app shell uses this to re-run the `me`
@@ -70,7 +67,6 @@ export function getCsrfToken(): string | null {
 export function setSession(csrf: string): void {
   try {
     localStorage.setItem(CSRF_KEY, csrf)
-    localStorage.removeItem(LEGACY_TOKEN_KEY)
   } catch {
     /* storage unavailable (private mode); auth simply won't persist */
   }
@@ -91,7 +87,6 @@ export function clearSession(): void {
   const hadSession = getCsrfToken() !== null
   try {
     localStorage.removeItem(CSRF_KEY)
-    localStorage.removeItem(LEGACY_TOKEN_KEY)
   } catch {
     /* ignore */
   }
