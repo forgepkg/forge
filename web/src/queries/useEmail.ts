@@ -2,14 +2,22 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
 import {
+  authorizeEmailOauthClientCredentials,
   deleteEmailSettings,
   emailKeys,
   fetchEmailSettings,
+  forgetEmailOauthClient,
   putEmailSettings,
+  registerEmailOauthClient,
   sendTestEmail,
+  startEmailOauthCodeFlow,
+  startEmailOauthDeviceFlow,
+  type DeviceAuthorization,
   type EmailSettings,
   type EmailSettingsInput,
   type EmailSettingsView,
+  type EmailSettingsWithWarning,
+  type RegistrationAuth,
   type TestEmailResult,
 } from '~/api/email'
 
@@ -30,7 +38,7 @@ export function useEmailSettings() {
 /** Store the settings (`PUT`). */
 export function useSaveEmailSettings() {
   const queryClient = useQueryClient()
-  return useMutation<EmailSettingsView, ApiError, EmailSettingsInput>({
+  return useMutation<EmailSettingsWithWarning, ApiError, EmailSettingsInput>({
     mutationFn: (body) => putEmailSettings(body),
     onSuccess: (view) => {
       queryClient.setQueryData(emailKeys.settings(), view)
@@ -56,6 +64,53 @@ export function useSendTestEmail() {
     mutationFn: (to) => sendTestEmail(to),
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: emailKeys.settings() })
+    },
+  })
+}
+
+/** Register Forge with the authorization server (`POST /oauth/register`). */
+export function useRegisterEmailOauthClient() {
+  const queryClient = useQueryClient()
+  return useMutation<EmailSettingsWithWarning, ApiError, RegistrationAuth>({
+    mutationFn: (auth) => registerEmailOauthClient(auth),
+    onSuccess: (view) => {
+      queryClient.setQueryData(emailKeys.settings(), view)
+    },
+  })
+}
+
+/** Forget the OAuth client and its authorization (`DELETE /oauth/client`). */
+export function useForgetEmailOauthClient() {
+  const queryClient = useQueryClient()
+  return useMutation<EmailSettingsWithWarning, ApiError, void>({
+    mutationFn: () => forgetEmailOauthClient(),
+    onSuccess: (view) => {
+      queryClient.setQueryData(emailKeys.settings(), view)
+    },
+  })
+}
+
+/** Start the code flow: the authorization URL to send the browser to. */
+export function useStartEmailOauthCodeFlow() {
+  return useMutation<{ authorization_url: string }, ApiError, void>({
+    mutationFn: () => startEmailOauthCodeFlow(),
+  })
+}
+
+/** Start a device authorization. */
+export function useStartEmailOauthDeviceFlow() {
+  return useMutation<DeviceAuthorization, ApiError, void>({
+    mutationFn: () => startEmailOauthDeviceFlow(),
+  })
+}
+
+/** Use the client credentials grant: no mailbox authorizes Forge. */
+export function useEmailOauthClientCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation<{ settings: EmailSettingsView }, ApiError, void>({
+    mutationFn: () => authorizeEmailOauthClientCredentials(),
+    onSuccess: ({ settings }) => {
+      queryClient.setQueryData(emailKeys.settings(), settings)
     },
   })
 }

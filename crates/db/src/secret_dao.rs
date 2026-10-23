@@ -1099,6 +1099,11 @@ pub fn email_secret_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         "smtp" => &["password"],
         "microsoft_graph" => &["client_secret"],
+        "smtp_oauth" => &[
+            "client_secret",
+            "registration_access_token",
+            "refresh_token",
+        ],
         _ => &[],
     }
 }
@@ -1113,6 +1118,9 @@ pub fn email_secret_binding_keys(kind: &str) -> &'static [&'static str] {
         "smtp" => &["host", "username"],
         // A client secret belongs to one app registration of one tenant.
         "microsoft_graph" => &["tenant_id", "client_id"],
+        // The client's secrets belong to its authorization server, and the
+        // refresh token to the mailbox that authorized it.
+        "smtp_oauth" => &["issuer", "client_id", "username"],
         _ => &[],
     }
 }
@@ -1229,6 +1237,33 @@ pub async fn store_email_settings(
     let mut tx = pool.begin().await?;
     lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row = email_settings_dao::put(&mut *tx, enabled, &stripped, Some(&blob)).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// [`store_email_settings`] as a compare-and-set over `expected`, for what
+/// Forge itself writes into the settings (an OAuth client it registered, a
+/// rotated refresh token): the row is replaced only while it is still the one
+/// read, so a concurrent admin edit is never undone, and the last send's
+/// outcome is kept. `None` when the row changed or is gone.
+pub async fn update_email_settings(
+    pool: &PgPool,
+    envelope: Option<&EnvelopeService>,
+    expected: &EmailSettingsRow,
+    config: &JsonValue,
+) -> Result<Option<EmailSettingsRow>, SecretDbError> {
+    let Some(envelope) = envelope else {
+        return Ok(email_settings_dao::put_if_unchanged(pool, expected, config, None).await?);
+    };
+    let (stripped, secrets) = split_email_secrets(config);
+    if secrets.is_empty() {
+        return Ok(email_settings_dao::put_if_unchanged(pool, expected, &stripped, None).await?);
+    }
+    let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
+    let mut tx = pool.begin().await?;
+    lock_sealing_dek(&mut tx, envelope, &blob).await?;
+    let row =
+        email_settings_dao::put_if_unchanged(&mut *tx, expected, &stripped, Some(&blob)).await?;
     tx.commit().await?;
     Ok(row)
 }

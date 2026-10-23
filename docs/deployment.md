@@ -427,10 +427,14 @@ email.
 - **Microsoft 365 (Graph).** Forge signs in as an Entra app registration and
   sends with Microsoft Graph, as the sender mailbox; see
   [Microsoft 365](#microsoft-365) below.
-- **Secrets** (the SMTP password, the Graph client secret) are write-only:
-  the page and `GET /admin/settings/email` say only whether one is set.
-  Saving without it keeps the stored one, unless the SMTP host or username,
-  or the Graph tenant or app, changed. With [secret
+- **SMTP server with OAuth.** SMTP submission with an OAuth access token
+  from the mail server's own authorization server instead of a password,
+  Stalwart's for one; see [SMTP with OAuth](#smtp-with-oauth) below.
+- **Secrets** (the SMTP password, the Graph client secret, the OAuth client
+  secret and refresh token) are write-only: the page and
+  `GET /admin/settings/email` say only whether one is set. Saving without it
+  keeps the stored one, unless the SMTP host or username, the Graph tenant
+  or app, or the OAuth issuer or mailbox changed. With [secret
   encryption](#secret-encryption-at-rest) on they are sealed at rest.
 - **Send test email** sends a message with the stored settings, to the
   address you enter or to your own (your UPN), even while sending is turned
@@ -500,6 +504,75 @@ it); a 401 from Graph usually means the sender has no
 Exchange Online mailbox or licence. Each instance caches its access token
 until shortly before it expires. National clouds and certificate
 credentials are not supported yet.
+
+### SMTP with OAuth
+
+A mail server with its own OAuth authorization server, Stalwart for one,
+takes an access token on SMTP submission (SASL `OAUTHBEARER`, RFC 7628, or
+`XOAUTH2`) where it would take a password. Forge then stores no mailbox
+password: it registers itself as an OAuth client, the mailbox authorizes it
+once, and Forge refreshes its access token from then on.
+
+1. **Enter the server** on **Admin → Email** with *SMTP server with OAuth*:
+   the SMTP host, port and encryption as for SMTP, the **mailbox** Forge
+   sends as (the account that authorizes it), and the **authorization
+   server**, its issuer URL (`https`). Forge reads its metadata from
+   `/.well-known/oauth-authorization-server` (RFC 8414), or
+   `/.well-known/openid-configuration`, and the document must name that
+   issuer. A **scope** is optional. Save.
+2. **Give Forge a client**, one of:
+   - **Register Forge** (RFC 7591). Forge registers a confidential client
+     named *Forge (`server.public_base_url`)* with the redirect URI the page
+     shows, for the authorization code, refresh and (when offered) device
+     and client credentials grants. A server that does not take
+     registrations from anyone wants them authenticated: with an **initial
+     access token**, or as **an account** of the mail server (HTTP Basic).
+     Either is used for that request only and never stored.
+   - **Enter a client** registered on the server by hand: its client id
+     and secret, with the redirect URI the page shows
+     (`https://<forge>/admin/settings/email/oauth/callback`).
+3. **Authorize Forge**, one of:
+   - **In this browser**: Forge sends you to the authorization server (the
+     code flow with PKCE, the mailbox as `login_hint`); sign in as the
+     mailbox and allow Forge, and the server sends you back to the page.
+     The flow is bound to your Forge sign-in and this browser, and expires
+     after 10 minutes.
+   - **On another device** (the device authorization grant, RFC 8628): the
+     page shows a code and where to enter it, and waits until the mailbox
+     has allowed Forge.
+   - **With the client credentials grant**, when the server issues tokens
+     to a client itself: no mailbox authorizes Forge.
+4. **Send test email.**
+
+Forge keeps the refresh token sealed with the settings and stores a new one
+whenever the server rotates it; instances take turns refreshing, so two
+never spend the same refresh token. When the server refuses a refresh
+(`invalid_grant`: the authorization was revoked or expired), sending stops
+and the page asks for a new authorization. A token the mail server refuses
+is dropped and the next send gets a new one. Saving the settings keeps the
+client and the authorization while the issuer and the mailbox stay the
+same. Forge deletes a client it registered (RFC 7592) when the settings stop
+using it, or names it so that it can be removed on the server when the
+server offers no way to.
+
+**Stalwart.** Stalwart 0.16 has all of this built in: its issuer is its
+public https URL. Registration wants an account allowed to register OAuth
+clients (the administrator account is), so choose *An account of the mail
+server* and enter it. Stalwart offers no RFC 7592 management: remove a client
+Forge no longer uses under its OAuth clients. Authorize in the browser on
+Stalwart's sign-in page, or on another device at Stalwart's `/device` page.
+Stalwart issues no tokens by the client credentials grant. The mailbox's
+account needs the permission to send email; a refused token is answered
+`535 5.7.8`, which the test send shows.
+
+The admin API is `POST /admin/settings/email/oauth/register` (body
+`{"initial_access_token": "…"}`, `{"username": "…", "password": "…"}` or
+`{}`), `DELETE /admin/settings/email/oauth/client`,
+`POST /admin/settings/email/oauth/authorize` (`{"method":
+"authorization_code" | "device" | "client_credentials"}`),
+`GET /admin/settings/email/oauth/callback` and
+`POST /admin/settings/email/oauth/device/{id}` (one poll of a device
+authorization).
 
 ## Secret encryption at rest
 
