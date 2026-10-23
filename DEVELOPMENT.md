@@ -358,12 +358,7 @@ Every account is named by a UPN, `local-part@domain` (admin user creation,
 the bootstrap admin, `oidc` realm provisioning, credential-forwarding
 accounts). The rule is `is_upn` in `crates/db/src/username.rs` (mirrored by
 `upnError` in `web/src/api/users.ts`); see
-[docs/deployment.md](docs/deployment.md#usernames). Accounts from before 2.0
-are renamed at startup: `rename_legacy_usernames` in
-`crates/db/src/user_dao.rs`, run by `forge_db::migrate` after the SQL
-migrations, renames each name that is no UPN to `<name>@example.com` (logged
-as a warning), and moves the bootstrap admin's markers with it. It goes in
-2.1.0 (#389).
+[docs/deployment.md](docs/deployment.md#usernames).
 
 A `credential_forwarding` realm creates no accounts: an administrator creates
 each one (`POST /admin/users` with `realm`, or **Admin → Users**), and a login
