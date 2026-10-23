@@ -919,6 +919,17 @@ fn repo_error(e: RepoError) -> Response {
             "temporarily unavailable, try again later",
         )
             .into_response(),
+        // An outage of the proxy's upstream, not a fault of Forge: logged as
+        // a warning (the error names the upstream URL), retried by clients.
+        RepoError::Upstream(_) => {
+            tracing::warn!(error = %e, "proxy upstream unavailable and nothing cached answers");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+                "the upstream is unavailable, try again later",
+            )
+                .into_response()
+        }
         RepoError::FormatUnavailable(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "the repository's format is not installed on this server",

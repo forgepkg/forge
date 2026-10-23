@@ -44,7 +44,7 @@ use axum::routing::get;
 use axum::Router;
 use forge_cache::Cache;
 use forge_core::repo::proxy::ProxyRepo;
-use forge_core::repo::RepoReadOps;
+use forge_core::repo::{RepoError, RepoReadOps};
 use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_plugin_api::{
@@ -900,7 +900,54 @@ async fn unauthorized_upstream_is_an_error_not_an_empty_listing() {
     let mock = start_mock_with_auth(sample_corpus("1.2.3"), Some("Basic x".into())).await;
     let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
-    assert!(px.list_versions(&repo, "Sample.Lib").await.is_err());
+    assert!(matches!(
+        px.list_versions(&repo, "Sample.Lib").await,
+        Err(RepoError::Storage(_))
+    ));
+}
+
+/// #283: an upstream that does not answer (nothing listens on its port), or
+/// answers 5xx, while nothing is cached is unavailable (the server answers
+/// 503 with `Retry-After`), not a failure of the proxy (500). An upstream
+/// refusing the proxy's credentials stays one (above).
+#[tokio::test]
+async fn an_unavailable_upstream_is_an_upstream_error() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    let unavailable = |result: Result<bool, RepoError>| match result {
+        Err(RepoError::Upstream(reason)) => reason,
+        other => panic!("expected an unavailable upstream, got {other:?}"),
+    };
+
+    // Connection refused, for the index and so for everything behind it.
+    let closed = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let repo = make_proxy(&pool, &format!("http://{closed}/index.json"), 0, true).await;
+    let reason = unavailable(px.list_versions(&repo, "Sample.Lib").await.map(|_| true));
+    assert!(reason.contains(&closed.to_string()), "{reason}");
+    unavailable(px.registration(&repo, "Sample.Lib").await.map(|_| true));
+    unavailable(
+        px.resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+            .await
+            .map(|l| l.is_some()),
+    );
+
+    // The index answers, a listing is a 503, a package a 500.
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    mock.state.listings_fail.store(true, Ordering::SeqCst);
+    unavailable(px.list_versions(&repo, "Other.Lib").await.map(|_| true));
+    mock.state.listings_fail.store(false, Ordering::SeqCst);
+    mock.fail_nupkg("sample.lib", "1.2.3");
+    unavailable(
+        px.resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+            .await
+            .map(|l| l.is_some()),
+    );
 }
 
 /// Requests a mock upstream has answered, per resource.
