@@ -16,7 +16,18 @@ const SECTIONS = [
   {
     to: '/manage/users',
     title: 'Users & tokens',
-    description: 'Create and delete accounts; issue and revoke their registry tokens.',
+    description:
+      'Create and delete accounts; assign their roles; issue, scope and revoke their registry tokens.',
+  },
+  {
+    to: '/manage/roles',
+    title: 'Roles',
+    description: 'Roles, the grants they carry on repositories, and their members.',
+  },
+  {
+    to: '/manage/content-selectors',
+    title: 'Content selectors',
+    description: 'Package-name patterns that narrow a grant to some packages.',
   },
   {
     to: '/manage/realms',
@@ -27,9 +38,10 @@ const SECTIONS = [
 
 /**
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
- * `is_admin`. Links to the repositories, users (incl. per-user tokens), and
- * authentication-realm management screens, and names what only the `/admin`
- * API manages (CHANGELOG "Known limitations").
+ * `is_admin`. Links to the repositories, users (incl. per-user tokens and
+ * roles), roles, content selectors and authentication-realm management
+ * screens, and names what only the `/admin` API manages (CHANGELOG "Known
+ * limitations").
  */
 function AdminHome() {
   return (
@@ -37,9 +49,10 @@ function AdminHome() {
       <div>
         <Heading>Administration</Heading>
         <Text className="mt-1">
-          Manage repositories, users and their API tokens, and authentication
-          realms. Retention, RBAC roles and grants, user deactivation and key
-          rotation have no screen yet; use the <Code>/admin</Code> API.
+          Manage repositories, users and their API tokens, roles and their
+          grants, content selectors, and authentication realms. Retention,
+          user deactivation and key rotation have no screen yet; use the{' '}
+          <Code>/admin</Code> API.
         </Text>
       </div>
       <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

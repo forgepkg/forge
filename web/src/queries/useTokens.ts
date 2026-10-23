@@ -8,9 +8,11 @@ import {
   fetchTokens,
   revokeMyToken,
   revokeToken,
+  setTokenScope,
   tokenKeys,
   type CreatedToken,
   type CreateToken,
+  type TokenScope,
   type TokenView,
 } from '~/api/tokens'
 
@@ -46,6 +48,17 @@ export function useRevokeToken(userId: number) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, number>({
     mutationFn: (id) => revokeToken(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: tokenKeys.list(userId) })
+    },
+  })
+}
+
+/** Set (or, with `null`, clear) a token's scope; invalidates the owner's list. */
+export function useSetTokenScope(userId: number) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, { id: number; scope: TokenScope | null }>({
+    mutationFn: ({ id, scope }) => setTokenScope(id, scope),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: tokenKeys.list(userId) })
     },
