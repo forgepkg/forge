@@ -10,7 +10,8 @@ and no API proxy in production. The admin **screens** live under `/manage/*`
 ## Develop
 
 This project uses **pnpm** (pinned via `packageManager` in `package.json`; run
-`corepack enable` to activate it). The default npm registry is configured with a
+`corepack enable` to activate it, after `npm install -g corepack` on Node 25+,
+which no longer bundles corepack). The default npm registry is configured with a
 7-day `minimumReleaseAge` cooldown in `pnpm-workspace.yaml` — pnpm will not pull
 a dependency version published within the last week (supply-chain hardening).
 
