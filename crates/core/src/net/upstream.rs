@@ -150,6 +150,25 @@ pub enum UpstreamError {
     },
 }
 
+impl UpstreamError {
+    /// Whether the upstream is unavailable for now rather than wrong: it did
+    /// not answer (refused, not resolved, cut off, timed out) or answered
+    /// that it cannot serve now (a 5xx, a 429). Asking again later may work;
+    /// a malformed URL, a refused target or an unusable answer will not.
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            UpstreamError::Transport { source, .. } => !source.is_builder(),
+            UpstreamError::Status { status, .. } => status_is_unavailable(*status),
+            _ => false,
+        }
+    }
+}
+
+/// Whether an upstream's `status` says it cannot serve now: a 5xx, a 429.
+pub fn status_is_unavailable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Host names of cloud instance-metadata services.
 const METADATA_HOSTS: &[&str] = &[
     "metadata",
@@ -1057,6 +1076,45 @@ mod tests {
         assert!(resolve("metadata.google.internal").await.is_err());
         assert!(!is_metadata_ip("127.0.0.1".parse().unwrap()));
         assert!(is_metadata_ip("169.254.169.254".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_does_not_answer_or_answers_5xx_is_unavailable() {
+        use axum_like_server::serve_raw;
+
+        let http = UpstreamHttp::new(UpstreamHttpConfig::default()).unwrap();
+        // Nothing listens on the port.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let e = http
+            .get_bytes(&format!("http://{closed}/index.json"), None)
+            .await
+            .unwrap_err();
+        assert!(e.is_unavailable(), "{e}");
+        for (status, unavailable) in [
+            (500, true),
+            (502, true),
+            (503, true),
+            (429, true),
+            (401, false),
+            (403, false),
+            (410, false),
+        ] {
+            let url = serve_raw(
+                format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .into_bytes(),
+            )
+            .await;
+            let e = http.get_bytes(&url, None).await.unwrap_err();
+            assert_eq!(e.is_unavailable(), unavailable, "{status}: {e}");
+        }
+        let too_large = UpstreamError::TooLarge {
+            url: "http://feed.example.com/".into(),
+            limit: 1,
+        };
+        assert!(!too_large.is_unavailable());
     }
 
     #[tokio::test]
