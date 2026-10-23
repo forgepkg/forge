@@ -16,7 +16,7 @@ import { renderApp } from '~/test/renderApp'
  *    package name matches the unsaved patterns;
  *  - editing keeps the name fixed and saves both lists;
  *  - deleting first names the grants (role, action, repository) that go with
- *    the selector.
+ *    the selector, in a confirmation dialog.
  */
 
 let api: FakeRbacApi
@@ -134,7 +134,7 @@ describe('admin content selectors', () => {
     await renderApp('/manage/content-selectors')
 
     await u.click(await screen.findByRole('button', { name: 'Delete acme' }))
-    const confirm = await screen.findByRole('region', { name: 'Delete selector acme' })
+    const confirm = await screen.findByRole('dialog', { name: 'Delete acme?' })
     expect(
       await within(confirm).findByText('ci-pushers: write on internal (packages of acme)'),
     ).toBeInTheDocument()

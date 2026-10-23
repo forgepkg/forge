@@ -52,9 +52,9 @@ describe('admin user roles', () => {
     await renderApp('/manage/users')
 
     const row = (name: string) =>
-      screen.getByRole('button', { name }).closest('tr')!
+      screen.getByRole('link', { name }).closest('tr')!
     const cells = (name: string) => within(row(name)).getAllByRole('cell')
-    await screen.findByRole('button', { name: 'alice' })
+    await screen.findByRole('link', { name: 'alice' })
     expect(screen.getByRole('columnheader', { name: 'Access' })).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'Roles' })).toBeInTheDocument()
 
@@ -155,7 +155,7 @@ describe('admin user roles', () => {
     expect(api.sent('PUT', /\/roles$/)[0].body).toEqual({ role_id: 7 })
 
     const row = (
-      await screen.findByRole('button', { name: 'carol@example.com' })
+      await screen.findByRole('link', { name: 'carol@example.com' })
     ).closest('tr')!
     await waitFor(() =>
       expect(within(row).getByText('ci-pushers')).toBeInTheDocument(),
@@ -180,7 +180,7 @@ describe('admin user roles', () => {
       'Created dave@example.com, but could not give it the role ci-pushers: role not found',
     )
     expect(
-      await screen.findByRole('button', { name: 'dave@example.com' }),
+      await screen.findByRole('link', { name: 'dave@example.com' }),
     ).toBeInTheDocument()
     expect(screen.getByLabelText('Username')).toHaveValue('')
   })
@@ -252,10 +252,7 @@ describe('admin user roles', () => {
     await u.click(screen.getByRole('checkbox', { name: /^write/ }))
     await u.click(screen.getByRole('radio', { name: /^Only these repositories/ }))
     // Admin needs every repository.
-    expect(screen.getByRole('checkbox', { name: /^admin/ })).toHaveAttribute(
-      'aria-disabled',
-      'true',
-    )
+    expect(screen.getByRole('checkbox', { name: /^admin/ })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Create token' })).toBeDisabled()
     expect(screen.getByText('Choose at least one repository.')).toBeInTheDocument()
     await u.click(await screen.findByRole('checkbox', { name: 'internal' }))
