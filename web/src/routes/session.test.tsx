@@ -121,7 +121,7 @@ describe('session expiry', () => {
     setSession('live-csrf')
     const server = fakeServer(readerMe)
     const { router, queryClient } = await renderApp('/')
-    const header = await screen.findByRole('banner')
+    const header = await screen.findByRole('navigation', { name: 'Main' })
     expect(await within(header).findByText('alice')).toBeInTheDocument()
 
     // The session expires server-side; the next identity refetch (window
@@ -162,7 +162,7 @@ describe('session expiry', () => {
     setSession('live-csrf')
     const server = fakeServer(adminMe)
     const { router, queryClient } = await renderApp('/')
-    await within(await screen.findByRole('banner')).findByText('root')
+    await within(await screen.findByRole('navigation', { name: 'Main' })).findByText('root')
 
     // Expire, then navigate in-app: the guards resolve the cached identity,
     // the page's own data query is the first to see the 401.
@@ -196,10 +196,10 @@ describe('sign-out', () => {
     setSession('live-csrf')
     fakeServer(readerMe)
     const { router, queryClient } = await renderApp('/')
-    const header = await screen.findByRole('banner')
+    const header = await screen.findByRole('navigation', { name: 'Main' })
     await within(header).findByText('alice')
     // The Browse screen cached this user's repository list.
-    await screen.findByRole('link', { name: /nuget/ })
+    await within(screen.getByRole('main')).findByRole('link', { name: /nuget/ })
     expect(queryClient.getQueryCache().getAll().length).toBeGreaterThan(1)
 
     await userEvent.click(within(header).getByRole('button', { name: 'Sign out' }))

@@ -120,12 +120,12 @@ describe('RawBrowse', () => {
     const user = userEvent.setup()
     const router = await renderApp('/repos/binaries')
 
-    const list = await screen.findByRole('list', { name: 'Contents of binaries/' })
+    const list = await screen.findByRole('table', { name: 'Contents of binaries/' })
     await user.click(within(list).getByRole('button', { name: /pdfium\// }))
     await waitFor(() =>
       expect(router.state.location.search).toEqual({ path: 'pdfium/' }),
     )
-    const dir = await screen.findByRole('list', { name: 'Contents of binaries/pdfium/' })
+    const dir = await screen.findByRole('table', { name: 'Contents of binaries/pdfium/' })
     expect(within(dir).getByText('7350/')).toBeInTheDocument()
     expect(within(dir).getByText('2.0 KiB')).toBeInTheDocument()
     expect(
@@ -158,7 +158,7 @@ describe('RawBrowse', () => {
     expect(within(details).getByText('application/gzip')).toBeInTheDocument()
     expect(within(details).getByText('ab'.repeat(32))).toBeInTheDocument()
     expect(
-      within(details).getByText(
+      within(details).getByDisplayValue(
         'https://forge.example.com/raw/binaries/pdfium/pdfium%20linux.tgz',
       ),
     ).toBeInTheDocument()
@@ -168,7 +168,8 @@ describe('RawBrowse', () => {
     )
 
     await user.click(within(details).getByRole('button', { name: 'Delete…' }))
-    await user.click(within(details).getByRole('button', { name: 'Delete file' }))
+    const confirm = screen.getByRole('dialog', { name: 'Delete pdfium linux.tgz?' })
+    await user.click(within(confirm).getByRole('button', { name: 'Delete file' }))
     await waitFor(() =>
       expect(
         calls.find((c) => c.method === 'DELETE')?.url.toString(),
@@ -200,10 +201,11 @@ describe('RawBrowse', () => {
     const user = userEvent.setup()
     const router = await renderApp('/repos/binaries?path=pdfium/')
 
-    await screen.findByRole('list', { name: 'Contents of binaries/pdfium/' })
+    await screen.findByRole('table', { name: 'Contents of binaries/pdfium/' })
     expect(screen.queryByRole('form', { name: 'Upload files' })).toBeNull()
     await user.click(screen.getByRole('button', { name: 'Delete this directory…' }))
-    await user.click(screen.getByRole('button', { name: 'Delete directory' }))
+    const confirm = screen.getByRole('dialog', { name: 'Delete pdfium/?' })
+    await user.click(within(confirm).getByRole('button', { name: 'Delete directory' }))
     await waitFor(() => expect(router.state.location.search).toEqual({}))
     const del = calls.find((c) => c.method === 'DELETE')
     expect(del?.url.pathname).toBe('/admin/repositories/binaries/files')

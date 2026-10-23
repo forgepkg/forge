@@ -1,10 +1,11 @@
-import { useState } from 'react'
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { Fragment, useState } from 'react'
+import { createFileRoute } from '@tanstack/react-router'
 
 import {
   IMPORT_FORMATS,
   isActive,
   type CreateImport,
+  type ImportState,
   type ImportView,
   type ItemState,
   type OnConflict,
@@ -18,15 +19,30 @@ import {
   useImports,
   useResumeImport,
 } from '~/queries/useImports'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
-import { Description, Field, Label } from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
-import { Text } from '~/components/catalyst/text'
+import {
+  Button,
+  CellStack,
+  Checkbox,
+  Code,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  ProgressBar,
+  SelectField,
+  Skeleton,
+  StatusBadge,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  TextField,
+  type Tone,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
+import { EmptyState } from '~/components/EmptyState'
 import { formatBytes, formatDateTime } from '~/lib/oci'
 
 export const Route = createFileRoute('/_app/manage/repositories/$repo/import')(
@@ -35,13 +51,23 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo/import')(
   },
 )
 
-const STATE_COLORS = {
-  queued: 'zinc',
-  running: 'sky',
-  completed: 'green',
-  failed: 'red',
-  cancelled: 'amber',
-} as const
+const STATE_TONES: Record<ImportState, Tone> = {
+  queued: 'neutral',
+  running: 'heat',
+  completed: 'ok',
+  failed: 'danger',
+  cancelled: 'neutral',
+}
+
+const ITEM_TONES: Record<ItemState, Tone> = {
+  imported: 'ok',
+  replaced: 'ok',
+  identical: 'neutral',
+  planned: 'neutral',
+  conflict: 'warn',
+  failed: 'danger',
+  pending: 'neutral',
+}
 
 /**
  * Import a Nexus hosted repository into this hosted repository (the admin
@@ -56,53 +82,57 @@ function ImportRepository() {
   const repo = useRepository(name)
   const imports = useImports(name)
 
+  const crumbs = [
+    { label: 'Repositories', to: '/manage/repositories' },
+    { label: name, to: '/manage/repositories/$repo', params: { repo: name } },
+    { label: 'Import' },
+  ]
+
   if (repo.isError) {
     return (
-      <ErrorState
-        title="Could not load repository"
-        message={repo.error?.message}
-        onRetry={() => void repo.refetch()}
-      />
+      <Page>
+        <PageHeader title={`Import into ${name}`} icon="Download" crumbs={crumbs} />
+        <ErrorState
+          title="Could not load repository"
+          message={repo.error?.message}
+          onRetry={() => void repo.refetch()}
+        />
+      </Page>
     )
   }
   if (repo.isLoading || !repo.data) {
-    return <Text>Loading repository…</Text>
+    return (
+      <Page>
+        <PageHeader title={`Import into ${name}`} icon="Download" crumbs={crumbs} />
+        <Skeleton lines={4} label="Loading repository…" />
+      </Page>
+    )
   }
   const supported =
     repo.data.kind === 'hosted' && IMPORT_FORMATS.includes(repo.data.format)
   const active = (imports.data ?? []).find(isActive)
+  const all = imports.data ?? []
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Link
-          to="/manage/repositories/$repo"
-          params={{ repo: name }}
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          ← Back to {name}
-        </Link>
-        <Heading className="mt-1">
-          Import into <span className="font-mono">{name}</span>
-        </Heading>
-        <Text className="mt-1">
-          Copy the packages of a Nexus 3 hosted repository of the same format
-          into this repository, with their publish dates, last downloads and
-          uploaders. Versions Forge already has with the same bytes are
-          skipped, so running an import again copies only what is new: import
-          once, then again just before clients switch to Forge.
-        </Text>
-      </div>
+    <Page>
+      <PageHeader
+        title={`Import into ${name}`}
+        icon="Download"
+        crumbs={crumbs}
+        kind={repo.data.kind}
+        format={repo.data.format}
+        description="Copy the packages of a Nexus 3 hosted repository of the same format into this repository, with their publish dates, last downloads and uploaders. Versions Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
+      />
 
       {!supported ? (
-        <Text>
+        <Notice tone="info">
           Imports go to a hosted NuGet, Helm or Docker repository; this is a{' '}
           {repo.data.format} {repo.data.kind} repository.
-        </Text>
+        </Notice>
       ) : active ? (
-        <Text>
+        <Notice tone="info">
           An import is {active.state}; a repository runs one import at a time.
-        </Text>
+        </Notice>
       ) : imports.isSuccess ? (
         <StartImportForm
           key={imports.data[0]?.id ?? 'first'}
@@ -112,8 +142,7 @@ function ImportRepository() {
         />
       ) : null}
 
-      <div className="space-y-4">
-        <Subheading>Imports</Subheading>
+      <Panel title="Imports" count={imports.isSuccess ? all.length : undefined}>
         {imports.isError ? (
           <ErrorState
             title="Could not load the imports"
@@ -121,16 +150,21 @@ function ImportRepository() {
             onRetry={() => void imports.refetch()}
           />
         ) : imports.isLoading ? (
-          <Text>Loading imports…</Text>
-        ) : (imports.data ?? []).length === 0 ? (
-          <Text>No imports yet.</Text>
+          <Skeleton lines={3} label="Loading imports…" />
+        ) : all.length === 0 ? (
+          <EmptyState title="No imports yet" icon="Download" bordered={false}>
+            The imports of this repository show here, with their progress.
+          </EmptyState>
         ) : (
-          (imports.data ?? []).map((i) => (
-            <ImportCard key={i.id} repo={name} imp={i} />
+          all.map((i, n) => (
+            <Fragment key={i.id}>
+              {n > 0 && <hr className="fg-divider" />}
+              <ImportCard repo={name} imp={i} />
+            </Fragment>
           ))
         )}
-      </div>
-    </section>
+      </Panel>
+    </Page>
   )
 }
 
@@ -197,121 +231,115 @@ function StartImportForm({
   }
 
   return (
-    <form
+    <Panel
+      as="form"
       onSubmit={handleSubmit}
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-    >
-      <Subheading>Import from Nexus</Subheading>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Nexus URL</Label>
-          <Description>With its context path, if it has one.</Description>
-          <Input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://nexus.example.com"
-          />
-        </Field>
-        <Field>
-          <Label>Nexus repository</Label>
-          <Description>A hosted repository of the same format.</Description>
-          <Input
-            value={source}
-            onChange={(e) => setSource(e.target.value)}
-            placeholder={docker ? 'docker-hosted' : 'nuget-hosted'}
-          />
-        </Field>
-        <Field>
-          <Label>Username</Label>
-          <Description>Leave empty to read anonymously.</Description>
-          <Input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="off"
-          />
-        </Field>
-        <Field>
-          <Label>Password</Label>
-          <Description>
-            Sealed with the secret encryption, and deleted when the import
-            completes.
-          </Description>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="new-password"
-          />
-        </Field>
-        {docker && (
-          <Field className="sm:col-span-2">
-            <Label>Registry URL</Label>
-            <Description>
-              The Nexus repository&rsquo;s registry API. Empty: its path route,{' '}
-              <span className="font-mono">
-                &lt;Nexus URL&gt;/repository/&lt;name&gt;
-              </span>
-              ; otherwise its connector, e.g.{' '}
-              <span className="font-mono">http://nexus.example.com:8082</span>.
-            </Description>
-            <Input
-              value={registryUrl}
-              onChange={(e) => setRegistryUrl(e.target.value)}
-            />
-          </Field>
-        )}
-        <Field>
-          <Label>A version Forge has with other bytes</Label>
-          <Select
-            value={onConflict}
-            onChange={(e) => setOnConflict(e.target.value as OnConflict)}
-          >
-            <option value="skip">Skip it and report it</option>
-            <option value="overwrite">Overwrite it with Nexus&rsquo; bytes</option>
-            <option value="fail">Fail the import</option>
-          </Select>
-        </Field>
-        <Field>
-          <Label>Concurrency</Label>
-          <Description>Items copied at a time (1–16).</Description>
-          <Input
-            type="number"
-            value={concurrency}
-            onChange={(e) => setConcurrency(e.target.value)}
-          />
-        </Field>
-      </div>
-      <CheckboxField>
-        <Checkbox checked={dryRun} onChange={setDryRun} />
-        <Label>Dry run</Label>
-        <Description>
-          Count what would be copied, its size and the conflicts, without
-          writing anything.
-        </Description>
-      </CheckboxField>
-      <div className="flex items-center gap-3">
-        <Button type="submit" disabled={create.isPending}>
+      title="Import from Nexus"
+      footer={
+        <Button
+          type="submit"
+          variant="primary"
+          icon="Download"
+          disabled={create.isPending}
+        >
           {create.isPending
             ? 'Checking Nexus…'
             : dryRun
               ? 'Start dry run'
               : 'Start import'}
         </Button>
+      }
+    >
+      <div className="fg-form">
+        <div className="fg-fieldrow">
+          <TextField
+            label="Nexus URL"
+            mono
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://nexus.example.com"
+            description="With its context path, if it has one."
+          />
+          <TextField
+            label="Nexus repository"
+            mono
+            value={source}
+            onChange={(e) => setSource(e.target.value)}
+            placeholder={docker ? 'docker-hosted' : 'nuget-hosted'}
+            description="A hosted repository of the same format."
+          />
+        </div>
+        <div className="fg-fieldrow">
+          <TextField
+            label="Username"
+            optional
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="off"
+            description="Leave empty to read anonymously."
+          />
+          <TextField
+            label="Password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+            description="Sealed with the secret encryption, and deleted when the import completes."
+          />
+        </div>
+        {docker && (
+          <TextField
+            label="Registry URL"
+            optional
+            mono
+            value={registryUrl}
+            onChange={(e) => setRegistryUrl(e.target.value)}
+            description={
+              <>
+                The Nexus repository&rsquo;s registry API. Empty: its path route,{' '}
+                <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;</Code>; otherwise its
+                connector, e.g. <Code>http://nexus.example.com:8082</Code>.
+              </>
+            }
+          />
+        )}
+        <div className="fg-fieldrow">
+          <SelectField
+            label="A version Forge has with other bytes"
+            value={onConflict}
+            onChange={(e) => setOnConflict(e.target.value as OnConflict)}
+          >
+            <option value="skip">Skip it and report it</option>
+            <option value="overwrite">Overwrite it with Nexus&rsquo; bytes</option>
+            <option value="fail">Fail the import</option>
+          </SelectField>
+          <TextField
+            label="Concurrency"
+            type="number"
+            mono
+            value={concurrency}
+            onChange={(e) => setConcurrency(e.target.value)}
+            description="Items copied at a time (1–16)."
+          />
+        </div>
+        <Checkbox
+          label="Dry run"
+          checked={dryRun}
+          onChange={setDryRun}
+          description="Count what would be copied, its size and the conflicts, without writing anything."
+        />
+        {formError && <Notice tone="danger">{formError}</Notice>}
+        {create.isError && (
+          <Notice tone="danger" title="Nexus refused the import">
+            {create.error.body || create.error.message}
+          </Notice>
+        )}
       </div>
-      {formError && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-          {formError}
-        </p>
-      )}
-      {create.isError && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-          {create.error.body || create.error.message}
-        </p>
-      )}
-    </form>
+    </Panel>
   )
 }
 
+/** One import of the repository: its state, progress, counts and actions. */
 function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
   const cancel = useCancelImport(repo)
   const resume = useResumeImport(repo)
@@ -338,19 +366,22 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
   }
 
   return (
-    <article
-      aria-label={`Import ${imp.id}`}
-      className="space-y-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-    >
+    <article aria-label={`Import ${imp.id}`} className="grid min-w-0 gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        <Badge color={STATE_COLORS[imp.state]}>{imp.state}</Badge>
-        {imp.dry_run && <Badge color="violet">dry run</Badge>}
-        {active && imp.cancel_requested && <Badge>cancelling</Badge>}
-        <span className="font-mono text-sm/6">
+        <StatusBadge tone={STATE_TONES[imp.state]}>{imp.state}</StatusBadge>
+        {imp.dry_run && (
+          <StatusBadge tone="neutral" dot={false}>
+            dry run
+          </StatusBadge>
+        )}
+        {active && imp.cancel_requested && (
+          <StatusBadge tone="warn">cancelling</StatusBadge>
+        )}
+        <span className="fg-mono min-w-0 text-ink [overflow-wrap:anywhere]">
           {imp.url} · {imp.source_repository}
         </span>
       </div>
-      <Text>
+      <p className="fg-text">
         {imp.state === 'queued'
           ? 'Waiting for a worker.'
           : imp.phase === 'scan' && active
@@ -361,22 +392,22 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         Started {formatDateTime(imp.started_at ?? imp.created_at)}
         {imp.finished_at && `, ended ${formatDateTime(imp.finished_at)}`}.
         {imp.nexus_version && ` ${imp.nexus_version}.`}
-      </Text>
+      </p>
       {p.found > 0 && (
-        <div
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={p.found}
-          aria-valuenow={done}
-          className="h-1.5 overflow-hidden rounded-full bg-zinc-950/5 dark:bg-white/10"
-        >
-          <div
-            className="h-full bg-sky-500"
-            style={{ width: `${(done / p.found) * 100}%` }}
-          />
-        </div>
+        <ProgressBar
+          value={done}
+          max={p.found}
+          valueText={`${done} of ${p.found}`}
+          tone={
+            imp.state === 'completed'
+              ? 'ok'
+              : imp.state === 'failed'
+                ? 'danger'
+                : undefined
+          }
+        />
       )}
-      <dl className="flex flex-wrap gap-x-6 gap-y-1 text-sm/6">
+      <ul className="m-0 flex list-none flex-wrap gap-2 p-0" aria-label="Items">
         {(
           [
             ['imported', p.imported],
@@ -390,52 +421,46 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         )
           .filter(([, n]) => n > 0)
           .map(([state, n]) => (
-            <div key={state} className="flex gap-1">
-              <dt className="text-zinc-500 dark:text-zinc-400">{state}</dt>
-              <dd className="font-medium">{n}</dd>
-            </div>
+            <li key={state}>
+              <StatusBadge tone={ITEM_TONES[state]}>{`${n} ${state}`}</StatusBadge>
+            </li>
           ))}
-        <div className="flex gap-1">
-          <dt className="text-zinc-500 dark:text-zinc-400">copied</dt>
-          <dd className="font-medium">{formatBytes(p.bytes_copied)}</dd>
-        </div>
+        <li>
+          <StatusBadge dot={false}>{`${formatBytes(p.bytes_copied)} copied`}</StatusBadge>
+        </li>
         {imp.dry_run && p.planned > 0 && (
-          <div className="flex gap-1">
-            <dt className="text-zinc-500 dark:text-zinc-400">would copy</dt>
-            <dd className="font-medium">{formatBytes(p.planned_size)}</dd>
-          </div>
+          <li>
+            <StatusBadge dot={false}>
+              {`would copy ${formatBytes(p.planned_size)}`}
+            </StatusBadge>
+          </li>
         )}
-      </dl>
+      </ul>
       {imp.last_error && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
+        <Notice tone="danger" title="The import stopped">
           {imp.last_error}
-        </p>
+        </Notice>
       )}
 
       <div className="flex flex-wrap items-end gap-3">
         {active && !imp.cancel_requested && (
-          <Button
-            outline
-            disabled={cancel.isPending}
-            onClick={() => cancel.mutate(imp.id)}
-          >
+          <Button disabled={cancel.isPending} onClick={() => cancel.mutate(imp.id)}>
             Cancel
           </Button>
         )}
         {!active && needsPassword && (p.failed > 0 || imp.state !== 'completed') && (
-          <Field className="min-w-56">
-            <Label>Nexus password</Label>
-            <Input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="new-password"
-            />
-          </Field>
+          <TextField
+            label="Nexus password"
+            type="password"
+            className="min-w-56"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+          />
         )}
         {(imp.state === 'cancelled' || imp.state === 'failed') && (
           <Button
-            outline
+            icon="Refresh"
             disabled={resume.isPending || (needsPassword && password === '')}
             onClick={() => doResume(false)}
           >
@@ -444,7 +469,7 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         )}
         {!active && p.failed > 0 && (
           <Button
-            outline
+            icon="Refresh"
             disabled={resume.isPending || (needsPassword && password === '')}
             onClick={() => doResume(true)}
           >
@@ -453,7 +478,8 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         )}
         {!active && (
           <Button
-            plain
+            variant="ghost"
+            icon="Trash"
             disabled={remove.isPending}
             onClick={() => remove.mutate(imp.id)}
           >
@@ -465,7 +491,9 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
           .map((s) => (
             <Button
               key={s}
-              plain
+              variant="ghost"
+              iconEnd={showItems === s ? 'ArrowUp' : 'ArrowDown'}
+              aria-expanded={showItems === s}
               onClick={() => setShowItems(showItems === s ? null : s)}
             >
               {showItems === s ? `Hide ${s}` : `Show ${s}`}
@@ -473,15 +501,14 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
           ))}
       </div>
       {error && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-          {error.body || error.message}
-        </p>
+        <Notice tone="danger">{error.body || error.message}</Notice>
       )}
       {showItems && <ItemList repo={repo} id={imp.id} state={showItems} />}
     </article>
   )
 }
 
+/** The items of an import in one state (its conflicts, its failures). */
 function ItemList({
   repo,
   id,
@@ -492,34 +519,34 @@ function ItemList({
   state: ItemState
 }) {
   const items = useImportItems(repo, id, state, true)
-  if (items.isLoading) return <Text>Loading…</Text>
+  if (items.isLoading) return <Skeleton variant="table" rows={3} columns={2} label="Loading…" />
   if (items.isError) {
-    return (
-      <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-        {items.error.message}
-      </p>
-    )
+    return <Notice tone="danger">{items.error.message}</Notice>
   }
   return (
-    <ul className="divide-y divide-zinc-950/5 text-sm/6 dark:divide-white/5">
-      {(items.data ?? []).map((item) => (
-        <li key={item.id} className="py-1.5">
-          <span className="font-mono">
-            {item.name} {item.version}
-          </span>
-          {item.size != null && (
-            <span className="text-zinc-500 dark:text-zinc-400">
-              {' '}
-              · {formatBytes(item.size)}
-            </span>
-          )}
-          {item.detail && (
-            <span className="block text-zinc-600 dark:text-zinc-400">
-              {item.detail}
-            </span>
-          )}
-        </li>
-      ))}
-    </ul>
+    <Table caption={`Items: ${state}`} dense>
+      <TableHead>
+        <TableHeader>Item</TableHeader>
+        <TableHeader width="120px" align="right">
+          Size
+        </TableHeader>
+      </TableHead>
+      <TableBody>
+        {(items.data ?? []).map((item) => (
+          <TableRow key={item.id}>
+            <TableCell lead>
+              <CellStack sub={item.detail ?? undefined}>
+                <span className="font-mono">
+                  {item.name} {item.version}
+                </span>
+              </CellStack>
+            </TableCell>
+            <TableCell align="right" nowrap>
+              {item.size != null ? formatBytes(item.size) : ''}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
   )
 }

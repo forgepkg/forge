@@ -1,13 +1,17 @@
 import type { AccessLevel } from '~/api/rbac'
-import { Badge } from '~/components/catalyst/badge'
+import { StatusBadge, type Tone } from '~/components/ui'
 
-const ACCESS_COLORS: Record<AccessLevel, 'red' | 'sky' | 'zinc'> = {
-  admin: 'red',
-  writer: 'sky',
-  reader: 'zinc',
+const ACCESS_TONES: Record<AccessLevel, Tone> = {
+  admin: 'heat',
+  writer: 'neutral',
+  reader: 'neutral',
 }
 
 /** A user's built-in access level (`accessLevel` in `~/api/rbac`). */
 export function AccessBadge({ level }: { level: AccessLevel }) {
-  return <Badge color={ACCESS_COLORS[level]}>{level}</Badge>
+  return (
+    <StatusBadge tone={ACCESS_TONES[level]} dot={level !== 'admin'}>
+      {level}
+    </StatusBadge>
+  )
 }

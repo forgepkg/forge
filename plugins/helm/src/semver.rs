@@ -3,6 +3,16 @@
 
 use std::cmp::Ordering;
 
+/// The longest chart version, as written and normalized. Helm pushes a chart
+/// to an OCI registry under its version as the tag (with `+` written `_`),
+/// and a tag is at most 128 characters (the OCI distribution spec's
+/// `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`), so no chart a Helm user can push to
+/// an OCI registry has a longer version. Without a limit a multi-kilobyte
+/// prerelease passed parsing and failed the `(repository_id, name, version)`
+/// index insert in PostgreSQL, so a push answered 500 instead of 400. A
+/// version is ASCII, so this counts bytes.
+pub const MAX_VERSION_LENGTH: usize = 128;
+
 /// A parsed version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
@@ -20,10 +30,15 @@ enum Ident {
 }
 
 impl Version {
-    /// Parse `raw`, or say why it is not a version.
+    /// Parse `raw`, or say why it is not a version. A version longer than
+    /// [`MAX_VERSION_LENGTH`], as written or normalized, is not one.
     pub fn parse(raw: &str) -> Result<Self, String> {
-        let s = raw.trim();
-        let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+        let written = raw.trim();
+        // Before parsing, so an oversized version is not copied around first.
+        if written.len() > MAX_VERSION_LENGTH {
+            return Err(too_long(written));
+        }
+        let s = written.strip_prefix(['v', 'V']).unwrap_or(written);
         let (rest, build) = match s.split_once('+') {
             Some((rest, build)) => (rest, Some(build)),
             None => (s, None),
@@ -82,14 +97,33 @@ impl Version {
             }
             None => String::new(),
         };
-        Ok(Version {
+        let version = Version {
             major,
             minor,
             patch,
             pre,
             build,
-        })
+        };
+        // Normalizing can lengthen a version (`1-x` → `1.0.0-x`).
+        let normalized = version.to_string();
+        if normalized.len() > MAX_VERSION_LENGTH {
+            return Err(format!(
+                "version {written:?} normalizes to {normalized:?}, longer than \
+                 {MAX_VERSION_LENGTH} characters"
+            ));
+        }
+        Ok(version)
     }
+}
+
+/// Why `written` is not a version: it is longer than [`MAX_VERSION_LENGTH`].
+/// The reason names only its start.
+fn too_long(written: &str) -> String {
+    let start: String = written.chars().take(MAX_VERSION_LENGTH).collect();
+    format!(
+        "version {:?} is longer than {MAX_VERSION_LENGTH} characters",
+        format!("{start}…")
+    )
 }
 
 impl std::fmt::Display for Version {
@@ -171,6 +205,27 @@ mod tests {
         ] {
             assert!(Version::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn refuses_versions_longer_than_an_oci_tag() {
+        let longest = format!("1.0.0-{}", "a".repeat(MAX_VERSION_LENGTH - 6));
+        assert_eq!(longest.len(), MAX_VERSION_LENGTH);
+        assert_eq!(v(&longest).to_string(), longest);
+        // Surrounding whitespace is not part of the version.
+        assert_eq!(v(&format!(" {longest}\n")).to_string(), longest);
+        let err = Version::parse(&format!("{longest}a")).unwrap_err();
+        assert!(err.contains("longer than 128 characters"), "{err}");
+        // A multi-kilobyte prerelease, named only by its start.
+        let err = Version::parse(&format!("1.0.0-{}", "x".repeat(4096))).unwrap_err();
+        assert!(err.len() < 200, "{err}");
+        // Normalized, `1-…` gains `.0.0`: the written form fits, not the
+        // normalized one.
+        let short = format!("1-{}", "a".repeat(MAX_VERSION_LENGTH - 2));
+        assert_eq!(short.len(), MAX_VERSION_LENGTH);
+        let err = Version::parse(&short).unwrap_err();
+        assert!(err.contains("normalizes to"), "{err}");
+        assert!(Version::parse(&format!("1-{}", "a".repeat(MAX_VERSION_LENGTH - 6))).is_ok());
     }
 
     #[test]

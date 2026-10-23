@@ -369,7 +369,7 @@ describe('repository names (M18)', () => {
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
     expect(onSubmit).not.toHaveBeenCalled()
     expect(screen.getByRole('alert')).toHaveTextContent(/no spaces/)
-    expect(screen.getByLabelText('Name')).toHaveAttribute('data-invalid')
+    expect(screen.getByLabelText('Name')).toHaveAttribute('aria-invalid', 'true')
 
     await user.clear(screen.getByLabelText('Name'))
     await user.type(screen.getByLabelText('Name'), 'new')
@@ -551,9 +551,9 @@ describe('docker repositories: create', () => {
 
     // "Allow moving latest" is only available with immutable tags.
     const latest = screen.getByLabelText(/Allow moving latest/)
-    expect(latest).toHaveAttribute('aria-disabled', 'true')
+    expect(latest).toBeDisabled()
     await user.click(screen.getByLabelText(/Immutable tags/))
-    expect(latest).not.toHaveAttribute('aria-disabled')
+    expect(latest).toBeEnabled()
     await user.click(latest)
     await create(user)
 

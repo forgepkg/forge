@@ -21,6 +21,7 @@ import {
 } from '~/api/email'
 import { ApiError } from '~/lib/httpClient'
 import { assignLocation } from '~/lib/navigation'
+import { formatDateTime } from '~/lib/oci'
 import {
   useDeleteEmailSettings,
   useEmailOauthClientCredentials,
@@ -32,22 +33,27 @@ import {
   useStartEmailOauthCodeFlow,
   useStartEmailOauthDeviceFlow,
 } from '~/queries/useEmail'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
 import {
-  Description,
-  Field,
-  FieldGroup,
+  Button,
+  Code,
+  Columns,
+  CopyButton,
+  CopyField,
+  Dialog,
+  FactList,
   Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
-import { Code, Text } from '~/components/catalyst/text'
-import { CommandSnippet } from '~/components/CopyButton'
+  FormActions,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+  StatusBadge,
+  Switch,
+  TextField,
+  type Fact,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { federatedSubject } from '~/components/RealmForm'
 
@@ -268,9 +274,10 @@ const TLS_LABELS: Record<SmtpTls, string> = {
  * **Admin → Email** (`/manage/settings/email`): the email service Forge sends
  * invitations and notifications through. The settings exist in the database
  * only (no `forge.toml` section, no `FORGE_*` variable): this screen is where
- * they are made. Shows the stored settings (the password write-only), the
- * outcome of the last send, a test send, and removing the settings. SMTP
- * with OAuth adds registering Forge and authorizing it.
+ * they are made. The main column holds the settings form (the secrets
+ * write-only) and, for SMTP with OAuth, registering Forge and authorizing
+ * it; the side column the stored settings' status, a test send and removing
+ * the settings.
  */
 function EmailSettingsScreen() {
   const settings = useEmailSettings()
@@ -278,89 +285,123 @@ function EmailSettingsScreen() {
   // Held here: the form remounts with what a save stored, its outcome stays.
   const save = useSaveEmailSettings()
 
+  const header = (
+    <PageHeader
+      title="Email"
+      description={
+        <>
+          The service Forge sends email through: invitations to new accounts
+          and notifications. It is configured here only; no{' '}
+          <Code>forge.toml</Code> setting or environment variable sets it, and a
+          change applies to every instance shortly after it is saved.
+        </>
+      }
+    />
+  )
+
   if (settings.isError) {
     return (
-      <ErrorState
-        title="Could not load the email settings"
-        message={settings.error?.message}
-        onRetry={() => void settings.refetch()}
-      />
+      <Page>
+        {header}
+        <ErrorState
+          title="Could not load the email settings"
+          message={settings.error?.message}
+          onRetry={() => void settings.refetch()}
+        />
+      </Page>
     )
   }
   if (settings.isLoading || !settings.data) {
-    return <Text>Loading email settings…</Text>
+    return (
+      <Page>
+        {header}
+        <Skeleton lines={6} label="Loading email settings…" />
+      </Page>
+    )
   }
   const stored = settings.data.configured ? settings.data : undefined
   const oauth = oauthOf(stored)
 
   return (
-    <section className="space-y-8">
-      <div>
-        <Heading>Email</Heading>
-        <Text className="mt-1">
-          The service Forge sends email through: invitations to new accounts
-          and notifications. It is configured here only; no{' '}
-          <Code>forge.toml</Code> setting or environment variable sets it, and a
-          change applies to every instance shortly after it is saved.
-        </Text>
-      </div>
+    <Page>
+      {header}
       {search.oauth && <OauthOutcomeNotice outcome={search.oauth} error={search.error} />}
-      {stored && <SendStatus stored={stored} />}
-      {/*
-       * Remount on a new `updated_at` or OAuth client, so the form shows what
-       * was stored.
-       */}
-      <EmailSettingsForm
-        key={`${stored?.updated_at ?? 'new'} ${oauth?.client_id ?? ''}`}
-        stored={stored}
-        save={save}
-      />
-      {stored && oauth && <OauthAuthorization stored={stored} oauth={oauth} />}
-      {stored && <TestSend />}
-      {stored && <RemoveSettings />}
-    </section>
+      <Columns
+        asideLabel="Email service"
+        aside={
+          stored && (
+            <>
+              <SendStatus stored={stored} />
+              <TestSend />
+              <RemoveSettings />
+            </>
+          )
+        }
+      >
+        {stored && <SendProblems stored={stored} />}
+        {/*
+         * Remount on a new `updated_at` or OAuth client, so the form shows what
+         * was stored.
+         */}
+        <EmailSettingsForm
+          key={`${stored?.updated_at ?? 'new'} ${oauth?.client_id ?? ''}`}
+          stored={stored}
+          save={save}
+        />
+        {stored && oauth && <OauthAuthorization stored={stored} oauth={oauth} />}
+      </Columns>
+    </Page>
   )
 }
 
-/** Whether email is on, the last send's outcome, unreadable secrets. */
+/** The side column's facts: whether email is on, how, and the last send. */
 function SendStatus({ stored }: { stored: EmailSettingsView }) {
+  const facts: Fact[] = [
+    {
+      term: 'State',
+      value: stored.enabled ? (
+        <StatusBadge tone="ok">sending</StatusBadge>
+      ) : (
+        <StatusBadge tone="neutral">turned off</StatusBadge>
+      ),
+    },
+    { term: 'Transport', value: TRANSPORT_LABELS[stored.transport.kind] },
+  ]
+  if (stored.last_success_at) {
+    facts.push({ term: 'Last sent', value: formatDateTime(stored.last_success_at) })
+  }
   return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap items-center gap-2">
-        {stored.enabled ? (
-          <Badge color="emerald">Sending</Badge>
-        ) : (
-          <Badge color="zinc">Turned off</Badge>
-        )}
-        {stored.last_success_at && (
-          <Text className="!text-sm">
-            Last sent {new Date(stored.last_success_at).toLocaleString()}.
-          </Text>
-        )}
-      </div>
+    <Panel title="Status">
+      <FactList items={facts} />
+    </Panel>
+  )
+}
+
+/** What needs attention: unreadable secrets, and the last send's failure. */
+function SendProblems({ stored }: { stored: EmailSettingsView }) {
+  if (!stored.secrets_unreadable && !stored.last_failure) return null
+  return (
+    <>
       {stored.secrets_unreadable && (
-        <p
-          role="alert"
-          className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-sm/6 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
-        >
+        <Notice tone="warn">
           The stored password does not decrypt (the secret-encryption root key
           changed). Enter it again below.
-        </p>
+        </Notice>
       )}
       {stored.last_failure && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-        >
-          The last send failed ({new Date(stored.last_failure.at).toLocaleString()}):{' '}
+        <Notice tone="danger">
+          The last send failed ({formatDateTime(stored.last_failure.at)}):{' '}
           {stored.last_failure.error}
-        </p>
+        </Notice>
       )}
-    </div>
+    </>
   )
 }
 
-/** The settings form; `PUT`s the whole document. */
+/**
+ * The settings form; `PUT`s the whole document. The sender and the transport
+ * are a panel each, with the outcome and the Save button after them.
+ */
 function EmailSettingsForm({
   stored,
   save,
@@ -372,105 +413,72 @@ function EmailSettingsForm({
   const set = <K extends keyof EmailFormValues>(key: K, value: EmailFormValues[K]) =>
     setValues((v) => ({ ...v, [key]: value }))
 
-
   function submit(e: React.FormEvent) {
     e.preventDefault()
     save.mutate(toEmailSettingsInput(values))
   }
 
   return (
-    <form onSubmit={submit} className="space-y-8" aria-label="Email settings">
-      {save.isSuccess && (
-        <p
-          role="status"
-          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-        >
-          Saved.
-        </p>
-      )}
-      {save.data?.warning && (
-        <p role="alert" className={NOTICE}>
-          Forge&apos;s earlier OAuth client was not deleted ({save.data.warning}).
-        </p>
-      )}
-      {save.isError && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-        >
-          {save.error.body || save.error.message}
-        </p>
-      )}
-
-      <Fieldset>
-        <Legend>Sender</Legend>
-        <FieldGroup>
-          <CheckboxField>
-            <Checkbox checked={values.enabled} onChange={(c) => set('enabled', c)} />
-            <Label>Send email</Label>
-            <Description>
-              Turned off, Forge keeps the settings but sends nothing.
-            </Description>
-          </CheckboxField>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field>
-              <Label>From address</Label>
-              <Input
-                type="email"
-                required
-                placeholder="forge@example.com"
-                value={values.from_address}
-                onChange={(e) => set('from_address', e.target.value)}
-              />
-            </Field>
-            <Field>
-              <Label>From name</Label>
-              <Input
-                placeholder="Forge"
-                value={values.from_name}
-                onChange={(e) => set('from_name', e.target.value)}
-              />
-            </Field>
-            <Field>
-              <Label>Reply-To</Label>
-              <Input
-                type="email"
-                value={values.reply_to}
-                onChange={(e) => set('reply_to', e.target.value)}
-              />
-              <Description>Optional: where replies go.</Description>
-            </Field>
-            <Field>
-              <Label>Invitation lifetime (hours)</Label>
-              <Input
-                type="number"
-                min={1}
-                max={720}
-                value={values.invitation_ttl_hours}
-                onChange={(e) => set('invitation_ttl_hours', e.target.value)}
-              />
-              <Description>How long an invitation link stays valid (1 to 720).</Description>
-            </Field>
+    <form onSubmit={submit} className="flex flex-col gap-6" aria-label="Email settings">
+      <Panel title="Sender">
+        <div className="fg-form">
+          <Switch
+            label="Send email"
+            // The label wraps the description too: name the switch by its label alone.
+            aria-label="Send email"
+            checked={values.enabled}
+            onChange={(c) => set('enabled', c)}
+            description="Turned off, Forge keeps the settings but sends nothing."
+          />
+          <div className="fg-fieldrow items-start">
+            <TextField
+              label="From address"
+              type="email"
+              required
+              placeholder="forge@example.com"
+              value={values.from_address}
+              onChange={(e) => set('from_address', e.target.value)}
+            />
+            <TextField
+              label="From name"
+              placeholder="Forge"
+              value={values.from_name}
+              onChange={(e) => set('from_name', e.target.value)}
+            />
+            <TextField
+              label="Reply-To"
+              type="email"
+              value={values.reply_to}
+              onChange={(e) => set('reply_to', e.target.value)}
+              description="Optional: where replies go."
+            />
+            <TextField
+              label="Invitation lifetime (hours)"
+              mono
+              type="number"
+              min={1}
+              max={720}
+              value={values.invitation_ttl_hours}
+              onChange={(e) => set('invitation_ttl_hours', e.target.value)}
+              description="How long an invitation link stays valid (1 to 720)."
+            />
           </div>
-        </FieldGroup>
-      </Fieldset>
+        </div>
+      </Panel>
 
-      <Fieldset>
-        <Legend>Transport</Legend>
-        <FieldGroup>
-          <Field className="sm:max-w-xs">
-            <Label>Send through</Label>
-            <Select
-              value={values.kind}
-              onChange={(e) => set('kind', e.target.value as TransportKind)}
-            >
-              {(Object.keys(TRANSPORT_LABELS) as TransportKind[]).map((kind) => (
-                <option key={kind} value={kind}>
-                  {TRANSPORT_LABELS[kind]}
-                </option>
-              ))}
-            </Select>
-          </Field>
+      <Panel title="Transport">
+        <div className="fg-form">
+          <SelectField
+            label="Send through"
+            value={values.kind}
+            onChange={(e) => set('kind', e.target.value as TransportKind)}
+          >
+            {(Object.keys(TRANSPORT_LABELS) as TransportKind[]).map((kind) => (
+              <option key={kind} value={kind}>
+                {TRANSPORT_LABELS[kind]}
+              </option>
+            ))}
+          </SelectField>
           {values.kind === 'microsoft_graph' ? (
             <GraphFields values={values} set={set} stored={stored} />
           ) : values.kind === 'smtp_oauth' ? (
@@ -478,12 +486,21 @@ function EmailSettingsForm({
           ) : (
             <SmtpFields values={values} set={set} stored={stored} />
           )}
-        </FieldGroup>
-      </Fieldset>
+        </div>
+      </Panel>
 
-      <Button type="submit" disabled={save.isPending}>
-        {save.isPending ? 'Saving…' : 'Save'}
-      </Button>
+      {save.isSuccess && <Notice tone="ok">Saved.</Notice>}
+      {save.data?.warning && (
+        <Notice tone="warn">
+          Forge&apos;s earlier OAuth client was not deleted ({save.data.warning}).
+        </Notice>
+      )}
+      {save.isError && <Notice tone="danger">{save.error.body || save.error.message}</Notice>}
+      <FormActions>
+        <Button type="submit" variant="primary" disabled={save.isPending}>
+          {save.isPending ? 'Saving…' : 'Save'}
+        </Button>
+      </FormActions>
     </form>
   )
 }
@@ -492,41 +509,82 @@ type SetField = <K extends keyof EmailFormValues>(key: K, value: EmailFormValues
 
 /** "set" or "not set" next to a write-only secret's label. */
 function SecretBadge({ set }: { set: boolean }) {
-  return set ? <Badge color="emerald">set</Badge> : <Badge color="zinc">not set</Badge>
+  return set ? (
+    <StatusBadge tone="ok">set</StatusBadge>
+  ) : (
+    <StatusBadge tone="neutral">not set</StatusBadge>
+  )
 }
 
-/** The SMTP server's host, encryption and port. */
+/** A write-only secret: blank keeps the stored one when the server would. */
+function SecretField({
+  label,
+  set,
+  keeps,
+  value,
+  onChange,
+  keepHint = 'A secret is stored; leave blank to keep it.',
+  blankHint = 'Never shown again once saved.',
+}: {
+  label: string
+  /** Whether a readable secret is stored. */
+  set: boolean
+  /** Whether a blank field keeps the stored secret. */
+  keeps: boolean
+  value: string
+  onChange: (value: string) => void
+  keepHint?: string
+  blankHint?: string
+}) {
+  return (
+    <TextField
+      label={
+        <>
+          {label} <SecretBadge set={set} />
+        </>
+      }
+      type="password"
+      autoComplete="new-password"
+      placeholder={keeps ? '(stored)' : ''}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      description={keeps ? keepHint : blankHint}
+    />
+  )
+}
+
+/** The SMTP server's host, then its encryption and port side by side. */
 function SmtpServerFields({ values, set }: { values: EmailFormValues; set: SetField }) {
   return (
     <>
-      <Field>
-        <Label>Host</Label>
-        <Input
-          required
-          placeholder="smtp.example.com"
-          value={values.host}
-          onChange={(e) => set('host', e.target.value)}
-        />
-      </Field>
-      <Field>
-        <Label>Encryption</Label>
-        <Select value={values.tls} onChange={(e) => set('tls', e.target.value as SmtpTls)}>
+      <TextField
+        label="Host"
+        mono
+        required
+        placeholder="smtp.example.com"
+        value={values.host}
+        onChange={(e) => set('host', e.target.value)}
+      />
+      <div className="fg-fieldrow items-start">
+        <SelectField
+          label="Encryption"
+          value={values.tls}
+          onChange={(e) => set('tls', e.target.value as SmtpTls)}
+          description={
+            values.tls === 'none'
+              ? 'Without TLS only a loopback host (a relay on this machine) is accepted.'
+              : undefined
+          }
+        >
           {(Object.keys(TLS_LABELS) as SmtpTls[]).map((tls) => (
             <option key={tls} value={tls}>
               {TLS_LABELS[tls]}
             </option>
           ))}
-        </Select>
-        {values.tls === 'none' && (
-          <Description>
-            Without TLS only a loopback host (a relay on this machine) is
-            accepted.
-          </Description>
-        )}
-      </Field>
-      <Field>
-        <Label>Port</Label>
-        <Input
+        </SelectField>
+        <TextField
+          label="Port"
+          mono
           type="number"
           min={1}
           max={65535}
@@ -534,7 +592,7 @@ function SmtpServerFields({ values, set }: { values: EmailFormValues; set: SetFi
           value={values.port}
           onChange={(e) => set('port', e.target.value)}
         />
-      </Field>
+      </div>
     </>
   )
 }
@@ -558,41 +616,29 @@ function SmtpFields({
     values.username.trim() === (smtp.username ?? '')
   return (
     <>
-      <Text>
+      <p className="fg-text">
         SMTP submission with a username and password, or none for a relay.
         The server&apos;s certificate is always verified against the
         system&apos;s trusted roots.
-      </Text>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <SmtpServerFields values={values} set={set} />
-        <Field>
-          <Label>Username</Label>
-          <Input
-            autoComplete="off"
-            value={values.username}
-            onChange={(e) => set('username', e.target.value)}
-          />
-          <Description>Leave blank for a relay that takes mail without signing in.</Description>
-        </Field>
+      </p>
+      <SmtpServerFields values={values} set={set} />
+      <div className="fg-fieldrow items-start">
+        <TextField
+          label="Username"
+          autoComplete="off"
+          value={values.username}
+          onChange={(e) => set('username', e.target.value)}
+          description="Leave blank for a relay that takes mail without signing in."
+        />
         {values.username.trim() !== '' && (
-          <Field>
-            <Label>
-              Password{' '}
-              <SecretBadge set={!!smtp?.password_set && !stored?.secrets_unreadable} />
-            </Label>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              placeholder={keepsPassword ? '(stored)' : ''}
-              value={values.password}
-              onChange={(e) => set('password', e.target.value)}
-            />
-            <Description>
-              {keepsPassword
-                ? 'A password is stored; leave blank to keep it.'
-                : 'Never shown again once saved.'}
-            </Description>
-          </Field>
+          <SecretField
+            label="Password"
+            set={!!smtp?.password_set && !stored?.secrets_unreadable}
+            keeps={keepsPassword}
+            value={values.password}
+            onChange={(v) => set('password', v)}
+            keepHint="A password is stored; leave blank to keep it."
+          />
         )}
       </div>
     </>
@@ -603,7 +649,8 @@ function SmtpFields({
  * The Microsoft Graph app's fields: the tenant and app registration, the
  * mailbox it sends as, and how it signs in. A federated credential shows the
  * values to enter on the app (Certificates & secrets → Federated credentials
- * → Other issuer); Forge's issuer URL is known once the settings are saved.
+ * → Other issuer), each with a Copy button; Forge's issuer URL is known once
+ * the settings are saved.
  */
 function GraphFields({
   values,
@@ -626,108 +673,91 @@ function GraphFields({
       : null
   return (
     <>
-      <Text>
+      <p className="fg-text">
         Forge signs in as an Entra app registration and sends with Microsoft
         Graph; no mailbox password is stored and SMTP AUTH can stay off. Give
         the app Exchange Online&apos;s <Code>Application Mail.Send</Code> role
         scoped to the sender mailbox (RBAC for Applications) rather than a
         tenant-wide <Code>Mail.Send</Code> consent.
-      </Text>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Tenant</Label>
-          <Input
-            required
-            placeholder="contoso.onmicrosoft.com"
-            value={values.tenant_id}
-            onChange={(e) => set('tenant_id', e.target.value)}
-          />
-          <Description>The directory (tenant) id, or one of its domains.</Description>
-        </Field>
-        <Field>
-          <Label>Application (client) id</Label>
-          <Input
-            required
-            value={values.client_id}
-            onChange={(e) => set('client_id', e.target.value)}
-          />
-        </Field>
-        <Field>
-          <Label>Sender mailbox</Label>
-          <Input
-            placeholder={values.from_address || 'the From address'}
-            value={values.sender}
-            onChange={(e) => set('sender', e.target.value)}
-          />
-          <Description>Its UPN or object id; blank sends as the From address.</Description>
-        </Field>
-        <Field>
-          <Label>Sign in with</Label>
-          <Select
-            value={values.client_authentication}
-            onChange={(e) => set('client_authentication', e.target.value as GraphClientAuth)}
-          >
-            <option value="client_secret">A client secret</option>
-            <option value="federated_credential">
-              A federated credential (no secret)
-            </option>
-          </Select>
-        </Field>
+      </p>
+      <div className="fg-fieldrow items-start">
+        <TextField
+          label="Tenant"
+          mono
+          required
+          placeholder="contoso.onmicrosoft.com"
+          value={values.tenant_id}
+          onChange={(e) => set('tenant_id', e.target.value)}
+          description="The directory (tenant) id, or one of its domains."
+        />
+        <TextField
+          label="Application (client) id"
+          mono
+          required
+          value={values.client_id}
+          onChange={(e) => set('client_id', e.target.value)}
+        />
+      </div>
+      <TextField
+        label="Sender mailbox"
+        placeholder={values.from_address || 'the From address'}
+        value={values.sender}
+        onChange={(e) => set('sender', e.target.value)}
+        description="Its UPN or object id; blank sends as the From address."
+      />
+      <div className="fg-fieldrow items-start">
+        <SelectField
+          label="Sign in with"
+          value={values.client_authentication}
+          onChange={(e) => set('client_authentication', e.target.value as GraphClientAuth)}
+        >
+          <option value="client_secret">A client secret</option>
+          <option value="federated_credential">A federated credential (no secret)</option>
+        </SelectField>
         {values.client_authentication === 'client_secret' && (
-          <Field>
-            <Label>
-              Client secret{' '}
-              <SecretBadge set={!!graph?.client_secret_set && !stored?.secrets_unreadable} />
-            </Label>
-            <Input
-              type="password"
-              autoComplete="new-password"
-              placeholder={keepsSecret ? '(stored)' : ''}
-              value={values.client_secret}
-              onChange={(e) => set('client_secret', e.target.value)}
-            />
-            <Description>
-              {keepsSecret
-                ? 'A secret is stored; leave blank to keep it.'
-                : 'Never shown again once saved.'}
-            </Description>
-          </Field>
+          <SecretField
+            label="Client secret"
+            set={!!graph?.client_secret_set && !stored?.secrets_unreadable}
+            keeps={keepsSecret}
+            value={values.client_secret}
+            onChange={(v) => set('client_secret', v)}
+          />
         )}
       </div>
       {values.client_authentication === 'federated_credential' && (
-        <div className="space-y-3 rounded-lg bg-zinc-950/[2.5%] px-3 py-3 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:ring-white/10">
-          <p className="text-sm/6 text-zinc-600 dark:text-zinc-400">
-            Forge signs in with a client assertion it signs itself, as an
-            OpenID Connect issuer publishing{' '}
-            <code>/.well-known/openid-configuration</code> and its keys (rotated
-            automatically). Add a federated credential for an <em>other
-            issuer</em> to the app registration with these values; Entra must
-            reach Forge&apos;s issuer URL over https.
-          </p>
+        <Fieldset
+          legend="Federated credential"
+          description={
+            <>
+              Forge signs in with a client assertion it signs itself, as an
+              OpenID Connect issuer publishing{' '}
+              <Code>/.well-known/openid-configuration</Code> and its keys
+              (rotated automatically). Add a federated credential for an{' '}
+              <em>other issuer</em> to the app registration with these values;
+              Entra must reach Forge&apos;s issuer URL over https.
+            </>
+          }
+        >
           {stored?.federated_credential ? (
-            <CommandSnippet
-              command={stored.federated_credential.issuer}
+            <CopyField
               label="Issuer"
+              value={stored.federated_credential.issuer}
               copyLabel="Copy issuer"
             />
           ) : (
-            <p className="text-sm/6 text-zinc-600 dark:text-zinc-400">
+            <p className="fg-text">
               Forge&apos;s issuer URL is shown once the settings are saved.
             </p>
           )}
           {subject && (
-            <CommandSnippet
-              command={subject}
+            <CopyField
               label="Subject identifier"
+              value={subject}
               copyLabel="Copy subject identifier"
             />
           )}
-          <CommandSnippet
-            command={ASSERTION_AUDIENCE}
-            label="Audience"
-            copyLabel="Copy audience"
-          />
-        </div>
+          <CopyField label="Audience" value={ASSERTION_AUDIENCE} copyLabel="Copy audience" />
+        </Fieldset>
       )}
     </>
   )
@@ -757,85 +787,69 @@ function OauthFields({
     values.oauth_client_id.trim() === (oauth.client_id ?? '')
   return (
     <>
-      <Text>
+      <p className="fg-text">
         SMTP submission with an OAuth access token (SASL{' '}
         <Code>OAUTHBEARER</Code>, or <Code>XOAUTH2</Code>) from the mail
         server&apos;s own authorization server, Stalwart&apos;s for one. Forge
         registers itself there or uses a client you enter, and the mailbox
         authorizes it once, below; no mailbox password is stored.
-      </Text>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <SmtpServerFields values={values} set={set} />
-        <Field>
-          <Label>Mailbox</Label>
-          <Input
-            required
-            autoComplete="off"
-            placeholder={values.from_address || 'forge@example.com'}
-            value={values.username}
-            onChange={(e) => set('username', e.target.value)}
-          />
-          <Description>The account Forge sends as; it authorizes Forge.</Description>
-        </Field>
-        <Field>
-          <Label>Authorization server</Label>
-          <Input
-            required
-            type="url"
-            placeholder="https://mail.example.com"
-            value={values.issuer}
-            onChange={(e) => set('issuer', e.target.value)}
-          />
-          <Description>
+      </p>
+      <SmtpServerFields values={values} set={set} />
+      <TextField
+        label="Mailbox"
+        required
+        autoComplete="off"
+        placeholder={values.from_address || 'forge@example.com'}
+        value={values.username}
+        onChange={(e) => set('username', e.target.value)}
+        description="The account Forge sends as; it authorizes Forge."
+      />
+      <TextField
+        label="Authorization server"
+        mono
+        required
+        type="url"
+        placeholder="https://mail.example.com"
+        value={values.issuer}
+        onChange={(e) => set('issuer', e.target.value)}
+        description={
+          <>
             Its issuer URL: Forge reads{' '}
             <Code>/.well-known/oauth-authorization-server</Code> there.
-          </Description>
-        </Field>
-        <Field>
-          <Label>Scope</Label>
-          <Input value={values.scope} onChange={(e) => set('scope', e.target.value)} />
-          <Description>Space-separated, when the server wants one.</Description>
-        </Field>
-      </div>
+          </>
+        }
+      />
+      <TextField
+        label="Scope"
+        mono
+        value={values.scope}
+        onChange={(e) => set('scope', e.target.value)}
+        description="Space-separated, when the server wants one."
+      />
       {registered ? (
-        <Text>
+        <p className="fg-text">
           Forge registered itself as the client <Code>{oauth.client_id}</Code>;
           forget it below to use another.
-        </Text>
+        </p>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field>
-            <Label>Client id</Label>
-            <Input
-              autoComplete="off"
-              value={values.oauth_client_id}
-              onChange={(e) => set('oauth_client_id', e.target.value)}
-            />
-            <Description>
-              Blank: register Forge after saving, when the server allows
-              dynamic client registration. Otherwise register a client there
-              with the redirect URI shown once the settings are saved.
-            </Description>
-          </Field>
+        <div className="fg-fieldrow items-start">
+          <TextField
+            label="Client id"
+            mono
+            autoComplete="off"
+            value={values.oauth_client_id}
+            onChange={(e) => set('oauth_client_id', e.target.value)}
+            description="Blank: register Forge after saving, when the server allows dynamic client registration. Otherwise register a client there with the redirect URI shown once the settings are saved."
+          />
           {values.oauth_client_id.trim() !== '' && (
-            <Field>
-              <Label>
-                Client secret{' '}
-                <SecretBadge set={!!oauth?.client_secret_set && !stored?.secrets_unreadable} />
-              </Label>
-              <Input
-                type="password"
-                autoComplete="new-password"
-                placeholder={keepsSecret ? '(stored)' : ''}
-                value={values.oauth_client_secret}
-                onChange={(e) => set('oauth_client_secret', e.target.value)}
-              />
-              <Description>
-                {keepsSecret
-                  ? 'A secret is stored; leave blank to keep it.'
-                  : 'Blank for a public client. Never shown again once saved.'}
-              </Description>
-            </Field>
+            <SecretField
+              label="Client secret"
+              set={!!oauth?.client_secret_set && !stored?.secrets_unreadable}
+              keeps={keepsSecret}
+              value={values.oauth_client_secret}
+              onChange={(v) => set('oauth_client_secret', v)}
+              blankHint="Blank for a public client. Never shown again once saved."
+            />
           )}
         </div>
       )}
@@ -843,33 +857,28 @@ function OauthFields({
   )
 }
 
-const ALERT =
-  'rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400'
-const NOTICE =
-  'rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-sm/6 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400'
-const SUCCESS =
-  'rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400'
-
 /** How the authorization in the browser ended, with a way to dismiss it. */
 function OauthOutcomeNotice({ outcome, error }: { outcome: OauthOutcome; error?: string }) {
   const navigate = useNavigate()
   const dismiss = () =>
     void navigate({ to: '/manage/settings/email', search: {}, replace: true })
   return (
-    <div role={outcome === 'authorized' ? 'status' : 'alert'} className={outcome === 'authorized' ? SUCCESS : ALERT}>
-      <p>
-        {OAUTH_OUTCOMES[outcome]}
-        {error && (
-          <>
-            {' '}
-            (<code>{error}</code>)
-          </>
-        )}
-      </p>
-      <button type="button" className="font-medium underline hover:no-underline" onClick={dismiss}>
-        Dismiss
-      </button>
-    </div>
+    <Notice
+      tone={outcome === 'authorized' ? 'ok' : 'danger'}
+      action={
+        <Button size="sm" variant="ghost" onClick={dismiss}>
+          Dismiss
+        </Button>
+      }
+    >
+      {OAUTH_OUTCOMES[outcome]}
+      {error && (
+        <>
+          {' '}
+          (<Code>{error}</Code>)
+        </>
+      )}
+    </Notice>
   )
 }
 
@@ -882,7 +891,8 @@ function errorText(e: unknown): string {
  * Forge's client at the authorization server and the mailbox's
  * authorization, for the stored `smtp_oauth` settings: register Forge or
  * forget its client, and authorize it in this browser, on another device, or
- * by the client credentials grant.
+ * by the client credentials grant. The redirect URI to register a client
+ * with closes the panel.
  */
 function OauthAuthorization({
   stored,
@@ -915,121 +925,100 @@ function OauthAuthorization({
     device !== null
 
   return (
-    <section
-      className="space-y-4 border-t border-zinc-950/5 pt-6 dark:border-white/10"
-      aria-label="OAuth authorization"
+    <Panel
+      title="Authorization"
+      description="Forge's client at the authorization server, and the mailbox's authorization to send with it."
     >
-      <Subheading>Authorization</Subheading>
-      {failed?.error && (
-        <p role="alert" className={ALERT}>
-          {errorText(failed.error)}
-        </p>
-      )}
+      {failed?.error && <Notice tone="danger">{errorText(failed.error)}</Notice>}
       {warning && (
-        <p role="alert" className={NOTICE}>
+        <Notice tone="warn">
           Forge&apos;s earlier registration was not deleted at the
           authorization server ({warning}); remove it there.
-        </p>
+        </Notice>
       )}
       {!oauth.client_id ? (
-        <div className="space-y-3">
-          <Text>
+        <form
+          className="fg-form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            const auth: RegistrationAuth =
+              registerAs === 'token'
+                ? { initial_access_token: initialAccessToken.trim() }
+                : registerAs === 'account'
+                  ? { username: registrationUsername.trim(), password: registrationPassword }
+                  : {}
+            register.mutate(auth, {
+              onSuccess: () => {
+                setInitialAccessToken('')
+                setRegistrationPassword('')
+              },
+            })
+          }}
+        >
+          <p className="fg-text">
             Forge has no client at the authorization server yet. Register it,
             when the server allows dynamic client registration (RFC 7591), or
             enter a client above.
-          </Text>
-          <form
-            className="space-y-3"
-            onSubmit={(e) => {
-              e.preventDefault()
-              const auth: RegistrationAuth =
-                registerAs === 'token'
-                  ? { initial_access_token: initialAccessToken.trim() }
-                  : registerAs === 'account'
-                    ? { username: registrationUsername.trim(), password: registrationPassword }
-                    : {}
-              register.mutate(auth, {
-                onSuccess: () => {
-                  setInitialAccessToken('')
-                  setRegistrationPassword('')
-                },
-              })
-            }}
+          </p>
+          <SelectField
+            label="Register as"
+            value={registerAs}
+            onChange={(e) => setRegisterAs(e.target.value as typeof registerAs)}
+            description="How the server authenticates registrations. Stalwart wants an account allowed to register OAuth clients. Used once, never stored."
           >
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Register as</Label>
-                <Select
-                  value={registerAs}
-                  onChange={(e) => setRegisterAs(e.target.value as typeof registerAs)}
-                >
-                  <option value="nothing">Anyone (open registration)</option>
-                  <option value="token">An initial access token</option>
-                  <option value="account">An account of the mail server</option>
-                </Select>
-                <Description>
-                  How the server authenticates registrations. Stalwart wants an
-                  account allowed to register OAuth clients. Used once, never
-                  stored.
-                </Description>
-              </Field>
-              {registerAs === 'token' && (
-                <Field>
-                  <Label>Initial access token</Label>
-                  <Input
-                    type="password"
-                    required
-                    autoComplete="off"
-                    value={initialAccessToken}
-                    onChange={(e) => setInitialAccessToken(e.target.value)}
-                  />
-                </Field>
-              )}
-              {registerAs === 'account' && (
-                <>
-                  <Field>
-                    <Label>Account</Label>
-                    <Input
-                      required
-                      autoComplete="off"
-                      value={registrationUsername}
-                      onChange={(e) => setRegistrationUsername(e.target.value)}
-                    />
-                  </Field>
-                  <Field>
-                    <Label>Account password</Label>
-                    <Input
-                      type="password"
-                      required
-                      autoComplete="off"
-                      value={registrationPassword}
-                      onChange={(e) => setRegistrationPassword(e.target.value)}
-                    />
-                  </Field>
-                </>
-              )}
+            <option value="nothing">Anyone (open registration)</option>
+            <option value="token">An initial access token</option>
+            <option value="account">An account of the mail server</option>
+          </SelectField>
+          {registerAs === 'token' && (
+            <TextField
+              label="Initial access token"
+              type="password"
+              required
+              autoComplete="off"
+              value={initialAccessToken}
+              onChange={(e) => setInitialAccessToken(e.target.value)}
+            />
+          )}
+          {registerAs === 'account' && (
+            <div className="fg-fieldrow items-start">
+              <TextField
+                label="Account"
+                required
+                autoComplete="off"
+                value={registrationUsername}
+                onChange={(e) => setRegistrationUsername(e.target.value)}
+              />
+              <TextField
+                label="Account password"
+                type="password"
+                required
+                autoComplete="off"
+                value={registrationPassword}
+                onChange={(e) => setRegistrationPassword(e.target.value)}
+              />
             </div>
+          )}
+          <div className="fg-actions">
             <Button type="submit" disabled={busy}>
               {register.isPending ? 'Registering…' : 'Register Forge'}
             </Button>
-          </form>
-        </div>
+          </div>
+        </form>
       ) : (
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <Text>
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="fg-text">
               Client <Code>{oauth.client_id}</Code>,{' '}
               {oauth.registered ? 'registered by Forge' : 'entered by hand'}.
-            </Text>
-            <Button plain disabled={busy} onClick={() => forget.mutate()}>
+            </p>
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => forget.mutate()}>
               Forget client
             </Button>
           </div>
           <AuthorizationState oauth={oauth} />
           {deviceAuthorized && !device && (
-            <p role="status" className={SUCCESS}>
-              The mailbox authorized Forge: it can send now.
-            </p>
+            <Notice tone="ok">The mailbox authorized Forge: it can send now.</Notice>
           )}
           {device ? (
             <DeviceFlow
@@ -1040,7 +1029,7 @@ function OauthAuthorization({
               }}
             />
           ) : (
-            <div className="flex flex-wrap gap-3">
+            <div className="fg-actions">
               <Button
                 disabled={busy}
                 onClick={() =>
@@ -1052,7 +1041,6 @@ function OauthAuthorization({
                 Authorize in this browser
               </Button>
               <Button
-                outline
                 disabled={busy}
                 onClick={() =>
                   deviceFlow.mutate(undefined, {
@@ -1065,21 +1053,24 @@ function OauthAuthorization({
               >
                 Authorize on another device
               </Button>
-              <Button plain disabled={busy} onClick={() => clientCredentials.mutate()}>
+              <Button variant="ghost" disabled={busy} onClick={() => clientCredentials.mutate()}>
                 Use the client credentials grant
               </Button>
             </div>
           )}
-        </div>
+        </>
       )}
       {stored.oauth_redirect_uri && (
-        <CommandSnippet
-          command={stored.oauth_redirect_uri}
-          label="Redirect URI"
-          copyLabel="Copy redirect URI"
-        />
+        <div className="fg-form">
+          <CopyField
+            label="Redirect URI"
+            value={stored.oauth_redirect_uri}
+            copyLabel="Copy redirect URI"
+            description="Where the authorization server sends the browser back to. A client entered by hand must allow it."
+          />
+        </div>
       )}
-    </section>
+    </Panel>
   )
 }
 
@@ -1087,34 +1078,32 @@ function OauthAuthorization({
 function AuthorizationState({ oauth }: { oauth: SmtpOauthTransportView }) {
   if (oauth.authorization_error) {
     return (
-      <p role="alert" className={NOTICE}>
+      <Notice tone="warn">
         The mailbox must authorize Forge again: {oauth.authorization_error}
-      </p>
+      </Notice>
     )
   }
   if (oauth.grant === 'refresh_token') {
     return (
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge color="emerald">Authorized</Badge>
-        <Text className="!text-sm">
-          by {oauth.username}; Forge refreshes its access token when it needs one.
-        </Text>
-      </div>
+      <p className="fg-text flex flex-wrap items-center gap-2">
+        <StatusBadge tone="ok">authorized</StatusBadge>
+        <span>by {oauth.username}; Forge refreshes its access token when it needs one.</span>
+      </p>
     )
   }
   if (oauth.grant === 'client_credentials') {
     return (
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge color="emerald">Client credentials</Badge>
-        <Text className="!text-sm">Forge gets its access tokens as the client itself.</Text>
-      </div>
+      <p className="fg-text flex flex-wrap items-center gap-2">
+        <StatusBadge tone="ok">client credentials</StatusBadge>
+        <span>Forge gets its access tokens as the client itself.</span>
+      </p>
     )
   }
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Badge color="amber">Not authorized</Badge>
-      <Text className="!text-sm">Forge cannot send until it is authorized.</Text>
-    </div>
+    <p className="fg-text flex flex-wrap items-center gap-2">
+      <StatusBadge tone="warn">not authorized</StatusBadge>
+      <span>Forge cannot send until it is authorized.</span>
+    </p>
   )
 }
 
@@ -1168,32 +1157,39 @@ function DeviceFlow({
   }, [flow, queryClient])
 
   return (
-    <div className="space-y-3 rounded-lg bg-zinc-950/[2.5%] px-3 py-3 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:ring-white/10">
-      <p className="text-sm/6 text-zinc-600 dark:text-zinc-400">
+    <div className="grid gap-4 rounded-md border border-line p-4">
+      <p className="fg-text">
         Open{' '}
         <a
           href={flow.verification_uri_complete ?? flow.verification_uri}
           target="_blank"
           rel="noreferrer"
-          className="font-medium underline hover:no-underline"
+          className="fg-link"
         >
           {flow.verification_uri}
         </a>{' '}
         on any device, sign in as the mailbox, and enter this code:
       </p>
-      <CommandSnippet command={flow.user_code} label="Code" copyLabel="Copy code" />
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="fg-mono rounded-sm border border-line bg-surface-sunken px-3 py-1 text-xl tracking-widest text-ink">
+          {flow.user_code}
+        </span>
+        <CopyButton value={flow.user_code} label="Copy code" withText />
+      </div>
       {error ? (
-        <p role="alert" className={ALERT}>
-          {error}
-        </p>
+        <Notice tone="danger">{error}</Notice>
       ) : (
-        <p role="status" className="text-sm/6 text-zinc-600 dark:text-zinc-400">
-          Waiting for the authorization…{note && ` (${note})`}
-        </p>
+        <Notice tone="info" title="Waiting for the authorization…">
+          Forge asks the authorization server every {flow.interval} second
+          {flow.interval === 1 ? '' : 's'} until the mailbox decides; keep this
+          page open until then.{note && ` (${note})`}
+        </Notice>
       )}
-      <Button plain onClick={() => onDone(false)}>
-        {error ? 'Close' : 'Cancel'}
-      </Button>
+      <div>
+        <Button variant="ghost" onClick={() => onDone(false)}>
+          {error ? 'Close' : 'Cancel'}
+        </Button>
+      </div>
     </div>
   )
 }
@@ -1203,91 +1199,72 @@ function TestSend() {
   const test = useSendTestEmail()
   const [to, setTo] = useState('')
   return (
-    <section className="space-y-3 border-t border-zinc-950/5 pt-6 dark:border-white/10">
-      <Subheading>Test</Subheading>
-      <Text>
-        Sends a test message with the stored settings, even while sending is
-        turned off.
-      </Text>
-      <form
-        className="flex flex-wrap items-end gap-3"
-        onSubmit={(e) => {
-          e.preventDefault()
-          test.mutate(to.trim() || undefined)
-        }}
-      >
-        <Field className="min-w-64 flex-1">
-          <Label>Recipient</Label>
-          <Input
-            type="email"
-            placeholder="Your address"
-            value={to}
-            onChange={(e) => setTo(e.target.value)}
-          />
-        </Field>
-        <Button type="submit" outline disabled={test.isPending}>
+    <Panel
+      as="form"
+      title="Test message"
+      description="Sends a test message with the stored settings, even while sending is turned off."
+      onSubmit={(e) => {
+        e.preventDefault()
+        test.mutate(to.trim() || undefined)
+      }}
+    >
+      <TextField
+        label="Recipient"
+        type="email"
+        placeholder="Your address"
+        value={to}
+        onChange={(e) => setTo(e.target.value)}
+      />
+      <div>
+        <Button type="submit" icon="Mail" disabled={test.isPending}>
           {test.isPending ? 'Sending…' : 'Send test email'}
         </Button>
-      </form>
-      {test.data?.sent && (
-        <p
-          role="status"
-          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-        >
-          Sent to {test.data.to}.
-        </p>
-      )}
+      </div>
+      {test.data?.sent && <Notice tone="ok">Sent to {test.data.to}.</Notice>}
       {(test.data?.sent === false || test.isError) && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-        >
+        <Notice tone="danger">
           {test.data?.sent === false
             ? `Sending to ${test.data.to} failed: ${test.data.error ?? 'unknown error'}`
             : test.error?.body || test.error?.message}
-        </p>
+        </Notice>
       )}
-    </section>
+    </Panel>
   )
 }
 
-/** Remove the settings, after a confirmation: Forge then sends no email. */
+/**
+ * Remove the settings, after a confirmation in a dialog: Forge then sends no
+ * email.
+ */
 function RemoveSettings() {
   const remove = useDeleteEmailSettings()
   const [confirming, setConfirming] = useState(false)
   return (
-    <section className="space-y-3 border-t border-zinc-950/5 pt-6 dark:border-white/10">
-      <Subheading>Remove</Subheading>
-      <Text>
+    <Panel title="Danger zone">
+      <p className="fg-text">
         Removes the settings and the stored password. Forge then sends no
         email, and invitations cannot be sent.
-      </Text>
+      </p>
       {remove.isError && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-        >
-          {remove.error.body || remove.error.message}
-        </p>
+        <Notice tone="danger">{remove.error.body || remove.error.message}</Notice>
       )}
-      {confirming ? (
-        <div className="flex items-center gap-3">
-          <Button
-            color="red"
-            disabled={remove.isPending}
-            onClick={() => remove.mutate(undefined, { onSettled: () => setConfirming(false) })}
-          >
-            {remove.isPending ? 'Removing…' : 'Remove the email settings'}
-          </Button>
-          <Button plain onClick={() => setConfirming(false)}>
-            Cancel
-          </Button>
-        </div>
-      ) : (
-        <Button outline onClick={() => setConfirming(true)}>
-          Remove…
+      <div>
+        <Button variant="danger" icon="Trash" onClick={() => setConfirming(true)}>
+          Remove email settings
         </Button>
-      )}
-    </section>
+      </div>
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title="Remove the email settings?"
+        icon="Trash"
+        tone="danger"
+        description="Forge then sends no email, and invitations cannot be sent until email is set up again. The stored password and secrets are deleted with the settings."
+        confirmLabel={remove.isPending ? 'Removing…' : 'Remove the email settings'}
+        confirmVariant="danger-solid"
+        confirmDisabled={remove.isPending}
+        onConfirm={() => remove.mutate(undefined, { onSettled: () => setConfirming(false) })}
+      />
+    </Panel>
   )
 }

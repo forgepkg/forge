@@ -167,3 +167,19 @@ export async function waitForPackage(
   }
   throw new Error(`package ${originalId} never appeared in ${repo}`)
 }
+
+/**
+ * The navigation rail (`<nav aria-label="Main">`): Browse, Your tokens, the
+ * Administration links for admins, the readable repositories and the user.
+ */
+export function rail(page: import('@playwright/test').Page) {
+  return page.getByRole('navigation', { name: 'Main' })
+}
+
+/** Navigate (client-side) through the rail to one of its links, e.g. `Repositories`. */
+export async function openFromRail(
+  page: import('@playwright/test').Page,
+  name: string,
+): Promise<void> {
+  await rail(page).getByRole('link', { name, exact: true }).click()
+}

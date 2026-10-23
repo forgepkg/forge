@@ -206,7 +206,7 @@ describe('ImageDetail', () => {
     ).toBeInTheDocument()
     // The login hint names the registry and links to the Tokens page.
     expect(within(pull).getByText('docker login forge.example.com')).toBeInTheDocument()
-    expect(within(pull).getByRole('link', { name: 'Tokens' })).toHaveAttribute(
+    expect(within(pull).getByRole('link', { name: 'Your tokens' })).toHaveAttribute(
       'href',
       '/tokens',
     )
@@ -399,7 +399,8 @@ describe('ImageDetail', () => {
     await renderDetail('/images/docker-hosted/team/missing')
 
     expect(await screen.findByText('Image not found')).toBeInTheDocument()
-    expect(screen.getByText('team/missing')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'team/missing' })).toBeInTheDocument()
+    expect(screen.getByText('team/missing', { selector: 'code' })).toBeInTheDocument()
   })
 
   it('renders an error state on a server error', async () => {

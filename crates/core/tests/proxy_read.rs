@@ -1908,6 +1908,62 @@ async fn an_empty_or_malformed_listing_retires_nothing() {
     }
 }
 
+/// `len` lowercase letters and digits that PostgreSQL cannot compress, so
+/// that an index entry holding them is as long as they are.
+fn incompressible(len: usize) -> String {
+    use sha2::Digest;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut block = sha2::Sha256::digest(b"incompressible");
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        out.extend(
+            block
+                .iter()
+                .map(|b| char::from(ALPHABET[usize::from(*b) % ALPHABET.len()]))
+                .take(len - out.len()),
+        );
+        block = sha2::Sha256::digest(&block[..]);
+    }
+    out
+}
+
+/// #231: an upstream listing with a version longer than the host takes
+/// (here a multi-kilobyte prerelease, which NuGet's listing parser accepts)
+/// lists the package's other versions. The long one is never recorded: its
+/// index entry failed the whole listing's insert, so the listing failed.
+#[tokio::test]
+async fn versions_longer_than_the_host_takes_are_left_out_of_a_listing() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(corpus_of("Contoso.Lib", &["1.0.0"])).await;
+    let huge = format!("2.0.0-{}", incompressible(4096));
+    mock.state.flat_index_override.lock().unwrap().insert(
+        "contoso.lib".into(),
+        serde_json::json!({ "versions": ["1.0.0", huge] }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
+        ["1.0.0"]
+    );
+    assert_eq!(
+        px.registration_versions(&repo, "Contoso.Lib")
+            .await
+            .unwrap(),
+        ["1.0.0"]
+    );
+    let long_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM proxy_cached_version WHERE repository_id = $1 \
+         AND length(version) > 256",
+    )
+    .bind(repo_id(&pool, &repo).await)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(long_rows, 0);
+}
+
 /// H3 follow-up: the package-level not-found marker (`*`) is cleared as soon
 /// as the package is downloaded, and an expired one is pruned like any other
 /// unconfirmed row (before, every request for a random id left a permanent

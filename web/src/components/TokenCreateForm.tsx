@@ -1,10 +1,7 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 
 import type { CreateToken } from '~/api/tokens'
-import { Button } from '~/components/catalyst/button'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { Button, Panel, TextField } from '~/components/ui'
 import {
   draftProblem,
   scopeFromDraft,
@@ -14,19 +11,23 @@ import {
 } from '~/components/TokenScopeFields'
 
 /**
- * The create-token form of the self-service and the admin token screens: a
- * name and the token's scope. An unscoped token is sent without `scope`.
- * `onSubmit` gets a `reset` to call once the token was created.
+ * The "New token" panel of the self-service and the admin token screens: a
+ * name and the token's scope, with Create token at the end. It is a whole
+ * panel (a `Panel` form), so callers place it as it is. An unscoped token is
+ * sent without `scope`. `onSubmit` gets a `reset` to call once the token was
+ * created.
  */
 export function TokenCreateForm({
   repositories,
   submitting,
   placeholder,
+  description = 'Name it after the machine or pipeline that uses it, so you know what breaks when you revoke it.',
   onSubmit,
 }: {
   repositories: ReadonlyArray<{ id: number; name: string }>
   submitting: boolean
   placeholder: string
+  description?: ReactNode
   onSubmit: (body: CreateToken, reset: () => void) => void
 }) {
   const [name, setName] = useState('')
@@ -44,28 +45,36 @@ export function TokenCreateForm({
   }
 
   return (
-    <form
+    <Panel
+      as="form"
       onSubmit={submit}
-      className="space-y-6 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+      title="New token"
+      description={description}
+      footer={
+        <>
+          {problem && <p className="fg-field-desc mr-auto self-center">{problem}</p>}
+          <Button
+            type="submit"
+            variant="primary"
+            icon="Plus"
+            disabled={submitting || !name.trim() || !!problem}
+          >
+            {submitting ? 'Creating…' : 'Create token'}
+          </Button>
+        </>
+      }
     >
-      <Field>
-        <Label>Token name</Label>
-        <Input
+      <div className="fg-form">
+        <TextField
+          label="Token name"
           type="text"
+          mono
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder={placeholder}
         />
-      </Field>
-      <TokenScopeFields
-        value={scope}
-        onChange={setScope}
-        repositories={repositories}
-      />
-      {problem && <Text>{problem}</Text>}
-      <Button type="submit" disabled={submitting || !name.trim() || !!problem}>
-        {submitting ? 'Creating…' : 'Create token'}
-      </Button>
-    </form>
+      </div>
+      <TokenScopeFields value={scope} onChange={setScope} repositories={repositories} />
+    </Panel>
   )
 }
