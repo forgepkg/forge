@@ -233,7 +233,7 @@ async fn a_realm_that_stops_forwarding_signs_in_with_the_kept_hash() {
 
     // A second account of the realm that keeps no hash.
     let bob = format!("keep-only-{}", unique());
-    forge_db::user_dao::provision_upstream_user(&pool, &bob, false, false, Some(realm_id))
+    forge_db::user_dao::provision_upstream_user(&pool, &bob, Some(realm_id))
         .await
         .unwrap()
         .expect("provisioned");

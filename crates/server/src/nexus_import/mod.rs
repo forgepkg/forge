@@ -312,7 +312,6 @@ impl Run<'_> {
         let principal = Principal::User {
             user_id: user.id,
             token_id: None,
-            is_admin: user.is_admin,
             method: AuthMethod::Session,
         };
         if !self.state.authz.is_global_admin(&principal).await {

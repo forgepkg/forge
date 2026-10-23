@@ -76,10 +76,14 @@ async fn me_basic(srv: &TestServer, user: &str, pass: &str) -> reqwest::Response
         .unwrap()
 }
 
-/// Look up an `app_user` row's `(auth_source, password_hash, is_admin)`.
+/// Look up an `app_user` row's `(auth_source, password_hash, holds the
+/// built-in admin role)`.
 async fn user_row(pool: &sqlx::PgPool, username: &str) -> Option<(String, Option<String>, bool)> {
     sqlx::query_as::<_, (String, Option<String>, bool)>(
-        "SELECT auth_source, password_hash, is_admin FROM app_user WHERE username = $1",
+        "SELECT u.auth_source, u.password_hash, EXISTS (
+             SELECT 1 FROM user_role ur JOIN role r ON r.id = ur.role_id
+             WHERE ur.user_id = u.id AND r.name = 'admin')
+         FROM app_user u WHERE u.username = $1",
     )
     .bind(username)
     .fetch_optional(pool)

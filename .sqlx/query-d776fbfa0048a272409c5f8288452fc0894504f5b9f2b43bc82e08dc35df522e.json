@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            u.id, u.username, u.password_hash, u.is_admin, u.active,\n            u.auth_source, u.external_subject, u.created_at, u.updated_at\n        FROM app_user u\n        JOIN external_identity ei ON ei.user_id = u.id\n        WHERE ei.issuer = $1 AND ei.subject = $2\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'upstream-basic'\n          AND NOT realm_orphaned\n          AND realm_id IS NOT DISTINCT FROM $2::bigint\n        ",
   "describe": {
     "columns": [
       {
@@ -38,17 +38,6 @@
       },
       {
         "ordinal": 3,
-        "name": "is_admin",
-        "type_info": "Bool",
-        "origin": {
-          "Table": {
-            "table": "app_user",
-            "name": "is_admin"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "auth_source",
         "type_info": "Text",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "external_subject",
         "type_info": "Text",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -106,7 +95,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -115,11 +104,10 @@
       true,
       false,
       false,
-      false,
       true,
       false,
       false
     ]
   },
-  "hash": "3a5f53b6adda97e6293ab6f2ed6e167eeca7072b4950f825b2d931517ab68957"
+  "hash": "d776fbfa0048a272409c5f8288452fc0894504f5b9f2b43bc82e08dc35df522e"
 }

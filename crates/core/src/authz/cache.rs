@@ -99,18 +99,12 @@ fn role_key(role_id: i64) -> String {
 }
 
 /// Load (cached) the **owner** effective set for an authenticated user, building
-/// the compiled [`EffectiveSet`] from the cached raw form.
-///
-/// `dual_read_is_admin` is the slice-1 `app_user.is_admin` fallback: during the
-/// migration window the admin short-circuit is `in_admin_role OR is_admin`. It is
-/// folded into the *built* set (not the cached raw set) so the cache stays a pure
-/// role-derived projection and the fallback can be dropped later without a cache
-/// format change.
+/// the compiled [`EffectiveSet`] from the cached raw form. The user is an admin
+/// iff it holds the built-in `admin` role.
 pub async fn load_user_effective(
     pool: &PgPool,
     cache: &Cache,
     user_id: i64,
-    dual_read_is_admin: bool,
 ) -> Result<EffectiveSet, LoadError> {
     let raw = cache
         .get_or_try_insert_local(NS_AUTHZ, &user_key(user_id), DEFAULT_TTL, || async {
@@ -119,11 +113,11 @@ pub async fn load_user_effective(
         })
         .await?;
 
-    build_set(raw, dual_read_is_admin)
+    build_set(raw)
 }
 
 /// Load (cached) the effective set applied to **anonymous** callers (exactly the
-/// built-in `anonymous` role's grants). Never admin, no dual-read.
+/// built-in `anonymous` role's grants). Never admin.
 pub async fn load_anonymous_effective(
     pool: &PgPool,
     cache: &Cache,
@@ -135,15 +129,14 @@ pub async fn load_anonymous_effective(
         })
         .await?;
 
-    build_set(raw, false)
+    build_set(raw)
 }
 
 /// Load (cached) the effective set granted by a **single role**, for a
 /// workload-identity (WIF) principal (slice 12.8). The validated CI token is
 /// mapped to one forge role; this resolves that role's grants directly (no
 /// `app_user` / `user_role` membership). `is_admin` is set iff the role is the
-/// built-in `admin` role — never via a dual-read fallback (a workload has no
-/// `app_user.is_admin` column). A role-grant change invalidates this via the
+/// built-in `admin` role. A role-grant change invalidates this via the
 /// blanket [`invalidate_all`] "epoch roll", like any other role edit.
 pub async fn load_role_effective(
     pool: &PgPool,
@@ -157,21 +150,14 @@ pub async fn load_role_effective(
         })
         .await?;
 
-    build_set(raw, false)
+    build_set(raw)
 }
 
-/// Build the compiled [`EffectiveSet`] from a cached raw set, applying the
-/// dual-read admin fallback.
+/// Build the compiled [`EffectiveSet`] from a cached raw set.
 ///
 /// A selector that fails to compile fails the whole build (fail-closed: the
 /// caller denies rather than silently treating the grant as unscoped).
-fn build_set(
-    mut raw: RawEffectiveSet,
-    dual_read_is_admin: bool,
-) -> Result<EffectiveSet, LoadError> {
-    if dual_read_is_admin {
-        raw.is_admin = true;
-    }
+fn build_set(raw: RawEffectiveSet) -> Result<EffectiveSet, LoadError> {
     EffectiveSet::build(&raw).map_err(|e| LoadError(e.to_string()))
 }
 
@@ -285,17 +271,5 @@ mod tests {
         };
         let raw = to_raw_set(rows);
         assert!(raw.grants.is_empty(), "malformed-selector grant dropped");
-    }
-
-    #[test]
-    fn build_set_dual_read_forces_admin() {
-        let raw = RawEffectiveSet::empty();
-        let no_dual = build_set(raw.clone(), false).expect("build");
-        assert!(!no_dual.is_admin());
-        let dual = build_set(raw, true).expect("build");
-        assert!(
-            dual.is_admin(),
-            "dual-read is_admin forces admin short-circuit"
-        );
     }
 }

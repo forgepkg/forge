@@ -10,8 +10,7 @@
 //! ## Capabilities
 //! `is_admin` and the capability list come from the **effective RBAC** verdict
 //! ([`forge_core::auth::authz::Authz::is_global_admin`]: the built-in `admin`
-//! role, or the legacy `app_user.is_admin` dual-read fallback) for the calling
-//! principal — the same check the admin API's `require_admin` gate uses, so the
+//! role) for the calling principal — the same check the admin API's `require_admin` gate uses, so the
 //! SPA never hides screens from an RBAC admin nor shows them to a demoted one.
 //! A token-scoped principal reports what that token may do.
 //! * every authenticated user can read (`repo.read`);

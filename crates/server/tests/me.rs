@@ -85,11 +85,11 @@ async fn me_reachable_by_non_admin() {
     assert_eq!(resp.status(), 403);
 }
 
-/// `/admin/me` reports the **effective** RBAC verdict: a user whose legacy
-/// `is_admin` column is false but who holds the built-in `admin` role is an
-/// admin to the SPA too (the admin API already treats it as one).
+/// `/admin/me` reports the **effective** RBAC verdict: a user created as a
+/// non-admin and given the built-in `admin` role afterwards is an admin to
+/// the SPA too (the admin API already treats it as one).
 #[tokio::test]
-async fn me_reflects_admin_role_not_legacy_column() {
+async fn me_reflects_the_admin_role() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();

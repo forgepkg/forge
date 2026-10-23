@@ -130,12 +130,7 @@ fn group_repo_depth(
 async fn user(pool: &PgPool) -> Principal {
     let u = user_dao::insert_user(
         pool,
-        NewUser::local(
-            format!("groupuser-{}", common::unique()),
-            "x".into(),
-            false,
-            true,
-        ),
+        NewUser::local(format!("groupuser-{}", common::unique()), "x".into(), true),
     )
     .await
     .expect("insert user");
@@ -149,7 +144,6 @@ async fn user(pool: &PgPool) -> Principal {
     Principal::User {
         user_id: u.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     }
 }
@@ -667,7 +661,7 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("diamond-user-{suffix}"), "x".into(), false, true),
+        NewUser::local(format!("diamond-user-{suffix}"), "x".into(), true),
     )
     .await
     .expect("insert user");
@@ -729,7 +723,6 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     let principal = Principal::User {
         user_id: account.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     };
     let g = group_repo(&pool, blobs.clone(), principal);
@@ -1565,7 +1558,7 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("scoped-user-{suffix}"), "x".into(), false, true),
+        NewUser::local(format!("scoped-user-{suffix}"), "x".into(), true),
     )
     .await
     .expect("insert user");
@@ -1595,7 +1588,6 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
     let principal = Principal::User {
         user_id: account.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     };
 

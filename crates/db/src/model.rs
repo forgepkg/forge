@@ -391,7 +391,6 @@ pub struct AppUser {
     pub id: i64,
     pub username: String,
     pub password_hash: Option<String>,
-    pub is_admin: bool,
     pub active: bool,
     pub auth_source: String,
     pub external_subject: Option<String>,

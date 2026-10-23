@@ -13,8 +13,6 @@ pub struct UserPrincipal {
     pub user_id: i64,
     /// `token.id` if authentication used an API token; `None` for password auth.
     pub token_id: Option<i64>,
-    /// Whether the user has the admin flag.
-    pub is_admin: bool,
 }
 
 /// How a [`Principal::User`] proved its identity on this request.
@@ -51,8 +49,6 @@ pub enum Principal {
         user_id: i64,
         /// `token.id` if a token was used, else `None`.
         token_id: Option<i64>,
-        /// Admin flag.
-        is_admin: bool,
         /// The kind of credential that authenticated this request.
         method: AuthMethod,
     },
@@ -127,7 +123,6 @@ impl Principal {
         Principal::User {
             user_id: u.user_id,
             token_id: u.token_id,
-            is_admin: u.is_admin,
             method: if u.token_id.is_some() {
                 AuthMethod::Token
             } else {
@@ -159,7 +154,6 @@ mod tests {
         let user = |token_id, method| Principal::User {
             user_id: 5,
             token_id,
-            is_admin: false,
             method,
         };
         assert_eq!(
@@ -193,14 +187,12 @@ mod tests {
         let up = UserPrincipal {
             user_id: 7,
             token_id: Some(3),
-            is_admin: true,
         };
         assert_eq!(
             Principal::from_user(up),
             Principal::User {
                 user_id: 7,
                 token_id: Some(3),
-                is_admin: true,
                 method: AuthMethod::Token
             }
         );
@@ -211,7 +203,6 @@ mod tests {
         assert!(Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: AuthMethod::Password
         }
         .is_user());

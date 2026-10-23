@@ -106,7 +106,7 @@ pub async fn find_user_by_subject(
         AppUser,
         r#"
         SELECT
-            u.id, u.username, u.password_hash, u.is_admin, u.active,
+            u.id, u.username, u.password_hash, u.active,
             u.auth_source, u.external_subject, u.created_at, u.updated_at
         FROM app_user u
         JOIN external_identity ei ON ei.user_id = u.id

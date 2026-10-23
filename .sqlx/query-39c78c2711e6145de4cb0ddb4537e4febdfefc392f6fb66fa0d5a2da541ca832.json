@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH active_admin AS (\n            SELECT u.id FROM app_user u\n            WHERE u.active\n              AND EXISTS (\n                  SELECT 1 FROM user_role ur\n                  JOIN role r ON r.id = ur.role_id\n                  WHERE ur.user_id = u.id AND r.name = $2\n              )\n        )\n        SELECT EXISTS (SELECT 1 FROM active_admin WHERE id = $1)\n           AND NOT EXISTS (SELECT 1 FROM active_admin WHERE id <> $1) AS \"last!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "39c78c2711e6145de4cb0ddb4537e4febdfefc392f6fb66fa0d5a2da541ca832"
+}

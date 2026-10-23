@@ -1774,10 +1774,10 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     assert_eq!(resp.status(), 401, "a revoked session stays revoked");
 }
 
-/// `(active, is_admin flag, holds the built-in admin role)` of a user.
-async fn admin_state(pool: &sqlx::PgPool, id: i64) -> (bool, bool, bool) {
+/// `(active, holds the built-in admin role)` of a user.
+async fn admin_state(pool: &sqlx::PgPool, id: i64) -> (bool, bool) {
     sqlx::query_as(
-        "SELECT u.active, u.is_admin, EXISTS (
+        "SELECT u.active, EXISTS (
              SELECT 1 FROM user_role ur JOIN role r ON r.id = ur.role_id
              WHERE ur.user_id = u.id AND r.name = 'admin')
          FROM app_user u WHERE u.id = $1",
@@ -1807,8 +1807,7 @@ async fn create_admin(srv: &common::TestServer, username: &str, password: &str) 
 /// deactivating or deleting the account and not unassigning its `admin`
 /// role, since getting an administrator back would take SQL (a deleted
 /// bootstrap admin is never re-created). Each path answers 409 and changes
-/// nothing. An admin by the role alone and one by the legacy `is_admin` flag
-/// alone both count; an inactive admin does not.
+/// nothing. An inactive admin does not count.
 #[tokio::test]
 async fn the_last_active_admin_cannot_lose_admin() {
     // Its own database: the shared one holds every other test's admins.
@@ -1843,10 +1842,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
         ]
     };
 
-    // The bootstrap admin, an admin by the role alone, removes itself.
-    forge_db::user_dao::update_is_admin(&srv.pool, boot, false)
-        .await
-        .unwrap();
+    // The bootstrap admin removes itself.
     let dormant = create_admin(&srv, "dormant", "pw-dormant").await;
     forge_db::user_dao::set_active(&srv.pool, dormant, false)
         .await
@@ -1859,14 +1855,11 @@ async fn the_last_active_admin_cannot_lose_admin() {
             .unwrap();
         assert_eq!(resp.status(), 409, "{path}");
     }
-    assert_eq!(admin_state(&srv.pool, boot).await, (true, false, true));
+    assert_eq!(admin_state(&srv.pool, boot).await, (true, true));
 
-    // With a second admin, by the legacy flag alone, the bootstrap admin may
-    // step down, and the second one is then the last.
+    // With a second admin, the bootstrap admin may step down, and the second
+    // one is then the last.
     let second = create_admin(&srv, "second", "pw-second").await;
-    forge_db::authz_dao::unassign_role(&srv.pool, second, admin_role)
-        .await
-        .unwrap();
     let resp = req(
         reqwest::Method::DELETE,
         &format!("/admin/users/{boot}/roles/{admin_role}"),
@@ -1887,7 +1880,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
             .unwrap();
         assert_eq!(resp.status(), 409, "{path}");
     }
-    assert_eq!(admin_state(&srv.pool, second).await, (true, true, false));
+    assert_eq!(admin_state(&srv.pool, second).await, (true, true));
     let resp = session
         .apply(req(
             reqwest::Method::DELETE,

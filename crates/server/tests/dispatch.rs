@@ -56,7 +56,6 @@ async fn unknown_repo_answers_like_a_denied_one() {
         forge_db::user_dao::NewUser::local(
             format!("nogrants{}", common::unique()),
             "$argon2id$unused".into(),
-            false,
             true,
         ),
     )
