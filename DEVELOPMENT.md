@@ -894,6 +894,46 @@ branch with the commit it forked off `main`, so it runs the jobs the pull
 request's change needs; its results show under **Actions**, not on the pull
 request. A pull request from a fork gets no merge: a push to it starts CI.
 
+## Code scanning (CodeQL)
+
+CodeQL code scanning runs as an advanced setup, the `CodeQL` workflow
+(`.github/workflows/codeql.yml`) with its configuration
+`.github/codeql/codeql-config.yml`. GitHub's default setup has to stay off
+(**CodeQL analysis** under code scanning in the repository's security
+settings): while it is on, GitHub refuses the workflow's uploads.
+
+The workflow analyzes three languages, each without a build, and a language
+only when a change touches its code:
+
+| Language | Paths |
+|---|---|
+| `rust` | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
+| `javascript-typescript` | `web/`, and every `.js`, `.cjs`, `.mjs`, `.ts` and `.tsx` file |
+| `actions` | `.github/workflows/`, and every `action.yml` and `action.yaml` |
+
+A pull request that targets `main` is compared with its base branch, and a
+push to `main` with `main`'s previous commit. A change to the workflow or to
+`.github/codeql/` analyzes every language, and so do the weekly run and a
+manual run (**Actions → CodeQL → Run workflow**), so that a newer CodeQL's
+queries also look at code no change touched. A language a push to `main`
+leaves out keeps the alerts of its last analysis there, which the Security
+tab shows. The Rust analysis is by far the slowest, so a change to the web UI
+or the docs no longer waits for it. CodeQL is not among `main`'s required
+checks (see above), and the merge queue does not run it.
+
+Tests are not analyzed. Their fixed passwords and keys and their plain-http
+URLs to local test servers are on purpose, and an alert for each would only
+be dismissed by hand. The configuration's `paths-ignore` leaves out the test
+directories (`**/tests`, `crates/e2e`, `web/e2e`), the web UI's
+`*.test.ts(x)` and test runner configuration, the `testing` helpers of
+`crates/plugin` and `crates/plugin-api`, and `fixtures/`. The unit tests
+inside the Rust source files (`#[cfg(test)] mod tests`) cannot be left out by
+path; the Rust extractor compiles the code with `cfg(test)` off instead
+(`CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test`), as a release build
+does. Add a new test directory or test helper outside these to `paths-ignore`.
+The repository's one Python file, `fixtures/nuget/make_fixtures.py`, makes
+test packages, so Python is not analyzed at all.
+
 ## Changelog entries
 
 A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its

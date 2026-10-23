@@ -1,0 +1,29 @@
+# CodeQL code scanning configuration (.github/workflows/codeql.yml).
+#
+# Code scanning looks at what Forge ships, not at its tests: their fixed
+# passwords, keys and plain-http URLs to local test servers are on purpose,
+# and an alert for each would only be dismissed by hand. Leaving the tests
+# out of the analysis also closes the alerts they raised before.
+name: Forge
+
+paths-ignore:
+  # Rust: every crate's integration tests (crates/*/tests, plugins/*/tests,
+  # xtask/tests), the end-to-end crate with its mock IdPs and upstreams, and
+  # the test helpers behind the `testing` feature. The unit tests inside the
+  # source files (`#[cfg(test)] mod tests`) cannot be left out by path: the
+  # workflow extracts the Rust code with `cfg(test)` off instead, as a release
+  # build compiles it.
+  - "**/tests"
+  - crates/e2e
+  - crates/plugin/src/testing.rs
+  - crates/plugin-api/src/testing.rs
+  # The web UI: unit tests next to the code, the Playwright suite with its
+  # mock upstream, and the test runners' configuration.
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - web/e2e
+  - web/vitest.config.ts
+  - web/vitest.setup.ts
+  - web/playwright.config.ts
+  # Test packages and the script that makes them.
+  - fixtures

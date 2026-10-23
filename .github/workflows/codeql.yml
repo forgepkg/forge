@@ -1,0 +1,143 @@
+name: CodeQL
+
+# Code scanning with CodeQL, as an advanced setup (GitHub's default setup has
+# to be off: it refuses this workflow's uploads while it is on). Unlike the
+# default setup, it analyzes a language only when a change touches its code,
+# and it leaves the tests out (.github/codeql/codeql-config.yml).
+#
+# - A pull request that targets the default branch analyzes the languages its
+#   change touches, compared with the base branch. A stacked pull request is
+#   analyzed from its first push after GitHub retargets it to the default
+#   branch, like CI.
+# - A push to the default branch analyzes the languages it changed. The
+#   default branch's alerts are what the Security tab shows; a language a
+#   push leaves out keeps the alerts of its last analysis.
+# - The weekly run and a manual run analyze every language, so that a newer
+#   CodeQL's queries also look at code no change touched.
+#
+# A change to this workflow or to .github/codeql/ analyzes every language.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+# As in ci.yml: a newer commit on a pull request cancels the running
+# analysis; every other run has a group of its own commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ── What the change touches ────────────────────────────────────────────────
+  # Sets `languages`, the JSON list of the languages to analyze. A pull
+  # request's merge commit is compared with its first parent, the base
+  # branch; a push with the branch's previous commit. The weekly run, a
+  # manual run, and a push whose previous commit cannot be fetched analyze
+  # every language, and so does every language whose diff fails.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      languages: ${{ steps.changes.outputs.languages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Which languages does the change touch?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          base=
+          case $EVENT in
+          pull_request) base=HEAD^1 ;;
+          push)
+              # A new branch's push names 40 zeros.
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] &&
+                  { git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null ||
+                      git fetch --quiet --no-tags --depth=1 origin "$PUSH_BEFORE"; }; then
+                  base=$PUSH_BEFORE
+              fi
+              ;;
+          esac
+
+          # touches <pathspec>...: whether the change touches these paths or
+          # the CodeQL configuration. Without a base, or when the diff fails
+          # (exit status 128), it does.
+          touches() {
+              [ -n "$base" ] || return 0
+              ! git diff --quiet "$base" HEAD -- "$@" .github/workflows/codeql.yml .github/codeql
+          }
+          languages=()
+          if touches .github/workflows ':(glob)**/action.yml' ':(glob)**/action.yaml'; then
+              languages+=(actions)
+          fi
+          if touches web ':(glob)**/*.js' ':(glob)**/*.cjs' ':(glob)**/*.mjs' ':(glob)**/*.ts' ':(glob)**/*.tsx'; then
+              languages+=(javascript-typescript)
+          fi
+          if touches Cargo.toml Cargo.lock rust-toolchain.toml .cargo .sqlx crates plugins xtask; then
+              languages+=(rust)
+          fi
+
+          json=$(jq -cn '$ARGS.positional' --args "${languages[@]}")
+          echo "languages=$json" >> "$GITHUB_OUTPUT"
+          {
+              echo "Languages to analyze: \`$json\`"
+              if [ -n "$base" ]; then
+                  echo "(compared with $(git rev-parse --short "$base"))."
+              else
+                  echo "(every language: $EVENT, or no commit to compare with)."
+              fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Analysis, one job per language ─────────────────────────────────────────
+  # Every language is analyzed without a build (`build-mode: none`). The
+  # category is the one GitHub's default setup uses, `/language:<language>`.
+  # If the changes job fails, every language is analyzed.
+  analyze:
+    name: analyze (${{ matrix.language }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.languages != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the CodeQL action reads this run's workflow
+      security-events: write # upload the results
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.changes.outputs.languages || '["actions", "javascript-typescript", "rust"]') }}
+    env:
+      # The Rust extractor compiles the code with `cfg(test)` off, as a release
+      # build does: the unit tests inside the source files (`#[cfg(test)] mod
+      # tests`) are left out like the test directories, which the
+      # configuration leaves out by path.
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: -test
+      # sqlx's query macros read the prepared queries in .sqlx/, as in CI.
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The extractor resolves the standard library from the toolchain's
+      # sources (rust-src), which the pinned toolchain lacks by default.
+      - name: Install Rust toolchain (rust-toolchain.toml) (with rust-src)
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        with:
+          components: rust-src
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config-file: .github/codeql/codeql-config.yml
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
