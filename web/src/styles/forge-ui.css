@@ -169,7 +169,7 @@
   .fg-field-error { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--danger); font-size: 12px; line-height: 16px; }
   .fg-check { position: relative; display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
   .fg-check.is-disabled { cursor: not-allowed; opacity: 0.55; }
-  .fg-check-input { position: absolute; top: 0; left: 0; width: 16px; height: 16px; margin: 0; opacity: 0; cursor: inherit; }
+  .fg-check-input { position: absolute; z-index: 1; top: 0; left: 0; width: 16px; height: 16px; margin: 0; opacity: 0; cursor: inherit; }
   .fg-check--switch .fg-check-input { width: 32px; height: 18px; }
   .fg-check-box { flex: none; display: grid; place-items: center; box-sizing: border-box; width: 16px; height: 16px; margin-top: 2px; border: 1px solid var(--line-strong); border-radius: var(--radius-xs); background: var(--surface); color: transparent; }
   .fg-check-input:checked + .fg-check-box { border-color: var(--heat); background: var(--heat); color: var(--on-heat); }

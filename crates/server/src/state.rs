@@ -75,6 +75,10 @@ pub struct AppState {
     /// `POST /auth/login` and the wire Basic password path; its limits follow
     /// [`Self::auth_settings`].
     pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Failed invitation lookups and acceptances per client network (#322),
+    /// with the login lockout's budget and window, which follow
+    /// [`Self::auth_settings`].
+    pub invitation_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
@@ -314,13 +318,15 @@ impl AppState {
                 forge_core::auth::PgKnownNetworks::new(pool.clone()),
             )),
         );
+        let invitation_throttle = Arc::new(forge_core::auth::LoginThrottle::default());
         let auth_settings = Arc::new(
             AuthSettingsCache::new(
                 pool.clone(),
                 std::time::Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1)),
             )
             .with_authz(authz.clone())
-            .with_login_throttle(login_throttle.clone()),
+            .with_login_throttle(login_throttle.clone())
+            .with_login_throttle(invitation_throttle.clone()),
         );
         let sessions = auth_settings.sessions().clone();
         let cookie_secure = config.public_base_url().starts_with("https://");
@@ -356,6 +362,7 @@ impl AppState {
             auth_settings,
             cookie_secure,
             login_throttle,
+            invitation_throttle,
             oidc_login_starts,
             envelope: None,
             upstream,

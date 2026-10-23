@@ -10,18 +10,9 @@ use serde_json::{json, Value};
 
 /// Create a non-admin user via the admin API; returns its (username, password).
 async fn make_user(srv: &common::TestServer) -> (String, String) {
-    let (au, ap) = srv.admin_basic();
     let username = format!("self{}@example.com", common::unique());
-    let resp = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    (username, "pw123456".into())
+    srv.create_user(&username, "pw123456-self", "reader").await;
+    (username, "pw123456-self".into())
 }
 
 /// A non-admin user mints, lists, uses, and revokes their own token.

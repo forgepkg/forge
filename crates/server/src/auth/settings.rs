@@ -344,8 +344,8 @@ pub struct AuthSettingsCache {
     sessions: SessionService,
     /// Gets public read for signed-in callers under anonymous mode `all`.
     authz: Option<Authz>,
-    /// Gets the lockout limits.
-    login_throttle: Option<Arc<LoginThrottle>>,
+    /// Each gets the lockout limits.
+    login_throttles: Vec<Arc<LoginThrottle>>,
 }
 
 impl AuthSettingsCache {
@@ -366,7 +366,7 @@ impl AuthSettingsCache {
             refresh: tokio::sync::Mutex::new(()),
             sessions,
             authz: None,
-            login_throttle: None,
+            login_throttles: Vec::new(),
         }
     }
 
@@ -377,9 +377,9 @@ impl AuthSettingsCache {
         self
     }
 
-    /// Set the lockout limits of `throttle`.
+    /// Set the lockout limits of `throttle` too.
     pub fn with_login_throttle(mut self, throttle: Arc<LoginThrottle>) -> Self {
-        self.login_throttle = Some(throttle);
+        self.login_throttles.push(throttle);
         self
     }
 
@@ -485,7 +485,7 @@ impl AuthSettingsCache {
         if let Some(authz) = &self.authz {
             authz.set_public_read_for_signed_in(settings.anonymous_mode == AnonymousMode::All);
         }
-        if let Some(throttle) = &self.login_throttle {
+        for throttle in &self.login_throttles {
             throttle.set_limits(
                 settings.login_max_failures,
                 Duration::from_secs(settings.login_failure_window_seconds),

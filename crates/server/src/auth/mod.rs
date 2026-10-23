@@ -21,6 +21,9 @@
 //!     validated relative target.
 //!   * `POST /auth/logout`        — revoke the session + clear the cookie (CSRF
 //!     protected via the per-session double-submit secret).
+//!   * `POST /auth/invitations/lookup` / `…/accept` — an invited user's link
+//!     (#322, [`crate::invitations`]): whose account it is, and choosing its
+//!     password. Failures are throttled per client network.
 //!
 //! All ephemeral flow state and the sessions live in Postgres (`oidc_flow` /
 //! `session`), so any instance can complete a callback another started, and a
@@ -182,6 +185,8 @@ pub fn auth_router() -> Router<AppState> {
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/auth/logout", post(logout))
+        .route("/auth/invitations/lookup", post(lookup_invitation))
+        .route("/auth/invitations/accept", post(accept_invitation))
         .route("/auth/me", get(me))
         .route("/auth/tokens", get(list_tokens).post(create_token))
         .route("/auth/tokens/{id}", delete(revoke_token))
@@ -964,6 +969,153 @@ async fn password_login(
         }),
     )
         .into_response()
+}
+
+/// The key the invitation throttle counts a client network's failures under
+/// (the throttle is the login lockout's, keyed by network and this).
+const INVITATION_THROTTLE_KEY: &str = "\u{0}invitation";
+
+/// `POST /auth/invitations/lookup` and `…/accept` body: the token from the
+/// link's fragment (and the password to choose).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvitationBody {
+    token: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// The one answer for a token that does not work.
+fn invalid_invitation() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": crate::invitations::INVALID_INVITATION})),
+    )
+        .into_response()
+}
+
+fn invitation_throttled(state: &AppState) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            state
+                .invitation_throttle
+                .current_limits()
+                .1
+                .as_secs()
+                .max(1)
+                .to_string(),
+        )],
+        "too many failed attempts; try again later",
+    )
+        .into_response()
+}
+
+/// `POST /auth/invitations/lookup`: whose account a live invitation is
+/// for, so the page can name it. **400** with the generic answer otherwise.
+async fn lookup_invitation(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<InvitationBody>,
+) -> Response {
+    let client_ip = login_client_ip(&state, connect, &headers);
+    let Ok(attempt) = state
+        .invitation_throttle
+        .begin(client_ip, INVITATION_THROTTLE_KEY)
+        .await
+    else {
+        return invitation_throttled(&state);
+    };
+    let hash = crate::invitations::token_hash(&body.token);
+    match forge_db::invitation_dao::find_live(&state.pool, &hash).await {
+        Ok(Some((username, expires_at))) => {
+            attempt.released();
+            Json(serde_json::json!({"username": username, "expires_at": expires_at}))
+                .into_response()
+        }
+        Ok(None) => {
+            attempt.failed();
+            invalid_invitation()
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation lookup failed");
+            auth_unavailable()
+        }
+    }
+}
+
+/// `POST /auth/invitations/accept`: choose the invited account's password.
+/// **200** `{"username"}` (the page then sends the browser to sign in);
+/// **400** for a password that is too short or too long, or with the generic
+/// answer for a token that does not work.
+async fn accept_invitation(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<InvitationBody>,
+) -> Response {
+    let Some(password) = body.password else {
+        return (StatusCode::BAD_REQUEST, "a password is required").into_response();
+    };
+    if let Err(why) = crate::invitations::check_password(&password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": why})),
+        )
+            .into_response();
+    }
+    let client_ip = login_client_ip(&state, connect, &headers);
+    let Ok(attempt) = state
+        .invitation_throttle
+        .begin(client_ip, INVITATION_THROTTLE_KEY)
+        .await
+    else {
+        return invitation_throttled(&state);
+    };
+    let hash = crate::invitations::token_hash(&body.token);
+    // Before the argon2 work: an unknown token costs none.
+    match forge_db::invitation_dao::find_live(&state.pool, &hash).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            attempt.failed();
+            return invalid_invitation();
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation lookup failed");
+            return auth_unavailable();
+        }
+    }
+    let password_hash = match crate::admin::hash_password(password).await {
+        Ok(hash) => hash,
+        Err(resp) => {
+            attempt.released();
+            return resp;
+        }
+    };
+    match forge_db::invitation_dao::accept(&state.pool, &hash, &password_hash).await {
+        Ok(Some(user)) => {
+            attempt.released();
+            tracing::info!(
+                user_id = user.id,
+                "invitation accepted: the password is set"
+            );
+            Json(serde_json::json!({"username": user.username})).into_response()
+        }
+        // Accepted, replaced or revoked meanwhile.
+        Ok(None) => {
+            attempt.failed();
+            invalid_invitation()
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation acceptance failed");
+            auth_unavailable()
+        }
+    }
 }
 
 /// Resolve the client IP for the lockout key and the login audit trail: honors

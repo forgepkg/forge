@@ -570,17 +570,7 @@ async fn mutations_outside_the_selector_are_unknown() {
             .send()
     };
     let username = format!("deleter{}@example.com", unique());
-    let user: Value = admin(
-        reqwest::Method::POST,
-        "/admin/users",
-        json!({ "username": username, "password": "pw-0123456789", "is_admin": false }),
-    )
-    .await
-    .unwrap()
-    .json()
-    .await
-    .unwrap();
-    let user_id = user["id"].as_i64().unwrap();
+    let user_id = srv.create_user(&username, "pw-0123456789", "reader").await;
     let selector: Value = admin(
         reqwest::Method::POST,
         "/admin/content-selectors",

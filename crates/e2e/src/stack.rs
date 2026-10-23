@@ -916,22 +916,39 @@ impl TestServer {
 
     // ── RBAC admin helpers ───────────────────────────────────────────────────
 
-    /// Create a non-admin user via the admin API and return its numeric id.
+    /// Create a non-admin local user the way an administrator and its user
+    /// do (#322): the admin invites it and, with no email service
+    /// configured, gets the invitation link; the user then chooses
+    /// `password` (at least 12 characters) from it. Returns its numeric id.
     pub async fn create_user(&self, username: &str, password: &str) -> i64 {
         let (u, p) = self.admin_basic();
         let body: serde_json::Value = self
             .client()
             .post(format!("{}/admin/users", self.base_url))
             .basic_auth(&u, Some(&p))
-            .json(&serde_json::json!({
-                "username": username, "password": password, "is_admin": false
-            }))
+            .json(&serde_json::json!({"username": username}))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        let link = body["invitation"]["link"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no invitation link: {body}"));
+        let token = link.split_once('#').expect("a fragment").1;
+        let resp = self
+            .client()
+            .post(format!("{}/auth/invitations/accept", self.base_url))
+            .json(&serde_json::json!({"token": token, "password": password}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "invitation accepted: {}",
+            resp.text().await.unwrap()
+        );
         body["id"].as_i64().expect("created user id")
     }
 

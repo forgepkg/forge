@@ -6,7 +6,6 @@
 #![cfg(feature = "forge-e2e")]
 
 use forge_e2e::{start_stack, AnonMode, StackBuilder};
-use serde_json::Value;
 
 /// An IP not in the allowlist (used to prove denial).
 const DENIED_IP: &str = "198.51.100.7";
@@ -194,21 +193,11 @@ async fn admin_api_requires_admin_and_bootstrap_works() {
     assert_eq!(resp.status(), 401, "unauthenticated admin call is 401");
 
     // Create a non-admin user, then assert it is forbidden from the admin API.
-    let body: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .json(&serde_json::json!({"username": "alice@example.com", "password": "alicepw", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(body["username"], serde_json::json!("alice@example.com"));
+    srv.create_user("alice@example.com", "alicepw-e2e-12").await;
 
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth("alice@example.com", Some("alicepw"))
+        .basic_auth("alice@example.com", Some("alicepw-e2e-12"))
         .send()
         .await
         .unwrap();

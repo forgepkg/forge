@@ -816,16 +816,7 @@ async fn selectors_scope_paths() {
 
     // A user who may read `pdfium/**` and `**/*.tgz` outside `secret/`.
     let username = format!("reader{}@example.com", unique());
-    let user: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw12345678", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let user_id = srv.create_user(&username, "pw12345678-raw", "reader").await;
     let selector: Value = client
         .post(format!("{}/admin/content-selectors", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -858,13 +849,13 @@ async fn selectors_scope_paths() {
         .unwrap();
     assert_eq!(resp.status(), 201);
     client
-        .put(format!("{}/admin/users/{}/roles", srv.base_url, user["id"]))
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
         .json(&json!({"role_id": role["id"]}))
         .send()
         .await
         .unwrap();
-    let session = srv.login(&username, "pw12345678").await;
+    let session = srv.login(&username, "pw12345678-raw").await;
     let get = |path: String| {
         session
             .apply(client.get(format!("{}/raw/{name}/{path}", srv.base_url)))

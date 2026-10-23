@@ -19,7 +19,8 @@ import { ApiError } from '~/lib/httpClient'
 import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import { safeReturnTo } from '~/lib/returnTo'
-import { Button, Code, Icon, Logo, Notice, Skeleton, TextField } from '~/components/ui'
+import { AuthCard } from '~/components/AuthCard'
+import { Button, Code, Icon, Notice, Skeleton, TextField } from '~/components/ui'
 
 interface LoginSearch {
   /**
@@ -39,6 +40,10 @@ interface LoginSearch {
    * only when it looks like a claim name (the URL is anyone's to craft).
    */
   claim?: string
+  /** A username to start with: an invited user who just chose a password. */
+  username?: string
+  /** Set when the user just chose their password from an invitation. */
+  invited?: boolean
 }
 
 /**
@@ -93,6 +98,11 @@ export const Route = createFileRoute('/login')({
       search.logout_failed === true || search.logout_failed === 'true',
     error: parseLoginError(search.error),
     claim: parseClaim(search.claim),
+    username:
+      typeof search.username === 'string' && search.username.length <= 256
+        ? search.username
+        : undefined,
+    invited: search.invited === true || search.invited === 'true',
   }),
 })
 
@@ -116,7 +126,7 @@ export const Route = createFileRoute('/login')({
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired, logout_failed, error, claim } = useSearch({
+  const { redirect, expired, logout_failed, error, claim, username, invited } = useSearch({
     from: '/login',
   })
   const options = useQuery<LoginOptions, ApiError>({
@@ -130,73 +140,67 @@ function Login() {
     options.data ?? (options.isError ? passwordFallbackOptions : undefined)
 
   return (
-    <div className="flex min-h-dvh flex-col items-center gap-7 bg-ground px-4 pt-16 pb-8 text-ink">
-      <Logo size={34} />
-      <main className="flex w-full max-w-[400px] flex-col gap-6 rounded-lg border border-line bg-surface p-8 shadow-lg max-sm:p-6">
-        <div className="flex flex-col gap-1">
-          <h1 className="m-0 text-2xl leading-8 font-semibold tracking-[-0.01em]">
-            Sign in to Forge
-          </h1>
-          <p className="fg-text">
-            {loginOptions?.mode === 'combined'
-              ? 'Use your username and password, or your organization’s sign-in.'
-              : 'Enter your username to continue.'}
-          </p>
-        </div>
+    <AuthCard
+      title="Sign in to Forge"
+      subtitle={
+        loginOptions?.mode === 'combined'
+          ? 'Use your username and password, or your organization’s sign-in.'
+          : 'Enter your username to continue.'
+      }
+    >
+      {error && (
+        <Notice
+          tone="danger"
+          action={
+            <Link to="/login" search={{ redirect }} className="fg-notice-action">
+              Try again
+            </Link>
+          }
+        >
+          <p>{loginErrorMessages[error]}</p>
+          {error === 'username_not_upn' && claim && (
+            <p>
+              The username came from the <Code>{claim}</Code> claim.
+            </p>
+          )}
+        </Notice>
+      )}
 
-        {error && (
-          <Notice
-            tone="danger"
-            action={
-              <Link to="/login" search={{ redirect }} className="fg-notice-action">
-                Try again
-              </Link>
-            }
-          >
-            <p>{loginErrorMessages[error]}</p>
-            {error === 'username_not_upn' && claim && (
-              <p>
-                The username came from the <Code>{claim}</Code> claim.
-              </p>
-            )}
-          </Notice>
-        )}
+      {invited && <Notice tone="ok">Your password is set. Sign in with it.</Notice>}
 
-        {expired && (
-          <Notice tone="warn">Your session expired. Sign in again to continue.</Notice>
-        )}
+      {expired && (
+        <Notice tone="warn">Your session expired. Sign in again to continue.</Notice>
+      )}
 
-        {logout_failed && (
-          <Notice tone="danger">
-            Sign-out could not be confirmed by the server, so your session may
-            still be active. Sign in and sign out again, or close the browser.
-          </Notice>
-        )}
+      {logout_failed && (
+        <Notice tone="danger">
+          Sign-out could not be confirmed by the server, so your session may
+          still be active. Sign in and sign out again, or close the browser.
+        </Notice>
+      )}
 
-        {options.isError && (
-          <Notice tone="warn" role="status">
-            Sign-in options could not be loaded. Password sign-in is available.
-          </Notice>
-        )}
+      {options.isError && (
+        <Notice tone="warn" role="status">
+          Sign-in options could not be loaded. Password sign-in is available.
+        </Notice>
+      )}
 
-        {!loginOptions ? (
-          <Skeleton lines={2} label="Loading sign-in options…" />
-        ) : loginOptions.mode === 'combined' ? (
-          <CombinedLogin options={loginOptions} redirect={redirect} />
-        ) : (
-          <IdentifierFirstLogin redirect={redirect} />
-        )}
+      {!loginOptions ? (
+        <Skeleton lines={2} label="Loading sign-in options…" />
+      ) : loginOptions.mode === 'combined' ? (
+        <CombinedLogin options={loginOptions} redirect={redirect} initialUsername={username} />
+      ) : (
+        <IdentifierFirstLogin redirect={redirect} initialUsername={username} />
+      )}
 
-        {loginOptions?.mode !== 'combined' && (
-          <p className="fg-text fg-text--small border-t border-line pt-4">
-            Forge checks which sign-in your account uses. With your
-            organization’s single sign-on you continue at its sign-in page;
-            otherwise Forge asks for your password next.
-          </p>
-        )}
-      </main>
-      <p className="fg-text fg-text--small">{window.location.host}</p>
-    </div>
+      {loginOptions?.mode !== 'combined' && (
+        <p className="fg-text fg-text--small border-t border-line pt-4">
+          Forge checks which sign-in your account uses. With your
+          organization’s single sign-on you continue at its sign-in page;
+          otherwise Forge asks for your password next.
+        </p>
+      )}
+    </AuthCard>
   )
 }
 
@@ -279,9 +283,15 @@ function FormError({ children }: { children: React.ReactNode }) {
  * realm decision either reveals the password field (step 2, username shown
  * with a back link) or navigates the browser to the IdP.
  */
-function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
+function IdentifierFirstLogin({
+  redirect,
+  initialUsername,
+}: {
+  redirect?: string
+  initialUsername?: string
+}) {
   const [step, setStep] = useState<'identify' | 'password'>('identify')
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting, setSubmitting } =
     usePasswordLogin(redirect)
@@ -378,11 +388,13 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 function CombinedLogin({
   options,
   redirect,
+  initialUsername,
 }: {
   options: LoginOptions
   redirect?: string
+  initialUsername?: string
 }) {
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting } = usePasswordLogin(redirect)
 

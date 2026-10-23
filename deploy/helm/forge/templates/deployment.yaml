@@ -19,7 +19,13 @@ spec:
   revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
   {{- with .Values.strategy }}
   strategy:
+    {{- /* Helm merges a user's `type: Recreate` into the default's
+    rollingUpdate, which the API server refuses next to Recreate. */}}
+    {{- if eq (.type | default "") "Recreate" }}
+    {{- toYaml (omit . "rollingUpdate") | nindent 4 }}
+    {{- else }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
   selector:
     matchLabels:

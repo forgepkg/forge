@@ -270,22 +270,13 @@ async fn local_user_authenticates_without_hitting_upstream() {
     let (admin_u, admin_p) = srv.admin_basic();
 
     // Create a *local* (password) user via the admin API.
-    let resp = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&admin_u, Some(&admin_p))
-        .json(&serde_json::json!({
-            "username": "local-bob@example.com", "password": "bobpw", "is_admin": false
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "local user created");
+    srv.create_user("local-bob@example.com", "bobpw-e2e-local")
+        .await;
     let hits_before = mock.hits();
 
     // local-bob authenticates via the FIRST provider (local-password); since the
     // chain stops at the first Authenticated, the upstream is never consulted.
-    let resp = me_basic(&srv, "local-bob@example.com", "bobpw").await;
+    let resp = me_basic(&srv, "local-bob@example.com", "bobpw-e2e-local").await;
     assert_eq!(resp.status(), 200, "local user authenticates");
     assert_eq!(
         mock.hits(),

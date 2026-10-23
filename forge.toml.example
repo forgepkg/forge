@@ -192,7 +192,9 @@ default_ttl_seconds = 30        # (default: 30)
 # downloads then answer 503 with Retry-After, and /readyz reports the object
 # store "degraded" instead of failing). S3 stays the source of truth. Unset
 # path = no cache. Each instance needs a directory of its own.
-# path = "/var/cache/forge"
+# Forge creates the directory (mode 0700) and refuses one another user owns,
+# such as a mounted volume's root: name a subdirectory of the volume.
+# path = "/var/cache/forge/blobs"
 # "auto": the size of the filesystem holding `path` minus min_free_bytes (and
 # server.max_staging_bytes when staging is on the same filesystem), re-read
 # every minute; or a fixed number of bytes. On a Kubernetes emptyDir, statvfs

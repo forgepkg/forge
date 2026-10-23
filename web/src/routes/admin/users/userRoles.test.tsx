@@ -10,8 +10,8 @@ import { renderApp } from '~/test/renderApp'
  * Roles, effective access and token scopes on the admin user screens,
  * against the real route tree and a stateful fake of the RBAC API:
  *  - the user list shows each user's access level (admin, writer or reader)
- *    from their role assignments and their other roles, and the create form
- *    gives a new user its roles;
+ *    from their role assignments and their other roles, and the create page
+ *    gives a new user its access level;
  *  - the user page switches the access level, assigns and removes roles,
  *    shows the 409 for the last administrator, and lists the effective
  *    access with repository and selector names;
@@ -133,56 +133,23 @@ describe('admin user roles', () => {
     expect(api.state.assignments).toContainEqual([1, 1])
   })
 
-  it('gives a new user the chosen roles', async () => {
+  it('creates a user with its access level', async () => {
     const u = userEvent.setup()
-    await renderApp('/manage/users')
+    await renderApp('/manage/users/new')
 
     await u.type(await screen.findByLabelText('Username'), 'carol@example.com')
-    await u.type(screen.getByLabelText('Password'), 'hunter2')
-    await u.click(await screen.findByRole('checkbox', { name: /^admin/ }))
-    await u.click(screen.getByRole('checkbox', { name: /^ci-pushers/ }))
-    await u.click(screen.getByRole('button', { name: 'Create user' }))
+    await u.click(screen.getByRole('radio', { name: /^Writer/ }))
+    await u.click(screen.getByRole('button', { name: 'Create and invite' }))
 
-    await waitFor(() => expect(api.sent('PUT', /\/roles$/)).toHaveLength(1))
+    await waitFor(() => expect(api.sent('POST', /^\/admin\/users$/)).toHaveLength(1))
     expect(api.sent('POST', /^\/admin\/users$/)[0].body).toEqual({
       username: 'carol@example.com',
-      password: 'hunter2',
-      active: true,
-      is_admin: true,
+      role: 'writer',
     })
-    const carol = api.state.users.find((x) => x.username === 'carol@example.com')!
-    expect(api.sent('PUT', /\/roles$/)[0].path).toBe(`/admin/users/${carol.id}/roles`)
-    expect(api.sent('PUT', /\/roles$/)[0].body).toEqual({ role_id: 7 })
-
-    const row = (
-      await screen.findByRole('link', { name: 'carol@example.com' })
-    ).closest('tr')!
-    await waitFor(() =>
-      expect(within(row).getByText('ci-pushers')).toBeInTheDocument(),
-    )
-    expect(within(row).getByText('admin')).toBeInTheDocument()
-    // The form is ready for the next user.
-    expect(screen.getByLabelText('Username')).toHaveValue('')
-  })
-
-  it('names the role a new user could not be given, keeping the user', async () => {
-    const u = userEvent.setup()
-    await renderApp('/manage/users')
-
-    await u.type(await screen.findByLabelText('Username'), 'dave@example.com')
-    await u.type(screen.getByLabelText('Password'), 'hunter2')
-    await u.click(await screen.findByRole('checkbox', { name: /^ci-pushers/ }))
-    // Deleted by someone else after the form loaded.
-    api.state.roles = api.state.roles.filter((r) => r.id !== 7)
-    await u.click(screen.getByRole('button', { name: 'Create user' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Created dave@example.com, but could not give it the role ci-pushers: role not found',
-    )
-    expect(
-      await screen.findByRole('link', { name: 'dave@example.com' }),
-    ).toBeInTheDocument()
-    expect(screen.getByLabelText('Username')).toHaveValue('')
+    // The role goes with the create: nothing is assigned afterwards.
+    expect(api.sent('PUT', /\/roles$/)).toHaveLength(0)
+    await u.click(await screen.findByRole('link', { name: 'Go to carol@example.com' }))
+    expect(await screen.findByRole('radio', { name: /^Writer/ })).toBeChecked()
   })
 
   it("assigns and removes a user's roles", async () => {

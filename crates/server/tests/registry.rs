@@ -277,14 +277,7 @@ fn repo_name(prefix: &str) -> String {
 /// A user and an API token for it.
 async fn user_with_token(srv: &TestServer) -> (String, String, i64) {
     let username = format!("dev{}x{}@example.com", std::process::id(), unique());
-    let resp = admin_post(
-        srv,
-        "/admin/users",
-        json!({"username": username, "password": "pw-pw-pw-pw", "is_admin": false}),
-    )
-    .await;
-    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
-    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let id = srv.create_user(&username, "pw-pw-pw-pw-pw", "reader").await;
     let token: Value = admin_post(
         srv,
         &format!("/admin/users/{id}/tokens"),

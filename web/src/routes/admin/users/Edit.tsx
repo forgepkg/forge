@@ -10,8 +10,13 @@ import {
   type AccessLevel,
 } from '~/api/rbac'
 import { ApiError } from '~/lib/httpClient'
-import { authSourceLabel, type UserView } from '~/api/users'
-import { useConvertUserToLocal, useUsers } from '~/queries/useUsers'
+import { authSourceLabel, type IssuedInvitation, type UserView } from '~/api/users'
+import {
+  useConvertUserToLocal,
+  useInviteUser,
+  useRevokeInvitation,
+  useUsers,
+} from '~/queries/useUsers'
 import {
   useCreateToken,
   useRevokeToken,
@@ -48,6 +53,7 @@ import {
   TableRow,
 } from '~/components/ui'
 import { AccessBadge } from '~/components/AccessBadge'
+import { UserStatusBadge } from './List'
 import { AccessLevelFields } from '~/components/AccessLevelFields'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
@@ -93,7 +99,9 @@ const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
  * header says how the user signs in, so a role or token does not go to a
  * look-alike account by mistake. A credential-forwarding account whose realm
  * kept its password hash can be switched to a local account with that
- * password from here.
+ * password from here. An invited account (its user has not chosen a password
+ * yet) shows its invitation, which can be resent, copied as a link (shown
+ * once) or revoked.
  */
 function UserPage() {
   const { userId } = Route.useParams()
@@ -120,9 +128,12 @@ function UserPage() {
             : undefined
         }
       >
-        {user && !user.active && <StatusBadge tone="neutral">inactive</StatusBadge>}
+        {user && <UserStatusBadge status={user.status} />}
       </PageHeader>
 
+      {user && (user.status === 'invited' || user.status === 'invitation_expired') && (
+        <UserInvitation user={user} />
+      )}
       {user?.captured_password_at && <KeptPassword user={user} />}
 
       <Columns asideLabel="Access" aside={<UserAccess userId={id} />}>
@@ -599,6 +610,102 @@ function ScopeEditor({
       <TokenScopeFields value={draft} onChange={setDraft} repositories={repositories} />
       {save.isError && (
         <InlineError>{save.error.body || save.error.message}</InlineError>
+      )}
+    </Panel>
+  )
+}
+
+/**
+ * An invited account's invitation: where it went and until when, sending a
+ * new one (the old link stops working), making a link to copy instead (shown
+ * once, like a token), and revoking it.
+ */
+function UserInvitation({ user }: { user: UserView }) {
+  const invite = useInviteUser()
+  const revoke = useRevokeInvitation()
+  // The answer of the last resend or copy: its link is shown once, held
+  // here and never cached.
+  const [issued, setIssued] = useState<IssuedInvitation | null>(null)
+  const invitation = user.invitation
+  const live = user.status === 'invited'
+
+  function make(sendEmail: boolean) {
+    setIssued(null)
+    invite.mutate(
+      { id: user.id, send_email: sendEmail },
+      { onSuccess: (made) => setIssued(made) },
+    )
+  }
+
+  return (
+    <Panel
+      title="Invitation"
+      description={
+        live && invitation
+          ? `${user.username} has not chosen a password yet. The invitation ${
+              invitation.sent_at ? `went to ${invitation.email}` : 'link was handed over'
+            } and works until ${formatTs(invitation.expires_at)}.`
+          : `${user.username} has not chosen a password yet, and no invitation link works: send a new one.`
+      }
+      footer={
+        <>
+          {live && (
+            <Button
+              variant="ghost"
+              disabled={revoke.isPending}
+              onClick={() => {
+                setIssued(null)
+                revoke.mutate(user.id)
+              }}
+            >
+              Revoke invitation
+            </Button>
+          )}
+          <Button icon="Copy" disabled={invite.isPending} onClick={() => make(false)}>
+            Copy invitation link
+          </Button>
+          <Button
+            variant="primary"
+            icon="Mail"
+            disabled={invite.isPending}
+            onClick={() => make(true)}
+          >
+            Resend invitation
+          </Button>
+        </>
+      }
+    >
+      {(invite.isError || revoke.isError) && (
+        <InlineError>
+          {invite.error?.body || invite.error?.message || revoke.error?.body || revoke.error?.message}
+        </InlineError>
+      )}
+      {issued?.email_sent && (
+        <Notice tone="ok">
+          Sent a new invitation to {issued.email}; the previous link no longer works.
+        </Notice>
+      )}
+      {issued && !issued.email_sent && issued.link && (
+        <>
+          {issued.error && (
+            <p className="fg-text">
+              {issued.error === 'no email service is configured'
+                ? 'No email service is configured,'
+                : `The invitation email was not sent (${issued.error}),`}{' '}
+              so give the user this link.
+            </p>
+          )}
+          <ShowOnceSecret
+            secret={issued.link}
+            label="Invitation link"
+            onDismiss={() => setIssued(null)}
+          />
+        </>
+      )}
+      {!issued && !invite.isError && !revoke.isError && (
+        <p className="fg-text fg-text--small">
+          Resending makes a new link; the one sent before stops working.
+        </p>
       )}
     </Panel>
   )
