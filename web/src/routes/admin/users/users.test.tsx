@@ -71,6 +71,7 @@ const fetchMock = vi.fn()
 
 interface ApiHandlers {
   users?: UserView[]
+  realms?: unknown[]
   tokens?: TokenView[]
   onCreateUser?: (body: unknown) => Response
   onDeleteUser?: (id: number) => Response
@@ -89,6 +90,9 @@ function mockApi(h: ApiHandlers) {
       const path = url.pathname
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+      if (path.endsWith('/admin/realms') && method === 'GET') {
+        return Promise.resolve(json(h.realms ?? []))
+      }
 
       // Per-user token list / create.
       const tokensMatch = path.match(/\/admin\/users\/(\d+)\/tokens$/)
@@ -217,26 +221,43 @@ describe('admin users', () => {
     expect(signIn('svc')).toHaveTextContent('scim')
   })
 
-  it('marks local and identity-provider accounts without a UPN as legacy names', async () => {
+  it('creates an account of a credential-forwarding realm, without a password', async () => {
+    let posted: unknown = null
     mockApi({
-      users: [
-        user({ id: 2, username: 'root', auth_source: 'local' }),
-        user({ id: 3, username: 'alice@corp.example', auth_source: 'local' }),
-        user({ id: 4, username: 'bob', auth_source: 'oidc' }),
-        // A forwarded account keeps the name its upstream accepted.
-        user({ id: 5, username: 'carol', auth_source: 'upstream-basic' }),
+      users: [],
+      realms: [
+        { id: 3, kind: 'credential_forwarding', name: 'nexus', enabled: true, priority: 20, config: {} },
+        { id: 4, kind: 'oidc', name: 'entra', enabled: true, priority: 30, config: {} },
       ],
+      onCreateUser: (body) => {
+        posted = body
+        return json(user({ id: 2, username: 'dora@example.com', auth_source: 'upstream-basic' }), 201)
+      },
     })
 
+    const u = userEvent.setup()
     await renderAt('/manage/users')
 
-    await screen.findByText('alice@corp.example')
-    const row = (name: string) =>
-      within(screen.getByRole('button', { name }).closest('tr')!)
-    expect(row('root').getByText('legacy name')).toBeInTheDocument()
-    expect(row('bob').getByText('legacy name')).toBeInTheDocument()
-    expect(row('alice@corp.example').queryByText('legacy name')).toBeNull()
-    expect(row('carol').queryByText('legacy name')).toBeNull()
+    await u.type(await screen.findByLabelText('Username'), 'dora@example.com')
+    const signIn = await screen.findByLabelText('Sign-in')
+    // Only credential-forwarding realms are offered.
+    expect(
+      within(signIn).queryByRole('option', { name: /entra/ }),
+    ).toBeNull()
+    await u.selectOptions(signIn, 'nexus')
+    expect(screen.queryByLabelText('Password')).toBeNull()
+    expect(
+      screen.getByText(/gets the part of the username before the @/),
+    ).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: 'Create user' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      username: 'dora@example.com',
+      realm: 'nexus',
+      is_admin: false,
+      active: true,
+    })
   })
 
   it('create-user asks for a UPN before it POSTs', async () => {

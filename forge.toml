@@ -52,7 +52,8 @@ allow_password_basic = true
 
 # First-run admin, created automatically if no admin user exists yet.
 [auth.bootstrap_admin]
-# A UPN (local-part@domain), as every new account is named.
+# A UPN (local-part@domain), as every account is named (default
+# admin@example.com).
 username = "admin@example.com"
 password = "changeme"
 

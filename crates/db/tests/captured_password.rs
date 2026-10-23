@@ -30,11 +30,10 @@ async fn realm(pool: &PgPool, capture: bool) -> i64 {
 }
 
 async fn upstream_user(pool: &PgPool, realm_id: i64) -> (i64, String) {
-    let name = format!("kept-user-{}", unique());
-    let user = user_dao::provision_upstream_user(pool, &name, Some(realm_id))
+    let name = format!("kept-user-{}@example.com", unique());
+    let user = user_dao::insert_forwarded_user(pool, &name, realm_id, true)
         .await
-        .unwrap()
-        .expect("provisioned");
+        .unwrap();
     (user.id, user.username)
 }
 

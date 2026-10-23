@@ -126,9 +126,8 @@ credential_forward_max_concurrent = 32  # (default: 32)
 # Omit the section, or leave the password empty/unset, for no bootstrap admin
 # (remove the password once real admins exist). "changeme" is refused unless
 # server.allow_insecure_defaults = true. The username is a UPN
-# (local-part@domain), as every new account is named, and has no default:
-# while the account still has to be created, startup refuses a missing or
-# non-UPN name. An install whose bootstrap admin exists already keeps it.
+# (local-part@domain), as every account is named; default admin@example.com,
+# which the `admin` of an install from before 1.2 is renamed to.
 [auth.bootstrap_admin]
 username = "admin@example.com"
 password = "changeme"

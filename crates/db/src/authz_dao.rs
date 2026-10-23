@@ -28,7 +28,7 @@ pub const ANONYMOUS_ROLE: &str = "anonymous";
 /// The fixed slug of the built-in `authenticated` role (read and write on
 /// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
-/// The fixed slug of the built-in `writer` role (migration 0040): read and
+/// The fixed slug of the built-in `writer` role (migration 0042): read and
 /// publish packages on every repository, without deleting them or any right
 /// to administer the instance.
 pub const WRITER_ROLE: &str = "writer";

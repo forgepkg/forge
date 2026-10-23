@@ -1,6 +1,6 @@
 # Developing & running Forge locally
 
-Forge is a NuGet, Docker / OCI and Helm registry written in Rust.
+Forge is a NuGet, Docker / OCI, Helm and raw file registry written in Rust.
 Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 (metadata) and an **S3-compatible** object store (blobs) — both provided by
 `docker-compose.yml` (versitygw stands in for S3).
@@ -118,8 +118,8 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
-origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
+The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/raw`, `/auth`
+to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
 `web-dev` binds Vite to IPv4 all-interfaces and prints local/network portal
@@ -240,6 +240,12 @@ password: `docker login localhost:8421 -u admin@example.com`, then
 `docker push localhost:8421/docker-hosted/team/app:1`. See
 [docs/docker.md](docs/docker.md).
 
+Raw repositories (`"format":"raw"`) hold files under arbitrary paths, served
+under `/raw/`: `curl -u admin@example.com:<token> --upload-file x.tgz
+localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
+(`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
+groups. See [docs/raw.md](docs/raw.md).
+
 ### Repositories of other formats (format plugins)
 
 Formats other than NuGet come from format plugins, crates in
@@ -270,7 +276,7 @@ Key knobs:
 | `auth.anonymous_mode` | `off` / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
 | `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
-| `auth.bootstrap_admin` | First-run admin username (a UPN such as `admin@example.com`, no default) / password. No or a blank password means no bootstrap admin. |
+| `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
@@ -329,32 +335,38 @@ could carry it. Form login answers such a name with 401, and admin user
 creation and the bootstrap admin refuse it. OIDC-provisioned names may still
 contain one.
 
-A **new** account is named by a UPN, `local-part@domain` (admin user
-creation, the bootstrap admin, `oidc` realm provisioning); accounts created
-before that rule keep their names, and credential-forwarding accounts keep the
-name the upstream accepted. The rule is `is_upn` in `crates/db/src/username.rs`
-(mirrored by `upnError` in `web/src/api/users.ts`); see
-[docs/deployment.md](docs/deployment.md#usernames).
+Every account is named by a UPN, `local-part@domain` (admin user creation,
+the bootstrap admin, `oidc` realm provisioning, credential-forwarding
+accounts). The rule is `is_upn` in `crates/db/src/username.rs` (mirrored by
+`upnError` in `web/src/api/users.ts`); see
+[docs/deployment.md](docs/deployment.md#usernames). Accounts from before 1.2
+are renamed at startup: `rename_legacy_usernames` in
+`crates/db/src/user_dao.rs`, run by `forge_db::migrate` after the SQL
+migrations, renames each name that is no UPN to `<name>@example.com` (logged
+as a warning), and moves the bootstrap admin's markers with it. It goes in
+1.3.0 (#389).
 
-A `credential_forwarding` realm forwards the **canonical** username with the
-password and, on success, signs the user in as that name. That is only safe
-when the upstream **binds the username to the secret**. Many do not: GitHub,
-Azure DevOps and GitLab accept a personal access token with *any* username,
-so anyone with a token could sign in as any Forge user. For such an upstream,
-set `identity_path` to where its JSON success response names the
-authenticated account (e.g. `login` for GitHub's `/user`): that name, in
-canonical form, must equal the username entered, or the login is rejected; a
-success without it fails closed.
+A `credential_forwarding` realm creates no accounts: an administrator creates
+each one (`POST /admin/users` with `realm`, or **Admin → Users**), and a login
+signs in only an active account of that realm. It forwards the **local part**
+of the canonical username with the password (`alice` for `alice@example.com`)
+and, on success, signs in the realm's account of that name; a name that is no
+UPN is never forwarded. That is only safe when the upstream **binds the
+username to the secret**. Many do not: GitHub, Azure DevOps and GitLab accept
+a personal access token with *any* username, so anyone with a token could sign
+in as any of the realm's accounts. For such an upstream, set `identity_path`
+to where its JSON success response names the authenticated account (e.g.
+`login` for GitHub's `/user`): that name, in canonical form, must equal the
+forwarded local part, or the login is rejected; a success without it fails
+closed.
 
-`identity_path` also matters for deactivation. A directory often accepts
-other spellings of one account (`CORP\mallory`, `mallory@corp`), and Forge
-provisions each spelling it forwards as an account of its own. Deactivating
-`mallory` then does not stop a login as `corp\mallory` unless the upstream
-names the account it authenticated (`identity_path`), or `auto_provision` is
-off, or the user is disabled in the directory too. Names a directory could
-fold onto another account by Unicode alone (full-width letters, a soft
-hyphen, zero-width characters) are never forwarded. Forge logs a warning for
-an auto-provisioning realm without `identity_path`.
+Since the realm creates no accounts, deactivating one holds for every
+spelling the directory accepts: `corp\mallory@example.com` or
+`mallory@other.example` forward a name the directory may take for `mallory`,
+but sign in no account unless an administrator created one of that name.
+Names a directory could fold onto another account by Unicode alone
+(full-width letters, a soft hyphen, zero-width characters) are never
+forwarded.
 
 Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":
@@ -600,6 +612,18 @@ cargo build -p forge-server
 .github/scripts/oci-e2e.sh target/debug/forge-server target/oci-e2e
 ```
 
+Raw repositories have one too, CI's `raw-e2e` job: curl against a live
+server (uploads, ranges and resumed downloads, checksum sidecars with
+`sha256sum -c`, path traversal sent with `--path-as-is`, a proxy of a mock
+upstream that redirects to a second host, a group, and the pdfium example
+against GitHub, skipped with `FORGE_E2E_SKIP_GITHUB=1`). It needs curl, jq
+and python3, a Postgres and an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
+```
+
 **Without Docker**, point the db / storage / core / server suites at running
 services instead (use a fresh database per crate run — suites share it):
 
@@ -804,6 +828,20 @@ gate requires (see [Releasing](#releasing)). A file that Rust code or its
 tests read from outside the crates belongs in the Rust group, one only
 xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
 A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
+
+The `audit` job runs `cargo audit` only for a change to `Cargo.lock` or
+`.cargo/audit.toml`: every change to a `Cargo.toml` that adds or updates a
+dependency changes the lockfile, and the lockfile is all the job reads. A
+RustSec advisory published for a dependency no change touches is caught by
+the `Audit` workflow (`.github/workflows/audit.yml`) instead, so it does not
+fail an unrelated pull request: it audits `main` every day at 9:00 Berlin
+time, and on demand (**Actions → Audit → Run workflow**). GitHub notifies the
+user who created the workflow, or who last changed its `cron` line, of a
+failed scheduled run, on github.com and by email as their notification
+settings for Actions say; to receive them yourself, disable and re-enable the
+workflow (**Actions → Audit → ⋯**). Fix a failure as in CI: update the crate
+(`cargo update -p <crate>`), or accept the advisory in `.cargo/audit.toml`
+with a one-line rationale.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks

@@ -1,4 +1,4 @@
-//! The email settings document (`email_settings.config`, migration 0041):
+//! The email settings document (`email_settings.config`, migration 0043):
 //! what an administrator enters on **Admin → Settings → Email**, its
 //! validation, and the write-only handling of the transport's secrets.
 //!

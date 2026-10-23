@@ -16,13 +16,14 @@
 //! A name that signs in with a password must also fit in an HTTP Basic
 //! `user-id` ([`canonical_password_username`]), which cannot hold a `:`.
 //!
-//! A **new** account is named by a UPN, `local-part@domain` ([`is_upn`],
+//! Every account is named by a UPN, `local-part@domain` ([`is_upn`],
 //! [`canonical_account_username`]): the name says which organization the
 //! account belongs to, two organizations' `alice` cannot collide, and it is
-//! the name Entra and Active Directory sign the person in with. Accounts
-//! created before that rule (`alice`, `admin`) keep their names, and lookups
-//! of stored rows never apply it. A credential-forwarding account keeps the
-//! name its upstream accepted ([`canonical_forwarded_username`]).
+//! the name Entra and Active Directory sign the person in with. Accounts named
+//! otherwise before 1.2 (`alice`, `admin`) are renamed `alice@example.com`
+//! when the server starts ([`crate::user_dao::rename_legacy_usernames`]). A
+//! credential-forwarding realm forwards only the local part of the name to its
+//! upstream ([`upn_local_part`]).
 //!
 //! A directory behind a credential-forwarding realm may fold more than this
 //! canonical form does (LDAP's `caseIgnoreMatch` and Active Directory ignore
@@ -119,12 +120,11 @@ pub fn canonical_password_username(raw: &str) -> Result<String, InvalidUsername>
     Ok(canonical)
 }
 
-/// The canonical name for a **new** local or `oidc`-provisioned account:
-/// [`canonical_password_username`] when the account signs in with a password
-/// (`with_password`), else [`canonical_username`]; either way a
+/// The canonical name for a **new** account: [`canonical_password_username`]
+/// when the account signs in with a password (`with_password`: a local or a
+/// credential-forwarding account), else [`canonical_username`]; either way a
 /// [reserved](RESERVED_USERNAMES) name is refused, and the name must be a UPN
-/// ([`is_upn`]). Lookups of existing rows keep using [`canonical_username`],
-/// so an account created before the UPN rule keeps signing in.
+/// ([`is_upn`]). Lookups of existing rows keep using [`canonical_username`].
 pub fn canonical_account_username(
     raw: &str,
     with_password: bool,
@@ -143,18 +143,13 @@ pub fn canonical_account_username(
     Ok(canonical)
 }
 
-/// The canonical name for a new account a credential-forwarding realm
-/// provisions: [`canonical_password_username`], and never a
-/// [reserved](RESERVED_USERNAMES) name, but not necessarily a UPN. The account
-/// keeps the name the upstream accepted: rewriting it before or after
-/// forwarding would give one upstream account a second spelling (see
-/// [`may_alias_upstream`]).
-pub fn canonical_forwarded_username(raw: &str) -> Result<String, InvalidUsername> {
-    let canonical = canonical_password_username(raw)?;
-    if is_reserved_username(&canonical) {
-        return Err(InvalidUsername::Reserved);
-    }
-    Ok(canonical)
+/// The local part of a UPN (`alice` of `alice@example.com`): the name a
+/// credential-forwarding realm sends its upstream. `None` for a name that is
+/// not a UPN.
+pub fn upn_local_part(name: &str) -> Option<&str> {
+    is_upn(name)
+        .then(|| name.split_once('@').map(|(local, _)| local))
+        .flatten()
 }
 
 /// Longest DNS label of a UPN's domain, in characters.
@@ -203,8 +198,9 @@ fn is_domain_label(label: &str) -> bool {
 /// that folds compatibility characters: it changes under Unicode NFKC
 /// (full-width or ligature letters, superscripts, ...) or contains a
 /// default-ignorable code point (soft hyphen, zero-width characters, ...).
-/// Forge would provision a separate account for it, so a deactivation of the
-/// plain name would not hold.
+/// The upstream would vouch for the plain name's account while Forge signs in
+/// the one of this spelling, so a deactivation of the plain name would not
+/// hold.
 pub fn may_alias_upstream(name: &str) -> bool {
     name.chars().any(is_default_ignorable) || name.nfkc().ne(name.chars())
 }
@@ -359,7 +355,7 @@ mod tests {
                     "{raw:?}"
                 );
             }
-            // Stored legacy names are still looked up.
+            // A stored name is still looked up as it is.
             assert!(canonical_username(raw).is_ok(), "{raw:?}");
         }
         assert_eq!(
@@ -447,21 +443,15 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_accounts_keep_the_upstream_name() {
-        for raw in ["alice", "corp\\alice", "alice@corp", "Alice@Corp.Example"] {
-            assert_eq!(
-                canonical_forwarded_username(raw).unwrap(),
-                canonical_username(raw).unwrap()
-            );
+    fn the_local_part_is_what_forwarding_sends() {
+        assert_eq!(upn_local_part("alice@example.com"), Some("alice"));
+        assert_eq!(
+            upn_local_part("first.last+ci@corp.example"),
+            Some("first.last+ci")
+        );
+        for not_upn in ["alice", "alice@corp", "a@b@c.example"] {
+            assert_eq!(upn_local_part(not_upn), None, "{not_upn}");
         }
-        assert_eq!(
-            canonical_forwarded_username("mallory:abc"),
-            Err(InvalidUsername::Colon)
-        );
-        assert_eq!(
-            canonical_forwarded_username(" OIDC "),
-            Err(InvalidUsername::Reserved)
-        );
     }
 
     #[test]

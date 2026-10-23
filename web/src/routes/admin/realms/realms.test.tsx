@@ -544,6 +544,11 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     await u.type(screen.getByLabelText('Upstream URL'), 'https://auth.example.com/check')
     await u.type(screen.getByLabelText('Success statuses'), '200, 204')
     await u.type(screen.getByLabelText('Key pepper'), 'pepper-1')
+    // It creates no accounts: the form says where they come from.
+    expect(
+      screen.queryByRole('checkbox', { name: /Auto-provision/ }),
+    ).toBeNull()
+    expect(screen.getByText(/signs in only the accounts created for it/)).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
@@ -553,7 +558,6 @@ describe('admin realms create', { timeout: 20_000 }, () => {
       enabled: true,
       config: {
         url: 'https://auth.example.com/check',
-        auto_provision: true,
         success_status: [200, 204],
         key_pepper: 'pepper-1',
       },
@@ -800,7 +804,6 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
     config: {
       url: 'https://nexus.example.com/status',
       key_pepper_set: true,
-      auto_provision: true,
       capture_password_hash: true,
     },
   })

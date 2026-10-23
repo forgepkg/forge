@@ -67,6 +67,17 @@ pub struct UpdateMember {
 /// group whose only flagged member is a proxy would serve its reserved ids
 /// from nowhere.
 fn owner_kind_error(member: &forge_db::model::Repository) -> Option<Response> {
+    if member.is_raw() {
+        // Owners guard package ids; a raw group serves a path from its first
+        // member that has it.
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                "raw groups have no owner members: a path is served by the first member that has it",
+            )
+                .into_response(),
+        );
+    }
     (member.kind() == RepoKind::Proxy).then(|| {
         (
             StatusCode::BAD_REQUEST,

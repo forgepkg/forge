@@ -1,7 +1,8 @@
 # Dependency update PRs (review L12). Security updates are raised as soon as an
 # advisory lands; version updates are batched weekly and grouped per ecosystem
 # so the queue stays reviewable. CI's `audit` job (cargo-audit) is the gate for
-# Rust advisories; accepted ones are listed in .cargo/audit.toml.
+# Rust advisories, and the daily Audit workflow (audit.yml) reports one for an
+# unchanged lockfile; accepted ones are listed in .cargo/audit.toml.
 version: 2
 updates:
   # Rust workspace (Cargo.toml / Cargo.lock at the root).

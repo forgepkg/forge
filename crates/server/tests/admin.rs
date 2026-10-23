@@ -274,11 +274,11 @@ async fn usernames_with_a_colon_are_refused() {
     }
 }
 
-/// #317: a new account is named by a UPN (`POST /admin/users` answers 400
-/// otherwise), while an account created before the rule keeps signing in
-/// with its password and its tokens.
+/// #317: every account is named by a UPN (`POST /admin/users` answers 400
+/// otherwise). An account from before 1.2 is renamed `<name>@example.com` at
+/// startup and signs in under that name, with its password and its tokens.
 #[tokio::test]
-async fn new_accounts_need_a_upn_and_legacy_accounts_keep_signing_in() {
+async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
     use argon2::PasswordHasher;
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
@@ -310,36 +310,25 @@ async fn new_accounts_need_a_upn_and_legacy_accounts_keep_signing_in() {
             .is_none());
     }
 
-    // An account from before the rule (written around the DAO, which no
-    // longer creates one).
-    let legacy = format!("erin{s}");
+    // An account from before 1.2, in a database of its own (the rename
+    // touches every account), written around the DAO, which no longer
+    // creates one.
+    let pool = common::fresh_pool().await;
     let hash = argon2::Argon2::default()
         .hash_password(b"legacy-pw-123")
         .unwrap()
         .to_string();
     let legacy_id: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, active, auth_source) \
-         VALUES ($1, $2, true, 'local') RETURNING id",
+         VALUES ('erin', $1, true, 'local') RETURNING id",
     )
-    .bind(&legacy)
     .bind(&hash)
-    .fetch_one(&srv.pool)
+    .fetch_one(&pool)
     .await
     .unwrap();
-
-    let resp = client
-        .post(format!("{}/auth/login", srv.base_url))
-        .json(&json!({"username": legacy, "password": "legacy-pw-123"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "the legacy account signs in");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["user_id"], json!(legacy_id));
-
     let token = forge_core::auth::generate_token_secret();
     forge_db::token_dao::insert_token(
-        &srv.pool,
+        &pool,
         forge_db::token_dao::NewToken {
             user_id: legacy_id,
             name: "legacy".into(),
@@ -350,15 +339,39 @@ async fn new_accounts_need_a_upn_and_legacy_accounts_keep_signing_in() {
     )
     .await
     .unwrap();
-    let resp = client
-        .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&legacy, Some(&token))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "and its tokens keep working");
-    let me: Value = resp.json().await.unwrap();
-    assert_eq!(me["user"]["username"], json!(legacy));
+    // The upgrade's start.
+    forge_db::migrate(&pool).await.expect("migrate");
+    let srv = common::start_with(pool, common::ServerOpts::default()).await;
+    let client = srv.client();
+
+    let login = |username: &'static str| {
+        client
+            .post(format!("{}/auth/login", srv.base_url))
+            .json(&json!({"username": username, "password": "legacy-pw-123"}))
+            .send()
+    };
+    let resp = login("erin@example.com").await.unwrap();
+    assert_eq!(resp.status(), 200, "the renamed account signs in");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user_id"], json!(legacy_id));
+    assert_eq!(
+        login("erin").await.unwrap().status(),
+        401,
+        "the old name is gone"
+    );
+
+    // A token ignores the name it is sent with: clients keep working.
+    for name in ["erin@example.com", "erin"] {
+        let resp = client
+            .get(format!("{}/admin/me", srv.base_url))
+            .basic_auth(name, Some(&token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "the token works as {name:?}");
+        let me: Value = resp.json().await.unwrap();
+        assert_eq!(me["user"]["username"], json!("erin@example.com"));
+    }
 }
 
 /// `POST /admin/users/{id}/reauth`: admin-only, 204 on a known user

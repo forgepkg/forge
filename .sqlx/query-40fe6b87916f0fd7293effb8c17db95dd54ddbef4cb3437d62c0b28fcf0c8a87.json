@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE raw_file SET last_downloaded_at = now()\n        WHERE id = $1\n          AND (last_downloaded_at IS NULL OR last_downloaded_at < now() - interval '1 hour')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "40fe6b87916f0fd7293effb8c17db95dd54ddbef4cb3437d62c0b28fcf0c8a87"
+}

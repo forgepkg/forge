@@ -1,7 +1,7 @@
 # Forge
 
-A self-hosted **NuGet package registry and Docker / OCI registry** written in
-Rust. It speaks the NuGet **V3** protocol and the **OCI Distribution Spec**
+A self-hosted **NuGet package registry, Docker / OCI registry and raw file
+repository** written in Rust. It speaks the NuGet **V3** protocol and the **OCI Distribution Spec**
 v1.1 (Docker, Podman, containerd, crane, Helm, cosign), and supports the
 three repository types you expect from an enterprise registry (more package
 formats come as **format plugins**, see below):
@@ -17,7 +17,11 @@ formats come as **format plugins**, see below):
 
 The same three types exist for container images: hosted image repositories,
 pull-through proxies of Docker Hub, GHCR, Quay or any OCI registry, and
-groups — see **[docs/docker.md](./docs/docker.md)**.
+groups — see **[docs/docker.md](./docs/docker.md)** — and for plain files
+under arbitrary paths (binaries, installers, fixtures), like Nexus' raw
+repositories, with ranges, checksum sidecars and proxies of any HTTP(S)
+download URL such as GitHub release assets — see
+**[docs/raw.md](./docs/raw.md)**.
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
@@ -49,7 +53,7 @@ A Cargo workspace of small crates plus the web SPA:
 | `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait, its WIT twin and the component glue. |
 | `plugin` | `forge-plugin` | The host side of format plugins: built-in and WebAssembly plugins (Wasmtime) behind one trait. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, raw file repositories (`/raw`), `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), `helm`. |
@@ -57,6 +61,7 @@ A Cargo workspace of small crates plus the web SPA:
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
 (NuGet at `/v3`, Helm at `/repository`), the Docker / OCI registry (`/v2`),
+raw file repositories (`/raw`),
 the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
 the same origin with relative URLs; no routing proxy is required (production
@@ -134,7 +139,7 @@ of S3 keys it can use short-lived credentials from the platform's workload
 identity (IRSA, EKS Pod Identity, STS web identity; see
 [docs/deployment.md](docs/deployment.md#short-lived-s3-credentials)). It
 bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start,
-named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN such as `admin@example.com`), and
+named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN, default `admin@example.com`), and
 once it is removed the image simply starts without one. It defaults to
 `anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads)
 and `allow_password_basic = false` (clients use API tokens; see
@@ -164,6 +169,17 @@ docker push localhost:8421/docker-hosted/team/alpine:3.20
 docker pull localhost:8421/docker-hosted/team/alpine:3.20
 ```
 
+### Upload and download files
+
+Create a raw repository (`"format": "raw"`), then upload with an API token as
+the password and download with its checksum:
+
+```bash
+curl -u admin@example.com:<TOKEN> --upload-file tool.tgz http://localhost:8421/raw/binaries/tools/1.0/tool.tgz
+curl -u admin@example.com:<TOKEN> -O http://localhost:8421/raw/binaries/tools/1.0/tool.tgz
+curl -u admin@example.com:<TOKEN> http://localhost:8421/raw/binaries/tools/1.0/tool.tgz.sha256 | sha256sum -c
+```
+
 ## Documentation
 
 - **[Production deployment](./docs/deployment.md)** — required settings, TLS
@@ -181,6 +197,10 @@ docker pull localhost:8421/docker-hosted/team/alpine:3.20
 - **[Docker / OCI registry](./docs/docker.md)** — image repositories (hosted,
   proxy, group), naming and host-based routing, `docker login`, retention and
   garbage collection.
+- **[Raw file repositories](./docs/raw.md)** — files under arbitrary paths
+  (hosted, proxy, group): uploads with curl, ranges and checksum sidecars,
+  listings, the deployment policy, proxies of release downloads (the pdfium
+  example) and retention.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
   and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).

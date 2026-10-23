@@ -50,7 +50,7 @@ use super::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential,
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainOutcome {
     /// A provider authenticated the credential. Carries the vouched-for
-    /// identity (for mapping / auto-provision) and the winning provider id.
+    /// identity (for mapping onto an account) and the winning provider id.
     Authenticated {
         /// The identity the winning provider vouched for.
         identity: ProvenIdentity,
@@ -234,45 +234,35 @@ pub async fn map_identity_to_principal(
     }))
 }
 
-/// Resolve a chain-vouched [`ProvenIdentity`] to a [`UserPrincipal`],
-/// **auto-provisioning** an `app_user` when the identity's vouching provider
-/// allows it (a per-realm flag the vouching provider stamps on the identity).
+/// Resolve a chain-vouched [`ProvenIdentity`] to a [`UserPrincipal`]. No
+/// provider creates accounts: an administrator creates a credential-forwarding
+/// realm's accounts (`POST /admin/users` with the realm), and a login maps only
+/// onto one of them.
 ///
-/// This is [`map_identity_to_principal`] plus the upstream auto-provision step:
-///
-/// * [`AuthSource::UpstreamBasic`] with `identity.auto_provision` → upsert the
-///   user via [`forge_db::user_dao::provision_upstream_user`] (creates a
-///   passwordless `'upstream-basic'` account on first login, recording the
-///   vouching realm as `app_user.realm_id`). A same-named **non-upstream**
-///   account (local / OIDC / another realm's upstream user) is never taken over:
-///   the upsert returns no row and the login is denied. The user is always
-///   `active = true` on insert; an operator who later sets `active = false` is
-///   honored on the next call.
+/// * [`AuthSource::UpstreamBasic`] → the existing, active `'upstream-basic'`
+///   account of that name and of the vouching realm
+///   ([`forge_db::user_dao::find_upstream_user`]), else `Ok(None)` (caller
+///   denies). A same-named account of another kind or realm is never mapped
+///   onto.
 /// * **Admin tracking** (upstream-basic users only): when the identity's admin
 ///   reading is authoritative (`admin_authoritative` — the realm maps an admin
 ///   group and this login fetched the groups), the user's membership in the
 ///   built-in `admin` role follows the upstream verdict, so an upstream
 ///   demotion takes effect here. Without an authoritative reading (no admin
-///   mapping, or a validated-credential cache hit) nothing is changed for an
-///   existing user. A demotion also ends the user's browser sessions; callers
-///   holding the authorization cache drop the user's effective set.
-/// * [`AuthSource::UpstreamBasic`] without `auto_provision` → behave like
-///   [`map_identity_to_principal`]: an existing, active upstream-basic user of
-///   that name, else `Ok(None)` (caller denies). The account is never created
-///   here, but an authoritative admin reading is tracked exactly as above: a
-///   realm switched to `auto_provision = false` must not keep an upstream
-///   demotion from taking effect.
-/// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → never provisioned here;
-///   delegate to [`map_identity_to_principal`].
+///   mapping, or a validated-credential cache hit) nothing is changed. A
+///   demotion also ends the user's browser sessions; callers holding the
+///   authorization cache drop the user's effective set.
+/// * [`AuthSource::Local`] / [`AuthSource::Oidc`] → delegate to
+///   [`map_identity_to_principal`].
 /// * **Kept password** (upstream-basic users only): an identity carrying a
 ///   [`ProvenIdentity::captured_password_hash`] stores it on the account it
 ///   signed in, while the vouching realm still opts in
 ///   ([`forge_db::user_dao::store_captured_password_hash`]). Best effort: a
 ///   failed write is logged and the login stands.
 ///
-/// Returns `Ok(None)` when no usable principal results (unknown/inactive and not
-/// auto-provisioned, or a name owned by another account kind), `Err` only on a
-/// DB failure (caller must fail closed).
+/// Returns `Ok(None)` when no usable principal results (unknown, inactive, or
+/// a name owned by another account kind or realm), `Err` only on a DB failure
+/// (caller must fail closed).
 pub async fn provision_and_map(
     pool: &PgPool,
     identity: &ProvenIdentity,
@@ -308,60 +298,33 @@ async fn resolve_upstream_or_map(
     pool: &PgPool,
     identity: &ProvenIdentity,
 ) -> sqlx::Result<Option<UserPrincipal>> {
-    if identity.source == AuthSource::UpstreamBasic && identity.auto_provision {
-        let Some(user) = forge_db::user_dao::provision_upstream_user(
-            pool,
-            &identity.username,
-            identity.realm_id,
-        )
-        .await?
-        else {
-            // The username belongs to a non-upstream account (or another
-            // realm's user): never map or take it over.
-            tracing::warn!(
-                username = %identity.username,
-                realm_id = ?identity.realm_id,
-                "upstream login denied: username is owned by a non-upstream account, \
-                 another realm's account, or an orphan of a deleted realm"
-            );
-            return Ok(None);
-        };
-        // A provisioned/refreshed user could have been deactivated by an operator
-        // between logins; honor that (the upsert does not reactivate).
-        if !user.active {
-            return Ok(None);
-        }
-        if identity.admin_authoritative {
-            // Keep the RBAC admin role in step with the (authoritative) upstream
-            // verdict, for a new account and an existing one alike.
-            sync_upstream_admin(pool, user.id, identity.suggested_is_admin).await?;
-        }
-        return Ok(Some(UserPrincipal {
-            user_id: user.id,
-            token_id: None,
-        }));
+    if identity.source != AuthSource::UpstreamBasic {
+        return map_identity_to_principal(pool, identity).await;
     }
-
-    if identity.source == AuthSource::UpstreamBasic && identity.admin_authoritative {
-        // No provisioning, but the realm fetched the groups: the upstream's
-        // admin verdict applies to the existing account all the same.
-        let Some(user) =
-            forge_db::user_dao::find_upstream_user(pool, &identity.username, identity.realm_id)
-                .await?
-        else {
-            return Ok(None);
-        };
-        if !user.active {
-            return Ok(None);
-        }
+    let Some(user) =
+        forge_db::user_dao::find_upstream_user(pool, &identity.username, identity.realm_id).await?
+    else {
+        // Credential-forwarding realms create no accounts; nor does a login
+        // map onto an account of another kind or realm.
+        tracing::warn!(
+            username = %identity.username,
+            realm_id = ?identity.realm_id,
+            "upstream login denied: no account of the realm has this name (credential \
+             forwarding signs in existing accounts only)"
+        );
+        return Ok(None);
+    };
+    if !user.active {
+        return Ok(None);
+    }
+    if identity.admin_authoritative {
+        // The realm fetched the groups: the upstream's admin verdict applies.
         sync_upstream_admin(pool, user.id, identity.suggested_is_admin).await?;
-        return Ok(Some(UserPrincipal {
-            user_id: user.id,
-            token_id: None,
-        }));
     }
-
-    map_identity_to_principal(pool, identity).await
+    Ok(Some(UserPrincipal {
+        user_id: user.id,
+        token_id: None,
+    }))
 }
 
 /// Bring the built-in `admin` role in line with an upstream user's
@@ -458,7 +421,6 @@ mod tests {
             groups: Vec::new(),
             suggested_is_admin: false,
             admin_authoritative: false,
-            auto_provision: false,
             realm_id: None,
             captured_password_hash: None,
         })

@@ -1,6 +1,6 @@
 //! Outgoing email (#319): the email service.
 //!
-//! The settings live in the database only (`email_settings`, migration 0041),
+//! The settings live in the database only (`email_settings`, migration 0043),
 //! written on **Admin → Settings → Email** (`/admin/settings/email`): there is
 //! no `forge.toml` section and no `FORGE_*` variable, so they can change while
 //! the server runs and every instance uses the same ones. Their secrets are

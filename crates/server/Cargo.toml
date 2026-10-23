@@ -63,6 +63,13 @@ argon2 = { workspace = true, features = ["password-hash"] }
 tokio-util = { workspace = true }
 # Format-plugin uploads: the named file part of a multipart body, streamed.
 multer = "3"
+# Raw repositories: the MD5 of uploads (the `.md5` sidecar), file paths in
+# URLs, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content types
+# guessed from file names.
+md-5 = "0.11"
+percent-encoding = "2.3"
+httpdate = "1"
+mime_guess = "2"
 futures-util = { workspace = true }
 async-stream = "0.3"
 bytes = "1"

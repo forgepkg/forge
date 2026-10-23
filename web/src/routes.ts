@@ -12,7 +12,8 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *     /login            -> Login.tsx            (user+password or realm login)
  *     layout 'app'      -> AppLayout.tsx        (login-gated nav shell)
  *       index           -> Browse.tsx           (folder view root: repositories)
- *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages or images + search)
+ *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages or images + search;
+ *                                                a raw repository's file tree)
  *       /packages/...   -> PackageDetail.tsx    (versions + dependencies)
  *       /images/$repo/$ -> ImageDetail.tsx      (docker image: tags + manifests;
  *                                                the splat is the image name,

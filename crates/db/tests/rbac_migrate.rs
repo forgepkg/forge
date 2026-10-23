@@ -281,8 +281,8 @@ async fn fresh_install_fails_closed() {
     );
 }
 
-/// `0040_writer_role.sql` carries version 40.
-const WRITER_ROLE_VERSION: i64 = 40;
+/// `0042_writer_role.sql` carries version 42.
+const WRITER_ROLE_VERSION: i64 = 42;
 
 /// The `(action, ANY repository)` grants of the role named `name`, sorted.
 async fn any_repo_grants(pool: &PgPool, name: &str) -> Vec<String> {
@@ -385,7 +385,7 @@ async fn an_existing_writer_role_is_renamed() {
     .await
     .unwrap();
 
-    migrator().await.run(&pool).await.expect("migrate 0040");
+    migrator().await.run(&pool).await.expect("migrate 0042");
 
     let renamed = format!("writer#{custom}");
     let name: String = sqlx::query_scalar("SELECT name FROM role WHERE id = $1")

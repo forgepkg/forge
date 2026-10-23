@@ -3,12 +3,7 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
 import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
-import {
-  authSourceLabel,
-  isUpn,
-  upnError,
-  type UserView,
-} from '~/api/users'
+import { authSourceLabel, upnError, type UserView } from '~/api/users'
 import {
   PartialCreate,
   useCreateUser,
@@ -16,6 +11,7 @@ import {
   useUsers,
 } from '~/queries/useUsers'
 import { useRoles } from '~/queries/useRbac'
+import { useRealms } from '~/queries/useRealms'
 import { AccessBadge } from '~/components/AccessBadge'
 import { Badge } from '~/components/catalyst/badge'
 import { Button } from '~/components/catalyst/button'
@@ -34,6 +30,7 @@ import {
 } from '~/components/catalyst/fieldset'
 import { Heading, Subheading } from '~/components/catalyst/heading'
 import { Input } from '~/components/catalyst/input'
+import { Select } from '~/components/catalyst/select'
 import { Text } from '~/components/catalyst/text'
 import {
   Table,
@@ -58,9 +55,8 @@ export const Route = createFileRoute('/_app/manage/users')({
  * they hold and their active flag, offers an inline create form
  * (`CreateUser`, then the chosen roles), links each user to its
  * roles-and-tokens screen, and deletes with a confirm step. There is no
- * edit-in-place beyond create/delete + the per-user screen. A new account is
- * named by a UPN; one created before that rule (`alice`) is marked "legacy
- * name".
+ * edit-in-place beyond create/delete + the per-user screen. Every account is
+ * named by a UPN.
  */
 function UsersList() {
   const users = useUsers()
@@ -177,15 +173,6 @@ function UserRow({
         >
           {user.username}
         </button>
-        {!isUpn(user.username) && user.auth_source !== 'upstream-basic' && (
-          <Badge
-            color="amber"
-            className="ml-2"
-            title="Created before Forge named new accounts by a UPN (alice@example.com). It keeps signing in."
-          >
-            legacy name
-          </Badge>
-        )}
       </TableCell>
       <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
       <TableCell>
@@ -293,13 +280,22 @@ function RoleBadges({
  * Inline create-user form. Controlled state (matching the codebase's Login /
  * RepositoryForm pattern); on success the fields reset so several users can be
  * added in a row. The username/password requirements mirror the server's 400s:
- * the username is a UPN (`upnError`), checked once the field was left.
+ * the username is a UPN (`upnError`), checked once the field was left. An
+ * account signs in with a Forge password, or through a credential-forwarding
+ * realm (`realm`, no password): such a realm signs in only the accounts
+ * created for it here.
  */
 function CreateUserForm() {
   const create = useCreateUser()
   const roles = useRoles()
+  const realms = useRealms()
+  const forwarding = (realms.data ?? []).filter(
+    (r) => r.kind === 'credential_forwarding',
+  )
   const [username, setUsername] = useState('')
   const [usernameTouched, setUsernameTouched] = useState(false)
+  // '' = a Forge password; otherwise the credential-forwarding realm's name.
+  const [realm, setRealm] = useState('')
   const [password, setPassword] = useState('')
   const [chosen, setChosen] = useState<ReadonlySet<number>>(new Set())
   const [active, setActive] = useState(true)
@@ -317,14 +313,16 @@ function CreateUserForm() {
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
-    if (!username.trim() || !password) return
+    if (!username.trim() || (!realm && !password)) return
     if (usernameError) {
       setUsernameTouched(true)
       return
     }
     create.mutate(
       {
-        body: { username: username.trim(), password, active },
+        body: realm
+          ? { username: username.trim(), realm, active }
+          : { username: username.trim(), password, active },
         roles: (roles.data ?? []).filter((r) => chosen.has(r.id)),
       },
       {
@@ -332,6 +330,7 @@ function CreateUserForm() {
           if (!created && !(error instanceof PartialCreate)) return
           setUsername('')
           setUsernameTouched(false)
+          setRealm('')
           setPassword('')
           setChosen(new Set())
           setActive(true)
@@ -360,15 +359,36 @@ function CreateUserForm() {
           />
           {showUsernameError && <ErrorMessage>{usernameError}</ErrorMessage>}
         </Field>
-        <Field>
-          <Label>Password</Label>
-          <Input
-            type="password"
-            autoComplete="new-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
+        {forwarding.length > 0 && (
+          <Field>
+            <Label>Sign-in</Label>
+            <Select value={realm} onChange={(e) => setRealm(e.target.value)}>
+              <option value="">Forge password</option>
+              {forwarding.map((r) => (
+                <option key={r.id} value={r.name}>
+                  Credential forwarding: {r.name}
+                </option>
+              ))}
+            </Select>
+            {realm && (
+              <Description>
+                Signs in with the upstream&apos;s password, which gets the part
+                of the username before the @.
+              </Description>
+            )}
+          </Field>
+        )}
+        {!realm && (
+          <Field>
+            <Label>Password</Label>
+            <Input
+              type="password"
+              autoComplete="new-password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </Field>
+        )}
       </div>
       <Fieldset>
         <Legend>Roles</Legend>
@@ -408,7 +428,10 @@ function CreateUserForm() {
       <Button
         type="submit"
         disabled={
-          create.isPending || !username.trim() || !password || !!usernameError
+          create.isPending ||
+          !username.trim() ||
+          (!realm && !password) ||
+          !!usernameError
         }
       >
         {create.isPending ? 'Creating…' : 'Create user'}

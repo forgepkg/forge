@@ -233,15 +233,17 @@ async fn oversized_login_username_is_refused_without_growing_the_lockout_map() {
 
 /// Review 2026-10-20 M2: a `:` in the form-login username is never forwarded.
 /// The upstream would split `mallory:abc` / `def` into `mallory` / `abc:def`
-/// (RFC 7617) and vouch for Mallory, while Forge signed in a fresh, active
-/// account `mallory:abc`, getting around her deactivation.
+/// (RFC 7617) and vouch for Mallory, while Forge signed in the account
+/// `mallory:abc@example.com`, getting around her deactivation.
 #[tokio::test]
 async fn form_login_with_a_colon_is_not_forwarded() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let upstream = MockServer::start().await;
-    let mallory = format!("mallory{}", common::unique());
+    // The upstream knows her by the local part of her account's name.
+    let local = format!("mallory{}", common::unique());
+    let mallory = format!("{local}@example.com");
     let basic = |user: &str, password: &str| {
         use base64::Engine as _;
         let raw = format!("{user}:{password}");
@@ -254,7 +256,7 @@ async fn form_login_with_a_colon_is_not_forwarded() {
     // below may reach the upstream.
     Mock::given(method("GET"))
         .and(path("/status"))
-        .and(header("authorization", basic(&mallory, "abc:def").as_str()))
+        .and(header("authorization", basic(&local, "abc:def").as_str()))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&upstream)
@@ -287,8 +289,16 @@ async fn form_login_with_a_colon_is_not_forwarded() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let resp = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "username": mallory, "realm": "nexus" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
 
-    // The realm is live: Mallory signs in and is provisioned...
+    // The realm is live: Mallory signs in to her account...
     let resp = client
         .post(&login)
         .json(&json!({ "username": mallory, "password": "abc:def" }))
@@ -310,7 +320,7 @@ async fn form_login_with_a_colon_is_not_forwarded() {
     assert_eq!(resp.status(), 200);
 
     let tracked = srv.state.login_throttle.tracked();
-    let alias = format!("{mallory}:abc");
+    let alias = format!("{local}:abc@example.com");
     let resp = client
         .post(&login)
         .json(&json!({ "username": alias, "password": "def" }))
@@ -324,7 +334,7 @@ async fn form_login_with_a_colon_is_not_forwarded() {
             .await
             .unwrap()
             .is_none(),
-        "no alias account is provisioned"
+        "no alias account is created"
     );
     assert_eq!(
         srv.state.login_throttle.tracked(),
@@ -760,20 +770,15 @@ async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
         .unwrap();
     assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
 
-    // A forwarded (password-less) account that owns three tokens.
-    let username = format!("fed{}", common::unique());
-    let user = forge_db::user_dao::insert_user(
-        &srv.pool,
-        forge_db::user_dao::NewUser {
-            username: username.clone(),
-            password_hash: None,
-            active: true,
-            auth_source: "upstream-basic".into(),
-            external_subject: Some(username.clone()),
-        },
-    )
-    .await
-    .unwrap();
+    // A forwarded (password-less) account of the realm that owns three tokens.
+    let realm = forge_db::auth_realm_dao::find_realm_by_name(&srv.pool, "nexus")
+        .await
+        .unwrap()
+        .expect("the realm");
+    let username = format!("fed{}@example.com", common::unique());
+    let user = forge_db::user_dao::insert_forwarded_user(&srv.pool, &username, realm.id, true)
+        .await
+        .unwrap();
     let mint = |expires_at: Option<chrono::DateTime<chrono::Utc>>| {
         let pool = srv.pool.clone();
         async move {
@@ -1250,12 +1255,18 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
             base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
         )
     };
-    let alice = format!("alice{}", common::unique());
-    let bob = format!("bob{}", common::unique());
+    // The accounts' names; the upstream knows them by their local parts.
+    let alice = format!("alice{}@example.com", common::unique());
+    let bob = format!("bob{}@example.com", common::unique());
+    let local = |user: &str| {
+        forge_db::username::upn_local_part(user)
+            .unwrap()
+            .to_string()
+    };
     let upstream = MockServer::start().await;
     let accepting = || async {
-        for (user, password) in [(&alice, "alice-pw"), (&bob, "bob-pw")] {
-            Mock::given(header("authorization", basic(user, password).as_str()))
+        for (user, password) in [(local(&alice), "alice-pw"), (local(&bob), "bob-pw")] {
+            Mock::given(header("authorization", basic(&user, password).as_str()))
                 .respond_with(ResponseTemplate::new(200))
                 .mount(&upstream)
                 .await;
@@ -1341,6 +1352,16 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
     assert_eq!(realm["config"]["capture_password_hash"], json!(true));
     let realm_id = realm["id"].as_i64().unwrap();
     let realm_path = format!("/admin/realms/{realm_id}");
+    // The realm creates no accounts: an administrator creates them.
+    for user in [&alice, &bob] {
+        let (status, body) = admin_call(
+            reqwest::Method::POST,
+            "/admin/users".into(),
+            Some(json!({ "username": user, "realm": "nexus" })),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
     let counts = || {
         admin_call(
             reqwest::Method::GET,
@@ -1355,7 +1376,7 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
         counts().await,
         (
             reqwest::StatusCode::OK,
-            json!({ "accounts": 1, "captured": 1 })
+            json!({ "accounts": 2, "captured": 1 })
         )
     );
     let (_, users) = admin_call(reqwest::Method::GET, "/admin/users".into(), None).await;
@@ -1364,7 +1385,7 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
         .unwrap()
         .iter()
         .find(|u| u["username"] == json!(alice))
-        .expect("alice provisioned")
+        .expect("alice")
         .clone();
     assert_eq!(alice_view["auth_source"], json!("upstream-basic"));
     assert!(
@@ -1380,7 +1401,7 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(counts().await.1, json!({ "accounts": 1, "captured": 0 }));
+    assert_eq!(counts().await.1, json!({ "accounts": 2, "captured": 0 }));
     // ...and turning it on again keeps them from each account's next upstream
     // check on. Alice's verdict from before is cached again (the config is
     // the one it was cached under), so her login keeps nothing until a
@@ -1425,7 +1446,10 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
         .await;
     assert_eq!(login(alice.clone(), "alice-pw").await, 200);
     assert_eq!(login(alice.clone(), "wrong").await, 401);
-    assert_eq!(login(format!("carol{}", common::unique()), "x").await, 401);
+    assert_eq!(
+        login(format!("carol{}@example.com", common::unique()), "x").await,
+        401
+    );
     // Basic auth on the wire works the same way.
     let resp = client
         .get(format!("{}/admin/me", srv.base_url))

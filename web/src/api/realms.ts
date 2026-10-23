@@ -74,7 +74,6 @@ export interface CredentialForwardingConfig {
   /** Accept a plain-http, non-loopback `url` (passwords travel in the clear). */
   allow_http?: boolean
   admin_group?: string
-  auto_provision?: boolean
   /** Keep an argon2id hash of every password the upstream accepts. */
   capture_password_hash?: boolean
   /** Stop forwarding: sign in with the kept hashes (needs `capture_password_hash`). */

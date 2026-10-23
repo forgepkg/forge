@@ -122,12 +122,18 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
-    let mounts: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
-        state
-            .formats
-            .mounts()
-            .into_iter()
-            .map(str::to_string)
+    let mounts: Vec<String> = state
+        .formats
+        .mounts()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // Raw repositories are feeds too, for the response policy.
+    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        mounts
+            .iter()
+            .cloned()
+            .chain([crate::raw::MOUNT.to_string()])
             .collect(),
     );
     let mut app = Router::new()
@@ -155,7 +161,11 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // the host) itself.
         .route("/v2", any(crate::registry::registry))
         .route("/v2/", any(crate::registry::registry))
-        .route("/v2/{*rest}", any(crate::registry::registry));
+        .route("/v2/{*rest}", any(crate::registry::registry))
+        // Raw (generic file) repositories: `/raw/<repo>/<path>`.
+        .route("/raw/{repo}", any(crate::raw::handle))
+        .route("/raw/{repo}/", any(crate::raw::handle))
+        .route("/raw/{repo}/{*rest}", any(crate::raw::handle));
     // Repositories, each served by its format's plugin under the format's
     // mount (`crate::plugins`; NuGet at `/v3`). `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
@@ -187,7 +197,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, mounts.clone(), public_base_url.clone(), req, next)
+            response_policy(hsts, feeds.clone(), public_base_url.clone(), req, next)
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).
@@ -317,11 +327,6 @@ pub const BOOTSTRAP_ADMIN_CREATED_KEY: &str = "bootstrap_admin_created";
 /// flow — so boot checks the stored hash too.
 const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 
-/// The bootstrap admin's name before 1.2, when `auth.bootstrap_admin.username`
-/// defaulted to it. A configuration that still sets no name keeps an account
-/// created under it.
-const LEGACY_BOOTSTRAP_USERNAME: &str = "admin";
-
 /// Create the bootstrap admin user if it does not already exist and was never
 /// created before (see [`BOOTSTRAP_ADMIN_CREATED_KEY`]).
 ///
@@ -333,36 +338,29 @@ const LEGACY_BOOTSTRAP_USERNAME: &str = "admin";
 /// restart. A concurrent instance creating the account at the same moment is
 /// handled the same way.
 ///
-/// A new bootstrap admin is named by a UPN. While the account still has to be
-/// created, a missing or non-UPN `auth.bootstrap_admin.username` fails startup
-/// with a message that asks for one. An install whose bootstrap admin exists,
-/// or was created and deleted since (its marker), is unaffected: a
-/// configuration without a name stands for the [legacy
-/// default](LEGACY_BOOTSTRAP_USERNAME) `admin`, and a non-UPN name for the
-/// account it already names.
+/// The name is a UPN (config validation): `admin@example.com` by default,
+/// which an install's `admin` from before 1.2 was renamed to, together with
+/// its marker ([`forge_db::user_dao::rename_legacy_usernames`]).
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it), and a loud one when the existing account still has the
 /// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. When
 /// `auth.bootstrap_admin` is unset (the documented production state once the
 /// account exists) nothing is created, but the placeholder check still runs
-/// for the default `admin` account and every account a marker names.
+/// for the default `admin@example.com` account and every account a marker
+/// names.
 pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let Some(ba) = &config.auth.bootstrap_admin else {
         warn_on_placeholder_accounts(pool).await;
         return Ok(());
     };
-    let username = ba
-        .username
-        .clone()
-        .unwrap_or_else(|| LEGACY_BOOTSTRAP_USERNAME.to_string());
-    let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{username}");
+    let marker = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:{}", ba.username);
 
-    if let Some(existing) = user_dao::find_user_by_username(pool, &username)
+    if let Some(existing) = user_dao::find_user_by_username(pool, &ba.username)
         .await
         .context("bootstrap admin lookup")?
     {
-        tracing::debug!(%username, "bootstrap admin already exists; skipping");
+        tracing::debug!(username = %ba.username, "bootstrap admin already exists; skipping");
         record_bootstrap_marker(pool, &marker, existing.id).await?;
         warn_if_placeholder_password(&existing).await;
         return Ok(());
@@ -378,25 +376,10 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         .is_some()
     {
         tracing::info!(
-            %username,
+            username = %ba.username,
             "bootstrap admin was created before and has since been removed; not re-creating it"
         );
         return Ok(());
-    }
-
-    // The account has to be created: it needs a name, and a UPN.
-    let Some(username) = ba.username.clone() else {
-        anyhow::bail!(
-            "auth.bootstrap_admin.username is not set: name the first administrator by a UPN \
-             such as admin@example.com (FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME)"
-        );
-    };
-    if !forge_core::auth::is_upn(&username) {
-        anyhow::bail!(
-            "auth.bootstrap_admin.username {username:?} is not a UPN: name the first \
-             administrator by one such as admin@example.com \
-             (FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME)"
-        );
     }
 
     let password = ba.password.clone();
@@ -416,7 +399,7 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     let mut tx = pool.begin().await.context("begin bootstrap admin")?;
     let user = match user_dao::insert_user(
         &mut *tx,
-        NewUser::local(username.clone(), password_hash, true),
+        NewUser::local(ba.username.clone(), password_hash, true),
     )
     .await
     {
@@ -425,7 +408,7 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         // account (it does the role grant) and make sure the marker exists.
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
             drop(tx);
-            let existing = user_dao::find_user_by_username(pool, &username)
+            let existing = user_dao::find_user_by_username(pool, &ba.username)
                 .await
                 .context("bootstrap admin lookup")?
                 .context("bootstrap admin vanished right after a unique violation")?;
@@ -448,11 +431,11 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     record_bootstrap_marker(pool, &marker, user.id).await?;
 
     tracing::warn!(
-        %username,
+        username = %ba.username,
         "created bootstrap admin from config; change its password as soon as possible"
     );
     if ba.password == PLACEHOLDER_BOOTSTRAP_PASSWORD {
-        warn_placeholder(&username);
+        warn_placeholder(&ba.username);
     }
     Ok(())
 }
@@ -493,7 +476,8 @@ pub async fn has_placeholder_password(user: &AppUser) -> bool {
 }
 
 /// Boot-time placeholder check when no bootstrap admin is configured: the
-/// default `admin` account and every account a "created once" marker names.
+/// default `admin@example.com` account and every account a "created once"
+/// marker names.
 /// Best effort — a lookup failure is logged, never fatal.
 async fn warn_on_placeholder_accounts(pool: &PgPool) {
     let pattern = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:%");
@@ -515,7 +499,7 @@ async fn warn_on_placeholder_accounts(pool: &PgPool) {
         .iter()
         .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
         .collect();
-    usernames.push(LEGACY_BOOTSTRAP_USERNAME.to_string());
+    usernames.push(crate::config::DEFAULT_BOOTSTRAP_USERNAME.to_string());
     usernames.sort();
     usernames.dedup();
     for username in usernames {

@@ -30,6 +30,7 @@ pub mod middleware;
 pub mod nexus_import;
 pub mod object_store;
 pub mod plugins;
+pub mod raw;
 pub mod registry;
 pub mod serve;
 pub mod state;

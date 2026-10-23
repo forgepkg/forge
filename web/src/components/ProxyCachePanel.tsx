@@ -17,12 +17,15 @@ function plural(n: number, one: string, many: string): string {
  * The proxy remembers the upstream's "not found" answers for the not-found
  * TTL and its listings (a docker proxy: its tags) for the metadata TTL; this
  * makes it ask the upstream again, for one package (an image) or for the
- * whole repository. Downloaded packages stay cached.
+ * whole repository. Downloaded packages stay cached. A raw proxy re-validates
+ * its cached files (of a file or a directory, or all of them) on their next
+ * download.
  */
 export function ProxyCachePanel({ repo }: { repo: RepoView }) {
   const invalidate = useInvalidateProxyCache(repo.name)
   const [pkg, setPkg] = useState('')
   const docker = repo.format === 'docker'
+  const raw = repo.format === 'raw'
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -41,18 +44,23 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
       <Text>
         {docker
           ? 'The proxy serves a cached tag without asking the upstream for the metadata TTL, and remembers an image or tag the upstream did not have for the not-found TTL.'
-          : 'The proxy remembers the upstream’s listings for the metadata TTL, and a package the upstream did not have for the not-found TTL.'}{' '}
-        Invalidate the cache to ask the upstream again, for example after a
-        package was published there. Downloaded packages stay cached.
+          : raw
+            ? 'The proxy serves a cached file without asking the upstream for its maximum age, and remembers a file the upstream did not have for the not-found TTL.'
+            : 'The proxy remembers the upstream’s listings for the metadata TTL, and a package the upstream did not have for the not-found TTL.'}{' '}
+        {raw
+          ? 'Invalidate the cache to ask the upstream again, for example after a file changed there. Cached files stay, and are re-validated on their next download.'
+          : 'Invalidate the cache to ask the upstream again, for example after a package was published there. Downloaded packages stay cached.'}
       </Text>
       <div className="flex flex-wrap items-end gap-3">
         <Field className="min-w-64">
-          <Label>{docker ? 'Image' : 'Package id'}</Label>
+          <Label>{docker ? 'Image' : raw ? 'File or directory' : 'Package id'}</Label>
           <Description>Leave empty for the whole repository.</Description>
           <Input
             value={pkg}
             onChange={(e) => setPkg(e.target.value)}
-            placeholder={docker ? 'library/nginx' : 'Newtonsoft.Json'}
+            placeholder={
+              docker ? 'library/nginx' : raw ? 'chromium/7350/' : 'Newtonsoft.Json'
+            }
           />
         </Field>
         <Button type="submit" outline disabled={invalidate.isPending}>
@@ -67,7 +75,9 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
           {target ? `Invalidated ${target}: ` : 'Invalidated the whole cache: '}
           {docker
             ? `${plural(done.tags_expired, 'tag is', 'tags are')} re-validated on the next pull.`
-            : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten; listings are fetched again.`}
+            : raw
+              ? `${plural(done.files_expired ?? 0, 'cached file is', 'cached files are')} re-validated on the next download; “not found” answers are forgotten.`
+              : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten; listings are fetched again.`}
         </p>
       )}
       {invalidate.isError && (

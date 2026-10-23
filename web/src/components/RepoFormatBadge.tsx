@@ -1,7 +1,7 @@
 import { Badge } from '~/components/catalyst/badge'
 
 /**
- * Badge for a repository format (`nuget` | `docker` | `helm`), with the
+ * Badge for a repository format (`nuget` | `docker` | `helm` | `raw`), with the
  * format's display name. Other formats (WebAssembly plugins) fall back to
  * their raw id in a neutral style, like `RepoKindBadge`.
  */
@@ -12,6 +12,7 @@ const FORMATS: Record<
   nuget: { label: 'NuGet', color: 'indigo' },
   docker: { label: 'Docker', color: 'cyan' },
   helm: { label: 'Helm', color: 'sky' },
+  raw: { label: 'Raw', color: 'amber' },
 }
 
 /** Display name of a repository format (`NuGet`, `Docker`, `Helm`). */
