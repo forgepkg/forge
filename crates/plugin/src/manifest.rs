@@ -132,7 +132,8 @@ impl Default for Assets {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedLimits {
-    /// Linear-memory ceiling per instance, in MiB.
+    /// Memory ceiling per instance, in MiB: its linear memories and tables
+    /// together, and the most one call returns to the host.
     pub memory_mib: Option<u64>,
     /// Fuel (roughly, WebAssembly instructions) per call.
     pub fuel: Option<u64>,

@@ -165,21 +165,23 @@ async fn proxy_upstream_index_is_not_read_from_redis() {
         .unwrap()
         .unwrap();
 
-    // Plant the forger's resources under the key the proxy caches its index.
+    // Plant the forger's resources under the key the proxy caches its index,
+    // with the forger among the origins the proxy may reach (#233).
     let key = ProxyRepo::upstream_scope(&repo);
     a.state
         .cache
-        .get_or_try_insert_with::<String, _, _, std::convert::Infallible>(
+        .get_or_try_insert_with::<serde_json::Value, _, _, std::convert::Infallible>(
             NS_UPSTREAM_INDEX,
             &key,
             Duration::from_secs(600),
             || async {
                 Ok(serde_json::json!({
+                    "remote_url": genuine.index_url(),
+                    "named_origins": [forger.base()],
                     "package_base_address": format!("{}/flat/", forger.base()),
                     "registrations_base_url": null,
                     "search_query_service": null,
-                })
-                .to_string())
+                }))
             },
         )
         .await

@@ -138,6 +138,16 @@ host asks `manifest_summary` of its stored manifest). The web UI's package detai
 if present: `description`, and `dependency_groups` (the same shape as
 NuGet's).
 
+Every listing hands each version's summary to the plugin, so a summary
+should stay small. The host stores none larger than 64 KiB from a
+WebAssembly plugin, and logs a warning instead; a built-in plugin bounds its
+own. Helm's summary, which holds a version's index entry, takes at most
+16 KiB: past that, its description is cut to 1 KiB, then its largest fields
+are left out until it fits, and `apiVersion`, `name`, `version`,
+`appVersion`, `kubeVersion`, `type` and `deprecated` go last. A Helm summary
+stored before this bound is cut down the same way when the index is
+rendered.
+
 ## Proxy repositories
 
 A plugin that lists `proxy` among its kinds implements the upstream side of
@@ -145,9 +155,10 @@ the contract, `upstream`. The host keeps everything a proxy is, whatever the
 format: the `proxy_cached_version` rows, the package delay, the not-found
 markers and their TTL, the download singleflight, the content-addressed
 store, credentials (decrypted per request, sent only to the origin of the
-repository's `remote_url`), the SSRF and cloud-metadata guards, the size and
-time bounds of every request, and the offline mode. What the plugin knows is
-which documents an operation needs and what they say:
+repository's `remote_url`), where requests may go (below), the SSRF and
+cloud-metadata guards, the size and time bounds of every request, and the
+offline mode. What the plugin knows is which documents an operation needs and
+what they say:
 
 | Operation | The plugin answers |
 | --- | --- |
@@ -164,6 +175,21 @@ GETs (`fetch`), and is called again with every fetch so far and how it went
 fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published. One
 conversation gets at most 4 rounds and 256 fetches, 4 at a time.
+
+The host sends a fetch only where the upstream points: to the origin (scheme,
+host and port) of `remote_url`, or to an origin that an absolute `http` or
+`https` URL names in a document the host fetched for the same operation (in an
+earlier round), or while resolving `index`. The URL `package` answers is held
+to the same rule. Anything else is not sent: the fetch comes back as a
+failure, a package URL fails the download like an upstream error, and the host
+logs a warning naming the format and the repository. What the plugin answers
+names no origin: its index is its own making (and the host keeps fields of its
+own beside it, so an index may not use the keys `remote_url` and
+`named_origins`). So a NuGet service index can put its resources on other
+hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), and a Helm
+index its charts (on a project's GitHub releases), but a plugin cannot make
+Forge request a host its upstream does not point at. Redirects are the
+upstream's to choose, and are followed under the cloud-metadata guard.
 
 An administrator makes a proxy of any format ask its upstream again before
 those TTLs run out with *Invalidate cache* on the repository's page, or
@@ -205,6 +231,17 @@ helm install web forge/mychart --version 1.2.0
 curl -u ci:$TOKEN -X DELETE \
   https://forge.example.com/repository/charts/api/charts/mychart/1.2.0
 ```
+
+Forge takes a chart's name and version from the `Chart.yaml` Helm loads
+when it installs the chart. Helm reads the whole archive and the last
+`<chart>/Chart.yaml` wins, so Forge reads the whole archive as Helm does, up
+to 256 MiB unpacked, and refuses one whose files are not all in one
+top-level directory, that holds more than one `<chart>/Chart.yaml`, or whose
+`requirements.yaml` declares more than `dependencies` (Helm reads it into
+the chart's metadata too). It also refuses names Helm refuses (absolute, or
+out of the chart's directory) and tar features charts do not use, such as
+sparse files. Archives from `helm package` or `tar` pass; a Helm proxy
+checks the charts it downloads the same way.
 
 A Helm **proxy** mirrors another chart repository: its index lists the
 upstream's charts, and each chart is downloaded from the upstream on first
@@ -301,7 +338,9 @@ FORGE_PLUGINS__FORMATS__EXAMPLE=sha256:c2053ffc…
   image derived from Forge's, or mount it from a volume (a ConfigMap's 1 MiB
   limit leaves little room for components).
 - **Limits.** A plugin's `plugin.toml` may ask for a memory ceiling per
-  instance (`memory_mib`, default 64, at most 512), fuel per call (`fuel`,
+  instance (`memory_mib`, default 64, at most 512; it covers the instance's
+  linear memories and tables together, and what one call returns to the
+  host), fuel per call (`fuel`,
   default 5·10⁹, at most 5·10¹⁰) and a wall-clock budget per call
   (`timeout_ms`, default 5,000, at most 30,000). Asking for more than the
   maximum fails startup. Built-in plugins ignore `[limits]`.
@@ -330,6 +369,14 @@ The host enforces these for every plugin, built in or not:
   PostgreSQL limits to about 2,700 bytes. The built-in plugins allow less:
   NuGet 100 characters for an id and 64 for a version, Helm 250 for a chart
   name and 128 for a version.
+- **Upstream requests go where the upstream points.** A proxy's plugin
+  reaches the network only through the GETs the host sends for it, and the
+  host sends them, and downloads packages, only from the origin of the
+  repository's `remote_url` and from origins that the documents it fetched
+  from that upstream name ([Proxy repositories](#proxy-repositories)). A
+  plugin cannot have Forge read `http://localhost:8421/admin/…` or an internal
+  search cluster that its upstream does not point at, and pass the answers on
+  through the proxy's metadata.
 - **Responses cannot attack the origin.** Only `cache-control`,
   `content-disposition`, `content-language`, `content-type`, `etag`,
   `last-modified` and `location` survive; `location` survives only when it
@@ -349,12 +396,20 @@ plugin is code from elsewhere, so it is also sandboxed:
 - **No ambient authority.** The component gets an empty WASI context: no
   files, no sockets, no environment, no arguments; only clocks and
   randomness. Its stdout and stderr go nowhere. It imports exactly one
-  host interface, the reader for the package being parsed.
+  host interface, the reader for the package being parsed. What it can make
+  the host request for a proxy is bounded by the rule above.
 - **Resource limits.** Each call runs with a fresh fuel budget and an epoch
-  deadline (10 ms ticks), in an instance with a memory ceiling. A trap (out
-  of fuel, past the deadline, out of memory, a guest panic) fails that call
-  with a 500 or 400 and discards the instance. The sandbox tests include a
-  gzip bomb.
+  deadline (10 ms ticks), in an instance with a memory ceiling. The ceiling
+  bounds the host memory an instance can take: all its linear memories and
+  tables count against it together (each table element as a pointer), the
+  strings and lists one call returns are copied into the host only up to
+  it (a string that several list elements point at is copied once per
+  element, and counted so), and so are the random bytes it asks WASI for. A
+  trap (out of fuel, past the deadline, out of memory, a guest panic, a
+  result past the ceiling) fails that call with a 500 or 400 and discards
+  the instance. The sandbox tests include a gzip bomb, an instance whose
+  memories together exceed the ceiling, a `table.grow` past it, and a
+  result whose list elements all point at one string.
 - **Isolation from the server's threads.** Guest code runs on dedicated
   threads, never on the async runtime's workers. The quick rule calls
   (`canonical-id`, `compare-versions`, …) and the slow calls (parsing a
@@ -364,6 +419,15 @@ plugin is code from elsewhere, so it is also sandboxed:
 Plugins are still code you run: a plugin with a bug can serve wrong
 metadata for its own repositories. Review a plugin like any other
 dependency before you pin it.
+
+The documents an upstream serves decide which hosts a proxy's plugin can
+reach. A public feed whose package metadata names an internal URL (a
+project URL or a chart's home page pointing at `http://10.0.0.5:9200/`) makes
+that host reachable for a proxy of that feed, and a plugin can read what it
+answers back into what the proxy serves. The rule bounds a plugin to the
+hosts its upstream points at, public or internal; where internal services
+must stay out of Forge's reach altogether, confine its egress with network
+policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 
@@ -580,5 +644,6 @@ contract:
 | Instances | A new store and instance per call | Instances reused per plugin, a fresh budget per call, recycled after a trap or 10,000 calls |
 
 The Helm plugin shows the difference in practice: a 64 MiB component serves
-a repository index of any size the query bounds allow, and a 500 MB chart is
-never copied into the sandbox, which reads it only up to its `Chart.yaml`.
+a repository index of any size the query bounds allow, and a chart is never
+copied into the sandbox, which streams it through the lent reader and keeps
+only its `Chart.yaml`.

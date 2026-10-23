@@ -132,7 +132,10 @@ pub struct Conversed {
 
 /// Run `op` against `remote` through `plugin`'s upstream side, answering
 /// its fetches with `fetch`. Errs with what the plugin returned, or when it
-/// needs more rounds or fetches than the host allows.
+/// needs more rounds or fetches than the host allows. Every fetch reaches
+/// `fetch`: the host also refuses the ones on origins its upstream does not
+/// point at ([`Fetch`]), which a test checks by the URLs in
+/// [`Conversed::fetches`].
 pub fn converse(
     plugin: &dyn FormatPlugin,
     remote: &Remote,

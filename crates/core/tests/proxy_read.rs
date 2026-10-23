@@ -25,6 +25,10 @@
 //!   served; a rejected package is not re-downloaded on every retry.
 //! * **upstream registration** — listed / published / dependency groups of
 //!   versions not downloaded yet, bounded page fetches, flat-view fallback.
+//! * **where requests go** — a format's fetches and package URLs reach the
+//!   `remote_url`'s origin and the origins the upstream's documents name,
+//!   nothing else (#233): a scripted format plays a plugin that wants to read
+//!   an internal service.
 
 mod common;
 
@@ -41,7 +45,11 @@ use axum::Router;
 use forge_cache::Cache;
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::RepoReadOps;
+use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::repository_dao::{self, NewRepository};
+use forge_plugin_api::{
+    Fetch, FetchResult, Fetched, Freshness, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
+};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -3175,4 +3183,338 @@ async fn the_recorded_id_casing_is_the_newest_versions() {
         .unwrap();
         assert_eq!(recorded, [Some("jQuery".to_string())], "read {read}");
     }
+}
+
+// ── Where a format's requests go (#233) ─────────────────────────────────────
+
+/// A format's upstream side as a test scripts it: given NuGet (to delegate
+/// to), the remote, the operation, and everything fetched so far.
+type Script = dyn Fn(&dyn Format, &Remote, &UpstreamOp, &[FetchResult]) -> Result<UpstreamStep, FormatError>
+    + Send
+    + Sync;
+
+/// NuGet with a scripted upstream side: a format plugin that wants to read
+/// what Forge's network position reaches.
+struct Scripted {
+    nuget: forge_plugin::PluginFormat,
+    script: Box<Script>,
+}
+
+impl Format for Scripted {
+    fn id(&self) -> &'static str {
+        "nuget"
+    }
+    fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+        self.nuget.parse_upload(file)
+    }
+    fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+        self.nuget.normalize_version(raw)
+    }
+    fn compare_versions(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        self.nuget.compare_versions(a, b)
+    }
+    fn lower_id(&self, id: &str) -> String {
+        self.nuget.lower_id(id)
+    }
+    fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        self.nuget.validate_id(id)
+    }
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        (self.script)(&self.nuget, remote, op, fetched)
+    }
+}
+
+/// A proxy facade whose format's upstream side is `script`.
+fn scripted_proxy(
+    pool: &PgPool,
+    cas: forge_storage::Cas,
+    script: impl Fn(&dyn Format, &Remote, &UpstreamOp, &[FetchResult]) -> Result<UpstreamStep, FormatError>
+        + Send
+        + Sync
+        + 'static,
+) -> ProxyRepo {
+    let format = Scripted {
+        nuget: nuget(),
+        script: Box::new(script),
+    };
+    ProxyRepo::new(pool.clone(), Arc::new(format), cas, Cache::l1_only(128))
+}
+
+/// NuGet's own upstream side, with its resolved index changed by `edit`.
+fn nuget_with_index(
+    edit: impl Fn(&mut serde_json::Value) + Send + Sync + 'static,
+) -> impl Fn(&dyn Format, &Remote, &UpstreamOp, &[FetchResult]) -> Result<UpstreamStep, FormatError>
+       + Send
+       + Sync
+       + 'static {
+    move |nuget, remote, op, fetched| {
+        Ok(match nuget.upstream(remote, op, fetched)? {
+            UpstreamStep::Done(UpstreamAnswer::Index(index)) => {
+                let mut index: serde_json::Value = serde_json::from_str(&index).unwrap();
+                edit(&mut index);
+                UpstreamStep::Done(UpstreamAnswer::Index(index.to_string()))
+            }
+            step => step,
+        })
+    }
+}
+
+/// A service on Forge's network that trusts its position: it answers any
+/// GET with a secret.
+async fn internal_service() -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(r#"{"secret": "internal"}"#),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// How many requests `server` received.
+async fn requests_to(server: &wiremock::MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .len()
+}
+
+/// #233: a format plugin's requests reach only the upstream's origin and the
+/// origins its documents name. A plugin asking for an internal service's URL
+/// gets a failure, and nothing is sent; a package URL there is not
+/// downloaded.
+#[tokio::test]
+async fn a_format_cannot_reach_an_origin_its_upstream_does_not_name() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let internal = internal_service().await;
+    let secret = format!("{}/_search?q=*", internal.uri());
+    let evil = format!("{}/sample.lib.1.2.3.nupkg", internal.uri());
+    let seen: Arc<Mutex<Option<Fetched>>> = Arc::default();
+    let px = {
+        let (secret, seen) = (secret.clone(), seen.clone());
+        scripted_proxy(&pool, cas, move |nuget, remote, op, fetched| match op {
+            // The listing reads the internal service first, then lists
+            // what the upstream lists, as NuGet does.
+            UpstreamOp::Versions(_) if fetched.is_empty() => Ok(UpstreamStep::Fetch(vec![Fetch {
+                url: secret.clone(),
+                freshness: Freshness::Metadata,
+            }])),
+            UpstreamOp::Versions(_) => {
+                *seen.lock().unwrap() = fetched
+                    .iter()
+                    .find(|f| f.fetch.url == secret)
+                    .map(|f| f.outcome.clone());
+                nuget.upstream(remote, op, fetched)
+            }
+            UpstreamOp::Package(_) => Ok(UpstreamStep::Done(UpstreamAnswer::Package(evil.clone()))),
+            _ => nuget.upstream(remote, op, fetched),
+        })
+    };
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Sample.Lib").await.unwrap()),
+        ["1.2.3"],
+        "what the upstream lists is still listed"
+    );
+    match seen.lock().unwrap().clone() {
+        Some(Fetched::Failed(reason)) => assert!(reason.contains("not sent"), "{reason}"),
+        other => panic!("the internal service's answer reached the format: {other:?}"),
+    }
+    let err = px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .expect_err("a package URL on the internal service is not downloaded");
+    assert!(err.to_string().contains("not downloaded"), "{err}");
+    assert_eq!(requests_to(&internal).await, 0, "nothing reached it");
+    assert_eq!(mock.nupkg_hits(), 0);
+}
+
+/// #233: a format's index is its own making, so a URL in it names no origin.
+/// A plugin cannot point its index at an internal service, nor write the
+/// origins the host records beside it.
+#[tokio::test]
+async fn a_formats_index_names_no_origin() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.2.3")).await;
+    let internal = internal_service().await;
+    let flat = format!("{}/flat/", internal.uri());
+
+    // The service index, with the flat container moved to the internal
+    // service.
+    let px = scripted_proxy(&pool, cas.clone(), {
+        let flat = flat.clone();
+        nuget_with_index(move |index| index["package_base_address"] = flat.clone().into())
+    });
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    assert!(px.list_versions(&repo, "Sample.Lib").await.is_err());
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .is_err());
+    assert_eq!(mock.index_hits(), 1);
+
+    // And the internal service among the origins the host records.
+    let px = scripted_proxy(&pool, cas, {
+        let (flat, named) = (flat.clone(), serde_json::json!([internal.uri()]));
+        nuget_with_index(move |index| {
+            index["package_base_address"] = flat.clone().into();
+            index["named_origins"] = named.clone();
+        })
+    });
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let err = px
+        .list_versions(&repo, "Sample.Lib")
+        .await
+        .expect_err("an index using the host's keys is refused");
+    assert!(err.to_string().contains("a key the host keeps"), "{err}");
+    assert!(
+        forge_db::proxy_dao::get_upstream_index(&pool, repo_id(&pool, &repo).await)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing was stored"
+    );
+    assert_eq!(requests_to(&internal).await, 0, "nothing reached it");
+}
+
+/// #233: a service index may put its resources on other hosts, and a
+/// document fetched from one may name yet another (a registration page):
+/// their origins are reached. The origins the service index names are
+/// recorded with the index for every later operation.
+#[tokio::test]
+async fn origins_the_upstreams_documents_name_are_reached() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    // The service index and the registration; the flat container; a
+    // registration page: three origins.
+    let feed = start_mock(Corpus::new()).await;
+    let cdn = start_mock(sample_corpus("1.2.3")).await;
+    let pages = start_mock(Corpus::new()).await;
+    feed.override_index(serde_json::json!({
+        "version": "3.0.0",
+        "resources": [
+            { "@id": format!("{}/flat/", cdn.base), "@type": "PackageBaseAddress/3.0.0" },
+            { "@id": format!("{}/registration/", feed.base), "@type": "RegistrationsBaseUrl/3.6.0" },
+        ]
+    }));
+    feed.set_registration(
+        "sample.lib",
+        serde_json::json!({ "count": 1, "items": [ {
+            "@id": format!("{}/registration/sample.lib/page/1.json", pages.base),
+            "lower": "1.2.3", "upper": "1.2.3", "count": 1,
+        } ] }),
+    );
+    pages.set_registration_page(
+        "sample.lib",
+        "1.json",
+        serde_json::json!({ "items": [ { "catalogEntry": {
+            "id": "Sample.Lib", "version": "1.2.3", "listed": true,
+            "published": "2026-05-01T10:00:00+00:00", "dependencyGroups": []
+        } } ] }),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", feed.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Sample.Lib").await.unwrap()),
+        ["1.2.3"]
+    );
+    let reg = px.registration(&repo, "Sample.Lib").await.unwrap();
+    assert_eq!(
+        reg[0].published,
+        Some("2026-05-01T10:00:00Z".parse().unwrap()),
+        "the registration page was read"
+    );
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!((cdn.flat_index_hits(), cdn.nupkg_hits()), (1, 1));
+    assert_eq!(feed.registration_hits(), 1);
+    assert_eq!(pages.registration_page_hits(), 1);
+
+    let stored = forge_db::proxy_dao::get_upstream_index(&pool, repo_id(&pool, &repo).await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.resources["named_origins"],
+        serde_json::json!([cdn.base]),
+        "the service index's other origin, not the remote_url's"
+    );
+}
+
+/// #233: an index kept before the host recorded the origins its documents
+/// name is resolved again at its next use, however fresh, and never trusted
+/// to name any: while its upstream fails, it serves with the `remote_url`'s
+/// origin alone.
+#[tokio::test]
+async fn an_index_kept_without_its_origins_is_resolved_again() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let internal = internal_service().await;
+    // As the previous release kept a format's index: the flat container on
+    // another host, without the origins its documents named.
+    let kept = |remote_url: &str| {
+        serde_json::json!({
+            "remote_url": remote_url,
+            "package_base_address": format!("{}/flat/", internal.uri()),
+            "registrations_base_url": null,
+            "search_query_service": null,
+        })
+    };
+
+    // The upstream answers an unusable service index: the kept one is the
+    // last good index, and reaches the remote_url's origin only.
+    let failing = start_mock(sample_corpus("1.2.3")).await;
+    failing.override_index(serde_json::json!({}));
+    let url = format!("{}/index.json", failing.base);
+    let repo = make_proxy(&pool, &url, 0, true).await;
+    forge_db::proxy_dao::set_upstream_index(&pool, repo_id(&pool, &repo).await, kept(&url), None)
+        .await
+        .unwrap();
+    let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+    assert!(px.list_versions(&repo, "Sample.Lib").await.is_err());
+    assert!(px
+        .resolve_nupkg(&repo, "Sample.Lib", "1.2.3")
+        .await
+        .is_err());
+    assert_eq!(failing.index_hits(), 1, "the kept index was not fresh");
+
+    // A good upstream: resolved again, with its origins.
+    let good = start_mock(sample_corpus("1.2.3")).await;
+    let url = format!("{}/index.json", good.base);
+    let repo = make_proxy(&pool, &url, 0, true).await;
+    let id = repo_id(&pool, &repo).await;
+    forge_db::proxy_dao::set_upstream_index(&pool, id, kept(&url), None)
+        .await
+        .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Sample.Lib").await.unwrap()),
+        ["1.2.3"]
+    );
+    assert_eq!(good.index_hits(), 1);
+    let stored = forge_db::proxy_dao::get_upstream_index(&pool, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.resources["package_base_address"],
+        format!("{}/flat/", good.base)
+    );
+    assert_eq!(stored.resources["named_origins"], serde_json::json!([]));
+    assert_eq!(requests_to(&internal).await, 0, "nothing reached it");
 }

@@ -2106,6 +2106,7 @@ dependencies = [
  "thiserror",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "wasm-encoder 0.258.3",
  "wasmtime",
  "wasmtime-wasi",
 ]

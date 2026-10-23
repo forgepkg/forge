@@ -22,6 +22,13 @@
 //!   credentials are sent with the service index, version listing, `.nuspec`
 //!   and `.nupkg` requests, but only to the `remote_url` host
 //!   ([`crate::net::upstream`] credential scoping).
+//! * **Requests only where the upstream points** — a request the format asks
+//!   for, and the package URL it answers with, is sent only to the origin of
+//!   `remote_url` or to an origin an absolute URL names in a document fetched
+//!   from the upstream for the same conversation, or while resolving its
+//!   index ([`crate::net::origins`]). Anything else is not sent: a format
+//!   plugin may be code from elsewhere, and must not turn the proxy into a
+//!   way to read the services around Forge (#233).
 //! * **NO advisory locks, no DB transaction across network I/O** — first-time
 //!   fetch singleflight is a plain row lock:
 //!   [`proxy_dao::insert_unconfirmed_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
@@ -98,7 +105,7 @@
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -122,6 +129,7 @@ use forge_plugin_api as api;
 
 use crate::authz::PackageFilter;
 use crate::format::Format;
+use crate::net::origins::{named_origins, UpstreamOrigins};
 use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
 use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
@@ -187,17 +195,34 @@ const MAX_UPSTREAM_FETCHES: usize = 256;
 const FETCH_CONCURRENCY: usize = 4;
 
 /// The `proxy_upstream_index.resources` JSON: the index the format resolved
-/// ([`api::UpstreamOp::Index`], a JSON object) and the `remote_url` it was
-/// resolved from. A row that came from another URL (the proxy has been
-/// repointed since), or that predates this field, is never used.
-#[derive(Serialize, Deserialize)]
+/// ([`api::UpstreamOp::Index`], a JSON object), the `remote_url` it was
+/// resolved from, and the origins the documents fetched to resolve it named.
+/// A row that came from another URL (the proxy has been repointed since), or
+/// that predates `remote_url`, is never used.
+///
+/// The host's fields sit beside the format's keys, which may not use their
+/// names ([`Self::HOST_KEYS`]): a format must not be able to write the
+/// origins its later requests may reach.
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedIndex {
     remote_url: String,
+    /// The origins the documents fetched while resolving the index named
+    /// ([`named_origins`]): every later conversation may reach them
+    /// (NuGet's resources on other hosts). `None` in a row written before
+    /// they were recorded: it is resolved again at its next use, and serves
+    /// meanwhile (offline, or while the upstream fails) with the
+    /// `remote_url`'s origin alone, never with origins read from the
+    /// format's index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    named_origins: Option<BTreeSet<Origin>>,
     #[serde(flatten)]
     index: serde_json::Map<String, JsonValue>,
 }
 
 impl PersistedIndex {
+    /// The keys the host keeps beside the format's index.
+    const HOST_KEYS: [&'static str; 2] = ["remote_url", "named_origins"];
+
     /// The index as the format reads it ([`api::Remote::index`]).
     fn index(&self) -> String {
         JsonValue::Object(self.index.clone()).to_string()
@@ -205,10 +230,12 @@ impl PersistedIndex {
 }
 
 /// A fetched document as cached: a body (base64, so the cache's JSON
-/// encoding stays compact) or a 404.
+/// encoding stays compact) with the origins its URLs name
+/// ([`named_origins`], read once per fetch rather than once per
+/// conversation: a Helm index is read by every operation), or a 404.
 #[derive(Clone, Serialize, Deserialize)]
 enum CachedFetch {
-    Found(String),
+    Found { body: String, named: Vec<Origin> },
     NotFound,
 }
 
@@ -436,17 +463,31 @@ impl ProxyRepo {
     /// (`None` while resolving it). Bounded to [`MAX_UPSTREAM_ROUNDS`] rounds
     /// and [`MAX_UPSTREAM_FETCHES`] fetches; the format runs off the async
     /// workers, as a format plugin may take its time.
+    ///
+    /// Only the origins the upstream points at are reached
+    /// ([`UpstreamOrigins`]): the `remote_url`'s, those `index` recorded, and
+    /// those the documents fetched in earlier rounds name. A fetch anywhere
+    /// else is not sent ([`Self::refuse`]), and a package URL anywhere else
+    /// is answered as an upstream failure. Returns the answer with the
+    /// origins the conversation could reach at its end, which resolving the
+    /// index records.
     async fn converse(
         &self,
         repo: &Repository,
-        index: Option<String>,
+        index: Option<&PersistedIndex>,
         op: api::UpstreamOp,
-    ) -> Result<api::UpstreamAnswer, RepoError> {
+    ) -> Result<(api::UpstreamAnswer, UpstreamOrigins), RepoError> {
         use futures_util::StreamExt;
         let remote = api::Remote {
             url: repo.remote_url.clone().unwrap_or_default(),
-            index,
+            index: index.map(PersistedIndex::index),
         };
+        let mut origins = UpstreamOrigins::new(
+            &remote.url,
+            index
+                .and_then(|index| index.named_origins.clone())
+                .unwrap_or_default(),
+        );
         let mut fetched: Vec<api::FetchResult> = Vec::new();
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let format = self.format.clone();
@@ -458,11 +499,22 @@ impl ProxyRepo {
             .await
             .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?;
             fetched = back;
-            let wanted =
-                match step.map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))? {
-                    api::UpstreamStep::Done(answer) => return Ok(answer),
-                    api::UpstreamStep::Fetch(wanted) => wanted,
-                };
+            let wanted = match step
+                .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?
+            {
+                api::UpstreamStep::Done(api::UpstreamAnswer::Package(url))
+                    if !origins.permits(&url) =>
+                {
+                    tracing::warn!(format = %self.format.id(), repo = %repo.name, %url, "the format answered a package URL on an origin neither the remote_url nor a document fetched from the upstream names; not downloaded");
+                    let reason = format!(
+                        "upstream package {url}: not downloaded, its origin is neither the \
+                             remote_url's nor named by a document fetched from the upstream"
+                    );
+                    return Ok((api::UpstreamAnswer::Failed(reason), origins));
+                }
+                api::UpstreamStep::Done(answer) => return Ok((answer, origins)),
+                api::UpstreamStep::Fetch(wanted) => wanted,
+            };
             if wanted.is_empty() || fetched.len() + wanted.len() > MAX_UPSTREAM_FETCHES {
                 return Err(RepoError::Storage(format!(
                     "upstream protocol asked for {} fetches after {}",
@@ -470,29 +522,52 @@ impl ProxyRepo {
                     fetched.len()
                 )));
             }
-            let results: Vec<api::FetchResult> = futures_util::stream::iter(wanted)
-                .map(|fetch| async move {
-                    let outcome = self.fetch(repo, &fetch).await;
-                    api::FetchResult { fetch, outcome }
+            // Each fetch is judged by the origins known when the round
+            // starts; what its document names counts from the next round.
+            let results: Vec<(api::FetchResult, Vec<Origin>)> = futures_util::stream::iter(wanted)
+                .map(|fetch| {
+                    let permitted = origins.permits(&fetch.url);
+                    async move {
+                        let (outcome, named) = if permitted {
+                            self.fetch(repo, &fetch).await
+                        } else {
+                            (self.refuse(repo, &fetch.url), Vec::new())
+                        };
+                        (api::FetchResult { fetch, outcome }, named)
+                    }
                 })
                 .buffered(FETCH_CONCURRENCY)
                 .collect()
                 .await;
-            fetched.extend(results);
+            for (result, named) in results {
+                origins.extend(named);
+                fetched.push(result);
+            }
         }
         Err(RepoError::Storage(format!(
             "upstream protocol needed more than {MAX_UPSTREAM_ROUNDS} rounds"
         )))
     }
 
+    /// The outcome of a fetch on an origin the conversation may not reach
+    /// ([`Self::converse`]): nothing is sent, and the format is told so.
+    fn refuse(&self, repo: &Repository, url: &str) -> api::Fetched {
+        tracing::warn!(format = %self.format.id(), repo = %repo.name, %url, "the format asked for an upstream URL on an origin neither the remote_url nor a document fetched from the upstream names; not sent");
+        api::Fetched::Failed(format!(
+            "{url}: not sent, its origin is neither the remote_url's nor named by a document \
+             fetched from the upstream"
+        ))
+    }
+
     /// GET one upstream document with the proxy's credentials, through the
     /// local cache for as long as its freshness allows (never Redis: what an
-    /// upstream answered decides what is downloaded and served).
+    /// upstream answered decides what is downloaded and served). Returns it
+    /// with the origins its URLs name ([`named_origins`]).
     ///
     /// A 404 is cached only for an immutable document: a metadata 404 (a
     /// package the upstream does not know yet) is what the not-found
     /// markers track, and they are cleared as soon as the package turns up.
-    async fn fetch(&self, repo: &Repository, fetch: &api::Fetch) -> api::Fetched {
+    async fn fetch(&self, repo: &Repository, fetch: &api::Fetch) -> (api::Fetched, Vec<Origin>) {
         let ttl = match fetch.freshness {
             api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
             api::Freshness::Immutable => IMMUTABLE_FETCH_TTL,
@@ -507,9 +582,20 @@ impl ProxyRepo {
                     .map_err(|e| Some(e.to_string()))?;
                 let auth = creds.as_ref().map(Credentials::auth);
                 match self.http.get_bytes(&fetch.url, auth.as_ref()).await {
-                    Ok(Some(bytes)) => Ok(CachedFetch::Found(
-                        base64::engine::general_purpose::STANDARD.encode(bytes),
-                    )),
+                    Ok(Some(bytes)) => {
+                        // A document may be megabytes: read off the async
+                        // workers.
+                        let (bytes, named) = tokio::task::spawn_blocking(move || {
+                            let named = named_origins(&bytes);
+                            (bytes, named)
+                        })
+                        .await
+                        .map_err(|e| Some(format!("read {}: {e}", fetch.url)))?;
+                        Ok(CachedFetch::Found {
+                            body: base64::engine::general_purpose::STANDARD.encode(bytes),
+                            named: named.into_iter().collect(),
+                        })
+                    }
                     Ok(None) if fetch.freshness == api::Freshness::Immutable => {
                         Ok(CachedFetch::NotFound)
                     }
@@ -519,14 +605,17 @@ impl ProxyRepo {
             })
             .await;
         match cached {
-            Ok(CachedFetch::Found(body)) => {
+            Ok(CachedFetch::Found { body, named }) => {
                 match base64::engine::general_purpose::STANDARD.decode(body) {
-                    Ok(bytes) => api::Fetched::Found(bytes),
-                    Err(e) => api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
+                    Ok(bytes) => (api::Fetched::Found(bytes), named),
+                    Err(e) => (
+                        api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
+                        Vec::new(),
+                    ),
                 }
             }
-            Ok(CachedFetch::NotFound) | Err(None) => api::Fetched::NotFound,
-            Err(Some(e)) => api::Fetched::Failed(e),
+            Ok(CachedFetch::NotFound) | Err(None) => (api::Fetched::NotFound, Vec::new()),
+            Err(Some(e)) => (api::Fetched::Failed(e), Vec::new()),
         }
     }
 
@@ -536,8 +625,9 @@ impl ProxyRepo {
         repo: &Repository,
         op: api::UpstreamOp,
     ) -> Result<api::UpstreamAnswer, RepoError> {
-        let index = Box::pin(self.resolve_upstream_index(repo)).await?;
-        self.converse(repo, Some(index), op).await
+        let index = Box::pin(self.upstream_index(repo)).await?;
+        let (answer, _) = self.converse(repo, Some(&index), op).await?;
+        Ok(answer)
     }
 
     /// Resolve the repository row by name, erroring if missing or not a proxy.
@@ -653,7 +743,9 @@ impl ProxyRepo {
     ///    upstream.
     /// 2. **DB freshness** — on an L1 miss, if `proxy_upstream_index.fetched_at`
     ///    is within metadata_ttl, reuse it without a network call. Only a row
-    ///    fetched from the current `remote_url` is used, fresh or stale.
+    ///    fetched from the current `remote_url` is used, fresh or stale, and
+    ///    a row without the origins its documents named
+    ///    ([`PersistedIndex::named_origins`]) is never fresh.
     /// 3. **Refresh** — otherwise resolve the index again (no DB transaction
     ///    or row lock held across the requests) and upsert it. Concurrent
     ///    instances may both refresh; the result is idempotent.
@@ -663,6 +755,12 @@ impl ProxyRepo {
     /// deleted-and-recreated repository) never serves the old upstream's
     /// index.
     pub async fn resolve_upstream_index(&self, repo: &Repository) -> Result<String, RepoError> {
+        Ok(self.upstream_index(repo).await?.index())
+    }
+
+    /// [`Self::resolve_upstream_index`], with the origins recorded with the
+    /// index ([`PersistedIndex::named_origins`]).
+    async fn upstream_index(&self, repo: &Repository) -> Result<PersistedIndex, RepoError> {
         let ttl = Self::metadata_ttl(repo);
         let remote_url = repo
             .remote_url
@@ -675,7 +773,8 @@ impl ProxyRepo {
         // so the factory yields a `String` and we re-wrap it on the way out.
         // Local-only (never read from Redis): the index decides which host
         // packages are downloaded from, and a downloaded package is cached for
-        // good, so a forged index in Redis would substitute packages.
+        // good, so a forged index in Redis would substitute packages (and its
+        // origins would let the format reach any host).
         self.cache
             .get_or_try_insert_local(
                 NS_UPSTREAM_INDEX,
@@ -691,32 +790,34 @@ impl ProxyRepo {
             .map_err(RepoError::Storage)
     }
 
-    /// The uncached body of [`Self::resolve_upstream_index`]: DB-freshness
+    /// The uncached body of [`Self::upstream_index`]: DB-freshness
     /// short-circuit, offline handling, and refresh.
     async fn resolve_index_uncached(
         &self,
         repo: &Repository,
         ttl: Duration,
         remote_url: &str,
-    ) -> Result<String, RepoError> {
+    ) -> Result<PersistedIndex, RepoError> {
         // An index resolved from another URL is not this upstream's: neither
         // reused nor fallen back to below.
         let persisted = proxy_dao::get_upstream_index(&self.pool, repo.id)
             .await?
             .and_then(|idx| {
                 let stored: PersistedIndex = serde_json::from_value(idx.resources).ok()?;
-                (stored.remote_url == remote_url).then(|| (stored.index(), idx.fetched_at))
+                (stored.remote_url == remote_url).then_some((stored, idx.fetched_at))
             });
-        if let Some((index, fetched_at)) = &persisted {
-            if self.db_now().await? - *fetched_at < ttl {
-                return Ok(index.clone());
+        if let Some((stored, fetched_at)) = &persisted {
+            // A row without the origins its documents named is resolved
+            // again now, whatever its age.
+            if stored.named_origins.is_some() && self.db_now().await? - *fetched_at < ttl {
+                return Ok(stored.clone());
             }
         }
 
         // Offline: never fetch. Serve a persisted (possibly stale) index if present.
         if !repo.online {
             return match persisted {
-                Some((index, _)) => Ok(index),
+                Some((stored, _)) => Ok(stored),
                 None => Err(RepoError::Storage(
                     "proxy is offline and has no cached upstream index".into(),
                 )),
@@ -728,32 +829,47 @@ impl ProxyRepo {
         // is an upstream failure, never stored over the last good index:
         // taken for an empty upstream, it would answer every id 404.
         let resolved = match self.converse(repo, None, api::UpstreamOp::Index).await {
-            Ok(api::UpstreamAnswer::Index(index)) => match serde_json::from_str(&index) {
-                Ok(JsonValue::Object(index)) => Ok(index),
-                _ => Err(RepoError::Storage(format!(
-                    "upstream {remote_url} resolved to an index that is not a JSON object"
-                ))),
-            },
-            Ok(api::UpstreamAnswer::Failed(reason)) => Err(RepoError::Storage(reason)),
+            Ok((api::UpstreamAnswer::Index(index), origins)) => {
+                match serde_json::from_str(&index) {
+                    // The host's own fields are not the format's to write.
+                    Ok(JsonValue::Object(index))
+                        if PersistedIndex::HOST_KEYS
+                            .iter()
+                            .any(|key| index.contains_key(*key)) =>
+                    {
+                        Err(RepoError::Storage(format!(
+                            "upstream {remote_url} resolved to an index that uses a key the \
+                             host keeps ({})",
+                            PersistedIndex::HOST_KEYS.join(", ")
+                        )))
+                    }
+                    Ok(JsonValue::Object(index)) => Ok((index, origins)),
+                    _ => Err(RepoError::Storage(format!(
+                        "upstream {remote_url} resolved to an index that is not a JSON object"
+                    ))),
+                }
+            }
+            Ok((api::UpstreamAnswer::Failed(reason), _)) => Err(RepoError::Storage(reason)),
             Ok(_) => Err(RepoError::Storage(
                 "upstream protocol answered index with something else".into(),
             )),
             Err(e) => Err(e),
         };
-        let index = match resolved {
-            Ok(index) => index,
+        let (index, origins) = match resolved {
+            Ok(resolved) => resolved,
             Err(e) => {
                 // A stale persisted index is better than failing every read
                 // while the upstream is briefly unreachable.
-                if let Some((index, _)) = persisted {
+                if let Some((stored, _)) = persisted {
                     tracing::warn!(repo = %repo.name, error = %e, "upstream index refresh failed; serving stale index");
-                    return Ok(index);
+                    return Ok(stored);
                 }
                 return Err(e);
             }
         };
         let stored = PersistedIndex {
             remote_url: remote_url.to_string(),
+            named_origins: Some(origins.named().clone()),
             index,
         };
         let resources_json = serde_json::to_value(&stored)
@@ -772,7 +888,7 @@ impl ProxyRepo {
         .execute(&self.pool)
         .await?;
 
-        Ok(stored.index())
+        Ok(stored)
     }
 
     // ── Metadata discovery: enumerate upstream versions (Task 8.2) ───────────
@@ -1114,7 +1230,9 @@ impl ProxyRepo {
 
         // ── Network I/O — performed with NO transaction held ─────────────────
         // Where the package is, as the format's upstream protocol says (for
-        // NuGet, `{flat container}{id}/{version}/{id}.{version}.nupkg`).
+        // NuGet, `{flat container}{id}/{version}/{id}.{version}.nupkg`), on
+        // an origin the upstream points at: [`Self::converse`] answers any
+        // other as an upstream failure.
         let url = match self
             .converse_resolved(
                 repo,
@@ -2539,20 +2657,43 @@ mod tests {
         };
         let stored = serde_json::to_value(PersistedIndex {
             remote_url: "https://up/index.json".into(),
+            named_origins: Some(BTreeSet::from(
+                [Origin::of("https://cdn.example/").unwrap()],
+            )),
             index: map,
         })
         .unwrap();
-        // The index keeps its shape; the URL is one more field, so a row
-        // written before the format's upstream protocol moved behind
-        // `Format::upstream` reads back as the same index.
+        // The index keeps its shape; the URL and the origins are two more
+        // fields beside it.
         assert_eq!(stored["package_base_address"], "https://up/flat/");
+        assert_eq!(
+            stored["named_origins"],
+            serde_json::json!(["https://cdn.example:443"])
+        );
         let parsed: PersistedIndex = serde_json::from_value(stored).unwrap();
         assert_eq!(parsed.remote_url, "https://up/index.json");
+        assert_eq!(
+            parsed.named_origins,
+            Some(BTreeSet::from(
+                [Origin::of("https://cdn.example/").unwrap()]
+            ))
+        );
         assert_eq!(
             serde_json::from_str::<JsonValue>(&parsed.index()).unwrap(),
             index
         );
         // A row written before the URL was recorded belongs to no URL.
-        assert!(serde_json::from_value::<PersistedIndex>(index).is_err());
+        assert!(serde_json::from_value::<PersistedIndex>(index.clone()).is_err());
+        // One written before the origins were recorded has none: it is
+        // resolved again, and its index reaches no origin but the
+        // remote_url's meanwhile.
+        let mut old = index.clone();
+        old["remote_url"] = "https://up/index.json".into();
+        let parsed: PersistedIndex = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.named_origins, None);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&parsed.index()).unwrap(),
+            index
+        );
     }
 }
