@@ -13,14 +13,14 @@
 # runs the jobs of what it changed (#361): with the merge queue, the same
 # commit already passed as a merge group. A push that sets a new workspace
 # version (a release commit) needs every group, since the release gate wants
-# every job of its run. A manual run given a base branch (DISPATCH_BASE;
-# stack.yml names the default branch for a pull request retargeted to it) is
+# every job of its run. A manual run given a base branch (DISPATCH_BASE, such
+# as the default branch for a stacked pull request's branch) is
 # compared with the commit it forked off that branch, as GitHub's compare API
 # finds it. Any other event (a manual run without a base), a commit that
 # cannot be fetched, or a diff that fails, needs every group.
 #
-# The groups are git pathspecs, each also covering the CI configuration
-# (COMMON).
+# The groups are git pathspecs, each also covering this script (COMMON). A
+# change to ci.yml counts for the groups of the jobs it changes (CI_JOB_GROUP).
 #
 # Usage: ci-changes.sh   (env: EVENT; MERGE_GROUP_BASE for a merge group,
 #                          PUSH_BEFORE for a push, DISPATCH_BASE and GH_TOKEN
@@ -30,7 +30,20 @@
 # shellcheck disable=SC2034
 set -uo pipefail
 
-COMMON=(.github/workflows/ci.yml .github/scripts/ci-changes.sh)
+COMMON=(.github/scripts/ci-changes.sh)
+
+# ci.yml, sorted by job (#365): a change to a job's lines needs the group that
+# runs the job, and with it that group's other jobs; a change to any other
+# line (the triggers, the settings, the `changes` job) or to a job missing
+# here needs every group. Blank and comment lines do not count, a `#` line of
+# a `run:` script being a shell comment too. (A YAML anchor shared by several
+# jobs would hide a change from the jobs using it; ci.yml has none.)
+CI=.github/workflows/ci.yml
+declare -A CI_JOB_GROUP=(
+    [fmt]=changelog [clippy]=rust [audit]=audit [plugins]=rust [test]=rust
+    [docker]=image [kubernetes]=kubernetes [web]=web [oci-e2e]=rust
+    [e2e]=rust [web-e2e]=web
+)
 
 # Rust: the workspace, what its build and tests read from outside the crates
 # (web/index.html and docker/forge.docker.toml are compiled in), and the
@@ -109,11 +122,49 @@ workflow_dispatch)
     ;;
 esac
 
-# changed <GROUP>: whether the change touches the group's paths or COMMON.
-# Without a base, or when the diff fails (exit status 128), it does.
+# ci_lines <commit>: ci.yml's lines at the commit but the blank and comment
+# ones, each after the job it belongs to, or `-` outside the jobs.
+ci_lines() {
+    git show "$1:$CI" | awk '
+        /^[ \t]*(#|$)/ { next }
+        /^[^ ]/ { jobs = /^jobs:/; job = "-" }
+        jobs && /^  [^ ]/ { job = $1; sub(/:$/, "", job) }
+        { print job "\t" $0 }'
+}
+
+# ci_jobs: the jobs whose lines the change of ci.yml changes, `-` for the
+# lines outside the jobs. Fails when ci.yml cannot be read.
+ci_jobs() {
+    local old new
+    old=$(ci_lines "$base") && new=$(ci_lines HEAD) || return 1
+    # diff's status 1 means "different", not a failure.
+    { diff <(printf '%s\n' "$old") <(printf '%s\n' "$new") || [ $? = 1 ]; } |
+        awk -F '\t' '/^[<>] / { print substr($1, 3) }' | sort -u
+}
+
+# ci_groups: the groups the change of ci.yml needs, `all` for every group.
+ci_groups=
+ci_changes=
+if [ -n "$base" ] && ! git diff --quiet "$base" HEAD -- "$CI"; then
+    if jobs=$(ci_jobs); then
+        for job in $jobs; do
+            ci_groups+=" ${CI_JOB_GROUP[$job]:-all}"
+            [ "$job" != - ] || job="lines outside the jobs"
+            ci_changes+="${ci_changes:+, }$job"
+        done
+    else
+        ci_changes="cannot be compared"
+        ci_groups=all
+    fi
+fi
+
+# changed <GROUP> <group>: whether the change touches the group's paths,
+# COMMON, or a ci.yml job of the group. Without a base, or when the diff
+# fails (exit status 128), it does.
 changed() {
     local -n paths=$1
     [ -n "$base" ] || return 0
+    case " $ci_groups " in *" all "* | *" $2 "*) return 0 ;; esac
     ! git diff --quiet "$base" HEAD -- "${paths[@]}" "${COMMON[@]}"
 }
 
@@ -122,7 +173,7 @@ changed() {
     echo "|---|---|"
 } >>"$summary"
 for group in "${JOB_GROUPS[@]}"; do
-    if changed "${group^^}"; then run=true; else run=false; fi
+    if changed "${group^^}" "$group"; then run=true; else run=false; fi
     echo "$group=$run" >>"$out"
     echo "| $group | $run |" >>"$summary"
 done
@@ -130,4 +181,7 @@ if [ -z "$base" ]; then
     echo "Every group runs ($reason)." >>"$summary"
 else
     echo "Compared with $(git rev-parse --short "$base" 2>/dev/null || echo "$base")." >>"$summary"
+    if [ -n "$ci_changes" ]; then
+        echo "ci.yml changes: $ci_changes." >>"$summary"
+    fi
 fi

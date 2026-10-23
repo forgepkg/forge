@@ -311,12 +311,8 @@ async fn resolve_upstream_or_map(
     identity: &ProvenIdentity,
 ) -> sqlx::Result<Option<UserPrincipal>> {
     if identity.source == AuthSource::UpstreamBasic && identity.auto_provision {
-        // The account and its initial role are created in one transaction: a
-        // concurrent first login of the same user waits on the insert and so
-        // sees the role, and a failure in between leaves no role-less account.
-        let mut tx = pool.begin().await?;
-        let Some((user, created)) = forge_db::user_dao::provision_upstream_user_tracked(
-            &mut *tx,
+        let Some(user) = forge_db::user_dao::provision_upstream_user(
+            pool,
             &identity.username,
             identity.suggested_is_admin,
             identity.admin_authoritative,
@@ -334,17 +330,6 @@ async fn resolve_upstream_or_map(
             );
             return Ok(None);
         };
-        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, an
-        // auto-provisioned upstream-basic user must inherit the `authenticated`
-        // role immediately so it keeps the slice-1 "read/write everywhere"
-        // behavior — `ensure_legacy_rbac` runs only once per install. Only when
-        // this login created the account (as for OIDC): on every login it
-        // re-added a role an administrator had removed. On a closed install
-        // (flag false) it does nothing.
-        if created {
-            forge_db::authz_dao::assign_authenticated_if_legacy_open_in(&mut tx, user.id).await?;
-        }
-        tx.commit().await?;
         // A provisioned/refreshed user could have been deactivated by an operator
         // between logins; honor that (the upsert does not reactivate).
         if !user.active {
