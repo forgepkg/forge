@@ -26,7 +26,7 @@ use crate::browse::browse_router;
 use crate::config::Config;
 use crate::me::me_router;
 use crate::me_tokens::me_tokens_router;
-use crate::middleware::{attach_principal, PrincipalLayer};
+use crate::middleware::{attach_principal, AnonSource, PrincipalLayer};
 use crate::state::AppState;
 use crate::web_ui::spa_service;
 
@@ -43,8 +43,10 @@ use crate::web_ui::spa_service;
 ///
 /// The Basic source's password path asks [`crate::auth::RealmAuth`] for the
 /// chain on every attempt, so admin realm edits apply without a restart
-/// (and the wire path stays disabled unless `auth.allow_password_basic` or an
-/// enabled credential-forwarding realm allows it). The session source is
+/// (and the wire path stays disabled unless the `allow_password_basic` auth
+/// setting or an enabled credential-forwarding realm allows it). The
+/// anonymous policy comes from the auth settings on every request too
+/// ([`AnonSource::Settings`]). The session source is
 /// always mounted — local password logins mint sessions too — and every
 /// state-changing request it authenticates must carry the session's CSRF
 /// token (enforced by [`attach_principal`]).
@@ -73,7 +75,6 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         )),
     ];
 
-    let anon = state.config.anon_policy().context("anonymous policy")?;
     let trusted = state
         .config
         .trusted_proxy_cidrs()
@@ -81,7 +82,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     Ok(PrincipalLayer {
         sources: Arc::new(sources),
         trusted_proxies: Arc::new(trusted),
-        anon: Arc::new(anon),
+        anon: AnonSource::Settings(state.auth_settings.clone()),
         // Cookie-authenticated mutations must carry the session's CSRF token.
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
@@ -339,7 +340,7 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 /// handled the same way.
 ///
 /// The name is a UPN (config validation): `admin@example.com` by default,
-/// which an install's `admin` from before 1.2 was renamed to, together with
+/// which an install's `admin` from before 2.0 was renamed to, together with
 /// its marker ([`forge_db::user_dao::rename_legacy_usernames`]).
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should
