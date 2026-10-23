@@ -18,11 +18,15 @@ import { routeTree } from '~/routeTree.gen'
 /**
  * Admin users + tokens screens, driven against the **real** route tree + query
  * hooks so the admin guard, routing, and mutations are all exercised:
- *  - the users list renders users with how each signs in, and create-user
- *    POSTs the right body + the list re-fetches (invalidation; roles are
- *    covered by `userRoles.test.tsx`);
- *  - delete-user asks in a dialog, then invalidates the list, and a refused
- *    delete (409 for the last active admin) shows the server's reason;
+ *  - the users list renders users with how each signs in and their status
+ *    (invited, invitation expired, …); the create page (`/manage/users/new`)
+ *    POSTs no password, says when no email service is configured and shows
+ *    an invitation link once (access levels are covered by
+ *    `userRoles.test.tsx`);
+ *  - the user page of an invited account resends, copies (shown once) and
+ *    revokes its invitation;
+ *  - delete-user invalidates the list, and a refused delete (409 for the last
+ *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
  *    revoke (after a dialog) removes the token (list invalidation
  *    reflecting `revoked_at`);
@@ -44,6 +48,8 @@ function user(over: Partial<UserView>): UserView {
     auth_source: 'local',
     captured_password_at: null,
     roles: [],
+    email: null,
+    status: 'active',
     ...over,
   }
 }
@@ -79,6 +85,9 @@ interface ApiHandlers {
   onCreateToken?: (userId: number, body: unknown) => Response
   onRevokeToken?: (id: number) => Response
   onConvertUser?: (id: number) => Response
+  onInvite?: (id: number, body: unknown) => Response
+  onRevokeInvitation?: (id: number) => Response
+  email?: unknown
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -91,6 +100,22 @@ function mockApi(h: ApiHandlers) {
       const path = url.pathname
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+      if (path.endsWith('/admin/settings/email') && method === 'GET') {
+        return Promise.resolve(json(h.email ?? { configured: false }))
+      }
+      const inviteMatch = path.match(/\/admin\/users\/(\d+)\/invitation$/)
+      if (inviteMatch) {
+        const id = Number(inviteMatch[1])
+        if (method === 'POST') {
+          const body = init?.body ? JSON.parse(init.body as string) : {}
+          return Promise.resolve(h.onInvite ? h.onInvite(id, body) : json({}))
+        }
+        if (method === 'DELETE') {
+          return Promise.resolve(
+            h.onRevokeInvitation ? h.onRevokeInvitation(id) : new Response(null, { status: 204 }),
+          )
+        }
+      }
       if (path.endsWith('/admin/realms') && method === 'GET') {
         return Promise.resolve(json(h.realms ?? []))
       }
@@ -186,15 +211,27 @@ describe('admin users', () => {
     mockApi({
       users: [
         user({ id: 2, username: 'alice', is_admin: false, active: true }),
-        user({ id: 3, username: 'bob', is_admin: true, active: false }),
+        user({ id: 3, username: 'bob', is_admin: true, active: false, status: 'inactive' }),
+        user({ id: 4, username: 'carol', status: 'invited' }),
+        user({ id: 5, username: 'dave', status: 'invitation_expired' }),
       ],
     })
 
     await renderAt('/manage/users')
 
     expect(await screen.findByText('alice')).toBeInTheDocument()
-    expect(screen.getByText('bob')).toBeInTheDocument()
-    expect(screen.getByText('inactive')).toBeInTheDocument()
+    const status = (name: string) =>
+      within(screen.getByRole('link', { name }).closest('tr')!).getAllByRole('cell')[4]
+    expect(status('alice')).toHaveTextContent('active')
+    expect(status('bob')).toHaveTextContent('inactive')
+    expect(status('carol')).toHaveTextContent('invited')
+    expect(status('dave')).toHaveTextContent('invitation expired')
+    // Users are created on a page of their own.
+    expect(screen.queryByLabelText('Password')).toBeNull()
+    expect(screen.getByRole('link', { name: 'New user' })).toHaveAttribute(
+      'href',
+      '/manage/users/new',
+    )
   })
 
   it('shows how each user signs in, telling look-alike accounts apart', async () => {
@@ -232,12 +269,15 @@ describe('admin users', () => {
       ],
       onCreateUser: (body) => {
         posted = body
-        return json(user({ id: 2, username: 'dora@example.com', auth_source: 'upstream-basic' }), 201)
+        return json(
+          { ...user({ id: 2, username: 'dora@example.com', auth_source: 'upstream-basic' }), invitation: null },
+          201,
+        )
       },
     })
 
     const u = userEvent.setup()
-    await renderAt('/manage/users')
+    await renderAt('/manage/users/new')
 
     await u.type(await screen.findByLabelText('Username'), 'dora@example.com')
     const signIn = await screen.findByLabelText('Sign-in')
@@ -250,15 +290,19 @@ describe('admin users', () => {
     expect(
       screen.getByText(/gets the part of the username before the @/),
     ).toBeInTheDocument()
+    // No invitation goes to such an account.
+    expect(screen.queryByText(/No email service is configured/)).toBeNull()
     await u.click(screen.getByRole('button', { name: 'Create user' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({
       username: 'dora@example.com',
+      role: 'reader',
       realm: 'nexus',
-      is_admin: false,
-      active: true,
     })
+    expect(
+      await screen.findByText('Created dora@example.com: it signs in with its upstream password.'),
+    ).toBeInTheDocument()
   })
 
   it('create-user asks for a UPN before it POSTs', async () => {
@@ -272,62 +316,175 @@ describe('admin users', () => {
     })
 
     const user_ = userEvent.setup()
-    await renderAt('/manage/users')
+    await renderAt('/manage/users/new')
 
     const username = await screen.findByLabelText('Username')
     expect(username).toHaveAttribute('placeholder', 'alice@example.com')
+    expect(screen.queryByLabelText('Password')).toBeNull()
     await user_.type(username, 'carol')
-    await user_.type(screen.getByLabelText('Password'), 'hunter2')
+    await user_.click(screen.getByLabelText('Email address'))
 
     expect(
       screen.getByText('The username must be a UPN such as alice@example.com.'),
     ).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+    const submit = screen.getByRole('button', { name: 'Create and invite' })
+    expect(submit).toBeDisabled()
 
     await user_.type(username, '@example')
-    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+    expect(submit).toBeDisabled()
     await user_.type(username, '.com')
     expect(
       screen.queryByText('The username must be a UPN such as alice@example.com.'),
     ).toBeNull()
-    expect(screen.getByRole('button', { name: 'Create user' })).toBeEnabled()
+    expect(submit).toBeEnabled()
+    // The address defaults to the username.
+    expect(screen.getByLabelText('Email address')).toHaveAttribute(
+      'placeholder',
+      'carol@example.com',
+    )
     expect(posted).toBe(false)
   })
 
-  it('create-user POSTs the right body and re-fetches the list', async () => {
+  it('invites a new user without an email service, showing the link once', async () => {
     let posted: unknown = null
-    const usersAfter = [user({ id: 2, username: 'carol@example.com' })]
     mockApi({
       users: [],
       onCreateUser: (body) => {
         posted = body
-        // Subsequent GET should reflect the new user.
-        mockApi({ users: usersAfter, onCreateUser: () => json(user(body as UserView), 201) })
-        return json(user({ id: 2, username: (body as UserView).username }), 201)
+        return json(
+          {
+            ...user({ id: 2, username: 'carol@example.com', status: 'invited' }),
+            invitation: {
+              email: 'carol.mail@example.org',
+              expires_at: '2026-10-26T09:00:00Z',
+              email_sent: false,
+              error: 'no email service is configured',
+              link: 'https://forge.example.com/invite#tok-1',
+            },
+          },
+          201,
+        )
       },
     })
 
-    const user_ = userEvent.setup()
-    await renderAt('/manage/users')
+    const u = userEvent.setup()
+    await renderAt('/manage/users/new')
 
-    await user_.type(await screen.findByLabelText('Username'), 'carol@example.com')
-    // A password manager must not offer the admin's own password here.
-    expect(screen.getByLabelText('Password')).toHaveAttribute(
-      'autocomplete',
-      'new-password',
+    expect(await screen.findByText(/No email service is configured, so no invitation/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Set up email' })).toHaveAttribute(
+      'href',
+      '/manage/settings/email',
     )
-    await user_.type(screen.getByLabelText('Password'), 'hunter2')
-    await user_.click(screen.getByRole('button', { name: 'Create user' }))
+    await u.type(screen.getByLabelText('Username'), 'carol@example.com')
+    await u.type(screen.getByLabelText('Email address'), 'carol.mail@example.org')
+    await u.click(screen.getByRole('radio', { name: /^Admin/ }))
+    await u.click(screen.getByRole('button', { name: 'Create and invite' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({
       username: 'carol@example.com',
-      password: 'hunter2',
-      is_admin: false,
-      active: true,
+      email: 'carol.mail@example.org',
+      role: 'admin',
     })
-    // List invalidation re-fetched and shows the new user.
-    expect(await screen.findByText('carol@example.com')).toBeInTheDocument()
+    expect(await screen.findByText('https://forge.example.com/invite#tok-1')).toBeInTheDocument()
+    expect(screen.getByText(/this is the only time it is shown/i)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Go to carol@example.com' })).toHaveAttribute(
+      'href',
+      '/manage/users/2',
+    )
+
+    // Another one: the form again, empty.
+    await u.click(screen.getByRole('button', { name: 'Create another' }))
+    expect(screen.getByLabelText('Username')).toHaveValue('')
+  })
+
+  it('says where the invitation went when it was sent', async () => {
+    mockApi({
+      users: [],
+      email: { configured: true, enabled: true },
+      onCreateUser: (body) =>
+        json(
+          {
+            ...user({ id: 3, username: (body as { username: string }).username, status: 'invited' }),
+            invitation: {
+              email: 'erin@example.com',
+              expires_at: '2026-10-26T09:00:00Z',
+              email_sent: true,
+              error: null,
+              link: null,
+            },
+          },
+          201,
+        ),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/new')
+
+    await u.type(await screen.findByLabelText('Username'), 'erin@example.com')
+    expect(screen.queryByText(/No email service is configured/)).toBeNull()
+    await u.click(screen.getByRole('button', { name: 'Create and invite' }))
+    expect(
+      await screen.findByText(/Created erin@example.com and sent the invitation to erin@example.com/),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/only time it is shown/i)).toBeNull()
+  })
+
+  it("resends, copies and revokes an invited user's invitation", async () => {
+    const invites: unknown[] = []
+    let revoked = 0
+    mockApi({
+      users: [
+        user({
+          id: 9,
+          username: 'frank@example.com',
+          email: 'frank@example.org',
+          status: 'invited',
+          invitation: {
+            email: 'frank@example.org',
+            expires_at: '2026-10-26T09:00:00Z',
+            created_at: '2026-10-23T09:00:00Z',
+            sent_at: '2026-10-23T09:00:01Z',
+          },
+        }),
+      ],
+      onInvite: (_id, body) => {
+        invites.push(body)
+        return (body as { send_email: boolean }).send_email
+          ? json({
+              email: 'frank@example.org',
+              expires_at: '2026-10-27T09:00:00Z',
+              email_sent: true,
+              error: null,
+              link: null,
+            })
+          : json({
+              email: 'frank@example.org',
+              expires_at: '2026-10-27T09:00:00Z',
+              email_sent: false,
+              error: null,
+              link: 'https://forge.example.com/invite#copied',
+            })
+      },
+      onRevokeInvitation: () => {
+        revoked += 1
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/9')
+
+    expect(await screen.findByText(/went to frank@example.org/)).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: 'Resend invitation' }))
+    expect(await screen.findByText(/Sent a new invitation to frank@example.org/)).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: 'Copy invitation link' }))
+    expect(await screen.findByText('https://forge.example.com/invite#copied')).toBeInTheDocument()
+    expect(invites).toEqual([{ send_email: true }, { send_email: false }])
+
+    await u.click(screen.getByRole('button', { name: 'Revoke invitation' }))
+    await waitFor(() => expect(revoked).toBe(1))
+    expect(screen.queryByText('https://forge.example.com/invite#copied')).toBeNull()
   })
 
   it('delete-user confirms then DELETEs and re-fetches', async () => {

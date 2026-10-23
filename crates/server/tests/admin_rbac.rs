@@ -20,21 +20,9 @@ use serde_json::{json, Value};
 
 /// Create a non-admin user, returning `(id, username, password)`.
 async fn make_user(srv: &common::TestServer) -> (i64, String, String) {
-    let (au, ap) = srv.admin_basic();
     let username = format!("rbac{}@example.com", common::unique());
-    let password = "pw12345678".to_string();
-    let created: Value = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": password, "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = created["id"].as_i64().expect("user id");
+    let password = "pw12345678-rbac".to_string();
+    let id = srv.create_user(&username, &password, "reader").await;
     (id, username, password)
 }
 
@@ -959,7 +947,7 @@ async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothin
         ),
         (
             "/admin/users",
-            json!({"username": format!("w{}@example.com", common::unique()), "password": "pw12345678"}),
+            json!({"username": format!("w{}@example.com", common::unique())}),
         ),
         (
             "/admin/roles",
@@ -1348,15 +1336,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
         .unwrap();
     assert_eq!(resp.status(), 201);
     let username = format!("anonuser{s}@example.com");
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw-anon-role"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    let user_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let user_id = srv.create_user(&username, "pw-anon-role-1", "reader").await;
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -1366,7 +1346,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
         .unwrap();
     assert_eq!(resp.status(), 204);
 
-    let session = srv.login(&username, "pw-anon-role").await;
+    let session = srv.login(&username, "pw-anon-role-1").await;
     let index = format!("{}/v3/{repo}/index.json", srv.base_url);
     let resp = session.apply(client.get(&index)).send().await.unwrap();
     assert_eq!(resp.status(), 200, "read through the anonymous role");

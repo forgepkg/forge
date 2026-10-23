@@ -55,6 +55,58 @@ export function referrerKind(artifactType: string | null): string | null {
 }
 
 /**
+ * Tags that name a referrer rather than an image: cosign's tag-based
+ * signatures, attestations and SBOMs (`sha256-<hex>.sig`, `.att`, `.sbom`)
+ * and the OCI referrers tag schema's fallback index (`sha256-<hex>`).
+ */
+const REFERRER_TAG = /^sha(256|512)-[0-9a-f]+(\.[a-z]+)?$/
+
+/** Whether a tag names a referrer (a signature, SBOM, …), not an image. */
+export function isReferrerTag(tag: string): boolean {
+  return REFERRER_TAG.test(tag)
+}
+
+/**
+ * The tag the pull commands start with: `latest`, else the most recently
+ * pushed tag, preferring tags of images (or indexes) over tags of other
+ * artifacts, and those over referrer tags. Tags arrive sorted by name, so
+ * the first one is often a signature (`sha256-….sig` sorts before `v1.2.0`)
+ * or the oldest version.
+ */
+export function defaultPullTag<T extends { tag: string; digest: string }>(
+  tags: T[],
+  manifests: {
+    digest: string
+    media_type: string
+    artifact_type: string | null
+    subject_digest: string | null
+    created_at: string
+  }[],
+): T | undefined {
+  const byDigest = new Map(manifests.map((m) => [m.digest, m]))
+  /** 0: an image or index, 1: another artifact, 2: a referrer tag. */
+  const tier = (t: T) => {
+    if (isReferrerTag(t.tag)) return 2
+    const manifest = byDigest.get(t.digest)
+    return manifest &&
+      (manifest.subject_digest || manifestKind(manifest) === 'Artifact')
+      ? 1
+      : 0
+  }
+  const pushed = (t: T) =>
+    Date.parse(byDigest.get(t.digest)?.created_at ?? '') || 0
+  /** Negative when `a` is the better default; ties keep the name order. */
+  const compare = (a: T, b: T) =>
+    tier(a) - tier(b) ||
+    Number(b.tag === 'latest') - Number(a.tag === 'latest') ||
+    pushed(b) - pushed(a)
+  return tags.reduce<T | undefined>(
+    (best, t) => (best === undefined || compare(t, best) < 0 ? t : best),
+    undefined,
+  )
+}
+
+/**
  * The first 12 hex characters of a digest — Docker's short image id. A
  * non-`sha256` algorithm keeps its prefix (`sha512:0123456789ab`).
  */

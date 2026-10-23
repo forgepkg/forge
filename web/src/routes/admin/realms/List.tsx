@@ -187,7 +187,9 @@ function RealmRow({
 }) {
   const update = useUpdateRealm(realm.id)
   // Disabling a realm people sign in with ends their logins (in the browser,
-  // over NuGet Basic, or both), so it waits for an explicit confirmation.
+  // over NuGet Basic, or both), and disabling a workload-identity realm
+  // revokes the API keys it issued for good, so it waits for an explicit
+  // confirmation.
   const disableWarning = disableRealmWarning(realm.kind, realm.name)
   const [confirmDisable, setConfirmDisable] = useState(false)
 

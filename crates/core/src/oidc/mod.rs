@@ -157,7 +157,8 @@ pub async fn resolve_user(
     }
 
     // 2. No link, but an existing user owns this username → link it, unless
-    //    it is a password account or an admin (never linkable by name).
+    //    it is a password account (or an invited one, whose user is to choose
+    //    a password) or an admin (never linkable by name).
     if policy.link_existing_by_username {
         if let Some(user) = user_dao::find_user_by_username(pool, &mapped.username)
             .await
@@ -172,14 +173,15 @@ pub async fn resolve_user(
             if user.password_hash.is_none()
                 && !is_admin_role
                 && user.auth_source != "upstream-basic"
+                && user.auth_source != "local"
                 && !already_linked
             {
                 return finalize(pool, user, login, &identity_claims, mapped, false).await;
             }
             tracing::warn!(
                 username = %mapped.username,
-                "oidc login not linked by username: target has a password, is an admin, \
-                 is a credential-forwarding account or is already linked to an identity"
+                "oidc login not linked by username: target has a password, is invited, is an \
+                 admin, is a credential-forwarding account or is already linked to an identity"
             );
         }
     }

@@ -11,7 +11,8 @@
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
 //!   duplicate member priorities are rejected, nested groups only when they
 //!   would form a cycle or exceed the depth limit) and package hard-delete.
-//! * [`users`] — user CRUD with argon2id password hashing.
+//! * [`users`] — user CRUD: local accounts are invited to choose their
+//!   password ([`crate::invitations`]), never given one here.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
@@ -230,6 +231,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             axum::routing::patch(users::update).delete(users::delete),
         )
         .route("/users/{id}/reauth", axum::routing::post(users::reauth))
+        .route(
+            "/users/{id}/invitation",
+            axum::routing::post(users::invite).delete(users::revoke_invitation),
+        )
         .route(
             "/users/{id}/convert-to-local",
             axum::routing::post(users::convert_to_local),

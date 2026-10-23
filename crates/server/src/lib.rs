@@ -24,6 +24,7 @@ pub mod dispatch;
 pub mod email;
 pub mod feed;
 pub mod health;
+pub mod invitations;
 pub mod me;
 pub mod me_tokens;
 pub mod middleware;

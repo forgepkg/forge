@@ -277,11 +277,10 @@ only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for
 the first start, and `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
 [UPN](#usernames) of your organization if `admin@example.com` will not do: the
 account is created **once**. Startup refuses a name that is no UPN. Sign in
-to the web UI,
-create personal admin accounts (or connect OIDC), then delete the bootstrap
-account. It is not re-created on later restarts. Then remove the password from
-the environment: with no bootstrap password configured, Forge simply starts
-without a bootstrap admin.
+to the web UI, invite personal admin accounts ([below](#inviting-users)) or
+connect OIDC, then delete the bootstrap account. It is not re-created on later
+restarts. Then remove the password from the environment: with no bootstrap
+password configured, Forge simply starts without a bootstrap admin.
 
 Forge never lets the last active administrator go: deleting or deactivating
 that account, or removing its `admin` role, is refused with `409 Conflict`.
@@ -317,6 +316,49 @@ Migration 0042 adds `writer`. An install that already had a custom role named
 `writer` keeps it as `writer#<id>`, with its grants and members, and a
 workload-identity rule that named it names `writer#<id>` too; the migration
 logs a warning for each.
+
+### Inviting users
+
+An administrator never sets another person's password. **Admin → Users →
+New user** (`/manage/users/new`) takes the [username](#usernames), the email
+address the invitation goes to (the username unless entered: a UPN is not
+always a mailbox) and the access level (reader, writer or admin). Forge
+creates the account without a password and emails its user a link,
+`<server.public_base_url>/invite#<token>`, with which they choose their own
+password, at least 12 characters, and then sign in.
+
+- **The link** works once, until the lifetime set on the
+  [email](#email) settings page (72 hours unless changed). The token is in the
+  URL fragment, which reaches no server or proxy log and no `Referer`; Forge
+  stores only its SHA-256 and never logs it. An unknown, used, expired,
+  replaced or revoked link gets one answer, which names no account. Failed
+  attempts are throttled per client network with the login lockout's budget
+  (`login_max_failures` per `login_failure_window_seconds`, among the
+  [access and sign-in settings](#access-and-sign-in-settings)).
+- **Until the user has chosen the password**, the account signs in by no
+  path: the login and HTTP Basic refuse every password, nothing is forwarded
+  to a credential-forwarding realm, and an OIDC login does not link to it by
+  name. **Admin → Users** shows it as *invited*, or *invitation expired* once
+  its link no longer works.
+- **The user's page** offers **Resend invitation** (a new email, to another
+  address if needed), **Copy invitation link** (a new link shown once, for an
+  install without email or a mailbox that does not receive it) and **Revoke
+  invitation**. A new link replaces the previous one, which stops working.
+  Deactivating or deleting the account revokes its invitation.
+- **Without an email service**, or when the send fails, the account is still
+  created and the link is shown once on the page to pass on yourself.
+- Accounts of a credential-forwarding realm (see [Usernames](#usernames)) and
+  OIDC accounts are not invited: they sign in through their realm. The
+  bootstrap admin keeps its configured password.
+
+The admin API is `POST /admin/users` with `{"username", "email", "role"}`
+(`role` is `reader`, `writer` or `admin`), or `"realm"` for a
+credential-forwarding account. It takes no password: the answer carries
+`invitation` (`email_sent`, `error`, `expires_at`, and the `link` when no
+email went out). `POST /admin/users/{id}/invitation` (`{"send_email": true |
+false, "email": "…"}`) makes a new invitation and `DELETE` revokes it. The
+invited user's page calls `POST /auth/invitations/lookup` and
+`POST /auth/invitations/accept` (`{"token", "password"}`).
 
 ### Usernames
 

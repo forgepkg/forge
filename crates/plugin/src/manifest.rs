@@ -54,7 +54,8 @@ const RESERVED_IDS: &[&str] = &[
 pub const DEFAULT_MOUNT: &str = "/repository";
 
 /// Mounts a plugin can never take: the server's own routes, the web UI's
-/// pages and the Docker registry.
+/// pages (the first segment of every route in `web/src/routes.ts`) and the
+/// Docker registry.
 const RESERVED_MOUNTS: &[&str] = &[
     "admin",
     "api",
@@ -62,6 +63,8 @@ const RESERVED_MOUNTS: &[&str] = &[
     "auth",
     "browse",
     "healthz",
+    "images",
+    "invite",
     "login",
     "manage",
     "packages",
@@ -411,7 +414,7 @@ mod tests {
         assert_eq!(m.assets.manifest_type, "application/yaml");
 
         for mount in [
-            "charts", "/", "/c", "/Charts", "/a/b", "/admin", "/v2", "/manage",
+            "charts", "/", "/c", "/Charts", "/a/b", "/admin", "/v2", "/manage", "/images",
         ] {
             assert!(
                 with(&format!("mount = {mount:?}"), "").is_err(),
@@ -440,6 +443,28 @@ mod tests {
             assert!(
                 with("", &format!("[assets]\n{assets}\n")).is_err(),
                 "{assets} accepted"
+            );
+        }
+    }
+
+    /// Every top-level page of the web UI is reserved, so a plugin cannot
+    /// take a page's deep links from the SPA fallback.
+    #[test]
+    fn reserves_the_web_uis_pages() {
+        let tree = include_str!("../../../web/src/routeTree.gen.ts");
+        let mut pages: Vec<&str> = tree
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("fullPath: '/"))
+            .filter_map(|path| path.split(['/', '\'']).next())
+            .filter(|page| !page.is_empty())
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        assert!(pages.contains(&"images"), "no pages read: {pages:?}");
+        for page in pages {
+            assert!(
+                RESERVED_MOUNTS.contains(&page),
+                "the web UI's page /{page} is not in RESERVED_MOUNTS"
             );
         }
     }

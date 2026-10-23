@@ -62,6 +62,8 @@ export function user(over: Partial<UserView>): UserView {
     auth_source: 'local',
     captured_password_at: null,
     roles: [],
+    email: null,
+    status: 'active',
     ...over,
   }
 }
@@ -282,14 +284,17 @@ export class FakeRbacApi {
       const u = {
         id: this.nextId++,
         username: body.username,
-        is_admin: body.is_admin,
-        active: body.active,
+        is_admin: body.role === 'admin',
+        active: true,
         auth_source: 'local',
         captured_password_at: null,
+        email: body.email ?? body.username,
+        status: 'invited' as const,
       }
       s.users.push(u)
       if (u.is_admin) s.assignments.push([u.id, this.roleNamed('admin')!.id])
-      return json(this.userView(u), 201)
+      if (body.role === 'writer') s.assignments.push([u.id, this.roleNamed('writer')!.id])
+      return json({ ...this.userView(u), invitation: null }, 201)
     }
     if ((m = path.match(/^\/admin\/users\/(\d+)\/roles$/))) {
       const uid = Number(m[1])
