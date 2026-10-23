@@ -36,6 +36,50 @@ export interface SmtpTransportView extends Omit<SmtpTransport, 'password'> {
   password_set: boolean
 }
 
+/**
+ * How Forge signs in as the Graph app registration: a client secret, or a
+ * client assertion it signs with its own issuer keys (a federated identity
+ * credential on the app; no secret is stored).
+ */
+export type GraphClientAuth = 'client_secret' | 'federated_credential'
+
+/** Microsoft Graph `sendMail` as an Entra app registration, as `PUT` takes it. */
+export interface GraphTransport {
+  kind: 'microsoft_graph'
+  /** The tenant id, or one of its domains (`contoso.onmicrosoft.com`). */
+  tenant_id: string
+  /** The app registration's application (client) id. */
+  client_id: string
+  /** The mailbox to send as (UPN or object id); absent: the `From` address. */
+  sender?: string
+  /** Absent: `client_secret`. */
+  client_authentication?: GraphClientAuth
+  /** SECRET — write-only; omit to keep the stored one (same tenant and app). */
+  client_secret?: string
+}
+
+/** Microsoft Graph, as `GET` returns it. */
+export interface GraphTransportView extends Omit<GraphTransport, 'client_secret'> {
+  client_secret_set: boolean
+}
+
+/** The transport, by `kind`. */
+export type EmailTransport = SmtpTransport | GraphTransport
+
+/** The transport, by `kind`, as `GET` returns it. */
+export type EmailTransportView = SmtpTransportView | GraphTransportView
+
+/**
+ * What the Graph app's federated identity credential must name (derived by
+ * the server): only for `federated_credential` authentication.
+ */
+export interface FederatedCredential {
+  /** Forge's issuer URL (its public base URL). */
+  issuer: string
+  subject: string
+  audience: string
+}
+
 /** `PUT /admin/settings/email` body. */
 export interface EmailSettingsInput {
   /** `false` keeps the settings but sends nothing. */
@@ -45,7 +89,7 @@ export interface EmailSettingsInput {
   reply_to?: string
   /** How long an invitation link stays valid (1 to 720 hours). */
   invitation_ttl_hours: number
-  transport: SmtpTransport
+  transport: EmailTransport
 }
 
 /** The outcome of the last send that failed. */
@@ -62,7 +106,9 @@ export interface EmailSettingsView {
   from_name?: string
   reply_to?: string
   invitation_ttl_hours: number
-  transport: SmtpTransportView
+  transport: EmailTransportView
+  /** Only for a Graph app with `federated_credential` authentication. */
+  federated_credential?: FederatedCredential
   /** The stored secrets do not decrypt (a lost root key): enter them again. */
   secrets_unreadable: boolean
   last_failure: EmailFailure | null

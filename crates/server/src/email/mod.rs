@@ -15,6 +15,7 @@
 //! outcome; never the message, its links or tokens, or a secret. The outcome
 //! is also kept on the settings row for the settings page.
 
+mod graph;
 pub mod settings;
 mod smtp;
 pub mod templates;
@@ -29,9 +30,14 @@ use lettre::message::{Mailbox, MultiPart};
 use lettre::{Address, Message};
 use sqlx::PgPool;
 
-pub use settings::{EmailConfig, InvalidSettings, SmtpConfig, SmtpTls, TransportConfig};
+pub use graph::MicrosoftEndpoints;
+pub use settings::{
+    EmailConfig, FederatedCredential, GraphClientAuth, GraphConfig, InvalidSettings, SmtpConfig,
+    SmtpTls, TransportConfig,
+};
 pub use templates::Content;
 
+use crate::auth::AssertionIssuer;
 use crate::config::Config;
 
 /// How long one send may take in all.
@@ -111,24 +117,44 @@ pub struct Mailer {
     public_base_url: String,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Snapshot>>,
+    graph: graph::GraphTransport,
 }
 
 impl Mailer {
     /// A sender over the settings in `pool`, opening their secrets with
-    /// `envelope`.
-    pub fn new(pool: PgPool, envelope: Option<Arc<EnvelopeService>>, config: &Config) -> Self {
+    /// `envelope`; a federated Graph app signs its client assertions with
+    /// `issuer`.
+    pub fn new(
+        pool: PgPool,
+        envelope: Option<Arc<EnvelopeService>>,
+        issuer: AssertionIssuer,
+        config: &Config,
+    ) -> Self {
         Mailer {
             pool,
             envelope,
             public_base_url: config.public_base_url(),
             ttl: Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1)),
             snapshot: tokio::sync::RwLock::new(None),
+            graph: graph::GraphTransport::new(issuer),
         }
     }
 
     /// `server.public_base_url`, which links in messages start with.
     pub fn public_base_url(&self) -> &str {
         &self.public_base_url
+    }
+
+    /// Forge's issuer URL, which a federated Graph app's credential names.
+    pub fn forge_issuer(&self) -> &str {
+        self.graph.issuer()
+    }
+
+    /// Send Graph mail through `endpoints` instead of Microsoft's: for tests
+    /// against mock servers. There is no setting for it.
+    #[doc(hidden)]
+    pub fn use_microsoft_endpoints(&self, endpoints: MicrosoftEndpoints) {
+        self.graph.set_endpoints(endpoints);
     }
 
     /// Drop the snapshot (after an admin write), so the next send reads the
@@ -212,18 +238,16 @@ impl Mailer {
             .parse()
             .map_err(|_| SendError::BadRecipient(to.to_string()))?;
         let domain = recipient.domain().to_string();
-        let result = match build_message(config, Mailbox::new(None, recipient), content) {
-            Ok(message) => {
-                match tokio::time::timeout(SEND_TIMEOUT, transmit(config, message)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(format!(
-                        "the send did not finish within {} seconds",
-                        SEND_TIMEOUT.as_secs()
-                    )),
-                }
-            }
-            Err(e) => Err(e),
-        };
+        let result =
+            match tokio::time::timeout(SEND_TIMEOUT, self.transmit(config, recipient, content))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "the send did not finish within {} seconds",
+                    SEND_TIMEOUT.as_secs()
+                )),
+            };
         match result {
             Ok(()) => {
                 tracing::info!(
@@ -254,6 +278,24 @@ impl Mailer {
             }
         }
     }
+
+    /// Hand the message to the configured transport.
+    async fn transmit(
+        &self,
+        config: &EmailConfig,
+        to: Address,
+        content: Content,
+    ) -> Result<(), String> {
+        match &config.transport {
+            TransportConfig::Smtp(smtp_config) => {
+                let message = build_message(config, Mailbox::new(None, to), content)?;
+                smtp::send(smtp_config, message).await
+            }
+            TransportConfig::MicrosoftGraph(graph_config) => {
+                self.graph.send(config, graph_config, &to, content).await
+            }
+        }
+    }
 }
 
 /// The message: `From`, optional `Reply-To`, `To`, the subject, and the text
@@ -272,11 +314,4 @@ fn build_message(config: &EmailConfig, to: Mailbox, content: Content) -> Result<
             content.html,
         ))
         .map_err(|e| format!("the message could not be built: {e}"))
-}
-
-/// Hand `message` to the configured transport.
-async fn transmit(config: &EmailConfig, message: Message) -> Result<(), String> {
-    match &config.transport {
-        TransportConfig::Smtp(smtp_config) => smtp::send(smtp_config, message).await,
-    }
 }

@@ -418,10 +418,14 @@ email.
   server offers; without a username Forge sends without signing in. IMAP is
   not used: a mail server whose IMAP takes an app password (Stalwart, for
   example) takes it on SMTP submission too.
-- **The password** is write-only: the page and `GET /admin/settings/email`
-  say only whether one is set. Saving without it keeps the stored one,
-  unless the host or the username changed. With [secret
-  encryption](#secret-encryption-at-rest) on it is sealed at rest.
+- **Microsoft 365 (Graph).** Forge signs in as an Entra app registration and
+  sends with Microsoft Graph, as the sender mailbox; see
+  [Microsoft 365](#microsoft-365) below.
+- **Secrets** (the SMTP password, the Graph client secret) are write-only:
+  the page and `GET /admin/settings/email` say only whether one is set.
+  Saving without it keeps the stored one, unless the SMTP host or username,
+  or the Graph tenant or app, changed. With [secret
+  encryption](#secret-encryption-at-rest) on they are sealed at rest.
 - **Send test email** sends a message with the stored settings, to the
   address you enter or to your own (your UPN), even while sending is turned
   off, and shows the server's error when it fails. The page also shows the
@@ -434,11 +438,68 @@ outcome; message bodies, links and secrets never are. The admin API is
 `GET`, `PUT` and `DELETE /admin/settings/email` and
 `POST /admin/settings/email/test` (`{"to": "..."}`, optional).
 
+### Microsoft 365
+
+For Exchange Online, send through Microsoft Graph rather than SMTP: SMTP
+AUTH is off under security defaults, Microsoft recommends turning it off
+tenant-wide, and its Basic authentication is being retired. Forge signs in
+with the OAuth client credentials grant as an app registration and calls
+`sendMail` for the sender mailbox, without saving the message to its Sent
+Items; no mailbox password is involved.
+
+1. **Register the app.** In the Entra admin center, **App registrations →
+   New registration**, single tenant. Note the **Application (client) ID**
+   and the **Directory (tenant) ID**.
+2. **Let it send as the sender mailbox only**, with **RBAC for
+   Applications** in Exchange Online:
+
+   ```powershell
+   Connect-ExchangeOnline
+   New-ServicePrincipal -AppId <client id> -ObjectId <enterprise app object id> -DisplayName "Forge"
+   New-ManagementScope -Name "Forge sender" -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'forge@contoso.com'"
+   New-ManagementRoleAssignment -App <client id> -Role "Application Mail.Send" -CustomResourceScope "Forge sender"
+   Test-ServicePrincipalAuthorization -Identity <client id> -Resource forge@contoso.com
+   ```
+
+   The object id is the enterprise application's (**Enterprise
+   applications → Forge → Object ID**), not the app registration's.
+3. **Do not consent `Mail.Send` in Entra.** The Microsoft Graph `Mail.Send`
+   application permission with admin consent works too, but lets the app
+   send as every mailbox in the tenant, and Exchange adds it to the scoped
+   role: with both, the scope narrows nothing. (Application Access Policies,
+   `New-ApplicationAccessPolicy`, are the legacy way to narrow an Entra
+   consent.)
+4. **Give Forge a credential**, one of:
+   - **A federated credential** (no secret to store or rotate). Choose
+     *A federated credential* on the page and save: Forge then shows the
+     issuer (its `server.public_base_url`), the subject and the audience.
+     On the app, **Certificates & secrets → Federated credentials → Add
+     credential → Other issuer**, and enter them. Forge signs its client
+     assertions with the issuer keys a federated OIDC realm uses, published
+     at `/.well-known/openid-configuration` and rotated automatically;
+     Entra must reach that URL over https. The subject is the one a
+     federated OIDC realm of the same app and tenant presents, so one
+     credential covers both.
+   - **A client secret**: **Certificates & secrets → New client secret**,
+     and enter its value on the page. Renew it before it expires.
+5. **Enter the tenant, the client id and the sender** (its UPN or object
+   id; blank sends as the `From` address) on **Admin → Email**, and **Send
+   test email**.
+
+A failed send shows Entra's or Graph's error: `invalid_client` with an
+`AADSTS…` description names a wrong secret or credential;
+`ErrorAccessDenied` means the sender mailbox is outside the app's
+`Application Mail.Send` scope (`Test-ServicePrincipalAuthorization` shows
+it); a 401 from Graph usually means the sender has no
+Exchange Online mailbox or licence. Each instance caches its access token
+until shortly before it expires. National clouds and certificate
+credentials are not supported yet.
+
 ## Secret encryption at rest
 
 Upstream proxy passwords, authentication-realm secrets (OIDC client
-secrets, credential-forwarding peppers), the email service's password
-([Email](#email)), the generated registry-token key
+secrets, credential-forwarding peppers), the email service's password or
+client secret ([Email](#email)), the generated registry-token key
 (without `docker.token_secret`) and the keys Forge signs its OIDC client
 assertions with (a realm with a federated credential) are stored with
 double-envelope encryption:
@@ -472,7 +533,8 @@ refuses to start while the database holds encrypted secrets.
 Each encrypted secret is bound to its row and to where it is sent: a proxy
 password to the origin (scheme, host and port) of the repository's
 `remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`,
-the email password to the SMTP host and username.
+the email password to the SMTP host and username, the Graph client secret to
+the tenant and app.
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to

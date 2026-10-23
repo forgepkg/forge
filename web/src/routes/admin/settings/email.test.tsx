@@ -6,7 +6,7 @@ import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { EmailSettings, EmailSettingsView } from '~/api/email'
 import { renderApp } from '~/test/renderApp'
-import { seedEmailFormValues, toEmailSettingsInput } from './Email'
+import { graphFederatedSubject, seedEmailFormValues, toEmailSettingsInput } from './Email'
 
 /**
  * **Admin → Email** (`/manage/settings/email`), against the real route tree:
@@ -15,7 +15,9 @@ import { seedEmailFormValues, toEmailSettingsInput } from './Email'
  *    is left out of the PUT (the server keeps the stored one), and the page
  *    shows the last failed send;
  *  - a test send shows the recipient, and a failed one the server's error;
- *  - removing the settings asks first, then DELETEs them.
+ *  - removing the settings asks first, then DELETEs them;
+ *  - a Microsoft Graph app: its fields, the federated credential's values to
+ *    register, and no secret sent for a federated app.
  */
 
 const adminMe: Me = {
@@ -132,6 +134,43 @@ describe('email settings form values', () => {
   })
 })
 
+const graphStored: EmailSettingsView = {
+  ...stored,
+  last_failure: null,
+  transport: {
+    kind: 'microsoft_graph',
+    tenant_id: 'contoso.onmicrosoft.com',
+    client_id: 'app-id',
+    client_authentication: 'federated_credential',
+    client_secret_set: false,
+  },
+  federated_credential: {
+    issuer: 'https://forge.example.com',
+    subject: 'app-id@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0',
+    audience: 'api://AzureADTokenExchange',
+  },
+}
+
+describe('graph form values', () => {
+  it('round-trips a federated app and sends no secret', () => {
+    const values = { ...seedEmailFormValues(graphStored), client_secret: 'typed before' }
+    expect(toEmailSettingsInput(values).transport).toEqual({
+      kind: 'microsoft_graph',
+      tenant_id: 'contoso.onmicrosoft.com',
+      client_id: 'app-id',
+      sender: undefined,
+      client_authentication: 'federated_credential',
+      client_secret: undefined,
+    })
+  })
+
+  it('derives the subject as the server does', () => {
+    expect(graphFederatedSubject(' contoso.onmicrosoft.com ', ' app-id ')).toBe(
+      'app-id@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0',
+    )
+  })
+})
+
 describe('admin email settings screen', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
@@ -245,5 +284,42 @@ describe('admin email settings screen', () => {
     expect(calls('DELETE', '/admin/settings/email')).toHaveLength(0)
     await user.click(screen.getByRole('button', { name: 'Remove the email settings' }))
     await waitFor(() => expect(calls('DELETE', '/admin/settings/email')).toHaveLength(1))
+  })
+
+  it('configures a Graph app with a secret, then shows a federated one', async () => {
+    const user = userEvent.setup()
+    const puts: Record<string, unknown>[] = []
+    mockApi({
+      settings: { configured: false },
+      onPut: (body) => {
+        puts.push(body as Record<string, unknown>)
+        return json(graphStored)
+      },
+    })
+    await renderApp('/manage/settings/email')
+
+    await user.type(await screen.findByLabelText('From address'), 'forge@contoso.com')
+    await user.selectOptions(screen.getByLabelText('Send through'), 'microsoft_graph')
+    expect(screen.queryByLabelText('Host')).toBeNull()
+    await user.type(screen.getByLabelText('Tenant'), 'contoso.onmicrosoft.com')
+    await user.type(screen.getByLabelText('Application (client) id'), 'app-id')
+    await user.type(screen.getByLabelText(/^Client secret/), 's3cret')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0].transport).toEqual({
+      kind: 'microsoft_graph',
+      tenant_id: 'contoso.onmicrosoft.com',
+      client_id: 'app-id',
+      client_authentication: 'client_secret',
+      client_secret: 's3cret',
+    })
+
+    // The stored federated app: the values to register on it.
+    expect(await screen.findByText('https://forge.example.com')).toBeInTheDocument()
+    expect(
+      screen.getByText('app-id@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0'),
+    ).toBeInTheDocument()
+    expect(screen.getByText('api://AzureADTokenExchange')).toBeInTheDocument()
+    expect(screen.queryByLabelText(/^Client secret/)).toBeNull()
   })
 })
