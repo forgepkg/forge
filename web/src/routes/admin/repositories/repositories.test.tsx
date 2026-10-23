@@ -13,6 +13,7 @@ import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { MemberView, RepoView } from '~/api/repositories'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Admin repositories screens, driven against the **real** route tree + query
@@ -165,6 +166,7 @@ async function renderAt(initialPath: string) {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [initialPath] }),
   })

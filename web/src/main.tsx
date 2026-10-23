@@ -6,6 +6,7 @@ import { createRouter, RouterProvider } from '@tanstack/react-router'
 import { makeQueryClient } from '~/lib/queryClient'
 import { installChunkReloadHandler } from '~/lib/chunkReload'
 import { initTheme } from '~/lib/theme'
+import { searchOptions } from '~/lib/search'
 import { RouteError } from '~/components/RouteError'
 import { routeTree } from './routeTree.gen'
 import '@fontsource-variable/ibm-plex-sans/wght.css'
@@ -30,6 +31,8 @@ const router = createRouter({
   defaultErrorComponent: RouteError,
   // SPA mode: there is no SSR; the router renders fully on the client.
   scrollRestoration: true,
+  // Query values stay strings: `?tag=1.10` is the tag `1.10`, not 1.1 (#403).
+  ...searchOptions,
 })
 
 declare module '@tanstack/react-router' {

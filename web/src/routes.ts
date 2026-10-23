@@ -48,6 +48,10 @@ export const routes = rootRoute('root.tsx', [
         'admin/repositories/GroupMembers.tsx',
       ),
       route('/repositories/$repo/import', 'admin/repositories/Import.tsx'),
+      route(
+        '/repositories/$repo/retention',
+        'admin/repositories/Retention.tsx',
+      ),
       route('/users', 'admin/users/List.tsx'),
       route('/users/new', 'admin/users/Create.tsx'),
       route('/users/$userId', 'admin/users/Edit.tsx'),
