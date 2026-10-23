@@ -162,6 +162,18 @@ impl Authz {
         }
     }
 
+    /// May `principal` write (publish) to **every** repository, ones created
+    /// later included, with no package scope? True for the `admin` role and
+    /// for an unscoped `write` grant on ANY repository, such as the built-in
+    /// `writer` role's; a token scope narrows it like every other check.
+    /// Fail-closed.
+    pub async fn can_write_every_repository(&self, principal: &Principal) -> bool {
+        match self.effective(principal).await {
+            Ok(eff) => eff.allows_every_repo(Action::Write),
+            Err(()) => false,
+        }
+    }
+
     /// The package-visibility predicate for `principal` reading `repo`.
     ///
     /// Used when listing/serving packages and **re-applied on direct download**

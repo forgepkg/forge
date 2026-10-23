@@ -131,6 +131,49 @@ async fn me_reflects_the_admin_role() {
         .contains(&json!("user.admin")));
 }
 
+/// #318: a holder of the built-in `writer` role may publish to every
+/// repository, which `/admin/me` reports as `repo.write` (no admin
+/// capability), so the SPA can show push instructions.
+#[tokio::test]
+async fn me_shows_repo_write_to_a_writer() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("writer{}@example.com", common::unique());
+
+    let created: Value = client
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"username": username, "password": "pw123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_i64().expect("user id");
+    let resp = client
+        .put(format!("{}/admin/users/{id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "writer"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "assign writer role");
+
+    let body: Value = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some("pw123456"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_admin"], json!(false));
+    assert_eq!(body["capabilities"], json!(["repo.read", "repo.write"]));
+}
+
 /// An unauthenticated caller (no credentials, anon mode off) gets 401.
 #[tokio::test]
 async fn me_unauthenticated_is_401() {

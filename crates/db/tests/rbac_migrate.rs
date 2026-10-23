@@ -280,3 +280,163 @@ async fn fresh_install_fails_closed() {
         "a roleless user on a fresh install has no privileges (fail-closed)"
     );
 }
+
+/// `0042_writer_role.sql` carries version 42.
+const WRITER_ROLE_VERSION: i64 = 42;
+
+/// The `(action, ANY repository)` grants of the role named `name`, sorted.
+async fn any_repo_grants(pool: &PgPool, name: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT rp.action FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = $1 AND rp.repository_id IS NULL AND rp.selector_id IS NULL \
+         ORDER BY rp.action",
+    )
+    .bind(name)
+    .fetch_all(pool)
+    .await
+    .expect("read grants")
+}
+
+/// #318: every install gets the built-in `writer` role, with read and write on
+/// every repository and nothing else.
+#[tokio::test]
+async fn writer_role_is_seeded_built_in() {
+    let (pool, _container) = fresh_pool().await;
+    migrator().await.run(&pool).await.expect("migrate all");
+
+    let (builtin, description): (bool, String) =
+        sqlx::query_as("SELECT builtin, description FROM role WHERE name = $1")
+            .bind(authz_dao::WRITER_ROLE)
+            .fetch_one(&pool)
+            .await
+            .expect("the writer role exists");
+    assert!(builtin);
+    assert_eq!(
+        description,
+        "Read and publish packages on every repository; no administration."
+    );
+    assert_eq!(
+        any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
+        vec!["read".to_string(), "write".to_string()]
+    );
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = $1",
+    )
+    .bind(authz_dao::WRITER_ROLE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, 2, "no delete, no admin");
+}
+
+/// #318: a custom role an install already named `writer` is renamed
+/// `writer#<id>`, keeping its grants and assignments, and a workload-identity
+/// rule that named it follows the rename instead of handing out the new
+/// built-in role.
+#[tokio::test]
+async fn an_existing_writer_role_is_renamed() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(WRITER_ROLE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0039");
+
+    let custom: i64 = sqlx::query_scalar(
+        "INSERT INTO role (name, description) VALUES ('writer', 'ours') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let repo: i64 = sqlx::query_scalar(
+        "INSERT INTO repository (name, format, kind) VALUES ('ci', 'nuget', 'hosted') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO repository_privilege (role_id, repository_id, action) VALUES ($1, $2, 'read')",
+    )
+    .bind(custom)
+    .bind(repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('w@example.com', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    authz_dao::assign_role(&pool, user, custom).await.unwrap();
+    let rules = serde_json::json!([
+        {"role": "ci"},
+        {"role": "writer", "conditions": [{"claim": "repository", "any_of": ["g/p"]}]},
+    ]);
+    let realm: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, enabled, priority, config) \
+         VALUES ('workload_identity', 'ci-wif', true, 500, \
+                 jsonb_build_object('issuer', 'https://ci.example', 'rules', $1::jsonb)) \
+         RETURNING id",
+    )
+    .bind(&rules)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    migrator().await.run(&pool).await.expect("migrate 0042");
+
+    let renamed = format!("writer#{custom}");
+    let name: String = sqlx::query_scalar("SELECT name FROM role WHERE id = $1")
+        .bind(custom)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, renamed);
+    let roles: Vec<String> = authz_dao::list_roles_for_user(&pool, user)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(roles, vec![renamed.clone()], "the assignment stays with it");
+    let kept: Vec<(Option<i64>, String)> =
+        sqlx::query_as("SELECT repository_id, action FROM repository_privilege WHERE role_id = $1")
+            .bind(custom)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        kept,
+        vec![(Some(repo), "read".to_string())],
+        "and its grants"
+    );
+
+    // The built-in role takes the name.
+    assert_eq!(
+        any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
+        vec!["read".to_string(), "write".to_string()]
+    );
+    assert_ne!(
+        authz_dao::role_id_by_name(&pool, authz_dao::WRITER_ROLE)
+            .await
+            .unwrap(),
+        Some(custom)
+    );
+
+    let config: serde_json::Value =
+        sqlx::query_scalar("SELECT config FROM auth_realm WHERE id = $1")
+            .bind(realm)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        config["rules"],
+        serde_json::json!([
+            {"role": "ci"},
+            {"role": renamed, "conditions": [{"claim": "repository", "any_of": ["g/p"]}]},
+        ])
+    );
+    assert_eq!(config["issuer"], "https://ci.example");
+}

@@ -539,6 +539,60 @@ async fn tokens_grant_only_what_rbac_allows() {
     assert_eq!(resp.status(), 401);
 }
 
+/// #318: a holder of the built-in `writer` role pushes a new image to any
+/// hosted docker repository (one created after the role was assigned too)
+/// and pulls it, but deletes no tag or manifest: its registry tokens carry
+/// `pull,push` and never `delete`.
+#[tokio::test]
+async fn a_writer_pushes_new_images_but_deletes_nothing() {
+    let srv = common::start().await;
+    let (user, secret, user_id) = user_with_token(&srv).await;
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/users/{user_id}/roles"),
+        json!({"role": "writer"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 204);
+    let repo = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let writer = Oci::new(&srv, Some((user, secret)));
+    let name = format!("{repo}/team/new-app");
+
+    let digest = writer
+        .push_image(&name, "1.0", "amd64", b"writer layer")
+        .await;
+    let resp = writer.get(&name, "manifests/1.0").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["docker-content-digest"], digest.as_str());
+
+    let jwt = writer
+        .token(&[format!("repository:{name}:pull,push,delete")])
+        .await;
+    let claims: Value = {
+        use base64::Engine;
+        let payload = jwt.split('.').nth(1).unwrap();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(claims["access"][0]["actions"], json!(["pull", "push"]));
+    for reference in ["1.0", digest.as_str()] {
+        let resp = writer
+            .delete(&name, &format!("manifests/{reference}"))
+            .await;
+        assert_eq!(resp.status(), 403, "{reference}");
+    }
+    assert_eq!(writer.get(&name, "manifests/1.0").await.status(), 200);
+}
+
 // ── Hosted repositories ─────────────────────────────────────────────────────
 
 #[tokio::test]

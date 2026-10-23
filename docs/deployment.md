@@ -291,6 +291,36 @@ that account, or removing its `admin` role, is refused with `409 Conflict`.
 So the replacement admin has to exist first; an OIDC or credential-forwarding
 admin counts once they have signed in.
 
+### Built-in roles
+
+What a user may do follows from the roles they hold (**Admin → Roles**,
+`/admin/roles`). Every install has four built-in roles, which cannot be
+deleted or renamed:
+
+| Role | Grants | For |
+| --- | --- | --- |
+| `admin` | Everything: every repository, and administering the instance (repositories, users, roles, authentication, settings). | Administrators. |
+| `writer` | `read` and `write` on every repository, ones created later included. No `delete`, no `admin`. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `authenticated` | `read` and `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
+| `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). | Anonymous access. |
+
+A user who holds neither `admin` nor `writer` is a **reader**: they read what
+their other roles and anonymous access allow. **Admin → Users** shows each
+user's level (admin, writer or reader), and the user's page switches it.
+
+A writer cannot unlist or delete package versions, delete image tags, or
+delete or replace raw files:
+deleting stays with administrators and custom roles that grant `delete`, so a
+leaked CI token cannot remove published versions. Nor can a writer reach the
+admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
+`repo.write` capability). A writer mints their own API tokens on the
+**Tokens** page; a token never carries more than its owner's rights.
+
+Migration 0042 adds `writer`. An install that already had a custom role named
+`writer` keeps it as `writer#<id>`, with its grants and members, and a
+workload-identity rule that named it names `writer#<id>` too; the migration
+logs a warning for each.
+
 ### Usernames
 
 Every account is named by a UPN, `local-part@domain` (`alice@example.com`):
