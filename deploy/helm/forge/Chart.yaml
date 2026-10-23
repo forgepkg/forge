@@ -21,7 +21,7 @@ keywords:
   - registry
   - package-registry
 annotations:
-  artifacthub.io/license: AGPL-3.0-only OR LicenseRef-envisia
+  artifacthub.io/license: MIT
   # The digest of the appVersion image. Empty here; the release workflow sets
   # it to the digest it signed before it publishes the chart
   # (oci://ghcr.io/forgepkg/charts/forge), so the published chart always pulls

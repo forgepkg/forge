@@ -216,17 +216,9 @@ Run `cargo xtask help` for the complete command list.
 
 ## License
 
-Forge is dual-licensed. You may use, modify and distribute it under
-either of:
-
-- the **GNU Affero General Public License, version 3** — see
-  [LICENSE](./LICENSE) (SPDX `AGPL-3.0-only`); or
-- the **envisia license**, a separate agreement with envisia for use on terms
-  other than the AGPL's.
-
-The SPDX expression for the project is `AGPL-3.0-only OR LicenseRef-envisia`.
+Forge is licensed under the [MIT License](./LICENSE) (SPDX `MIT`).
 
 Contributions are accepted under the [Contributor License Agreement](./CLA.md),
-which lets the forgepkg organization relicense them, for example to move the
-project to the MIT License. See [CONTRIBUTING.md](./CONTRIBUTING.md) for how
-to sign it.
+which grants the forgepkg organization the rights to distribute them under
+the MIT License or other terms. See [CONTRIBUTING.md](./CONTRIBUTING.md) for
+how to sign it.
