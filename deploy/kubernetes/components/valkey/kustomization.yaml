@@ -12,7 +12,7 @@ kind: Component
 
 labels:
   - pairs:
-      app.kubernetes.io/part-of: envisia-forge
+      app.kubernetes.io/part-of: forge
 
 resources:
   - valkey.yaml

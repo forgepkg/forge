@@ -1,4 +1,4 @@
-envisia-forge {{ include "forge.imageTag" . }} is deployed as {{ include "forge.fullname" . }} in namespace {{ .Release.Namespace }}.
+Forge {{ include "forge.imageTag" . }} is deployed as {{ include "forge.fullname" . }} in namespace {{ .Release.Namespace }}.
 
 Image: {{ include "forge.image" . }}
 Public URL: {{ include "forge.publicBaseUrl" . }}

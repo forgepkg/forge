@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: envisia-forge:latest
+    image: forge:latest
     depends_on:
       db:
         condition: service_healthy

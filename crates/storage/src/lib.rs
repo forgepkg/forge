@@ -1,4 +1,4 @@
-//! Blob storage for envisia-forge.
+//! Blob storage for Forge.
 //!
 //! This crate is the storage half of the system:
 //!

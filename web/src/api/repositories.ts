@@ -64,7 +64,7 @@ export interface RepoView {
   /**
    * Group: package id prefixes (lowercase, e.g. `acme.`) never served from a
    * proxy member, even before a hosted member has the id. Empty otherwise.
-   * A docker group's prefixes may name namespaces (`envisia/`).
+   * A docker group's prefixes may name namespaces (`acme/`).
    */
   reserved_prefixes: string[]
   /**

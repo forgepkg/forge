@@ -1,4 +1,4 @@
-# envisia-forge — Kubernetes base.
+# Forge — Kubernetes base.
 #
 # The Forge server on its own: Deployment, Service, ServiceAccount and a
 # ConfigMap of non-secret FORGE_* settings. Secrets come from a Secret named
@@ -11,7 +11,7 @@ kind: Kustomization
 
 labels:
   - pairs:
-      app.kubernetes.io/part-of: envisia-forge
+      app.kubernetes.io/part-of: forge
 
 resources:
   - serviceaccount.yaml

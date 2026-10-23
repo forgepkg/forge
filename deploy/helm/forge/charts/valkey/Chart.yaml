@@ -3,7 +3,7 @@
 # which then sets FORGE_REDIS__URL; off by default.
 apiVersion: v2
 name: valkey
-description: Password-protected, cache-only Valkey for envisia-forge
+description: Password-protected, cache-only Valkey for Forge
 type: application
 version: 1.0.0
 appVersion: "9.1"

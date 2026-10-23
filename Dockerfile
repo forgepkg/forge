@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # ─────────────────────────────────────────────────────────────────────────────
-# envisia-forge — single-image build.
+# Forge — single-image build.
 #
 # Packages the TanStack Router SPA *and* the Rust forge-server into ONE image.
 # The server serves the API and the static SPA on a single port (no Node in
@@ -16,7 +16,7 @@
 # SBOM attestation (release.yml), the web and builder stages are scanned as
 # well as the final one, and the binary embeds its crate list (cargo-auditable).
 #
-# Build:  docker build -t envisia-forge:latest .   (or `cargo xtask docker-build`)
+# Build:  docker build -t forge:latest .   (or `cargo xtask docker-build`)
 # Run:    see the `runtime` stage footer for required FORGE_* env vars.
 #
 # The syntax line pins the Dockerfile frontend by digest (1.7, the same one
@@ -149,7 +149,7 @@ WORKDIR /app
 # RUN that follows it, so a new commit SHA would rebuild them.
 ARG FORGE_VERSION=0.0.0-dev
 ARG FORGE_GIT_SHA=unknown
-LABEL org.opencontainers.image.title="envisia-forge" \
+LABEL org.opencontainers.image.title="forge" \
       org.opencontainers.image.description="Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)" \
       org.opencontainers.image.version="${FORGE_VERSION}" \
       org.opencontainers.image.revision="${FORGE_GIT_SHA}"

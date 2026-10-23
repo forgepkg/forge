@@ -26,11 +26,11 @@ export function RouteError(props: ErrorComponentProps) {
   }, [stale])
 
   if (!stale) return <ErrorComponent {...props} />
-  if (reloading) return <Text>Loading the latest version of envisia forge…</Text>
+  if (reloading) return <Text>Loading the latest version of Forge…</Text>
   return (
     <ErrorState
       title="This page could not be loaded"
-      message="envisia forge may have been updated since this tab was opened. Reload the page to continue."
+      message="Forge may have been updated since this tab was opened. Reload the page to continue."
       onRetry={reloadDocument}
     />
   )

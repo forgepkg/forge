@@ -27,7 +27,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{ include "forge-postgresql.selectorLabels" . }}
 app.kubernetes.io/version: {{ include "forge-postgresql.imageVersion" . | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: envisia-forge
+app.kubernetes.io/part-of: forge
 {{- end }}
 
 {{/* image.tag without the digest it is pinned by. */}}

@@ -1,4 +1,4 @@
-# Values for the envisia-forge chart. docs/deployment.md explains every
+# Values for the Forge chart. docs/deployment.md explains every
 # Forge setting; deploy/helm/forge/README.md explains how this chart maps them.
 
 nameOverride: ""
@@ -13,7 +13,7 @@ image:
   # Defaults to the chart's appVersion: the release this chart belongs to.
   # While tag and digest are empty, the published chart pulls that release by
   # the digest the release workflow signed (the Chart.yaml annotation
-  # forge.envisia.de/image-digest).
+  # forge/image-digest).
   tag: ""
   # Pull by this digest (the tag is kept for readability).
   digest: ""

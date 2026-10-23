@@ -349,7 +349,7 @@ jobs:
             helm pull "oci://${CHART_REPO}/forge" --version "$VERSION" --destination "$RUNNER_TEMP/chart" 2>&1 | tee helm-pull.log
             package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
             pulled=$(sed -n 's/^Digest: *//p' helm-pull.log)
-            pinned=$(helm show chart "$package" | sed -n 's/^  forge\.envisia\.de\/image-digest: *//p' | tr -d '"')
+            pinned=$(helm show chart "$package" | sed -n 's/^  forge\/image-digest: *//p' | tr -d '"')
             if [ "$pulled" != "$chart_digest" ] || [ "$pinned" != "$image_digest" ]; then
               echo "::error::chart ${CHART_REPO}/forge:${VERSION} pulled as '$pulled' (expected $chart_digest) pins image '$pinned' (expected $image_digest)"
               exit 1
@@ -372,7 +372,7 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,format=short
           labels: |
-            org.opencontainers.image.title=envisia-forge
+            org.opencontainers.image.title=forge
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
       # Push the image untagged (by digest only); the tags are attached after
@@ -460,7 +460,7 @@ jobs:
           fi
 
       # The packaged chart records the signed digest (Chart.yaml annotation
-      # forge.envisia.de/image-digest), so it deploys exactly this image while
+      # forge/image-digest), so it deploys exactly this image while
       # image.tag and image.digest are left unset. The checkout itself keeps
       # the annotation empty. A chart an earlier run pushed and signed is
       # used as pulled.
@@ -474,7 +474,7 @@ jobs:
           if [ -n "$PUBLISHED" ]; then
             package="$PUBLISHED"
           else
-            annotation='  forge.envisia.de/image-digest:'
+            annotation='  forge/image-digest:'
             if [ "$(grep -cx "${annotation} \"\"" "$CHART_DIR/Chart.yaml")" != 1 ]; then
               echo "::error::$CHART_DIR/Chart.yaml needs exactly one empty '${annotation# }' annotation"
               exit 1

@@ -161,10 +161,10 @@ function AppLayout() {
     <StackedLayout
       navbar={
         <Navbar>
-          <NavbarItem href="/" aria-label="envisia forge home">
+          <NavbarItem href="/" aria-label="Forge home">
             <BrandMark />
             <NavbarLabel className="font-semibold tracking-tight">
-              envisia&nbsp;forge
+              Forge
             </NavbarLabel>
           </NavbarItem>
           <NavbarDivider className="max-lg:hidden" />
@@ -201,7 +201,7 @@ function AppLayout() {
           <SidebarHeader>
             <span className="flex items-center gap-2 px-2 py-1 font-semibold tracking-tight">
               <BrandMark />
-              envisia&nbsp;forge
+              Forge
             </span>
           </SidebarHeader>
           <SidebarBody>
