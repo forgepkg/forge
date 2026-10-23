@@ -81,7 +81,7 @@ jobs:
   # base branch, a merge group with the group ahead of it in the queue or
   # main, a push with the branch's previous commit, a manual run given a
   # `base` branch with the commit it forked off that branch) and sets one
-  # output per group of paths (rust, changelog, audit, web, image,
+  # output per group of paths (rust, changelog, release, audit, web, image,
   # kubernetes), and a job whose groups are all `false` is skipped, which
   # passes a required check. A push to main repeats its merge group's run on
   # the same commit, so it runs only what that push changed; a push that sets
@@ -96,6 +96,7 @@ jobs:
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
       changelog: ${{ steps.changes.outputs.changelog }}
+      release: ${{ steps.changes.outputs.release }}
       audit: ${{ steps.changes.outputs.audit }}
       web: ${{ steps.changes.outputs.web }}
       image: ${{ steps.changes.outputs.image }}
@@ -117,10 +118,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-changes.sh
 
-  # ── Formatting, and the changelog fragments ────────────────────────────────
-  # The fragment check builds only xtask, which has no dependencies. On a
-  # pull request it sees the merge with the base, so a fragment under a
-  # milestone that was released after the pull request was written fails.
+  # ── Formatting, the changelog fragments and xtask's tests ──────────────────
+  # The fragment check and the tests build only xtask, which has no
+  # dependencies. On a pull request the fragment check sees the merge with
+  # the base, so a fragment under a milestone that was released after the
+  # pull request was written fails. xtask's tests run in `test` as well; here
+  # they also run for a change to the files they read outside xtask (the
+  # release group), which leaves the rest of the Rust jobs out.
   # No job waits for this one (`needs: [fmt]`): a job behind `needs` joins
   # the runner queue only once fmt is done, so when the runners are busy the
   # long jobs would queue twice (#337).
@@ -128,7 +132,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.changelog != 'false') }}
+    if: ${{ !cancelled() && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.changelog != 'false' || needs.changes.outputs.release != 'false') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml) (with rustfmt)
@@ -139,6 +143,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Changelog fragments (docs/changes)
         run: cargo xtask changelog --check
+      - name: cargo test -p xtask
+        run: cargo test -p xtask
 
   # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
   # Both are check builds; the drift guard runs here rather than in `test`,

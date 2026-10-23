@@ -759,7 +759,7 @@ queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
 requests](#stacked-pull-requests)).
 
-A job runs only when the change touches what it checks (#353, #361). The
+A job runs only when the change touches what it checks (#353, #361, #363). The
 `changes` job (`.github/scripts/ci-changes.sh`) compares:
 
 - a pull request with its base branch;
@@ -777,11 +777,12 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `migrations/`, `.sqlx/`, `fixtures/`, `.github/scripts/`; and the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`, `web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
+| Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
-| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to the CI configuration counts for every group. A job left out is
@@ -790,7 +791,8 @@ runs. A manual run without a `base` (`gh workflow run ci.yml --ref main`)
 and the push of a release commit, which sets a new workspace version, run
 every job, which the release gate requires (see [Releasing](#releasing)). A
 file that Rust code or its tests read from outside the crates belongs in the
-Rust group: add a new one to `ci-changes.sh`.
+Rust group, one only xtask's tests read in the Release group: add a new one
+to `ci-changes.sh`.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
