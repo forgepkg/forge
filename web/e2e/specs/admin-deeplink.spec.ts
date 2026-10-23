@@ -54,7 +54,10 @@ test.describe('admin UI deep links', () => {
     // Formerly a 405 (the API only has `DELETE /admin/users/{id}`).
     await page.goto(`/manage/users/${admin!.id}`)
     await expect(
-      page.getByRole('heading', { name: new RegExp(`tokens.*${f.adminUser}`, 'i') }),
+      page.getByRole('heading', { level: 1, name: f.adminUser, exact: true }),
+    ).toBeVisible()
+    await expect(
+      page.getByRole('heading', { level: 2, name: /^tokens$/i }),
     ).toBeVisible()
   })
 
