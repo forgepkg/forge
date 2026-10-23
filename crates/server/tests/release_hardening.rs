@@ -392,16 +392,7 @@ async fn removing_the_admin_role_revokes_admin() {
 
     // A user created as admin holds the role.
     let username = format!("second-admin{}@example.com", common::unique());
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&admin, Some(&password))
-        .json(&json!({ "username": username, "password": "pw-second", "is_admin": true }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    let user: Value = resp.json().await.unwrap();
-    let user_id = user["id"].as_i64().unwrap();
+    let user_id = srv.create_user(&username, "pw-second-admin", "admin").await;
 
     let roles: Vec<Value> = client
         .get(format!("{}/admin/users/{user_id}/roles", srv.base_url))
@@ -418,7 +409,7 @@ async fn removing_the_admin_role_revokes_admin() {
         .expect("admin created via the API holds the admin role");
     let admin_role_id = admin_role["id"].as_i64().unwrap();
 
-    let session = srv.login(&username, "pw-second").await;
+    let session = srv.login(&username, "pw-second-admin").await;
     let as_user = |path: &str| {
         session
             .apply(client.get(format!("{}{path}", srv.base_url)))

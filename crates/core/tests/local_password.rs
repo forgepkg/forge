@@ -170,6 +170,30 @@ async fn local_provider_rejects_inactive_user() {
 }
 
 #[tokio::test]
+async fn local_provider_rejects_an_invited_account() {
+    // #322: an invited local account has no password until its user chooses
+    // one. The name is still the local realm's: Rejected whatever the
+    // password, never a Skip that would let a later (forwarding) provider
+    // take it over.
+    let pool = common::pool().await;
+    let username = format!("invited-{}@example.com", common::unique());
+    forge_db::invitation_dao::insert_invited_user(&pool, &username, &username)
+        .await
+        .expect("insert invited user");
+    for forwarding_follows in [false, true] {
+        let provider =
+            LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
+        for password in ["", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password:?} (forwarding follows: {forwarding_follows})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_provider_skips_user_without_local_password() {
     // An upstream-basic / oidc provisioned user has no local password_hash and
     // must never be acceptable by the local provider — it's not ours.

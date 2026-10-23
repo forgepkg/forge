@@ -81,7 +81,12 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 /// login from the request body and never act on the presented session, so a
 /// stale cookie in the browser must not block signing in again. (Both require
 /// a JSON body, which a cross-site form cannot send without a CORS preflight.)
-pub const CSRF_EXEMPT_PATHS: &[&str] = &["/auth/login", "/auth/identify"];
+pub const CSRF_EXEMPT_PATHS: &[&str] = &[
+    "/auth/login",
+    "/auth/identify",
+    "/auth/invitations/lookup",
+    "/auth/invitations/accept",
+];
 
 /// Everything the middleware needs, shared via the router layer.
 ///

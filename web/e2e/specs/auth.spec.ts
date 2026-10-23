@@ -32,18 +32,29 @@ async function uiSignIn(
   await page.getByRole('button', { name: /^sign in$/i }).click()
 }
 
-/** Create a non-admin user via the admin API; returns its credentials. */
+/**
+ * Create a non-admin user the way an administrator and its user do (#322):
+ * the admin invites it and, with no email service configured, gets the
+ * invitation link; the user chooses the password from it. Returns its
+ * credentials.
+ */
 async function createReader(
   request: import('@playwright/test').APIRequestContext,
 ): Promise<{ username: string; password: string }> {
   const f = facts()
   const username = `reader_${Date.now()}@example.com`
-  const password = 'reader-pw'
+  const password = 'reader-password'
   const createUser = await request.post(`${f.baseUrl}/admin/users`, {
     headers: { authorization: adminBasic() },
-    data: { username, password, is_admin: false },
+    data: { username },
   })
   expect(createUser.ok()).toBeTruthy()
+  const created = (await createUser.json()) as { invitation: { link: string } }
+  const token = created.invitation.link.split('#')[1]
+  const accepted = await request.post(`${f.baseUrl}/auth/invitations/accept`, {
+    data: { token, password },
+  })
+  expect(accepted.ok()).toBeTruthy()
   return { username, password }
 }
 

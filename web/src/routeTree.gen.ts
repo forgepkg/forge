@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/root'
 import { Route as AppLayoutRouteImport } from './routes/AppLayout'
+import { Route as InviteRouteImport } from './routes/Invite'
 import { Route as LoginRouteImport } from './routes/Login'
 import { Route as BrowseRouteImport } from './routes/Browse'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
@@ -32,12 +33,18 @@ import { Route as adminRepositoriesCreateRouteImport } from './routes/admin/repo
 import { Route as adminRolesEditRouteImport } from './routes/admin/roles/Edit'
 import { Route as adminSettingsEmailRouteImport } from './routes/admin/settings/Email'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
+import { Route as adminUsersCreateRouteImport } from './routes/admin/users/Create'
 import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
 import { Route as adminRepositoriesImportRouteImport } from './routes/admin/repositories/Import'
 import { Route as adminRepositoriesGroupMembersRouteImport } from './routes/admin/repositories/GroupMembers'
 
 const AppLayoutRoute = AppLayoutRouteImport.update({
   id: '/_app',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const InviteRoute = InviteRouteImport.update({
+  id: '/invite',
+  path: '/invite',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -150,6 +157,11 @@ const adminUsersEditRoute = adminUsersEditRouteImport.update({
   path: '/users/$userId',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminUsersCreateRoute = adminUsersCreateRouteImport.update({
+  id: '/users/new',
+  path: '/users/new',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
 const PackageDetailRoute = PackageDetailRouteImport.update({
   id: '/packages/$repo/$id',
   path: '/packages/$repo/$id',
@@ -169,6 +181,7 @@ const adminRepositoriesGroupMembersRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof BrowseRoute
+  '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
   '/manage': typeof AdminLayoutRouteWithChildren
   '/tokens': typeof TokensRoute
@@ -190,11 +203,13 @@ export interface FileRoutesByFullPath {
   '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
+  '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
 }
 export interface FileRoutesByTo {
+  '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
   '/': typeof BrowseRoute
   '/tokens': typeof TokensRoute
@@ -216,6 +231,7 @@ export interface FileRoutesByTo {
   '/manage/roles/$roleId': typeof adminRolesEditRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
+  '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
   '/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
@@ -223,6 +239,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppLayoutRouteWithChildren
+  '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
   '/_app/': typeof BrowseRoute
   '/_app/manage': typeof AdminLayoutRouteWithChildren
@@ -245,6 +262,7 @@ export interface FileRoutesById {
   '/_app/manage/roles/$roleId': typeof adminRolesEditRoute
   '/_app/manage/settings/email': typeof adminSettingsEmailRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
+  '/_app/manage/users/new': typeof adminUsersCreateRoute
   '/_app/packages/$repo/$id': typeof PackageDetailRoute
   '/_app/manage/repositories/$repo/import': typeof adminRepositoriesImportRoute
   '/_app/manage/repositories/$repo/members': typeof adminRepositoriesGroupMembersRoute
@@ -253,6 +271,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/invite'
     | '/login'
     | '/manage'
     | '/tokens'
@@ -274,11 +293,13 @@ export interface FileRouteTypes {
     | '/manage/roles/$roleId'
     | '/manage/settings/email'
     | '/manage/users/$userId'
+    | '/manage/users/new'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
     | '/manage/repositories/$repo/members'
   fileRoutesByTo: FileRoutesByTo
   to:
+    | '/invite'
     | '/login'
     | '/'
     | '/tokens'
@@ -300,12 +321,14 @@ export interface FileRouteTypes {
     | '/manage/roles/$roleId'
     | '/manage/settings/email'
     | '/manage/users/$userId'
+    | '/manage/users/new'
     | '/packages/$repo/$id'
     | '/manage/repositories/$repo/import'
     | '/manage/repositories/$repo/members'
   id:
     | '__root__'
     | '/_app'
+    | '/invite'
     | '/login'
     | '/_app/'
     | '/_app/manage'
@@ -328,6 +351,7 @@ export interface FileRouteTypes {
     | '/_app/manage/roles/$roleId'
     | '/_app/manage/settings/email'
     | '/_app/manage/users/$userId'
+    | '/_app/manage/users/new'
     | '/_app/packages/$repo/$id'
     | '/_app/manage/repositories/$repo/import'
     | '/_app/manage/repositories/$repo/members'
@@ -335,6 +359,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   AppLayoutRoute: typeof AppLayoutRouteWithChildren
+  InviteRoute: typeof InviteRoute
   LoginRoute: typeof LoginRoute
 }
 
@@ -345,6 +370,13 @@ declare module '@tanstack/react-router' {
       path: ''
       fullPath: '/'
       preLoaderRoute: typeof AppLayoutRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/invite': {
+      id: '/invite'
+      path: '/invite'
+      fullPath: '/invite'
+      preLoaderRoute: typeof InviteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -501,6 +533,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminUsersEditRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/users/new': {
+      id: '/_app/manage/users/new'
+      path: '/users/new'
+      fullPath: '/manage/users/new'
+      preLoaderRoute: typeof adminUsersCreateRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/packages/$repo/$id': {
       id: '/_app/packages/$repo/$id'
       path: '/packages/$repo/$id'
@@ -542,6 +581,7 @@ interface AdminLayoutRouteChildren {
   adminRolesEditRoute: typeof adminRolesEditRoute
   adminSettingsEmailRoute: typeof adminSettingsEmailRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
+  adminUsersCreateRoute: typeof adminUsersCreateRoute
   adminRepositoriesImportRoute: typeof adminRepositoriesImportRoute
   adminRepositoriesGroupMembersRoute: typeof adminRepositoriesGroupMembersRoute
 }
@@ -563,6 +603,7 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminRolesEditRoute: adminRolesEditRoute,
   adminSettingsEmailRoute: adminSettingsEmailRoute,
   adminUsersEditRoute: adminUsersEditRoute,
+  adminUsersCreateRoute: adminUsersCreateRoute,
   adminRepositoriesImportRoute: adminRepositoriesImportRoute,
   adminRepositoriesGroupMembersRoute: adminRepositoriesGroupMembersRoute,
 }
@@ -595,6 +636,7 @@ const AppLayoutRouteWithChildren = AppLayoutRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   AppLayoutRoute: AppLayoutRouteWithChildren,
+  InviteRoute: InviteRoute,
   LoginRoute: LoginRoute,
 }
 export const routeTree = rootRouteImport

@@ -100,7 +100,6 @@ async fn seed_hosted_with_versions(
 #[tokio::test]
 async fn retention_admin_gated() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let s = common::unique();
     let name = format!("ret{s}");
@@ -119,21 +118,15 @@ async fn retention_admin_gated() {
 
     // Non-admin user → 403.
     let username = format!("plain{s}@example.com");
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    srv.create_user(&username, "pw123456-retention", "reader")
+        .await;
 
     let resp = client
         .get(format!(
             "{}/admin/repositories/{name}/retention",
             srv.base_url
         ))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-retention"))
         .send()
         .await
         .unwrap();

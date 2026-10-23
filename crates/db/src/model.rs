@@ -471,8 +471,9 @@ pub struct ProxyUpstreamIndex {
 /// A row of `app_user`.
 ///
 /// `password_hash` is `None` for users with no local password (auth_source
-/// `'upstream-basic'` or `'oidc'`); a `'local'` user always has one (DB CHECK
-/// `app_user_local_password_hash_check`). `auth_source` records how
+/// `'upstream-basic'` or `'oidc'`); a `'local'` user has one unless it is
+/// invited and has not set it yet (DB CHECK
+/// `app_user_local_password_hash_check`, [`crate::invitation_dao`]). `auth_source` records how
 /// the user last authenticated / was provisioned; `external_subject` is the
 /// opaque upstream identifier for non-local sources.
 #[derive(Debug, Clone, sqlx::FromRow)]
