@@ -6,8 +6,8 @@ import {
   Button,
   Fieldset,
   FormActions,
-  Icon,
   Input,
+  Notice,
   Panel,
   StatusBadge,
   TextField,
@@ -142,22 +142,15 @@ function clean(patterns: string[]): string[] {
 }
 
 /**
- * The warning that an empty include list matches every package: a warn
- * notice announced politely (`role="status"`, as `Notice` would make it an
- * alert), since it comes and goes while the reader types.
+ * The warning that an empty include list matches every package, announced
+ * politely (`role="status"`) since it comes and goes while the reader types.
  */
 function EveryPackageWarning() {
   return (
-    <div className="fg-notice fg-notice--warn" role="status">
-      <Icon name="Alert" size={16} />
-      <div className="fg-notice-text">
-        <p className="fg-notice-body">
-          An empty include list matches <strong>every package</strong>: a grant
-          scoped by this selector then covers all packages but the excluded
-          ones.
-        </p>
-      </div>
-    </div>
+    <Notice tone="warn" role="status">
+      An empty include list matches <strong>every package</strong>: a grant
+      scoped by this selector then covers all packages but the excluded ones.
+    </Notice>
   )
 }
 

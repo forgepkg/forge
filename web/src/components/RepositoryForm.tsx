@@ -12,7 +12,6 @@ import {
   Button,
   Code,
   FormActions,
-  Icon,
   Notice,
   Panel,
   SelectField,
@@ -293,21 +292,6 @@ export function mibToBytes(raw: string): number | null {
  */
 function announced(message: string | undefined): ReactNode {
   return message ? <span role="alert">{message}</span> : undefined
-}
-
-/**
- * A warning that appears while the admin types, announced politely
- * (`role="status"`); the kit's warn `Notice` is an alert, too loud for it.
- */
-function WarnStatus({ children }: { children: ReactNode }) {
-  return (
-    <div className="fg-notice fg-notice--warn" role="status">
-      <Icon name="Alert" size={16} />
-      <div className="fg-notice-text">
-        <div className="fg-notice-body">{children}</div>
-      </div>
-    </div>
-  )
 }
 
 /** What a format is, for the Format field on create. */
@@ -772,11 +756,11 @@ export function RepositoryForm({
             </div>
 
             {credentialsWillDrop && (
-              <WarnStatus>
+              <Notice tone="warn" role="status">
                 The remote URL now points to a different host. The stored
                 upstream credentials will be dropped when you save, unless you
                 enter a new password for the new host.
-              </WarnStatus>
+              </Notice>
             )}
 
             <div className="fg-fieldrow">
