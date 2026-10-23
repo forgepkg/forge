@@ -99,13 +99,14 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
-    /// **Deprecated**: each hosted repository has its own upload limit, set
-    /// in the admin UI or API ([`forge_db::model::Repository::max_upload_bytes`]).
-    /// When set, this is still the default of package repositories without
-    /// one (in place of [`DEFAULT_MAX_UPLOAD_BYTES`]), so an upgraded install
-    /// keeps its limit; startup warns. Docker repositories never used it.
-    #[serde(default)]
-    pub max_upload_bytes: Option<u64>,
+    /// The removed `server.max_upload_bytes`, kept only to refuse it: each
+    /// hosted repository has its own upload limit, set in the admin UI or
+    /// API ([`forge_db::model::Repository::max_upload_bytes`]). `ServerConfig`
+    /// accepts unknown keys, so without this a leftover setting would be
+    /// ignored and package repositories would quietly fall back to
+    /// [`DEFAULT_MAX_UPLOAD_BYTES`].
+    #[serde(default, rename = "max_upload_bytes")]
+    removed_max_upload_bytes: Option<serde::de::IgnoredAny>,
     /// Directory pushes and first-time proxy downloads are staged in. Files a
     /// killed process left there are removed at startup. Default:
     /// `forge-staging` under the system temp directory.
@@ -161,8 +162,7 @@ pub struct ServerConfig {
     pub request_timeout_seconds: u64,
 }
 
-/// The upload limit of a package repository without one of its own (and no
-/// deprecated `server.max_upload_bytes`): 512 MiB.
+/// The upload limit of a package repository without one of its own: 512 MiB.
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The upload limit, per blob, of a docker repository without one of its
@@ -2286,9 +2286,13 @@ impl Config {
         self.docker.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
-        if self.server.max_upload_bytes == Some(0) {
+        if self.server.removed_max_upload_bytes.is_some() {
             return Err(ConfigError::Invalid(
-                "server.max_upload_bytes must be greater than 0".into(),
+                "server.max_upload_bytes was removed: set each repository's upload limit \
+                 instead (Maximum upload size in the web UI, max_upload_bytes in the admin \
+                 API), then remove the setting. A package repository without a limit of its \
+                 own accepts pushes of 512 MiB"
+                    .into(),
             ));
         }
         if self.blob_cache.path.is_some()
@@ -2328,15 +2332,10 @@ impl Config {
     /// ([`Self::docker_default`]), so only settings an operator can change
     /// decide it then.
     fn largest_staged_item_and_setting(&self) -> (u64, &'static str) {
-        let package = self.default_upload_limit(forge_db::model::NUGET_FORMAT);
         [
             (
-                package,
-                if self.server.max_upload_bytes.is_some() {
-                    "server.max_upload_bytes"
-                } else {
-                    "the default upload limit of package repositories"
-                },
+                self.default_upload_limit(forge_db::model::NUGET_FORMAT),
+                "the default upload limit of package repositories",
             ),
             (self.proxy.max_package_bytes, "proxy.max_package_bytes"),
             (
@@ -2384,15 +2383,13 @@ impl Config {
     /// The upload limit of a hosted repository of `format` without one of
     /// its own: for docker [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob (as
     /// far as an explicit staging budget allows, [`Self::docker_default`]),
-    /// for a package format the deprecated `server.max_upload_bytes` when
-    /// set, else [`DEFAULT_MAX_UPLOAD_BYTES`].
+    /// for a package format [`DEFAULT_MAX_UPLOAD_BYTES`].
     pub fn default_upload_limit(&self, format: &str) -> u64 {
         if format == forge_db::model::DOCKER_FORMAT {
-            return self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES);
+            self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES)
+        } else {
+            DEFAULT_MAX_UPLOAD_BYTES
         }
-        self.server
-            .max_upload_bytes
-            .unwrap_or(DEFAULT_MAX_UPLOAD_BYTES)
     }
 
     /// The largest upload limit a repository may be given: what a push can
@@ -2406,16 +2403,7 @@ impl Config {
     /// Settings this configuration still uses but that are on their way
     /// out, each with what replaces it: logged as warnings at startup.
     pub fn deprecations(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(bytes) = self.server.max_upload_bytes {
-            out.push(format!(
-                "server.max_upload_bytes ({bytes}) is deprecated: it is now only the default \
-                 upload limit of package repositories without one of their own. Set each \
-                 repository's limit in the web UI or the admin API (max_upload_bytes) \
-                 and remove the setting."
-            ));
-        }
-        out
+        Vec::new()
     }
 
     /// What one push or download stages at once at most: the package, and
@@ -4104,10 +4092,8 @@ mod tests {
     #[test]
     fn an_explicit_staging_budget_bounds_the_docker_defaults() {
         const MIB: u64 = 1024 * 1024;
-        let budget = MINIMAL.replace(
-            "[server]",
-            "[server]\nmax_upload_bytes = 268435456\nmax_staging_bytes = 805306368",
-        ) + "\n[proxy]\nmax_package_bytes = 268435456\n";
+        let budget = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 805306368")
+            + "\n[proxy]\nmax_package_bytes = 268435456\n";
         let cfg = Config::from_figment(fig_from_toml(&budget)).expect("a small budget starts");
         let fits = 768 * MIB - cfg.nuget.max_nuspec_bytes;
         assert_eq!(cfg.default_upload_limit("docker"), fits);
@@ -4181,19 +4167,20 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(&unlimited)).expect("valid");
         assert_eq!(cfg.max_repository_upload_bytes(), None);
 
-        // The deprecated server-wide limit is the package default, and only
-        // that; startup warns.
-        let legacy = MINIMAL.replace("[server]", "[server]\nmax_upload_bytes = 4096");
-        let cfg = Config::from_figment(fig_from_toml(&legacy)).expect("valid");
-        assert_eq!(cfg.default_upload_limit("nuget"), 4096);
-        assert_eq!(
-            cfg.default_upload_limit("docker"),
-            DEFAULT_DOCKER_MAX_UPLOAD_BYTES
-        );
-        assert_eq!(cfg.deprecations().len(), 1);
-        assert!(cfg.deprecations()[0].contains("server.max_upload_bytes"));
-        let zero = MINIMAL.replace("[server]", "[server]\nmax_upload_bytes = 0");
-        assert!(Config::from_figment(fig_from_toml(&zero)).is_err());
+        // The removed server-wide limit refuses to start, whatever its
+        // value, and the error names what replaces it.
+        for value in ["4096", "0", "\"512MiB\""] {
+            let removed =
+                MINIMAL.replace("[server]", &format!("[server]\nmax_upload_bytes = {value}"));
+            let err = Config::from_figment(fig_from_toml(&removed))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("server.max_upload_bytes was removed")
+                    && err.contains("Maximum upload size"),
+                "{err}"
+            );
+        }
 
         // `[plugins.max_upload_bytes]` is gone: limits are per repository.
         let per_format = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nhelm = 4096\n");
