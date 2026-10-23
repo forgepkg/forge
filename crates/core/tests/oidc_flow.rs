@@ -634,9 +634,8 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
 }
 
 /// #317: every account is named by a UPN. A username claim that is none
-/// refuses the login and names the claim; an identity linked before 1.2
-/// keeps signing in to its account, renamed `<name>@example.com` at the
-/// upgrade, whatever its claim says.
+/// refuses the login and names the claim; an identity linked to an account
+/// keeps signing in to it, whatever its claim says.
 #[tokio::test]
 async fn provisioning_needs_a_upn_and_names_the_claim() {
     let pool = pool().await;
@@ -660,13 +659,12 @@ async fn provisioning_needs_a_upn_and_names_the_claim() {
         .unwrap()
         .is_none());
 
-    // The same identity, linked before 1.2 to an account of that name, which
-    // the upgrade renamed, still resolves to it.
+    // The same identity, once linked to an account, still resolves to it.
     let legacy_id: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, active, auth_source, external_subject) \
          VALUES ($1, NULL, true, 'oidc', $2) RETURNING id",
     )
-    .bind(forge_db::user_dao::legacy_upn(&username, ""))
+    .bind(format!("{username}@example.com"))
     .bind(format!("sub-{n}"))
     .fetch_one(&pool)
     .await

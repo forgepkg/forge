@@ -338,9 +338,7 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 /// restart. A concurrent instance creating the account at the same moment is
 /// handled the same way.
 ///
-/// The name is a UPN (config validation): `admin@example.com` by default,
-/// which an install's `admin` from before 1.2 was renamed to, together with
-/// its marker ([`forge_db::user_dao::rename_legacy_usernames`]).
+/// The name is a UPN (config validation): `admin@example.com` by default.
 ///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it), and a loud one when the existing account still has the

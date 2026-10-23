@@ -853,8 +853,7 @@ fn default_negative_ttl() -> u64 {
 #[derive(Clone, Deserialize)]
 pub struct BootstrapAdmin {
     /// Admin username to create on first run if absent: a UPN, like every
-    /// account's. Default `admin@example.com`, which the `admin` of an install
-    /// from before 1.2 is renamed to.
+    /// account's. Default `admin@example.com`.
     #[serde(default = "default_bootstrap_username")]
     pub username: String,
     /// Plaintext password (hashed with argon2id on creation). Required for the
@@ -2289,12 +2288,9 @@ impl Config {
                         ba.username.trim()
                     ),
                     forge_core::auth::InvalidUsername::NotUpn => format!(
-                        "auth.bootstrap_admin.username: {:?} is not a UPN: since 1.2 every \
-                         account is named by one, such as admin@example.com (an account named \
-                         {:?} before was renamed {:?})",
+                        "auth.bootstrap_admin.username: {:?} is not a UPN: every account is \
+                         named by one, such as admin@example.com",
                         ba.username.trim(),
-                        ba.username.trim(),
-                        forge_db::user_dao::legacy_upn(ba.username.trim(), "")
                     ),
                     e => format!("auth.bootstrap_admin.username: {e}"),
                 })
@@ -4430,8 +4426,7 @@ mod tests {
         );
     }
 
-    /// #317: every account is named by a UPN, the bootstrap admin too; the
-    /// error names what an account of that name was renamed to.
+    /// #317: every account is named by a UPN, the bootstrap admin too.
     #[test]
     fn bootstrap_admin_without_a_upn_refused() {
         let toml = MINIMAL.replace(
@@ -4442,7 +4437,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("\"root\" is not a UPN"), "{err}");
-        assert!(err.contains("renamed \"root@example.com\""), "{err}");
+        assert!(err.contains("such as admin@example.com"), "{err}");
     }
 
     /// A bootstrap admin named `oidc`, in any case and padding: the error
