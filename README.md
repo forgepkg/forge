@@ -71,8 +71,8 @@ still puts a TLS-terminating proxy in front — see
 ## Quickstart
 
 Prerequisites: **Docker**, a **Rust** toolchain (pinned in `rust-toolchain.toml`),
-and **Node 22 + pnpm 11** (`corepack enable`). Optionally the **.NET SDK** to
-drive the feed with a real client.
+and **Node 26 + pnpm 11** (`npm install -g corepack && corepack enable`).
+Optionally the **.NET SDK** to drive the feed with a real client.
 
 ```bash
 cargo xtask dev

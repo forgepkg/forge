@@ -11,8 +11,9 @@ Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 - **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`), with
   the `wasm32-wasip2` target for the format plugins' component builds and the
   tests that load them (`rustup target add wasm32-wasip2`).
-- **Node 22 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
-  pinned `pnpm@11.5.0` from `web/package.json`).
+- **Node 26 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
+  pinned `pnpm@11.5.0` from `web/package.json`. Node 25+ no longer bundles
+  corepack: `npm install -g corepack` first).
 - *Optional:* the **.NET SDK** (`dotnet`) to drive the feed with a real client.
 - *Optional:* `sqlx-cli` (`cargo install sqlx-cli --no-default-features --features postgres,rustls`)
   only if you change SQL queries and need to regenerate the offline data.
@@ -744,7 +745,7 @@ The root `Dockerfile` is a multi-stage build that packages the TanStack Router
 SPA **and** the Rust `forge-server` into ONE image. The server serves the API
 and the static SPA on a single port (no Node in prod):
 
-1. **web** — Node 22 + pnpm (corepack): `pnpm install --frozen-lockfile` +
+1. **web** — Node 26 + pnpm (corepack): `pnpm install --frozen-lockfile` +
    `pnpm run build` → `web/dist`.
 2. **builder** — `rust:1.99` with cargo-chef for dependency-layer caching;
    `cargo build --release -p forge-server` with `SQLX_OFFLINE=true` against the
