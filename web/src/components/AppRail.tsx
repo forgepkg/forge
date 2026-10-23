@@ -26,6 +26,7 @@ const ADMINISTRATION: RailLink[] = [
   { label: 'Authentication', to: '/manage/realms', icon: 'Shield' },
   { label: 'Settings', to: '/manage/settings', icon: 'Sliders' },
   { label: 'Email', to: '/manage/settings/email', icon: 'Mail' },
+  { label: 'System', to: '/manage/system', icon: 'Database' },
 ]
 
 /**

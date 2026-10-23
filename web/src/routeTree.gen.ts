@@ -20,6 +20,7 @@ import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
 import { Route as adminRolesListRouteImport } from './routes/admin/roles/List'
 import { Route as adminSettingsSettingsRouteImport } from './routes/admin/settings/Settings'
+import { Route as adminSystemSystemRouteImport } from './routes/admin/system/System'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as RepoBrowseRouteImport } from './routes/RepoBrowse'
 import { Route as ImageDetailRouteImport } from './routes/ImageDetail'
@@ -88,6 +89,11 @@ const adminRolesListRoute = adminRolesListRouteImport.update({
 const adminSettingsSettingsRoute = adminSettingsSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
+const adminSystemSystemRoute = adminSystemSystemRouteImport.update({
+  id: '/system',
+  path: '/system',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
 const adminUsersListRoute = adminUsersListRouteImport.update({
@@ -178,6 +184,7 @@ export interface FileRoutesByFullPath {
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/roles': typeof adminRolesListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
+  '/manage/system': typeof adminSystemSystemRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
@@ -204,6 +211,7 @@ export interface FileRoutesByTo {
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/roles': typeof adminRolesListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
+  '/manage/system': typeof adminSystemSystemRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
@@ -233,6 +241,7 @@ export interface FileRoutesById {
   '/_app/manage/repositories': typeof adminRepositoriesListRoute
   '/_app/manage/roles': typeof adminRolesListRoute
   '/_app/manage/settings': typeof adminSettingsSettingsRoute
+  '/_app/manage/system': typeof adminSystemSystemRoute
   '/_app/manage/users': typeof adminUsersListRoute
   '/_app/repos/$repo': typeof RepoBrowseRoute
   '/_app/images/$repo/$': typeof ImageDetailRoute
@@ -262,6 +271,7 @@ export interface FileRouteTypes {
     | '/manage/repositories'
     | '/manage/roles'
     | '/manage/settings'
+    | '/manage/system'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
@@ -288,6 +298,7 @@ export interface FileRouteTypes {
     | '/manage/repositories'
     | '/manage/roles'
     | '/manage/settings'
+    | '/manage/system'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
@@ -316,6 +327,7 @@ export interface FileRouteTypes {
     | '/_app/manage/repositories'
     | '/_app/manage/roles'
     | '/_app/manage/settings'
+    | '/_app/manage/system'
     | '/_app/manage/users'
     | '/_app/repos/$repo'
     | '/_app/images/$repo/$'
@@ -415,6 +427,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/manage/settings'
       preLoaderRoute: typeof adminSettingsSettingsRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/system': {
+      id: '/_app/manage/system'
+      path: '/system'
+      fullPath: '/manage/system'
+      preLoaderRoute: typeof adminSystemSystemRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
     '/_app/manage/users': {
@@ -532,6 +551,7 @@ interface AdminLayoutRouteChildren {
   adminRepositoriesListRoute: typeof adminRepositoriesListRoute
   adminRolesListRoute: typeof adminRolesListRoute
   adminSettingsSettingsRoute: typeof adminSettingsSettingsRoute
+  adminSystemSystemRoute: typeof adminSystemSystemRoute
   adminUsersListRoute: typeof adminUsersListRoute
   adminSelectorsEditRoute: typeof adminSelectorsEditRoute
   adminSelectorsCreateRoute: typeof adminSelectorsCreateRoute
@@ -553,6 +573,7 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminRepositoriesListRoute: adminRepositoriesListRoute,
   adminRolesListRoute: adminRolesListRoute,
   adminSettingsSettingsRoute: adminSettingsSettingsRoute,
+  adminSystemSystemRoute: adminSystemSystemRoute,
   adminUsersListRoute: adminUsersListRoute,
   adminSelectorsEditRoute: adminSelectorsEditRoute,
   adminSelectorsCreateRoute: adminSelectorsCreateRoute,
