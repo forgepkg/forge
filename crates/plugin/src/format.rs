@@ -11,6 +11,25 @@ use forge_plugin_api::{self as api, FormatPlugin};
 use crate::manifest::Assets;
 use crate::Plugin;
 
+/// The longest version the host takes from a format plugin, in bytes: a
+/// version to normalize as given, its normalized form, and a parsed
+/// package's version as written and normalized. Versions are stored in the
+/// `UNIQUE (repository_id, name, version)` indexes of `component` and
+/// `proxy_cached_version`, and PostgreSQL refuses a B-tree index entry
+/// larger than about 2,700 bytes: a plugin without a limit of its own let a
+/// multi-kilobyte version through to that insert, so a push answered 500
+/// instead of 400, and so did a proxy asked for such a version. 256 is above
+/// every built-in plugin's own limit (NuGet's 64 characters, Helm's 128) and,
+/// with [`MAX_ID_LENGTH`], keeps an entry far below PostgreSQL's.
+const MAX_VERSION_LENGTH: usize = 256;
+
+/// The longest package id the host takes from a format plugin, in bytes:
+/// an id to validate, and a parsed package's id as written and canonical.
+/// Ids share the indexes of [`MAX_VERSION_LENGTH`]. 512 is above every
+/// built-in plugin's own limit (Helm's 250 ASCII characters, NuGet's 100
+/// characters, at most 400 bytes in UTF-8).
+const MAX_ID_LENGTH: usize = 512;
+
 /// A format plugin, built in or WebAssembly, as a [`Format`]: what the
 /// hosted write path, the read ops, the proxy read path and retention work
 /// with.
@@ -45,8 +64,43 @@ fn format_error(e: api::FormatError) -> FormatError {
     }
 }
 
-fn parsed_upload(parsed: api::ParsedPackage) -> ParsedUpload {
-    ParsedUpload {
+/// The start of `value`, to name an oversized one in an error.
+fn start(value: &str) -> String {
+    let start: String = value.chars().take(64).collect();
+    format!("{start}…")
+}
+
+/// Refuses an id longer than [`MAX_ID_LENGTH`].
+fn check_id(id: &str) -> Result<(), FormatError> {
+    if id.len() > MAX_ID_LENGTH {
+        return Err(FormatError::InvalidPackage(format!(
+            "invalid package id {:?}: longer than {MAX_ID_LENGTH} bytes",
+            start(id)
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a version longer than [`MAX_VERSION_LENGTH`].
+fn check_version(version: &str) -> Result<(), FormatError> {
+    if version.len() > MAX_VERSION_LENGTH {
+        return Err(FormatError::InvalidVersion {
+            value: start(version),
+            reason: format!("longer than {MAX_VERSION_LENGTH} bytes"),
+        });
+    }
+    Ok(())
+}
+
+/// A package the plugin parsed, as the host stores it, unless its id or
+/// version is longer than the host takes ([`MAX_ID_LENGTH`],
+/// [`MAX_VERSION_LENGTH`]): a push of it is refused (400).
+fn parsed_upload(parsed: api::ParsedPackage) -> Result<ParsedUpload, FormatError> {
+    check_id(&parsed.id)?;
+    check_id(&parsed.original_id)?;
+    check_version(&parsed.version)?;
+    check_version(&parsed.version_original)?;
+    Ok(ParsedUpload {
         id: parsed.id,
         original_id: parsed.original_id,
         version: parsed.version,
@@ -68,7 +122,7 @@ fn parsed_upload(parsed: api::ParsedPackage) -> ParsedUpload {
                     .collect(),
             })
             .collect(),
-    }
+    })
 }
 
 impl Format for PluginFormat {
@@ -96,19 +150,25 @@ impl Format for PluginFormat {
         file.rewind()?;
         self.plugin
             .parse_package(&mut file)
-            .map(parsed_upload)
             .map_err(format_error)
+            .and_then(parsed_upload)
     }
 
     fn parse_upload_file(&self, path: &Path) -> Result<ParsedUpload, FormatError> {
         self.plugin
             .parse_package_file(path)
-            .map(parsed_upload)
             .map_err(format_error)
+            .and_then(parsed_upload)
     }
 
+    /// The plugin's normalized form of `raw`, refused when either is longer
+    /// than [`MAX_VERSION_LENGTH`] (a read naming it answers 404).
     fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
-        self.plugin.normalize_version(raw).map_err(format_error)
+        // Before the plugin, so an oversized version never reaches it.
+        check_version(raw)?;
+        let normalized = self.plugin.normalize_version(raw).map_err(format_error)?;
+        check_version(&normalized)?;
+        Ok(normalized)
     }
 
     fn compare_versions(&self, a: &str, b: &str) -> Ordering {
@@ -119,7 +179,11 @@ impl Format for PluginFormat {
         self.plugin.canonical_id(id)
     }
 
+    /// Whether the plugin takes `id`, which is never longer than
+    /// [`MAX_ID_LENGTH`].
     fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        // Before the plugin, so an oversized id never reaches it.
+        check_id(id)?;
         self.plugin.validate_id(id).map_err(format_error)
     }
 
@@ -145,6 +209,156 @@ impl Format for PluginFormat {
                 );
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A format without limits of its own: every id is valid, every version
+    /// normalizes to `normalized` (or to itself), and every package parses
+    /// as `parsed`.
+    struct Unlimited {
+        normalized: Option<String>,
+        parsed: api::ParsedPackage,
+    }
+
+    impl FormatPlugin for Unlimited {
+        fn canonical_id(&self, id: &str) -> String {
+            id.to_ascii_lowercase()
+        }
+
+        fn validate_id(&self, _id: &str) -> Result<(), api::FormatError> {
+            Ok(())
+        }
+
+        fn normalize_version(&self, version: &str) -> Result<String, api::FormatError> {
+            Ok(self
+                .normalized
+                .clone()
+                .unwrap_or_else(|| version.to_string()))
+        }
+
+        fn compare_versions(&self, a: &str, b: &str) -> Ordering {
+            a.cmp(b)
+        }
+
+        fn parse_package(
+            &self,
+            _package: &mut dyn api::PackageSource,
+        ) -> Result<api::ParsedPackage, api::FormatError> {
+            Ok(self.parsed.clone())
+        }
+
+        fn manifest_summary(&self, _manifest: &[u8]) -> Option<String> {
+            None
+        }
+
+        fn handle(&self, _repo: &api::Repository, _req: &api::Request) -> api::Action {
+            api::Action::Respond(api::Response::text(404, "not found"))
+        }
+
+        fn render(
+            &self,
+            _repo: &api::Repository,
+            _req: &api::Request,
+            _data: &[api::Loaded],
+        ) -> api::Rendered {
+            api::Rendered::Respond(api::Response::text(404, "not found"))
+        }
+    }
+
+    /// A package `id` at `version`, as written and normalized.
+    fn package(id: &str, version: &str) -> api::ParsedPackage {
+        api::ParsedPackage {
+            id: id.to_ascii_lowercase(),
+            original_id: id.to_string(),
+            version: version.to_string(),
+            version_original: version.to_string(),
+            listed: true,
+            manifest: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// [`Unlimited`] as the host sees it.
+    fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> PluginFormat {
+        let plugin = Plugin::builtin(
+            "[plugin]\nid = \"unlimited\"\nname = \"Unlimited\"\nversion = \"0.1.0\"\napi = \"0.3.0\"\n",
+            Unlimited {
+                normalized: normalized.map(str::to_string),
+                parsed,
+            },
+        )
+        .unwrap();
+        PluginFormat::new(&plugin)
+    }
+
+    #[test]
+    fn versions_longer_than_the_host_takes_do_not_normalize() {
+        let longest = "1".repeat(MAX_VERSION_LENGTH);
+        let longer = "1".repeat(MAX_VERSION_LENGTH + 1);
+        let format = unlimited(None, package("demo", "1.0.0"));
+        assert_eq!(format.normalize_version(&longest).unwrap(), longest);
+        for version in [longer.clone(), "1".repeat(4096)] {
+            let err = format.normalize_version(&version).unwrap_err();
+            assert!(matches!(err, FormatError::InvalidVersion { .. }), "{err}");
+            assert!(err.to_string().len() < 200, "{err}");
+        }
+        // The normalized form too.
+        let lengthened = unlimited(Some(&longer), package("demo", "1.0.0"));
+        assert!(matches!(
+            lengthened.normalize_version("1"),
+            Err(FormatError::InvalidVersion { .. })
+        ));
+        let normalized = unlimited(Some(&longest), package("demo", "1.0.0"));
+        assert_eq!(normalized.normalize_version("1").unwrap(), longest);
+    }
+
+    #[test]
+    fn ids_longer_than_the_host_takes_are_invalid() {
+        let format = unlimited(None, package("demo", "1.0.0"));
+        assert!(format.validate_id(&"a".repeat(MAX_ID_LENGTH)).is_ok());
+        // Bytes: 129 four-byte characters are longer.
+        for id in ["a".repeat(MAX_ID_LENGTH + 1), "\u{1F600}".repeat(129)] {
+            assert!(matches!(
+                format.validate_id(&id),
+                Err(FormatError::InvalidPackage(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_package_with_a_longer_id_or_version_is_refused() {
+        let parse = |parsed: api::ParsedPackage| {
+            unlimited(None, parsed).parse_upload(&mut std::io::Cursor::new(Vec::new()))
+        };
+        let longest_version = "1".repeat(MAX_VERSION_LENGTH);
+        let longest_id = "A".repeat(MAX_ID_LENGTH);
+        let parsed = parse(package(&longest_id, &longest_version)).unwrap();
+        assert_eq!(parsed.id, longest_id.to_ascii_lowercase());
+        assert_eq!(parsed.version, longest_version);
+
+        let longer_version = format!("{longest_version}1");
+        let longer_id = format!("{longest_id}A");
+        let version_original = api::ParsedPackage {
+            version_original: longer_version.clone(),
+            ..package("demo", "1.0.0")
+        };
+        let original_id = api::ParsedPackage {
+            original_id: longer_id.clone(),
+            ..package("demo", "1.0.0")
+        };
+        for parsed in [package("demo", &longer_version), version_original] {
+            assert!(matches!(
+                parse(parsed),
+                Err(FormatError::InvalidVersion { .. })
+            ));
+        }
+        for parsed in [package(&longer_id, "1.0.0"), original_id] {
+            assert!(matches!(parse(parsed), Err(FormatError::InvalidPackage(_))));
         }
     }
 }
