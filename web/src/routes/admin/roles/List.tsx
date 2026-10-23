@@ -3,20 +3,22 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { RoleView } from '~/api/rbac'
 import { useCreateRole, useRoles } from '~/queries/useRbac'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
 import {
+  Button,
+  CellActions,
+  Page,
+  PageHeader,
+  Panel,
+  Skeleton,
+  StatusBadge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+  TextField,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { InlineError } from '~/components/RbacLabels'
@@ -30,27 +32,29 @@ export const Route = createFileRoute('/_app/manage/roles')({
  * Admin roles screen. Lists every role with its description, whether it is
  * built in, and how many grants and users it holds; creates a role (then
  * opens it, to add its grants and members); and deletes a role that is not
- * built in after a confirmation that names the users and grants it takes
- * along.
+ * built in after a confirmation dialog that names the users and grants it
+ * takes along.
  */
 function RolesList() {
   const roles = useRoles()
   const [pendingDelete, setPendingDelete] = useState<RoleView | null>(null)
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Heading>Roles</Heading>
-        <Text className="mt-1">
-          A role grants actions on repositories to the users who hold it. The
-          built-in roles cannot be deleted: <strong>admin</strong> may do
-          everything, <strong>anonymous</strong> applies to callers who do not
-          sign in (and its reads to everyone), and{' '}
-          <strong>authenticated</strong> reads and writes every repository,
-          the open access from before roles existed; no user gets it
-          automatically.
-        </Text>
-      </div>
+    <Page>
+      <PageHeader
+        title="Roles"
+        description={
+          <>
+            A role grants actions on repositories to the users who hold it. The
+            built-in roles cannot be deleted: <strong>admin</strong> may do
+            everything, <strong>anonymous</strong> applies to callers who do not
+            sign in (and its reads to everyone), and{' '}
+            <strong>authenticated</strong> reads and writes every repository,
+            the open access from before roles existed; no user gets it
+            automatically.
+          </>
+        }
+      />
 
       <CreateRoleForm />
 
@@ -70,60 +74,69 @@ function RolesList() {
           onRetry={() => void roles.refetch()}
         />
       ) : roles.isLoading ? (
-        <Text>Loading roles…</Text>
+        <Skeleton variant="table" rows={4} columns={4} label="Loading roles…" />
       ) : (roles.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No roles">Create a role with the form above.</EmptyState>
+        <EmptyState title="No roles" icon="Lock">
+          Create a role with the form above.
+        </EmptyState>
       ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
+        <Panel title="All roles" count={roles.data!.length} flush>
+          <Table caption="Roles">
+            <TableHead>
               <TableHeader>Name</TableHeader>
               <TableHeader>Description</TableHeader>
-              <TableHeader>Grants</TableHeader>
-              <TableHeader>Users</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {roles.data!.map((role) => (
-              <TableRow key={role.id}>
-                <TableCell>
-                  <span className="flex items-center gap-2">
-                    <Link
-                      to="/manage/roles/$roleId"
-                      params={{ roleId: String(role.id) }}
-                      className="font-medium text-sky-600 hover:underline dark:text-sky-400"
-                    >
-                      {role.name}
-                    </Link>
-                    {role.builtin && <Badge color="zinc">built-in</Badge>}
-                  </span>
-                </TableCell>
-                <TableCell className="whitespace-normal text-zinc-500 dark:text-zinc-400">
-                  {role.description || '—'}
-                </TableCell>
-                <TableCell>{role.grant_count}</TableCell>
-                <TableCell>{role.user_count}</TableCell>
-                <TableCell>
-                  {role.builtin ? (
-                    <span className="text-zinc-400 dark:text-zinc-500">—</span>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() => setPendingDelete(role)}
-                      className="font-medium text-red-600 hover:underline dark:text-red-400"
-                      aria-label={`Delete ${role.name}`}
-                    >
-                      Delete
-                    </button>
-                  )}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+              <TableHeader align="right" width="96px">
+                Grants
+              </TableHeader>
+              <TableHeader align="right" width="96px">
+                Users
+              </TableHeader>
+              <TableHeader align="right" width="96px">
+                <span className="fg-sr">Actions</span>
+              </TableHeader>
+            </TableHead>
+            <TableBody>
+              {roles.data!.map((role) => (
+                <TableRow key={role.id}>
+                  <TableCell lead>
+                    <span className="flex flex-wrap items-center gap-2">
+                      <Link
+                        to="/manage/roles/$roleId"
+                        params={{ roleId: String(role.id) }}
+                        className="fg-link-strong"
+                      >
+                        {role.name}
+                      </Link>
+                      {role.builtin && <StatusBadge dot={false}>built-in</StatusBadge>}
+                    </span>
+                  </TableCell>
+                  <TableCell>{role.description || '—'}</TableCell>
+                  <TableCell align="right">{role.grant_count}</TableCell>
+                  <TableCell align="right">{role.user_count}</TableCell>
+                  <TableCell align="right">
+                    {role.builtin ? (
+                      <span className="text-ink-faint">—</span>
+                    ) : (
+                      <CellActions>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          icon="Trash"
+                          aria-label={`Delete ${role.name}`}
+                          onClick={() => setPendingDelete(role)}
+                        >
+                          Delete
+                        </Button>
+                      </CellActions>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Panel>
       )}
-    </section>
+    </Page>
   )
 }
 
@@ -150,36 +163,43 @@ function CreateRoleForm() {
   }
 
   return (
-    <form
+    <Panel
+      as="form"
       onSubmit={submit}
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+      title="New role"
+      description="Create the role here, then add its grants and members on its page."
+      footer={
+        <Button
+          type="submit"
+          variant="primary"
+          icon="Plus"
+          disabled={create.isPending || !name.trim()}
+        >
+          {create.isPending ? 'Creating…' : 'Create role'}
+        </Button>
+      }
     >
-      <Subheading>New role</Subheading>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Name</Label>
-          <Input
+      <div className="fg-form">
+        <div className="fg-fieldrow">
+          <TextField
+            label="Name"
             type="text"
+            mono
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="e.g. ci-pushers"
           />
-        </Field>
-        <Field>
-          <Label>Description</Label>
-          <Input
+          <TextField
+            label="Description"
             type="text"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
-        </Field>
+        </div>
       </div>
       {create.isError && (
         <InlineError>{create.error.body || create.error.message}</InlineError>
       )}
-      <Button type="submit" disabled={create.isPending || !name.trim()}>
-        {create.isPending ? 'Creating…' : 'Create role'}
-      </Button>
-    </form>
+    </Panel>
   )
 }

@@ -56,9 +56,7 @@ test.describe('admin UI deep links', () => {
     await expect(
       page.getByRole('heading', { level: 1, name: f.adminUser, exact: true }),
     ).toBeVisible()
-    await expect(
-      page.getByRole('heading', { level: 2, name: /^tokens$/i }),
-    ).toBeVisible()
+    await expect(page.getByRole('region', { name: /^tokens$/i })).toBeVisible()
   })
 
   test('a deep link while signed out returns there after sign-in', async ({

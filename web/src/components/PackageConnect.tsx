@@ -1,8 +1,6 @@
 import { Link } from '@tanstack/react-router'
 
-import { Subheading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
-import { CommandSnippet } from '~/components/CopyButton'
+import { CommandSnippet, CopyField, Panel } from '~/components/ui'
 
 /** One copyable command of a format's connect panel. */
 interface Snippet {
@@ -76,9 +74,9 @@ export function connectSnippets(
 
 /**
  * "Connect" panel of a package repository (NuGet, Helm, or another format
- * plugin's): copyable client commands for its address, and where the
+ * plugin's): the address to copy, the client commands for it, and where the
  * password comes from — clients authenticate with an API token (from the
- * Tokens screen), not the UI sign-in. Docker repositories have
+ * Your tokens screen), not the UI sign-in. Docker repositories have
  * `DockerConnect`.
  */
 export function PackageConnect({
@@ -92,28 +90,31 @@ export function PackageConnect({
   url: string
   canPush?: boolean
 }) {
+  const snippets = connectSnippets(format, repo, url, canPush)
   return (
-    <section
-      aria-labelledby="package-connect"
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+    <Panel
+      title="Connect"
+      description={
+        <>
+          Use your username and an API token as the password; create one
+          under{' '}
+          <Link to="/tokens" className="fg-link">
+            Your tokens
+          </Link>
+          .
+        </>
+      }
     >
-      <div>
-        <Subheading id="package-connect">Connect</Subheading>
-        <Text className="mt-1">
-          Use your username and an API token as the password — create one on
-          the{' '}
-          <Link
-            to="/tokens"
-            className="text-sky-600 hover:underline dark:text-sky-400"
-          >
-            Tokens
-          </Link>{' '}
-          page.
-        </Text>
-      </div>
-      {connectSnippets(format, repo, url, canPush).map((snippet) => (
-        <CommandSnippet key={snippet.label} {...snippet} />
+      {format === 'nuget' && (
+        <CopyField
+          label="Service index"
+          value={`${url}/index.json`}
+          copyLabel="Copy service index"
+        />
+      )}
+      {snippets.map((snippet) => (
+        <CommandSnippet key={snippet.label} {...snippet} prompt={snippet.command !== url} />
       ))}
-    </section>
+    </Panel>
   )
 }

@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useCreateRepository, useFormats } from '~/queries/useRepositories'
-import { Heading } from '~/components/catalyst/heading'
+import { Page, PageHeader } from '~/components/ui'
 import {
   RepositoryForm,
   toCreateBody,
@@ -36,8 +36,15 @@ function CreateRepository() {
   }
 
   return (
-    <section className="space-y-6">
-      <Heading>New repository</Heading>
+    <Page>
+      <PageHeader
+        title="New repository"
+        crumbs={[
+          { label: 'Repositories', to: '/manage/repositories' },
+          { label: 'New repository' },
+        ]}
+        description="Choose what the repository serves and where its contents come from. The format and the kind cannot be changed later."
+      />
       <RepositoryForm
         mode="create"
         formats={formats.data}
@@ -48,6 +55,6 @@ function CreateRepository() {
         onSubmit={handleSubmit}
         onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
-    </section>
+    </Page>
   )
 }

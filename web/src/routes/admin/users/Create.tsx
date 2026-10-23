@@ -6,20 +6,20 @@ import { canonicalUsername, upnError, type CreatedUser } from '~/api/users'
 import { useCreateUser } from '~/queries/useUsers'
 import { useRealms } from '~/queries/useRealms'
 import { useEmailSettings } from '~/queries/useEmail'
+import { formatDateTime } from '~/lib/oci'
 import { AccessLevelFields } from '~/components/AccessLevelFields'
-import { Button } from '~/components/catalyst/button'
-import {
-  Description,
-  ErrorMessage,
-  Field,
-  FieldGroup,
-  Label,
-} from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Select } from '~/components/catalyst/select'
-import { Text } from '~/components/catalyst/text'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
+import {
+  Button,
+  Columns,
+  FormActions,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  TextField,
+} from '~/components/ui'
 
 export const Route = createFileRoute('/_app/manage/users/new')({
   component: CreateUserPage,
@@ -86,160 +86,164 @@ function CreateUserPage() {
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Link
-          to="/manage/users"
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          ← Users
-        </Link>
-        <Heading className="mt-1">New user</Heading>
-      </div>
+    <Page>
+      <PageHeader
+        title="New user"
+        crumbs={[{ label: 'Users', to: '/manage/users' }, { label: 'New user' }]}
+        description="A local account is invited to choose its own password; an account of a credential-forwarding realm signs in with the upstream's."
+      />
 
       {created ? (
         <Created user={created} onAnother={another} />
       ) : (
-        <form onSubmit={submit} className="space-y-8" aria-label="New user">
-          {!realm && noEmailService && (
-            <p
-              role="status"
-              className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-sm/6 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400"
-            >
-              No email service is configured, so no invitation can be sent:
-              the account is created and its invitation link is shown here
-              once, to pass on yourself.{' '}
-              <Link
-                to="/manage/settings/email"
-                className="font-medium underline hover:no-underline"
+        <Columns
+          aside={
+            <Panel title="Invitations">
+              <p className="fg-text">
+                The invitation link works once, until it expires; the user
+                page can send a new one or hand over a link while the user
+                has not chosen a password.
+              </p>
+            </Panel>
+          }
+          asideLabel="About invitations"
+        >
+          <form onSubmit={submit} className="flex flex-col gap-6" aria-label="New user">
+            {!realm && noEmailService && (
+              <Notice
+                tone="warn"
+                role="status"
+                action={
+                  <Link to="/manage/settings/email" className="fg-notice-action">
+                    Set up email
+                  </Link>
+                }
               >
-                Set up email
-              </Link>
-            </p>
-          )}
-          <FieldGroup>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Username</Label>
-                <Input
+                No email service is configured, so no invitation can be sent:
+                the account is created and its invitation link is shown here
+                once, to pass on yourself.
+              </Notice>
+            )}
+            <Panel title="Account">
+              <div className="fg-form">
+                <TextField
+                  label="Username"
                   type="text"
                   autoComplete="off"
+                  mono
                   placeholder="alice@example.com"
                   value={username}
-                  invalid={showUsernameError}
                   onChange={(e) => setUsername(e.target.value)}
                   onBlur={() => setUsernameTouched(true)}
+                  error={showUsernameError ? usernameError : undefined}
                 />
-                {showUsernameError && <ErrorMessage>{usernameError}</ErrorMessage>}
-              </Field>
-              {forwarding.length > 0 && (
-                <Field>
-                  <Label>Sign-in</Label>
-                  <Select value={realm} onChange={(e) => setRealm(e.target.value)}>
+                {forwarding.length > 0 && (
+                  <SelectField
+                    label="Sign-in"
+                    value={realm}
+                    onChange={(e) => setRealm(e.target.value)}
+                    description={
+                      realm
+                        ? 'Signs in with the upstream’s password, which gets the part of the username before the @.'
+                        : 'The user is invited to choose a password.'
+                    }
+                  >
                     <option value="">Forge password (invitation)</option>
                     {forwarding.map((r) => (
                       <option key={r.id} value={r.name}>
                         Credential forwarding: {r.name}
                       </option>
                     ))}
-                  </Select>
-                  <Description>
-                    {realm
-                      ? 'Signs in with the upstream’s password, which gets the part of the username before the @.'
-                      : 'The user is invited to choose a password.'}
-                  </Description>
-                </Field>
-              )}
-              <Field>
-                <Label>Email address</Label>
-                <Input
+                  </SelectField>
+                )}
+                <TextField
+                  label="Email address"
                   type="email"
                   autoComplete="off"
                   placeholder={canonicalUsername(username) || 'the username'}
                   value={address}
-                  invalid={addressError !== null}
                   onChange={(e) => setAddress(e.target.value)}
-                />
-                {addressError ? (
-                  <ErrorMessage>{addressError}</ErrorMessage>
-                ) : (
-                  <Description>
-                    {realm
+                  error={addressError ?? undefined}
+                  description={
+                    realm
                       ? 'Optional: where Forge writes to the user.'
-                      : 'Where the invitation goes. Blank: the username, when it is a mailbox.'}
-                  </Description>
-                )}
-              </Field>
-            </div>
-            <AccessLevelFields value={level} onChange={setLevel} />
-          </FieldGroup>
-          {create.isError && (
-            <p
-              role="alert"
-              className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-            >
-              {create.error.body || create.error.message}
-            </p>
-          )}
-          <Button
-            type="submit"
-            disabled={create.isPending || !username.trim() || !!usernameError || !!addressError}
-          >
-            {create.isPending ? 'Creating…' : realm ? 'Create user' : 'Create and invite'}
-          </Button>
-        </form>
+                      : 'Where the invitation goes. Blank: the username, when it is a mailbox.'
+                  }
+                />
+              </div>
+            </Panel>
+            <Panel title="Access">
+              <AccessLevelFields value={level} onChange={setLevel} />
+            </Panel>
+            {create.isError && (
+              <Notice tone="danger">{create.error.body || create.error.message}</Notice>
+            )}
+            <FormActions>
+              <Button variant="ghost" href="/manage/users">
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                icon={realm ? 'Plus' : 'Mail'}
+                disabled={
+                  create.isPending || !username.trim() || !!usernameError || !!addressError
+                }
+              >
+                {create.isPending ? 'Creating…' : realm ? 'Create user' : 'Create and invite'}
+              </Button>
+            </FormActions>
+          </form>
+        </Columns>
       )}
-    </section>
+    </Page>
   )
 }
 
 /** What the create did: the invitation sent, or its link to pass on. */
 function Created({ user, onAnother }: { user: CreatedUser; onAnother: () => void }) {
   const invitation = user.invitation
+  const until = invitation ? formatDateTime(invitation.expires_at) : ''
   return (
-    <div className="space-y-4">
+    <Panel
+      title={`Created ${user.username}`}
+      footer={
+        <>
+          <Button onClick={onAnother}>Create another</Button>
+          <Button
+            variant="primary"
+            href={`/manage/users/${user.id}`}
+            aria-label={`Go to ${user.username}`}
+          >
+            {`Go to ${user.username}`}
+          </Button>
+        </>
+      }
+    >
       {invitation?.email_sent ? (
-        <p
-          role="status"
-          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-        >
+        <Notice tone="ok">
           Created {user.username} and sent the invitation to {invitation.email}.
-          The link works once, until {new Date(invitation.expires_at).toLocaleString()}.
-        </p>
+          The link works once, until {until}.
+        </Notice>
       ) : invitation ? (
         <>
-          <Text>
+          <p className="fg-text">
             Created {user.username}.{' '}
             {invitation.error === 'no email service is configured'
               ? 'No email service is configured,'
               : `The invitation email was not sent (${invitation.error ?? 'unknown error'}),`}{' '}
             so give the user this link to choose a password. It works once,
-            until {new Date(invitation.expires_at).toLocaleString()}.
-          </Text>
+            until {until}.
+          </p>
           {invitation.link && (
             <ShowOnceSecret secret={invitation.link} label="Invitation link" />
           )}
         </>
       ) : (
-        <p
-          role="status"
-          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-        >
+        <Notice tone="ok">
           Created {user.username}: it signs in with its upstream password.
-        </p>
+        </Notice>
       )}
-      <div className="flex flex-wrap gap-3">
-        <Link
-          to="/manage/users/$userId"
-          params={{ userId: String(user.id) }}
-          className="inline-flex items-center rounded-lg bg-zinc-900 px-3 py-1.5 text-sm/6 font-semibold text-white hover:bg-zinc-700 dark:bg-white dark:text-zinc-900"
-        >
-          Go to {user.username}
-        </Link>
-        <Button outline onClick={onAnother}>
-          Create another
-        </Button>
-      </div>
-    </div>
+    </Panel>
   )
 }

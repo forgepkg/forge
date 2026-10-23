@@ -7,16 +7,18 @@ import {
   shortDigest,
   type ManifestKind,
 } from '~/lib/oci'
-import { Badge } from '~/components/catalyst/badge'
 import {
+  Chip,
+  CopyButton,
+  StatusBadge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
-import { CopyButton } from '~/components/CopyButton'
+  type IconName,
+} from '~/components/ui'
 
 /**
  * The image-detail tables: an image's **tags** (what each points at, its size
@@ -30,8 +32,8 @@ import { CopyButton } from '~/components/CopyButton'
 /** A short digest with its full value as tooltip, plus a copy button. */
 export function Digest({ digest, label }: { digest: string; label: string }) {
   return (
-    <span className="inline-flex items-center gap-1">
-      <span className="font-mono" title={digest}>
+    <span className="fg-digest">
+      <span className="fg-digest-short" title={digest}>
         {shortDigest(digest)}
       </span>
       <CopyButton value={digest} label={label} />
@@ -39,17 +41,15 @@ export function Digest({ digest, label }: { digest: string; label: string }) {
   )
 }
 
-/** Platforms (`linux/amd64`, …) as chips; an em dash when none are known. */
-function Platforms({ platforms }: { platforms: string[] }) {
-  if (platforms.length === 0) {
-    return <span className="text-zinc-400 dark:text-zinc-500">—</span>
+/** Chips (platforms, tags); an em dash when there are none. */
+function Chips({ values }: { values: string[] }) {
+  if (values.length === 0) {
+    return <span className="text-ink-faint">—</span>
   }
   return (
-    <span className="flex flex-wrap gap-1">
-      {platforms.map((p) => (
-        <Badge key={p} color="zinc" className="font-mono">
-          {p}
-        </Badge>
+    <span className="fg-cell-badges">
+      {values.map((v) => (
+        <Chip key={v}>{v}</Chip>
       ))}
     </span>
   )
@@ -57,27 +57,29 @@ function Platforms({ platforms }: { platforms: string[] }) {
 
 export function TagTable({ tags }: { tags: ImageTag[] }) {
   return (
-    <Table striped>
+    <Table caption="Tags">
       <TableHead>
-        <TableRow>
-          <TableHeader>Tag</TableHeader>
-          <TableHeader>Digest</TableHeader>
-          <TableHeader>Size</TableHeader>
-          <TableHeader>Platforms</TableHeader>
-        </TableRow>
+        <TableHeader width="160px">Tag</TableHeader>
+        <TableHeader>Digest</TableHeader>
+        <TableHeader align="right" width="110px">
+          Size
+        </TableHeader>
+        <TableHeader>Platforms</TableHeader>
       </TableHead>
       <TableBody>
         {tags.map((t) => (
           <TableRow key={t.tag}>
-            <TableCell className="font-mono font-medium">{t.tag}</TableCell>
+            <TableCell lead>
+              <span className="fg-mono font-semibold">{t.tag}</span>
+            </TableCell>
             <TableCell>
               <Digest digest={t.digest} label={`Copy digest of ${t.tag}`} />
             </TableCell>
-            <TableCell className="text-zinc-500 dark:text-zinc-400">
+            <TableCell align="right" nowrap>
               {formatBytes(t.size)}
             </TableCell>
             <TableCell>
-              <Platforms platforms={t.platforms} />
+              <Chips values={t.platforms} />
             </TableCell>
           </TableRow>
         ))}
@@ -86,10 +88,10 @@ export function TagTable({ tags }: { tags: ImageTag[] }) {
   )
 }
 
-const KIND_COLORS: Record<ManifestKind, React.ComponentProps<typeof Badge>['color']> = {
-  Image: 'sky',
-  Index: 'purple',
-  Artifact: 'amber',
+const KIND_ICONS: Record<ManifestKind, IconName> = {
+  Image: 'Package',
+  Index: 'Layers',
+  Artifact: 'Shield',
 }
 
 export function ManifestTable({
@@ -104,65 +106,44 @@ export function ManifestTable({
   const tagsByDigest = new Map(manifests.map((m) => [m.digest, m.tags]))
 
   return (
-    <Table striped>
+    <Table caption="Manifests">
       <TableHead>
-        <TableRow>
-          <TableHeader>Digest</TableHeader>
-          <TableHeader>Kind</TableHeader>
-          <TableHeader>Size</TableHeader>
-          <TableHeader>Platforms</TableHeader>
-          <TableHeader>Tags</TableHeader>
-          <TableHeader>Pushed</TableHeader>
-          <TableHeader>Last pulled</TableHeader>
-          {showSource && <TableHeader>Source</TableHeader>}
-        </TableRow>
+        <TableHeader>Digest</TableHeader>
+        <TableHeader>Kind</TableHeader>
+        <TableHeader align="right">Size</TableHeader>
+        <TableHeader>Platforms</TableHeader>
+        <TableHeader>Tags</TableHeader>
+        <TableHeader>Pushed</TableHeader>
+        <TableHeader>Last pulled</TableHeader>
+        {showSource && <TableHeader>Source</TableHeader>}
       </TableHead>
       <TableBody>
         {manifests.map((m) => (
           <TableRow key={m.digest}>
-            <TableCell>
+            <TableCell lead>
               <Digest digest={m.digest} label={`Copy digest ${shortDigest(m.digest)}`} />
             </TableCell>
             <TableCell>
               <ManifestKindCell manifest={m} subjectTags={tagsByDigest} />
             </TableCell>
-            <TableCell
-              className="text-zinc-500 dark:text-zinc-400"
-              title={`Manifest: ${m.manifest_size} B`}
-            >
+            <TableCell align="right" nowrap title={`Manifest: ${m.manifest_size} B`}>
               {formatBytes(m.size)}
             </TableCell>
             <TableCell>
-              <Platforms platforms={m.platforms} />
+              <Chips values={m.platforms} />
             </TableCell>
             <TableCell>
-              {m.tags.length === 0 ? (
-                <span className="text-zinc-400 dark:text-zinc-500">—</span>
-              ) : (
-                <span className="flex flex-wrap gap-1">
-                  {m.tags.map((tag) => (
-                    <Badge key={tag} color="zinc" className="font-mono">
-                      {tag}
-                    </Badge>
-                  ))}
-                </span>
-              )}
+              <Chips values={m.tags} />
             </TableCell>
-            <TableCell
-              className="text-zinc-500 dark:text-zinc-400"
-              title={m.created_at}
-            >
+            <TableCell nowrap title={m.created_at}>
               {formatDateTime(m.created_at)}
             </TableCell>
-            <TableCell
-              className="text-zinc-500 dark:text-zinc-400"
-              title={m.last_pulled_at ?? undefined}
-            >
+            <TableCell nowrap title={m.last_pulled_at ?? undefined}>
               {formatDateTime(m.last_pulled_at)}
             </TableCell>
             {showSource && (
-              <TableCell className="font-mono text-zinc-500 dark:text-zinc-400">
-                {m.source ?? '—'}
+              <TableCell>
+                <span className="fg-mono">{m.source ?? '—'}</span>
               </TableCell>
             )}
           </TableRow>
@@ -189,17 +170,20 @@ function ManifestKindCell({
   const tags = subject ? (subjectTags.get(subject) ?? []) : []
   return (
     <span className="flex flex-col items-start gap-0.5">
-      <span title={manifest.artifact_type ?? manifest.media_type}>
-        <Badge color={KIND_COLORS[kind]}>{kind}</Badge>
-      </span>
+      <StatusBadge
+        icon={KIND_ICONS[kind]}
+        title={manifest.artifact_type ?? manifest.media_type}
+      >
+        {kind}
+      </StatusBadge>
       {manifest.children.length > 0 && (
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
+        <span className="fg-cell-sub">
           lists {manifest.children.length}{' '}
           {manifest.children.length === 1 ? 'manifest' : 'manifests'}
         </span>
       )}
       {subject && (
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
+        <span className="fg-cell-sub">
           {referrerKind(manifest.artifact_type) ?? 'Referrer'} · refers to{' '}
           <span className="font-mono" title={subject}>
             {shortDigest(subject)}

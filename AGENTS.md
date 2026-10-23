@@ -89,4 +89,13 @@ Never create an issue without a milestone; set it when you create the issue:
 - An issue that must ship in the next release carries the `release blocker`
   label and goes in the earliest open milestone, the lowest version not yet
   released.
+- An issue planned for a later release goes in that release's milestone
+  (`2.1.0`), without the `release blocker` label. A planning milestone is a
+  plan, not a promise: when its release becomes the next one, the issues that
+  must ship in it get the label, and the others move to a later milestone or
+  to `Backlog`.
 - Every other issue goes in `Backlog`.
+
+Whatever merges to `main` ships in the next release. When an issue of a later
+milestone is fixed before then, move the issue to the next release's
+milestone, and its changelog fragment to that milestone's directory.

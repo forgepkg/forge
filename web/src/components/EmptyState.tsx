@@ -1,22 +1,28 @@
 import type { ReactNode } from 'react'
 
-import { Text } from '~/components/catalyst/text'
+import { EmptyState as UiEmptyState, type IconName } from '~/components/ui'
 
 /**
- * Neutral empty-result placeholder. Rendered when a query succeeds but returns
- * no rows (no search hits, a package with no visible versions, etc.).
+ * Empty-result placeholder. Rendered when a query succeeds but returns no
+ * rows (no search hits, a package with no visible versions, etc.): it names
+ * what is missing and who can change it.
  */
 export function EmptyState({
   title,
+  icon,
+  action,
+  bordered,
   children,
 }: {
   title: string
+  icon?: IconName
+  action?: ReactNode
+  bordered?: boolean
   children?: ReactNode
 }) {
   return (
-    <div className="rounded-xl border border-dashed border-zinc-950/15 p-10 text-center dark:border-white/15">
-      <p className="font-medium text-zinc-950 dark:text-white">{title}</p>
-      {children && <Text className="mt-1">{children}</Text>}
-    </div>
+    <UiEmptyState title={title} icon={icon} action={action} bordered={bordered}>
+      {children}
+    </UiEmptyState>
   )
 }

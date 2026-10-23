@@ -28,7 +28,8 @@ import { routeTree } from '~/routeTree.gen'
  *  - delete-user invalidates the list, and a refused delete (409 for the last
  *    active admin) shows the server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
- *    revoke removes the token (list invalidation reflecting `revoked_at`);
+ *    revoke (after a dialog) removes the token (list invalidation
+ *    reflecting `revoked_at`);
  *    an expired token is not shown as active, and scopes are visible.
  */
 
@@ -220,7 +221,7 @@ describe('admin users', () => {
 
     expect(await screen.findByText('alice')).toBeInTheDocument()
     const status = (name: string) =>
-      within(screen.getByRole('button', { name }).closest('tr')!).getAllByRole('cell')[4]
+      within(screen.getByRole('link', { name }).closest('tr')!).getAllByRole('cell')[4]
     expect(status('alice')).toHaveTextContent('active')
     expect(status('bob')).toHaveTextContent('inactive')
     expect(status('carol')).toHaveTextContent('invited')
@@ -248,7 +249,7 @@ describe('admin users', () => {
     await screen.findByText('alice@corp')
     expect(screen.getByRole('columnheader', { name: 'Sign-in' })).toBeInTheDocument()
     const signIn = (name: string) =>
-      within(screen.getByRole('button', { name }).closest('tr')!).getAllByRole(
+      within(screen.getByRole('link', { name }).closest('tr')!).getAllByRole(
         'cell',
       )[1]
     expect(signIn('alice')).toHaveTextContent('Credential forwarding')
@@ -502,7 +503,9 @@ describe('admin users', () => {
 
     expect(await screen.findByText('doomed')).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Delete' }))
-    await u.click(screen.getByRole('button', { name: 'Confirm' }))
+    const dialog = screen.getByRole('dialog', { name: 'Delete doomed?' })
+    expect(deleted).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Delete user' }))
 
     await waitFor(() => expect(deleted).toBe(7))
   })
@@ -521,7 +524,12 @@ describe('admin users', () => {
     await renderAt('/manage/users')
 
     await u.click(await screen.findByRole('button', { name: 'Delete' }))
-    await u.click(screen.getByRole('button', { name: 'Confirm' }))
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Delete sole-admin?' })).getByRole(
+        'button',
+        { name: 'Delete user' },
+      ),
+    )
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'this would leave no active administrator',
@@ -647,7 +655,9 @@ describe('admin tokens', () => {
 
     expect(await screen.findByText('ci')).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Revoke' }))
-    await u.click(screen.getByRole('button', { name: 'Confirm' }))
+    const dialog = screen.getByRole('dialog', { name: 'Revoke ci?' })
+    expect(revoked).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Revoke token' }))
 
     await waitFor(() => expect(revoked).toBe(5))
     expect(await screen.findByText('revoked')).toBeInTheDocument()
