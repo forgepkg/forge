@@ -276,15 +276,11 @@ The image bakes no bootstrap admin; it comes only from the environment, and
 only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for
 the first start, and `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
 [UPN](#usernames) of your organization if `admin@example.com` will not do: the
-account is created **once**. Startup refuses a name that is no UPN. Before 2.0
-the name defaulted to `admin`; the upgrade renames that account
-`admin@example.com` ([below](#accounts-from-before-20)), so a configuration
-that sets no name keeps finding it, and one that names a non-UPN must name the
-account's new name instead. Sign in to the web UI,
-invite personal admin accounts ([below](#inviting-users)) or connect OIDC,
-then delete the bootstrap account. It is not re-created on later restarts.
-Then remove the password from the environment: with no bootstrap password
-configured, Forge simply starts without a bootstrap admin.
+account is created **once**. Startup refuses a name that is no UPN. Sign in
+to the web UI, invite personal admin accounts ([below](#inviting-users)) or
+connect OIDC, then delete the bootstrap account. It is not re-created on later
+restarts. Then remove the password from the environment: with no bootstrap
+password configured, Forge simply starts without a bootstrap admin.
 
 Forge never lets the last active administrator go: deleting or deactivating
 that account, or removing its `admin` role, is refused with `409 Conflict`.
@@ -393,38 +389,9 @@ The rule applies wherever an account is created:
   `"realm": "<name>"` and no password), named by a UPN whose local part is the
   upstream's username: Forge forwards the local part, so
   `alice@example.com` signs in as the upstream's `alice`. A login the
-  upstream accepts but that names no account of the realm is refused.
-
-#### Accounts from before 2.0
-
-The first start of 2.0 renames every account whose name is no UPN, and logs
-each rename as a warning:
-
-- `alice` becomes `alice@example.com`, the bootstrap admin `admin` becomes
-  `admin@example.com`. In the local part, an `@` becomes `+` (the
-  `bob@entra` of an earlier OIDC namespace becomes `bob+entra@example.com`)
-  and whitespace `_`.
-- Where that name is taken, the account becomes `<name>#<id>@example.com`.
-- The account keeps its id, password, roles, tokens, sessions and identity
-  links. Users sign in with the new name; API tokens keep working whatever
-  name a client sends with them, but a password sent over Basic needs the new
-  name.
-- A credential-forwarding account keeps forwarding its old name (the new
-  name's local part). One whose old name held an `@` (`alice@corp`) would
-  forward `alice+corp`; delete it and create `alice@<your domain>` for the
-  realm instead. Its cached upstream verdicts are dropped, so its next login
-  asks the upstream again.
-- A bootstrap admin deleted before the upgrade stays deleted under its new
-  name.
-
-A credential-forwarding account that was named by a UPN already
-(`alice@corp.example`) is not renamed, but now forwards its local part,
-`alice`, too. Credential-forwarding realms no longer create accounts: create
-the accounts of new users under **Admin → Users**. A realm config that still
-sets `auto_provision: true` is refused by the admin API; the legacy
-`[auth.upstream_basic]` block's `auto_provision` is ignored.
-
-The rename goes away in 2.1.0; upgrade to 2.1 from a 2.0 release.
+  upstream accepts but that names no account of the realm is refused. A
+  realm config that sets `auto_provision: true` is refused by the admin API,
+  and the `[auth.upstream_basic]` block's `auto_provision` is ignored.
 
 ### Access and sign-in settings
 
