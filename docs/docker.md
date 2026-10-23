@@ -175,7 +175,9 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   upstream has more; an upstream that refuses a large `n` is asked without
   one.
 - An offline proxy (`"online": false`) serves only what it cached. Pointing a
-  proxy at another `remote_url` empties its cache.
+  proxy at another `remote_url` empties its cache; a fetch from the previous
+  upstream still running then caches nothing, and its client is asked to
+  retry (503).
 - To ask the upstream again before those TTLs run out (a tag moved, an image
   published after the proxy answered "not found"), invalidate the proxy's
   cache: *Invalidate cache* on its page in the web UI, or

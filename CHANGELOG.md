@@ -141,6 +141,12 @@ until the release folds them in.
   refused, and links to its next page when the upstream has more. A group
   ends its page where a member left tags out.
   ([#216](https://github.com/schmitch/forge/issues/216))
+- Docker proxies: a fetch from the previous upstream that was still running
+  when the proxy was pointed at another `remote_url` cached its tag,
+  manifest or layer after the repoint had emptied the cache, so the
+  previous upstream's tag was served for `metadata_ttl_seconds`. Such a
+  fetch caches nothing; its client is asked to retry (503).
+  ([#217](https://github.com/schmitch/forge/issues/217))
 
 ## [1.1.0]
 

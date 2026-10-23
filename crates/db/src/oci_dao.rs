@@ -61,6 +61,34 @@ where
     .await
 }
 
+/// Inside a proxy's transaction that caches what its upstream served: take a
+/// `FOR SHARE` lock on the repository row while it still names `remote_url`
+/// as the upstream. `false`: the proxy was repointed (or deleted) since the
+/// content was fetched, which must then not be cached. The lock conflicts
+/// with the update that repoints a proxy and purges its cache in the same
+/// transaction ([`purge_repository`]): the update waits for this insert to
+/// commit and purges it, or this waits for the update and sees the new
+/// upstream.
+pub async fn lock_proxy_upstream(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    remote_url: Option<&str>,
+) -> sqlx::Result<bool> {
+    let row = sqlx::query_scalar!(
+        r#"
+        SELECT 1 AS "one!"
+        FROM repository
+        WHERE id = $1 AND remote_url IS NOT DISTINCT FROM $2
+        FOR SHARE
+        "#,
+        repository_id,
+        remote_url,
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Remove every image row of `repository_id` (uploads, tags, manifests,
 /// links), releasing one blob reference per removed row. Returns how many
 /// references were released. The caller must hold the repository row

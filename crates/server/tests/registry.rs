@@ -1319,6 +1319,8 @@ struct MockRegistry {
     max_tags_n: Mutex<Option<usize>>,
     /// The query of every tag list request.
     tag_queries: Mutex<Vec<String>>,
+    /// Hold every manifest `GET` this long before answering.
+    manifest_delay: Mutex<std::time::Duration>,
 }
 
 impl MockRegistry {
@@ -1400,6 +1402,8 @@ impl MockRegistry {
                 };
                 if !head {
                     self.manifest_gets.fetch_add(1, Ordering::SeqCst);
+                    let delay = *self.manifest_delay.lock().unwrap();
+                    tokio::time::sleep(delay).await;
                 }
                 let digest = sha(&body);
                 if self.corrupt.load(Ordering::SeqCst) {
@@ -1626,6 +1630,67 @@ async fn group_tag_lists_end_where_a_member_left_tags_out() {
     assert!(resp.headers().get("link").is_none());
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["tags"], json!(["t10", "t11", "zz"]));
+}
+
+/// A docker proxy repointed while it fetches from its previous upstream
+/// caches nothing of that fetch: the repoint purges the cache, and what the
+/// previous upstream served must not land in it after the purge (#217).
+#[tokio::test]
+async fn a_fetch_from_the_previous_upstream_is_not_cached_after_a_repoint() {
+    let srv = common::start().await;
+    let old = MockRegistry::start().await;
+    let new = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let manifest = image(&cfg, &[b"previous upstream layer"]);
+    old.put("library/base", "1.0", OCI_MANIFEST, &manifest);
+    *old.manifest_delay.lock().unwrap() = std::time::Duration::from_secs(2);
+    let proxy = repo_name("proxy");
+    let created = create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": old.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = Arc::new(admin_oci(&srv).await);
+    let name = format!("{proxy}/library/base");
+
+    let pull = tokio::spawn({
+        let oci = oci.clone();
+        let name = name.clone();
+        async move { oci.get(&name, "manifests/1.0").await.status() }
+    });
+    for _ in 0..200 {
+        if old.manifest_gets.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        old.manifest_gets.load(Ordering::SeqCst),
+        1,
+        "the fetch is under way"
+    );
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{proxy}"),
+        json!({"remote_url": new.base()}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    assert_eq!(pull.await.unwrap(), 503, "asked to retry");
+    let rows: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM oci_tag WHERE repository_id = $1), \
+                (SELECT count(*) FROM oci_manifest WHERE repository_id = $1)",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, (0, 0), "no tag or manifest of the previous upstream");
 }
 
 #[tokio::test]
