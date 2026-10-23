@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 
 import {
   facts,
+  openFromRail,
   pushNupkg,
   readFixture,
   signInSession,
@@ -27,8 +28,7 @@ test.beforeEach(async ({ page }) => {
  */
 async function gotoRepositoriesList(page: import('@playwright/test').Page) {
   await page.goto('/')
-  await page.getByRole('link', { name: /^admin$/i }).click()
-  await page.getByRole('link', { name: /repositor/i }).first().click()
+  await openFromRail(page, 'Repositories')
   await expect(page).toHaveURL(/\/manage\/repositories$/)
 }
 
@@ -86,7 +86,11 @@ test('a pushed package appears in the repo folder view and in package detail', a
   // Folder view: open the repository from the Browse root, then search within
   // it — search is per repository now, so there is no cross-repo ambiguity.
   await page.goto('/')
-  await page.getByRole('link', { name: new RegExp(`\\b${repo}\\b`) }).click()
+  // (The rail lists the repository too; open it from the page.)
+  await page
+    .getByRole('main')
+    .getByRole('link', { name: new RegExp(`\\b${repo}\\b`) })
+    .click()
   await expect(page).toHaveURL(new RegExp(`/repos/${repo}`))
   await page.getByRole('searchbox').fill('Sample.Lib')
   const pkgLink = page.getByRole('link', { name: /Sample\.Lib/ })
