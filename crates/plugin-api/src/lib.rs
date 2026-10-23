@@ -90,7 +90,9 @@ pub trait FormatPlugin: Send + Sync + 'static {
 
     /// A JSON object summarizing `manifest`, stored with the version so that
     /// rendering never re-reads the manifest ([`PackageInfo::summary`]).
-    /// `None` when there is nothing worth keeping.
+    /// `None` when there is nothing worth keeping. Every listing hands each
+    /// version's summary back, so keep it small: the host stores none larger
+    /// than 64 KiB from a WebAssembly plugin.
     fn manifest_summary(&self, manifest: &[u8]) -> Option<String>;
 
     /// What a request is: a response right away, data to load first (then

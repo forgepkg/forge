@@ -138,6 +138,16 @@ host asks `manifest_summary` of its stored manifest). The web UI's package detai
 if present: `description`, and `dependency_groups` (the same shape as
 NuGet's).
 
+Every listing hands each version's summary to the plugin, so a summary
+should stay small. The host stores none larger than 64 KiB from a
+WebAssembly plugin, and logs a warning instead; a built-in plugin bounds its
+own. Helm's summary, which holds a version's index entry, takes at most
+16 KiB: past that, its description is cut to 1 KiB, then its largest fields
+are left out until it fits, and `apiVersion`, `name`, `version`,
+`appVersion`, `kubeVersion`, `type` and `deprecated` go last. A Helm summary
+stored before this bound is cut down the same way when the index is
+rendered.
+
 ## Proxy repositories
 
 A plugin that lists `proxy` among its kinds implements the upstream side of
