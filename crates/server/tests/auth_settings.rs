@@ -69,21 +69,10 @@ async fn create_repo(srv: &TestServer, anonymous_read: bool) -> String {
 
 /// A user without any grant, with a password.
 async fn make_user(srv: &TestServer) -> (i64, String, String) {
-    let (u, p) = srv.admin_basic();
     let username = format!("plain{}@example.com", common::unique());
-    let password = "pw12345678".to_string();
-    let created: Value = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"username": username, "password": password}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    (created["id"].as_i64().expect("user id"), username, password)
+    let password = "pw123456-plain".to_string();
+    let id = srv.create_user(&username, &password, "reader").await;
+    (id, username, password)
 }
 
 /// The status of reading `repo`'s service index, with `basic` credentials
@@ -332,7 +321,7 @@ async fn password_basic_sessions_and_lockout_follow_the_settings() {
     assert_eq!(resp.headers()["retry-after"], "120");
     // Turning the lockout off lets the right password in again.
     put_settings(&srv, json!({"login_max_failures": 0})).await;
-    assert_eq!(login("pw12345678").await.unwrap().status(), 200);
+    assert_eq!(login("pw123456-plain").await.unwrap().status(), 200);
 }
 
 /// A change on one instance reaches another within its cache TTL, without a
