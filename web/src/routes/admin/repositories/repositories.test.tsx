@@ -578,10 +578,7 @@ describe('admin repositories', () => {
 
     const toggle = await screen.findByRole('checkbox', { name: 'existing owner' })
     // A proxy cannot own package ids, so its toggle is off.
-    expect(screen.getByRole('checkbox', { name: 'nuget-org owner' })).toHaveAttribute(
-      'aria-disabled',
-      'true',
-    )
+    expect(screen.getByRole('checkbox', { name: 'nuget-org owner' })).toBeDisabled()
 
     await user.click(toggle)
     await waitFor(() =>
@@ -632,7 +629,9 @@ describe('admin repositories', () => {
     await renderAt('/manage/repositories/grp/members')
 
     await user.click(await screen.findByRole('button', { name: 'Remove' }))
-    await user.click(screen.getByRole('button', { name: 'Confirm' }))
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove releases' }),
+    )
 
     await waitFor(() => expect(removed).toBe('releases'))
     expect(await screen.findByRole('alert')).toHaveTextContent(
@@ -661,20 +660,23 @@ describe('admin repositories', () => {
     const toggle = await screen.findByRole('checkbox', { name: 'releases owner' })
     await user.click(toggle)
 
-    const row = toggle.closest('li')!
-    expect(within(row).getByText(/is the last owner/)).toHaveTextContent(
+    // The confirmation is a dialog naming the member.
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText(/is the last owner/)).toHaveTextContent(
       'the group trusts every hosted member equally',
     )
     expect(toggle).toBeChecked()
 
-    await user.click(within(row).getByRole('button', { name: 'Cancel' }))
-    expect(within(row).queryByText(/is the last owner/)).toBeNull()
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
     expect(toggle).toBeChecked()
     expect(patches).toEqual([])
 
     await user.click(toggle)
     expect(patches).toEqual([])
-    await user.click(within(row).getByRole('button', { name: 'Unflag' }))
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Unflag releases' }),
+    )
 
     await waitFor(() =>
       expect(patches).toEqual([{ member: 'releases', body: { owner: false } }]),
@@ -702,7 +704,10 @@ describe('admin repositories', () => {
     await user.click(within(row).getByRole('button', { name: 'Remove' }))
     expect(removed).toEqual([])
 
-    await user.click(within(row).getByRole('button', { name: 'Cancel' }))
+    // The confirmation is a dialog naming the member.
+    const dialog = screen.getByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
     expect(within(row).getByRole('button', { name: 'Remove' })).toBeInTheDocument()
     expect(removed).toEqual([])
     expect(
@@ -712,7 +717,9 @@ describe('admin repositories', () => {
     ).toBe(false)
 
     await user.click(within(row).getByRole('button', { name: 'Remove' }))
-    await user.click(within(row).getByRole('button', { name: 'Confirm' }))
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove nuget-org' }),
+    )
 
     await waitFor(() => expect(removed).toEqual(['nuget-org']))
   })

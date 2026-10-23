@@ -12,6 +12,7 @@ import { makeQueryClient } from '~/lib/queryClient'
 import type { Me } from '~/api/me'
 import type { PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
+import { textContent } from '~/test/text'
 
 /**
  * Package-detail screen: renders versions + dependency groups; a delayed proxy
@@ -134,9 +135,9 @@ describe('PackageDetail', () => {
       await screen.findByRole('heading', { name: 'Newtonsoft.Json' }),
     ).toBeInTheDocument()
     // Both versions appear in the versions table.
-    const versionsTable = screen.getByRole('table')
+    const versionsTable = screen.getByRole('table', { name: 'Versions of Newtonsoft.Json' })
     expect(within(versionsTable).getByText('13.0.3')).toBeInTheDocument()
-    expect(within(versionsTable).getByText('14.0.0-beta')).toBeInTheDocument()
+    expect(within(versionsTable).getByText(textContent('14.0.0-beta'))).toBeInTheDocument()
     // The dependency links to the same-repo package.
     const dep = screen.getByRole('link', { name: 'System.Text.Json' })
     expect(dep).toBeInTheDocument()
@@ -150,8 +151,8 @@ describe('PackageDetail', () => {
     await renderDetail('/packages/proxy/newtonsoft.json')
 
     await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
-    const table = screen.getByRole('table')
-    const betaRow = within(table).getByText('14.0.0-beta').closest('tr')
+    const table = screen.getByRole('table', { name: 'Versions of Newtonsoft.Json' })
+    const betaRow = within(table).getByText(textContent('14.0.0-beta')).closest('tr')
     expect(betaRow).not.toBeNull()
     expect(within(betaRow as HTMLElement).getByText(/delayed/)).toBeInTheDocument()
 

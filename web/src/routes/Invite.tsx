@@ -9,12 +9,8 @@ import {
   MIN_INVITATION_PASSWORD_CHARS,
 } from '~/api/auth'
 import { ApiError } from '~/lib/httpClient'
-import { AuthLayout } from '~/components/catalyst/auth-layout'
-import { Button } from '~/components/catalyst/button'
-import { Description, Field, Label } from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { AuthCard } from '~/components/AuthCard'
+import { Button, Icon, Notice, Skeleton, TextField } from '~/components/ui'
 
 export const Route = createFileRoute('/invite')({
   component: Invite,
@@ -85,64 +81,57 @@ function Invite() {
   const invalid = token === '' || lookup.isError
 
   return (
-    <AuthLayout>
-      <div className="w-full max-w-sm space-y-8">
-        <div className="space-y-2 text-center">
-          <Heading className="!text-2xl">Choose your password</Heading>
-          {lookup.data && (
-            <Text>
-              For your Forge account{' '}
-              <span className="font-medium text-zinc-950 dark:text-white">
-                {lookup.data.username}
-              </span>
-            </Text>
-          )}
-        </div>
-
-        {invalid ? (
-          <div
-            role="alert"
-            className="space-y-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
-          >
-            <p>{token === '' ? INVALID_INVITATION : reason(lookup.error)}</p>
-            <Link to="/login" className="font-medium underline hover:no-underline">
+    <AuthCard
+      title="Choose your password"
+      subtitle={
+        lookup.data && (
+          <>
+            For your Forge account <span className="fg-strong">{lookup.data.username}</span>
+          </>
+        )
+      }
+    >
+      {invalid ? (
+        <Notice
+          tone="danger"
+          action={
+            <Link to="/login" className="fg-notice-action">
               Sign in
             </Link>
-          </div>
-        ) : !lookup.data ? (
-          <Text>Checking the invitation…</Text>
-        ) : (
-          <form onSubmit={submit} className="space-y-6" aria-label="Choose your password">
-            <Field>
-              <Label>Password</Label>
-              <Input
-                type="password"
-                autoComplete="new-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <Description>At least {MIN_INVITATION_PASSWORD_CHARS} characters.</Description>
-            </Field>
-            <Field>
-              <Label>Password again</Label>
-              <Input
-                type="password"
-                autoComplete="new-password"
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-              />
-            </Field>
-            {(problem || accept.isError) && (
-              <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-                {problem ?? reason(accept.error)}
-              </p>
-            )}
-            <Button type="submit" className="w-full" disabled={accept.isPending}>
-              {accept.isPending ? 'Saving…' : 'Set password'}
-            </Button>
-          </form>
-        )}
-      </div>
-    </AuthLayout>
+          }
+        >
+          {token === '' ? INVALID_INVITATION : reason(lookup.error)}
+        </Notice>
+      ) : !lookup.data ? (
+        <Skeleton lines={2} label="Checking the invitation…" />
+      ) : (
+        <form onSubmit={submit} className="flex flex-col gap-4" aria-label="Choose your password">
+          <TextField
+            label="Password"
+            type="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            description={`At least ${MIN_INVITATION_PASSWORD_CHARS} characters.`}
+          />
+          <TextField
+            label="Password again"
+            type="password"
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+          />
+          {(problem || accept.isError) && (
+            <p role="alert" className="fg-field-error">
+              <Icon name="Alert" size={14} />
+              <span>{problem ?? reason(accept.error)}</span>
+            </p>
+          )}
+          <Button type="submit" variant="primary" block disabled={accept.isPending}>
+            {accept.isPending ? 'Saving…' : 'Set password'}
+          </Button>
+        </form>
+      )}
+    </AuthCard>
   )
 }

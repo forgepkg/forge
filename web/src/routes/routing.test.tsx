@@ -95,37 +95,46 @@ describe('app routing + admin gating', () => {
     clearSession()
   })
 
-  it('hides the Admin nav link for a reader', async () => {
+  it('hides the Administration links for a reader', async () => {
     setSession('reader-csrf')
     mockMe(readerMe)
 
     await renderApp('/')
 
-    const header = await screen.findByRole('banner')
+    const rail = await screen.findByRole('navigation', { name: 'Main' })
     // Wait for the identity to resolve so the current-user widget has rendered:
-    // the username plus a "reader" role badge and a Sign out button.
-    expect(await within(header).findByText('alice')).toBeInTheDocument()
-    expect(within(header).getByText('reader')).toBeInTheDocument()
+    // the username, its role and a Sign out button.
+    expect(await within(rail).findByText('alice')).toBeInTheDocument()
+    expect(within(rail).getByText('User')).toBeInTheDocument()
     expect(
-      within(header).getByRole('button', { name: 'Sign out' }),
+      within(rail).getByRole('button', { name: 'Sign out' }),
     ).toBeInTheDocument()
 
-    const nav = within(header).getByRole('navigation')
-    expect(within(nav).getByRole('link', { name: 'Browse' })).toBeInTheDocument()
+    expect(within(rail).getByRole('link', { name: 'Browse' })).toBeInTheDocument()
+    expect(within(rail).getByRole('link', { name: 'Your tokens' })).toBeInTheDocument()
+    expect(within(rail).queryByText('Administration')).not.toBeInTheDocument()
     expect(
-      within(nav).queryByRole('link', { name: 'Admin' }),
+      within(rail).queryByRole('link', { name: 'Overview' }),
     ).not.toBeInTheDocument()
   })
 
-  it('shows the Admin nav link for an admin', async () => {
+  it('shows the Administration links for an admin', async () => {
     setSession('admin-csrf')
     mockMe(adminMe)
 
     await renderApp('/')
 
-    const nav = await screen.findByRole('navigation')
+    const rail = await screen.findByRole('navigation', { name: 'Main' })
     await waitFor(() =>
-      expect(within(nav).getByRole('link', { name: 'Admin' })).toBeInTheDocument(),
+      expect(within(rail).getByRole('link', { name: 'Overview' })).toHaveAttribute(
+        'href',
+        '/manage',
+      ),
+    )
+    expect(within(rail).getByText('Administrator')).toBeInTheDocument()
+    expect(within(rail).getByRole('link', { name: 'Authentication' })).toHaveAttribute(
+      'href',
+      '/manage/realms',
     )
   })
 
@@ -147,21 +156,23 @@ describe('app routing + admin gating', () => {
     const router = await renderApp('/manage')
 
     expect(router.state.location.pathname).toBe('/manage')
-    expect(await screen.findByText('Administration')).toBeInTheDocument()
+    const main = within(screen.getByRole('main'))
+    expect(await main.findByRole('heading', { level: 1, name: 'Administration' })).toBeInTheDocument()
     // Only what the UI can manage; the rest is named as API-only, and RBAC
     // is no longer part of that rest.
-    expect(screen.queryByText(/admin flags|with retention/)).toBeNull()
+    expect(main.queryByText(/admin flags|with retention/)).toBeNull()
     expect(
-      screen.getByText(/Retention, user deactivation and key rotation have no screen/),
+      main.getByText(/Retention and user deactivation have no screen/),
     ).toBeInTheDocument()
-    expect(screen.queryByText(/RBAC/)).toBeNull()
-    expect(screen.getByRole('link', { name: /^Roles/ })).toHaveAttribute(
+    expect(main.queryByText(/RBAC/)).toBeNull()
+    expect(main.getByRole('link', { name: /^Roles/ })).toHaveAttribute(
       'href',
       '/manage/roles',
     )
     expect(
-      screen.getByRole('link', { name: /^Content selectors/ }),
+      main.getByRole('link', { name: /^Content selectors/ }),
     ).toHaveAttribute('href', '/manage/content-selectors')
+    expect(main.getByRole('link', { name: /^System/ })).toHaveAttribute('href', '/manage/system')
   })
 
   it('refreshes the stored CSRF token from the live session on load', async () => {
@@ -192,9 +203,9 @@ describe('app routing + admin gating', () => {
     })
     const router = await renderApp('/')
 
-    const header = await screen.findByRole('banner')
-    await within(header).findByText('alice')
-    await userEvent.click(within(header).getByRole('button', { name: 'Sign out' }))
+    const rail = await screen.findByRole('navigation', { name: 'Main' })
+    await within(rail).findByText('alice')
+    await userEvent.click(within(rail).getByRole('button', { name: 'Sign out' }))
 
     await waitFor(() => expect(router.state.location.pathname).toBe('/login'))
     expect(
@@ -219,9 +230,9 @@ describe('app routing + admin gating', () => {
     })
     const router = await renderApp('/')
 
-    const header = await screen.findByRole('banner')
-    await within(header).findByText('alice')
-    await userEvent.click(within(header).getByRole('button', { name: 'Sign out' }))
+    const rail = await screen.findByRole('navigation', { name: 'Main' })
+    await within(rail).findByText('alice')
+    await userEvent.click(within(rail).getByRole('button', { name: 'Sign out' }))
 
     await waitFor(() => expect(router.state.location.pathname).toBe('/login'))
     expect(screen.queryByText(/sign-out could not be confirmed/i)).toBeNull()

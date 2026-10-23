@@ -230,6 +230,13 @@ helm repo add bitnami-via-forge https://forge.example.com/repository/bitnami \
   --username me --password $TOKEN
 ```
 
+Chart versions are SemVer, as Helm reads them (`v1.2` is `1.2.0`), and at
+most 128 characters, as written and normalized: Helm pushes a chart to an OCI
+registry with its version as the tag, and an OCI tag is at most 128
+characters, so every chart Helm can push there fits. A push of a chart with a
+longer version answers 400, a URL naming one answers 404, and a proxy leaves
+such versions of its upstream's index out.
+
 Its index describes each chart's newest version fully and the older ones by
 name, version and URL: that is what one search of the upstream says, and
 reading the upstream's index once per chart would be slow for large
@@ -325,6 +332,15 @@ The host enforces these for every plugin, built in or not:
   action against the method the caller was authorized for, the repository
   kind and the credential type, before the hosted write path applies its
   own selector and redeploy checks.
+- **Bounded ids and versions.** Whatever the plugin's own rules, an id
+  longer than 512 bytes or a version longer than 256 bytes, as given or as
+  the plugin normalizes it, is not one: a push of a package carrying one
+  answers 400, a request naming one answers like one naming an unknown
+  package (404), and a proxy leaves such versions of an upstream listing
+  out. Ids and versions are keys of database indexes, whose entries
+  PostgreSQL limits to about 2,700 bytes. The built-in plugins allow less:
+  NuGet 100 characters for an id and 64 for a version, Helm 250 for a chart
+  name and 128 for a version.
 - **Responses cannot attack the origin.** Only `cache-control`,
   `content-disposition`, `content-language`, `content-type`, `etag`,
   `last-modified` and `location` survive; `location` survives only when it

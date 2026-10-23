@@ -1,21 +1,23 @@
+import type { ReactNode } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { ImageDetail } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
-import { defaultPullTag } from '~/lib/oci'
+import { defaultPullTag, formatDateTime } from '~/lib/oci'
 import { useImageDetail } from '~/queries/useImageDetail'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Code, Text } from '~/components/catalyst/text'
-import { Divider } from '~/components/catalyst/divider'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Select } from '~/components/catalyst/select'
-import { RepoKindBadge } from '~/components/RepoKindBadge'
-import { CommandSnippet } from '~/components/CopyButton'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
-import { Breadcrumbs } from '~/components/Breadcrumbs'
+import {
+  Code,
+  CommandSnippet,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+} from '~/components/ui'
 
 /** `?tag=` — the tag the pull commands use (deep-linkable). */
 interface ImageDetailSearch {
@@ -47,58 +49,74 @@ function ImageDetailPage() {
   const navigate = useNavigate({ from: Route.fullPath })
   const detail = useImageDetail(repo, image)
 
+  const crumbs = [
+    { label: 'Repositories', to: '/' },
+    { label: repo, to: '/repos/$repo', params: { repo } },
+    { label: image },
+  ]
+  const shell = (body: ReactNode) => (
+    <Page>
+      <PageHeader title={image || repo} icon="Layers" crumbs={crumbs} />
+      {body}
+    </Page>
+  )
   const notFound = (
-    <EmptyState title="Image not found">
-      No readable image <span className="font-mono">{image}</span> in
-      repository <span className="font-mono">{repo}</span>.
+    <EmptyState title="Image not found" icon="Layers">
+      No readable image <Code>{image}</Code> in repository <Code>{repo}</Code>.
     </EmptyState>
   )
 
-  if (image === '') return notFound
+  if (image === '') return shell(notFound)
 
   if (detail.isLoading) {
-    return <Text>Loading image…</Text>
+    return shell(<Skeleton variant="table" label="Loading image…" />)
   }
 
   if (detail.isError) {
     // A 404 means the image (or repo) is not visible / does not exist; render
     // it as a not-found empty state rather than a scary error panel.
     if (detail.error instanceof ApiError && detail.error.status === 404) {
-      return notFound
+      return shell(notFound)
     }
     if (isRepositoryOffline(detail.error)) {
-      return <RepositoryOfflineState onRetry={() => void detail.refetch()} />
+      return shell(<RepositoryOfflineState onRetry={() => void detail.refetch()} />)
     }
-    return (
+    return shell(
       <ErrorState
         title="Could not load image"
         message={detail.error?.message}
         onRetry={() => void detail.refetch()}
-      />
+      />,
     )
   }
 
   const img = detail.data
   if (!img) return null
+  const lastPushed = img.manifests
+    .map((m) => m.created_at)
+    .filter((t): t is string => !!t)
+    .sort()
+    .at(-1)
 
   return (
-    <section className="space-y-8">
-      <div className="space-y-2">
-        <Breadcrumbs
-          items={[
-            { label: 'Repositories', to: '/' },
-            { label: img.repo, to: '/repos/$repo', params: { repo: img.repo } },
-            { label: img.image },
-          ]}
-        />
-        <div className="flex flex-wrap items-center gap-3">
-          <Heading className="break-all">{img.image}</Heading>
-          <span className="flex items-center gap-2 text-sm/6 text-zinc-500 dark:text-zinc-400">
-            {img.repo}
-            <RepoKindBadge kind={img.repo_kind} />
-          </span>
-        </div>
-      </div>
+    <Page>
+      <PageHeader
+        title={img.image}
+        icon="Layers"
+        crumbs={[
+          { label: 'Repositories', to: '/' },
+          { label: img.repo, to: '/repos/$repo', params: { repo: img.repo } },
+          { label: img.image },
+        ]}
+        kind={img.repo_kind}
+        format="docker"
+        meta={[
+          img.tags.length === 1 ? '1 tag' : `${img.tags.length} tags`,
+          img.manifests.length === 1 ? '1 manifest' : `${img.manifests.length} manifests`,
+          // A proxy's manifests carry their cache time, not a push (#248).
+          img.repo_kind === 'hosted' && lastPushed && `Pushed ${formatDateTime(lastPushed)}`,
+        ]}
+      />
 
       <PullPanel
         detail={img}
@@ -108,31 +126,30 @@ function ImageDetailPage() {
         }
       />
 
-      <section aria-labelledby="image-tags">
-        <Subheading id="image-tags">Tags</Subheading>
-        <div className="mt-3">
-          {img.tags.length === 0 ? (
-            <EmptyState title="No tags">
-              This image has only untagged manifests; pull one by digest.
-            </EmptyState>
-          ) : (
-            <TagTable tags={img.tags} />
-          )}
-        </div>
-      </section>
+      <Panel
+        title="Tags"
+        count={img.tags.length}
+        flush
+        description="A tag on an index pulls the platform that matches the client."
+      >
+        {img.tags.length === 0 ? (
+          <EmptyState title="No tags" icon="Layers" bordered={false}>
+            This image has only untagged manifests; pull one by digest.
+          </EmptyState>
+        ) : (
+          <TagTable tags={img.tags} />
+        )}
+      </Panel>
 
-      <Divider />
-
-      <section aria-labelledby="image-manifests">
-        <Subheading id="image-manifests">Manifests</Subheading>
-        <div className="mt-3">
-          <ManifestTable
-            manifests={img.manifests}
-            showSource={img.repo_kind === 'group'}
-          />
-        </div>
-      </section>
-    </section>
+      <Panel
+        title="Manifests"
+        count={img.manifests.length}
+        flush
+        description="Indexes, the platform images they list, and referrers such as signatures and SBOMs."
+      >
+        <ManifestTable manifests={img.manifests} showSource={img.repo_kind === 'group'} />
+      </Panel>
+    </Page>
   )
 }
 
@@ -164,48 +181,43 @@ function PullPanel({
     )?.digest
 
   return (
-    <section
-      aria-labelledby="image-pull"
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+    <Panel
+      title="Pull"
+      description={
+        <>
+          Log in first with <Code>docker login {detail.registry}</Code>, using
+          an API token from{' '}
+          <Link to="/tokens" className="fg-link">
+            Your tokens
+          </Link>{' '}
+          as the password.
+        </>
+      }
     >
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <Subheading id="image-pull">Pull</Subheading>
-          <Text className="mt-1">
-            Log in first with <Code>docker login {detail.registry}</Code>,
-            using an API token from the{' '}
-            <Link
-              to="/tokens"
-              className="text-sky-600 hover:underline dark:text-sky-400"
-            >
-              Tokens
-            </Link>{' '}
-            page as the password.
-          </Text>
-        </div>
+      <div className="flex flex-wrap items-end gap-4">
         {detail.tags.length > 1 && current && (
-          <Field className="w-48">
-            <Label>Tag</Label>
-            <Select
-              value={current.tag}
-              onChange={(e) => onSelectTag(e.target.value)}
-            >
-              {detail.tags.map((t) => (
-                <option key={t.tag} value={t.tag}>
-                  {t.tag}
-                </option>
-              ))}
-            </Select>
-          </Field>
+          <SelectField
+            label="Tag"
+            className="w-48"
+            value={current.tag}
+            onChange={(e) => onSelectTag(e.target.value)}
+          >
+            {detail.tags.map((t) => (
+              <option key={t.tag} value={t.tag}>
+                {t.tag}
+              </option>
+            ))}
+          </SelectField>
+        )}
+        {current && (
+          <CommandSnippet
+            label="By tag"
+            className="min-w-0 flex-[1_1_420px]"
+            command={`docker pull ${detail.pull_name}:${current.tag}`}
+            copyLabel="Copy pull command"
+          />
         )}
       </div>
-      {current && (
-        <CommandSnippet
-          label="By tag"
-          command={`docker pull ${detail.pull_name}:${current.tag}`}
-          copyLabel="Copy pull command"
-        />
-      )}
       {digest && (
         <CommandSnippet
           label="By digest"
@@ -213,6 +225,6 @@ function PullPanel({
           copyLabel="Copy pull-by-digest command"
         />
       )}
-    </section>
+    </Panel>
   )
 }

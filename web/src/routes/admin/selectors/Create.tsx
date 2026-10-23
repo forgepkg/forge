@@ -1,7 +1,7 @@
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useCreateSelector } from '~/queries/useRbac'
-import { Heading } from '~/components/catalyst/heading'
+import { Page, PageHeader } from '~/components/ui'
 import { SelectorForm } from '~/components/SelectorForm'
 
 export const Route = createFileRoute('/_app/manage/content-selectors/new')({
@@ -14,16 +14,14 @@ function CreateSelector() {
   const create = useCreateSelector()
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Link
-          to="/manage/content-selectors"
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          ← Content selectors
-        </Link>
-        <Heading className="mt-1">New content selector</Heading>
-      </div>
+    <Page>
+      <PageHeader
+        title="New content selector"
+        crumbs={[
+          { label: 'Content selectors', to: '/manage/content-selectors' },
+          { label: 'New content selector' },
+        ]}
+      />
       <SelectorForm
         mode="create"
         submitting={create.isPending}
@@ -37,6 +35,6 @@ function CreateSelector() {
         }
         onCancel={() => void navigate({ to: '/manage/content-selectors' })}
       />
-    </section>
+    </Page>
   )
 }

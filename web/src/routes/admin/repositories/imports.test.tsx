@@ -255,7 +255,7 @@ describe('import from Nexus', () => {
       },
     })
     await renderAt('/manage/repositories/nuget-internal/import')
-    await screen.findByText('No imports yet.')
+    await screen.findByText('No imports yet')
 
     await userEvent.type(
       screen.getByPlaceholderText('https://nexus.example.com'),

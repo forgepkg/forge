@@ -8,16 +8,23 @@ import {
   useRevokeMyToken,
 } from '~/queries/useTokens'
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
-import { Code, Text } from '~/components/catalyst/text'
-import { Heading } from '~/components/catalyst/heading'
 import {
+  Button,
+  CellActions,
+  Code,
+  Dialog,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  Skeleton,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
@@ -45,24 +52,26 @@ function MyTokens() {
   const repos = useBrowseRepos()
 
   const [created, setCreated] = useState<CreatedToken | null>(null)
-  const [pendingRevoke, setPendingRevoke] = useState<number | null>(null)
+  const [pendingRevoke, setPendingRevoke] = useState<TokenView | null>(null)
 
   function confirmRevoke(tokenId: number) {
     revoke.mutate(tokenId, { onSettled: () => setPendingRevoke(null) })
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Heading>Your tokens</Heading>
-        <Text className="mt-1">
-          Registry tokens authenticate NuGet clients (e.g.{' '}
-          <Code>dotnet restore</Code> / <Code>push</Code>) against the feed,
-          and Docker clients: use one as the password of{' '}
-          <Code>docker login</Code>. They cannot be used to sign in here. The
-          secret is shown only at creation time.
-        </Text>
-      </div>
+    <Page>
+      <PageHeader
+        title="Your tokens"
+        description={
+          <>
+            Registry tokens authenticate NuGet clients (<Code>dotnet restore</Code>,{' '}
+            <Code>push</Code>), Helm and Docker clients as you: use one as the
+            password of <Code>docker login</Code> with your username. They
+            cannot be used to sign in here. The secret is shown only at
+            creation time.
+          </>
+        }
+      />
 
       {created && (
         <ShowOnceSecret
@@ -75,7 +84,7 @@ function MyTokens() {
       <TokenCreateForm
         repositories={repos.data ?? []}
         submitting={create.isPending}
-        placeholder="e.g. my-laptop"
+        placeholder="e.g. build-agent-04"
         onSubmit={(body, reset) =>
           create.mutate(body, {
             onSuccess: (token) => {
@@ -87,10 +96,10 @@ function MyTokens() {
       />
 
       {create.isError && (
-        <InlineError>{create.error.body || create.error.message}</InlineError>
+        <Notice tone="danger">{create.error.body || create.error.message}</Notice>
       )}
       {revoke.isError && (
-        <InlineError>{revoke.error.body || revoke.error.message}</InlineError>
+        <Notice tone="danger">{revoke.error.body || revoke.error.message}</Notice>
       )}
 
       {tokens.isError ? (
@@ -99,120 +108,99 @@ function MyTokens() {
           message={tokens.error?.message}
           onRetry={() => void tokens.refetch()}
         />
-      ) : tokens.isLoading ? (
-        <Text>Loading tokens…</Text>
-      ) : (tokens.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No tokens yet">
-          Create a token above to authenticate your NuGet or Docker client.
-        </EmptyState>
       ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
-              <TableHeader>Name</TableHeader>
-              <TableHeader>Created</TableHeader>
-              <TableHeader>Last used</TableHeader>
-              <TableHeader>Scope</TableHeader>
-              <TableHeader>Status</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {tokens.data!.map((token) => (
-              <TokenRow
-                key={token.id}
-                token={token}
-                isRevoking={revoke.isPending && pendingRevoke === token.id}
-                pendingRevoke={pendingRevoke === token.id}
-                onRequestRevoke={() => setPendingRevoke(token.id)}
-                onCancelRevoke={() => setPendingRevoke(null)}
-                onConfirmRevoke={() => confirmRevoke(token.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
+        <Panel
+          title="Tokens"
+          count={tokens.data?.length}
+          flush
+          description="A token stops working when you revoke it or when it expires."
+        >
+          {tokens.isLoading ? (
+            <Skeleton variant="table" label="Loading tokens…" />
+          ) : (tokens.data?.length ?? 0) === 0 ? (
+            <EmptyState title="No tokens yet" icon="Key" bordered={false}>
+              Create a token above to authenticate your NuGet, Helm or Docker client.
+            </EmptyState>
+          ) : (
+            <Table caption="Your registry tokens">
+              <TableHead>
+                <TableHeader>Name</TableHeader>
+                <TableHeader>Created</TableHeader>
+                <TableHeader>Last used</TableHeader>
+                <TableHeader>Scope</TableHeader>
+                <TableHeader>Status</TableHeader>
+                <TableHeader align="right">
+                  <span className="fg-sr">Actions</span>
+                </TableHeader>
+              </TableHead>
+              <TableBody>
+                {tokens.data!.map((token) => (
+                  <TokenRow
+                    key={token.id}
+                    token={token}
+                    onRequestRevoke={() => setPendingRevoke(token)}
+                  />
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </Panel>
       )}
-    </section>
-  )
-}
 
-function InlineError({ children }: { children: React.ReactNode }) {
-  return (
-    <p
-      role="alert"
-      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-    >
-      {children}
-    </p>
+      <Dialog
+        open={pendingRevoke !== null}
+        onClose={() => setPendingRevoke(null)}
+        icon="Key"
+        tone="danger"
+        title={`Revoke ${pendingRevoke?.name ?? 'token'}?`}
+        description="Clients that use it can no longer pull or push. This cannot be undone."
+        confirmLabel={revoke.isPending ? 'Revoking…' : 'Revoke token'}
+        confirmVariant="danger-solid"
+        confirmDisabled={revoke.isPending}
+        onConfirm={() => pendingRevoke && confirmRevoke(pendingRevoke.id)}
+      />
+    </Page>
   )
 }
 
 function formatTs(ts: string | null): string {
   if (!ts) return '—'
   const d = new Date(ts)
-  return Number.isNaN(d.getTime()) ? ts : d.toLocaleString()
+  return Number.isNaN(d.getTime())
+    ? ts
+    : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
 function TokenRow({
   token,
-  isRevoking,
-  pendingRevoke,
   onRequestRevoke,
-  onCancelRevoke,
-  onConfirmRevoke,
 }: {
   token: TokenView
-  isRevoking: boolean
-  pendingRevoke: boolean
   onRequestRevoke: () => void
-  onCancelRevoke: () => void
-  onConfirmRevoke: () => void
 }) {
   const revoked = token.revoked_at != null
   return (
     <TableRow>
-      <TableCell className="font-medium">{token.name}</TableCell>
-      <TableCell className="text-zinc-500 dark:text-zinc-400">
-        {formatTs(token.created_at)}
+      <TableCell lead className="font-mono text-[13px] font-semibold">
+        {token.name}
       </TableCell>
-      <TableCell className="text-zinc-500 dark:text-zinc-400">
-        {formatTs(token.last_used_at)}
-      </TableCell>
+      <TableCell nowrap>{formatTs(token.created_at)}</TableCell>
+      <TableCell nowrap>{formatTs(token.last_used_at)}</TableCell>
       <TableCell>
         <TokenScopeBadges scope={token.scope} />
       </TableCell>
       <TableCell>
         <TokenStatusBadge token={token} />
       </TableCell>
-      <TableCell>
+      <TableCell align="right">
         {revoked ? (
-          <span className="text-zinc-400 dark:text-zinc-500">—</span>
-        ) : pendingRevoke ? (
-          <span className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onConfirmRevoke}
-              disabled={isRevoking}
-              className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
-            >
-              {isRevoking ? 'Revoking…' : 'Confirm'}
-            </button>
-            <button
-              type="button"
-              onClick={onCancelRevoke}
-              className="text-zinc-500 hover:underline dark:text-zinc-400"
-            >
-              Cancel
-            </button>
-          </span>
+          <span className="text-ink-faint">—</span>
         ) : (
-          <button
-            type="button"
-            onClick={onRequestRevoke}
-            className="font-medium text-red-600 hover:underline dark:text-red-400"
-          >
-            Revoke
-          </button>
+          <CellActions>
+            <Button size="sm" variant="ghost" icon="Trash" onClick={onRequestRevoke}>
+              Revoke
+            </Button>
+          </CellActions>
         )}
       </TableCell>
     </TableRow>

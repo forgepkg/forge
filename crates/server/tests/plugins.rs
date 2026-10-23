@@ -1053,3 +1053,114 @@ async fn a_helm_proxy_serves_its_upstreams_charts() {
     let resp = push(&srv, &proxy, &creds, chart("demo", "1.0.1")).await;
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+/// `len` lowercase letters and digits that PostgreSQL cannot compress, so
+/// that an index entry holding them is as long as they are.
+fn incompressible(len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut block = sha2::Sha256::digest(b"incompressible");
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        out.extend(
+            block
+                .iter()
+                .map(|b| char::from(ALPHABET[usize::from(*b) % ALPHABET.len()]))
+                .take(len - out.len()),
+        );
+        block = sha2::Sha256::digest(&block[..]);
+    }
+    out
+}
+
+/// #231: a chart version longer than 128 characters (an OCI tag's limit)
+/// is refused on push with 400, not stored until its index entry fails the
+/// insert (500); a URL naming one answers 404, in a hosted repository and in
+/// a proxy, which neither records it nor asks its upstream; and a proxy
+/// leaves an upstream's such version out of its listings.
+#[tokio::test]
+async fn chart_versions_longer_than_an_oci_tag_are_refused() {
+    let huge = format!("1.0.0-{}", incompressible(4096));
+    let srv = start_helm(ServerOpts::default()).await;
+    let creds = credentials(&srv).await;
+    let get = |path: String| {
+        srv.client()
+            .get(format!("{}{path}", srv.base_url))
+            .basic_auth(&creds.0, Some(&creds.1))
+            .send()
+    };
+    let long_rows = |repo: String| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM proxy_cached_version v JOIN repository r \
+                 ON r.id = v.repository_id WHERE r.name = $1 AND length(v.version) > 128",
+            )
+            .bind(repo)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let repo = helm_repo(&srv, false).await;
+    let resp = push(&srv, &repo, &creds, chart("demo", &huge)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("longer than 128 characters"));
+    let longest = format!("1.0.0-{}", "a".repeat(122));
+    for (version, status) in [
+        (format!("{longest}a"), StatusCode::BAD_REQUEST),
+        (longest.clone(), StatusCode::CREATED),
+    ] {
+        let resp = push(&srv, &repo, &creds, chart("demo", &version)).await;
+        assert_eq!(resp.status(), status, "{}", version.len());
+    }
+    let resp = get(format!("/repository/{repo}/charts/demo/{longest}/demo.tgz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = get(format!("/repository/{repo}/charts/demo/{huge}/demo.tgz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let index = format!(
+        "apiVersion: v1\nentries:\n  demo:\n    - apiVersion: v2\n      name: demo\n      \
+         version: 1.0.0\n      urls: [charts/demo-1.0.0.tgz]\n    - apiVersion: v2\n      \
+         name: demo\n      version: {huge}\n      urls: [charts/demo-huge.tgz]\n"
+    );
+    let upstream = ChartUpstream::start(index).await;
+    upstream.publish("demo-huge.tgz", chart("demo", &huge));
+    let proxy = format!("proxy{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": proxy, "kind": "proxy", "format": "helm", "remote_url": upstream.base }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = get(format!("/repository/{proxy}/charts/demo/{huge}/demo.tgz"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(upstream.downloads(), 0);
+    assert_eq!(long_rows(proxy.clone()).await, 0);
+
+    // The upstream's longer version is left out of the proxy's listings.
+    let resp = get(format!("/repository/{proxy}/api/charts/demo"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let versions: Value = resp.json().await.unwrap();
+    assert_eq!(versions.as_array().unwrap().len(), 1);
+    assert_eq!(versions[0]["version"], "1.0.0");
+    let index: Value = get_index(&srv, &proxy, Some(&creds))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(index["entries"]["demo"].as_array().unwrap().len(), 1);
+    assert_eq!(long_rows(proxy).await, 0);
+}

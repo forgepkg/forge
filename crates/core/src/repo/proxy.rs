@@ -885,7 +885,11 @@ impl ProxyRepo {
             .converse_resolved(repo, api::UpstreamOp::Versions(lower_id.to_string()))
             .await?;
         match answer {
-            api::UpstreamAnswer::Versions(Some(versions)) => {
+            api::UpstreamAnswer::Versions(Some(mut versions)) => {
+                // A version the format does not normalize is not the
+                // package's: one longer than the format allows would fail
+                // the whole listing's insert, so it is left out.
+                versions.retain(|v| self.format.normalize_version(v).is_ok());
                 // Record each version's first sighting (idempotent, one round-trip),
                 // then retire versions the upstream no longer lists (deleted
                 // upstream; still missing one metadata TTL after the first

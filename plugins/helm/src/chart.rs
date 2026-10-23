@@ -353,6 +353,24 @@ mod tests {
     }
 
     #[test]
+    fn refuses_versions_longer_than_an_oci_tag() {
+        let chart_yaml = |version: &str| {
+            format!("apiVersion: v2\nname: demo\nversion: {version}\n").into_bytes()
+        };
+        let longest = format!(
+            "1.0.0-{}",
+            "a".repeat(crate::semver::MAX_VERSION_LENGTH - 6)
+        );
+        let chart = parse_chart_yaml(chart_yaml(&longest)).unwrap();
+        assert_eq!(chart.version, longest);
+        assert_eq!(chart.normalized.to_string(), longest);
+        for longer in [format!("{longest}a"), format!("1.0.0-{}", "x".repeat(4096))] {
+            let err = parse_chart_yaml(chart_yaml(&longer)).err().unwrap();
+            assert!(err.contains("longer than 128 characters"), "{err}");
+        }
+    }
+
+    #[test]
     fn chart_names() {
         assert!(valid_name("nginx-ingress"));
         assert!(valid_name("my_chart.v2"));

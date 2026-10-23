@@ -1,8 +1,6 @@
 import { Link } from '@tanstack/react-router'
 
-import { Subheading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
-import { CommandSnippet } from '~/components/CopyButton'
+import { CommandSnippet, Panel } from '~/components/ui'
 
 /**
  * "Connect" panel of a docker repository: copyable `docker login` / `docker
@@ -24,24 +22,19 @@ export function DockerConnect({
   canPush?: boolean
 }) {
   return (
-    <section
-      aria-labelledby="docker-connect"
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+    <Panel
+      title="Connect"
+      description={
+        <>
+          Log in with your username and an API token as the password; create
+          one under{' '}
+          <Link to="/tokens" className="fg-link">
+            Your tokens
+          </Link>
+          .
+        </>
+      }
     >
-      <div>
-        <Subheading id="docker-connect">Connect</Subheading>
-        <Text className="mt-1">
-          Log in with your username and an API token as the password — create
-          one on the{' '}
-          <Link
-            to="/tokens"
-            className="text-sky-600 hover:underline dark:text-sky-400"
-          >
-            Tokens
-          </Link>{' '}
-          page.
-        </Text>
-      </div>
       <CommandSnippet
         label="Log in"
         command={`docker login ${registry}`}
@@ -59,6 +52,6 @@ export function DockerConnect({
           copyLabel="Copy push command"
         />
       )}
-    </section>
+    </Panel>
   )
 }
