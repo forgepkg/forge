@@ -22,13 +22,15 @@ import { routeTree } from '~/routeTree.gen'
  *    delete affordance for the built-in local realm;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;
  *  - the enabled toggle PATCHes the realm; disabling a realm people sign in
- *    with (local, OIDC, credential forwarding) asks first, and a server
- *    refusal (409) is shown with its reason;
+ *    with (local, OIDC, credential forwarding) or a workload-identity realm
+ *    (whose API keys it revokes) asks first, and a server refusal (409) is
+ *    shown with its reason;
  *  - the create form validates required fields per kind (no POST when
  *    invalid) and POSTs the parsed config when valid;
  *  - the edit form sends list values containing commas back unchanged,
  *    requires a new client secret once the issuer or client ID changes, and
- *    asks before saving a sign-in realm as disabled.
+ *    asks before saving a sign-in realm as disabled or saving a
+ *    workload-identity realm at all.
  */
 
 const adminMe: Me = {
@@ -62,6 +64,26 @@ function realm(over: Partial<RealmView>): RealmView {
     ...over,
   }
 }
+
+const ciRealm = realm({
+  id: 7,
+  kind: 'workload_identity',
+  name: 'github-actions',
+  priority: 3,
+  config: {
+    issuer: 'https://token.actions.githubusercontent.com',
+    allowed_audiences: ['https://forge.example.com'],
+    rules: [
+      {
+        role: 'ci-deployer',
+        conditions: [
+          { claim: 'repository_id', any_of: ['987654321'] },
+          { claim: 'repository_owner_id', any_of: ['1234567'] },
+        ],
+      },
+    ],
+  },
+})
 
 const threeRealms: RealmView[] = [
   realm({ id: 1, kind: 'local', name: 'local', priority: 0 }),
@@ -368,6 +390,36 @@ describe('admin realms list', () => {
         ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
       ),
     ).toBe(false)
+  })
+
+  it('asks before disabling a workload-identity realm: its keys are revoked for good', async () => {
+    const patches: Array<{ id: number; body: unknown }> = []
+    mockApi({
+      realms: [...threeRealms, ciRealm],
+      onPatch: (id, body) => {
+        patches.push({ id, body })
+        return json({ ...ciRealm, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'github-actions enabled' })
+    await u.click(toggle)
+
+    const row = toggle.closest('tr')!
+    expect(
+      within(row).getByText(/revokes every API key it issued/),
+    ).toHaveTextContent('Enabling the realm again does not bring the keys back.')
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+
+    await u.click(within(row).getByRole('button', { name: 'Disable' }))
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ id: 7, body: { enabled: false } }]),
+    )
   })
 
   it('shows the server refusal after disabling local is confirmed', async () => {
@@ -986,6 +1038,59 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
 
     await waitFor(() => expect(patched).not.toBeNull())
     expect(patched).toMatchObject({ name: 'corp-sso', enabled: false })
+  })
+
+  it('asks before saving a workload-identity realm, which revokes its keys', async () => {
+    const patches: unknown[] = []
+    mockApi({
+      realms: [ciRealm],
+      roles: [role({ id: 4, name: 'ci-deployer' })],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(ciRealm)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/7')
+
+    await u.click(await screen.findByRole('button', { name: 'Save changes' }))
+
+    expect(
+      screen.getByText(/Saving github-actions revokes every API key it issued/),
+    ).toHaveTextContent('The keys stay revoked.')
+    expect(patches).toEqual([])
+
+    await u.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/revokes every API key/)).toBeNull()
+    expect(patches).toEqual([])
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await u.click(screen.getByRole('button', { name: 'Save and revoke keys' }))
+
+    await waitFor(() => expect(patches).toHaveLength(1))
+    expect(patches[0]).toMatchObject({ name: 'github-actions', enabled: true })
+  })
+
+  it('saves a disabled workload-identity realm without asking', async () => {
+    const disabled = { ...ciRealm, enabled: false }
+    let patched: unknown = null
+    mockApi({
+      realms: [disabled],
+      roles: [role({ id: 4, name: 'ci-deployer' })],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(disabled)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/7')
+
+    await u.click(await screen.findByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).toMatchObject({ enabled: false }))
+    expect(screen.queryByText(/revokes every API key/)).toBeNull()
   })
 
   it('requires a new client secret after the client ID changes', async () => {

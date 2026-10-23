@@ -156,9 +156,9 @@ export interface RealmFormProps {
 }
 
 /**
- * What stops working when a realm people sign in with is disabled: the text
- * of the confirmation the realm list and the edit form show before sending
- * the disable. `null` for a kind that needs none (workload identity).
+ * What stops working when a realm is disabled: the text of the confirmation
+ * the realm list and the edit form show before sending the disable. `null`
+ * for a kind that needs none.
  */
 export function disableRealmWarning(kind: RealmKind, name: string): string | null {
   switch (kind) {
@@ -168,6 +168,8 @@ export function disableRealmWarning(kind: RealmKind, name: string): string | nul
       return `Disabling ${name} stops sign-in through its identity provider: people who use it can no longer sign in to Forge. API tokens keep working.`
     case 'credential_forwarding':
       return `Disabling ${name} stops the logins it checks against its upstream: NuGet clients sending those passwords over Basic, and browser sign-in with them. API tokens keep working.`
+    case 'workload_identity':
+      return `Disabling ${name} stops its token exchange and revokes every API key it issued: CI jobs using one fail with 401 until they exchange a new token. Enabling the realm again does not bring the keys back.`
     default:
       return null
   }
@@ -299,14 +301,20 @@ export function RealmForm({
     seedRealmFormValues(existing),
   )
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [confirmDisable, setConfirmDisable] = useState(false)
+  const [confirmSave, setConfirmSave] = useState(false)
 
-  // Saving a realm people sign in with as disabled ends their logins, so the
-  // save waits for an explicit confirmation, as the list's toggle does.
-  const disableWarning =
-    mode === 'edit' && existing?.enabled && !values.enabled
-      ? disableRealmWarning(existing.kind, existing.name)
-      : null
+  // Saving a realm as disabled ends the logins (or the keys) it serves, and
+  // any write to a workload-identity realm revokes the API keys it issued
+  // for good, so the save waits for an explicit confirmation, as the list's
+  // toggle does.
+  const saveWarning =
+    mode !== 'edit' || !existing?.enabled
+      ? null
+      : !values.enabled
+        ? disableRealmWarning(existing.kind, existing.name)
+        : existing.kind === 'workload_identity'
+          ? `Saving ${existing.name} revokes every API key it issued: CI jobs using one fail with 401 until they exchange a new token. The keys stay revoked.`
+          : null
 
   // The server keeps a stored client secret only while the issuer and client
   // ID stay the same (it must not reach another IdP), so after changing
@@ -435,15 +443,15 @@ export function RealmForm({
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!validate()) return
-    if (disableWarning) {
-      setConfirmDisable(true)
+    if (saveWarning) {
+      setConfirmSave(true)
       return
     }
     onSubmit(values)
   }
 
   function saveConfirmed() {
-    setConfirmDisable(false)
+    setConfirmSave(false)
     if (!validate()) return
     onSubmit(values)
   }
@@ -537,7 +545,7 @@ export function RealmForm({
           checked={values.enabled}
           onChange={(c) => {
             set('enabled', c)
-            setConfirmDisable(false)
+            setConfirmSave(false)
           }}
         />
         <Label>Enabled (used for sign-in / credential checks)</Label>
@@ -1328,9 +1336,9 @@ export function RealmForm({
         </p>
       )}
 
-      {confirmDisable && disableWarning ? (
+      {confirmSave && saveWarning ? (
         <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6">
-          <p className="text-amber-700 dark:text-amber-400">{disableWarning}</p>
+          <p className="text-amber-700 dark:text-amber-400">{saveWarning}</p>
           <div className="flex items-center gap-3">
             <Button
               type="button"
@@ -1338,12 +1346,12 @@ export function RealmForm({
               onClick={saveConfirmed}
               disabled={submitting}
             >
-              Disable and save
+              {values.enabled ? 'Save and revoke keys' : 'Disable and save'}
             </Button>
             <Button
               type="button"
               outline
-              onClick={() => setConfirmDisable(false)}
+              onClick={() => setConfirmSave(false)}
             >
               Cancel
             </Button>
