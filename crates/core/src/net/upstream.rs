@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use url::Url;
 
@@ -286,8 +287,13 @@ pub struct UpstreamAuth<'a> {
     pub password: &'a str,
 }
 
-/// Scheme + host + port triple used to scope credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Scheme + host + port triple used to scope credentials, and the requests
+/// a format's upstream conversation may send ([`super::origins`]).
+///
+/// It is written, and stored, as `scheme://host:port`
+/// (`https://api.nuget.org:443`), and read back with [`Origin::of`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub struct Origin {
     scheme: String,
     host: String,
@@ -303,6 +309,30 @@ impl Origin {
             host: parsed.host_str()?.to_ascii_lowercase(),
             port: parsed.port_or_known_default(),
         })
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}://{}", self.scheme, self.host)?;
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<Origin> for String {
+    fn from(origin: Origin) -> String {
+        origin.to_string()
+    }
+}
+
+impl TryFrom<String> for Origin {
+    type Error = String;
+
+    fn try_from(written: String) -> Result<Origin, String> {
+        Origin::of(&written).ok_or_else(|| format!("not an origin: {written:?}"))
     }
 }
 
@@ -735,6 +765,33 @@ mod tests {
             Origin::of("https://evil.example.com/v3/index.json").unwrap()
         );
         assert_ne!(a, Origin::of("https://feed.example.com:8443/").unwrap());
+    }
+
+    #[test]
+    fn origin_is_written_as_scheme_host_and_port_and_read_back() {
+        for (url, written) in [
+            (
+                "https://Feed.Example.com/v3/index.json",
+                "https://feed.example.com:443",
+            ),
+            (
+                "http://127.0.0.1:8421/v3/x/index.json",
+                "http://127.0.0.1:8421",
+            ),
+            ("http://[::1]:9200/_search", "http://[::1]:9200"),
+            (
+                "https://user:pw@feed.example.com/",
+                "https://feed.example.com:443",
+            ),
+        ] {
+            let origin = Origin::of(url).unwrap();
+            assert_eq!(origin.to_string(), written);
+            assert_eq!(Origin::of(written), Some(origin.clone()));
+            let json = serde_json::to_value(&origin).unwrap();
+            assert_eq!(json, written);
+            assert_eq!(serde_json::from_value::<Origin>(json).unwrap(), origin);
+        }
+        assert!(serde_json::from_value::<Origin>(serde_json::json!("no origin")).is_err());
     }
 
     #[test]

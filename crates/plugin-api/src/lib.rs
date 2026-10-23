@@ -112,11 +112,12 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// fetch of earlier rounds with its result, so a plugin stays stateless.
     ///
     /// The host does the rest of what a proxy is: it sends every request
-    /// (credentials only to the upstream's own origin, bounded in size and
-    /// time, cached as [`Fetch::freshness`] says), downloads and verifies
-    /// packages, and keeps the package delay, the not-found markers and the
-    /// offline mode. Only a plugin whose `plugin.toml` lists the `proxy`
-    /// kind is asked; the default says so.
+    /// (only to origins the upstream points at, see [`Fetch`]; credentials
+    /// only to the upstream's own origin; bounded in size and time, cached
+    /// as [`Fetch::freshness`] says), downloads and verifies packages, and
+    /// keeps the package delay, the not-found markers and the offline mode.
+    /// Only a plugin whose `plugin.toml` lists the `proxy` kind is asked;
+    /// the default says so.
     fn upstream(
         &self,
         remote: &Remote,

@@ -1114,3 +1114,48 @@ async fn chart_versions_longer_than_an_oci_tag_are_refused() {
     assert_eq!(index["entries"]["demo"].as_array().unwrap().len(), 1);
     assert_eq!(long_rows(proxy).await, 0);
 }
+
+/// A Helm index may list a chart on another host (a project's GitHub
+/// releases): the proxy downloads it from there, a host its upstream's
+/// index names (#233).
+#[tokio::test]
+async fn a_helm_proxy_downloads_a_chart_its_upstreams_index_lists_on_another_host() {
+    let releases = ChartUpstream::start(String::new()).await;
+    let demo = chart("demo", "1.0.0");
+    releases.publish("demo-1.0.0.tgz", demo.clone());
+    let index = format!(
+        "apiVersion: v1\nentries:\n  demo:\n    - apiVersion: v2\n      name: demo\n      \
+         version: 1.0.0\n      urls:\n        - {}/charts/demo-1.0.0.tgz\n",
+        releases.base
+    );
+    let upstream = ChartUpstream::start(index).await;
+
+    let srv = start_helm(ServerOpts::default()).await;
+    let creds = credentials(&srv).await;
+    let proxy = format!("proxy{}", unique());
+    let resp = create_repo(
+        &srv,
+        json!({ "name": proxy, "kind": "proxy", "format": "helm", "remote_url": upstream.base }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    let resp = srv
+        .client()
+        .get(format!(
+            "{}/repository/{proxy}/charts/demo/1.0.0/demo-1.0.0.tgz",
+            srv.base_url
+        ))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), demo.as_slice());
+    assert_eq!((upstream.downloads(), releases.downloads()), (0, 1));
+}
