@@ -154,7 +154,8 @@ replicaCount: 1
 revisionHistoryLimit: 5
 # Pods that start while others still serve; maxUnavailable 0 keeps the old
 # pods until the new ones are ready. Do not roll back to an older image once a
-# newer one has migrated the database.
+# newer one has migrated the database. A ReadWriteOnce cache volume needs
+# `type: Recreate`, which leaves rollingUpdate out.
 strategy:
   type: RollingUpdate
   rollingUpdate:
