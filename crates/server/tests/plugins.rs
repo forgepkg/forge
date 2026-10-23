@@ -53,17 +53,24 @@ fn chart_with_values(name: &str, version: &str, values: &str) -> Vec<u8> {
 /// A gzipped chart archive of the chart `name` with `chart_yaml` as its
 /// Chart.yaml.
 fn chart_archive(name: &str, chart_yaml: &str, values: &str) -> Vec<u8> {
-    let entries: [(String, String); 2] = [
-        (format!("{name}/values.yaml"), values.into()),
-        (format!("{name}/Chart.yaml"), chart_yaml.into()),
-    ];
+    tgz(&[
+        (&format!("{name}/values.yaml"), values),
+        (&format!("{name}/Chart.yaml"), chart_yaml),
+    ])
+}
+
+/// A gzipped ustar archive of `(path, contents)` entries.
+fn tgz(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut tar = Vec::new();
-    for (path, data) in &entries {
+    for (path, data) in entries {
         let mut header = [0u8; 512];
         header[..path.len()].copy_from_slice(path.as_bytes());
         header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
         header[156] = b'0';
         header[257..263].copy_from_slice(b"ustar\0");
+        header[148..156].fill(b' ');
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
         tar.extend_from_slice(&header);
         tar.extend_from_slice(data.as_bytes());
         tar.resize(tar.len().div_ceil(512) * 512, 0);
@@ -206,6 +213,25 @@ async fn a_helm_repository_round_trip() {
     let resp = push(&srv, &repo, &creds, b"not a chart".to_vec()).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(resp.text().await.unwrap().contains("not a chart archive"));
+    // A chart that Helm would install as another one: Helm loads the last
+    // Chart.yaml of an archive.
+    let twin = tgz(&[
+        (
+            "demo/Chart.yaml",
+            "apiVersion: v2\nname: demo\nversion: 3.0.0\n",
+        ),
+        (
+            "evil/Chart.yaml",
+            "apiVersion: v2\nname: evil\nversion: 6.6.6\n",
+        ),
+    ]);
+    let resp = push(&srv, &repo, &creds, twin).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("more than one top-level directory"));
 
     // The index lists both versions, newest first, as published.
     let resp = get_index(&srv, &repo, Some(&creds)).await;
@@ -927,10 +953,24 @@ async fn an_index_lists_scalars_as_the_strings_helm_reads() {
 /// the upstream once and from its cache after, and publishes nothing.
 #[tokio::test]
 async fn a_helm_proxy_serves_its_upstreams_charts() {
-    let index = "apiVersion: v1\nentries:\n  demo:\n    - apiVersion: v2\n      name: demo\n      version: 1.0.0\n      description: demo chart\n      urls: [charts/demo-1.0.0.tgz]\n  other:\n    - apiVersion: v2\n      name: other\n      version: 2.0.0\n      urls: [charts/other-2.0.0.tgz]\n".to_string();
+    let index = "apiVersion: v1\nentries:\n  demo:\n    - apiVersion: v2\n      name: demo\n      version: 1.0.0\n      description: demo chart\n      urls: [charts/demo-1.0.0.tgz]\n  other:\n    - apiVersion: v2\n      name: other\n      version: 2.0.0\n      urls: [charts/other-2.0.0.tgz]\n  twin:\n    - apiVersion: v2\n      name: twin\n      version: 1.0.0\n      urls: [charts/twin-1.0.0.tgz]\n".to_string();
     let upstream = ChartUpstream::start(index).await;
     let demo = chart("demo", "1.0.0");
     upstream.publish("demo-1.0.0.tgz", demo.clone());
+    // Helm would install it as `evil` 6.6.6, its last Chart.yaml.
+    upstream.publish(
+        "twin-1.0.0.tgz",
+        tgz(&[
+            (
+                "twin/Chart.yaml",
+                "apiVersion: v2\nname: twin\nversion: 1.0.0\n",
+            ),
+            (
+                "twin/Chart.yaml",
+                "apiVersion: v2\nname: evil\nversion: 6.6.6\n",
+            ),
+        ]),
+    );
 
     let srv = start_helm(ServerOpts::default()).await;
     let creds = credentials(&srv).await;
@@ -987,6 +1027,16 @@ async fn a_helm_proxy_serves_its_upstreams_charts() {
     .await
     .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A chart that is not what Helm would install is not cached.
+    let resp = get(format!(
+        "{}/repository/{proxy}/charts/twin/1.0.0/twin-1.0.0.tgz",
+        srv.base_url
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(upstream.downloads(), 2);
 
     // The ChartMuseum view of one chart, from the upstream's index.
     let resp = get(format!(
