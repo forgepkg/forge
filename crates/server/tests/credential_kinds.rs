@@ -67,27 +67,19 @@ async fn admin_api_refuses_a_password_sent_over_basic() {
 async fn tokens_are_minted_only_from_a_session() {
     let srv = common::start().await;
     let client = srv.client();
-    let (au, ap) = srv.admin_basic();
     let username = format!("minter{}@example.com", common::unique());
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    srv.create_user(&username, "pw123456-minter", "reader").await;
 
     let resp = client
         .post(format!("{}/admin/me/tokens", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-minter"))
         .json(&json!({"name": "via-basic"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "a Basic password cannot mint tokens");
 
-    let session = srv.login(&username, "pw123456").await;
+    let session = srv.login(&username, "pw123456-minter").await;
     let resp = session
         .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
         .json(&json!({"name": "via-session"}))
