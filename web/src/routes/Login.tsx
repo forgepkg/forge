@@ -19,6 +19,7 @@ import { ApiError } from '~/lib/httpClient'
 import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import { safeReturnTo } from '~/lib/returnTo'
+import { searchFlag } from '~/lib/search'
 import { AuthCard } from '~/components/AuthCard'
 import { Button, Code, Icon, Notice, Skeleton, TextField } from '~/components/ui'
 
@@ -93,16 +94,15 @@ export const Route = createFileRoute('/login')({
   component: Login,
   validateSearch: (search: Record<string, unknown>): LoginSearch => ({
     redirect: typeof search.redirect === 'string' ? search.redirect : undefined,
-    expired: search.expired === true || search.expired === 'true',
-    logout_failed:
-      search.logout_failed === true || search.logout_failed === 'true',
+    expired: searchFlag(search.expired),
+    logout_failed: searchFlag(search.logout_failed),
     error: parseLoginError(search.error),
     claim: parseClaim(search.claim),
     username:
       typeof search.username === 'string' && search.username.length <= 256
         ? search.username
         : undefined,
-    invited: search.invited === true || search.invited === 'true',
+    invited: searchFlag(search.invited),
   }),
 })
 
